@@ -1,0 +1,4 @@
+runtime/
+config/projects.json
+*.log
+*.tmp

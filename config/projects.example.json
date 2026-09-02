@@ -1,0 +1,10 @@
+{
+  "projects": [
+    {
+      "id": "example",
+      "name": "Example Project",
+      "root": "D:\\Path\\To\\Project",
+      "worker_runtime": "tmp\\worker-dsh"
+    }
+  ]
+}
