@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dev Orchestrator</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">LOCAL DEVELOPMENT CONTROL PLANE</div>
+      <h1>Dev Orchestrator</h1>
+    </div>
+    <div id="monitorBadge" class="badge unknown">Monitor unknown</div>
+  </header>
+
+  <main>
+    <section class="hero-grid">
+      <article class="panel">
+        <div class="section-title">Monitor</div>
+        <div id="monitorDetails" class="kv-grid"></div>
+      </article>
+      <article class="panel">
+        <div class="section-title">Overview</div>
+        <div id="overviewDetails" class="kv-grid"></div>
+      </article>
+    </section>
+
+    <section>
+      <div class="section-heading"><h2>Projects</h2><span id="lastRefresh">—</span></div>
+      <div id="projects" class="project-grid"></div>
+    </section>
+    <section class="split-grid">
+      <article class="panel">
+        <div class="section-heading"><h2>Recent transitions</h2></div>
+        <div id="events" class="timeline"></div>
+      </article>
+      <article class="panel">
+        <div class="section-heading"><h2>Recent runs</h2></div>
+        <div id="runs" class="timeline"></div>
+      </article>
+    </section>
+  </main>
+
+  <footer>
+    Read-only dashboard · GET/HEAD only · no Worker or hardware controls
+  </footer>
+  <script src="/app.js"></script>
+</body>
+</html>

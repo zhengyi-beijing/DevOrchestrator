@@ -1,74 +1,104 @@
 # Dev Orchestrator
 
-Independent local orchestration/observability service for AI-assisted development projects.
+Independent local observability/orchestration service for AI-assisted development projects.
 
-## Current scope: P1
+## Current scope: P2
 
-P0 established the read-only 60-second project monitor. P1 adds runtime telemetry and ETA history while preserving the same observation-only safety boundary.
+P0 established the read-only 60-second project monitor. P1 added runtime telemetry, Worker history, activity health, and ETA. P2 adds a dependency-free read-only Web dashboard over those normalized runtime files.
 
-P1 records state transitions, real Worker durations, elapsed time, activity age, stall/timeout health, and an ETA range. It still does not call AI, start Workers, advance phases, or touch hardware.
+The project still does **not** invoke AI, start Workers, advance phases, mutate observed Git repositories, run hardware actions, or expose a generic shell/prompt endpoint.
 
-Current polling interval: 60 seconds.
+## Architecture
 
-## Current project adapter
+```text
+Observed projects (read-only)
+        |
+        v
+src/monitor.ps1  +  src/telemetry.ps1
+        |
+        v
+runtime/*.json + runtime/history/*.jsonl
+        |
+        v
+src/web-server.ps1
+        |
+        v
+Browser dashboard
+```
 
-The first registered project is LabDemo. The monitor reads:
-
-- Git branch, HEAD, and dirty entry count.
-- `agent/CURRENT.md` and `agent/next.md` summary fields.
-- `tmp/worker-dsh/status.json` and Worker process liveness.
-- Last activity timestamps from Worker/agent files.
-
-Snapshots are written only under `runtime/` in this repository.
-## Commands
-
-Single read-only sample:
+Monitor and Web server are independent processes. A dead/stale monitor is shown explicitly by the dashboard rather than hidden.
+## Monitor commands
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\monitor.ps1 -Once
-```
-
-Start the detached monitor:
-
-```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\start-monitor.ps1 -IntervalSeconds 60
-```
-
-Check or stop it:
-
-```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\status-monitor.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\stop-monitor.ps1
 ```
+
+## Web dashboard
+
+Default loopback start:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\start-web.ps1
+```
+
+Open:
+
+```text
+http://127.0.0.1:8770/
+```
+
+Status / stop:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\status-web.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\stop-web.ps1
+```
+Explicit LAN bind example (only when LAN exposure is intended):
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\start-web.ps1 -ListenAddress 10.138.7.167 -Port 8770
+```
+
+The P2 server uses `.NET TcpListener`, so a specific local IP bind does not require an HttpListener URLACL. Windows firewall/network policy can still control reachability.
+
+### Read-only HTTP surface
+
+Allowed methods: `GET`, `HEAD` only.
+
+- `/` dashboard
+- `/app.js`, `/style.css`
+- `/api/monitor`
+- `/api/summary`
+- `/api/projects/<id>`
+- `/api/events?limit=N` (bounded to 100)
+- `/api/runs?limit=N` (bounded to 100)
+
+All other routes return 404; write methods return 405; encoded/raw path traversal is rejected. There are no Worker, shell, prompt, Git mutation, or hardware-control endpoints.
+
 ## Runtime state
 
-- `runtime/monitor.json`: watchdog heartbeat.
-- `runtime/summary.json`: all registered projects.
-- `runtime/projects/<id>.json`: normalized per-project snapshot including telemetry/ETA.
-- `runtime/history/events.jsonl`: state/run transition history.
-- `runtime/history/runs.jsonl`: one immutable record per completed/failed Worker run.
-
-ETA uses an explicit task override when configured. Otherwise it starts from the project default; after the configured minimum number of completed runs, the fallback can use the project historical median. Health is `OK`, `STALLED_WARNING`, or `TIMEOUT`; P1 only reports these states and never terminates a Worker.
-
-Possible project states currently include `READY_TO_RUN`, `WORKER_RUNNING`, `WAITING_REVIEW`, `WORKER_FAILED`, `WORKER_LOST`, `BLOCKED`, `WAITING_PHASE_GATE`, and `IDLE`.
-
-## Safety boundary
-
-P1 remains observation only. It does not execute `next`, run tests/builds, invoke DeepSeek/Codex, alter Git state, terminate Workers, or issue hardware commands.
-
-Telemetry self-test:
+- `runtime/monitor.json`: monitor heartbeat.
+- `runtime/summary.json`: normalized registered-project overview.
+- `runtime/projects/<id>.json`: project state including telemetry/ETA.
+- `runtime/history/events.jsonl`: state/run transitions.
+- `runtime/history/runs.jsonl`: immutable terminal Worker samples.
+- `runtime/web.json`: Web server heartbeat and bind information.
+## Tests
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\telemetry-selftest.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\web-selftest.ps1
 ```
 
-## Planned next layers
+`web-selftest.ps1` is hardware-free and uses fixture runtime state plus loopback HTTP. It verifies static/API success, stale-monitor derivation, bounded history, HEAD, 404, 405, encoded traversal rejection, and start/status/stop lifecycle.
 
-1. Read-only Web dashboard over normalized snapshots.
-2. Explicit `PHASE_AUTO` state machine with hard phase/hardware/architecture gates.
+## Safety boundary
 
-## Next queued task: P2 Web Dashboard
+P2 is observation only. Software acceptance does not imply hardware acceptance. Dashboard state is a projection of normalized project state and does not infer safety or hardware truth beyond the data provided by each registered adapter.
 
-`NEXT.md` is the authoritative next-task handoff. P2 adds a separate read-only Web process over the existing normalized runtime snapshots. It does not enable Worker control or phase automation.
+## Planned next layer
 
-Planned default local URL: `http://127.0.0.1:8770/`. The implementation must also support an explicit listen address for LAN access; firewall/OS exposure changes remain separate from the read-only dashboard implementation.
+P3 is an explicit `PHASE_AUTO` state machine with hard phase/hardware/architecture gates. P3 is not implemented or authorized by P2.
