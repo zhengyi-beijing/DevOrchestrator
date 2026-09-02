@@ -8,9 +8,14 @@ $ErrorActionPreference = 'Stop'
 $script:ProjectRoot = Split-Path -Parent $PSScriptRoot
 $script:RuntimeRoot = Join-Path $script:ProjectRoot 'runtime'
 $script:ProjectsRuntime = Join-Path $script:RuntimeRoot 'projects'
+$script:HistoryRoot = Join-Path $script:RuntimeRoot 'history'
+$script:EventsPath = Join-Path $script:HistoryRoot 'events.jsonl'
+$script:RunsPath = Join-Path $script:HistoryRoot 'runs.jsonl'
 $script:ConfigPath = Join-Path $script:ProjectRoot 'config\projects.json'
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+. (Join-Path $PSScriptRoot 'telemetry.ps1')
 [System.IO.Directory]::CreateDirectory($script:ProjectsRuntime) | Out-Null
+[System.IO.Directory]::CreateDirectory($script:HistoryRoot) | Out-Null
 
 function Write-JsonAtomic {
     param([string]$Path, [object]$Value)
@@ -102,8 +107,13 @@ function Get-ProjectSnapshot {
     $nextTitle = Get-MatchingLine -Path $nextPath -Pattern '^# '
     $nextStatus = Get-MatchingLine -Path $nextPath -Pattern '^Status:'
     $phaseHint = Get-MatchingLine -Path $currentPath -Pattern '^- P[0-9].*(DESIGN READY|NOT STARTED|BLOCKED|RUNNING)'
-    $worker = Get-WorkerInfo -Root $root -RelativeRuntime ([string]$Project.worker_runtime)
+    $worker = [pscustomobject](Get-WorkerInfo -Root $root -RelativeRuntime ([string]$Project.worker_runtime))
     $state = Resolve-MonitorState -Worker $worker -NextStatus ([string]$nextStatus)
+    $titleText = if ($nextTitle) { $nextTitle.Substring(2).Trim() } else { $null }
+    $statusText = if ($nextStatus) { $nextStatus.Substring(7).Trim() } else { $null }
+    $lastActivity = Get-LastActivityUtc -Root $root -RelativeRuntime ([string]$Project.worker_runtime)
+    $taskId = Get-TaskId -Title $titleText
+    $telemetry = Get-WorkerTelemetry -Project $Project -Worker $worker -TaskId $taskId -LastActivityAt $lastActivity -RunsPath $script:RunsPath
     return [ordered]@{
         id = [string]$Project.id
         name = [string]$Project.name
@@ -112,9 +122,10 @@ function Get-ProjectSnapshot {
         state = $state
         git = Get-GitInfo -Root $root
         worker = $worker
-        last_activity_at = Get-LastActivityUtc -Root $root -RelativeRuntime ([string]$Project.worker_runtime)
-        next_title = if ($nextTitle) { $nextTitle.Substring(2).Trim() } else { $null }
-        next_status = if ($nextStatus) { $nextStatus.Substring(7).Trim() } else { $null }
+        telemetry = $telemetry
+        last_activity_at = $lastActivity
+        next_title = $titleText
+        next_status = $statusText
         phase_hint = if ($phaseHint) { $phaseHint.Trim() } else { $null }
     }
 }
@@ -123,18 +134,31 @@ function Invoke-Tick {
     $config = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $snapshots = @()
     foreach ($project in @($config.projects)) {
+        $snapshotPath = Join-Path $script:ProjectsRuntime ($project.id + '.json')
+        $previous = $null
+        if (Test-Path -LiteralPath $snapshotPath) {
+            try { $previous = Get-Content -LiteralPath $snapshotPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+        }
         try {
-            $snapshot = Get-ProjectSnapshot -Project $project
+            $snapshot = [pscustomobject](Get-ProjectSnapshot -Project $project)
         }
         catch {
-            $snapshot = [ordered]@{
+            $snapshot = [pscustomobject][ordered]@{
                 id = [string]$project.id; name = [string]$project.name; root = [string]$project.root
                 observed_at = (Get-Date).ToUniversalTime().ToString('o'); state = 'MONITOR_ERROR'
                 error = $_.Exception.Message
             }
         }
+        $event = New-StateEvent -Previous $previous -Current $snapshot
+        if ($null -ne $event) { Append-JsonLine -Path $script:EventsPath -Value $event -Encoding $script:Utf8NoBom }
+        if ($snapshot.PSObject.Properties.Name -contains 'telemetry') {
+            $run = New-RunRecord -Project $project -Snapshot $snapshot
+            if ($null -ne $run -and -not (Test-RunRecorded -Path $script:RunsPath -RunId ([string]$run.run_id))) {
+                Append-JsonLine -Path $script:RunsPath -Value $run -Encoding $script:Utf8NoBom
+            }
+        }
         $snapshots += $snapshot
-        Write-JsonAtomic -Path (Join-Path $script:ProjectsRuntime ($project.id + '.json')) -Value $snapshot
+        Write-JsonAtomic -Path $snapshotPath -Value $snapshot
     }
     $summary = [ordered]@{
         observed_at = (Get-Date).ToUniversalTime().ToString('o')

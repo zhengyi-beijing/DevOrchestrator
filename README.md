@@ -2,9 +2,11 @@
 
 Independent local orchestration/observability service for AI-assisted development projects.
 
-## P0 scope
+## Current scope: P1
 
-P0 is intentionally read-only. It monitors registered projects and writes normalized runtime snapshots without calling AI, starting Workers, advancing phases, or touching hardware.
+P0 established the read-only 60-second project monitor. P1 adds runtime telemetry and ETA history while preserving the same observation-only safety boundary.
+
+P1 records state transitions, real Worker durations, elapsed time, activity age, stall/timeout health, and an ETA range. It still does not call AI, start Workers, advance phases, or touch hardware.
 
 Current polling interval: 60 seconds.
 
@@ -42,16 +44,25 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\stop-monitor.ps1
 
 - `runtime/monitor.json`: watchdog heartbeat.
 - `runtime/summary.json`: all registered projects.
-- `runtime/projects/<id>.json`: normalized per-project snapshot.
+- `runtime/projects/<id>.json`: normalized per-project snapshot including telemetry/ETA.
+- `runtime/history/events.jsonl`: state/run transition history.
+- `runtime/history/runs.jsonl`: one immutable record per completed/failed Worker run.
+
+ETA uses an explicit task override when configured. Otherwise it starts from the project default; after the configured minimum number of completed runs, the fallback can use the project historical median. Health is `OK`, `STALLED_WARNING`, or `TIMEOUT`; P1 only reports these states and never terminates a Worker.
 
 Possible project states currently include `READY_TO_RUN`, `WORKER_RUNNING`, `WAITING_REVIEW`, `WORKER_FAILED`, `WORKER_LOST`, `BLOCKED`, `WAITING_PHASE_GATE`, and `IDLE`.
 
 ## Safety boundary
 
-P0 performs observation only. It does not execute `next`, run tests/builds, invoke DeepSeek/Codex, alter Git state, or issue hardware commands.
+P1 remains observation only. It does not execute `next`, run tests/builds, invoke DeepSeek/Codex, alter Git state, terminate Workers, or issue hardware commands.
+
+Telemetry self-test:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\telemetry-selftest.ps1
+```
 
 ## Planned next layers
 
-1. Runtime telemetry and ETA history.
-2. Read-only Web dashboard over normalized snapshots.
-3. Explicit `PHASE_AUTO` state machine with hard phase/hardware/architecture gates.
+1. Read-only Web dashboard over normalized snapshots.
+2. Explicit `PHASE_AUTO` state machine with hard phase/hardware/architecture gates.
