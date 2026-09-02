@@ -66,3 +66,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\telemetry-selfte
 
 1. Read-only Web dashboard over normalized snapshots.
 2. Explicit `PHASE_AUTO` state machine with hard phase/hardware/architecture gates.
+
+## Next queued task: P2 Web Dashboard
+
+`NEXT.md` is the authoritative next-task handoff. P2 adds a separate read-only Web process over the existing normalized runtime snapshots. It does not enable Worker control or phase automation.
+
+Planned default local URL: `http://127.0.0.1:8770/`. The implementation must also support an explicit listen address for LAN access; firewall/OS exposure changes remain separate from the read-only dashboard implementation.
