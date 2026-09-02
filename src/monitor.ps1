@@ -64,6 +64,24 @@ function Get-WorkerInfo {
     return $info
 }
 
+function Get-GitChangedActivityUtc {
+    param([string]$Root)
+    $statusLines = @(& git -c core.quotepath=false -C $Root status --porcelain --untracked-files=all 2>$null)
+    $times = @()
+    foreach ($line in $statusLines) {
+        if ([string]::IsNullOrWhiteSpace([string]$line) -or ([string]$line).Length -lt 4) { continue }
+        $relative = ([string]$line).Substring(3).Trim()
+        if ($relative -match ' -> ') { $relative = @($relative -split ' -> ')[-1] }
+        $relative = $relative.Trim('"')
+        $path = Join-Path $Root $relative
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $times += (Get-Item -LiteralPath $path).LastWriteTimeUtc
+        }
+    }
+    if ($times.Count -eq 0) { return $null }
+    return ($times | Sort-Object -Descending | Select-Object -First 1)
+}
+
 function Get-LastActivityUtc {
     param([string]$Root, [string]$RelativeRuntime)
     $runRoot = Join-Path $Root $RelativeRuntime
@@ -79,19 +97,30 @@ function Get-LastActivityUtc {
     foreach ($path in $paths) {
         if (Test-Path -LiteralPath $path) { $times += (Get-Item -LiteralPath $path).LastWriteTimeUtc }
     }
+    $gitActivity = Get-GitChangedActivityUtc -Root $Root
+    if ($null -ne $gitActivity) { $times += $gitActivity }
     if ($times.Count -eq 0) { return $null }
     return (($times | Sort-Object -Descending | Select-Object -First 1).ToString('o'))
 }
 
 function Resolve-MonitorState {
-    param([object]$Worker, [string]$NextStatus)
+    param([object]$Worker, [string]$NextStatus, [AllowNull()][string]$NextUpdatedAt)
     if ($Worker.kind -eq 'task' -and $Worker.state -in @('starting','running') -and -not $Worker.process_alive) { return 'WORKER_LOST' }
     if ($Worker.kind -eq 'task' -and $Worker.state -in @('starting','running')) { return 'WORKER_RUNNING' }
     if ($Worker.kind -eq 'task' -and $Worker.state -eq 'failed') { return 'WORKER_FAILED' }
     if ($NextStatus -match 'BLOCKED') { return 'BLOCKED' }
-    if ($NextStatus -match 'DESIGN READY|EXECUTABLE') { return 'READY_TO_RUN' }
     if ($NextStatus -match 'ACCEPTED|awaiting') { return 'WAITING_PHASE_GATE' }
-    if ($Worker.kind -eq 'task' -and $Worker.state -eq 'completed') { return 'WAITING_REVIEW' }
+    if ($Worker.kind -eq 'task' -and $Worker.state -eq 'completed') {
+        if ($NextStatus -match 'DESIGN READY|EXECUTABLE') {
+            $workerUpdated = Convert-ToUtcDate $(if ($Worker.PSObject.Properties.Name -contains 'updated_at') { $Worker.updated_at } else { $null })
+            $nextUpdated = Convert-ToUtcDate $NextUpdatedAt
+            if ($null -ne $workerUpdated -and $null -ne $nextUpdated -and $nextUpdated -gt $workerUpdated) {
+                return 'READY_TO_RUN'
+            }
+        }
+        return 'WAITING_REVIEW'
+    }
+    if ($NextStatus -match 'DESIGN READY|EXECUTABLE') { return 'READY_TO_RUN' }
     return 'IDLE'
 }
 
@@ -106,9 +135,10 @@ function Get-ProjectSnapshot {
     $currentPath = Join-Path $root 'agent\CURRENT.md'
     $nextTitle = Get-MatchingLine -Path $nextPath -Pattern '^# '
     $nextStatus = Get-MatchingLine -Path $nextPath -Pattern '^Status:'
+    $nextUpdatedAt = if (Test-Path -LiteralPath $nextPath) { (Get-Item -LiteralPath $nextPath).LastWriteTimeUtc.ToString('o') } else { $null }
     $phaseHint = Get-MatchingLine -Path $currentPath -Pattern '^- P[0-9].*(DESIGN READY|NOT STARTED|BLOCKED|RUNNING)'
     $worker = [pscustomobject](Get-WorkerInfo -Root $root -RelativeRuntime ([string]$Project.worker_runtime))
-    $state = Resolve-MonitorState -Worker $worker -NextStatus ([string]$nextStatus)
+    $state = Resolve-MonitorState -Worker $worker -NextStatus ([string]$nextStatus) -NextUpdatedAt $nextUpdatedAt
     $titleText = if ($nextTitle) { $nextTitle.Substring(2).Trim() } else { $null }
     $statusText = if ($nextStatus) { $nextStatus.Substring(7).Trim() } else { $null }
     $lastActivity = Get-LastActivityUtc -Root $root -RelativeRuntime ([string]$Project.worker_runtime)
@@ -126,6 +156,7 @@ function Get-ProjectSnapshot {
         last_activity_at = $lastActivity
         next_title = $titleText
         next_status = $statusText
+        next_updated_at = $nextUpdatedAt
         phase_hint = if ($phaseHint) { $phaseHint.Trim() } else { $null }
     }
 }
