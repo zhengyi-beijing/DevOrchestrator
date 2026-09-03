@@ -1,13 +1,13 @@
 # CURRENT — DevOrchestrator
 
-Branch: `feature/python-v1-p2`
-Baseline: `main` @ `5ff917a25712479a91a34d384f27d0722c52f3ed`
+Branch: `feature/agent-router-foundation`
+Baseline: `81120db` (accepted Python P2 compatibility layer)
 
-Phase: **Python v1 — P2 Compatibility Slice**
+Phase: **Unified Agent Backend + Router foundation**
 Status: **ACCEPTED**
 
-The Python >=3.11, stdlib-only P2-equivalent monitor/Web/lifecycle implementation is independently reviewed and GREEN. Existing PowerShell P2 remains preserved as a reference/fallback.
+Fresh Reviewer independently verified the provider-neutral models/base/registry/router and real `DshBackend`, including both bounded remediation fixes: probe exception containment and correct natural-terminal settlement/cancellation semantics.
 
-No PHASE_AUTO, AgentBackend/Router, AI invocation, Worker/Reviewer start, observed-repository mutation, LabDemo phase advance, or hardware action is implemented by this accepted slice.
+Acceptance evidence: Python `tests_py` 19/19 PASS; PowerShell telemetry 10/10 PASS; PowerShell Web self-test PASS; real `DshBackend().probe()` available via `--version` only; real LabDemo monitor read-only with unchanged HEAD/status/file timestamps; `git diff --check` exit 0; no PHASE_AUTO or other provider adapters present.
 
-Next architectural stage: **Unified Agent Backend + Router foundation — NOT STARTED**. PHASE_AUTO remains later and NOT STARTED.
+PHASE_AUTO, automatic workflow execution, Codex/Claude/Gemini/Local adapters, LabDemo P4.3.4, and hardware actions remain NOT STARTED / NOT AUTHORIZED.

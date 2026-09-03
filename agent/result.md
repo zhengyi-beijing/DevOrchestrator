@@ -1,16 +1,14 @@
-# Reviewer Result — Python v1 P2 Compatibility Slice
+# Result — Unified Agent Backend + Router foundation
 
 Status: **ACCEPTED**
 
-Independent final evidence on XLabServer:
-- Python Designer/Reviewer suite: **7/7 PASS**.
-- Legacy PowerShell telemetry self-test: **10/10 PASS**.
-- Legacy PowerShell Web self-test: **PASS**.
-- Real LabDemo `monitor --once`: exit 0; LabDemo HEAD unchanged, `git status --porcelain` unchanged, and observed file timestamps unchanged (`LAB_FILE_TIMES_CHANGED=0`).
-- Python Web lifecycle: start=running, status process_alive=true, `/api/summary` HTTP 200, stop=stopped.
-- `git diff --check`: exit 0; only accepted LF/CRLF warning.
-- No P3/PHASE_AUTO/AgentBackend/Worker-start implementation found under `src/dev_orchestrator`.
+Independent Reviewer evidence:
+- `tests_py`: 19/19 PASS, including both Reviewer regressions.
+- Router contains backend `probe()` exceptions and continues deterministic fail-closed routing.
+- `DshBackend` settles naturally-ended runs exactly once; later `cancel()` preserves COMPLETED/FAILED and log handles close.
+- PowerShell telemetry: 10/10 PASS; PowerShell Web self-test: PASS.
+- Real `DshBackend().probe()`: available=True, quota=UNKNOWN, model `0.1.1-rc.2`; probe uses `--version` only.
+- Real LabDemo monitor one-shot: HEAD/status/file timestamps unchanged.
+- `git diff --check`: exit 0; no PHASE_AUTO/other-provider scope hits.
 
-Reviewer also found and closed one remediation defect: Git porcelain v1 activity parsing incorrectly stripped the leading XY status columns. Frozen regression now passes and dirty tracked-file activity is detected.
-
-Python P2-equivalent is accepted. Unified Agent Backend/Router and PHASE_AUTO are separate future stages.
+No next-stage Worker was started by this Reviewer cycle.
