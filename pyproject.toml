@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dev-orchestrator"
+version = "0.1.0"
+description = "Read-only DevOrchestrator P2-equivalent monitor and web compatibility layer (Python v1)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "DevOrchestrator" }]
+dependencies = []
+
+[project.scripts]
+dev-orchestrator = "dev_orchestrator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

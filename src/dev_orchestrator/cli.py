@@ -1,0 +1,474 @@
+"""DevOrchestrator command-line entry point (``python -m dev_orchestrator``).
+
+Implements the accepted CLI contract:
+
+- ``monitor --once [--config PATH] [--runtime-root PATH]`` — one read-only
+  tick printing the normalized summary JSON.
+- ``monitor --interval N`` — heartbeat loop writing ``monitor.pid``.
+- ``web --listen IP --port N`` — long-running read-only dashboard.
+- ``start-monitor|status-monitor|stop-monitor`` and
+  ``start-web|status-web|stop-web`` lifecycle commands operating only on
+  DevOrchestrator-owned PID/heartbeat files.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Optional, Sequence
+
+from dev_orchestrator.config import (
+    REPO_ROOT,
+    resolve_config_path,
+    resolve_runtime_root,
+    resolve_web_root,
+)
+from dev_orchestrator.monitor.project import run_monitor_once
+from dev_orchestrator.platform.process import (
+    executable_path,
+    is_pid_alive,
+    spawn_detached,
+    terminate_pid,
+)
+from dev_orchestrator.storage.json_store import (
+    read_json,
+    utc_now_iso,
+    write_json,
+    write_text,
+)
+from dev_orchestrator.web.server import monitor_payload, run_web
+
+_INTERVAL_MIN = 5
+_INTERVAL_MAX = 3600
+_PORT_MIN = 1
+_PORT_MAX = 65535
+
+
+class CliError(Exception):
+    """Fatal CLI error printed to stderr before exiting non-zero."""
+
+
+def _print_json(value: Any) -> None:
+    sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _child_env() -> dict:
+    env = dict(os.environ)
+    src = str(REPO_ROOT / "src")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = src + (os.pathsep + existing if existing else "")
+    return env
+
+
+def _spawn_child(argv: Sequence[str]) -> Any:
+    return spawn_detached(
+        list(argv), cwd=str(REPO_ROOT), env=_child_env()
+    )
+
+
+def _read_pid_text(path: Path) -> Optional[str]:
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def _wait_for_child_ready(
+    runtime: Path,
+    pid_file_name: str,
+    heartbeat_file_name: str,
+    states: tuple,
+    deadline_seconds: float = 8.0,
+) -> Optional[dict]:
+    """Wait until the freshly spawned child records its own pid + heartbeat.
+
+    The spawn handle may refer to a launcher/supervisor process whose pid
+    differs from the actual child (observed under sandboxed hosts), so
+    readiness is established from the child's own ``<name>.pid`` file changing
+    to a pid that matches the ``<name>.json`` heartbeat.
+    """
+    pid_file = runtime / pid_file_name
+    heartbeat_path = runtime / heartbeat_file_name
+    prior = _read_pid_text(pid_file)
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        pid_text = _read_pid_text(pid_file)
+        if pid_text and pid_text != prior:
+            try:
+                recorded_pid = int(pid_text)
+            except ValueError:
+                recorded_pid = -1
+            heartbeat = read_json(heartbeat_path)
+            if (
+                isinstance(heartbeat, dict)
+                and heartbeat.get("state") in states
+                and _as_int(heartbeat.get("pid"), -1) == recorded_pid
+            ):
+                return heartbeat
+        time.sleep(0.1)
+    return None
+
+
+def _pid_file(runtime: Path, name: str) -> Path:
+    return runtime / name
+
+
+def _fail(message: str) -> "NoReturn":
+    sys.stderr.write(message + "\n")
+    raise SystemExit(1)
+
+
+# --------------------------------------------------------------------------
+# monitor / web long-running commands
+# --------------------------------------------------------------------------
+
+def _monitor_loop(config: Path, runtime: Path, interval: int, started_at: str) -> int:
+    pid_path = runtime / "monitor.pid"
+    heartbeat_path = runtime / "monitor.json"
+    write_text(pid_path, str(os.getpid()))
+    while True:
+        last_error: Optional[str] = None
+        try:
+            run_monitor_once(config, runtime)
+        except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
+            last_error = str(exc)
+        write_json(
+            heartbeat_path,
+            {
+                "state": "degraded" if last_error else "running",
+                "pid": os.getpid(),
+                "interval_seconds": interval,
+                "started_at": started_at,
+                "last_tick_at": utc_now_iso(),
+                "last_error": last_error,
+            },
+        )
+        time.sleep(interval)
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    interval = args.interval
+    if not (_INTERVAL_MIN <= interval <= _INTERVAL_MAX):
+        _fail("interval must be between {0} and {1} seconds".format(_INTERVAL_MIN, _INTERVAL_MAX))
+    config = resolve_config_path(args.config)
+    runtime = resolve_runtime_root(args.runtime_root)
+    runtime.mkdir(parents=True, exist_ok=True)
+    if args.once:
+        summary = run_monitor_once(config, runtime)
+        _print_json(summary)
+        return 0
+    try:
+        return _monitor_loop(config, runtime, interval, utc_now_iso())
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_web(args: argparse.Namespace) -> int:
+    if not (_PORT_MIN <= args.port <= _PORT_MAX):
+        _fail("port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
+    runtime = resolve_runtime_root(args.runtime_root)
+    web_root = resolve_web_root(args.web_root)
+    return run_web(args.listen, args.port, runtime, web_root)
+
+
+# --------------------------------------------------------------------------
+# web lifecycle
+# --------------------------------------------------------------------------
+
+def cmd_start_web(args: argparse.Namespace) -> int:
+    if not (_PORT_MIN <= args.port <= _PORT_MAX):
+        _fail("port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
+    runtime = resolve_runtime_root(args.runtime_root)
+    runtime.mkdir(parents=True, exist_ok=True)
+    pid_path = runtime / "web.pid"
+    existing = _read_pid_file(pid_path)
+    if existing is not None and is_pid_alive(existing):
+        _fail("Web dashboard already running with PID {0}.".format(existing))
+    web_root = resolve_web_root(args.web_root)
+
+    child = _spawn_child(
+        [
+            executable_path(),
+            "-m",
+            "dev_orchestrator",
+            "web",
+            "--listen",
+            args.listen,
+            "--port",
+            str(args.port),
+            "--runtime-root",
+            str(runtime),
+            "--web-root",
+            str(web_root),
+        ]
+    )
+    heartbeat = _wait_for_child_ready(runtime, "web.pid", "web.json", ("running",))
+    if heartbeat is None:
+        recorded = _read_pid_file(pid_path)
+        terminate_pid(child.pid)
+        if recorded is not None and recorded != child.pid:
+            terminate_pid(recorded)
+        _fail("Web dashboard process started but heartbeat was not observed within 8 seconds.")
+    _print_json(
+        {
+            "state": "running",
+            "pid": heartbeat["pid"],
+            "listen_address": args.listen,
+            "port": args.port,
+            "url": _display_url(args.listen, args.port),
+        }
+    )
+    return 0
+
+
+def cmd_status_web(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    heartbeat_path = runtime / "web.json"
+    if not heartbeat_path.is_file():
+        _print_json({"state": "not_started", "process_alive": False})
+        return 0
+    heartbeat = read_json(heartbeat_path)
+    if not isinstance(heartbeat, dict):
+        heartbeat = {}
+    pid = _as_int(heartbeat.get("pid"), 0)
+    alive = pid > 0 and is_pid_alive(pid)
+    address = heartbeat.get("listen_address")
+    address = address if isinstance(address, str) and address else "127.0.0.1"
+    port = _as_int(heartbeat.get("port"), 8770)
+    raw_state = heartbeat.get("state")
+    if alive:
+        state = raw_state if isinstance(raw_state, str) and raw_state else "running"
+    else:
+        state = "stopped"
+    _print_json(
+        {
+            "state": state,
+            "pid": pid,
+            "process_alive": alive,
+            "listen_address": address,
+            "port": port,
+            "started_at": heartbeat.get("started_at"),
+            "last_request_at": heartbeat.get("last_request_at"),
+            "url": _display_url(address, port),
+        }
+    )
+    return 0
+
+
+def cmd_stop_web(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    pid_path = runtime / "web.pid"
+    heartbeat_path = runtime / "web.json"
+    pid = _read_pid_file(pid_path) or 0
+    if pid > 0 and is_pid_alive(pid):
+        terminate_pid(pid)
+    stopped = {"state": "stopped", "pid": pid, "stopped_at": utc_now_iso()}
+    write_json(heartbeat_path, stopped)
+    try:
+        pid_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _print_json(stopped)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# monitor lifecycle
+# --------------------------------------------------------------------------
+
+def cmd_start_monitor(args: argparse.Namespace) -> int:
+    interval = args.interval
+    if not (_INTERVAL_MIN <= interval <= _INTERVAL_MAX):
+        _fail("interval must be between {0} and {1} seconds".format(_INTERVAL_MIN, _INTERVAL_MAX))
+    runtime = resolve_runtime_root(args.runtime_root)
+    runtime.mkdir(parents=True, exist_ok=True)
+    pid_path = runtime / "monitor.pid"
+    existing = _read_pid_file(pid_path)
+    if existing is not None and is_pid_alive(existing):
+        _fail("Monitor already running with PID {0}.".format(existing))
+    config = resolve_config_path(args.config)
+
+    child = _spawn_child(
+        [
+            executable_path(),
+            "-m",
+            "dev_orchestrator",
+            "monitor",
+            "--interval",
+            str(interval),
+            "--config",
+            str(config),
+            "--runtime-root",
+            str(runtime),
+        ]
+    )
+    heartbeat = _wait_for_child_ready(
+        runtime, "monitor.pid", "monitor.json", ("running", "degraded")
+    )
+    if heartbeat is None:
+        recorded = _read_pid_file(pid_path)
+        terminate_pid(child.pid)
+        if recorded is not None and recorded != child.pid:
+            terminate_pid(recorded)
+        _fail("Monitor process started but heartbeat was not observed within 8 seconds.")
+    _print_json(heartbeat)
+    return 0
+
+
+def cmd_status_monitor(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    heartbeat_path = runtime / "monitor.json"
+    if not heartbeat_path.is_file():
+        _print_json({"state": "not_started", "process_alive": False})
+        return 0
+    payload = monitor_payload(runtime)
+    _print_json(
+        {
+            "state": payload["state"] if payload["process_alive"] else "stopped",
+            "pid": payload["pid"],
+            "process_alive": payload["process_alive"],
+            "interval_seconds": payload["interval_seconds"],
+            "started_at": payload["started_at"],
+            "last_tick_at": payload["last_tick_at"],
+            "heartbeat_age_seconds": payload["heartbeat_age_seconds"],
+            "stale": payload["stale"],
+            "last_error": payload["last_error"],
+        }
+    )
+    return 0
+
+
+def cmd_stop_monitor(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    pid_path = runtime / "monitor.pid"
+    heartbeat_path = runtime / "monitor.json"
+    pid = _read_pid_file(pid_path) or 0
+    if pid > 0 and is_pid_alive(pid):
+        terminate_pid(pid)
+    stopped = {"state": "stopped", "pid": pid, "stopped_at": utc_now_iso()}
+    write_json(heartbeat_path, stopped)
+    try:
+        pid_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _print_json(stopped)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+def _read_pid_file(path: Path) -> Optional[int]:
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        pid = int(text)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _display_url(address: str, port: int) -> str:
+    if address in ("0.0.0.0", "::"):
+        return "http://localhost:{0}/".format(port)
+    return "http://{0}:{1}/".format(address, port)
+
+
+# --------------------------------------------------------------------------
+# parser
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="dev_orchestrator",
+        description="Read-only DevOrchestrator monitor and web dashboard (P2-equivalent Python v1).",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="command")
+
+    monitor = sub.add_parser("monitor", help="run one tick (--once) or the heartbeat loop")
+    monitor.add_argument("--once", action="store_true", help="run a single tick and print the summary")
+    monitor.add_argument("--interval", type=int, default=60, help="loop interval in seconds (5..3600)")
+    monitor.add_argument("--config", default=None, help="path to projects.json")
+    monitor.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    web = sub.add_parser("web", help="run the read-only dashboard server")
+    web.add_argument("--listen", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8770)
+    web.add_argument("--runtime-root", default=None)
+    web.add_argument("--web-root", default=None)
+
+    start_web = sub.add_parser("start-web", help="start the dashboard as a detached process")
+    start_web.add_argument("--listen", default="127.0.0.1")
+    start_web.add_argument("--port", type=int, default=8770)
+    start_web.add_argument("--runtime-root", default=None)
+    start_web.add_argument("--web-root", default=None)
+
+    status_web = sub.add_parser("status-web", help="report dashboard process status")
+    status_web.add_argument("--runtime-root", default=None)
+
+    stop_web = sub.add_parser("stop-web", help="stop the recorded dashboard process")
+    stop_web.add_argument("--runtime-root", default=None)
+
+    start_monitor = sub.add_parser("start-monitor", help="start the monitor loop as a detached process")
+    start_monitor.add_argument("--interval", type=int, default=60)
+    start_monitor.add_argument("--config", default=None)
+    start_monitor.add_argument("--runtime-root", default=None)
+
+    status_monitor = sub.add_parser("status-monitor", help="report monitor process status")
+    status_monitor.add_argument("--runtime-root", default=None)
+
+    stop_monitor = sub.add_parser("stop-monitor", help="stop the recorded monitor process")
+    stop_monitor.add_argument("--runtime-root", default=None)
+
+    return parser
+
+
+_COMMANDS = {
+    "monitor": cmd_monitor,
+    "web": cmd_web,
+    "start-web": cmd_start_web,
+    "status-web": cmd_status_web,
+    "stop-web": cmd_stop_web,
+    "start-monitor": cmd_start_monitor,
+    "status-monitor": cmd_status_monitor,
+    "stop-monitor": cmd_stop_monitor,
+}
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "command", None):
+        parser.print_help(sys.stderr)
+        return 2
+    handler = _COMMANDS.get(args.command)
+    if handler is None:
+        parser.print_help(sys.stderr)
+        return 2
+    try:
+        return int(handler(args))
+    except CliError as exc:
+        sys.stderr.write(str(exc) + "\n")
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

@@ -1,0 +1,330 @@
+"""Read-only stdlib HTTP server implementing the accepted P2 surface.
+
+Contract: methods ``GET``/``HEAD`` only; static allowlist ``/``, ``/app.js``,
+``/style.css``; API allowlist ``/api/monitor``, ``/api/summary``,
+``/api/projects/<id>``, ``/api/events?limit=N``, ``/api/runs?limit=N``;
+history limits clamp to 1..100; unknown routes 404; write methods 405 with
+``Allow: GET, HEAD``; traversal/malformed paths 400. ``Cache-Control:
+no-store`` and ``X-Content-Type-Options: nosniff`` are always present.
+
+The server reads DevOrchestrator runtime projections only; it never shells
+into observed projects.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import parse_qs, unquote, urlsplit
+
+from dev_orchestrator.platform.process import is_pid_alive
+from dev_orchestrator.storage.json_store import (
+    parse_utc,
+    read_json,
+    read_last_jsonl,
+    utc_now,
+    utc_now_iso,
+    write_json,
+)
+
+_STATIC = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/style.css": ("style.css", "text/css; charset=utf-8"),
+}
+_PROJECT_PATH_RE = re.compile(r"^/api/projects/([A-Za-z0-9_-]+)$")
+_ALLOW_HEADER = "GET, HEAD"
+
+
+def monitor_payload(runtime_root: Path | str) -> dict[str, Any]:
+    """Derive the /api/monitor payload from the monitor heartbeat file."""
+    runtime = Path(runtime_root)
+    raw = read_json(runtime / "monitor.json", {"state": "not_started"})
+    if not isinstance(raw, dict):
+        raw = {"state": "not_started"}
+    pid_value = raw.get("pid")
+    try:
+        pid = int(pid_value) if pid_value is not None else 0
+    except (TypeError, ValueError):
+        pid = 0
+    alive = pid > 0 and is_pid_alive(pid)
+    last_tick = parse_utc(raw.get("last_tick_at"))
+    age: Optional[float] = None
+    if last_tick is not None:
+        age = round(max(0.0, (utc_now() - last_tick).total_seconds()), 1)
+    interval_value = raw.get("interval_seconds")
+    try:
+        interval = int(interval_value) if interval_value is not None else 60
+    except (TypeError, ValueError):
+        interval = 60
+    stale = (not alive) or (age is None) or (age > interval * 2.5)
+    state = raw.get("state")
+    return {
+        "state": state if isinstance(state, str) and state else "not_started",
+        "pid": pid,
+        "process_alive": alive,
+        "interval_seconds": interval,
+        "started_at": raw.get("started_at"),
+        "last_tick_at": raw.get("last_tick_at"),
+        "heartbeat_age_seconds": age,
+        "stale": stale,
+        "last_error": raw.get("last_error"),
+    }
+
+
+def _default_summary() -> dict[str, Any]:
+    return {"observed_at": None, "project_count": 0, "projects": []}
+
+
+class DevOrchestratorHTTPServer(ThreadingHTTPServer):
+    """Threading HTTP server that owns the DevOrchestrator web heartbeat."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(
+        self,
+        server_address: tuple,
+        runtime_root: Path | str,
+        web_root: Path | str,
+        listen_label: str,
+        started_at: str,
+    ) -> None:
+        self.runtime_root = Path(runtime_root)
+        self.web_root = Path(web_root)
+        self.listen_label = listen_label
+        self.started_at = started_at
+        self._heartbeat_lock = threading.Lock()
+        super().__init__(server_address, _DashboardHandler)
+        self.touch_heartbeat(None)
+
+    def touch_heartbeat(self, last_request_at: Optional[str]) -> None:
+        """Atomically refresh ``web.json`` under a process-local lock."""
+        port = 0
+        try:
+            port = int(self.server_address[1])
+        except (TypeError, ValueError):
+            pass
+        value = {
+            "state": "running",
+            "pid": os.getpid(),
+            "listen_address": self.listen_label,
+            "port": port,
+            "started_at": self.started_at,
+            "last_request_at": last_request_at,
+        }
+        with self._heartbeat_lock:
+            write_json(self.runtime_root / "web.json", value)
+
+
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False).encode("utf-8")
+
+
+class _DashboardHandler(BaseHTTPRequestHandler):
+    """GET/HEAD-only handler; every response carries no-store/nosniff."""
+
+    protocol_version = "HTTP/1.1"
+    server_version = "DevOrchestrator/1.0"
+
+    def log_message(self, fmt: str, *args: Any) -> None:  # silence access log
+        return
+
+    # -- entry points -----------------------------------------------------
+    def do_GET(self) -> None:
+        self._dispatch(head_only=False)
+
+    def do_HEAD(self) -> None:
+        self._dispatch(head_only=True)
+
+    def _unsupported(self) -> None:
+        self._dispatch_method_not_allowed()
+
+    do_POST = _unsupported
+    do_PUT = _unsupported
+    do_DELETE = _unsupported
+    do_PATCH = _unsupported
+    do_OPTIONS = _unsupported
+    do_TRACE = _unsupported
+    do_CONNECT = _unsupported
+
+    # -- plumbing ---------------------------------------------------------
+    def _send(
+        self,
+        status: int,
+        reason: str,
+        content_type: str,
+        body: bytes,
+        head_only: bool,
+        extra_headers: Optional[dict] = None,
+    ) -> None:
+        self.send_response(status, reason)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if not head_only and body:
+            self.wfile.write(body)
+
+    def _error(
+        self,
+        status: int,
+        reason: str,
+        message: str,
+        head_only: bool,
+        extra_headers: Optional[dict] = None,
+    ) -> None:
+        payload = {"error": reason, "message": message}
+        self._send(
+            status,
+            reason,
+            "application/json; charset=utf-8",
+            _json_bytes(payload),
+            head_only,
+            extra_headers,
+        )
+
+    def _dispatch_method_not_allowed(self) -> None:
+        self._error(
+            405,
+            "Method Not Allowed",
+            "read-only dashboard supports GET and HEAD only",
+            self.command == "HEAD",
+            {"Allow": _ALLOW_HEADER},
+        )
+
+    def _touch_after_request(self) -> None:
+        try:
+            self.server.touch_heartbeat(utc_now_iso())
+        except Exception:  # noqa: BLE001 - heartbeat must never break serving
+            pass
+
+    # -- routing ----------------------------------------------------------
+    def _dispatch(self, head_only: bool) -> None:
+        try:
+            self._route(head_only)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception:  # noqa: BLE001 - 500 on unexpected handler errors
+            try:
+                self._error(
+                    500, "Internal Server Error", "request failed", head_only
+                )
+            except Exception:  # noqa: BLE001
+                self.close_connection = True
+        finally:
+            self._touch_after_request()
+
+    def _route(self, head_only: bool) -> None:
+        parsed = urlsplit(self.path)
+        raw_path = parsed.path
+        try:
+            path = unquote(raw_path)
+        except Exception:  # noqa: BLE001
+            path = ""
+        if ".." in path or "\\" in path:
+            self._error(400, "Bad Request", "path traversal is not allowed", head_only)
+            return
+
+        static = _STATIC.get(path)
+        if static is not None:
+            filename, content_type = static
+            static_path = self.server.web_root / filename
+            try:
+                body = static_path.read_bytes()
+            except OSError:
+                self._error(404, "Not Found", "route not found", head_only)
+                return
+            self._send(200, "OK", content_type, body, head_only)
+            return
+
+        runtime = self.server.runtime_root
+        if path == "/api/monitor":
+            payload = monitor_payload(runtime)
+        elif path == "/api/summary":
+            payload = read_json(runtime / "summary.json", _default_summary())
+        elif path == "/api/events":
+            payload = {"items": read_last_jsonl(runtime / "history" / "events.jsonl", self._query_limit(parsed.query))}
+        elif path == "/api/runs":
+            payload = {"items": read_last_jsonl(runtime / "history" / "runs.jsonl", self._query_limit(parsed.query))}
+        elif path.startswith("/api/projects/"):
+            match = _PROJECT_PATH_RE.fullmatch(path)
+            if not match:
+                self._error(404, "Not Found", "route not found", head_only)
+                return
+            project_path = runtime / "projects" / (match.group(1) + ".json")
+            if not project_path.is_file():
+                self._error(404, "Not Found", "project snapshot not found", head_only)
+                return
+            payload = read_json(project_path, {})
+        else:
+            self._error(404, "Not Found", "route not found", head_only)
+            return
+        self._send(
+            200,
+            "OK",
+            "application/json; charset=utf-8",
+            _json_bytes(payload),
+            head_only,
+        )
+
+    @staticmethod
+    def _query_limit(query: str) -> int:
+        values = parse_qs(query).get("limit")
+        if not values:
+            return 20
+        try:
+            return max(1, min(100, int(values[0])))
+        except ValueError:
+            return 20
+
+
+def make_server(
+    host: str, port: int, runtime_root: Path | str, web_root: Path | str
+) -> DevOrchestratorHTTPServer:
+    """Create (and bind) the dashboard server; runtime heartbeat is written now."""
+    runtime = Path(runtime_root)
+    runtime.mkdir(parents=True, exist_ok=True)
+    started_at = utc_now_iso()
+    return DevOrchestratorHTTPServer(
+        (host, port), runtime, Path(web_root), host, started_at
+    )
+
+
+def run_web(
+    listen: str,
+    port: int,
+    runtime_root: Path | str,
+    web_root: Path | str,
+) -> int:
+    """Run the dashboard server until interrupted (the CLI ``web`` command).
+
+    Writes ``web.pid`` on start and removes it on graceful exit. The server is
+    stopped via the PID recorded in ``web.pid``/``web.json`` only.
+    """
+    from dev_orchestrator.storage.json_store import write_text
+
+    runtime = Path(runtime_root)
+    runtime.mkdir(parents=True, exist_ok=True)
+    server = make_server(listen, port, runtime, web_root)
+    pid_path = runtime / "web.pid"
+    write_text(pid_path, str(os.getpid()))
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return 0
