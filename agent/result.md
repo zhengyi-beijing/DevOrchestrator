@@ -9,3 +9,5 @@ Accepted baseline remains `586c49b` (multi-project/Web Sol Core). The current br
 Latest independent Reviewer status before the stop: **CHANGES REQUESTED**. Open defects were expired-claim response authority and fail-closed Userscript renew handling. The interrupted remediation modified the relevant bridge/Userscript files, but no fresh Reviewer was run after those edits.
 
 Do not treat this branch as accepted. Resume by reviewing the interrupted lease remediation first; do not start PHASE_AUTO or automatic event dispatch before this slice is accepted.
+
+Remote status: `origin` now points to `https://github.com/zhengyi-beijing/DevOrchestrator.git`. Push has not completed because XLabServer currently cannot connect to `github.com:443`; this is a network deployment blocker, not a confirmed GitHub permission failure.
