@@ -1,13 +1,15 @@
 # CURRENT — DevOrchestrator
 
-Branch: `feature/agent-router-foundation`
-Baseline: `81120db` (accepted Python P2 compatibility layer)
+Branch: `feature/multiproject-websol-contract`
+Baseline: `64950cb` (accepted AgentBackend + Router foundation)
 
-Phase: **Unified Agent Backend + Router foundation**
-Status: **ACCEPTED**
+Phase: **Multi-project daemon + Web Sol Core contract**
+Status: **ACCEPTED — fresh Reviewer verified**
 
-Fresh Reviewer independently verified the provider-neutral models/base/registry/router and real `DshBackend`, including both bounded remediation fixes: probe exception containment and correct natural-terminal settlement/cancellation semantics.
-
-Acceptance evidence: Python `tests_py` 19/19 PASS; PowerShell telemetry 10/10 PASS; PowerShell Web self-test PASS; real `DshBackend().probe()` available via `--version` only; real LabDemo monitor read-only with unchanged HEAD/status/file timestamps; `git diff --check` exit 0; no PHASE_AUTO or other provider adapters present.
-
-PHASE_AUTO, automatic workflow execution, Codex/Claude/Gemini/Local adapters, LabDemo P4.3.4, and hardware actions remain NOT STARTED / NOT AUTHORIZED.
+Accepted architecture:
+- one preferred DevOrchestrator daemon manages N configured projects;
+- each project has canonical `project_id`, nonblank `repo_path`, worker/task projection, adapter, and optional conversation binding;
+- missing/malformed conversation binding is monitor-only (`orchestration_ready=false`);
+- ProjectAdapter is config-selected; Core has no LabDemo/xray special cases;
+- Web Sol protocol/decision guard is fail-closed and does not execute Workers;
+- unified daemon owns monitor + Web heartbeat under one PID.

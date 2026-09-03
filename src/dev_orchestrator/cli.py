@@ -6,9 +6,13 @@ Implements the accepted CLI contract:
   tick printing the normalized summary JSON.
 - ``monitor --interval N`` — heartbeat loop writing ``monitor.pid``.
 - ``web --listen IP --port N`` — long-running read-only dashboard.
+- ``start-daemon/status-daemon/stop-daemon`` — one-process daemon lifecycle:
+  the daemon runs the monitor loop and the read-only Web server in the same
+  PID and reports that PID in ``daemon.json``, ``monitor.json`` and
+  ``web.json``.
 - ``start-monitor|status-monitor|stop-monitor`` and
-  ``start-web|status-web|stop-web`` lifecycle commands operating only on
-  DevOrchestrator-owned PID/heartbeat files.
+  ``start-web|status-web|stop-web`` — legacy P2 lifecycle commands operating
+  only on DevOrchestrator-owned PID/heartbeat files (compatibility paths).
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from dev_orchestrator.config import (
     resolve_runtime_root,
     resolve_web_root,
 )
+from dev_orchestrator.daemon import run_daemon
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.platform.process import (
     executable_path,
@@ -190,6 +195,9 @@ def cmd_start_web(args: argparse.Namespace) -> int:
     existing = _read_pid_file(pid_path)
     if existing is not None and is_pid_alive(existing):
         _fail("Web dashboard already running with PID {0}.".format(existing))
+    daemon_pid = _recorded_pid(runtime, "daemon")
+    if daemon_pid is not None:
+        _fail_conflicting_process("Unified daemon", daemon_pid, "start-web (legacy dashboard)")
     web_root = resolve_web_root(args.web_root)
 
     child = _spawn_child(
@@ -292,6 +300,9 @@ def cmd_start_monitor(args: argparse.Namespace) -> int:
     existing = _read_pid_file(pid_path)
     if existing is not None and is_pid_alive(existing):
         _fail("Monitor already running with PID {0}.".format(existing))
+    daemon_pid = _recorded_pid(runtime, "daemon")
+    if daemon_pid is not None:
+        _fail_conflicting_process("Unified daemon", daemon_pid, "start-monitor (legacy monitor)")
     config = resolve_config_path(args.config)
 
     child = _spawn_child(
@@ -362,6 +373,145 @@ def cmd_stop_monitor(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# unified daemon lifecycle (one process: monitor loop + web server)
+# --------------------------------------------------------------------------
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    """Run the unified daemon until interrupted (spawned by start-daemon)."""
+    if not (_INTERVAL_MIN <= args.interval <= _INTERVAL_MAX):
+        _fail("interval must be between {0} and {1} seconds".format(_INTERVAL_MIN, _INTERVAL_MAX))
+    if not (_PORT_MIN <= args.port <= _PORT_MAX):
+        _fail("port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
+    config = resolve_config_path(args.config)
+    runtime = resolve_runtime_root(args.runtime_root)
+    web_root = resolve_web_root(args.web_root)
+    try:
+        return run_daemon(
+            config,
+            runtime,
+            web_root,
+            args.interval,
+            args.listen,
+            args.port,
+        )
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_start_daemon(args: argparse.Namespace) -> int:
+    if not (_INTERVAL_MIN <= args.interval <= _INTERVAL_MAX):
+        _fail("interval must be between {0} and {1} seconds".format(_INTERVAL_MIN, _INTERVAL_MAX))
+    if not (_PORT_MIN <= args.port <= _PORT_MAX):
+        _fail("port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
+    runtime = resolve_runtime_root(args.runtime_root)
+    runtime.mkdir(parents=True, exist_ok=True)
+    pid_path = runtime / "daemon.pid"
+    existing = _read_pid_file(pid_path)
+    if existing is not None and is_pid_alive(existing):
+        _fail("Daemon already running with PID {0}.".format(existing))
+    for name, label in (("monitor", "Legacy monitor"), ("web", "Legacy web dashboard")):
+        legacy_pid = _recorded_pid(runtime, name)
+        if legacy_pid is not None:
+            _fail_conflicting_process(label, legacy_pid, "start-daemon")
+    config = resolve_config_path(args.config)
+    web_root = resolve_web_root(args.web_root)
+
+    child = _spawn_child(
+        [
+            executable_path(),
+            "-m",
+            "dev_orchestrator",
+            "daemon",
+            "--config",
+            str(config),
+            "--runtime-root",
+            str(runtime),
+            "--web-root",
+            str(web_root),
+            "--listen",
+            args.listen,
+            "--port",
+            str(args.port),
+            "--interval",
+            str(args.interval),
+        ]
+    )
+    heartbeat = _wait_for_child_ready(
+        runtime, "daemon.pid", "daemon.json", ("running", "degraded")
+    )
+    if heartbeat is None:
+        recorded = _read_pid_file(pid_path)
+        terminate_pid(child.pid)
+        if recorded is not None and recorded != child.pid:
+            terminate_pid(recorded)
+        _fail("Daemon process started but heartbeat was not observed within 8 seconds.")
+    _print_json(
+        {
+            "state": "running",
+            "pid": heartbeat["pid"],
+            "listen_address": args.listen,
+            "port": args.port,
+            "interval_seconds": args.interval,
+            "url": _display_url(args.listen, args.port),
+        }
+    )
+    return 0
+
+
+def cmd_status_daemon(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    heartbeat_path = runtime / "daemon.json"
+    if not heartbeat_path.is_file():
+        _print_json({"state": "not_started", "process_alive": False})
+        return 0
+    heartbeat = read_json(heartbeat_path)
+    if not isinstance(heartbeat, dict):
+        heartbeat = {}
+    pid = _as_int(heartbeat.get("pid"), 0)
+    alive = pid > 0 and is_pid_alive(pid)
+    address = heartbeat.get("listen_address")
+    address = address if isinstance(address, str) and address else "127.0.0.1"
+    port = _as_int(heartbeat.get("port"), 8770)
+    raw_state = heartbeat.get("state")
+    if alive:
+        state = raw_state if isinstance(raw_state, str) and raw_state else "running"
+    else:
+        state = "stopped"
+    _print_json(
+        {
+            "state": state,
+            "pid": pid,
+            "process_alive": alive,
+            "interval_seconds": heartbeat.get("interval_seconds"),
+            "started_at": heartbeat.get("started_at"),
+            "last_tick_at": heartbeat.get("last_tick_at"),
+            "last_error": heartbeat.get("last_error"),
+            "listen_address": address,
+            "port": port,
+            "url": _display_url(address, port),
+        }
+    )
+    return 0
+
+
+def cmd_stop_daemon(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    pid_path = runtime / "daemon.pid"
+    heartbeat_path = runtime / "daemon.json"
+    pid = _read_pid_file(pid_path) or 0
+    if pid > 0 and is_pid_alive(pid):
+        terminate_pid(pid)
+    stopped = {"state": "stopped", "pid": pid, "stopped_at": utc_now_iso()}
+    write_json(heartbeat_path, stopped)
+    try:
+        pid_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _print_json(stopped)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
 
@@ -375,6 +525,27 @@ def _read_pid_file(path: Path) -> Optional[int]:
     except ValueError:
         return None
     return pid if pid > 0 else None
+
+
+def _recorded_pid(runtime: Path, name: str) -> Optional[int]:
+    """Live PID recorded for a DevOrchestrator lifecycle process ``name``.
+
+    Only the DevOrchestrator-owned ``<name>.pid`` file is consulted; a stale
+    (dead) PID is not a conflict.
+    """
+    pid = _read_pid_file(_pid_file(runtime, name + ".pid"))
+    if pid is not None and is_pid_alive(pid):
+        return pid
+    return None
+
+
+def _fail_conflicting_process(conflict: str, pid: int, starter: str) -> "NoReturn":
+    _fail(
+        "{0} already running with PID {1}; {2} would start a second "
+        "DevOrchestrator process on this computer (one daemon per computer).".format(
+            conflict, pid, starter
+        )
+    )
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -436,12 +607,41 @@ def build_parser() -> argparse.ArgumentParser:
     stop_monitor = sub.add_parser("stop-monitor", help="stop the recorded monitor process")
     stop_monitor.add_argument("--runtime-root", default=None)
 
+    daemon = sub.add_parser(
+        "daemon",
+        help="run the unified daemon (monitor loop + read-only web server, one PID)",
+    )
+    daemon.add_argument("--listen", default="127.0.0.1")
+    daemon.add_argument("--port", type=int, default=8770)
+    daemon.add_argument("--interval", type=int, default=60, help="loop interval in seconds (5..3600)")
+    daemon.add_argument("--config", default=None)
+    daemon.add_argument("--runtime-root", default=None)
+    daemon.add_argument("--web-root", default=None)
+
+    start_daemon = sub.add_parser("start-daemon", help="start the unified daemon as a detached process")
+    start_daemon.add_argument("--listen", default="127.0.0.1")
+    start_daemon.add_argument("--port", type=int, default=8770)
+    start_daemon.add_argument("--interval", type=int, default=60)
+    start_daemon.add_argument("--config", default=None)
+    start_daemon.add_argument("--runtime-root", default=None)
+    start_daemon.add_argument("--web-root", default=None)
+
+    status_daemon = sub.add_parser("status-daemon", help="report unified daemon process status")
+    status_daemon.add_argument("--runtime-root", default=None)
+
+    stop_daemon = sub.add_parser("stop-daemon", help="stop the recorded unified daemon process")
+    stop_daemon.add_argument("--runtime-root", default=None)
+
     return parser
 
 
 _COMMANDS = {
     "monitor": cmd_monitor,
     "web": cmd_web,
+    "daemon": cmd_daemon,
+    "start-daemon": cmd_start_daemon,
+    "status-daemon": cmd_status_daemon,
+    "stop-daemon": cmd_stop_daemon,
     "start-web": cmd_start_web,
     "status-web": cmd_status_web,
     "stop-web": cmd_stop_web,

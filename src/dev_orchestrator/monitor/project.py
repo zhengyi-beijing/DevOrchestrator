@@ -1,8 +1,13 @@
-"""Observed-project monitor: read-only Git/Worker projections and tick logic.
+"""Observed-project monitor Core: read-only Git helpers and tick logic.
 
-The monitor only ever reads the observed repository (Git porcelain via
-argument-array subprocess calls and worker runtime ``status.json``). It never
-writes into the observed repository, starts agents, or advances phases.
+Core responsibilities live here: shared read-only Git helpers, monitor state
+policy, and the per-project monitor tick that selects a ``ProjectAdapter``
+from configuration and writes DevOrchestrator-owned runtime projections.
+Project-specific snapshot/Worker projection lives in the adapters package;
+``agent_files`` is the default adapter. The monitor only ever reads the
+observed repository (Git porcelain via argument-array subprocess calls and
+worker runtime ``status.json``). It never writes into the observed repository,
+starts agents, or advances phases.
 """
 
 from __future__ import annotations
@@ -16,13 +21,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dev_orchestrator.monitor.telemetry import (
-    extract_task_id,
     is_run_recorded,
     new_run_record,
     new_state_event,
-    worker_telemetry,
 )
-from dev_orchestrator.platform.process import is_pid_alive
 from dev_orchestrator.storage.json_store import (
     append_jsonl,
     parse_utc,
@@ -30,11 +32,6 @@ from dev_orchestrator.storage.json_store import (
     utc_now,
     write_json,
 )
-
-_NEXT_TITLE_RE = re.compile(r"^# ")
-_NEXT_STATUS_RE = re.compile(r"^Status:", re.IGNORECASE)
-_PHASE_HINT_RE = re.compile(r"^- P[0-9].*(?:DESIGN READY|NOT STARTED|BLOCKED|RUNNING)", re.IGNORECASE)
-_WORKER_COPY_FIELDS = ("pid", "started_at", "updated_at", "exit_code", "command", "model")
 
 _GIT_ENV = dict(os.environ)
 _GIT_ENV["GIT_OPTIONAL_LOCKS"] = "0"
@@ -98,82 +95,6 @@ def git_changed_activity_utc(root: Path) -> Optional[datetime]:
     return latest
 
 
-def _first_matching_line(text: str, pattern: re.Pattern) -> Optional[str]:
-    for line in text.splitlines():
-        if pattern.search(line):
-            return line
-    return None
-
-
-def _read_tolerant(path: Path) -> str:
-    """Read text with replacement decoding (PowerShell ``-Encoding UTF8`` parity)."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            return handle.read()
-    except OSError:
-        return ""
-
-
-def worker_info(root: Path, relative_runtime: str) -> dict[str, Any]:
-    """Read the worker projection from ``<root>/<runtime>/status.json``.
-
-    A missing status file means ``not_started``. The file is read-only; the
-    worker runtime directory is never created or modified here.
-    """
-    status_path = root / relative_runtime / "status.json"
-    if not status_path.is_file():
-        return {"state": "not_started", "kind": "none", "process_alive": False}
-    try:
-        status = json.loads(read_text_strict(status_path))
-    except (OSError, ValueError) as exc:
-        raise RuntimeError("invalid worker status.json: {0}".format(exc)) from exc
-    if not isinstance(status, dict):
-        raise RuntimeError("worker status.json must contain a JSON object")
-    command = status.get("command")
-    kind = "task" if command and re.search(r"headless next", str(command)) else "utility"
-    info: dict[str, Any] = {
-        "state": str(status.get("state") or ""),
-        "kind": kind,
-        "process_alive": is_pid_alive(status.get("pid")),
-    }
-    for name in _WORKER_COPY_FIELDS:
-        if name in status:
-            info[name] = status[name]
-    return info
-
-
-def _activity_candidates(root: Path, relative_runtime: str) -> list[Path]:
-    run_root = root / relative_runtime
-    candidates = [
-        run_root / "status.json",
-        run_root / "stdout.log",
-        run_root / "stderr.log",
-        root / "agent" / "CURRENT.md",
-        root / "agent" / "next.md",
-        root / "agent" / "result.md",
-    ]
-    return candidates
-
-
-def last_activity_utc(root: Path, relative_runtime: str) -> Optional[str]:
-    """Newest mtime across worker logs, agent files and changed Git files."""
-    latest: Optional[datetime] = None
-    for path in _activity_candidates(root, relative_runtime):
-        try:
-            if path.is_file():
-                mtime = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
-                if latest is None or mtime > latest:
-                    latest = mtime
-        except OSError:
-            continue
-    git_activity = git_changed_activity_utc(root)
-    if git_activity is not None and (latest is None or git_activity > latest):
-        latest = git_activity
-    if latest is None:
-        return None
-    return latest.astimezone().isoformat()
-
-
 def resolve_monitor_state(
     worker: dict, next_status: Optional[str], next_updated_at: Optional[str]
 ) -> str:
@@ -209,77 +130,32 @@ def resolve_monitor_state(
     return "IDLE"
 
 
-def project_snapshot(
-    project: dict, runs_path: Path, *, now: Optional[datetime] = None
+def _adapter_for_project(project: dict) -> Any:
+    """Select the configured ProjectAdapter; unknown ids fail closed."""
+    from dev_orchestrator.adapters import get_project_adapter
+
+    adapter_id = str(project.get("adapter") or "agent_files")
+    return get_project_adapter(adapter_id)
+
+
+def _monitor_error_snapshot(
+    project: dict, observed_at: datetime, exc: Exception
 ) -> dict[str, Any]:
-    """One read-only projection for a configured project."""
-    now = now or utc_now()
-    observed_at = now.isoformat()
-    project_id = str(project.get("id") or "")
-    project_name = project.get("name")
-    root_text = str(project.get("root") or "")
-    root = Path(os.path.abspath(root_text))
-
-    if not root.is_dir():
-        return {
-            "id": project_id,
-            "name": project_name,
-            "root": root_text,
-            "observed_at": observed_at,
-            "state": "UNAVAILABLE",
-        }
-
-    relative_runtime = str(project.get("worker_runtime") or "")
-    next_path = root / "agent" / "next.md"
-    current_path = root / "agent" / "CURRENT.md"
-
-    next_title: Optional[str] = None
-    next_status: Optional[str] = None
-    if next_path.is_file():
-        next_text = _read_tolerant(next_path)
-        title_line = _first_matching_line(next_text, _NEXT_TITLE_RE)
-        if title_line is not None:
-            next_title = title_line[2:].strip() or None
-        status_line = _first_matching_line(next_text, _NEXT_STATUS_RE)
-        if status_line is not None:
-            status_text = status_line[7:].strip()
-            next_status = status_text or None
-
-    next_updated_at: Optional[str] = None
-    try:
-        if next_path.is_file():
-            next_updated_at = datetime.fromtimestamp(next_path.stat().st_mtime).astimezone().isoformat()
-    except OSError:
-        next_updated_at = None
-
-    phase_hint: Optional[str] = None
-    if current_path.is_file():
-        current_text = _read_tolerant(current_path)
-        hint_line = _first_matching_line(current_text, _PHASE_HINT_RE)
-        if hint_line is not None:
-            phase_hint = hint_line.strip()
-
-    worker = worker_info(root, relative_runtime)
-    state = resolve_monitor_state(worker, next_status, next_updated_at)
-    last_activity = last_activity_utc(root, relative_runtime)
-    task_id = extract_task_id(next_title)
-    telemetry = worker_telemetry(
-        project, worker, task_id, last_activity, runs_path, now=now
-    )
+    """Fail-closed snapshot envelope when a project cannot be projected."""
+    project_id = str(project.get("project_id") or "")
+    repo_path = str(project.get("repo_path") or "")
     return {
         "id": project_id,
-        "name": project_name,
-        "root": root_text,
-        "observed_at": observed_at,
-        "state": state,
-        "git": git_info(root),
-        "worker": worker,
-        "telemetry": telemetry,
-        "last_activity_at": last_activity,
-        "next_title": next_title,
-        "next_status": next_status,
-        "next_updated_at": next_updated_at,
-        "phase_hint": phase_hint,
+        "project_id": project_id,
+        "name": project.get("name"),
+        "root": repo_path,
+        "repo_path": repo_path,
+        "adapter": project.get("adapter"),
+        "conversation_binding": project.get("conversation_binding"),
+        "orchestration_ready": bool(project.get("orchestration_ready")),
+        "observed_at": observed_at.isoformat(),
+        "state": "MONITOR_ERROR",
+        "error": str(exc),
     }
 
 
@@ -305,7 +181,7 @@ def run_monitor_once(
 
     snapshots: list[dict[str, Any]] = []
     for project in config.get("projects") or []:
-        project_id = str(project.get("id") or "")
+        project_id = str(project.get("project_id") or "")
         snapshot_path = projects_dir / (project_id + ".json")
         previous: Optional[dict] = None
         if snapshot_path.is_file():
@@ -316,16 +192,10 @@ def run_monitor_once(
             except (OSError, ValueError):
                 previous = None
         try:
-            snapshot = project_snapshot(project, runs_path, now=tick_now)
+            adapter = _adapter_for_project(project)
+            snapshot = adapter.snapshot(project, runs_path, now=tick_now)
         except Exception as exc:  # noqa: BLE001 - match PS MONITOR_ERROR catch-all
-            snapshot = {
-                "id": project_id,
-                "name": project.get("name"),
-                "root": str(project.get("root") or ""),
-                "observed_at": tick_now.isoformat(),
-                "state": "MONITOR_ERROR",
-                "error": str(exc),
-            }
+            snapshot = _monitor_error_snapshot(project, tick_now, exc)
         event = new_state_event(previous, snapshot)
         if event is not None:
             append_jsonl(events_path, event)

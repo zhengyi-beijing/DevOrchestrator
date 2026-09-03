@@ -1,14 +1,18 @@
-# Result — Unified Agent Backend + Router foundation
+# RESULT — Multi-project daemon + Web Sol Core contract
 
-Status: **ACCEPTED**
+Verdict: **ACCEPTED**
 
-Independent Reviewer evidence:
-- `tests_py`: 19/19 PASS, including both Reviewer regressions.
-- Router contains backend `probe()` exceptions and continues deterministic fail-closed routing.
-- `DshBackend` settles naturally-ended runs exactly once; later `cancel()` preserves COMPLETED/FAILED and log handles close.
-- PowerShell telemetry: 10/10 PASS; PowerShell Web self-test: PASS.
-- Real `DshBackend().probe()`: available=True, quota=UNKNOWN, model `0.1.1-rc.2`; probe uses `--version` only.
-- Real LabDemo monitor one-shot: HEAD/status/file timestamps unchanged.
-- `git diff --check`: exit 0; no PHASE_AUTO/other-provider scope hits.
+Fresh Reviewer evidence:
+- Reviewer regressions: 3/3 PASS.
+- Full Python suite: 32/32 PASS.
+- PowerShell telemetry: 10/10 PASS.
+- PowerShell Web self-test: PASS.
+- Unified two-project daemon: PASS; daemon/monitor/web heartbeat PID identical.
+- Real LabDemo monitor: exit 0; HEAD/status/non-.git file timestamps unchanged.
+- `git diff --check`: exit 0 (line-ending warnings only).
+- No project-name special cases in Core source; no stray DevOrchestrator service processes after tests.
 
-No next-stage Worker was started by this Reviewer cycle.
+Reviewer-confirmed remediation:
+1. blank/missing repo path rejected;
+2. unified daemon vs legacy start-monitor/start-web lifecycle is mutually exclusive;
+3. Web Sol request/response identity fields are nonblank and task/stage identity is nonblank fail-closed.
