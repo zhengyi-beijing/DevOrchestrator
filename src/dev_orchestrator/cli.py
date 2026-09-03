@@ -7,9 +7,9 @@ Implements the accepted CLI contract:
 - ``monitor --interval N`` — heartbeat loop writing ``monitor.pid``.
 - ``web --listen IP --port N`` — long-running read-only dashboard.
 - ``start-daemon/status-daemon/stop-daemon`` — one-process daemon lifecycle:
-  the daemon runs the monitor loop and the read-only Web server in the same
-  PID and reports that PID in ``daemon.json``, ``monitor.json`` and
-  ``web.json``.
+  the daemon runs the monitor loop, the read-only Web server and the Browser
+  Bridge in the same PID and reports that PID in ``daemon.json``,
+  ``monitor.json``, ``web.json`` and ``bridge.json``.
 - ``start-monitor|status-monitor|stop-monitor`` and
   ``start-web|status-web|stop-web`` — legacy P2 lifecycle commands operating
   only on DevOrchestrator-owned PID/heartbeat files (compatibility paths).
@@ -382,6 +382,8 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         _fail("interval must be between {0} and {1} seconds".format(_INTERVAL_MIN, _INTERVAL_MAX))
     if not (_PORT_MIN <= args.port <= _PORT_MAX):
         _fail("port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
+    if not (_PORT_MIN <= args.bridge_port <= _PORT_MAX):
+        _fail("bridge port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
     config = resolve_config_path(args.config)
     runtime = resolve_runtime_root(args.runtime_root)
     web_root = resolve_web_root(args.web_root)
@@ -393,6 +395,8 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             args.interval,
             args.listen,
             args.port,
+            args.bridge_listen,
+            args.bridge_port,
         )
     except KeyboardInterrupt:
         return 0
@@ -403,6 +407,8 @@ def cmd_start_daemon(args: argparse.Namespace) -> int:
         _fail("interval must be between {0} and {1} seconds".format(_INTERVAL_MIN, _INTERVAL_MAX))
     if not (_PORT_MIN <= args.port <= _PORT_MAX):
         _fail("port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
+    if not (_PORT_MIN <= args.bridge_port <= _PORT_MAX):
+        _fail("bridge port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
     runtime = resolve_runtime_root(args.runtime_root)
     runtime.mkdir(parents=True, exist_ok=True)
     pid_path = runtime / "daemon.pid"
@@ -432,6 +438,10 @@ def cmd_start_daemon(args: argparse.Namespace) -> int:
             args.listen,
             "--port",
             str(args.port),
+            "--bridge-listen",
+            args.bridge_listen,
+            "--bridge-port",
+            str(args.bridge_port),
             "--interval",
             str(args.interval),
         ]
@@ -609,10 +619,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     daemon = sub.add_parser(
         "daemon",
-        help="run the unified daemon (monitor loop + read-only web server, one PID)",
+        help="run the unified daemon (monitor loop + read-only web + bridge, one PID)",
     )
     daemon.add_argument("--listen", default="127.0.0.1")
     daemon.add_argument("--port", type=int, default=8770)
+    daemon.add_argument("--bridge-listen", default="127.0.0.1")
+    daemon.add_argument("--bridge-port", type=int, default=8765)
     daemon.add_argument("--interval", type=int, default=60, help="loop interval in seconds (5..3600)")
     daemon.add_argument("--config", default=None)
     daemon.add_argument("--runtime-root", default=None)
@@ -621,6 +633,8 @@ def build_parser() -> argparse.ArgumentParser:
     start_daemon = sub.add_parser("start-daemon", help="start the unified daemon as a detached process")
     start_daemon.add_argument("--listen", default="127.0.0.1")
     start_daemon.add_argument("--port", type=int, default=8770)
+    start_daemon.add_argument("--bridge-listen", default="127.0.0.1")
+    start_daemon.add_argument("--bridge-port", type=int, default=8765)
     start_daemon.add_argument("--interval", type=int, default=60)
     start_daemon.add_argument("--config", default=None)
     start_daemon.add_argument("--runtime-root", default=None)

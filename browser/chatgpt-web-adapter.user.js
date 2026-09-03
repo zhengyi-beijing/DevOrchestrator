@@ -1,0 +1,381 @@
+// ==UserScript==
+// @name         DevOrchestrator ChatGPT Web binding adapter
+// @namespace    devorchestrator
+// @version      0.1.0
+// @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge. Derives the binding id from the current /c/<conversation-id> URL, claims only that binding, submits the rendered prompt, waits for the matching response marker, and posts the raw assistant text back.
+// @author       DevOrchestrator
+// @match        https://chatgpt.com/*
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// @run-at       document-idle
+// ==/UserScript==
+//
+// Transport only. This script performs DOM adaptation and transport
+// acknowledgement: it never decides what happens next in a project workflow,
+// never starts Workers, and never interprets repository or Worker state.
+// The binding id is always derived from the live ChatGPT conversation URL, so
+// no project/conversation key is hard-coded here and each tab (conversation)
+// claims only its own project queue.
+
+(function (root) {
+  "use strict";
+
+  var BRIDGE_BASE = "http://127.0.0.1:8765";
+  var ADAPTER_ID = "chatgpt_web";
+  var CONVERSATION_PATH_RE = /\/c\/([A-Za-z0-9_-]+)/;
+  var REQUEST_HEAD = "[DEVORCH_WEB_SOL_REQUEST ";
+  var RESPONSE_HEAD = "[DEVORCH_WEB_SOL_RESPONSE ";
+  var CLAIM_PATH = "/v1/claim";
+  var RENEW_PATH = "/v1/renew";
+  var RESPONSE_PATH = "/v1/response";
+  var POLL_MS = 1500;
+  var RENEW_INTERVAL_MS = 20000;
+  var WAIT_DEADLINE_MS = 15 * 60 * 1000;
+  var RETRY_MS = 2500;
+
+  // Renewal-failure policy verdicts (transport authority only):
+  //   continue - 200, lease extended, keep waiting;
+  //   retry    - transient network/5xx, may retry inside the lease window;
+  //   abandon  - authoritative rejection (e.g. 409) or no safe window left.
+  var RENEW_CONTINUE = "continue";
+  var RENEW_RETRY = "retry";
+  var RENEW_ABANDON = "abandon";
+  var RENEW_RETRY_MS = 5000;
+
+  // ------------------------------------------------------------------
+  // pure helpers (also exercised by the automated Node test harness)
+  // ------------------------------------------------------------------
+
+  function conversationIdFromUrl(rawUrl) {
+    if (typeof rawUrl !== "string" || rawUrl.length === 0) {
+      return "";
+    }
+    var match = CONVERSATION_PATH_RE.exec(rawUrl);
+    return match ? match[1] : "";
+  }
+
+  function currentBindingId() {
+    if (typeof window === "undefined" || !window.location) {
+      return "";
+    }
+    return conversationIdFromUrl(String(window.location.href));
+  }
+
+  function responseMatches(text, requestId) {
+    if (typeof text !== "string" || typeof requestId !== "string") {
+      return false;
+    }
+    return text.indexOf(RESPONSE_HEAD + requestId + "]") !== -1;
+  }
+
+  // Pure classifier for one /v1/renew HTTP result. It reasons only about
+  // transport authority - it never parses or applies any workflow content.
+  function classifyRenewResult(result) {
+    if (!result || typeof result !== "object" || typeof result.status !== "number") {
+      return RENEW_ABANDON;
+    }
+    if (result.status === 200) {
+      return RENEW_CONTINUE;
+    }
+    if (result.status === 0 || (result.status >= 500 && result.status <= 599)) {
+      return RENEW_RETRY;
+    }
+    return RENEW_ABANDON;
+  }
+
+  // Reads the lease_expires_at transport metadata (UTC ISO-8601) from a claim
+  // or renew envelope into an epoch-millisecond timestamp; 0 when absent.
+  function leaseExpiryMs(metadata) {
+    if (metadata && typeof metadata.lease_expires_at === "string") {
+      var parsed = Date.parse(metadata.lease_expires_at);
+      if (!isNaN(parsed)) {
+        return parsed;
+      }
+    }
+    return 0;
+  }
+
+  var adapterApi = {
+    conversationIdFromUrl: conversationIdFromUrl,
+    currentBindingId: currentBindingId,
+    responseMatches: responseMatches,
+    classifyRenewResult: classifyRenewResult
+  };
+
+  // Exposed for the automated adapter test (Node `require`); harmless in a
+  // real browser content-script context.
+  root.__DEVORCH_CHATGPT_ADAPTER_TEST__ = adapterApi;
+
+  // ------------------------------------------------------------------
+  // bridge transport calls (GM_xmlhttpRequest first, fetch fallback)
+  // ------------------------------------------------------------------
+
+  function bridgePost(path, payload) {
+    var url = BRIDGE_BASE + path;
+    var body = JSON.stringify(payload);
+    return new Promise(function (resolve) {
+      var settled = false;
+      function finish(status, text) {
+        if (settled) { return; }
+        settled = true;
+        resolve({ status: status, text: text });
+      }
+      if (typeof GM_xmlhttpRequest === "function") {
+        GM_xmlhttpRequest({
+          method: "POST",
+          url: url,
+          data: body,
+          headers: { "Content-Type": "application/json" },
+          timeout: 8000,
+          onload: function (response) { finish(response.status, response.responseText); },
+          onerror: function () { finish(0, ""); },
+          ontimeout: function () { finish(0, ""); }
+        });
+        return;
+      }
+      if (typeof fetch === "function") {
+        fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: body
+        }).then(function (response) {
+          response.text().then(function (text) { finish(response.status, text); });
+        }).catch(function () { finish(0, ""); });
+        return;
+      }
+      finish(0, "");
+    });
+  }
+
+  function claimOnce(bindingId) {
+    return bridgePost(CLAIM_PATH, { adapter: ADAPTER_ID, binding_id: bindingId }).then(function (result) {
+      if (result.status === 204) {
+        return null;
+      }
+      if (result.status !== 200 || !result.text) {
+        return null;
+      }
+      try {
+        var claim = JSON.parse(result.text);
+        return claim && claim.request_id ? claim : null;
+      } catch (err) {
+        return null;
+      }
+    });
+  }
+
+  function respond(bindingId, claim, responseText) {
+    return bridgePost(RESPONSE_PATH, {
+      adapter: ADAPTER_ID,
+      binding_id: bindingId,
+      request_id: claim.request_id,
+      nonce: claim.nonce,
+      claim_token: claim.claim_token,
+      response_text: responseText
+    });
+  }
+
+  // Renews the exact active claim while ChatGPT is still answering. Purely
+  // transport: posts back the claim identity so the server can extend the
+  // lease; never inspects or decides any workflow content. The caller must
+  // inspect the returned HTTP result (see classifyRenewResult) so a failed
+  // renewal can never silently lose claim authority.
+  function renewClaim(bindingId, claim) {
+    return bridgePost(RENEW_PATH, {
+      adapter: ADAPTER_ID,
+      binding_id: bindingId,
+      request_id: claim.request_id,
+      nonce: claim.nonce,
+      claim_token: claim.claim_token
+    });
+  }
+
+  function parsedJsonText(result) {
+    if (!result || typeof result.text !== "string") {
+      return null;
+    }
+    try {
+      var body = JSON.parse(result.text);
+      return body && typeof body === "object" ? body : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // ChatGPT DOM adaptation (best effort; live DOM acceptance is a
+  // separate deployment gate - automated tests never touch this path)
+  // ------------------------------------------------------------------
+
+  function setComposerText(composer, text) {
+    composer.focus();
+    try {
+      if (document.execCommand("insertText", false, text)) {
+        return true;
+      }
+    } catch (err) {
+      // fall through to direct insertion
+    }
+    composer.textContent = text;
+    if (typeof InputEvent === "function") {
+      composer.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: text
+      }));
+    }
+    return true;
+  }
+
+  function clickSendButton() {
+    var send = document.querySelector("button[data-testid='send-button']");
+    if (send && !send.disabled) {
+      send.click();
+      return true;
+    }
+    return false;
+  }
+
+  function insertAndSubmit(text) {
+    if (typeof document === "undefined") {
+      return false;
+    }
+    var composer = document.querySelector("#prompt-textarea");
+    if (!composer) {
+      return false;
+    }
+    setComposerText(composer, text);
+    return clickSendButton();
+  }
+
+  function findResponseText(requestId) {
+    if (typeof document === "undefined") {
+      return "";
+    }
+    var messages = document.querySelectorAll("[data-message-author-role='assistant']");
+    for (var i = messages.length - 1; i >= 0; i--) {
+      var messageText = messages[i].innerText || "";
+      if (responseMatches(messageText, requestId)) {
+        return messageText;
+      }
+    }
+    return "";
+  }
+
+  function schedule(fn, delayMs) {
+    setTimeout(fn, delayMs);
+  }
+
+  // ------------------------------------------------------------------
+  // adapter loop: claim -> submit prompt -> await marker -> post back
+  // ------------------------------------------------------------------
+
+  function makeRenewalState(claim) {
+    return {
+      nextRenewAt: Date.now() + RENEW_INTERVAL_MS,
+      leaseExpiresMs: leaseExpiryMs(claim)
+    };
+  }
+
+  function runAdapter() {
+    if (typeof window === "undefined" || !window.document) {
+      return;
+    }
+    var bindingId = currentBindingId();
+    if (!bindingId) {
+      // Tab without a stable conversation id stays idle.
+      schedule(runAdapter, RETRY_MS);
+      return;
+    }
+
+    claimOnce(bindingId).then(function (claim) {
+      if (!claim) {
+        schedule(runAdapter, RETRY_MS);
+        return;
+      }
+      if (!insertAndSubmit(claim.prompt)) {
+        // Composer not ready; do not double-submit this request.
+        schedule(runAdapter, RETRY_MS);
+        return;
+      }
+      waitForResponse(bindingId, claim, Date.now() + WAIT_DEADLINE_MS, makeRenewalState(claim));
+    });
+  }
+
+  function waitForResponse(bindingId, claim, deadline, renewal) {
+    var responseText = findResponseText(claim.request_id);
+    if (responseText) {
+      // Response found: stop polling/renewing and acknowledge the raw text.
+      respond(bindingId, claim, responseText).then(function () {
+        schedule(runAdapter, RETRY_MS);
+      });
+      return;
+    }
+    if (Date.now() >= deadline) {
+      // Wait timed out: stop renewing; the lease will expire server-side and
+      // the request may be reclaimed later.
+      schedule(runAdapter, RETRY_MS);
+      return;
+    }
+    if (renewal.leaseExpiresMs > 0 && Date.now() >= renewal.leaseExpiresMs) {
+      // The current lease safety window is over: do not keep waiting as if
+      // the claim were still authoritative; abandon the stale claim now.
+      abandonClaim(bindingId, claim);
+      return;
+    }
+    if (Date.now() < renewal.nextRenewAt) {
+      // Not yet time to renew; keep watching for the response marker.
+      setTimeout(function () {
+        waitForResponse(bindingId, claim, deadline, renewal);
+      }, POLL_MS);
+      return;
+    }
+    // Time to renew: inspect the HTTP result instead of firing and forgetting,
+    // so a failed renewal can never silently lose the claim authority.
+    renewClaim(bindingId, claim).then(function (result) {
+      handleRenewOutcome(bindingId, claim, deadline, renewal, result);
+    });
+  }
+
+  function handleRenewOutcome(bindingId, claim, deadline, renewal, result) {
+    var verdict = classifyRenewResult(result);
+    if (verdict === RENEW_CONTINUE) {
+      // 200: the lease was extended. Refresh the lease metadata from the
+      // renew envelope when present and keep waiting for the marker.
+      var body = parsedJsonText(result);
+      var renewedLease = leaseExpiryMs(body);
+      if (renewedLease > 0) {
+        renewal.leaseExpiresMs = renewedLease;
+      }
+      renewal.nextRenewAt = Date.now() + RENEW_INTERVAL_MS;
+      waitForResponse(bindingId, claim, deadline, renewal);
+      return;
+    }
+    if (verdict === RENEW_RETRY) {
+      // Transient network/5xx failure: retry is allowed only inside the
+      // current lease safety window; past expiry the claim authority is gone.
+      if (Date.now() < renewal.leaseExpiresMs) {
+        renewal.nextRenewAt = Date.now() + RENEW_RETRY_MS;
+        waitForResponse(bindingId, claim, deadline, renewal);
+        return;
+      }
+      abandonClaim(bindingId, claim);
+      return;
+    }
+    // Authoritative rejection (e.g. HTTP 409 Conflict) or an unreadable
+    // result: the stale claim must be abandoned immediately.
+    abandonClaim(bindingId, claim);
+  }
+
+  // Explicit abandon path. The claim is stale/expired at the transport level,
+  // so the adapter stops waiting and renewing for it and returns to the idle
+  // claim loop. No response is posted for a stale claim; server-side lease
+  // expiry lets the request be reclaimed by another adapter.
+  function abandonClaim(bindingId, claim) {
+    schedule(runAdapter, RETRY_MS);
+  }
+
+  if (typeof document !== "undefined" && !root.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__) {
+    schedule(runAdapter, 1000);
+  }
+})(typeof globalThis !== "undefined" ? globalThis : this);

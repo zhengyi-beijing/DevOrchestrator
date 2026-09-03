@@ -18,6 +18,9 @@ Rules enforced here:
   is accepted); missing/blank paths are rejected with explicit repo-path
   evidence.
 - Duplicate canonical project ids are rejected explicitly.
+- Among orchestration-ready projects, ``(transport, adapter, binding_id)``
+  conversation bindings must be unique; a duplicate is a configuration error
+  because it could cross-route two project workflows into one conversation.
 - ``adapter`` defaults to ``agent_files`` when omitted.
 - A structurally valid ``conversation_binding`` exposes ``orchestration_ready``;
   a missing or malformed binding stays monitorable but is NOT
@@ -140,6 +143,41 @@ def load_projects_config(path: Path | str) -> dict[str, Any]:
         seen_ids[project_id] = index
         normalized_projects.append(normalized)
 
+    _reject_duplicate_conversation_bindings(normalized_projects, config_path)
+
     data = dict(data)
     data["projects"] = normalized_projects
     return data
+
+
+def _reject_duplicate_conversation_bindings(
+    projects: list[dict[str, Any]], config_path: Path
+) -> None:
+    """Reject orchestration-ready projects sharing one binding triple.
+
+    Only structurally ready bindings participate; monitor-only legacy projects
+    (missing/malformed binding) are untouched. A duplicate
+    ``(transport, adapter, binding_id)`` is a configuration error because it
+    could cross-route two project workflows into one conversation.
+    """
+    seen_bindings: dict[tuple, tuple] = {}
+    for index, project in enumerate(projects):
+        if not bool(project.get("orchestration_ready")):
+            continue
+        binding = project.get("conversation_binding")
+        if not isinstance(binding, dict):
+            continue
+        key = (
+            binding.get("transport"),
+            binding.get("adapter"),
+            binding.get("binding_id"),
+        )
+        if key in seen_bindings:
+            first_index, first_id = seen_bindings[key]
+            raise ValueError(
+                "duplicate conversation binding ({0}, {1}, {2}) in config {3} "
+                "(projects {4!r} and {5!r})".format(
+                    key[0], key[1], key[2], config_path, first_id, project["project_id"]
+                )
+            )
+        seen_bindings[key] = (index, project["project_id"])

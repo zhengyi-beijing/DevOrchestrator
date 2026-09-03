@@ -1,15 +1,13 @@
 # CURRENT — DevOrchestrator
 
-Branch: `feature/multiproject-websol-contract`
-Baseline: `64950cb` (accepted AgentBackend + Router foundation)
+Branch: `feature/browser-bridge-multiproject`
+Baseline: `586c49b` (accepted multi-project/Web Sol Core)
 
-Phase: **Multi-project daemon + Web Sol Core contract**
-Status: **ACCEPTED — fresh Reviewer verified**
+Phase: **Browser Bridge transport + ChatGPT Web multi-project binding**
+Status: **WIP — OWNER STOPPED DURING LEASE REMEDIATION**
 
-Accepted architecture:
-- one preferred DevOrchestrator daemon manages N configured projects;
-- each project has canonical `project_id`, nonblank `repo_path`, worker/task projection, adapter, and optional conversation binding;
-- missing/malformed conversation binding is monitor-only (`orchestration_ready=false`);
-- ProjectAdapter is config-selected; Core has no LabDemo/xray special cases;
-- Web Sol protocol/decision guard is fail-closed and does not execute Workers;
-- unified daemon owns monitor + Web heartbeat under one PID.
+Owner explicitly stopped execution before the remediation Worker completed. Worker PID 4784 and dsh/node child PID 17952 were terminated. No further implementation or tests are authorized in this handoff.
+
+The latest fresh Reviewer had CHANGES REQUESTED for two lease-authority defects: expired claims could still submit responses, and the Userscript did not fail closed when `/v1/renew` failed. A bounded remediation had started and modified bridge/store.py, bridge/server.py, and browser/chatgpt-web-adapter.user.js, but these interrupted changes have NOT received fresh Reviewer acceptance.
+
+No PHASE_AUTO, automatic event dispatcher, Worker execution, project-specific code, or hardware action is accepted or authorized.
