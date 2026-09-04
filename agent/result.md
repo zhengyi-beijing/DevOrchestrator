@@ -1,13 +1,29 @@
 # RESULT — Browser Bridge lease remediation
 
-Verdict: **WIP / OWNER STOPPED**
+Verdict: **ACCEPTED**
 
-The owner explicitly stopped execution before the bounded lease-authority remediation Worker completed. Worker PID 4784 and child node PID 17952 were terminated.
+The 2026-09-03 interrupted lease-authority remediation has been resumed and verified.
 
-Accepted baseline remains `586c49b` (multi-project/Web Sol Core). The current branch contains unaccepted WIP for Browser Bridge transport + ChatGPT Web multi-project binding.
+Blocking defects fixed:
+1. `BrowserBridgeStore.respond()` rejects expired claims even when state/token/nonce still match.
+2. Claim/renew expose `lease_expires_at`; the ChatGPT Web adapter inspects renew results and fails closed: 200 continues, status 0/5xx retries only inside the current lease window, authoritative rejection such as 409 abandons immediately.
 
-Latest independent Reviewer status before the stop: **CHANGES REQUESTED**. Open defects were expired-claim response authority and fail-closed Userscript renew handling. The interrupted remediation modified the relevant bridge/Userscript files, but no fresh Reviewer was run after those edits.
+Acceptance evidence on XLabServer:
+- frozen fresh Reviewer regressions 2/2 PASS;
+- original Reviewer regressions 4/4 PASS;
+- ChatGPT adapter tests 3/3 PASS;
+- full `tests_py` 52/52 PASS;
+- telemetry selftest 10/10 PASS;
+- Web selftest PASS;
+- unified same-PID bridge daemon test PASS;
+- real LabDemo monitor read-only evidence PASS;
+- `node --check` PASS;
+- `git diff --check` PASS.
 
-Do not treat this branch as accepted. Resume by reviewing the interrupted lease remediation first; do not start PHASE_AUTO or automatic event dispatch before this slice is accepted.
+Independent fresh Reviewer found no blocking defect in the remediation content. Its sandbox could not execute the full runtime gates, but those gates were executed separately on the real XLabServer and passed.
 
-Remote status: `origin` now points to `https://github.com/zhengyi-beijing/DevOrchestrator.git`. Push has not completed because XLabServer currently cannot connect to `github.com:443`; this is a network deployment blocker, not a confirmed GitHub permission failure.
+Non-blocking follow-ups: strengthen Userscript renew-policy behavioral tests; assert `lease_expires_at` in HTTP tests; live DOM duplicate-message handling remains a separate deployment gate; long-term response retention may need pruning.
+
+GitHub push/authentication is now operational via the ts-pc-zy HTTPS CONNECT proxy; the current branch is present on origin.
+
+Next phase is bounded to `WORKER_DONE → Event Dispatcher → WebSolRequest → Bridge`. No response application or PHASE_AUTO is accepted yet.

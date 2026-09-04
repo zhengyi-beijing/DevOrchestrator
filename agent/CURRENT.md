@@ -1,17 +1,29 @@
 # CURRENT — DevOrchestrator
 
 Branch: `feature/browser-bridge-multiproject`
-Baseline: `586c49b` (accepted multi-project/Web Sol Core)
+Accepted baseline before this slice: `586c49b` (multi-project/Web Sol Core)
 
 Phase: **Browser Bridge transport + ChatGPT Web multi-project binding**
-Status: **WIP — OWNER STOPPED DURING LEASE REMEDIATION**
+Status: **ACCEPTED**
 
-Owner explicitly stopped execution before the remediation Worker completed. Worker PID 4784 and dsh/node child PID 17952 were terminated. No further implementation or tests are authorized in this handoff.
+Accepted code checkpoint: `2fef5edfaab6542c5b1762ab5c7fbc9a9fc1e7bb` plus handoff/docs commit `4d2ce9077a7e2605d18e9c6cb01f52d3cc34b9f9`.
+The interrupted lease-authority remediation was resumed and independently reviewed on 2026-09-04.
 
-The latest fresh Reviewer had CHANGES REQUESTED for two lease-authority defects: expired claims could still submit responses, and the Userscript did not fail closed when `/v1/renew` failed. A bounded remediation had started and modified bridge/store.py, bridge/server.py, and browser/chatgpt-web-adapter.user.js, but these interrupted changes have NOT received fresh Reviewer acceptance.
+Verified acceptance evidence:
+- fresh lease regressions: 2/2 PASS;
+- prior Reviewer regressions: 4/4 PASS;
+- adapter tests: 3/3 PASS; `node --check` PASS;
+- full Python suite: 52/52 PASS;
+- PowerShell telemetry selftest: 10/10 PASS;
+- PowerShell Web selftest: PASS;
+- same-PID daemon/monitor/web/bridge test: PASS in full suite;
+- real LabDemo monitor read-only: HEAD/status unchanged before/after;
+- `git diff --check`: PASS.
 
-No PHASE_AUTO, automatic event dispatcher, Worker execution, project-specific code, or hardware action is accepted or authorized.
+Fresh Reviewer found no blocking lease-authority defect. Non-blocking watch items remain test-strength/live-DOM/retention concerns; they do not block this accepted transport slice.
 
-Repository checkpoint: local WIP commit `2fef5edfaab6542c5b1762ab5c7fbc9a9fc1e7bb` exists and the working tree was clean after that checkpoint.
-GitHub remote repository `zhengyi-beijing/DevOrchestrator` has been created and local `origin` is configured to `https://github.com/zhengyi-beijing/DevOrchestrator.git`.
-Push is NOT complete: XLabServer cannot currently reach `github.com:443` (connection reset / TCP connect failure), so GitHub authentication on this host has not yet been verified.
+GitHub remote is operational through the ts-pc-zy Git HTTPS proxy. Branch is pushed and tracks `origin/feature/browser-bridge-multiproject`.
+
+Next bounded phase: **Event Dispatcher → WebSolRequest → Bridge**, first slice only: `WORKER_DONE` automatically submits a REVIEWER request to the project’s configured `conversation_binding`.
+
+No PHASE_AUTO, no automatic Worker execution, no response decision application, no hardware action, and no LabDemo feature advancement are authorized by this handoff.
