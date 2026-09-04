@@ -26,6 +26,7 @@ from typing import Any, Optional
 from dev_orchestrator.bridge.server import make_bridge_server
 from dev_orchestrator.bridge.store import BrowserBridgeStore
 from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
+from dev_orchestrator.core.response_consumer import consume_websol_responses
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.storage.json_store import utc_now_iso, write_json, write_text
 from dev_orchestrator.web.server import make_server
@@ -80,9 +81,11 @@ def run_daemon(
     Browser Bridge each run on their own daemon thread, so one PID owns all
     three surfaces. After each successful monitor tick the daemon dispatches
     ``WORKER_DONE`` requests (Event Dispatcher -> WebSolRequest -> Bridge) into
-    each orchestration-ready project's exact binding queue. Stops are handled
-    by the recorded ``daemon.pid`` only (``stop-daemon``); nothing here starts
-    Workers or advances tasks.
+    each orchestration-ready project's exact binding queue, then consumes any
+    newly ``RESPONDED`` Bridge response through the Decision Guard into a
+    persisted disposition only. Stops are handled by the recorded
+    ``daemon.pid`` only (``stop-daemon``); nothing here starts Workers or
+    advances tasks.
     """
     runtime = Path(runtime_root)
     runtime.mkdir(parents=True, exist_ok=True)
@@ -138,6 +141,14 @@ def run_daemon(
                     # First bounded event slice: WORKER_DONE -> WebSolRequest ->
                     # the project's exact Bridge queue. Transport only.
                     dispatch_worker_done_events(summary, bridge_store, runtime)
+                except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
+                    last_error = str(exc)
+            if last_error is None:
+                try:
+                    # Response Consumer + Decision Guard: turn each newly
+                    # RESPONDED Bridge response into one persisted
+                    # disposition/intention. Never executes a next_action.
+                    consume_websol_responses(summary, bridge_store, runtime)
                 except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
                     last_error = str(exc)
             state = "degraded" if last_error else "running"

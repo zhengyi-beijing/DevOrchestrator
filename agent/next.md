@@ -1,26 +1,17 @@
-# NEXT — Response Consumer + Decision Guard
+# NEXT — STOP (awaiting owner direction)
 
-Status: **AUTHORIZED — design + TDD + implementation**
+Status: **NOT AUTHORIZED — no further slice is queued in this session**
 
-Goal: consume the raw Browser Bridge response and produce a validated Web Sol disposition without executing any Worker action.
+Response Consumer + Decision Guard is **ACCEPTED**: Bridge responses are now
+consumed into validated, persisted dispositions without executing any Worker
+action.
 
-Bounded chain:
-`Bridge response → parse exact DEVORCH_WEB_SOL_RESPONSE marker/JSON → construct WebSolResponse → validate echoed identity → fresh repository truth → Decision Guard → disposition`.
+Remaining layers stay NOT IMPLEMENTED / NOT AUTHORIZED until the owner
+queues them:
+- executing any disposition (start/restart Worker, Agent Router, applying
+  NEXT/REMEDIATE/RETRY);
+- PHASE_AUTO;
+- live ChatGPT Web deployment/POC gate;
+- dashboard surfacing of `websol-decisions.json` and retention/pruning.
 
-Required behavior:
-1. Match the exact request marker/request_id and parse one JSON object only.
-2. Require exact echo of project_id/request_id/task_id/stage_id/branch/head/role/event/nonce.
-3. Re-read fresh repository branch/HEAD/dirty state before accepting a decision.
-4. Apply the existing decision/next_action compatibility rules fail-closed.
-5. Return only a disposition/intention such as APPLY/IGNORE/STALE/STOP/REVIEW_REQUIRED/OWNER_GATE.
-6. Preserve project/binding isolation and deterministic request identity.
-7. Add fixture-only tests for valid, malformed, stale, dirty, mismatched, and owner-gated responses.
-
-Strict non-goals:
-- do not start/restart a Worker;
-- do not invoke Agent Router;
-- do not auto-execute NEXT/REMEDIATE/RETRY;
-- do not implement PHASE_AUTO;
-- do not touch LabDemo or hardware.
-
-Carry-over hardening from live POC may be addressed only if it stays bounded and does not expand into actuation.
+Stop for owner direction.

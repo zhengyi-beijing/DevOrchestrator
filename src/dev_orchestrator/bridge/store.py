@@ -513,6 +513,26 @@ class BrowserBridgeStore:
                 state=STATE_CLAIMED,
             )
 
+    def list_responded(self, adapter: str, binding_id: str) -> list[dict[str, Any]]:
+        """Return immutable copies of RESPONDED records for the exact binding.
+
+        Transport-observation helper used by the Response Consumer: Core reads
+        what an adapter delivered without ever mutating queue state here.
+        Records are returned in deterministic ``request_id`` order so repeated
+        consumers see one stable view.
+        """
+        _require_route(adapter, binding_id)
+        with self._lock:
+            queue = self._load_queue(adapter, binding_id)
+            records: list[dict[str, Any]] = []
+            for request_id in sorted(queue):
+                record = queue[request_id]
+                if not isinstance(record, dict):
+                    continue
+                if record.get("state") == STATE_RESPONDED:
+                    records.append(dict(record))
+            return records
+
     def get_response(self, request_id: str, nonce: str) -> Optional[StoredResponse]:
         """Return the stored response matching ``request_id``/``nonce``.
 

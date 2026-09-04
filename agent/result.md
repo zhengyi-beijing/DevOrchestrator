@@ -1,25 +1,51 @@
-# RESULT — ChatGPT Web duplicate/reclaim remediation
+# RESULT — Response Consumer + Decision Guard
 
 Verdict: **ACCEPTED**
 
-Problem reproduced in the live POC: after a claim lease expired, the same Bridge request could be reclaimed and inserted into the ChatGPT conversation again.
+Implemented against the frozen contract (`e127f28`) authorized in
+`agent/next.md`.
 
-Remediation:
-1. Freeze the failure contract in `b07adb4`.
-2. Add binding/request-scoped submitted evidence to `browser/chatgpt-web-adapter.user.js`.
-3. Check storage and current user-message DOM before inserting a reclaimed prompt.
-4. Resume waiting for the existing ChatGPT response under the new claim token.
-5. Record submitted state only after a successful `insertAndSubmit()`.
+Deliverables:
+1. `src/dev_orchestrator/core/response_consumer.py` — Core Response Consumer:
+   exact `[DEVORCH_WEB_SOL_RESPONSE <request_id>]` marker match, exactly one
+   JSON object parsed after the marker (no trailing non-whitespace content),
+   explicit `WebSolResponse` construction with the strict response schema
+   (extra fields fail closed), echoed-identity validation, fresh
+   repository-truth read, then the existing Decision Guard.
+2. `src/dev_orchestrator/daemon.py` — after each successful monitor tick the
+   unified daemon consumes newly RESPONDED Bridge responses into persisted
+   dispositions only.
+3. `src/dev_orchestrator/bridge/store.py` — transport-observation helper
+   `list_responded(adapter, binding_id)` (read-only, deterministic); queue
+   state is never mutated by Core.
+4. Fixture-only tests were frozen by the contract commit; no product test was
+   touched or weakened.
+
+Safety / correctness properties:
+- disposition/intention only — APPLY/IGNORE/STALE/STOP/REVIEW_REQUIRED/
+  OWNER_GATE; never any Worker/next-action execution;
+- decision record persisted under `runtime/websol-decisions.json` keyed by
+  request id, written atomically after each consumption; `next_action` is
+  preserved only for APPLY and OWNER_GATE/STOP waits, otherwise `None`;
+- each responded request id consumed exactly once across ticks/restarts;
+- project/binding isolation by construction: only orchestration-ready
+  projects with a valid browser-bridge binding route are scanned, and only
+  their exact binding queues are read;
+- malformed/multiple JSON, unknown enums, extra fields, blank identities,
+  un-reconstructable records and unavailable truth all fail closed to STOP;
+- fresh repository branch/HEAD/dirty truth is read immediately before the
+  guard accepts any decision.
 
 Acceptance evidence:
-- focused duplicate/Bridge tests: **11/11 PASS**;
-- full `tests_py`: **63/63 PASS** on XLabServer normal environment;
-- userscript Node syntax check: PASS;
-- `git diff --check`: PASS;
-- live dedicated binding `6a9a5c4a-b360-83ea-82cf-111fff98eed3`;
-- first and reclaimed claims used distinct tokens, proving real reclaim;
-- Bridge reached `responded` with the original response;
-- UI Automation counted exactly one request message after excluding accessibility clones;
-- fresh Reviewer: **ACCEPT**, no blocking defect.
+- frozen Response Consumer + daemon integration tests: **9/9 PASS**
+  (valid apply-once, malformed/multiple-object STOP, identity-mismatch
+  IGNORE, fresh-head STALE, dirty REVIEW_REQUIRED, owner-gate preservation,
+  invalid decision/extra-field STOP, two-project isolation, daemon
+  consume-to-disposition);
+- full `tests_py` suite: **72/72 PASS**;
+- `git diff --check`: PASS (accepted CRLF warnings only).
 
-Non-blocking carry-over: bound lost-send recovery, submitted-mark cleanup, tiny post-send/pre-mark crash window, stronger behavioral adapter test, and routine retention/pruning.
+Non-blocking carry-over for later slices: surfacing dispositions to the Web
+dashboard, disposition-history retention/pruning, and the live ChatGPT Web
+deployment gate. PHASE_AUTO and any execution of a disposition remain NOT
+AUTHORIZED.
