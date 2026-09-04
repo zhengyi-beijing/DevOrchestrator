@@ -6,9 +6,13 @@ This is the first bounded event slice of the accepted Web Sol transport:
                        -> rendered prompt -> BrowserBridgeStore.submit()
 
 A project snapshot dispatches exactly one ``WORKER_DONE`` request when an
-orchestration-ready project shows a completed task Worker run. The dispatcher
-never claims, responds, or interprets a Web Sol response — the Bridge remains
-transport only (see ``docs/BROWSER_BRIDGE_CHATGPT_BINDING_DESIGN.md``).
+eligible project shows a completed task Worker run. Delivery is withheld until
+the project is orchestration-ready and routed to a ``browser_bridge`` binding
+(and, for live-binding stores, until that conversation is actually being
+watched); an occurrence that cannot be delivered yet stays frozen as
+``prepared``/``unbound`` and resumes with the same identity on a later tick.
+The dispatcher never claims, responds, or interprets a Web Sol response — the
+Bridge remains transport only (see ``docs/BROWSER_BRIDGE_CHATGPT_BINDING_DESIGN.md``).
 
 Guarantees (fail closed):
 
@@ -21,6 +25,18 @@ Guarantees (fail closed):
   restart can never enqueue a second request for the same occurrence. A
   persisted dispatcher ledger under the runtime root additionally prevents
   re-submission once an occurrence has been dispatched.
+- Every eligible completed occurrence is frozen exactly once under the ledger
+  as ``prepared`` with its request identity, fresh branch/head and rendered
+  prompt. Delivery into a Bridge queue happens only when the project is
+  orchestration-ready and routed to a ``browser_bridge`` binding; anything not
+  yet deliverable stays ``prepared`` with ``delivery_state=unbound`` and is
+  re-attempted on a later tick (no new request identity is ever created for the
+  same occurrence, so a later binding/rebinding resumes the frozen request).
+- Stores created with ``require_live_binding=True`` additionally withhold
+  delivery until the exact binding shows live adapter presence
+  (``BrowserBridgeStore.binding_status() == bound``): a request is never handed
+  to a ChatGPT conversation that no adapter is currently watching. Ordinary
+  stores keep the accepted direct-submit behavior.
 - Routing uses only the project's validated ``conversation_binding``
   ``(transport, adapter, binding_id)``; the only transport implemented in this
   slice is ``browser_bridge``. Missing/malformed bindings, non-browser
@@ -49,6 +65,10 @@ DISPATCHER_STATE_FILE = "dispatcher-state.json"
 _LEDGER_VERSION = 2
 _LEDGER_EVENT_KEY = WebSolEvent.WORKER_DONE.value  # "worker_done"
 _BROWSER_BRIDGE_TRANSPORT = "browser_bridge"
+
+_STATE_PREPARED = "prepared"
+_STATE_SUBMITTED = "submitted"
+_DELIVERY_UNBOUND = "unbound"
 
 
 @dataclass(frozen=True)
@@ -212,16 +232,72 @@ def _request_from_prepared(project_id: str, occurrence: dict) -> WebSolRequest:
     )
 
 
-def _dispatch_result(project_id: str, run_id: str, occurrence: dict) -> WorkerDoneDispatch:
+def _dispatch_result(
+    project_id: str, run_id: str, occurrence: dict, adapter: str, binding_id: str
+) -> WorkerDoneDispatch:
     return WorkerDoneDispatch(
         project_id=project_id,
-        adapter=str(occurrence["adapter"]),
-        binding_id=str(occurrence["binding_id"]),
+        adapter=adapter,
+        binding_id=binding_id,
         request_id=str(occurrence["request_id"]),
         run_id=run_id,
         branch=str(occurrence["branch"]),
         head=str(occurrence["head"]),
     )
+
+
+def _delivery_allowed(store: BrowserBridgeStore, adapter: str, binding_id: str) -> bool:
+    """Whether a submission into the exact binding may happen right now.
+
+    Ordinary stores submit directly to the configured route. Live-binding
+    stores (``require_live_binding=True``) require the exact binding to show
+    live adapter presence inside its presence window — a conversation nobody is
+    watching must not receive a request (unbound browser reliability).
+    """
+    require_live = bool(getattr(store, "require_live_binding", False))
+    if not require_live:
+        return True
+    status = store.binding_status(adapter, binding_id)
+    return status.get("state") == "bound"
+
+
+def _keep_unbound(occurrence: dict, path: Path, ledger: dict) -> None:
+    """Persist the observable prepared/unbound marker exactly once."""
+    if occurrence.get("delivery_state") == _DELIVERY_UNBOUND:
+        return
+    occurrence["delivery_state"] = _DELIVERY_UNBOUND
+    _save_ledger(path, ledger)
+
+
+def _submit_prepared(
+    project_id: str,
+    run_id: str,
+    occurrence: dict,
+    adapter: str,
+    binding_id: str,
+    store: BrowserBridgeStore,
+    path: Path,
+    ledger: dict,
+) -> WorkerDoneDispatch:
+    """Submit one frozen prepared occurrence and mark the ledger submitted.
+
+    The request identity (and the rendered prompt) come exclusively from the
+    frozen occurrence, so a crash between freeze and submit — or a later
+    binding/rebinding — always resumes the exact same request and never
+    fabricates a new identity for the same completed Worker occurrence.
+    """
+    prompt = occurrence.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise RuntimeError(
+            "prepared dispatcher occurrence is missing its prompt for {0}/{1}".format(project_id, run_id)
+        )
+    request = _request_from_prepared(project_id, occurrence)
+    store.submit(adapter, binding_id, request, prompt)
+    occurrence["state"] = _STATE_SUBMITTED
+    occurrence["dispatched_at"] = utc_now_iso()
+    occurrence.pop("delivery_state", None)
+    _save_ledger(path, ledger)
+    return _dispatch_result(project_id, run_id, occurrence, adapter, binding_id)
 
 
 # --------------------------------------------------------------------------
@@ -238,8 +314,6 @@ def _dispatch_one(
     project_id = _non_blank(snapshot.get("project_id"))
     repo_path = _non_blank(snapshot.get("repo_path"))
     if project_id is None or repo_path is None:
-        return None
-    if snapshot.get("orchestration_ready") is not True:
         return None
 
     worker = snapshot.get("worker")
@@ -259,26 +333,32 @@ def _dispatch_one(
     prepared = occurrences.get(run_id)
     if isinstance(prepared, dict):
         state = prepared.get("state")
-        if state == "submitted":
+        if state == _STATE_SUBMITTED:
             return None
-        if state != "prepared":
-            raise RuntimeError("invalid dispatcher occurrence state for {0}/{1}".format(project_id, run_id))
-        adapter = _non_blank(prepared.get("adapter"))
-        binding_id = _non_blank(prepared.get("binding_id"))
-        prompt = prepared.get("prompt")
-        if adapter is None or binding_id is None or not isinstance(prompt, str) or not prompt.strip():
-            raise RuntimeError("prepared dispatcher occurrence is missing route/prompt for {0}/{1}".format(project_id, run_id))
-        request = _request_from_prepared(project_id, prepared)
-        store.submit(adapter, binding_id, request, prompt)
-        prepared["state"] = "submitted"
-        prepared["dispatched_at"] = utc_now_iso()
-        _save_ledger(path, ledger)
-        return _dispatch_result(project_id, run_id, prepared)
+        if state != _STATE_PREPARED:
+            raise RuntimeError(
+                "invalid dispatcher occurrence state for {0}/{1}".format(project_id, run_id)
+            )
+        # Resume an existing frozen occurrence. Delivery is gated on the
+        # project being orchestration-ready, on a current browser-bridge
+        # route, and (for live-binding stores) on live adapter presence. A
+        # rebind between freeze and delivery therefore resumes the same frozen
+        # request into the new conversation instead of fabricating a new one.
+        if snapshot.get("orchestration_ready") is not True:
+            _keep_unbound(prepared, path, ledger)
+            return None
+        route = _binding_route(snapshot.get("conversation_binding"))
+        if route is None:
+            _keep_unbound(prepared, path, ledger)
+            return None
+        _, adapter, binding_id = route
+        if not _delivery_allowed(store, adapter, binding_id):
+            _keep_unbound(prepared, path, ledger)
+            return None
+        return _submit_prepared(project_id, run_id, prepared, adapter, binding_id, store, path, ledger)
 
     route = _binding_route(snapshot.get("conversation_binding"))
-    if route is None:
-        return None
-    transport, adapter, binding_id = route
+    ready = snapshot.get("orchestration_ready") is True
 
     truth = read_repository_truth(repo_path)
     if not truth.valid:
@@ -298,11 +378,12 @@ def _dispatch_one(
     context = _worker_done_evidence(snapshot, truth, worker, task_id, stage_id, run_id)
     prompt = render_websol_prompt(request, context)
 
-    occurrence = {
-        "state": "prepared",
-        "transport": transport,
-        "adapter": adapter,
-        "binding_id": binding_id,
+    # Freeze the occurrence exactly once, before any delivery decision. The
+    # frozen identity/prompt is what a later binding or live presence resumes;
+    # a project that is not yet deliverable stays prepared/unbound (visible in
+    # the dashboard) instead of silently disappearing.
+    occurrence: dict[str, Any] = {
+        "state": _STATE_PREPARED,
         "request_id": request.request_id,
         "nonce": request.nonce,
         "task_id": request.task_id,
@@ -311,15 +392,19 @@ def _dispatch_one(
         "head": request.head,
         "prompt": prompt,
         "prepared_at": utc_now_iso(),
+        "delivery_state": _DELIVERY_UNBOUND,
     }
+    if route is not None:
+        transport, adapter, binding_id = route
+        occurrence["transport"] = transport
+        occurrence["adapter"] = adapter
+        occurrence["binding_id"] = binding_id
     occurrences[run_id] = occurrence
     _save_ledger(path, ledger)
 
-    store.submit(adapter, binding_id, request, prompt)
-    occurrence["state"] = "submitted"
-    occurrence["dispatched_at"] = utc_now_iso()
-    _save_ledger(path, ledger)
-    return _dispatch_result(project_id, run_id, occurrence)
+    if route is not None and ready and _delivery_allowed(store, route[1], route[2]):
+        return _submit_prepared(project_id, run_id, occurrence, route[1], route[2], store, path, ledger)
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -336,8 +421,10 @@ def dispatch_worker_done_events(summary: Any, store: BrowserBridgeStore, runtime
 
     Returns the list of :class:`WorkerDoneDispatch` outcomes for requests that
     were newly enqueued in this call — ``[]`` when there is nothing new
-    (duplicate ticks, restarts, ineligible projects). Never claims, responds,
-    or consumes a Web Sol response.
+    (duplicate ticks, restarts, ineligible projects) or when delivery is
+    withheld because the occurrence is frozen but not yet deliverable
+    (``prepared``/``unbound``). Never claims, responds, or consumes a Web Sol
+    response.
     """
     if not isinstance(summary, dict):
         return []

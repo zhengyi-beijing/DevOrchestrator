@@ -2,10 +2,16 @@
 
 Contract: methods ``GET``/``HEAD`` only; static allowlist ``/``, ``/app.js``,
 ``/style.css``; API allowlist ``/api/monitor``, ``/api/summary``,
-``/api/projects/<id>``, ``/api/events?limit=N``, ``/api/runs?limit=N``;
-history limits clamp to 1..100; unknown routes 404; write methods 405 with
-``Allow: GET, HEAD``; traversal/malformed paths 400. ``Cache-Control:
-no-store`` and ``X-Content-Type-Options: nosniff`` are always present.
+``/api/projects/<id>``, ``/api/events?limit=N``, ``/api/runs?limit=N``,
+``/api/orchestration``; history limits clamp to 1..100; unknown routes 404;
+write methods 405 with ``Allow: GET, HEAD``; traversal/malformed paths 400.
+``Cache-Control: no-store`` and ``X-Content-Type-Options: nosniff`` are always
+present.
+
+``/api/orchestration`` is a read-only projection of the dispatcher ledger: it
+surfaces projects whose prepared Web Sol request cannot be delivered yet
+(``delivery_state=unbound``) so the dashboard can ask the owner to bind/rebind
+the ChatGPT conversation. The server never mutates the ledger.
 
 The server reads DevOrchestrator runtime projections only; it never shells
 into observed projects.
@@ -22,6 +28,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE
 from dev_orchestrator.platform.process import is_pid_alive
 from dev_orchestrator.storage.json_store import (
     parse_utc,
@@ -79,6 +86,50 @@ def monitor_payload(runtime_root: Path | str) -> dict[str, Any]:
 
 def _default_summary() -> dict[str, Any]:
     return {"observed_at": None, "project_count": 0, "projects": []}
+
+
+def orchestration_payload(runtime_root: Path | str) -> dict[str, Any]:
+    """Project the dispatcher ledger into an orchestration-ready view.
+
+    A project is surfaced as ``UNBOUND`` while it holds a prepared Web Sol
+    request that is not yet deliverable (``delivery_state=unbound``) — e.g. a
+    completed Worker occurrence whose ChatGPT conversation is not bound or is
+    not being watched yet. The dashboard uses this to instruct the owner to
+    bind/rebind the conversation so delivery resumes with the frozen request
+    identity. Read-only: the server never mutates the dispatcher ledger.
+    """
+    runtime = Path(runtime_root)
+    data = read_json(runtime / DISPATCHER_STATE_FILE, None)
+    projects: dict[str, Any] = {}
+    if not isinstance(data, dict):
+        return {"projects": projects}
+    events = data.get("worker_done")
+    if not isinstance(events, dict):
+        return {"projects": projects}
+    for project_id, record in events.items():
+        if not isinstance(project_id, str) or not isinstance(record, dict):
+            continue
+        occurrences = record.get("occurrences")
+        if not isinstance(occurrences, dict):
+            continue
+        blocked = [
+            occurrence
+            for occurrence in occurrences.values()
+            if isinstance(occurrence, dict)
+            and occurrence.get("state") == "prepared"
+            and occurrence.get("delivery_state") == "unbound"
+        ]
+        if not blocked:
+            continue
+        latest = max(blocked, key=lambda value: str(value.get("prepared_at") or ""))
+        projects[project_id] = {
+            "state": "UNBOUND",
+            "delivery_state": "unbound",
+            "request_id": latest.get("request_id"),
+            "binding_id": latest.get("binding_id"),
+            "prepared_at": latest.get("prepared_at"),
+        }
+    return {"projects": projects}
 
 
 class DevOrchestratorHTTPServer(ThreadingHTTPServer):
@@ -255,6 +306,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             payload = {"items": read_last_jsonl(runtime / "history" / "events.jsonl", self._query_limit(parsed.query))}
         elif path == "/api/runs":
             payload = {"items": read_last_jsonl(runtime / "history" / "runs.jsonl", self._query_limit(parsed.query))}
+        elif path == "/api/orchestration":
+            payload = orchestration_payload(runtime)
         elif path.startswith("/api/projects/"):
             match = _PROJECT_PATH_RE.fullmatch(path)
             if not match:

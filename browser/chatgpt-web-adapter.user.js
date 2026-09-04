@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.1
-// @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge. Derives the binding id from the current /c/<conversation-id> URL, claims only that binding, submits the rendered prompt, waits for the matching response marker, and posts the raw assistant text back.
+// @version      0.1.2
+// @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge. Derives the binding id from the current /c/<conversation-id> URL, claims only that binding, submits the rendered prompt, waits for a stable matching response marker, and posts the raw assistant text back.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
 // @grant        GM_xmlhttpRequest
@@ -15,7 +15,8 @@
 // never starts Workers, and never interprets repository or Worker state.
 // The binding id is always derived from the live ChatGPT conversation URL, so
 // no project/conversation key is hard-coded here and each tab (conversation)
-// claims only its own project queue.
+// claims only its own project queue. Assistant responses are acknowledged only
+// after their marker text has been stable across the polling window.
 
 (function (root) {
   "use strict";
@@ -42,6 +43,16 @@
   var RENEW_ABANDON = "abandon";
   var RENEW_RETRY_MS = 5000;
 
+  // Response-stability gate. ChatGPT streams assistant output, so a DOM
+  // snapshot that already carries the response marker may still be growing.
+  // The adapter only acknowledges text whose content has been unchanged for
+  // RESPONSE_STABILITY_MS, so a partial answer is never POSTed as final.
+  var RESPONSE_STABILITY_MS = 1500;
+  // Cross-poll stability state for the response currently being awaited:
+  // responseStability.ready turns true only after the same complete text has
+  // been observed unchanged for the full stability window.
+  var responseStability = { text: null, since: 0, ready: false };
+
   // ------------------------------------------------------------------
   // pure helpers (also exercised by the automated Node test harness)
   // ------------------------------------------------------------------
@@ -66,6 +77,25 @@
       return false;
     }
     return text.indexOf(RESPONSE_HEAD + requestId + "]") !== -1;
+  }
+
+  // Advances one poll's response-stability state. ``state`` may be null on the
+  // first observation. A text change resets ``since``/``ready``; unchanged
+  // text flips ``ready`` once it has persisted for RESPONSE_STABILITY_MS.
+  // Exposed through the test API so the stability contract is deterministic.
+  function advanceResponseStability(state, text, now) {
+    if (!state || typeof state !== "object") {
+      state = { text: null, since: 0, ready: false };
+    }
+    var current = typeof text === "string" ? text : "";
+    if (current !== state.text) {
+      state.text = current;
+      state.since = now;
+      state.ready = false;
+    } else if (!state.ready && now - state.since >= RESPONSE_STABILITY_MS) {
+      state.ready = true;
+    }
+    return state;
   }
 
   function submittedStorageKey(bindingId, requestId) {
@@ -140,6 +170,7 @@
     conversationIdFromUrl: conversationIdFromUrl,
     currentBindingId: currentBindingId,
     responseMatches: responseMatches,
+    advanceResponseStability: advanceResponseStability,
     classifyRenewResult: classifyRenewResult,
     requestAlreadySubmitted: requestAlreadySubmitted,
     markRequestSubmitted: markRequestSubmitted
@@ -354,8 +385,11 @@
 
   function waitForResponse(bindingId, claim, deadline, renewal) {
     var responseText = findResponseText(claim.request_id);
-    if (responseText) {
-      // Response found: stop polling/renewing and acknowledge the raw text.
+    responseStability = advanceResponseStability(responseStability, responseText, Date.now());
+    if (responseText && responseStability.ready) {
+      // The matching assistant text has been unchanged for the full stability
+      // window, so it is no longer streaming: stop polling/renewing and
+      // acknowledge the raw text. A still-growing answer is never acked early.
       respond(bindingId, claim, responseText).then(function () {
         schedule(runAdapter, RETRY_MS);
       });

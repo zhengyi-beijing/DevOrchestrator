@@ -34,6 +34,16 @@ Contract (design ``docs/BROWSER_BRIDGE_CHATGPT_BINDING_DESIGN.md``):
 - Pending/claimed/responded state is persisted under the store root, so it
   survives a store reopen.
 
+Binding presence: every valid adapter poll (``claim``) and every successful
+``renew``/``respond`` records that the exact ``(adapter, binding_id)`` was
+recently observed live. ``binding_status`` derives ``bound``/``unbound`` from
+that observation against ``binding_presence_seconds``; a binding that was never
+observed, or whose last observation is older than the window, is ``unbound``
+(fail closed). Stores created with ``require_live_binding=True`` expose this
+status to the dispatcher so a request is only handed to a conversation an
+adapter is actually watching (unbound browser reliability); ordinary stores
+keep submitting directly to the configured route.
+
 The transport only stores and delivers the response. It never validates
 structured response content and never applies any decision.
 """
@@ -53,10 +63,14 @@ from dev_orchestrator.core.websol import WebSolRequest
 from dev_orchestrator.storage.json_store import read_json, write_json
 
 _DEFAULT_LEASE_SECONDS = 30
+_DEFAULT_PRESENCE_SECONDS = 300
 
 STATE_PENDING = "pending"
 STATE_CLAIMED = "claimed"
 STATE_RESPONDED = "responded"
+
+STATE_BOUND = "bound"
+STATE_UNBOUND = "unbound"
 
 _IDENTITY_FIELDS = (
     "project_id",
@@ -191,14 +205,38 @@ class BrowserBridgeStore:
     operation so state survives reopen.
     """
 
-    def __init__(self, root: Path | str, *, lease_seconds: int = _DEFAULT_LEASE_SECONDS) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        *,
+        lease_seconds: int = _DEFAULT_LEASE_SECONDS,
+        require_live_binding: bool = False,
+        binding_presence_seconds: Optional[int] = None,
+    ) -> None:
+        """Open (creating when needed) the persistent transport store.
+
+        ``require_live_binding=True`` makes the store advertise that delivery
+        into a binding must be gated on live adapter presence (see
+        :meth:`binding_status`); the dispatcher consults that flag before
+        handing a request to a conversation no adapter is watching.
+        ``binding_presence_seconds`` bounds how recent a claim poll/renewal
+        must be for a binding to count as live (default 300 s).
+        """
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         if lease_seconds is None or int(lease_seconds) <= 0:
             raise ValueError("lease_seconds must be a positive number")
         self.lease_seconds = int(lease_seconds)
+        self.require_live_binding = bool(require_live_binding)
+        if binding_presence_seconds is None:
+            binding_presence_seconds = _DEFAULT_PRESENCE_SECONDS
+        if int(binding_presence_seconds) <= 0:
+            raise ValueError("binding_presence_seconds must be a positive number")
+        self.binding_presence_seconds = int(binding_presence_seconds)
         self._queue_dir = self.root / "queues"
         self._queue_dir.mkdir(parents=True, exist_ok=True)
+        self._presence_dir = self.root / "presence"
+        self._presence_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
@@ -226,6 +264,25 @@ class BrowserBridgeStore:
         if not self._queue_dir.is_dir():
             return []
         return sorted(path for path in self._queue_dir.glob("*/*.json"))
+
+    def _presence_path(self, adapter: str, binding_id: str) -> Path:
+        return self._presence_dir / _encode_segment(adapter) / (_encode_segment(binding_id) + ".json")
+
+    def _touch_presence(self, adapter: str, binding_id: str, moment: datetime) -> None:
+        """Record that the exact binding was just observed live by an adapter.
+
+        Called for every valid claim poll (including polls that find nothing)
+        and for every successful renew/respond, so presence reflects "an
+        adapter is watching this exact conversation right now".
+        """
+        write_json(
+            self._presence_path(adapter, binding_id),
+            {
+                "adapter": adapter,
+                "binding_id": binding_id,
+                "last_seen_at": _iso(moment),
+            },
+        )
 
     def _request_id_lives_elsewhere(
         self, adapter: str, binding_id: str, request_id: str
@@ -287,6 +344,37 @@ class BrowserBridgeStore:
     # ------------------------------------------------------------------
     # public transport API
     # ------------------------------------------------------------------
+
+    def binding_status(
+        self, adapter: str, binding_id: str, *, now: Optional[datetime] = None
+    ) -> dict[str, Any]:
+        """Report whether the exact binding currently has live adapter presence.
+
+        ``bound`` means an adapter poll/renewal for the exact
+        ``(adapter, binding_id)`` was observed within the last
+        ``binding_presence_seconds``; anything else — never observed, or
+        observed before the presence window — is ``unbound`` (fail closed, so
+        a conversation nobody is watching never looks deliverable).
+        """
+        _require_route(adapter, binding_id)
+        moment = _as_utc(now)
+        with self._lock:
+            data = read_json(self._presence_path(adapter, binding_id), None)
+        last_seen_at: Optional[str] = None
+        state = STATE_UNBOUND
+        if isinstance(data, dict):
+            last_seen = _parse_iso(data.get("last_seen_at"))
+            if last_seen is not None:
+                last_seen_at = _iso(last_seen)
+                if (moment - last_seen).total_seconds() < self.binding_presence_seconds:
+                    state = STATE_BOUND
+        return {
+            "state": state,
+            "adapter": adapter,
+            "binding_id": binding_id,
+            "last_seen_at": last_seen_at,
+            "binding_presence_seconds": self.binding_presence_seconds,
+        }
 
     def submit(
         self,
@@ -378,6 +466,10 @@ class BrowserBridgeStore:
         _require_route(adapter, binding_id)
         moment = _as_utc(now)
         with self._lock:
+            # Every claim poll is liveness evidence for the exact binding, even
+            # an empty one: an adapter that polls and finds nothing is still
+            # watching this conversation.
+            self._touch_presence(adapter, binding_id, moment)
             queue = self._load_queue(adapter, binding_id)
             for request_id, record in queue.items():
                 state = record.get("state")
@@ -446,6 +538,8 @@ class BrowserBridgeStore:
             record["response_text"] = response_text
             record["responded_at"] = _iso(moment)
             self._save_queue(adapter, binding_id, queue)
+            # A successful response proves the adapter is alive on this binding.
+            self._touch_presence(adapter, binding_id, moment)
             return StoredResponse(
                 adapter=adapter,
                 binding_id=binding_id,
@@ -504,6 +598,8 @@ class BrowserBridgeStore:
             renewed_lease = _iso(moment + timedelta(seconds=self.lease_seconds))
             record["lease_expires_at"] = renewed_lease
             self._save_queue(adapter, binding_id, queue)
+            # A successful renew proves the adapter is alive on this binding.
+            self._touch_presence(adapter, binding_id, moment)
             return StoredRenewal(
                 adapter=adapter,
                 binding_id=binding_id,

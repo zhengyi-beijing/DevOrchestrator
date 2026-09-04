@@ -147,16 +147,55 @@ function renderTimeline(hostId, items, formatter) {
     row.append(main, meta); host.appendChild(row);
   }
 }
+
+function renderOrchestration(orchestration) {
+  const host = $('orchestration');
+  host.replaceChildren();
+  const entries = (orchestration && orchestration.projects) || {};
+  const ids = Object.keys(entries).sort();
+  if (!ids.length) {
+    const empty = document.createElement('div'); empty.className = 'empty';
+    empty.textContent = 'No pending orchestration requests.';
+    host.appendChild(empty);
+    return;
+  }
+  for (const id of ids) {
+    const entry = entries[id];
+    const card = document.createElement('article');
+    card.className = `project-card ${entry.state === 'UNBOUND' ? 'bad' : 'ok'}`;
+    const head = document.createElement('div'); head.className = 'project-head';
+    const nameBox = document.createElement('div');
+    const name = document.createElement('div'); name.className = 'project-name'; name.textContent = text(id);
+    const state = document.createElement('div'); state.className = 'project-state'; state.textContent = `${text(entry.state)} / BLOCKED`;
+    nameBox.append(name, state);
+    const badge = document.createElement('div'); badge.className = 'badge bad'; badge.textContent = entry.state === 'UNBOUND' ? 'UNBOUND / BLOCKED' : text(entry.state);
+    head.append(nameBox, badge); card.appendChild(head);
+    const next = document.createElement('div'); next.className = 'project-next';
+    const nextLabel = document.createElement('div'); nextLabel.className = 'label'; nextLabel.textContent = 'Resume path';
+    const nextValue = document.createElement('div'); nextValue.className = 'value';
+    nextValue.textContent = 'Rebind the ChatGPT conversation to resume the pending request.';
+    next.append(nextLabel, nextValue); card.appendChild(next);
+    const grid = document.createElement('div'); grid.className = 'kv-grid';
+    kv(grid, 'Delivery', text(entry.delivery_state));
+    kv(grid, 'Request', entry.request_id, true);
+    kv(grid, 'Binding', text(entry.binding_id), true);
+    kv(grid, 'Prepared', ago(entry.prepared_at));
+    card.appendChild(grid);
+    host.appendChild(card);
+  }
+}
+
 async function refresh() {
   try {
-    const [monitor, summary, eventsPayload, runsPayload] = await Promise.all([
-      getJson('/api/monitor'), getJson('/api/summary'), getJson('/api/events?limit=30'), getJson('/api/runs?limit=20')
+    const [monitor, summary, eventsPayload, runsPayload, orchestration] = await Promise.all([
+      getJson('/api/monitor'), getJson('/api/summary'), getJson('/api/events?limit=30'), getJson('/api/runs?limit=20'), getJson('/api/orchestration')
     ]);
     const events = Array.isArray(eventsPayload.items) ? eventsPayload.items : [];
     const runs = Array.isArray(runsPayload.items) ? runsPayload.items : [];
     renderMonitor(monitor);
     renderOverview(summary);
     renderProjects(summary, events);
+    renderOrchestration(orchestration);
     renderTimeline('events', events, e => `${text(e.from_state)} → ${text(e.to_state)} · ${text(e.task_id)}`);
     renderTimeline('runs', runs, r => `${text(r.task_id)} · ${text(r.result)} · ${seconds(r.duration_seconds)}`);
     $('lastRefresh').textContent = `refreshed ${new Date().toLocaleTimeString()}`;
