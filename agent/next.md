@@ -1,21 +1,26 @@
-# NEXT — Real ChatGPT Web POC
+# NEXT — Response Consumer + Decision Guard
 
-Status: **AUTHORIZED — live transport POC only**
+Status: **AUTHORIZED — design + TDD + implementation**
 
-Goal: prove the accepted one-way chain against a real ChatGPT Web conversation:
+Goal: consume the raw Browser Bridge response and produce a validated Web Sol disposition without executing any Worker action.
 
-`fixture Worker DONE → Event Dispatcher → WebSolRequest(REVIEWER) → conversation_binding → Browser Bridge → ChatGPT Web adapter → raw response returned to Bridge`.
+Bounded chain:
+`Bridge response → parse exact DEVORCH_WEB_SOL_RESPONSE marker/JSON → construct WebSolResponse → validate echoed identity → fresh repository truth → Decision Guard → disposition`.
 
-Required POC evidence:
-1. Use a DevOrchestrator-owned temporary fixture repository only; do not use LabDemo.
-2. Bind exactly one live ChatGPT conversation by its URL-derived binding_id.
-3. Trigger one synthetic completed Worker occurrence through the real unified daemon path.
-4. Verify exactly one request is claimed by the intended conversation and no other binding can claim it.
-5. Verify the prompt identity carries project_id/request_id/task_id-or-stage_id/branch/head/role/event/nonce.
-6. Verify the browser adapter returns one raw assistant response to the same Bridge request.
-7. Verify duplicate monitor ticks/restart do not re-submit the same occurrence.
-8. Record browser/Bridge/runtime evidence and clean up the temporary fixture after the POC.
+Required behavior:
+1. Match the exact request marker/request_id and parse one JSON object only.
+2. Require exact echo of project_id/request_id/task_id/stage_id/branch/head/role/event/nonce.
+3. Re-read fresh repository branch/HEAD/dirty state before accepting a decision.
+4. Apply the existing decision/next_action compatibility rules fail-closed.
+5. Return only a disposition/intention such as APPLY/IGNORE/STALE/STOP/REVIEW_REQUIRED/OWNER_GATE.
+6. Preserve project/binding isolation and deterministic request identity.
+7. Add fixture-only tests for valid, malformed, stale, dirty, mismatched, and owner-gated responses.
 
-Non-goals: parse/validate/apply WebSolResponse; decision transitions; Agent Router/Worker start; PHASE_AUTO; LabDemo access; hardware actions.
+Strict non-goals:
+- do not start/restart a Worker;
+- do not invoke Agent Router;
+- do not auto-execute NEXT/REMEDIATE/RETRY;
+- do not implement PHASE_AUTO;
+- do not touch LabDemo or hardware.
 
-After a successful live POC, next bounded development phase is **Response Consumer + Decision Guard**, still without Worker execution.
+Carry-over hardening from live POC may be addressed only if it stays bounded and does not expand into actuation.

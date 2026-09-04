@@ -1,28 +1,25 @@
-# RESULT — WORKER_DONE dispatcher slice
+# RESULT — ChatGPT Web duplicate/reclaim remediation
 
 Verdict: **ACCEPTED**
 
-Implemented:
-1. `src/dev_orchestrator/core/dispatcher.py` — bounded WORKER_DONE dispatcher.
-2. `src/dev_orchestrator/daemon.py` — dispatch after successful monitor tick using the same BrowserBridgeStore instance.
-3. Fixture-only dispatcher and daemon integration tests; LabDemo is not part of this acceptance.
+Problem reproduced in the live POC: after a claim lease expired, the same Bridge request could be reclaimed and inserted into the ChatGPT conversation again.
 
-Safety / correctness properties:
-- only `worker.kind=task` + `worker.state=completed` + stable run_id can dispatch;
-- project must be explicitly `orchestration_ready=True` with valid browser_bridge binding;
-- at least task_id or stage_id is required;
-- fresh repo truth supplies branch/head;
-- deterministic occurrence identity prevents duplicate queueing;
-- ledger persists complete PREPARED identity before Bridge submit, then marks SUBMITTED;
-- recovery reuses frozen route/request/nonce/branch/head after a crash;
-- historical run occurrences are not replayed;
-- Bridge remains transport-only.
+Remediation:
+1. Freeze the failure contract in `b07adb4`.
+2. Add binding/request-scoped submitted evidence to `browser/chatgpt-web-adapter.user.js`.
+3. Check storage and current user-message DOM before inserting a reclaimed prompt.
+4. Resume waiting for the existing ChatGPT response under the new claim token.
+5. Record submitted state only after a successful `insertAndSubmit()`.
 
 Acceptance evidence:
-- latest full Python suite: **61/61 PASS**;
-- targeted dispatcher + daemon integration: PASS;
-- Node userscript syntax: PASS;
+- focused duplicate/Bridge tests: **11/11 PASS**;
+- full `tests_py`: **63/63 PASS** on XLabServer normal environment;
+- userscript Node syntax check: PASS;
 - `git diff --check`: PASS;
-- fresh independent Reviewer: **ACCEPT**, zero blocking findings.
+- live dedicated binding `6a9a5c4a-b360-83ea-82cf-111fff98eed3`;
+- first and reclaimed claims used distinct tokens, proving real reclaim;
+- Bridge reached `responded` with the original response;
+- UI Automation counted exactly one request message after excluding accessibility clones;
+- fresh Reviewer: **ACCEPT**, no blocking defect.
 
-Reviewer watch items: per-project dispatcher failure isolation (highest priority), terminal-run task identity fidelity, crash-window config reroute behavior, ledger retention/version handling, whitespace normalization, and heartbeat wording. None blocks this slice.
+Non-blocking carry-over: bound lost-send recovery, submitted-mark cleanup, tiny post-send/pre-mark crash window, stronger behavioral adapter test, and routine retention/pruning.

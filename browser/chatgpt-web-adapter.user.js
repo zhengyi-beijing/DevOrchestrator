@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.0
+// @version      0.1.1
 // @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge. Derives the binding id from the current /c/<conversation-id> URL, claims only that binding, submits the rendered prompt, waits for the matching response marker, and posts the raw assistant text back.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
@@ -68,6 +68,29 @@
     return text.indexOf(RESPONSE_HEAD + requestId + "]") !== -1;
   }
 
+  function submittedStorageKey(bindingId, requestId) {
+    return "devorch:websol:submitted:" + bindingId + ":" + requestId;
+  }
+
+  function markRequestSubmitted(binding, requestId) {
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(submittedStorageKey(binding, requestId), String(Date.now()));
+      }
+    } catch (err) {
+      // Storage can be unavailable; DOM evidence remains the fallback.
+    }
+  }
+
+  function hasSubmittedStorageMark(bindingId, requestId) {
+    try {
+      return typeof localStorage !== "undefined" &&
+        localStorage.getItem(submittedStorageKey(bindingId, requestId)) !== null;
+    } catch (err) {
+      return false;
+    }
+  }
+
   // Pure classifier for one /v1/renew HTTP result. It reasons only about
   // transport authority - it never parses or applies any workflow content.
   function classifyRenewResult(result) {
@@ -95,11 +118,31 @@
     return 0;
   }
 
+  function requestAlreadySubmitted(bindingId, requestId) {
+    if (hasSubmittedStorageMark(bindingId, requestId)) {
+      return true;
+    }
+    if (typeof document === "undefined") {
+      return false;
+    }
+    var marker = REQUEST_HEAD + requestId + "]";
+    var messages = document.querySelectorAll("[data-message-author-role='user']");
+    for (var i = messages.length - 1; i >= 0; i--) {
+      if ((messages[i].innerText || "").indexOf(marker) !== -1) {
+        markRequestSubmitted(bindingId, requestId);
+        return true;
+      }
+    }
+    return false;
+  }
+
   var adapterApi = {
     conversationIdFromUrl: conversationIdFromUrl,
     currentBindingId: currentBindingId,
     responseMatches: responseMatches,
-    classifyRenewResult: classifyRenewResult
+    classifyRenewResult: classifyRenewResult,
+    requestAlreadySubmitted: requestAlreadySubmitted,
+    markRequestSubmitted: markRequestSubmitted
   };
 
   // Exposed for the automated adapter test (Node `require`); harmless in a
@@ -293,11 +336,18 @@
         schedule(runAdapter, RETRY_MS);
         return;
       }
+      if (requestAlreadySubmitted(bindingId, claim.request_id)) {
+        // Reclaimed after lease expiry/reload: resume waiting for the existing
+        // ChatGPT turn instead of inserting the same request a second time.
+        waitForResponse(bindingId, claim, Date.now() + WAIT_DEADLINE_MS, makeRenewalState(claim));
+        return;
+      }
       if (!insertAndSubmit(claim.prompt)) {
-        // Composer not ready; do not double-submit this request.
+        // Composer not ready; do not record a submission that never happened.
         schedule(runAdapter, RETRY_MS);
         return;
       }
+      markRequestSubmitted(bindingId, claim.request_id);
       waitForResponse(bindingId, claim, Date.now() + WAIT_DEADLINE_MS, makeRenewalState(claim));
     });
   }
