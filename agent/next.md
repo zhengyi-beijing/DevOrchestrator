@@ -1,17 +1,26 @@
-# NEXT — STOP (awaiting owner direction)
+# NEXT — LabDemo review-only POC → Transition Executor
 
-Status: **NOT AUTHORIZED — no further slice is queued in this session**
+Status: **AUTHORIZED BY OWNER**
 
-Response Consumer + Decision Guard is **ACCEPTED**: Bridge responses are now
-consumed into validated, persisted dispositions without executing any Worker
-action.
+Step 1 — real LabDemo review-only integration POC:
+- add one real LabDemo project entry with exact repo path/worker runtime;
+- bind it to its intended ChatGPT conversation;
+- no LabDemo code modification for the POC;
+- observe an existing/synthetic completed Worker occurrence only;
+- prove WORKER_DONE → ChatGPT Reviewer → raw response → validated disposition;
+- verify exact binding isolation and no Worker start/restart.
 
-Remaining layers stay NOT IMPLEMENTED / NOT AUTHORIZED until the owner
-queues them:
-- executing any disposition (start/restart Worker, Agent Router, applying
-  NEXT/REMEDIATE/RETRY);
-- PHASE_AUTO;
-- live ChatGPT Web deployment/POC gate;
-- dashboard surfacing of `websol-decisions.json` and retention/pruning.
+POC gate:
+- fresh LabDemo branch/HEAD/dirty truth must be used;
+- one request, one response, one persisted disposition;
+- no project-crossing and no duplicate/reclaim resend;
+- cleanly stop/restore temporary POC runtime after evidence capture.
 
-Stop for owner direction.
+Step 2 — only after POC PASS: Transition Executor / Worker actuation.
+Bounded goal: validated disposition → explicit transition intent → Agent Router
+→ at most one Worker action, with owner gates and fresh repository revalidation.
+
+Required safety: fail closed on dirty/stale/unknown state; OWNER_GATE/STOP never
+start a Worker; no test weakening; no project-name special cases; no hardware;
+no PHASE_AUTO in this slice. Freeze RED tests before implementation and require
+fresh independent Reviewer before acceptance/push.
