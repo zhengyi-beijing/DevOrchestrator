@@ -1,29 +1,28 @@
-# RESULT — Browser Bridge lease remediation
+# RESULT — WORKER_DONE dispatcher slice
 
 Verdict: **ACCEPTED**
 
-The 2026-09-03 interrupted lease-authority remediation has been resumed and verified.
+Implemented:
+1. `src/dev_orchestrator/core/dispatcher.py` — bounded WORKER_DONE dispatcher.
+2. `src/dev_orchestrator/daemon.py` — dispatch after successful monitor tick using the same BrowserBridgeStore instance.
+3. Fixture-only dispatcher and daemon integration tests; LabDemo is not part of this acceptance.
 
-Blocking defects fixed:
-1. `BrowserBridgeStore.respond()` rejects expired claims even when state/token/nonce still match.
-2. Claim/renew expose `lease_expires_at`; the ChatGPT Web adapter inspects renew results and fails closed: 200 continues, status 0/5xx retries only inside the current lease window, authoritative rejection such as 409 abandons immediately.
+Safety / correctness properties:
+- only `worker.kind=task` + `worker.state=completed` + stable run_id can dispatch;
+- project must be explicitly `orchestration_ready=True` with valid browser_bridge binding;
+- at least task_id or stage_id is required;
+- fresh repo truth supplies branch/head;
+- deterministic occurrence identity prevents duplicate queueing;
+- ledger persists complete PREPARED identity before Bridge submit, then marks SUBMITTED;
+- recovery reuses frozen route/request/nonce/branch/head after a crash;
+- historical run occurrences are not replayed;
+- Bridge remains transport-only.
 
-Acceptance evidence on XLabServer:
-- frozen fresh Reviewer regressions 2/2 PASS;
-- original Reviewer regressions 4/4 PASS;
-- ChatGPT adapter tests 3/3 PASS;
-- full `tests_py` 52/52 PASS;
-- telemetry selftest 10/10 PASS;
-- Web selftest PASS;
-- unified same-PID bridge daemon test PASS;
-- real LabDemo monitor read-only evidence PASS;
-- `node --check` PASS;
-- `git diff --check` PASS.
+Acceptance evidence:
+- latest full Python suite: **61/61 PASS**;
+- targeted dispatcher + daemon integration: PASS;
+- Node userscript syntax: PASS;
+- `git diff --check`: PASS;
+- fresh independent Reviewer: **ACCEPT**, zero blocking findings.
 
-Independent fresh Reviewer found no blocking defect in the remediation content. Its sandbox could not execute the full runtime gates, but those gates were executed separately on the real XLabServer and passed.
-
-Non-blocking follow-ups: strengthen Userscript renew-policy behavioral tests; assert `lease_expires_at` in HTTP tests; live DOM duplicate-message handling remains a separate deployment gate; long-term response retention may need pruning.
-
-GitHub push/authentication is now operational via the ts-pc-zy HTTPS CONNECT proxy; the current branch is present on origin.
-
-Next phase is bounded to `WORKER_DONE → Event Dispatcher → WebSolRequest → Bridge`. No response application or PHASE_AUTO is accepted yet.
+Reviewer watch items: per-project dispatcher failure isolation (highest priority), terminal-run task identity fidelity, crash-window config reroute behavior, ledger retention/version handling, whitespace normalization, and heartbeat wording. None blocks this slice.

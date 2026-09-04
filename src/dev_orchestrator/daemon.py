@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from dev_orchestrator.bridge.server import make_bridge_server
 from dev_orchestrator.bridge.store import BrowserBridgeStore
+from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.storage.json_store import utc_now_iso, write_json, write_text
 from dev_orchestrator.web.server import make_server
@@ -77,8 +78,11 @@ def run_daemon(
 
     The monitor loop runs on the calling thread; the Web dashboard and the
     Browser Bridge each run on their own daemon thread, so one PID owns all
-    three surfaces. Stops are handled by the recorded ``daemon.pid`` only
-    (``stop-daemon``); nothing here starts Workers or advances tasks.
+    three surfaces. After each successful monitor tick the daemon dispatches
+    ``WORKER_DONE`` requests (Event Dispatcher -> WebSolRequest -> Bridge) into
+    each orchestration-ready project's exact binding queue. Stops are handled
+    by the recorded ``daemon.pid`` only (``stop-daemon``); nothing here starts
+    Workers or advances tasks.
     """
     runtime = Path(runtime_root)
     runtime.mkdir(parents=True, exist_ok=True)
@@ -124,10 +128,18 @@ def run_daemon(
     try:
         while True:
             last_error: Optional[str] = None
+            summary = None
             try:
-                run_monitor_once(config, runtime)
+                summary = run_monitor_once(config, runtime)
             except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
                 last_error = str(exc)
+            if last_error is None:
+                try:
+                    # First bounded event slice: WORKER_DONE -> WebSolRequest ->
+                    # the project's exact Bridge queue. Transport only.
+                    dispatch_worker_done_events(summary, bridge_store, runtime)
+                except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
+                    last_error = str(exc)
             state = "degraded" if last_error else "running"
             heartbeat = _monitor_heartbeat(
                 state=state, pid=pid, interval=interval,
