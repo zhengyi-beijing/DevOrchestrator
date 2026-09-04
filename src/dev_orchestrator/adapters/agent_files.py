@@ -155,6 +155,7 @@ class AgentFilesAdapter(ProjectAdapter):
 
         next_title: Optional[str] = None
         next_status: Optional[str] = None
+        next_text = ""
         if next_path.is_file():
             next_text = _read_tolerant(next_path)
             title_line = _first_matching_line(next_text, _NEXT_TITLE_RE)
@@ -183,6 +184,8 @@ class AgentFilesAdapter(ProjectAdapter):
         state = resolve_monitor_state(worker, next_status, next_updated_at)
         last_activity = _last_activity_utc(root, relative_runtime)
         task_id = extract_task_id(next_title)
+        if task_id is None:
+            task_id = extract_task_id(next_text)
         telemetry = worker_telemetry(
             project, worker, task_id, last_activity, runs_path, now=now
         )
