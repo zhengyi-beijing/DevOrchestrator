@@ -2,29 +2,26 @@
 
 Branch: `feature/browser-bridge-multiproject`
 
-Phase: **Response Consumer + Decision Guard**
-Status: **ACCEPTED — fresh independent review complete**
+Phase: **Browser reliability + response-side idempotency remediation**
+Status: **ACCEPTED — real LabDemo POC + fresh independent review complete**
 
-Frozen contract: `e127f28` (`test: freeze response consumer decision guard contract`).
-Implementation: `0166ef4` (`feat: accept response consumer decision guard`).
+Accepted baseline HEAD before this commit: `c894a00`.
 
-Accepted chain:
-- Bridge raw response → exact response marker + one JSON object;
-- strict `WebSolResponse` construction and echoed identity validation;
-- fresh repository branch/HEAD/dirty truth immediately before decision;
-- existing fail-closed Decision Guard;
-- persisted disposition only under `runtime/websol-decisions.json`;
-- project/binding isolation and at-most-once consumption across restarts;
-- no Worker execution, Agent Router actuation, or PHASE_AUTO in this slice.
+Delivered in this remediation:
+- unified daemon now enables `require_live_binding=True`;
+- configured binding is not treated as live presence;
+- UNBOUND occurrences stay frozen as `prepared` and resume the same request identity;
+- exact duplicate `/v1/response` replay is idempotent; conflicting replay remains fail-closed;
+- `websol-decisions.json` acts as a durable consumed-response tombstone so a consumed deterministic WORKER_DONE cannot be re-emitted after dispatcher/queue loss;
+- existing response completion/stability gate remains the browser-side final-response requirement;
+- no Worker actuation, PHASE_AUTO, project-name special case, or hardware action was added.
 
 Acceptance evidence:
-- focused Response Consumer + daemon integration: **9/9 PASS**;
-- full `tests_py`: **72/72 PASS**;
+- full `tests_py`: **83/83 PASS**;
 - Node syntax checks: PASS;
 - `git diff --check`: PASS;
-- frozen tests unchanged from `e127f28`;
-- fresh independent Reviewer #2: **ACCEPTED**, no blocking correctness,
-  safety, isolation, or scope finding.
+- real LabDemo POC: UNBOUND → same request_id/nonce → claim → complete response → Decision Guard → one disposition;
+- real duplicate-response replay: HTTP 200, unchanged `responded_at`, one decision, one occurrence;
+- fresh independent dsh Reviewer: **ACCEPTED**, no blocking correctness/safety/isolation/scope finding.
 
-Reviewer carry-over: branch-switch/unknown-enum dedicated tests, retention/
-pruning, dashboard disposition surfacing, and minor defensive cleanup.
+Deployment debt: TS-ZY_PC Tampermonkey is still running DevOrchestrator adapter **0.1.1**; repository adapter is **0.1.2**. Upgrade and final deployed-browser POC remain pending.

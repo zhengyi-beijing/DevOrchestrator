@@ -99,7 +99,7 @@ def run_daemon(
     bridge_thread: Optional[threading.Thread] = None
     try:
         server = make_server(listen, port, runtime, web_root)
-        bridge_store = BrowserBridgeStore(runtime / "bridge")
+        bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=True)
         bridge_server = make_bridge_server(bridge_listen, bridge_port, bridge_store)
     except Exception:
         # Never leave a live-looking pid file behind when a bind fails.

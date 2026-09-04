@@ -60,6 +60,36 @@ class BrowserBridgeStoreTests(unittest.TestCase):
             self.assertEqual(stored.response_text, "ok")
             self.assertEqual(store.get_response("r3", "n3").response_text, "ok")
 
+    def test_identical_response_replay_is_idempotent_but_conflicting_replay_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = BrowserBridgeStore(Path(td))
+            store.submit("chatgpt_web", "conv-A", req("alpha", "r-response", "n-response"), "p")
+            base = datetime(2026, 9, 4, tzinfo=timezone.utc)
+            claim = store.claim("chatgpt_web", "conv-A", now=base)
+            first = store.respond(
+                "chatgpt_web", "conv-A", "r-response", "n-response",
+                claim.claim_token, "same response", now=base + timedelta(seconds=1),
+            )
+            before = store.list_responded("chatgpt_web", "conv-A")
+            again = store.respond(
+                "chatgpt_web", "conv-A", "r-response", "n-response",
+                claim.claim_token, "same response", now=base + timedelta(minutes=5),
+            )
+            after = store.list_responded("chatgpt_web", "conv-A")
+            self.assertEqual(first, again)
+            self.assertEqual(before, after)
+            self.assertEqual(len(after), 1)
+            with self.assertRaises(BridgeConflictError):
+                store.respond(
+                    "chatgpt_web", "conv-A", "r-response", "n-response",
+                    "wrong-token", "same response", now=base + timedelta(minutes=5),
+                )
+            with self.assertRaises(BridgeConflictError):
+                store.respond(
+                    "chatgpt_web", "conv-A", "r-response", "n-response",
+                    claim.claim_token, "different response", now=base + timedelta(minutes=5),
+                )
+
     def test_pending_request_survives_store_reopen(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

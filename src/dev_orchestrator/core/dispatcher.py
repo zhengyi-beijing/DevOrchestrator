@@ -24,7 +24,9 @@ Guarantees (fail closed):
   ``(project_id, run_id, event, role)``, so repeated monitor ticks or a daemon
   restart can never enqueue a second request for the same occurrence. A
   persisted dispatcher ledger under the runtime root additionally prevents
-  re-submission once an occurrence has been dispatched.
+  re-submission once an occurrence has been dispatched, while a persisted
+  Response Consumer decision acts as a durable tombstone even if dispatcher or
+  Bridge transport state is later pruned/recovered.
 - Every eligible completed occurrence is frozen exactly once under the ledger
   as ``prepared`` with its request identity, fresh branch/head and rendered
   prompt. Delivery into a Bridge queue happens only when the project is
@@ -65,6 +67,7 @@ DISPATCHER_STATE_FILE = "dispatcher-state.json"
 _LEDGER_VERSION = 2
 _LEDGER_EVENT_KEY = WebSolEvent.WORKER_DONE.value  # "worker_done"
 _BROWSER_BRIDGE_TRANSPORT = "browser_bridge"
+_RESPONSE_DECISIONS_FILE = "websol-decisions.json"
 
 _STATE_PREPARED = "prepared"
 _STATE_SUBMITTED = "submitted"
@@ -204,6 +207,37 @@ def _save_ledger(path: Path, ledger: dict) -> None:
     write_json(path, ledger, indent=2)
 
 
+def _response_already_consumed(
+    dispatcher_path: Path, project_id: str, request_id: str
+) -> bool:
+    """Return whether Response Consumer already durably handled request_id.
+
+    The response decision ledger is a second-line tombstone independent of the
+    dispatcher ledger and Bridge queue. This prevents retention/pruning or
+    recovery of those transport-side files from re-emitting the same
+    deterministic WORKER_DONE request after its response was already consumed.
+    A present but malformed/conflicting tombstone fails closed instead of
+    risking a duplicate Web Sol turn.
+    """
+    decisions_path = dispatcher_path.with_name(_RESPONSE_DECISIONS_FILE)
+    if not decisions_path.exists():
+        return False
+    data = read_json(decisions_path, None)
+    if not isinstance(data, dict) or not isinstance(data.get("decisions"), dict):
+        raise RuntimeError("response decision ledger is malformed")
+    decisions = data["decisions"]
+    if request_id not in decisions:
+        return False
+    record = decisions[request_id]
+    if not isinstance(record, dict):
+        raise RuntimeError("response decision tombstone is malformed for {0}".format(request_id))
+    if _non_blank(record.get("request_id")) != request_id:
+        raise RuntimeError("response decision tombstone request_id mismatch for {0}".format(request_id))
+    if _non_blank(record.get("project_id")) != project_id:
+        raise RuntimeError("response decision tombstone project_id mismatch for {0}".format(request_id))
+    return True
+
+
 def _project_occurrences(ledger: dict, project_id: str) -> dict:
     entries = ledger[_LEDGER_EVENT_KEY]
     project = entries.get(project_id)
@@ -329,6 +363,10 @@ def _dispatch_one(
     if run_id is None or (task_id is None and stage_id is None):
         return None
 
+    request_id = _request_id(project_id, run_id)
+    if _response_already_consumed(path, project_id, request_id):
+        return None
+
     occurrences = _project_occurrences(ledger, project_id)
     prepared = occurrences.get(run_id)
     if isinstance(prepared, dict):
@@ -366,7 +404,7 @@ def _dispatch_one(
 
     request = WebSolRequest(
         project_id=project_id,
-        request_id=_request_id(project_id, run_id),
+        request_id=request_id,
         task_id=task_id,
         stage_id=stage_id,
         branch=truth.branch,

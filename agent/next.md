@@ -1,26 +1,21 @@
-# NEXT — LabDemo review-only POC → Transition Executor
+# NEXT — Deploy adapter 0.1.2 → final deployed-browser POC
 
-Status: **AUTHORIZED BY OWNER**
+Status: **NOT YET EXECUTED**
 
-Step 1 — real LabDemo review-only integration POC:
-- add one real LabDemo project entry with exact repo path/worker runtime;
-- bind it to its intended ChatGPT conversation;
-- no LabDemo code modification for the POC;
-- observe an existing/synthetic completed Worker occurrence only;
-- prove WORKER_DONE → ChatGPT Reviewer → raw response → validated disposition;
-- verify exact binding isolation and no Worker start/restart.
+Immediate next candidate:
+- upgrade the DevOrchestrator Tampermonkey adapter on TS-ZY_PC from 0.1.1 to repository version 0.1.2;
+- preserve the real topology: XLabServer runs LabDemo/DevOrchestrator, TS-ZY_PC runs Chrome/ChatGPT;
+- use an explicit, documented browser-to-XLabServer Bridge path instead of relying on an accidental localhost assumption;
+- rerun one final real LabDemo review-only POC with the deployed 0.1.2 adapter.
 
-POC gate:
-- fresh LabDemo branch/HEAD/dirty truth must be used;
-- one request, one response, one persisted disposition;
-- no project-crossing and no duplicate/reclaim resend;
-- cleanly stop/restore temporary POC runtime after evidence capture.
+Final deployment gate:
+- initial UNBOUND remains prepared and does not submit;
+- rebind reuses the same request_id/nonce/prompt;
+- one browser prompt only;
+- response is POSTed only after the full assistant turn is stable;
+- Response Consumer produces exactly one Decision Guard disposition;
+- exact duplicate response replay remains idempotent;
+- no duplicate WORKER_DONE after daemon restart or runtime-state pruning covered by the durable tombstone;
+- no Worker start/restart, no PHASE_AUTO, no hardware action.
 
-Step 2 — only after POC PASS: Transition Executor / Worker actuation.
-Bounded goal: validated disposition → explicit transition intent → Agent Router
-→ at most one Worker action, with owner gates and fresh repository revalidation.
-
-Required safety: fail closed on dirty/stale/unknown state; OWNER_GATE/STOP never
-start a Worker; no test weakening; no project-name special cases; no hardware;
-no PHASE_AUTO in this slice. Freeze RED tests before implementation and require
-fresh independent Reviewer before acceptance/push.
+After that deployment gate passes, the next architectural slice may be Transition Executor / Worker actuation, but it requires a separate owner authorization and a new frozen contract.

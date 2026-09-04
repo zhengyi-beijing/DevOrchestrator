@@ -503,9 +503,12 @@ class BrowserBridgeStore:
     ) -> StoredResponse:
         """Store the raw assistant response for one claimed request.
 
-        The response must present the exact binding, request id, nonce and
-        claim token of a claim whose lease has not yet expired; any mismatch —
-        including an expired lease whose state/token/nonce still match — raises
+        The first response must present the exact binding, request id, nonce and
+        claim token of a claim whose lease has not yet expired. Once that exact
+        response has been accepted, an identical replay with the same nonce,
+        claim token and response text is idempotent even after the original
+        lease window; it returns the already-stored response without mutating
+        queue state. Any non-identical replay or identity mismatch raises
         :class:`BridgeConflictError` and never changes queue state.
         """
         _require_route(adapter, binding_id)
@@ -521,6 +524,25 @@ class BrowserBridgeStore:
                 raise BridgeConflictError(
                     "no request {0!r} exists in binding {1!r}".format(request_id, binding_id)
                 )
+            if record.get("state") == STATE_RESPONDED:
+                identical_replay = (
+                    record.get("nonce") == nonce
+                    and record.get("claim_token") == claim_token
+                    and record.get("response_text") == response_text
+                )
+                if identical_replay:
+                    return StoredResponse(
+                        adapter=adapter,
+                        binding_id=binding_id,
+                        request_id=request_id,
+                        nonce=nonce,
+                        response_text=response_text,
+                    )
+                raise BridgeConflictError(
+                    "response for request {0!r} conflicts with the already "
+                    "accepted response".format(request_id)
+                )
+
             expires_at = _parse_iso(record.get("lease_expires_at"))
             valid = (
                 record.get("state") == STATE_CLAIMED

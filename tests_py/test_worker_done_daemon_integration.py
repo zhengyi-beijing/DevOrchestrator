@@ -1,6 +1,7 @@
 import http.client
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -83,7 +84,20 @@ class WorkerDoneDaemonIntegrationTests(unittest.TestCase):
                 bridge = json.loads((runtime / "bridge.json").read_text(encoding="utf-8"))
                 self.assertEqual({pid, daemon["pid"], monitor["pid"], web["pid"], bridge["pid"]}, {pid})
 
-                status, payload = claim(bridge_port, "conv-p1")
+                ledger = json.loads((runtime / "dispatcher-state.json").read_text(encoding="utf-8"))
+                occurrence = next(iter(ledger["worker_done"]["p1"]["occurrences"].values()))
+                self.assertEqual(occurrence["state"], "prepared")
+                self.assertEqual(occurrence["delivery_state"], "unbound")
+
+                status0, payload0 = claim(bridge_port, "conv-p1")
+                self.assertEqual(status0, 204)
+                self.assertIsNone(payload0)
+
+                deadline = time.time() + 8
+                status, payload = 204, None
+                while time.time() < deadline and status == 204:
+                    time.sleep(0.25)
+                    status, payload = claim(bridge_port, "conv-p1")
                 self.assertEqual(status, 200)
                 self.assertEqual(payload["project_id"], "p1")
                 self.assertEqual(payload["event"], "worker_done")

@@ -62,7 +62,15 @@ class ResponseConsumerDaemonIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(started.returncode, 0, started.stderr)
             try:
-                status, claimed = claim(bridge_port, "conv-p1")
+                status0, claimed0 = claim(bridge_port, "conv-p1")
+                self.assertEqual(status0, 204)
+                self.assertIsNone(claimed0)
+
+                claim_deadline = time.time() + 8
+                status, claimed = 204, None
+                while time.time() < claim_deadline and status == 204:
+                    time.sleep(0.25)
+                    status, claimed = claim(bridge_port, "conv-p1")
                 self.assertEqual(status, 200)
                 response_status, _ = post_response(
                     bridge_port, claimed, structured_response(claimed)

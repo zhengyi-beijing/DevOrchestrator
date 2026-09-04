@@ -51,6 +51,14 @@ class BridgeHttpTests(unittest.TestCase):
                 })
                 self.assertEqual(status, 200)
                 self.assertEqual(ack["state"], "responded")
+                status2, ack2 = post(port, "/v1/response", {
+                    "adapter":"chatgpt_web", "binding_id":"conv-A",
+                    "request_id":"req-http", "nonce":"nonce-http",
+                    "claim_token":claim["claim_token"],
+                    "response_text":"[DEVORCH_WEB_SOL_RESPONSE req-http] ok",
+                })
+                self.assertEqual(status2, 200)
+                self.assertEqual(ack2, ack)
             finally:
                 server.shutdown(); server.server_close(); thread.join(timeout=2)
 

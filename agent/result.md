@@ -1,33 +1,27 @@
-# RESULT — Response Consumer + Decision Guard
+# RESULT — Browser reliability + response-side idempotency remediation
 
 Verdict: **ACCEPTED**
 
-Implementation commit: `0166ef4`.
-Frozen contract commit: `e127f28`.
+Implemented against baseline `c894a00`.
 
 Delivered:
-1. `core/response_consumer.py` strictly parses one exact Web Sol response.
-2. Original request identity is reconstructed from durable Bridge/dispatcher state.
-3. Fresh repository truth is re-read immediately before the existing guard.
-4. Guard output is persisted as disposition only; no Worker action is executed.
-5. `bridge/store.py` adds only read-only responded-record observation.
-6. Unified daemon consumes responded records after a successful monitor tick.
+1. `daemon.py` creates the real daemon Bridge store with live-binding enforcement enabled.
+2. `bridge/store.py` accepts only byte-identical duplicate responses with the same nonce/claim token as idempotent replay; non-identical replay remains a conflict.
+3. `core/dispatcher.py` consults consumed `websol-decisions.json` records as durable tombstones before emitting deterministic WORKER_DONE requests.
+4. Integration/unit tests cover UNBOUND-before-presence, rebind with stable identity, duplicate response POST, one-disposition consumption, and replay suppression after dispatcher/queue loss.
+5. Browser bridge design documentation records response replay and consumed-response tombstone semantics.
 
-Verified outcomes:
-- valid response → APPLY with bounded `next_action`;
-- identity mismatch → IGNORE;
-- stale branch/HEAD → STALE;
-- dirty repository → REVIEW_REQUIRED;
-- OWNER_GATE → OWNER_GATE;
-- malformed/extra/unknown/invalid decision-action → STOP.
+Real LabDemo evidence:
+- request: `worker_done:labdemo:labdemo-20260904T075412066Z-23356`;
+- nonce preserved across UNBOUND → live binding recovery;
+- complete structured response stored and consumed successfully;
+- Decision Guard produced `review_required` because the LabDemo worktree was dirty;
+- queue/dispatcher each remained single-entry for the occurrence;
+- exact response replay returned HTTP 200 without changing `responded_at` or creating another decision.
 
-Acceptance evidence:
-- focused tests: **9/9 PASS**;
-- full Python regression: **72/72 PASS**;
-- Node checks and `git diff --check`: PASS;
-- frozen tests unchanged;
-- fresh independent Reviewer #2 final verdict: **ACCEPTED**.
+Verification:
+- full Python regression: **83/83 PASS**;
+- Node syntax checks + `git diff --check`: PASS;
+- Fresh Independent Reviewer: **ACCEPTED**.
 
-Non-blocking findings: add explicit branch-switch/unknown-enum frozen cases;
-plan retention/pruning for Bridge responses and decision history; surface
-validated dispositions in the dashboard later.
+Non-blocking reviewer notes: minor module-doc drift, dispatcher/consumer malformed-ledger tolerance asymmetry, wall-clock integration-test sensitivity, and one daemon live-binding design-doc clarification.

@@ -73,6 +73,26 @@ class ResponseConsumerTests(unittest.TestCase):
             self.assertNotIn("worker_pid", record)
             self.assertNotIn("executed", record)
 
+    def test_duplicate_response_replay_produces_only_one_disposition(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, runtime, store, summary, claim = setup_case(Path(td))
+            raw = response_text(claim)
+            respond(store, claim, raw)
+            respond(store, claim, raw)
+
+            first = consume_websol_responses(summary, store, runtime)
+            second = consume_websol_responses(
+                summary, BrowserBridgeStore(runtime / "bridge"), runtime
+            )
+
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0].request_id, claim.request_id)
+            self.assertEqual(second, [])
+            decisions = json.loads(
+                (runtime / "websol-decisions.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(list(decisions["decisions"]), [claim.request_id])
+
     def test_malformed_or_multiple_json_objects_stop_fail_closed(self):
         cases = ["not-json", "{}\n{}"]
         for index, suffix in enumerate(cases):

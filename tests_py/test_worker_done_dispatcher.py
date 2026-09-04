@@ -1,10 +1,11 @@
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from dev_orchestrator.bridge.store import BrowserBridgeStore
-from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
+from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE, dispatch_worker_done_events
 
 
 def git(root: Path, *args: str) -> str:
@@ -82,6 +83,32 @@ class WorkerDoneDispatcherTests(unittest.TestCase):
             again = dispatch_worker_done_events(summary, reopened, runtime)
             self.assertEqual(again, [])
             self.assertIsNone(reopened.claim("chatgpt_web", "conv-A"))
+
+    def test_consumed_response_tombstone_prevents_replay_after_dispatch_and_queue_loss(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; make_repo(repo)
+            runtime = base / "runtime"; summary = {"projects": [snap("alpha", repo, "conv-A", "run-1")]}
+            first_store = BrowserBridgeStore(runtime / "bridge")
+            first = dispatch_worker_done_events(summary, first_store, runtime)
+            self.assertEqual(len(first), 1)
+            request_id = first[0].request_id
+            (runtime / "websol-decisions.json").write_text(json.dumps({
+                "version": 1,
+                "decisions": {
+                    request_id: {
+                        "project_id": "alpha",
+                        "request_id": request_id,
+                        "disposition": "apply",
+                        "next_action": "next_task",
+                    }
+                },
+            }), encoding="utf-8")
+            (runtime / DISPATCHER_STATE_FILE).unlink()
+
+            pruned_store = BrowserBridgeStore(runtime / "bridge-after-prune")
+            again = dispatch_worker_done_events(summary, pruned_store, runtime)
+            self.assertEqual(again, [])
+            self.assertIsNone(pruned_store.claim("chatgpt_web", "conv-A"))
 
     def test_two_projects_route_to_distinct_bindings(self):
         with tempfile.TemporaryDirectory() as td:
