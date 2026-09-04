@@ -1,22 +1,39 @@
 # DevOrchestrator Backlog
 
-Longer-horizon work that is intentionally not part of the currently authorized execution slice.
+Longer-horizon work intentionally outside the currently accepted portable
+integration V1 slice.
 
 ## Machine-independent development environment
 
-Goal: make normal DevOrchestrator development and most integration testing independent of XLabServer or any single lab machine. XLabServer should remain only a real integration target, not a development prerequisite.
+Status: **PORTABLE V1 BASELINE DELIVERED 2026-09-04 / FOLLOW-UPS REMAIN**
 
-Scope candidates:
-- keep machine-specific project paths, browser bindings, ports, and runtime locations in local overrides rather than repository assumptions;
-- provide a portable development/test configuration using temporary repositories, fake Worker state, and a fake browser adapter/transport;
-- keep generated runtime/evidence fully outside tracked source or covered by `.gitignore`;
-- allow core, Web UI, Bridge, dispatcher, response consumer, Decision Guard, and router tests to run on another Windows host and, where practical, macOS/Linux;
-- document how to clone/bootstrap the repository on a new machine without XLabServer access;
-- preserve a separate explicit real-integration profile for LabDemo/XLabServer and deployed ChatGPT browser validation.
+Delivered:
+- clean clone on ZXZ-PC runs the normal automated suite without XLabServer;
+- external repositories are registered through project configuration only;
+- relative `repo_path` is resolved from the selected config directory;
+- `validate-config` checks canonical config, adapter availability and Git truth;
+- generic tracked example/configuration documentation no longer requires a
+  LabDemo/XLabServer path;
+- temporary/fake repositories cover normal Core integration tests.
 
-Acceptance target:
-- a clean clone on another development computer can install dependencies and run the normal automated suite without XLabServer;
-- no tracked configuration requires `D:\LabDemo\LabDemo`, `10.138.7.167`, or any other XLabServer-specific value;
-- real LabDemo/XLabServer tests remain opt-in and clearly separated from portable CI/development tests.
+Remaining candidates:
+- verify macOS/Linux portability in CI or equivalent clean hosts;
+- decide whether a non-editable packaged distribution is a supported product
+  surface; current V1 deployment model is a standalone DevOrchestrator clone;
+- isolate any remaining machine-specific browser/runtime deployment overrides;
+- add a dynamic third-party ProjectAdapter registration/discovery surface only if a
+  real target cannot adopt the existing `agent_files` contract;
+- keep a separate opt-in real LabDemo/XLabServer + deployed-browser profile.
 
-Priority: backlog; schedule only with separate owner authorization.
+## Deployed ChatGPT browser POC
+
+Adapter 0.1.2 real-browser deployment on TS-ZY_PC with XLabServer remains a
+valuable integration gate, but it is not a prerequisite for normal Core
+feature development or third-party project onboarding.
+
+## Transition Executor / Worker actuation
+
+Still owner-gated. Before implementation, freeze a new contract covering
+execution authority, idempotency/replay, project isolation, stop conditions,
+and stage/owner boundaries. Do not infer authorization from a valid Web Sol
+disposition alone.

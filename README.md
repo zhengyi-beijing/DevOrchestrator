@@ -1,104 +1,122 @@
-# Dev Orchestrator
+# DevOrchestrator
 
-Independent local observability/orchestration service for AI-assisted development projects.
+Project-neutral local orchestration infrastructure for AI-assisted development.
+One DevOrchestrator service can observe multiple external Git repositories,
+route bounded reasoning events through a Browser Bridge, and persist validated
+decision dispositions without embedding product-specific logic in Core.
 
-## Current scope: P2
+## Current authority boundary
 
-P0 established the read-only 60-second project monitor. P1 added runtime telemetry, Worker history, activity health, and ETA. P2 adds a dependency-free read-only Web dashboard over those normalized runtime files.
+Implemented:
 
-The project still does **not** invoke AI, start Workers, advance phases, mutate observed Git repositories, run hardware actions, or expose a generic shell/prompt endpoint.
+- multi-project read-only repository/Worker monitoring;
+- one-process daemon with dashboard and Browser Bridge;
+- configuration-driven `ProjectAdapter` selection;
+- WORKER_DONE reasoning-event dispatch;
+- ChatGPT Web binding/claim/renew/response transport;
+- response stability, replay/idempotency and live-binding gates;
+- Response Consumer + repository-truth Decision Guard;
+- AgentBackend registry/router foundation.
 
-## Architecture
+Not implemented/authorized:
 
-```text
-Observed projects (read-only)
-        |
-        v
-src/monitor.ps1  +  src/telemetry.ps1
-        |
-        v
-runtime/*.json + runtime/history/*.jsonl
-        |
-        v
-src/web-server.ps1
-        |
-        v
-Browser dashboard
-```
+- executing a `next_action`;
+- starting/restarting a project Worker from a Web Sol decision;
+- PHASE_AUTO or automatic stage crossing;
+- hardware actions.
 
-Monitor and Web server are independent processes. A dead/stale monitor is shown explicitly by the dashboard rather than hidden.
-## Monitor commands
+## Portable external-project onboarding
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\monitor.ps1 -Once
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\start-monitor.ps1 -IntervalSeconds 60
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\status-monitor.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\stop-monitor.ps1
-```
+DevOrchestrator runs as a standalone service. External product repositories are
+referenced by configuration; they do not need to vendor or import this source.
+Generic Git repositories can be monitored this way. The currently implemented
+WORKER_DONE/Web Sol flow additionally expects the `agent_files` project
+contract (or another registered ProjectAdapter); dynamic third-party adapter
+discovery is not part of V1. See `docs/PORTABLE_PROJECT_INTEGRATION.md`.
 
-## Web dashboard
-
-Default loopback start:
+Copy the example configuration:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\start-web.ps1
+Copy-Item .\config\projects.example.json .\config\projects.json
 ```
 
-Open:
+Edit `project_id` and `repo_path`. Relative `repo_path` values are resolved from
+the directory containing `projects.json`, not from the current shell directory.
 
-```text
-http://127.0.0.1:8770/
+Validate the integration before starting services:
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python -m dev_orchestrator validate-config --config .\config\projects.json
 ```
+
+A project without a browser conversation binding is valid but monitor-only.
+`validate-config` reports `orchestration_ready=false` explicitly.
+
+## Run
+
+One monitor tick:
+
+```powershell
+python -m dev_orchestrator monitor --once `
+  --config .\config\projects.json `
+  --runtime-root .\runtime
+```
+
+Preferred unified daemon:
+
+```powershell
+python -m dev_orchestrator start-daemon `
+  --config .\config\projects.json `
+  --runtime-root .\runtime
+```
+
+Default surfaces:
+
+- dashboard: `http://127.0.0.1:8770/`
+- Browser Bridge: `http://127.0.0.1:8765/`
 
 Status / stop:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\status-web.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\stop-web.ps1
-```
-Explicit LAN bind example (only when LAN exposure is intended):
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\start-web.ps1 -ListenAddress 10.138.7.167 -Port 8770
+python -m dev_orchestrator status-daemon --runtime-root .\runtime
+python -m dev_orchestrator stop-daemon --runtime-root .\runtime
 ```
 
-The P2 server uses `.NET TcpListener`, so a specific local IP bind does not require an HttpListener URLACL. Windows firewall/network policy can still control reachability.
+Legacy independent monitor/Web lifecycle commands remain compatibility paths,
+but one daemon per computer is the target architecture.
 
-### Read-only HTTP surface
-
-Allowed methods: `GET`, `HEAD` only.
-
-- `/` dashboard
-- `/app.js`, `/style.css`
-- `/api/monitor`
-- `/api/summary`
-- `/api/projects/<id>`
-- `/api/events?limit=N` (bounded to 100)
-- `/api/runs?limit=N` (bounded to 100)
-
-All other routes return 404; write methods return 405; encoded/raw path traversal is rejected. There are no Worker, shell, prompt, Git mutation, or hardware-control endpoints.
-
-## Runtime state
-
-- `runtime/monitor.json`: monitor heartbeat.
-- `runtime/summary.json`: normalized registered-project overview.
-- `runtime/projects/<id>.json`: project state including telemetry/ETA.
-- `runtime/history/events.jsonl`: state/run transitions.
-- `runtime/history/runs.jsonl`: immutable terminal Worker samples.
-- `runtime/web.json`: Web server heartbeat and bind information.
 ## Tests
 
+Python regression suite:
+
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\telemetry-selftest.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\web-selftest.ps1
+$env:PYTHONPATH = "$PWD\src"
+python -m unittest discover -s tests_py -v
 ```
 
-`web-selftest.ps1` is hardware-free and uses fixture runtime state plus loopback HTTP. It verifies static/API success, stale-monitor derivation, bounded history, HEAD, 404, 405, encoded traversal rejection, and start/status/stop lifecycle.
+Userscript syntax check:
 
-## Safety boundary
+```powershell
+node --check .\browser\chatgpt-web-adapter.user.js
+```
 
-P2 is observation only. Software acceptance does not imply hardware acceptance. Dashboard state is a projection of normalized project state and does not infer safety or hardware truth beyond the data provided by each registered adapter.
+Repository hygiene:
 
-## Planned next layer
+```powershell
+git diff --check
+```
 
-P3 is an explicit `PHASE_AUTO` state machine with hard phase/hardware/architecture gates. P3 is not implemented or authorized by P2.
+The normal automated suite uses temporary repositories and local loopback
+services; XLabServer, LabDemo hardware, and a deployed ChatGPT browser are not
+required for ordinary Core development.
+
+## Repository ownership boundary
+
+DevOrchestrator owns its configured runtime directory. Monitoring, Bridge
+transport and response validation do not write into observed product
+repositories. Current Worker actuation remains intentionally absent.
+
+Machine-specific project paths, browser bindings and runtime choices belong in
+the ignored `config/projects.json` or other explicitly selected local config,
+not in Core source.

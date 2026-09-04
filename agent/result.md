@@ -1,27 +1,27 @@
-# RESULT — Browser reliability + response-side idempotency remediation
+# RESULT — Portable Integration Contract V1
 
-Verdict: **ACCEPTED**
+Verdict: **ACCEPTED BY AUTOMATED CONTRACT**
 
-Implemented against baseline `c894a00`.
+Implemented against baseline `8d8fe98`.
 
 Delivered:
-1. `daemon.py` creates the real daemon Bridge store with live-binding enforcement enabled.
-2. `bridge/store.py` accepts only byte-identical duplicate responses with the same nonce/claim token as idempotent replay; non-identical replay remains a conflict.
-3. `core/dispatcher.py` consults consumed `websol-decisions.json` records as durable tombstones before emitting deterministic WORKER_DONE requests.
-4. Integration/unit tests cover UNBOUND-before-presence, rebind with stable identity, duplicate response POST, one-disposition consumption, and replay suppression after dispatcher/queue loss.
-5. Browser bridge design documentation records response replay and consumed-response tombstone semantics.
+1. Config-relative `repo_path` semantics for relocatable deployment layouts.
+2. `validate-config --config <path>` as a read-only onboarding gate.
+3. Fail-closed adapter/repository validation without requiring a browser binding.
+4. A generic project example with no tracked LabDemo/XLabServer path requirement.
+5. A public standalone-service integration contract and current README.
+6. New integration tests using arbitrary temporary external Git repositories.
 
-Real LabDemo evidence:
-- request: `worker_done:labdemo:labdemo-20260904T075412066Z-23356`;
-- nonce preserved across UNBOUND → live binding recovery;
-- complete structured response stored and consumed successfully;
-- Decision Guard produced `review_required` because the LabDemo worktree was dirty;
-- queue/dispatcher each remained single-entry for the occurrence;
-- exact response replay returned HTTP 200 without changing `responded_at` or creating another decision.
+Key evidence:
+- config-only external project monitor: PASS and observed repo stays unchanged;
+- relative project path independent of process CWD: PASS;
+- valid monitor-only project validation: PASS;
+- missing repository / unknown adapter fail closed: PASS;
+- full Python regression: **87/87 PASS**;
+- Userscript syntax + Git whitespace checks: PASS.
 
-Verification:
-- full Python regression: **83/83 PASS**;
-- Node syntax checks + `git diff --check`: PASS;
-- Fresh Independent Reviewer: **ACCEPTED**.
-
-Non-blocking reviewer notes: minor module-doc drift, dispatcher/consumer malformed-ledger tolerance asymmetry, wall-clock integration-test sensitivity, and one daemon live-binding design-doc clarification.
+Authority unchanged:
+- no Worker start/restart;
+- no `next_action` execution;
+- no PHASE_AUTO;
+- no stage crossing or hardware action.

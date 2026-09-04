@@ -27,6 +27,7 @@ from typing import Any, Optional, Sequence
 
 from dev_orchestrator.config import (
     REPO_ROOT,
+    load_projects_config,
     resolve_config_path,
     resolve_runtime_root,
     resolve_web_root,
@@ -172,6 +173,57 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         return _monitor_loop(config, runtime, interval, utc_now_iso())
     except KeyboardInterrupt:
         return 0
+
+
+def cmd_validate_config(args: argparse.Namespace) -> int:
+    """Validate a portable project configuration without starting services."""
+    from dev_orchestrator.adapters import get_project_adapter
+    from dev_orchestrator.core.repository import read_repository_truth
+
+    config_path = resolve_config_path(args.config)
+    try:
+        config = load_projects_config(config_path)
+    except (OSError, ValueError) as exc:
+        _print_json({
+            "valid": False,
+            "config": str(config_path),
+            "project_count": 0,
+            "projects": [],
+            "error": str(exc),
+        })
+        return 1
+
+    projects = []
+    all_valid = True
+    for project in config.get("projects") or []:
+        adapter_error = ""
+        try:
+            get_project_adapter(str(project.get("adapter") or ""))
+            adapter_valid = True
+        except ValueError as exc:  # unknown/unregistered adapter: fail closed
+            adapter_valid = False
+            adapter_error = str(exc)
+        truth = read_repository_truth(project.get("repo_path") or "")
+        project_valid = adapter_valid and truth.valid
+        all_valid = all_valid and project_valid
+        projects.append({
+            "project_id": project.get("project_id"),
+            "repo_path": project.get("repo_path"),
+            "adapter": project.get("adapter"),
+            "adapter_valid": adapter_valid,
+            "adapter_error": adapter_error or None,
+            "repository_valid": truth.valid,
+            "repository_error": truth.error or None,
+            "orchestration_ready": bool(project.get("orchestration_ready")),
+        })
+
+    _print_json({
+        "valid": all_valid,
+        "config": str(config_path),
+        "project_count": len(projects),
+        "projects": projects,
+    })
+    return 0 if all_valid else 1
 
 
 def cmd_web(args: argparse.Namespace) -> int:
@@ -578,9 +630,14 @@ def _display_url(address: str, port: int) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dev_orchestrator",
-        description="Read-only DevOrchestrator monitor and web dashboard (P2-equivalent Python v1).",
+        description="Project-neutral DevOrchestrator multi-project service.",
     )
     sub = parser.add_subparsers(dest="command", metavar="command")
+
+    validate_config = sub.add_parser(
+        "validate-config", help="validate project config/repositories without starting services"
+    )
+    validate_config.add_argument("--config", default=None, help="path to projects.json")
 
     monitor = sub.add_parser("monitor", help="run one tick (--once) or the heartbeat loop")
     monitor.add_argument("--once", action="store_true", help="run a single tick and print the summary")
@@ -650,6 +707,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _COMMANDS = {
+    "validate-config": cmd_validate_config,
     "monitor": cmd_monitor,
     "web": cmd_web,
     "daemon": cmd_daemon,

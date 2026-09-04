@@ -14,6 +14,8 @@ Canonical project fields (design: ``docs/MULTIPROJECT_WEBSOL_CORE_DESIGN.md``):
 Rules enforced here:
 
 - ``project_id``/``repo_path`` normalize from ``id``/``root`` when present.
+- Relative ``repo_path`` values resolve from the configuration file directory,
+  not the DevOrchestrator process working directory.
 - Every project requires a non-blank canonical ``repo_path`` (legacy ``root``
   is accepted); missing/blank paths are rejected with explicit repo-path
   evidence.
@@ -95,6 +97,10 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
             "(set canonical repo_path or legacy root)".format(config_path, index)
         )
     repo_path = raw_path.strip()
+    repo_candidate = Path(repo_path).expanduser()
+    if not repo_candidate.is_absolute():
+        repo_candidate = (config_path.parent / repo_candidate).resolve(strict=False)
+        repo_path = str(repo_candidate)
 
     normalized = dict(project)
     normalized["project_id"] = project_id

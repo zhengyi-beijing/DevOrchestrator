@@ -1,22 +1,14 @@
-# P2 COMPLETE — Read-only Web Dashboard
+# DevOrchestrator current handoff
 
-Status: **IMPLEMENTED / ACCEPTANCE EVIDENCE GREEN / NO P3 AUTHORIZATION**.
+Canonical live handoff files are under `agent/`:
 
-## Delivered
+- `agent/CURRENT.md` — accepted current state and evidence;
+- `agent/result.md` — result of the most recent bounded slice;
+- `agent/next.md` — next authorized/candidate bounded work.
 
-- Dependency-free `.NET TcpListener` Web server under `src/web-server.ps1`.
-- Default `127.0.0.1:8770`, with explicit `-ListenAddress` / `-Port` support.
-- Exact static/API route allowlist; GET/HEAD only; 405 write-method rejection; raw/encoded traversal rejection.
-- Dashboard shows monitor health/staleness, project state/gate, Git, Worker, telemetry/ETA, recent transitions, and recent runs.
-- Independent `start-web`, `status-web`, `stop-web` lifecycle.
-- Hardware-free `tests/web-selftest.ps1` with fixture runtime and loopback HTTP.
+Current baseline: **Portable Integration Contract V1 implemented and automated acceptance green**.
 
-## Acceptance evidence
-
-- `web-selftest.ps1`: PASS.
-- `telemetry-selftest.ps1`: 10/10 PASS.
-- No observed-project Worker, Git mutation, AI invocation, build, or hardware action was added to P2.
-
-## Hard stop
-
-P3 `PHASE_AUTO` remains NOT IMPLEMENTED / NOT AUTHORIZED. Stop for owner direction.
+The historical P2-only dashboard milestone is superseded by the current
+multi-project daemon + Browser Bridge + Response Consumer/Decision Guard
+implementation. Worker actuation and Transition Executor remain separately
+owner-gated; see `agent/next.md` and `docs/backlog.md`.

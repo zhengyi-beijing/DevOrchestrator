@@ -1,18 +1,17 @@
 {
   "projects": [
     {
-      "id": "labdemo",
-      "name": "LabDemo",
-      "root": "D:\\LabDemo\\LabDemo",
+      "project_id": "your-project",
+      "name": "Your Project",
+      "repo_path": "../../your-project",
       "worker_runtime": "tmp\\worker-dsh",
+      "adapter": "agent_files",
       "eta": {
         "default_worker_minutes": { "min": 30, "max": 90 },
         "historical_min_samples": 3,
         "stall_warning_minutes": 15,
         "hard_timeout_minutes": 180,
-        "task_overrides": [
-          { "task_id": "P4.2.3b", "min": 45, "max": 90 }
-        ]
+        "task_overrides": []
       }
     }
   ]

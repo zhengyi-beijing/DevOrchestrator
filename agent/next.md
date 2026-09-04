@@ -1,21 +1,28 @@
-# NEXT — Deploy adapter 0.1.2 → final deployed-browser POC
+# NEXT — Portable bootstrap hardening + real external-project smoke test
 
-Status: **NOT YET EXECUTED**
+Status: **READY CANDIDATE / NO WORKER-ACTUATION AUTHORIZATION**
 
-Immediate next candidate:
-- upgrade the DevOrchestrator Tampermonkey adapter on TS-ZY_PC from 0.1.1 to repository version 0.1.2;
-- preserve the real topology: XLabServer runs LabDemo/DevOrchestrator, TS-ZY_PC runs Chrome/ChatGPT;
-- use an explicit, documented browser-to-XLabServer Bridge path instead of relying on an accidental localhost assumption;
-- rerun one final real LabDemo review-only POC with the deployed 0.1.2 adapter.
+Recommended next bounded slice:
+- exercise the documented onboarding flow against one real non-LabDemo project
+  using only local project configuration (monitor-only first, then determine whether
+  its task/Worker contract is `agent_files` compatible);
+- verify `validate-config`, one monitor tick, dashboard projection, and daemon
+  lifecycle without changing DevOrchestrator Core for that project;
+- identify any remaining assumptions that force project-specific files or host paths;
+- if needed, harden bootstrap/launch scripts so a clean clone can be started
+  from an arbitrary working directory with explicit config/runtime locations.
 
-Final deployment gate:
-- initial UNBOUND remains prepared and does not submit;
-- rebind reuses the same request_id/nonce/prompt;
-- one browser prompt only;
-- response is POSTed only after the full assistant turn is stable;
-- Response Consumer produces exactly one Decision Guard disposition;
-- exact duplicate response replay remains idempotent;
-- no duplicate WORKER_DONE after daemon restart or runtime-state pruning covered by the durable tombstone;
-- no Worker start/restart, no PHASE_AUTO, no hardware action.
+Acceptance target:
+- real external project is registered with config only;
+- no source-code branch or product-name special case is added;
+- observed project remains unchanged by monitor/Bridge/Decision Guard;
+- full automated regression remains green;
+- any machine-specific values remain local/untracked configuration.
 
-After that deployment gate passes, the next architectural slice may be Transition Executor / Worker actuation, but it requires a separate owner authorization and a new frozen contract.
+Deferred independent integration gate:
+- deploy ChatGPT adapter 0.1.2 on TS-ZY_PC and rerun the real LabDemo browser POC
+  when TS-ZY_PC/XLabServer are available.
+
+Hard stop:
+Transition Executor / Worker actuation still requires a separately frozen
+contract and explicit owner authorization.
