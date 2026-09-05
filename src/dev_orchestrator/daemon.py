@@ -27,6 +27,8 @@ from dev_orchestrator.bridge.server import make_bridge_server
 from dev_orchestrator.bridge.store import BrowserBridgeStore
 from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
 from dev_orchestrator.core.response_consumer import consume_websol_responses
+from dev_orchestrator.core.transition_executor import TransitionExecutor
+from dev_orchestrator.core.project_status import write_project_statuses
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.storage.json_store import utc_now_iso, write_json, write_text
 from dev_orchestrator.web.server import make_server
@@ -65,6 +67,24 @@ def _bridge_heartbeat(
     }
 
 
+def _run_orchestration_tick(
+    config: Path | str, runtime: Path, bridge_store: BrowserBridgeStore,
+    executor: TransitionExecutor, *, pid: int,
+) -> dict[str, Any]:
+    """Run one ordered control-plane tick and return the projected summary."""
+    raw_summary = run_monitor_once(config, runtime)
+    write_project_statuses(raw_summary, runtime, phase="monitor", daemon_state="running", pid=pid)
+    projected = executor.overlay_managed_runs(raw_summary)
+    dispatch_worker_done_events(projected, bridge_store, runtime)
+    write_project_statuses(projected, runtime, phase="dispatch", daemon_state="running", pid=pid)
+    consume_websol_responses(projected, bridge_store, runtime)
+    write_project_statuses(projected, runtime, phase="decision", daemon_state="running", pid=pid)
+    executor.advance(raw_summary, config)
+    projected = executor.overlay_managed_runs(raw_summary)
+    write_project_statuses(projected, runtime, phase="actuation", daemon_state="running", pid=pid)
+    return projected
+
+
 def run_daemon(
     config: Path | str,
     runtime_root: Path | str,
@@ -80,12 +100,11 @@ def run_daemon(
     The monitor loop runs on the calling thread; the Web dashboard and the
     Browser Bridge each run on their own daemon thread, so one PID owns all
     three surfaces. After each successful monitor tick the daemon dispatches
-    ``WORKER_DONE`` requests (Event Dispatcher -> WebSolRequest -> Bridge) into
-    each orchestration-ready project's exact binding queue, then consumes any
-    newly ``RESPONDED`` Bridge response through the Decision Guard into a
-    persisted disposition only. Stops are handled by the recorded
-    ``daemon.pid`` only (``stop-daemon``); nothing here starts Workers or
-    advances tasks.
+    ``WORKER_DONE`` requests into each project's exact binding queue, consumes
+    newly ``RESPONDED`` Bridge responses through the Decision Guard, then lets
+    the owner-authorized Transition Executor act on durable APPLY+NEXT_TASK
+    decisions. Project-local ``.devorch/status.json`` mirrors are refreshed at
+    each control-plane phase. Stops are handled by ``stop-daemon``.
     """
     runtime = Path(runtime_root)
     runtime.mkdir(parents=True, exist_ok=True)
@@ -128,29 +147,16 @@ def run_daemon(
     web_thread.start()
     bridge_thread.start()
     bridge_bound_port = int(bridge_server.server_address[1])
+    transition_executor = TransitionExecutor(runtime)
     try:
         while True:
             last_error: Optional[str] = None
-            summary = None
             try:
-                summary = run_monitor_once(config, runtime)
+                _run_orchestration_tick(
+                    config, runtime, bridge_store, transition_executor, pid=pid
+                )
             except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
                 last_error = str(exc)
-            if last_error is None:
-                try:
-                    # First bounded event slice: WORKER_DONE -> WebSolRequest ->
-                    # the project's exact Bridge queue. Transport only.
-                    dispatch_worker_done_events(summary, bridge_store, runtime)
-                except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
-                    last_error = str(exc)
-            if last_error is None:
-                try:
-                    # Response Consumer + Decision Guard: turn each newly
-                    # RESPONDED Bridge response into one persisted
-                    # disposition/intention. Never executes a next_action.
-                    consume_websol_responses(summary, bridge_store, runtime)
-                except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
-                    last_error = str(exc)
             state = "degraded" if last_error else "running"
             heartbeat = _monitor_heartbeat(
                 state=state, pid=pid, interval=interval,
@@ -159,20 +165,14 @@ def run_daemon(
             write_json(runtime / "monitor.json", heartbeat)
             write_json(
                 runtime / "daemon.json",
-                {
-                    **heartbeat,
-                    "listen_address": listen,
-                    "port": port,
-                    "bridge_listen_address": bridge_listen,
-                    "bridge_port": bridge_bound_port,
-                },
+                {**heartbeat, "listen_address": listen, "port": port,
+                 "bridge_listen_address": bridge_listen, "bridge_port": bridge_bound_port},
             )
             write_json(
                 runtime / "bridge.json",
                 _bridge_heartbeat(
-                    state=state, pid=pid, listen=bridge_listen,
-                    port=bridge_bound_port, started_at=started_at,
-                    last_error=last_error,
+                    state=state, pid=pid, listen=bridge_listen, port=bridge_bound_port,
+                    started_at=started_at, last_error=last_error,
                 ),
             )
             time.sleep(interval)

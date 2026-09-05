@@ -1,0 +1,671 @@
+"""Owner-authorized APPLY+NEXT_TASK Worker actuation.
+
+Contract: docs/TRANSITION_EXECUTOR_CONTRACT.md.  This Core component is the
+only V1 execution boundary.  Browser transport and Decision Guard remain
+non-executing; this executor acts only after their accepted disposition and an
+explicit local project execution policy.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+from dev_orchestrator.agents.base import AgentBackend
+from dev_orchestrator.agents.backends.agy import AgyBackend
+from dev_orchestrator.agents.backends.dsh import DshBackend
+from dev_orchestrator.agents.models import AgentRequest, AgentRole, AgentRunState
+from dev_orchestrator.agents.registry import BackendRegistry
+from dev_orchestrator.agents.router import AgentRouter
+from dev_orchestrator.config import load_projects_config
+from dev_orchestrator.core.repository import read_repository_truth
+from dev_orchestrator.core.project_status import write_execution_status
+from dev_orchestrator.core.websol import NextAction, WebSolEvent, WebSolRole
+from dev_orchestrator.monitor.telemetry import extract_task_id
+from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
+
+ACTUATION_FILE = "transition-executor.json"
+_LEDGER_VERSION = 1
+_ACTIVE_STATES = frozenset({"launching", "running"})
+_TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
+
+_DEFAULT_WORKER_PROMPT = (
+    "Execute exactly one bounded task from agent/next.md. Read repository "
+    "instructions and agent/CURRENT.md first. Implement the task, run the "
+    "required tests, update agent/CURRENT.md and agent/result.md, and update "
+    "agent/next.md to the next executable task when appropriate. Commit the "
+    "completed bounded task locally so the working tree is clean; do not push. "
+    "Stop after one task."
+)
+
+
+@dataclass(frozen=True)
+class ActuationLaunch:
+    project_id: str
+    source_request_id: str
+    task_id: str
+    backend_id: str
+    state: str
+
+
+def _empty_ledger() -> dict[str, Any]:
+    return {"version": _LEDGER_VERSION, "executions": {}}
+
+
+def _project_map(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(project.get("project_id")): project
+        for project in (config.get("projects") or [])
+        if isinstance(project, dict) and project.get("project_id")
+    }
+
+
+def _snapshot_map(summary: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(summary, dict) or not isinstance(summary.get("projects"), list):
+        return {}
+    return {
+        str(snapshot.get("project_id")): snapshot
+        for snapshot in summary["projects"]
+        if isinstance(snapshot, dict) and snapshot.get("project_id")
+    }
+
+
+def _current_task_id(snapshot: dict[str, Any]) -> Optional[str]:
+    telemetry = snapshot.get("telemetry")
+    if isinstance(telemetry, dict):
+        value = telemetry.get("task_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return extract_task_id(snapshot.get("next_title"))
+
+
+def _external_worker_active(snapshot: dict[str, Any]) -> bool:
+    worker = snapshot.get("worker")
+    if not isinstance(worker, dict) or worker.get("kind") != "task":
+        return False
+    return worker.get("state") in ("starting", "running")
+
+
+_SUPPORTED_BACKENDS = frozenset({"agy", "dsh"})
+
+
+def _non_blank_config(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]], str]:
+    raw = project.get("execution")
+    if not isinstance(raw, dict):
+        return None, "execution config missing"
+    if raw.get("enabled") is not True:
+        return None, "execution is disabled"
+    if raw.get("owner_authorized") is not True:
+        return None, "execution is not owner-authorized"
+    allowed = raw.get("allowed_next_actions")
+    if allowed != [NextAction.NEXT_TASK.value]:
+        return None, "allowed_next_actions must be exactly ['next_task']"
+
+    preferred = raw.get("preferred_backends")
+    if not isinstance(preferred, list) or not preferred:
+        return None, "preferred_backends must be a non-empty list"
+    if any(not isinstance(value, str) or not value.strip() for value in preferred):
+        return None, "preferred_backends entries must be non-blank strings"
+    preferred_ids = [value.strip() for value in preferred]
+    if len(set(preferred_ids)) != len(preferred_ids):
+        return None, "preferred_backends must not contain duplicates"
+    unknown = [value for value in preferred_ids if value not in _SUPPORTED_BACKENDS]
+    if unknown:
+        return None, "unsupported execution backend: {0}".format(unknown[0])
+
+    raw_backends = raw.get("backends", {})
+    if not isinstance(raw_backends, dict):
+        return None, "execution.backends must be an object"
+    backend_configs: dict[str, dict[str, Any]] = {}
+    for backend_id in preferred_ids:
+        config = raw_backends.get(backend_id, {})
+        if not isinstance(config, dict):
+            return None, "execution.backends.{0} must be an object".format(backend_id)
+        normalized: dict[str, Any] = {}
+        executable = config.get("executable")
+        if executable is not None:
+            executable = _non_blank_config(executable)
+            if executable is None:
+                return None, "{0} executable must be a non-blank string".format(backend_id)
+            normalized["executable"] = executable
+        if backend_id == "agy":
+            for key in ("model", "effort", "mode"):
+                value = config.get(key)
+                if value is not None:
+                    text = _non_blank_config(value)
+                    if text is None:
+                        return None, "agy {0} must be a non-blank string".format(key)
+                    normalized[key] = text
+            timeout = config.get("print_timeout")
+            if timeout is not None:
+                if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+                    return None, "agy print_timeout must be a positive integer"
+                normalized["print_timeout"] = timeout
+        backend_configs[backend_id] = normalized
+
+    prompt = raw.get("worker_prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        prompt = _DEFAULT_WORKER_PROMPT
+    bootstrap = raw.get("bootstrap")
+    normalized_bootstrap = None
+    if bootstrap is not None:
+        if not isinstance(bootstrap, dict):
+            return None, "execution.bootstrap must be an object"
+        request_id = _non_blank_config(bootstrap.get("request_id"))
+        task_id = _non_blank_config(bootstrap.get("task_id"))
+        if request_id is None or task_id is None:
+            return None, "execution.bootstrap requires non-blank request_id and task_id"
+        normalized_bootstrap = {"request_id": request_id, "task_id": task_id}
+
+    return {
+        "preferred_backends": tuple(preferred_ids),
+        "backends": backend_configs,
+        "worker_prompt": prompt.strip(),
+        "bootstrap": normalized_bootstrap,
+    }, ""
+
+
+class TransitionExecutor:
+    """Long-lived daemon-owned transition executor with project-scoped routing."""
+
+    def __init__(
+        self,
+        runtime_root: Path | str,
+        *,
+        backend_overrides: Optional[dict[str, AgentBackend]] = None,
+    ) -> None:
+        self.runtime_root = Path(runtime_root)
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        self.ledger_path = self.runtime_root / ACTUATION_FILE
+        self._lock = threading.RLock()
+        self._threads: dict[str, threading.Thread] = {}
+        self._backend_overrides: dict[str, AgentBackend] = {}
+        for backend_id, backend in (backend_overrides or {}).items():
+            if backend_id not in _SUPPORTED_BACKENDS:
+                raise ValueError("unsupported backend override: {0}".format(backend_id))
+            if not isinstance(backend, AgentBackend):
+                raise TypeError("backend override must implement AgentBackend")
+            if backend.backend_id != backend_id:
+                raise ValueError("backend override id mismatch for {0}".format(backend_id))
+            self._backend_overrides[backend_id] = backend
+        self._recover_interrupted_runs()
+
+    def _backend_for_policy(self, backend_id: str, config: dict[str, Any]) -> AgentBackend:
+        override = self._backend_overrides.get(backend_id)
+        if override is not None:
+            return override
+        executable = config.get("executable")
+        command_prefix = (str(executable),) if executable else None
+        if backend_id == "dsh":
+            return DshBackend(runtime_root=self.runtime_root, command_prefix=command_prefix)
+        if backend_id == "agy":
+            kwargs: dict[str, Any] = {"runtime_root": self.runtime_root}
+            if command_prefix is not None:
+                kwargs["command_prefix"] = command_prefix
+            for key in ("model", "effort", "mode", "print_timeout"):
+                if key in config:
+                    kwargs[key] = config[key]
+            return AgyBackend(**kwargs)
+        raise ValueError("unsupported backend: {0}".format(backend_id))
+
+    def _router_for_policy(
+        self, policy: dict[str, Any]
+    ) -> tuple[AgentRouter, dict[str, AgentBackend]]:
+        registry = BackendRegistry()
+        backends: dict[str, AgentBackend] = {}
+        for backend_id in policy["preferred_backends"]:
+            backend = self._backend_for_policy(backend_id, policy["backends"][backend_id])
+            registry.register(backend)
+            backends[backend_id] = backend
+        return AgentRouter(registry), backends
+
+    def _load_ledger(self) -> dict[str, Any]:
+        data = read_json(self.ledger_path, None)
+        if not isinstance(data, dict):
+            return _empty_ledger()
+        executions = data.get("executions")
+        if not isinstance(executions, dict):
+            executions = {}
+        clean = {
+            key: value for key, value in executions.items()
+            if isinstance(key, str) and isinstance(value, dict)
+        }
+        return {"version": _LEDGER_VERSION, "executions": clean}
+
+    def _save_ledger(self, ledger: dict[str, Any]) -> None:
+        write_json(self.ledger_path, ledger, indent=2)
+
+    def _recover_interrupted_runs(self) -> None:
+        with self._lock:
+            ledger = self._load_ledger()
+            changed = False
+            for record in ledger["executions"].values():
+                if record.get("state") in _ACTIVE_STATES:
+                    record["state"] = "recovery_required"
+                    record["reason"] = (
+                        "daemon restarted while managed execution was active; "
+                        "automatic replay is forbidden"
+                    )
+                    record["recovered_at"] = utc_now_iso()
+                    changed = True
+            if changed:
+                self._save_ledger(ledger)
+
+    def state(self) -> dict[str, Any]:
+        with self._lock:
+            return copy.deepcopy(self._load_ledger())
+
+    def overlay_managed_runs(self, summary: Any) -> Any:
+        """Project managed-run truth onto a deep copy for WORKER_DONE dispatch."""
+        projected = copy.deepcopy(summary)
+        if not isinstance(projected, dict) or not isinstance(projected.get("projects"), list):
+            return projected
+        latest: dict[str, dict[str, Any]] = {}
+        for record in self.state()["executions"].values():
+            if not isinstance(record, dict) or record.get("state") not in (_ACTIVE_STATES | _TERMINAL_STATES):
+                continue
+            project_id = _non_blank_config(record.get("project_id"))
+            if project_id is None:
+                continue
+            key = (str(record.get("started_at") or ""), str(record.get("source_request_id") or ""))
+            previous = latest.get(project_id)
+            previous_key = ((str(previous.get("started_at") or ""), str(previous.get("source_request_id") or "")) if previous else None)
+            if previous_key is None or key > previous_key:
+                latest[project_id] = record
+        for snapshot in projected["projects"]:
+            if not isinstance(snapshot, dict):
+                continue
+            record = latest.get(str(snapshot.get("project_id") or ""))
+            if record is None:
+                continue
+            state = str(record.get("state") or "")
+            worker_state = "starting" if state == "launching" else state
+            snapshot["worker"] = {"kind":"task","state":worker_state,"process_alive":state in _ACTIVE_STATES,"pid":record.get("pid"),"started_at":record.get("started_at"),"updated_at":record.get("completed_at") or record.get("started_at"),"exit_code":record.get("exit_code"),"command":"managed {0}".format(record.get("backend_id") or "worker")}
+            telemetry = snapshot.get("telemetry")
+            telemetry = copy.deepcopy(telemetry) if isinstance(telemetry, dict) else {}
+            telemetry["run_id"] = record.get("backend_run_id")
+            telemetry["task_id"] = record.get("task_id")
+            snapshot["telemetry"] = telemetry
+            snapshot["state"] = ("WORKER_RUNNING" if state in _ACTIVE_STATES else ("WAITING_REVIEW" if state == "completed" else "WORKER_FAILED"))
+        return projected
+
+    @staticmethod
+    def _active_project(ledger: dict[str, Any], project_id: str) -> bool:
+        for record in ledger["executions"].values():
+            if record.get("project_id") == project_id and record.get("state") in _ACTIVE_STATES:
+                return True
+        return False
+
+    def _record_blocked(
+        self, source_request_id: str, project_id: str, reason: str,
+        *, task_id: Optional[str] = None, source_kind: str = "decision",
+    ) -> None:
+        with self._lock:
+            ledger = self._load_ledger()
+            if source_request_id in ledger["executions"]:
+                return
+            ledger["executions"][source_request_id] = {
+                "project_id": project_id,
+                "source_request_id": source_request_id,
+                "source_kind": source_kind,
+                "task_id": task_id,
+                "state": "blocked",
+                "reason": reason,
+                "recorded_at": utc_now_iso(),
+            }
+            self._save_ledger(ledger)
+
+    def _fresh_guard(
+        self,
+        project: dict[str, Any],
+        snapshot: dict[str, Any],
+        *,
+        expected_branch: str,
+        expected_head: str,
+        expected_task_id: Optional[str] = None,
+        must_advance_from: Optional[str] = None,
+    ) -> tuple[Optional[str], str]:
+        if snapshot.get("state") != "READY_TO_RUN":
+            return None, "project is not READY_TO_RUN"
+        if _external_worker_active(snapshot):
+            return None, "an external task Worker is already active"
+        current_task = _current_task_id(snapshot)
+        if current_task is None:
+            return None, "current agent/next.md task id is unavailable"
+        if expected_task_id is not None and current_task != expected_task_id:
+            return None, "bootstrap task id does not match current agent/next.md"
+        if must_advance_from is not None and current_task == must_advance_from:
+            return None, "NEXT_TASK refused because agent/next.md has not advanced"
+
+        truth = read_repository_truth(project.get("repo_path") or "")
+        if not truth.valid:
+            return None, "repository truth unavailable"
+        if truth.dirty:
+            return None, "repository is dirty"
+        if truth.branch != expected_branch or truth.head != expected_head:
+            return None, "repository changed after reviewed/bootstrapped truth"
+        return current_task, ""
+
+    def _launch(
+        self,
+        project: dict[str, Any],
+        *,
+        source_request_id: str,
+        source_kind: str,
+        task_id: str,
+        source_task_id: Optional[str],
+        branch: str,
+        head: str,
+        worker_prompt: str,
+        policy: dict[str, Any],
+    ) -> Optional[ActuationLaunch]:
+        request = AgentRequest(
+            project_id=str(project["project_id"]),
+            role=AgentRole.WORKER,
+            prompt=worker_prompt,
+            working_directory=Path(str(project["repo_path"])),
+            required_capabilities=frozenset({"code", "repository"}),
+            preferred_backends=tuple(policy["preferred_backends"]),
+        )
+        try:
+            router, backends = self._router_for_policy(policy)
+            route = router.route(request)
+        except Exception as exc:
+            self._record_blocked(
+                source_request_id, str(project["project_id"]),
+                "backend construction failed: {0}".format(exc),
+                task_id=task_id, source_kind=source_kind,
+            )
+            return None
+        if route.selected_backend_id is None:
+            self._record_blocked(
+                source_request_id, str(project["project_id"]), route.reason,
+                task_id=task_id, source_kind=source_kind,
+            )
+            return None
+        backend = backends.get(route.selected_backend_id)
+        if backend is None:
+            self._record_blocked(
+                source_request_id, str(project["project_id"]),
+                "selected backend instance is unavailable",
+                task_id=task_id, source_kind=source_kind,
+            )
+            return None
+
+        with self._lock:
+            ledger = self._load_ledger()
+            if source_request_id in ledger["executions"]:
+                return None
+            project_id = str(project["project_id"])
+            if self._active_project(ledger, project_id):
+                ledger["executions"][source_request_id] = {
+                    "project_id": project_id,
+                    "source_request_id": source_request_id,
+                    "source_kind": source_kind,
+                    "task_id": task_id,
+                    "state": "blocked",
+                    "reason": "another managed Worker is already active",
+                    "recorded_at": utc_now_iso(),
+                }
+                self._save_ledger(ledger)
+                return None
+            started_at = utc_now_iso()
+            ledger["executions"][source_request_id] = {
+                "project_id": project_id,
+                "source_request_id": source_request_id,
+                "source_kind": source_kind,
+                "source_task_id": source_task_id,
+                "task_id": task_id,
+                "branch": branch,
+                "head": head,
+                "repo_path": str(project["repo_path"]),
+                "backend_id": route.selected_backend_id,
+                "state": "launching",
+                "started_at": started_at,
+                "review_state": "pending",
+            }
+            self._save_ledger(ledger)
+            status_record = copy.deepcopy(ledger["executions"][source_request_id])
+        write_execution_status(status_record, self.runtime_root)
+
+        thread = threading.Thread(
+            target=self._run_worker_thread,
+            args=(source_request_id, request, backend),
+            name="devorch-worker-" + project_id,
+            daemon=True,
+        )
+        with self._lock:
+            self._threads[source_request_id] = thread
+        thread.start()
+        return ActuationLaunch(
+            project_id=project_id,
+            source_request_id=source_request_id,
+            task_id=task_id,
+            backend_id=route.selected_backend_id,
+            state="launching",
+        )
+
+    def _update_record(self, source_request_id: str, **changes: Any) -> None:
+        with self._lock:
+            ledger = self._load_ledger()
+            record = ledger["executions"].get(source_request_id)
+            if not isinstance(record, dict):
+                return
+            record.update(changes)
+            self._save_ledger(ledger)
+            status_record = copy.deepcopy(record)
+        write_execution_status(status_record, self.runtime_root)
+
+    def _run_worker_thread(
+        self, source_request_id: str, request: AgentRequest, backend: AgentBackend
+    ) -> None:
+        try:
+            asyncio.run(self._run_worker(source_request_id, request, backend))
+        except Exception as exc:  # fail closed; never auto-retry
+            self._update_record(
+                source_request_id,
+                state="failed",
+                reason="worker lifecycle error: {0}".format(exc),
+                completed_at=utc_now_iso(),
+            )
+
+    async def _run_worker(
+        self, source_request_id: str, request: AgentRequest, backend: AgentBackend
+    ) -> None:
+        run = await backend.start(request)
+        self._update_record(
+            source_request_id,
+            state=run.state.value,
+            backend_run_id=run.run_id,
+            pid=run.pid,
+            backend_id=run.backend_id,
+        )
+        result = await backend.collect(run.run_id)
+        terminal = result.state.value
+        if result.state not in (
+            AgentRunState.COMPLETED,
+            AgentRunState.FAILED,
+            AgentRunState.CANCELLED,
+        ):
+            terminal = "failed"
+        self._update_record(
+            source_request_id,
+            state=terminal,
+            exit_code=result.exit_code,
+            completed_at=utc_now_iso(),
+            stdout_path=str(
+                self.runtime_root / "agent-runs" / run.run_id / "stdout.log"
+            ),
+            stderr_path=str(
+                self.runtime_root / "agent-runs" / run.run_id / "stderr.log"
+            ),
+        )
+
+    def _load_decisions(self) -> dict[str, dict[str, Any]]:
+        data = read_json(self.runtime_root / "websol-decisions.json", None)
+        if not isinstance(data, dict) or not isinstance(data.get("decisions"), dict):
+            return {}
+        return {
+            request_id: record
+            for request_id, record in data["decisions"].items()
+            if isinstance(request_id, str) and isinstance(record, dict)
+        }
+
+    @staticmethod
+    def _project_has_execution_history(ledger: dict[str, Any], project_id: str) -> bool:
+        return any(
+            record.get("project_id") == project_id and record.get("state") != "blocked"
+            for record in ledger["executions"].values()
+            if isinstance(record, dict)
+        )
+
+    def _advance_decisions(
+        self,
+        projects: dict[str, dict[str, Any]],
+        snapshots: dict[str, dict[str, Any]],
+    ) -> list[ActuationLaunch]:
+        launches: list[ActuationLaunch] = []
+        decisions = self._load_decisions()
+        ordered = sorted(
+            decisions.items(),
+            key=lambda item: (str(item[1].get("consumed_at") or ""), item[0]),
+        )
+        for request_id, record in ordered:
+            with self._lock:
+                if request_id in self._load_ledger()["executions"]:
+                    continue
+            if record.get("disposition") != "apply" or record.get("next_action") != "next_task":
+                continue
+            project_id = _non_blank_config(record.get("project_id"))
+            if project_id is None:
+                continue
+            task_id = _non_blank_config(record.get("task_id"))
+            branch = _non_blank_config(record.get("branch"))
+            head = _non_blank_config(record.get("head"))
+            if task_id is None or branch is None or head is None:
+                self._record_blocked(request_id, project_id, "decision identity is incomplete")
+                continue
+            if record.get("role") != WebSolRole.REVIEWER.value or record.get("event") != WebSolEvent.WORKER_DONE.value:
+                self._record_blocked(
+                    request_id, project_id, "V1 actuation requires WORKER_DONE reviewer flow",
+                    task_id=task_id,
+                )
+                continue
+            project = projects.get(project_id)
+            snapshot = snapshots.get(project_id)
+            if project is None or snapshot is None:
+                self._record_blocked(
+                    request_id, project_id,
+                    "project configuration or monitor snapshot unavailable",
+                    task_id=task_id,
+                )
+                continue
+            policy, error = _execution_policy(project)
+            if policy is None:
+                self._record_blocked(request_id, project_id, error, task_id=task_id)
+                continue
+            next_task_id, guard_error = self._fresh_guard(
+                project,
+                snapshot,
+                expected_branch=branch,
+                expected_head=head,
+                must_advance_from=task_id,
+            )
+            if next_task_id is None:
+                self._record_blocked(request_id, project_id, guard_error, task_id=task_id)
+                continue
+            launch = self._launch(
+                project,
+                source_request_id=request_id,
+                source_kind="decision",
+                task_id=next_task_id,
+                source_task_id=task_id,
+                branch=branch,
+                head=head,
+                worker_prompt=str(policy["worker_prompt"]),
+                policy=policy,
+            )
+            if launch is not None:
+                launches.append(launch)
+        return launches
+
+    def _advance_bootstrap(
+        self,
+        projects: dict[str, dict[str, Any]],
+        snapshots: dict[str, dict[str, Any]],
+    ) -> list[ActuationLaunch]:
+        launches: list[ActuationLaunch] = []
+        for project_id, project in projects.items():
+            policy, _ = _execution_policy(project)
+            if policy is None or policy.get("bootstrap") is None:
+                continue
+            bootstrap = policy["bootstrap"]
+            request_id = str(bootstrap["request_id"])
+            task_id = str(bootstrap["task_id"])
+            with self._lock:
+                ledger = self._load_ledger()
+                if request_id in ledger["executions"]:
+                    continue
+                if self._project_has_execution_history(ledger, project_id):
+                    continue
+            snapshot = snapshots.get(project_id)
+            if snapshot is None:
+                self._record_blocked(
+                    request_id, project_id, "monitor snapshot unavailable",
+                    task_id=task_id, source_kind="bootstrap",
+                )
+                continue
+            truth = read_repository_truth(project.get("repo_path") or "")
+            if not truth.valid:
+                self._record_blocked(
+                    request_id, project_id, "repository truth unavailable",
+                    task_id=task_id, source_kind="bootstrap",
+                )
+                continue
+            launch_task, guard_error = self._fresh_guard(
+                project,
+                snapshot,
+                expected_branch=truth.branch,
+                expected_head=truth.head,
+                expected_task_id=task_id,
+            )
+            if launch_task is None:
+                self._record_blocked(
+                    request_id, project_id, guard_error,
+                    task_id=task_id, source_kind="bootstrap",
+                )
+                continue
+            launch = self._launch(
+                project,
+                source_request_id=request_id,
+                source_kind="bootstrap",
+                task_id=launch_task,
+                source_task_id=None,
+                branch=truth.branch,
+                head=truth.head,
+                worker_prompt=str(policy["worker_prompt"]),
+                policy=policy,
+            )
+            if launch is not None:
+                launches.append(launch)
+        return launches
+
+    def advance(self, summary: Any, config_path: Path | str) -> list[ActuationLaunch]:
+        """Act on durable APPLY+NEXT_TASK decisions, then optional one-time bootstrap."""
+        config = load_projects_config(config_path)
+        projects = _project_map(config)
+        snapshots = _snapshot_map(summary)
+        launches = self._advance_decisions(projects, snapshots)
+        launches.extend(self._advance_bootstrap(projects, snapshots))
+        return launches
