@@ -8,10 +8,10 @@ Execution contract (frozen in ``docs/AGENT_BACKEND_ROUTER_DESIGN.md``):
 - ``probe()`` executes only ``<prefix> --version`` — it never sends a prompt.
 - ``start()`` runs::
 
-      <prefix> --print --mode <mode> --output-format <output_format>
-               --print-timeout <timeout> --add-dir <working_directory>
+      <prefix> --mode <mode> --output-format <output_format>
+               --print-timeout <timeout>s --add-dir <working_directory>
                [--model <model>] [--effort <effort>]
-               <workspace_instruction + user_prompt>
+               --print=<workspace_instruction + user_prompt>
 
   with ``shell=False`` and an explicit argv list.  The working directory comes
   from the request and must exist.
@@ -247,17 +247,16 @@ class AgyBackend(AgentBackend):
 
         argv: list[str] = [
             *self._command_prefix,
-            "--print",
             "--mode", self._mode,
             "--output-format", self._output_format,
-            "--print-timeout", str(self._print_timeout),
+            "--print-timeout", "{0}s".format(self._print_timeout),
             "--add-dir", working_directory,
         ]
         if self._model is not None:
             argv.extend(["--model", self._model])
         if self._effort is not None:
             argv.extend(["--effort", self._effort])
-        argv.append(full_prompt)
+        argv.append("--print=" + full_prompt)
         return argv
 
     async def start(self, request: AgentRequest) -> AgentRun:

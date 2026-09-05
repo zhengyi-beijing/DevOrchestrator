@@ -44,8 +44,9 @@ if "--version" in args:
 details = {"argv": args}
 print(json.dumps(details))
 
-# Locate the prompt (last positional arg that doesn't start with "--")
-prompt = args[-1] if args else ""
+# Real agy 1.1.26 requires the prompt attached as --print=<prompt>.
+prompt_arg = next((arg for arg in args if arg.startswith("--print=")), "")
+prompt = prompt_arg.split("=", 1)[1] if prompt_arg else ""
 
 if "SLEEP" in prompt:
     time.sleep(30)
@@ -109,7 +110,7 @@ class AgyBackendTests(unittest.IsolatedAsyncioTestCase):
         --print-timeout, and --add-dir."""
         request = self.make_request(self.work, "DO SOMETHING")
         argv = self.backend._build_argv(request)
-        self.assertIn("--print", argv)
+        self.assertTrue(any(arg.startswith("--print=") for arg in argv))
         self.assertIn("--mode", argv)
         self.assertIn("--output-format", argv)
         self.assertIn("--print-timeout", argv)
@@ -142,7 +143,7 @@ class AgyBackendTests(unittest.IsolatedAsyncioTestCase):
         request = self.make_request(self.work, "x")
         argv = backend._build_argv(request)
         idx = argv.index("--print-timeout")
-        self.assertEqual(argv[idx + 1], "60")
+        self.assertEqual(argv[idx + 1], "60s")
 
     def test_argv_model_and_effort_omitted_when_not_set(self):
         request = self.make_request(self.work, "x")
@@ -169,7 +170,8 @@ class AgyBackendTests(unittest.IsolatedAsyncioTestCase):
         instruction with the absolute working directory path."""
         request = self.make_request(self.work, "MY TASK")
         argv = self.backend._build_argv(request)
-        full_prompt = argv[-1]
+        print_arg = next(arg for arg in argv if arg.startswith("--print="))
+        full_prompt = print_arg.split("=", 1)[1]
         self.assertIn("[WORKSPACE]", full_prompt)
         self.assertIn(str(self.work), full_prompt)
         self.assertIn("MY TASK", full_prompt)
