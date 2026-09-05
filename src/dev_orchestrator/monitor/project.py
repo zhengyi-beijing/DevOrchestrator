@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.monitor.telemetry import (
     is_run_recorded,
     new_run_record,
@@ -51,6 +52,7 @@ def _run_git(root: Path, *arguments: str) -> subprocess.CompletedProcess:
         timeout=15,
         env=_GIT_ENV,
         check=False,
+        **hidden_subprocess_kwargs(),
     )
 
 

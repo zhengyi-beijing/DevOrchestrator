@@ -36,6 +36,13 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "abc-123|xyz-789||true|false")
 
+    def test_userscript_has_compact_transport_status_badge(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('STATUS_ELEMENT_ID = "devorch-web-status"', source)
+        for state in ("LIVE", "IDLE", "CLAIMED", "WAITING", "OFFLINE"):
+            self.assertIn('setAdapterStatus("' + state, source)
+        self.assertIn('badge.style.cssText = "position:fixed;right:12px;bottom:12px;', source)
+
     def test_userscript_contains_no_workflow_decision_logic(self):
         source = SCRIPT.read_text(encoding="utf-8")
         for forbidden in ("NEXT_STAGE", "NEXT_TASK", "CONTINUE_CURRENT_STAGE", "OWNER_GATE", "validate_websol_response"):

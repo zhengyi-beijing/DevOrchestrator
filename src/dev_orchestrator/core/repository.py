@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
+
 _GIT_ENV = dict(os.environ)
 _GIT_ENV["GIT_OPTIONAL_LOCKS"] = "0"
 
@@ -54,6 +56,7 @@ def _run_git(root: Path, timeout: float, *arguments: str) -> subprocess.Complete
         timeout=timeout,
         env=_GIT_ENV,
         check=False,
+        **hidden_subprocess_kwargs(),
     )
 
 

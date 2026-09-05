@@ -109,6 +109,19 @@ def terminate_pid(pid: Any) -> bool:
         return False
 
 
+def hidden_subprocess_kwargs() -> dict[str, int]:
+    """Return Popen kwargs that suppress console windows on Windows.
+
+    Background monitor/backend child processes must never create a visible
+    console or steal focus from the interactive desktop. POSIX needs no extra
+    flags, so callers can safely splat the returned mapping into run/Popen.
+    """
+    if os.name != "nt":
+        return {}
+    flag = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    return {"creationflags": int(flag)}
+
+
 def spawn_detached(
     argv: Sequence[str],
     *,

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.2
+// @version      0.1.3
 // @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge. Derives the binding id from the current /c/<conversation-id> URL, claims only that binding, submits the rendered prompt, waits for a stable matching response marker, and posts the raw assistant text back.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
@@ -52,6 +52,30 @@
   // responseStability.ready turns true only after the same complete text has
   // been observed unchanged for the full stability window.
   var responseStability = { text: null, since: 0, ready: false };
+
+
+  var STATUS_ELEMENT_ID = "devorch-web-status";
+
+  function ensureStatusBadge() {
+    if (typeof document === "undefined" || !document.body) { return null; }
+    var badge = document.getElementById(STATUS_ELEMENT_ID);
+    if (badge) { return badge; }
+    badge = document.createElement("div");
+    badge.id = STATUS_ELEMENT_ID;
+    badge.style.cssText = "position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:5px 9px;border-radius:7px;font:12px/1.2 system-ui,sans-serif;color:#fff;background:#555;box-shadow:0 1px 5px rgba(0,0,0,.25);pointer-events:none;opacity:.92";
+    document.body.appendChild(badge);
+    return badge;
+  }
+
+  function setAdapterStatus(state, detail) {
+    var badge = ensureStatusBadge();
+    if (!badge) { return; }
+    var colors = { LIVE: "#237a3b", IDLE: "#555", CLAIMED: "#8a5a00", WAITING: "#2457a6", OFFLINE: "#a32929" };
+    badge.textContent = "DevOrch · " + state;
+    badge.style.background = colors[state] || "#555";
+    badge.setAttribute("data-state", state);
+    badge.title = detail || state;
+  }
 
   // ------------------------------------------------------------------
   // pure helpers (also exercised by the automated Node test harness)
@@ -224,9 +248,11 @@
   function claimOnce(bindingId) {
     return bridgePost(CLAIM_PATH, { adapter: ADAPTER_ID, binding_id: bindingId }).then(function (result) {
       if (result.status === 204) {
+        setAdapterStatus("LIVE", "Bridge connected; no queued request");
         return null;
       }
       if (result.status !== 200 || !result.text) {
+        setAdapterStatus("OFFLINE", "Bridge claim failed: HTTP " + result.status);
         return null;
       }
       try {
@@ -358,6 +384,7 @@
     var bindingId = currentBindingId();
     if (!bindingId) {
       // Tab without a stable conversation id stays idle.
+      setAdapterStatus("IDLE", "Waiting for a stable /c/<conversation-id> URL");
       schedule(runAdapter, RETRY_MS);
       return;
     }
@@ -367,9 +394,11 @@
         schedule(runAdapter, RETRY_MS);
         return;
       }
+      setAdapterStatus("CLAIMED", "Claimed " + claim.request_id);
       if (requestAlreadySubmitted(bindingId, claim.request_id)) {
         // Reclaimed after lease expiry/reload: resume waiting for the existing
         // ChatGPT turn instead of inserting the same request a second time.
+        setAdapterStatus("WAITING", "Waiting for matching ChatGPT response");
         waitForResponse(bindingId, claim, Date.now() + WAIT_DEADLINE_MS, makeRenewalState(claim));
         return;
       }
@@ -379,6 +408,7 @@
         return;
       }
       markRequestSubmitted(bindingId, claim.request_id);
+      setAdapterStatus("WAITING", "Prompt submitted; waiting for ChatGPT response");
       waitForResponse(bindingId, claim, Date.now() + WAIT_DEADLINE_MS, makeRenewalState(claim));
     });
   }
@@ -390,7 +420,12 @@
       // The matching assistant text has been unchanged for the full stability
       // window, so it is no longer streaming: stop polling/renewing and
       // acknowledge the raw text. A still-growing answer is never acked early.
-      respond(bindingId, claim, responseText).then(function () {
+      respond(bindingId, claim, responseText).then(function (result) {
+        if (result && result.status === 200) {
+          setAdapterStatus("LIVE", "Response acknowledged by Bridge");
+        } else {
+          setAdapterStatus("OFFLINE", "Response acknowledgement failed");
+        }
         schedule(runAdapter, RETRY_MS);
       });
       return;
@@ -436,6 +471,7 @@
       return;
     }
     if (verdict === RENEW_RETRY) {
+      setAdapterStatus("OFFLINE", "Bridge renewal failed; retrying inside lease window");
       // Transient network/5xx failure: retry is allowed only inside the
       // current lease safety window; past expiry the claim authority is gone.
       if (Date.now() < renewal.leaseExpiresMs) {
@@ -456,10 +492,12 @@
   // claim loop. No response is posted for a stale claim; server-side lease
   // expiry lets the request be reclaimed by another adapter.
   function abandonClaim(bindingId, claim) {
+    setAdapterStatus("IDLE", "Claim abandoned; returning to idle polling");
     schedule(runAdapter, RETRY_MS);
   }
 
   if (typeof document !== "undefined" && !root.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__) {
+    setAdapterStatus("IDLE", "Adapter starting");
     schedule(runAdapter, 1000);
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -44,6 +44,7 @@ from dev_orchestrator.agents.models import (
     QuotaState,
 )
 from dev_orchestrator.config import DEFAULT_RUNTIME_ROOT
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 
 _PROFILE_LABEL = "headless"
 _RUNS_DIRNAME = "agent-runs"
@@ -153,6 +154,7 @@ class DshBackend(AgentBackend):
                 errors="replace",
                 timeout=_PROBE_TIMEOUT_SECONDS,
                 check=False,
+                **hidden_subprocess_kwargs(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return BackendStatus(
@@ -205,6 +207,7 @@ class DshBackend(AgentBackend):
                 cwd=str(cwd),
                 stdout=out_handle,
                 stderr=err_handle,
+                **hidden_subprocess_kwargs(),
             )
         except OSError as exc:
             record.state = AgentRunState.FAILED
