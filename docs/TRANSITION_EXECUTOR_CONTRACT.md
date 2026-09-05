@@ -47,6 +47,8 @@ The dispatcher freezes `review_status_hash` with the review occurrence. Response
 
 The launched Worker request uses role `worker`, working directory `repo_path`, and requires `code` + `repository` capabilities. Routing remains provider-neutral through `AgentRouter`. V1 supports `agy` and `dsh`; `preferred_backends` defines deterministic project-local priority and normal router fallback. AGY may configure an explicit executable path so daemon behavior never depends on an ambient PATH refresh.
 
+If the selected backend starts but then fails with an explicit provider quota-exhaustion signal, the executor may perform one runtime fallback to the next already-eligible backend. Runtime fallback is allowed only when fresh repository branch, HEAD, and status hash still exactly equal the values captured immediately before the failed backend launch. Any repository change disables fallback. Ordinary task/test failures never trigger provider fallback.
+
 ## Idempotency and replay
 
 Before starting a model, the executor persists an entry keyed by the source request id in `runtime/transition-executor.json`.

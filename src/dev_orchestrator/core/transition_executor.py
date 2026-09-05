@@ -18,7 +18,7 @@ from typing import Any, Optional
 from dev_orchestrator.agents.base import AgentBackend
 from dev_orchestrator.agents.backends.agy import AgyBackend
 from dev_orchestrator.agents.backends.dsh import DshBackend
-from dev_orchestrator.agents.models import AgentRequest, AgentRole, AgentRunState
+from dev_orchestrator.agents.models import AgentRequest, AgentResult, AgentRole, AgentRunState, QuotaState
 from dev_orchestrator.agents.registry import BackendRegistry
 from dev_orchestrator.agents.router import AgentRouter
 from dev_orchestrator.config import load_projects_config
@@ -100,6 +100,19 @@ def _external_worker_active(snapshot: dict[str, Any]) -> bool:
 
 
 _SUPPORTED_BACKENDS = frozenset({"agy", "dsh"})
+
+_RETRYABLE_PROVIDER_FAILURE_MARKERS = (
+    "individual quota reached",
+    "quota exhausted",
+    "quota reached",
+)
+
+
+def _retryable_provider_failure(result: AgentResult) -> bool:
+    if result.state is not AgentRunState.FAILED:
+        return False
+    text = (str(result.stderr or "") + "\n" + str(result.stdout or "")).casefold()
+    return any(marker in text for marker in _RETRYABLE_PROVIDER_FAILURE_MARKERS)
 
 
 def _non_blank_config(value: Any) -> Optional[str]:
@@ -425,6 +438,18 @@ class TransitionExecutor:
                 task_id=task_id, source_kind=source_kind,
             )
             return None
+        fallback_ids = tuple(
+            candidate.backend_id for candidate in route.candidates
+            if candidate.eligible and candidate.backend_id != route.selected_backend_id
+        )
+        launch_truth = read_repository_truth(project.get("repo_path") or "")
+        if (not launch_truth.valid or launch_truth.branch != branch or launch_truth.head != head):
+            self._record_blocked(
+                source_request_id, str(project["project_id"]),
+                "repository changed before Worker launch",
+                task_id=task_id, source_kind=source_kind,
+            )
+            return None
 
         with self._lock:
             ledger = self._load_ledger()
@@ -457,6 +482,7 @@ class TransitionExecutor:
                 "state": "launching",
                 "started_at": started_at,
                 "review_state": "pending",
+                "launch_status_hash": launch_truth.status_hash,
             }
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])
@@ -464,7 +490,7 @@ class TransitionExecutor:
 
         thread = threading.Thread(
             target=self._run_worker_thread,
-            args=(source_request_id, request, backend),
+            args=(source_request_id, request, backend, backends, fallback_ids),
             name="devorch-worker-" + project_id,
             daemon=True,
         )
@@ -491,10 +517,13 @@ class TransitionExecutor:
         write_execution_status(status_record, self.runtime_root)
 
     def _run_worker_thread(
-        self, source_request_id: str, request: AgentRequest, backend: AgentBackend
+        self, source_request_id: str, request: AgentRequest, backend: AgentBackend,
+        backends: dict[str, AgentBackend], fallback_ids: tuple[str, ...],
     ) -> None:
         try:
-            asyncio.run(self._run_worker(source_request_id, request, backend))
+            asyncio.run(
+                self._run_worker(source_request_id, request, backend, backends, fallback_ids)
+            )
         except Exception as exc:  # fail closed; never auto-retry
             self._update_record(
                 source_request_id,
@@ -504,7 +533,8 @@ class TransitionExecutor:
             )
 
     async def _run_worker(
-        self, source_request_id: str, request: AgentRequest, backend: AgentBackend
+        self, source_request_id: str, request: AgentRequest, backend: AgentBackend,
+        backends: dict[str, AgentBackend], fallback_ids: tuple[str, ...],
     ) -> None:
         run = await backend.start(request)
         self._update_record(
@@ -515,24 +545,80 @@ class TransitionExecutor:
             backend_id=run.backend_id,
         )
         result = await backend.collect(run.run_id)
+        first_stdout = str(self.runtime_root / "agent-runs" / run.run_id / "stdout.log")
+        first_stderr = str(self.runtime_root / "agent-runs" / run.run_id / "stderr.log")
+        if _retryable_provider_failure(result) and fallback_ids:
+            with self._lock:
+                record = copy.deepcopy(
+                    self._load_ledger()["executions"].get(source_request_id, {})
+                )
+            truth = read_repository_truth(request.working_directory)
+            unchanged = (
+                truth.valid
+                and truth.branch == record.get("branch")
+                and truth.head == record.get("head")
+                and truth.status_hash == record.get("launch_status_hash")
+            )
+            if not unchanged:
+                self._update_record(
+                    source_request_id, state="failed", exit_code=result.exit_code,
+                    completed_at=utc_now_iso(), stdout_path=first_stdout,
+                    stderr_path=first_stderr,
+                    reason="runtime fallback refused because repository changed after provider failure",
+                )
+                return
+            fallback = None
+            for fallback_id in fallback_ids:
+                candidate = backends.get(fallback_id)
+                if candidate is None:
+                    continue
+                try:
+                    status = candidate.probe()
+                    caps = candidate.capabilities()
+                except Exception:
+                    continue
+                if (status.available and status.quota is not QuotaState.EXHAUSTED
+                        and request.role in caps.roles
+                        and request.required_capabilities.issubset(caps.tags)):
+                    fallback = candidate
+                    break
+            if fallback is None:
+                self._update_record(
+                    source_request_id, state="failed", exit_code=result.exit_code,
+                    completed_at=utc_now_iso(), stdout_path=first_stdout,
+                    stderr_path=first_stderr,
+                    reason="retryable provider failure but no healthy fallback backend is available",
+                )
+                return
+            self._update_record(
+                source_request_id,
+                state="launching",
+                fallback_from_backend=backend.backend_id,
+                fallback_from_run_id=run.run_id,
+                fallback_from_exit_code=result.exit_code,
+                fallback_from_stdout_path=first_stdout,
+                fallback_from_stderr_path=first_stderr,
+                fallback_reason="retryable provider quota failure",
+                fallback_attempted_at=utc_now_iso(),
+                backend_id=fallback.backend_id,
+            )
+            run = await fallback.start(request)
+            self._update_record(
+                source_request_id, state=run.state.value, backend_run_id=run.run_id,
+                pid=run.pid, backend_id=run.backend_id,
+            )
+            result = await fallback.collect(run.run_id)
+
         terminal = result.state.value
         if result.state not in (
-            AgentRunState.COMPLETED,
-            AgentRunState.FAILED,
-            AgentRunState.CANCELLED,
+            AgentRunState.COMPLETED, AgentRunState.FAILED, AgentRunState.CANCELLED,
         ):
             terminal = "failed"
         self._update_record(
-            source_request_id,
-            state=terminal,
-            exit_code=result.exit_code,
+            source_request_id, state=terminal, exit_code=result.exit_code,
             completed_at=utc_now_iso(),
-            stdout_path=str(
-                self.runtime_root / "agent-runs" / run.run_id / "stdout.log"
-            ),
-            stderr_path=str(
-                self.runtime_root / "agent-runs" / run.run_id / "stderr.log"
-            ),
+            stdout_path=str(self.runtime_root / "agent-runs" / run.run_id / "stdout.log"),
+            stderr_path=str(self.runtime_root / "agent-runs" / run.run_id / "stderr.log"),
         )
 
     def _load_decisions(self) -> dict[str, dict[str, Any]]:
