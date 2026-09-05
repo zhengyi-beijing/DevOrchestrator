@@ -78,6 +78,13 @@ class WebSolConsumption:
     when an OWNER_GATE/STOP explicitly requests a wait; every other
     fail-closed outcome carries ``None`` so nothing can be accidentally
     executed from a rejected response.
+
+    Identity fields ``task_id``, ``stage_id``, ``branch``, ``head``, ``role``
+    and ``event`` are populated from the validated ``WebSolRequest`` whenever
+    the request was reconstructable; they remain ``None`` on malformed /
+    unreconstructable stop paths so fail-closed behaviour is unchanged.  The
+    Transition Executor reads these fields to enforce the exact same request
+    identity it previously validated through the Decision Guard.
     """
 
     project_id: str
@@ -85,6 +92,12 @@ class WebSolConsumption:
     disposition: DecisionDisposition
     next_action: Optional[NextAction] = None
     reason: str = ""
+    task_id: Optional[str] = None
+    stage_id: Optional[str] = None
+    branch: Optional[str] = None
+    head: Optional[str] = None
+    role: Optional[WebSolRole] = None
+    event: Optional[WebSolEvent] = None
 
 
 # --------------------------------------------------------------------------
@@ -265,6 +278,14 @@ def _consume_one(snapshot: dict, record: dict, repo_path: str) -> WebSolConsumpt
     may be un-reconstructable, the payload malformed, identity invalid, truth
     unavailable, or the guard itself rejects the response. Nothing here
     executes a next_action.
+
+    Identity fields ``task_id``, ``stage_id``, ``branch``, ``head``, ``role``
+    and ``event`` are populated from the reconstructed ``WebSolRequest``
+    whenever the request is reconstructable (i.e. after the
+    ``_request_from_record`` call succeeds).  Outcomes that fail before the
+    request is reconstructed (missing ``request_id`` or an
+    un-reconstructable record) retain ``None`` for those fields so the
+    fail-closed default is preserved.
     """
     request_id = _non_blank(record.get("request_id"))
     project_id = _non_blank(record.get("project_id"))
@@ -285,7 +306,19 @@ def _consume_one(snapshot: dict, record: dict, repo_path: str) -> WebSolConsumpt
         payload = _extract_payload(request.request_id, str(record.get("response_text") or ""))
         response = _response_from_payload(payload)
     except ValueError as exc:
-        return _stop_outcome(request.project_id, request.request_id, _brief(exc))
+        return WebSolConsumption(
+            project_id=request.project_id,
+            request_id=request.request_id,
+            disposition=DecisionDisposition.STOP,
+            next_action=None,
+            reason=_brief(exc),
+            task_id=request.task_id,
+            stage_id=request.stage_id,
+            branch=request.branch,
+            head=request.head,
+            role=request.role,
+            event=request.event,
+        )
 
     truth = read_repository_truth(repo_path)
     verdict = validate_websol_response(request, response, truth)
@@ -295,6 +328,12 @@ def _consume_one(snapshot: dict, record: dict, repo_path: str) -> WebSolConsumpt
         disposition=verdict.disposition,
         next_action=verdict.next_action,
         reason=verdict.reason,
+        task_id=request.task_id,
+        stage_id=request.stage_id,
+        branch=request.branch,
+        head=request.head,
+        role=request.role,
+        event=request.event,
     )
 
 
@@ -326,6 +365,12 @@ def _consume_project(
             "disposition": outcome.disposition.value,
             "next_action": outcome.next_action.value if outcome.next_action is not None else None,
             "reason": outcome.reason,
+            "task_id": outcome.task_id,
+            "stage_id": outcome.stage_id,
+            "branch": outcome.branch,
+            "head": outcome.head,
+            "role": outcome.role.value if outcome.role is not None else None,
+            "event": outcome.event.value if outcome.event is not None else None,
             "consumed_at": utc_now_iso(),
         }
         _save_decisions(path, ledger)

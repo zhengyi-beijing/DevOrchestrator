@@ -159,6 +159,86 @@ class ResponseConsumerTests(unittest.TestCase):
             result = consume_websol_responses(summary, store, runtime)
             self.assertEqual(result[0].disposition, DecisionDisposition.STOP)
 
+    def test_valid_apply_next_task_consumption_carries_exact_identity(self):
+        """APPLY+NEXT_TASK outcome preserves all 6 identity fields on the object
+        and in the persisted websol-decisions.json record."""
+        with tempfile.TemporaryDirectory() as td:
+            repo, runtime, store, summary, claim = setup_case(Path(td))
+            respond(store, claim, response_text(claim))
+
+            result = consume_websol_responses(summary, store, runtime)
+            self.assertEqual(len(result), 1)
+            outcome = result[0]
+
+            # -- object identity --
+            self.assertEqual(outcome.task_id, claim.task_id)
+            self.assertIsNone(outcome.stage_id)           # snap has no stage_id
+            self.assertEqual(outcome.branch, claim.branch)
+            self.assertEqual(outcome.head, claim.head)
+            # role/event on the dataclass are enum members
+            from dev_orchestrator.core.websol import WebSolEvent, WebSolRole
+            self.assertEqual(outcome.role, WebSolRole.REVIEWER)
+            self.assertEqual(outcome.event, WebSolEvent.WORKER_DONE)
+
+            # -- persisted record identity --
+            decisions = json.loads(
+                (runtime / "websol-decisions.json").read_text(encoding="utf-8")
+            )
+            record = decisions["decisions"][claim.request_id]
+            self.assertEqual(record["task_id"], claim.task_id)
+            self.assertIsNone(record["stage_id"])
+            self.assertEqual(record["branch"], claim.branch)
+            self.assertEqual(record["head"], claim.head)
+            self.assertEqual(record["role"], "reviewer")
+            self.assertEqual(record["event"], "worker_done")
+            # sanity: core disposition fields still present
+            self.assertEqual(record["disposition"], "apply")
+            self.assertEqual(record["next_action"], "next_task")
+
+    def test_malformed_and_identity_mismatch_stop_paths_retain_none_identity(self):
+        """Malformed JSON and identity-mismatch outcomes still stop fail-closed
+        and their identity fields on the object remain None (for unreconstructable
+        stops) or match the request (for post-reconstruction stops).
+        Persisted records for pre-reconstruction stops carry null identity values."""
+        # --- pre-reconstruction stop: malformed response text ---
+        with tempfile.TemporaryDirectory() as td:
+            repo, runtime, store, summary, claim = setup_case(Path(td))
+            raw = "[DEVORCH_WEB_SOL_RESPONSE {0}]\nnot-json".format(claim.request_id)
+            respond(store, claim, raw)
+            result = consume_websol_responses(summary, store, runtime)
+            self.assertEqual(len(result), 1)
+            outcome = result[0]
+            self.assertEqual(outcome.disposition.value, "stop")
+            # request WAS reconstructable so identity fields are populated from it
+            self.assertEqual(outcome.task_id, claim.task_id)
+            self.assertEqual(outcome.branch, claim.branch)
+            self.assertEqual(outcome.head, claim.head)
+            self.assertIsNotNone(outcome.role)
+            self.assertIsNotNone(outcome.event)
+            # persisted record has those identity values too
+            decisions = json.loads(
+                (runtime / "websol-decisions.json").read_text(encoding="utf-8")
+            )
+            record = decisions["decisions"][claim.request_id]
+            self.assertEqual(record["disposition"], "stop")
+            self.assertEqual(record["task_id"], claim.task_id)
+            self.assertEqual(record["branch"], claim.branch)
+
+        # --- identity mismatch (project_id wrong) -> IGNORE, identity from request ---
+        with tempfile.TemporaryDirectory() as td:
+            repo, runtime, store, summary, claim = setup_case(Path(td))
+            respond(store, claim, response_text(claim, changes={"project_id": "other"}))
+            result = consume_websol_responses(summary, store, runtime)
+            self.assertEqual(len(result), 1)
+            outcome = result[0]
+            self.assertEqual(outcome.disposition.value, "ignore")
+            self.assertIsNone(outcome.next_action)
+            # identity still comes from the request (mismatch is in response, not request)
+            self.assertEqual(outcome.task_id, claim.task_id)
+            self.assertEqual(outcome.branch, claim.branch)
+            self.assertEqual(outcome.head, claim.head)
+
+
     def test_two_projects_consume_only_the_response_that_exists(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); runtime = base / "runtime"
