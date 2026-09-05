@@ -1,27 +1,32 @@
-# RESULT — Portable Integration Contract V1
+# RESULT — DevOrchestrator V1
 
-Verdict: **ACCEPTED BY AUTOMATED CONTRACT**
+Verdict: **ACCEPTED**
 
-Implemented against baseline `8d8fe98`.
+V1 has completed automated regression and real external-project acceptance on
+ZXZ-PC using LineScanViewer as the managed project.
 
-Delivered:
-1. Config-relative `repo_path` semantics for relocatable deployment layouts.
-2. `validate-config --config <path>` as a read-only onboarding gate.
-3. Fail-closed adapter/repository validation without requiring a browser binding.
-4. A generic project example with no tracked LabDemo/XLabServer path requirement.
-5. A public standalone-service integration contract and current README.
-6. New integration tests using arbitrary temporary external Git repositories.
+Verified control path:
+1. standalone daemon monitors an external repository from local config;
+2. owner bootstrap starts AGY through the provider-neutral backend/router layer;
+3. `WORKER_DONE` is dispatched through Browser Bridge to the bound ChatGPT conversation;
+4. Web Sol response is identity-checked and persisted by Decision Guard;
+5. reviewed remediation can continue the same task under exact dirty/clean fingerprint guards;
+6. explicit AGY quota exhaustion triggers one runtime fallback only when branch,
+   HEAD and status hash are unchanged;
+7. DSH completed the handoff and committed LineScanViewer `42f7d9d` cleanly;
+8. project-local `.devorch/status.json` tracked the run without polluting Git.
+Browser acceptance:
+- ChatGPT Web adapter upgraded to 0.1.4; Tampermonkey local extension storage confirms the installed 0.1.4 script;
+- cross-client sync was verified with two Chrome windows on the same conversation:
+  the non-claim window produced the standard assistant response, the claim window
+  recovered it via conversation reload/sync, and Bridge stored the exact response;
+- Decision Guard consumed the resulting `STOP / stop` response; no P2 Worker launched.
 
-Key evidence:
-- config-only external project monitor: PASS and observed repo stays unchanged;
-- relative project path independent of process CWD: PASS;
-- valid monitor-only project validation: PASS;
-- missing repository / unknown adapter fail closed: PASS;
-- full Python regression: **87/87 PASS**;
-- Userscript syntax + Git whitespace checks: PASS.
+Regression evidence:
+- `tests_py`: **127/127 PASS**;
+- userscript syntax check: PASS;
+- Git whitespace check: PASS.
 
-Authority unchanged:
-- no Worker start/restart;
-- no `next_action` execution;
-- no PHASE_AUTO;
-- no stage crossing or hardware action.
+V1 execution scope remains intentionally bounded: `NEXT_TASK` and reviewed same-stage
+remediation only. `next_stage`, generic retry, owner-gated/hardware actions and a
+cross-machine central coordinator remain future work, not incomplete V1 acceptance items.

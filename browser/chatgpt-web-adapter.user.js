@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.3
+// @version      0.1.4
 // @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge. Derives the binding id from the current /c/<conversation-id> URL, claims only that binding, submits the rendered prompt, waits for a stable matching response marker, and posts the raw assistant text back.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
@@ -33,6 +33,8 @@
   var RENEW_INTERVAL_MS = 20000;
   var WAIT_DEADLINE_MS = 15 * 60 * 1000;
   var RETRY_MS = 2500;
+  var REMOTE_SYNC_RELOAD_AFTER_MS = 30000;
+  var REMOTE_SYNC_RELOAD_COOLDOWN_MS = 60000;
 
   // Renewal-failure policy verdicts (transport authority only):
   //   continue - 200, lease extended, keep waiting;
@@ -122,6 +124,14 @@
     return state;
   }
 
+  function remoteSyncReloadStorageKey(bindingId, requestId) {
+    return "devorch:websol:remote-sync-reload:" + bindingId + ":" + requestId;
+  }
+
+  function shouldRemoteSyncReload(lastReloadMs, now) {
+    return !lastReloadMs || now - lastReloadMs >= REMOTE_SYNC_RELOAD_COOLDOWN_MS;
+  }
+
   function submittedStorageKey(bindingId, requestId) {
     return "devorch:websol:submitted:" + bindingId + ":" + requestId;
   }
@@ -172,6 +182,18 @@
     return 0;
   }
 
+  function remoteSyncReloadAllowed(bindingId, requestId, now) {
+    try {
+      var raw = localStorage.getItem(remoteSyncReloadStorageKey(bindingId, requestId));
+      var last = raw ? Number(raw) : 0;
+      return shouldRemoteSyncReload(last, now);
+    } catch (err) { return true; }
+  }
+
+  function markRemoteSyncReload(bindingId, requestId, now) {
+    try { localStorage.setItem(remoteSyncReloadStorageKey(bindingId, requestId), String(now)); } catch (err) {}
+  }
+
   function requestAlreadySubmitted(bindingId, requestId) {
     if (hasSubmittedStorageMark(bindingId, requestId)) {
       return true;
@@ -197,7 +219,8 @@
     advanceResponseStability: advanceResponseStability,
     classifyRenewResult: classifyRenewResult,
     requestAlreadySubmitted: requestAlreadySubmitted,
-    markRequestSubmitted: markRequestSubmitted
+    markRequestSubmitted: markRequestSubmitted,
+    shouldRemoteSyncReload: shouldRemoteSyncReload
   };
 
   // Exposed for the automated adapter test (Node `require`); harmless in a
@@ -373,7 +396,8 @@
   function makeRenewalState(claim) {
     return {
       nextRenewAt: Date.now() + RENEW_INTERVAL_MS,
-      leaseExpiresMs: leaseExpiryMs(claim)
+      leaseExpiresMs: leaseExpiryMs(claim),
+      remoteSyncAt: Date.now() + REMOTE_SYNC_RELOAD_AFTER_MS
     };
   }
 
@@ -429,6 +453,11 @@
         schedule(runAdapter, RETRY_MS);
       });
       return;
+    }
+    if (!responseText && Date.now() >= renewal.remoteSyncAt && requestAlreadySubmitted(bindingId, claim.request_id) && remoteSyncReloadAllowed(bindingId, claim.request_id, Date.now())) {
+      markRemoteSyncReload(bindingId, claim.request_id, Date.now());
+      setAdapterStatus("WAITING", "Refreshing conversation to sync a remote-client response");
+      if (typeof window !== "undefined" && window.location && typeof window.location.reload === "function") { window.location.reload(); return; }
     }
     if (Date.now() >= deadline) {
       // Wait timed out: stop renewing; the lease will expire server-side and

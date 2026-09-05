@@ -177,3 +177,18 @@ class RemediationWaitingReviewTests(unittest.TestCase):
             record = wait_terminal(executor, request_id)
             self.assertEqual(record["state"], "completed")
             self.assertEqual(len(backend.started), 1)
+
+    def test_idle_same_task_can_enter_exact_remediation(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            head = make_repo(repo, "P1")
+            truth = read_repository_truth(repo)
+            helper = RemediationActuationTests()
+            config = base / "projects.json"; helper._config(config, repo)
+            request_id = helper._decision(runtime, head, truth.status_hash)
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            summary = ready_summary(repo, "P1"); summary["projects"][0]["state"] = "IDLE"
+            self.assertEqual(len(executor.advance(summary, config)), 1)
+            self.assertEqual(wait_terminal(executor, request_id)["state"], "completed")
+            self.assertEqual(len(backend.started), 1)

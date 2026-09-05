@@ -1,28 +1,23 @@
-# NEXT — Portable bootstrap hardening + real external-project smoke test
+# NEXT — V1 maintenance / future expansion
 
-Status: **READY CANDIDATE / NO WORKER-ACTUATION AUTHORIZATION**
+Status: **MAINTENANCE / NO BOUNDED CORE TASK PENDING**
 
-Recommended next bounded slice:
-- exercise the documented onboarding flow against one real non-LabDemo project
-  using only local project configuration (monitor-only first, then determine whether
-  its task/Worker contract is `agent_files` compatible);
-- verify `validate-config`, one monitor tick, dashboard projection, and daemon
-  lifecycle without changing DevOrchestrator Core for that project;
-- identify any remaining assumptions that force project-specific files or host paths;
-- if needed, harden bootstrap/launch scripts so a clean clone can be started
-  from an arbitrary working directory with explicit config/runtime locations.
+DevOrchestrator V1 is accepted. New managed projects should be onboarded through
+local project configuration and their own `agent/*` contract; no DevOrchestrator
+Core change is required for ordinary onboarding.
 
-Acceptance target:
-- real external project is registered with config only;
-- no source-code branch or product-name special case is added;
-- observed project remains unchanged by monitor/Bridge/Decision Guard;
-- full automated regression remains green;
-- any machine-specific values remain local/untracked configuration.
+Future work is owner-selected, not part of unfinished V1 acceptance:
+- multi-machine central coordinator / fleet view;
+- additional provider backends and richer quota telemetry;
+- explicitly authorized `next_stage` / retry policies;
+- hardware-action authority boundaries;
+- richer dashboard/history/notification UX;
+- broader browser adapters if ChatGPT DOM contracts change.
 
-Deferred independent integration gate:
-- deploy ChatGPT adapter 0.1.2 on TS-ZY_PC and rerun the real LabDemo browser POC
-  when TS-ZY_PC/XLabServer are available.
+Operational default:
+- keep daemon + Browser Bridge running on the host;
+- keep machine-specific project config untracked;
+- use `.devorch/status.json` for quick project status queries;
+- preserve fail-closed branch/HEAD/status-hash and one-active-Worker guards.
 
-Hard stop:
-Transition Executor / Worker actuation still requires a separately frozen
-contract and explicit owner authorization.
+Start a new DevOrchestrator development slice only after an explicit owner request.

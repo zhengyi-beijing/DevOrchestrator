@@ -36,6 +36,22 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "abc-123|xyz-789||true|false")
 
+    def test_userscript_remote_sync_reload_is_throttled(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "require(\"" + script + "\");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "console.log([a.shouldRemoteSyncReload(0,1000),"
+            "a.shouldRemoteSyncReload(1000,50000),"
+            "a.shouldRemoteSyncReload(1000,61000)].join(\"|\"));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "true|false|true")
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("REMOTE_SYNC_RELOAD_AFTER_MS", source)
+        self.assertIn("window.location.reload()", source)
+
     def test_userscript_has_compact_transport_status_badge(self):
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('STATUS_ELEMENT_ID = "devorch-web-status"', source)

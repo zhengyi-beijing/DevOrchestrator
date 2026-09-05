@@ -37,7 +37,7 @@ Immediately before launch the executor re-reads repository truth and requires:
 
 - repository truth is valid;
 - branch and HEAD still equal the reviewed request identity;
-- ordinary bootstrap/`NEXT_TASK` requires monitor state `READY_TO_RUN`; exact-fingerprint `REMEDIATE` may also enter from `WAITING_REVIEW`;
+- ordinary bootstrap/`NEXT_TASK` requires monitor state `READY_TO_RUN`; exact-fingerprint `REMEDIATE` may also enter from `WAITING_REVIEW` or `IDLE`;
 - no external task Worker is currently alive;
 - the current `agent/next.md` resolves to a task id;
 - for automatic `NEXT_TASK`, the repository is clean and the current task id differs from the task just reviewed;
