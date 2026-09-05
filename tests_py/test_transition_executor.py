@@ -225,7 +225,7 @@ def write_decision(runtime: Path, *, head: str, task_id: str = "P1", request_id:
     runtime.mkdir(parents=True, exist_ok=True)
     record = {
         "project_id": "p1", "request_id": request_id,
-        "disposition": "apply", "next_action": "next_task",
+        "disposition": "apply", "decision": "next", "next_action": "next_task",
         "task_id": task_id, "stage_id": None,
         "branch": "master", "head": head,
         "role": "reviewer", "event": "worker_done",

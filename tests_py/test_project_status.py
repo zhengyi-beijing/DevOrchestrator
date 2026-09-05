@@ -77,6 +77,33 @@ class ProjectStatusTests(unittest.TestCase):
             self.assertFalse(status["worker"]["process_alive"])
             self.assertEqual(status["actuation"]["exit_code"], 0)
 
+    def test_web_sol_decision_and_disposition_are_distinct(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            head = make_repo(repo); runtime.mkdir()
+            (runtime / "websol-decisions.json").write_text(json.dumps({
+                "version": 1, "decisions": {"r1": {
+                    "project_id": "p1", "request_id": "r1",
+                    "decision": "remediate", "disposition": "apply",
+                    "next_action": "continue_current_stage",
+                    "consumed_at": "2026-09-05T01:00:00+00:00",
+                }}
+            }), encoding="utf-8")
+            snapshot = {
+                "project_id": "p1", "repo_path": str(repo), "state": "READY_TO_RUN",
+                "orchestration_ready": True, "next_title": "P1 bounded task",
+                "telemetry": {"task_id": "P1", "run_id": None},
+                "worker": {"kind": "none", "state": "not_started", "process_alive": False},
+                "git": {"branch": "master", "head": head, "dirty": False, "changed_entries": 0},
+            }
+            target = write_project_status(
+                snapshot, runtime, phase="decision", daemon_state="running", pid=123
+            )
+            status = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(status["web_sol"]["decision"], "remediate")
+            self.assertEqual(status["web_sol"]["disposition"], "apply")
+            self.assertEqual(status["web_sol"]["next_action"], "continue_current_stage")
+
 
 if __name__ == "__main__":
     unittest.main()

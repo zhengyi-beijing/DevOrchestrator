@@ -91,7 +91,9 @@ class WebSolConsumption:
     request_id: str
     disposition: DecisionDisposition
     next_action: Optional[NextAction] = None
+    decision: Optional[WebSolDecision] = None
     reason: str = ""
+    review_status_hash: Optional[str] = None
     task_id: Optional[str] = None
     stage_id: Optional[str] = None
     branch: Optional[str] = None
@@ -271,7 +273,24 @@ def _save_decisions(path: Path, ledger: dict) -> None:
 # --------------------------------------------------------------------------
 
 
-def _consume_one(snapshot: dict, record: dict, repo_path: str) -> WebSolConsumption:
+def _reviewed_status_hash(path: Path, project_id: str, request_id: str) -> Optional[str]:
+    data = read_json(path.with_name("dispatcher-state.json"), None)
+    if not isinstance(data, dict):
+        return None
+    worker_done = data.get("worker_done")
+    project = worker_done.get(project_id) if isinstance(worker_done, dict) else None
+    occurrences = project.get("occurrences") if isinstance(project, dict) else None
+    if not isinstance(occurrences, dict):
+        return None
+    for occurrence in occurrences.values():
+        if isinstance(occurrence, dict) and occurrence.get("request_id") == request_id:
+            return _non_blank(occurrence.get("review_status_hash"))
+    return None
+
+
+def _consume_one(
+    snapshot: dict, record: dict, repo_path: str, reviewed_status_hash: Optional[str] = None
+) -> WebSolConsumption:
     """Turn one RESPONDED Bridge record into a persisted disposition.
 
     Every failure path returns a STOP outcome (fail closed): the raw record
@@ -321,13 +340,17 @@ def _consume_one(snapshot: dict, record: dict, repo_path: str) -> WebSolConsumpt
         )
 
     truth = read_repository_truth(repo_path)
-    verdict = validate_websol_response(request, response, truth)
+    verdict = validate_websol_response(
+        request, response, truth, known_dirty_status_hash=reviewed_status_hash
+    )
     return WebSolConsumption(
         project_id=request.project_id,
         request_id=request.request_id,
         disposition=verdict.disposition,
         next_action=verdict.next_action,
+        decision=response.decision,
         reason=verdict.reason,
+        review_status_hash=reviewed_status_hash,
         task_id=request.task_id,
         stage_id=request.stage_id,
         branch=request.branch,
@@ -358,13 +381,16 @@ def _consume_project(
         request_id = _non_blank(record.get("request_id"))
         if request_id is None or request_id in ledger["decisions"]:
             continue
-        outcome = _consume_one(snapshot, record, repo_path)
+        reviewed_status_hash = _reviewed_status_hash(path, str(snapshot.get("project_id") or ""), request_id)
+        outcome = _consume_one(snapshot, record, repo_path, reviewed_status_hash)
         ledger["decisions"][outcome.request_id] = {
             "project_id": outcome.project_id,
             "request_id": outcome.request_id,
             "disposition": outcome.disposition.value,
             "next_action": outcome.next_action.value if outcome.next_action is not None else None,
+            "decision": outcome.decision.value if outcome.decision is not None else None,
             "reason": outcome.reason,
+            "review_status_hash": outcome.review_status_hash,
             "task_id": outcome.task_id,
             "stage_id": outcome.stage_id,
             "branch": outcome.branch,

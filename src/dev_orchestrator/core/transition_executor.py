@@ -1,4 +1,4 @@
-"""Owner-authorized APPLY+NEXT_TASK Worker actuation.
+"""Owner-authorized NEXT_TASK and reviewed-remediation Worker actuation.
 
 Contract: docs/TRANSITION_EXECUTOR_CONTRACT.md.  This Core component is the
 only V1 execution boundary.  Browser transport and Decision Guard remain
@@ -40,6 +40,15 @@ _DEFAULT_WORKER_PROMPT = (
     "agent/next.md to the next executable task when appropriate. Commit the "
     "completed bounded task locally so the working tree is clean; do not push. "
     "Stop after one task."
+)
+
+_DEFAULT_REMEDIATION_PROMPT = (
+    "Remediate the current bounded task in place. Read agent/next.md, "
+    "agent/CURRENT.md, agent/result.md and the current uncommitted diff first. "
+    "Do not advance to a new task. Fix every acceptance gap in the current task, "
+    "run all required build/tests, update the agent status/result files, and commit "
+    "the completed current task locally so the working tree is clean; do not push. "
+    "Stop after the current task is complete."
 )
 
 
@@ -109,8 +118,13 @@ def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]]
     if raw.get("owner_authorized") is not True:
         return None, "execution is not owner-authorized"
     allowed = raw.get("allowed_next_actions")
-    if allowed != [NextAction.NEXT_TASK.value]:
-        return None, "allowed_next_actions must be exactly ['next_task']"
+    supported_actions = {NextAction.CONTINUE_CURRENT_STAGE.value, NextAction.NEXT_TASK.value}
+    if not isinstance(allowed, list) or not allowed:
+        return None, "allowed_next_actions must be a non-empty list"
+    if any(value not in supported_actions for value in allowed):
+        return None, "allowed_next_actions contains unsupported V1 action"
+    if len(set(allowed)) != len(allowed):
+        return None, "allowed_next_actions must not contain duplicates"
 
     preferred = raw.get("preferred_backends")
     if not isinstance(preferred, list) or not preferred:
@@ -157,6 +171,9 @@ def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]]
     prompt = raw.get("worker_prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         prompt = _DEFAULT_WORKER_PROMPT
+    remediation_prompt = raw.get("remediation_prompt")
+    if not isinstance(remediation_prompt, str) or not remediation_prompt.strip():
+        remediation_prompt = _DEFAULT_REMEDIATION_PROMPT
     bootstrap = raw.get("bootstrap")
     normalized_bootstrap = None
     if bootstrap is not None:
@@ -171,7 +188,9 @@ def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]]
     return {
         "preferred_backends": tuple(preferred_ids),
         "backends": backend_configs,
+        "allowed_next_actions": frozenset(allowed),
         "worker_prompt": prompt.strip(),
+        "remediation_prompt": remediation_prompt.strip(),
         "bootstrap": normalized_bootstrap,
     }, ""
 
@@ -335,6 +354,7 @@ class TransitionExecutor:
         expected_head: str,
         expected_task_id: Optional[str] = None,
         must_advance_from: Optional[str] = None,
+        expected_status_hash: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
         if snapshot.get("state") != "READY_TO_RUN":
             return None, "project is not READY_TO_RUN"
@@ -351,10 +371,13 @@ class TransitionExecutor:
         truth = read_repository_truth(project.get("repo_path") or "")
         if not truth.valid:
             return None, "repository truth unavailable"
-        if truth.dirty:
-            return None, "repository is dirty"
         if truth.branch != expected_branch or truth.head != expected_head:
             return None, "repository changed after reviewed/bootstrapped truth"
+        if expected_status_hash is not None:
+            if truth.status_hash != expected_status_hash:
+                return None, "reviewed dirty fingerprint changed before remediation"
+        elif truth.dirty:
+            return None, "repository is dirty"
         return current_task, ""
 
     def _launch(
@@ -541,11 +564,19 @@ class TransitionExecutor:
             decisions.items(),
             key=lambda item: (str(item[1].get("consumed_at") or ""), item[0]),
         )
+        accepted = {
+            ("next", NextAction.NEXT_TASK.value),
+            ("remediate", NextAction.CONTINUE_CURRENT_STAGE.value),
+        }
         for request_id, record in ordered:
             with self._lock:
                 if request_id in self._load_ledger()["executions"]:
                     continue
-            if record.get("disposition") != "apply" or record.get("next_action") != "next_task":
+            if record.get("disposition") != "apply":
+                continue
+            decision = _non_blank_config(record.get("decision"))
+            next_action = _non_blank_config(record.get("next_action"))
+            if (decision, next_action) not in accepted:
                 continue
             project_id = _non_blank_config(record.get("project_id"))
             if project_id is None:
@@ -575,25 +606,53 @@ class TransitionExecutor:
             if policy is None:
                 self._record_blocked(request_id, project_id, error, task_id=task_id)
                 continue
-            next_task_id, guard_error = self._fresh_guard(
-                project,
-                snapshot,
-                expected_branch=branch,
-                expected_head=head,
-                must_advance_from=task_id,
-            )
-            if next_task_id is None:
-                self._record_blocked(request_id, project_id, guard_error, task_id=task_id)
+            if next_action not in policy["allowed_next_actions"]:
+                self._record_blocked(
+                    request_id, project_id,
+                    "next_action is not owner-authorized by project execution policy",
+                    task_id=task_id,
+                )
+                continue
+            if decision == "remediate":
+                reviewed_hash = _non_blank_config(record.get("review_status_hash"))
+                if reviewed_hash is None:
+                    self._record_blocked(
+                        request_id, project_id,
+                        "remediation decision lacks reviewed dirty fingerprint",
+                        task_id=task_id, source_kind="remediation",
+                    )
+                    continue
+                launch_task, guard_error = self._fresh_guard(
+                    project, snapshot,
+                    expected_branch=branch, expected_head=head,
+                    expected_task_id=task_id,
+                    expected_status_hash=reviewed_hash,
+                )
+                source_kind = "remediation"
+                prompt = str(policy["remediation_prompt"])
+            else:
+                launch_task, guard_error = self._fresh_guard(
+                    project, snapshot,
+                    expected_branch=branch, expected_head=head,
+                    must_advance_from=task_id,
+                )
+                source_kind = "decision"
+                prompt = str(policy["worker_prompt"])
+            if launch_task is None:
+                self._record_blocked(
+                    request_id, project_id, guard_error,
+                    task_id=task_id, source_kind=source_kind,
+                )
                 continue
             launch = self._launch(
                 project,
                 source_request_id=request_id,
-                source_kind="decision",
-                task_id=next_task_id,
+                source_kind=source_kind,
+                task_id=launch_task,
                 source_task_id=task_id,
                 branch=branch,
                 head=head,
-                worker_prompt=str(policy["worker_prompt"]),
+                worker_prompt=prompt,
                 policy=policy,
             )
             if launch is not None:
@@ -662,7 +721,7 @@ class TransitionExecutor:
         return launches
 
     def advance(self, summary: Any, config_path: Path | str) -> list[ActuationLaunch]:
-        """Act on durable APPLY+NEXT_TASK decisions, then optional one-time bootstrap."""
+        """Act on durable authorized next/remediation decisions, then optional bootstrap."""
         config = load_projects_config(config_path)
         projects = _project_map(config)
         snapshots = _snapshot_map(summary)

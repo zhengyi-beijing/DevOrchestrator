@@ -11,12 +11,12 @@ managed Worker completes
   -> WORKER_DONE
   -> Web Sol reviewer
   -> Decision Guard
-  -> APPLY + NEXT_TASK
+  -> APPLY + (NEXT_TASK | reviewed REMEDIATE)
   -> Transition Executor
-  -> one new Worker
+  -> one bounded Worker
 ```
 
-V1 does not automate `next_stage`, `remediate`, `retry`, owner-gated actions, or hardware actions.
+V1 automates only `NEXT + NEXT_TASK` and `REMEDIATE + CONTINUE_CURRENT_STAGE`. It does not automate `next_stage`, `retry`, owner-gated actions, or hardware actions.
 
 ## Execution authority
 
@@ -25,22 +25,25 @@ A project is executable only when its local project config contains all of:
 
 - `execution.enabled == true`;
 - `execution.owner_authorized == true`;
-- `execution.allowed_next_actions == ["next_task"]`;
+- `execution.allowed_next_actions` is a non-empty duplicate-free subset of `continue_current_stage` / `next_task`;
 - `execution.preferred_backends` is an ordered non-empty subset of `agy` / `dsh`;
 - backend-specific options live under `execution.backends.agy` and `execution.backends.dsh`.
 
-The executor accepts only a newly consumed `APPLY + NEXT_TASK` response whose role is `reviewer` and event is `worker_done`.
+The executor accepts only a newly consumed `APPLY` response in the `WORKER_DONE` reviewer flow, and only for `NEXT + NEXT_TASK` or `REMEDIATE + CONTINUE_CURRENT_STAGE`. The selected action must also be explicitly owner-authorized by the project execution policy.
 
 ## Fresh-truth and task gates
 
 Immediately before launch the executor re-reads repository truth and requires:
 
-- repository truth is valid and clean;
+- repository truth is valid;
 - branch and HEAD still equal the reviewed request identity;
 - the project monitor state is `READY_TO_RUN`;
 - no external task Worker is currently alive;
 - the current `agent/next.md` resolves to a task id;
-- for automatic `NEXT_TASK`, that current task id differs from the task just reviewed.
+- for automatic `NEXT_TASK`, the repository is clean and the current task id differs from the task just reviewed;
+- for `REMEDIATE`, the current task id must equal the reviewed task id and the current Git status hash must exactly equal the dirty fingerprint frozen when `WORKER_DONE` was dispatched.
+
+The dispatcher freezes `review_status_hash` with the review occurrence. Response Consumer rechecks that exact hash in Decision Guard and persists it with the decision; Transition Executor checks it again immediately before launching remediation. Any intervening worktree change therefore fails closed.
 
 The launched Worker request uses role `worker`, working directory `repo_path`, and requires `code` + `repository` capabilities. Routing remains provider-neutral through `AgentRouter`. V1 supports `agy` and `dsh`; `preferred_backends` defines deterministic project-local priority and normal router fallback. AGY may configure an explicit executable path so daemon behavior never depends on an ambient PATH refresh.
 
@@ -69,10 +72,12 @@ No Worker is launched when any of these is true:
 
 - execution config is absent, disabled, malformed, or not owner-authorized;
 - disposition is not `APPLY`;
-- next action is not `NEXT_TASK`;
+- decision/action is outside `NEXT + NEXT_TASK` or `REMEDIATE + CONTINUE_CURRENT_STAGE`;
+- selected next action is not authorized by project execution policy;
 - event/role is outside `WORKER_DONE` reviewer flow;
-- repository truth is unavailable, dirty, stale, or changed after review;
-- current task cannot be identified or has not advanced;
+- repository truth is unavailable, stale, or branch/HEAD changed after review;
+- clean `NEXT_TASK` sees a dirty repository or an unadvanced task;
+- remediation lacks the reviewed fingerprint, the fingerprint changed, or the current task differs from the reviewed task;
 - another managed/external Worker is active;
 - routing has no eligible backend.
 
@@ -90,11 +95,12 @@ The bootstrap uses the same execution policy, fresh-truth checks, one-active-run
 
 ## Acceptance
 
-1. Unit tests prove config authority and `APPLY + NEXT_TASK` gates.
-2. Duplicate decisions/ticks start one Worker only.
-3. Restart of an active ledger entry becomes `recovery_required` without replay.
-4. Completion overlay preserves the task id captured at launch.
-5. Failed Worker stops without implicit retry.
-6. Full `tests_py`, `node --check`, and `git diff --check` remain green.
-7. Real AGY and DSH probes remain non-prompt; no acceptance test sends a real AI task.
-8. Real LineScanViewer smoke starts P1 only through an explicit bootstrap token; subsequent successful reviews may use automatic `NEXT_TASK`.
+1. Unit tests prove project authority for `NEXT + NEXT_TASK` and `REMEDIATE + CONTINUE_CURRENT_STAGE`.
+2. Known-dirty remediation applies only when the current Git status hash exactly matches the fingerprint frozen at review dispatch.
+3. Any post-review worktree change blocks remediation; duplicate decisions/ticks start one Worker only.
+4. Restart of an active ledger entry becomes `recovery_required` without replay.
+5. Completion overlay preserves the task id captured at launch.
+6. Failed Worker stops without implicit retry.
+7. Full `tests_py`, `node --check`, and `git diff --check` remain green.
+8. Real AGY and DSH probes remain non-prompt in automated tests.
+9. Real LineScanViewer smoke proves bootstrap -> WORKER_DONE -> Web Sol remediation -> same-task Worker -> review, before allowing `NEXT_TASK`.

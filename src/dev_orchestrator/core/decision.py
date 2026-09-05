@@ -78,6 +78,8 @@ def validate_websol_response(
     request: WebSolRequest,
     response: WebSolResponse,
     truth: RepositoryTruth,
+    *,
+    known_dirty_status_hash: Optional[str] = None,
 ) -> DecisionVerdict:
     """Validate a response against its request and fresh repository truth."""
     # project / request / nonce identity mismatch -> IGNORE
@@ -137,12 +139,22 @@ def validate_websol_response(
             reason="invalid decision/next_action combination",
         )
 
-    # dirty workspace without an established known-dirty contract -> REVIEW_REQUIRED
+    # Dirty work may proceed only for an explicitly reviewed remediation of
+    # the same current stage, and only while the exact reviewed Git porcelain
+    # fingerprint is unchanged. Any late/unreviewed worktree change fails closed.
     if truth.dirty:
-        return DecisionVerdict(
-            DecisionDisposition.REVIEW_REQUIRED,
-            reason="dirty workspace requires review",
+        reviewed_remediation = (
+            response.decision is WebSolDecision.REMEDIATE
+            and response.next_action is NextAction.CONTINUE_CURRENT_STAGE
+            and isinstance(known_dirty_status_hash, str)
+            and bool(known_dirty_status_hash.strip())
+            and truth.status_hash == known_dirty_status_hash
         )
+        if not reviewed_remediation:
+            return DecisionVerdict(
+                DecisionDisposition.REVIEW_REQUIRED,
+                reason="dirty workspace requires review or reviewed fingerprint changed",
+            )
 
     # OWNER_GATE -> STOP and wait for human authorization
     if response.decision is WebSolDecision.OWNER_GATE:

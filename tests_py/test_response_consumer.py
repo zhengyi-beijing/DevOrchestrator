@@ -69,7 +69,9 @@ class ResponseConsumerTests(unittest.TestCase):
             decisions = json.loads((runtime / "websol-decisions.json").read_text(encoding="utf-8"))
             record = decisions["decisions"][claim.request_id]
             self.assertEqual(record["disposition"], "apply")
+            self.assertEqual(record["decision"], "next")
             self.assertEqual(record["next_action"], "next_task")
+            self.assertTrue(record["review_status_hash"])
             self.assertNotIn("worker_pid", record)
             self.assertNotIn("executed", record)
 

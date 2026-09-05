@@ -114,7 +114,9 @@ def build_project_status(
     if decision is not None:
         web_sol = {
             "state": "consumed", "request_id": decision.get("request_id"),
-            "decision": decision.get("disposition"), "next_action": decision.get("next_action"),
+            "decision": decision.get("decision"),
+            "disposition": decision.get("disposition"),
+            "next_action": decision.get("next_action"),
             "consumed_at": decision.get("consumed_at"),
         }
     elif dispatch is not None:

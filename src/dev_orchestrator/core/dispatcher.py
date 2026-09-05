@@ -428,6 +428,8 @@ def _dispatch_one(
         "stage_id": request.stage_id,
         "branch": request.branch,
         "head": request.head,
+        "review_dirty": bool(truth.dirty),
+        "review_status_hash": truth.status_hash,
         "prompt": prompt,
         "prepared_at": utc_now_iso(),
         "delivery_state": _DELIVERY_UNBOUND,
