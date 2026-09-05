@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -103,6 +104,30 @@ class RemediationActuationTests(unittest.TestCase):
             self.assertEqual(len(backend.started), 1)
             self.assertEqual(executor.advance(ready_summary(repo, "P1"), config), [])
             self.assertEqual(len(backend.started), 1)
+
+    def test_reviewed_task_can_remediate_after_next_md_advanced(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P1")
+            (repo / "agent" / "next.md").write_text(
+                "# P2 bounded task\nStatus: DESIGN READY / EXECUTABLE\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "agent/next.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "advance handoff"], check=True, stdout=subprocess.DEVNULL)
+            truth = read_repository_truth(repo)
+            config = base / "projects.json"; self._config(config, repo)
+            request_id = self._decision(runtime, truth.head, truth.status_hash)
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            launches = executor.advance(ready_summary(repo, "P2"), config)
+            self.assertEqual(len(launches), 1)
+            record = wait_terminal(executor, request_id)
+            self.assertEqual(record["task_id"], "P1")
+            self.assertEqual(record["source_kind"], "remediation")
+            self.assertEqual(len(backend.started), 1)
+            self.assertIn("Reviewed task identity: P1", backend.started[0].prompt)
+            self.assertIn("do not implement that later task", backend.started[0].prompt)
 
     def test_dirty_change_after_review_blocks_remediation(self):
         with tempfile.TemporaryDirectory() as td:

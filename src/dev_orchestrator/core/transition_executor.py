@@ -720,14 +720,25 @@ class TransitionExecutor:
                         task_id=task_id, source_kind="remediation",
                     )
                     continue
-                launch_task, guard_error = self._fresh_guard(
+                # Exact remediation is anchored to the reviewed task identity and
+                # reviewed repository truth, not to the task currently advertised
+                # by agent/next.md. A completed Worker may already have advanced
+                # next.md for NEXT_TASK handoff before review; remediation must
+                # still repair the reviewed task without starting that later task.
+                _guard_task, guard_error = self._fresh_guard(
                     project, snapshot,
                     expected_branch=branch, expected_head=head,
-                    expected_task_id=task_id,
                     expected_status_hash=reviewed_hash,
                 )
+                launch_task = task_id if _guard_task is not None else None
                 source_kind = "remediation"
-                prompt = str(policy["remediation_prompt"])
+                prompt = (
+                    str(policy["remediation_prompt"])
+                    + "\nReviewed task identity: {0}. Remediate only this reviewed task. "
+                    + "If agent/next.md already advertises a later task, do not implement "
+                    + "that later task; preserve the handoff unless the review gap itself "
+                    + "requires correcting it."
+                ).format(task_id)
             else:
                 launch_task, guard_error = self._fresh_guard(
                     project, snapshot,
