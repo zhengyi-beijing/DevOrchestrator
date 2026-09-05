@@ -35,3 +35,5 @@ Operational state after acceptance:
 - daemon `last_error=null`;
 - no managed Worker running;
 - LineScanViewer P2 is `DESIGN READY / EXECUTABLE` but intentionally not started.
+
+Post-baseline operational extension: one-shot `execution.owner_start` allows an explicitly owner-authorized current READY task to be launched once after a deliberate STOP, with the normal fresh-truth, idempotency, router and fallback guards.

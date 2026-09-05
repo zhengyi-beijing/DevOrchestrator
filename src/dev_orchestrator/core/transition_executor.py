@@ -197,6 +197,13 @@ def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]]
         if request_id is None or task_id is None:
             return None, "execution.bootstrap requires non-blank request_id and task_id"
         normalized_bootstrap = {"request_id": request_id, "task_id": task_id}
+    owner_start = raw.get("owner_start")
+    normalized_owner_start = None
+    if owner_start is not None:
+        if not isinstance(owner_start, dict): return None, "execution.owner_start must be an object"
+        request_id = _non_blank_config(owner_start.get("request_id")); task_id = _non_blank_config(owner_start.get("task_id"))
+        if request_id is None or task_id is None: return None, "execution.owner_start requires non-blank request_id and task_id"
+        normalized_owner_start = {"request_id": request_id, "task_id": task_id}
 
     return {
         "preferred_backends": tuple(preferred_ids),
@@ -205,6 +212,7 @@ def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]]
         "worker_prompt": prompt.strip(),
         "remediation_prompt": remediation_prompt.strip(),
         "bootstrap": normalized_bootstrap,
+        "owner_start": normalized_owner_start,
     }, ""
 
 
@@ -381,7 +389,7 @@ class TransitionExecutor:
         if current_task is None:
             return None, "current agent/next.md task id is unavailable"
         if expected_task_id is not None and current_task != expected_task_id:
-            return None, "bootstrap task id does not match current agent/next.md"
+            return None, "requested task id does not match current agent/next.md"
         if must_advance_from is not None and current_task == must_advance_from:
             return None, "NEXT_TASK refused because agent/next.md has not advanced"
 
@@ -749,6 +757,26 @@ class TransitionExecutor:
                 launches.append(launch)
         return launches
 
+    def _advance_owner_start(
+        self, projects: dict[str, dict[str, Any]], snapshots: dict[str, dict[str, Any]],
+    ) -> list[ActuationLaunch]:
+        launches: list[ActuationLaunch] = []
+        for project_id, project in projects.items():
+            policy, _ = _execution_policy(project)
+            if policy is None or policy.get("owner_start") is None: continue
+            token = policy["owner_start"]; request_id = str(token["request_id"]); task_id = str(token["task_id"])
+            with self._lock:
+                if request_id in self._load_ledger()["executions"]: continue
+            snapshot = snapshots.get(project_id)
+            if snapshot is None: self._record_blocked(request_id, project_id, "monitor snapshot unavailable", task_id=task_id, source_kind="owner_start"); continue
+            truth = read_repository_truth(project.get("repo_path") or "")
+            if not truth.valid: self._record_blocked(request_id, project_id, "repository truth unavailable", task_id=task_id, source_kind="owner_start"); continue
+            launch_task, error = self._fresh_guard(project, snapshot, expected_branch=truth.branch, expected_head=truth.head, expected_task_id=task_id)
+            if launch_task is None: self._record_blocked(request_id, project_id, error, task_id=task_id, source_kind="owner_start"); continue
+            launch = self._launch(project, source_request_id=request_id, source_kind="owner_start", task_id=launch_task, source_task_id=None, branch=truth.branch, head=truth.head, worker_prompt=str(policy["worker_prompt"]), policy=policy)
+            if launch is not None: launches.append(launch)
+        return launches
+
     def _advance_bootstrap(
         self,
         projects: dict[str, dict[str, Any]],
@@ -811,10 +839,11 @@ class TransitionExecutor:
         return launches
 
     def advance(self, summary: Any, config_path: Path | str) -> list[ActuationLaunch]:
-        """Act on durable authorized next/remediation decisions, then optional bootstrap."""
+        """Act on durable decisions, one-shot owner starts, then optional bootstrap."""
         config = load_projects_config(config_path)
         projects = _project_map(config)
         snapshots = _snapshot_map(summary)
         launches = self._advance_decisions(projects, snapshots)
+        launches.extend(self._advance_owner_start(projects, snapshots))
         launches.extend(self._advance_bootstrap(projects, snapshots))
         return launches

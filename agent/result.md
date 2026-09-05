@@ -30,3 +30,5 @@ Regression evidence:
 V1 execution scope remains intentionally bounded: `NEXT_TASK` and reviewed same-stage
 remediation only. `next_stage`, generic retry, owner-gated/hardware actions and a
 cross-machine central coordinator remain future work, not incomplete V1 acceptance items.
+
+Post-baseline operational extension: one-shot `execution.owner_start` allows an explicitly owner-authorized current READY task to be launched once after a deliberate STOP, with the normal fresh-truth, idempotency, router and fallback guards.

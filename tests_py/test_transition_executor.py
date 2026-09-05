@@ -305,6 +305,31 @@ class TransitionExecutorActuationTests(unittest.TestCase):
                 self.assertTrue(record["reason"])
                 self.assertEqual(len(backend.started), 0)
 
+    def test_owner_start_launches_current_task_once_after_prior_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P2")
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            data = json.loads(config.read_text(encoding="utf-8")); data["projects"][0]["execution"]["owner_start"] = {"request_id":"owner-start-p2","task_id":"P2"}; config.write_text(json.dumps(data), encoding="utf-8")
+            runtime.mkdir(); (runtime / "transition-executor.json").write_text(json.dumps({"version":1,"executions":{"old":{"project_id":"p1","source_request_id":"old","source_kind":"decision","task_id":"P1","state":"completed"}}}), encoding="utf-8")
+            backend = FakeBackend("agy"); executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            launches = executor.advance(ready_summary(repo, "P2"), config)
+            self.assertEqual(len(launches), 1)
+            record = wait_terminal(executor, "owner-start-p2")
+            self.assertEqual((record["state"], record["source_kind"], record["task_id"]), ("completed", "owner_start", "P2"))
+            self.assertEqual(len(backend.started), 1)
+            self.assertEqual(executor.advance(ready_summary(repo, "P2"), config), [])
+
+    def test_owner_start_task_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P2"); config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            data = json.loads(config.read_text(encoding="utf-8")); data["projects"][0]["execution"]["owner_start"] = {"request_id":"owner-start-p3","task_id":"P3"}; config.write_text(json.dumps(data), encoding="utf-8")
+            backend = FakeBackend("agy"); executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            self.assertEqual(executor.advance(ready_summary(repo, "P2"), config), [])
+            record = executor.state()["executions"]["owner-start-p3"]
+            self.assertEqual(record["state"], "blocked"); self.assertIn("task id", record["reason"]); self.assertEqual(len(backend.started), 0)
+
     def test_restart_marks_active_execution_recovery_required(self):
         with tempfile.TemporaryDirectory() as td:
             runtime = Path(td) / "runtime"; runtime.mkdir()

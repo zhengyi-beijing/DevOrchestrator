@@ -85,6 +85,16 @@ No Worker is launched when any of these is true:
 
 A managed run that exits nonzero is recorded `failed` and stops the automatic chain in V1. There is no implicit retry.
 
+## One-shot owner start
+
+After a reviewed chain has intentionally stopped, the owner may explicitly start the current executable task again by adding a local execution token:
+
+```json
+"owner_start": { "request_id": "owner-unique-id", "task_id": "P2" }
+```
+
+`owner_start` is not a standing auto-run switch. The request id is persisted in the same transition ledger and can launch at most once. It requires `execution.enabled=true`, `owner_authorized=true`, a clean valid repository, monitor state `READY_TO_RUN`, exact current task-id match, no active Worker, and the same backend/router/fallback guards as normal actuation. A later manual start requires a new unique request id.
+
 ## One-time owner bootstrap
 
 An unattended chain needs an initial Worker before any `WORKER_DONE` decision exists. V1 therefore permits one explicitly configured bootstrap token:
