@@ -52,6 +52,27 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         self.assertIn("REMOTE_SYNC_RELOAD_AFTER_MS", source)
         self.assertIn("window.location.reload()", source)
 
+    def test_userscript_stale_storage_mark_does_not_prove_submission(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "globalThis.localStorage={getItem:()=>'stale',setItem:()=>{}};"
+            "globalThis.document={querySelectorAll:()=>[]};"
+            "require(\"" + script + "\");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const stale=a.requestAlreadySubmitted('binding','req-1');"
+            "globalThis.document.querySelectorAll=()=>[{innerText:'[DEVORCH_WEB_SOL_REQUEST req-1] ok'}];"
+            "const dom=a.requestAlreadySubmitted('binding','req-1');"
+            "console.log(String(stale)+'|'+String(dom));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "false|true")
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("SUBMISSION_CONFIRM_MS", source)
+        self.assertIn("range.selectNodeContents(composer)", source)
+        self.assertIn("confirmSubmission(bindingId, claim", source)
+
     def test_userscript_has_compact_transport_status_badge(self):
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('STATUS_ELEMENT_ID = "devorch-web-status"', source)

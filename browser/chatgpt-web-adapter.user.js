@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.4
+// @version      0.1.5
 // @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge. Derives the binding id from the current /c/<conversation-id> URL, claims only that binding, submits the rendered prompt, waits for a stable matching response marker, and posts the raw assistant text back.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
@@ -33,6 +33,7 @@
   var RENEW_INTERVAL_MS = 20000;
   var WAIT_DEADLINE_MS = 15 * 60 * 1000;
   var RETRY_MS = 2500;
+  var SUBMISSION_CONFIRM_MS = 10000;
   var REMOTE_SYNC_RELOAD_AFTER_MS = 30000;
   var REMOTE_SYNC_RELOAD_COOLDOWN_MS = 60000;
 
@@ -194,10 +195,7 @@
     try { localStorage.setItem(remoteSyncReloadStorageKey(bindingId, requestId), String(now)); } catch (err) {}
   }
 
-  function requestAlreadySubmitted(bindingId, requestId) {
-    if (hasSubmittedStorageMark(bindingId, requestId)) {
-      return true;
-    }
+  function userMessageHasRequest(requestId) {
     if (typeof document === "undefined") {
       return false;
     }
@@ -205,11 +203,21 @@
     var messages = document.querySelectorAll("[data-message-author-role='user']");
     for (var i = messages.length - 1; i >= 0; i--) {
       if ((messages[i].innerText || "").indexOf(marker) !== -1) {
-        markRequestSubmitted(bindingId, requestId);
         return true;
       }
     }
     return false;
+  }
+
+  function requestAlreadySubmitted(bindingId, requestId) {
+    // A localStorage mark is only telemetry. It is not submission authority:
+    // a click can leave text in ChatGPT's conversationDrafts without creating
+    // a real user turn. Only live user-message DOM evidence proves submission.
+    if (!userMessageHasRequest(requestId)) {
+      return false;
+    }
+    markRequestSubmitted(bindingId, requestId);
+    return true;
   }
 
   var adapterApi = {
@@ -219,6 +227,7 @@
     advanceResponseStability: advanceResponseStability,
     classifyRenewResult: classifyRenewResult,
     requestAlreadySubmitted: requestAlreadySubmitted,
+    userMessageHasRequest: userMessageHasRequest,
     markRequestSubmitted: markRequestSubmitted,
     shouldRemoteSyncReload: shouldRemoteSyncReload
   };
@@ -332,13 +341,24 @@
 
   function setComposerText(composer, text) {
     composer.focus();
+    // Replace the entire composer, never append to a stale ChatGPT draft.
+    // The old adapter could leave Pn+1 concatenated after Pn, then mistake the
+    // click for a successful submission.
     try {
+      if (typeof window !== "undefined" && window.getSelection && document.createRange) {
+        var selection = window.getSelection();
+        var range = document.createRange();
+        range.selectNodeContents(composer);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
       if (document.execCommand("insertText", false, text)) {
         return true;
       }
     } catch (err) {
-      // fall through to direct insertion
+      // fall through to direct replacement
     }
+    composer.textContent = "";
     composer.textContent = text;
     if (typeof InputEvent === "function") {
       composer.dispatchEvent(new InputEvent("input", {
@@ -431,10 +451,30 @@
         schedule(runAdapter, RETRY_MS);
         return;
       }
-      markRequestSubmitted(bindingId, claim.request_id);
+      // A send-button click is not proof of submission. Wait until ChatGPT
+      // renders the exact request marker as a user turn before persisting the
+      // submitted mark or waiting for an assistant response.
+      setAdapterStatus("CLAIMED", "Send clicked; confirming user turn");
+      confirmSubmission(bindingId, claim, Date.now() + SUBMISSION_CONFIRM_MS);
+    });
+  }
+
+  function confirmSubmission(bindingId, claim, confirmDeadline) {
+    if (requestAlreadySubmitted(bindingId, claim.request_id)) {
       setAdapterStatus("WAITING", "Prompt submitted; waiting for ChatGPT response");
       waitForResponse(bindingId, claim, Date.now() + WAIT_DEADLINE_MS, makeRenewalState(claim));
-    });
+      return;
+    }
+    if (Date.now() >= confirmDeadline) {
+      setAdapterStatus("WAITING", "Submission not confirmed; refreshing conversation");
+      if (typeof window !== "undefined" && window.location && typeof window.location.reload === "function") {
+        window.location.reload();
+        return;
+      }
+      schedule(runAdapter, RETRY_MS);
+      return;
+    }
+    schedule(function () { confirmSubmission(bindingId, claim, confirmDeadline); }, 500);
   }
 
   function waitForResponse(bindingId, claim, deadline, renewal) {

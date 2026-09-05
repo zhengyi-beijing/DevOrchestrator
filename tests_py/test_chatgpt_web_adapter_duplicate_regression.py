@@ -7,7 +7,7 @@ SCRIPT = ROOT / "browser" / "chatgpt-web-adapter.user.js"
 
 
 class ChatGptWebAdapterDuplicateRegressionTests(unittest.TestCase):
-    def test_reclaimed_request_is_not_resubmitted_when_dom_or_storage_marks_it_submitted(self):
+    def test_reclaimed_request_requires_dom_evidence_not_storage_mark(self):
         script = SCRIPT.as_posix()
         code = r'''
 const store = new Map();
@@ -32,17 +32,19 @@ console.log(a.requestAlreadySubmitted('conv-A','req-1'));
 '''.replace('__SCRIPT__', script)
         result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip().splitlines(), ["false", "true", "false", "true"])
+        self.assertEqual(result.stdout.strip().splitlines(), ["false", "false", "false", "true"])
 
     def test_claim_path_checks_duplicate_before_inserting_prompt(self):
         source = SCRIPT.read_text(encoding="utf-8")
         duplicate_check = "requestAlreadySubmitted(bindingId, claim.request_id)"
         insert_call = "insertAndSubmit(claim.prompt)"
-        mark_call = "markRequestSubmitted(bindingId, claim.request_id)"
+        confirm_call = "confirmSubmission(bindingId, claim"
+        direct_mark = "markRequestSubmitted(bindingId, claim.request_id)"
         self.assertIn(duplicate_check, source)
-        self.assertIn(mark_call, source)
+        self.assertIn(confirm_call, source)
         self.assertLess(source.index(duplicate_check), source.index(insert_call))
-        self.assertGreater(source.index(mark_call), source.index(insert_call))
+        self.assertLess(source.index(insert_call), source.index(confirm_call))
+        self.assertNotIn(direct_mark, source)
 
 
 if __name__ == "__main__":
