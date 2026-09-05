@@ -51,6 +51,9 @@ def wait_terminal(executor: TransitionExecutor) -> dict:
     while time.time() < deadline:
         record = executor.state()["executions"].get("owner-p1")
         if isinstance(record, dict) and record.get("state") in {"completed", "failed"}:
+            thread = executor._threads.get("owner-p1")
+            if thread is not None:
+                thread.join(timeout=1.0)
             return record
         time.sleep(0.02)
     raise AssertionError("execution did not become terminal")

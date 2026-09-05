@@ -369,7 +369,11 @@ class TransitionExecutor:
         must_advance_from: Optional[str] = None,
         expected_status_hash: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
-        if snapshot.get("state") != "READY_TO_RUN":
+        state = snapshot.get("state")
+        if expected_status_hash is not None:
+            if state not in ("READY_TO_RUN", "WAITING_REVIEW"):
+                return None, "project state is not eligible for exact remediation"
+        elif state != "READY_TO_RUN":
             return None, "project is not READY_TO_RUN"
         if _external_worker_active(snapshot):
             return None, "an external task Worker is already active"

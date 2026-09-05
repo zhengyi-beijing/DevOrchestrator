@@ -243,6 +243,9 @@ def wait_terminal(executor: TransitionExecutor, request_id: str) -> dict:
         if isinstance(record, dict) and record.get("state") in {
             "completed", "failed", "cancelled", "blocked", "recovery_required"
         }:
+            thread = executor._threads.get(request_id)
+            if thread is not None:
+                thread.join(timeout=1.0)
             return record
         time.sleep(0.02)
     raise AssertionError("execution did not reach terminal state")
