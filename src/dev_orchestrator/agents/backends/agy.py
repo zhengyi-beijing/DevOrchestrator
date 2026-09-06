@@ -107,7 +107,7 @@ class _RunState:
     run_id: str
     request: AgentRequest
     run_dir: Path
-    process: Optional[asyncio.subprocess.Process] = None
+    process: Optional[subprocess.Popen] = None
     state: AgentRunState = AgentRunState.RUNNING
     exit_code: Optional[int] = None
     stdout_handle: Optional[BinaryIO] = None
@@ -280,11 +280,19 @@ class AgyBackend(AgentBackend):
         record.stdout_handle = out_handle
         record.stderr_handle = err_handle
         try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
+            # Use a real Popen process handle instead of asyncio's subprocess
+            # watcher. Managed Workers run inside a background thread with its
+            # own event loop; on Windows a completed child can otherwise leave
+            # ``Process.wait()`` pending even after the OS process has exited.
+            # Popen.wait() is delegated to a worker thread in _settle(), so the
+            # async backend contract remains non-blocking while terminal status
+            # is anchored directly to the operating-system process handle.
+            process = subprocess.Popen(
+                argv,
                 cwd=str(cwd),
                 stdout=out_handle,
                 stderr=err_handle,
+                shell=False,
                 **hidden_subprocess_kwargs(),
             )
         except OSError as exc:
@@ -312,7 +320,7 @@ class AgyBackend(AgentBackend):
         if (
             not record.settled
             and record.process is not None
-            and record.process.returncode is not None
+            and record.process.poll() is not None
         ):
             await self._settle(record)
         return self._to_run(record)
@@ -328,7 +336,7 @@ class AgyBackend(AgentBackend):
         if (
             not record.settled
             and record.process is not None
-            and record.process.returncode is not None
+            and record.process.poll() is not None
         ):
             # Process exited on its own: finalize to the true terminal state.
             await self._settle(record)
@@ -384,22 +392,23 @@ class AgyBackend(AgentBackend):
         if record.settled:
             return
         process = record.process
-        if process is not None and process.returncode is None:
+        if process is not None and process.poll() is None:
             try:
-                await process.wait()
+                await asyncio.to_thread(process.wait)
             except ProcessLookupError:
                 pass
         if record.settled:
             return
+        return_code = process.poll() if process is not None else None
         if forced is not None:
             record.state = forced
         elif record.state not in _TERMINAL_STATES:
-            if process is None or process.returncode != 0:
+            if process is None or return_code != 0:
                 record.state = AgentRunState.FAILED
             else:
                 record.state = AgentRunState.COMPLETED
-        if process is not None and process.returncode is not None:
-            record.exit_code = process.returncode
+        if return_code is not None:
+            record.exit_code = return_code
         self._close_handles(record)
         record.settled = True
 
@@ -418,7 +427,7 @@ class AgyBackend(AgentBackend):
         process = record.process
         exit_code = record.exit_code
         if exit_code is None and process is not None:
-            exit_code = process.returncode
+            exit_code = process.poll()
         return AgentRun(
             run_id=record.run_id,
             backend_id=self.backend_id,

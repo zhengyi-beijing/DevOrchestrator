@@ -17,6 +17,7 @@ Covers:
 import asyncio
 import sys
 import tempfile
+import threading
 import textwrap
 import unittest
 from pathlib import Path
@@ -209,6 +210,39 @@ class AgyBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             (self.runtime / "agent-runs" / run.run_id / "stderr.log").is_file()
         )
+
+    def test_collect_completes_from_background_thread_event_loop(self):
+        """Managed AGY runs must settle from the executor's worker thread.
+
+        TransitionExecutor owns a daemon thread and calls asyncio.run() there.
+        On Windows the backend must not depend on an asyncio subprocess watcher
+        tied to that thread-local loop for terminal notification.
+        """
+        results = []
+        errors = []
+
+        def target():
+            async def execute():
+                run = await self.backend.start(
+                    self.make_request(self.work, "THREAD-COLLECT")
+                )
+                results.append(await self.backend.collect(run.run_id))
+
+            try:
+                asyncio.run(execute())
+            except BaseException as exc:  # captured for assertion in test thread
+                errors.append(exc)
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(timeout=5.0)
+
+        self.assertFalse(thread.is_alive(), "background collect did not terminate")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].state, AgentRunState.COMPLETED)
+        self.assertEqual(results[0].exit_code, 0)
+        self.assertIn("OUT:THREAD-COLLECT", results[0].stdout)
 
     # -- nonzero exit / unknown run id ----------------------------------------
 
