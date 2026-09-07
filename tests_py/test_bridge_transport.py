@@ -45,6 +45,21 @@ class BrowserBridgeStoreTests(unittest.TestCase):
             self.assertEqual(second.request_id, first.request_id)
             self.assertNotEqual(second.claim_token, first.claim_token)
 
+    def test_pending_request_is_not_blocked_by_expired_older_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = datetime(2026, 9, 7, tzinfo=timezone.utc)
+            store = BrowserBridgeStore(Path(td), lease_seconds=10)
+            store.submit("chatgpt_web", "conv-A", req("alpha", "old", "n-old"), "old", now=base)
+            old = store.claim("chatgpt_web", "conv-A", now=base)
+            self.assertEqual(old.request_id, "old")
+            store.submit(
+                "chatgpt_web", "conv-A", req("alpha", "new", "n-new"), "new",
+                now=base + timedelta(seconds=5),
+            )
+
+            claimed = store.claim("chatgpt_web", "conv-A", now=base + timedelta(seconds=11))
+            self.assertEqual(claimed.request_id, "new")
+
     def test_response_requires_exact_binding_nonce_and_claim_token(self):
         with tempfile.TemporaryDirectory() as td:
             store = BrowserBridgeStore(Path(td))

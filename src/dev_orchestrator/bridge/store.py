@@ -471,23 +471,29 @@ class BrowserBridgeStore:
             # watching this conversation.
             self._touch_presence(adapter, binding_id, moment)
             queue = self._load_queue(adapter, binding_id)
-            for request_id, record in queue.items():
-                state = record.get("state")
-                if state == STATE_PENDING:
-                    pass
-                elif state == STATE_CLAIMED:
-                    expires_at = _parse_iso(record.get("lease_expires_at"))
-                    if expires_at is None or moment < expires_at:
-                        continue
-                else:  # RESPONDED and anything unexpected fail closed
-                    continue
-                claim_token = secrets.token_urlsafe(18)
-                record["state"] = STATE_CLAIMED
-                record["claim_token"] = claim_token
-                record["claimed_at"] = _iso(moment)
-                record["lease_expires_at"] = _iso(moment + timedelta(seconds=self.lease_seconds))
-                self._save_queue(adapter, binding_id, queue)
-                return self._record_to_claim(record, claim_token)
+            # Fresh pending work must not be head-of-line blocked by an older
+            # request whose claim keeps expiring and being retried. Prefer all
+            # never-claimed pending requests first; only then reclaim expired
+            # claims. Within each class, preserve insertion order.
+            for reclaim_expired in (False, True):
+                for request_id, record in queue.items():
+                    state = record.get("state")
+                    if not reclaim_expired:
+                        if state != STATE_PENDING:
+                            continue
+                    else:
+                        if state != STATE_CLAIMED:
+                            continue
+                        expires_at = _parse_iso(record.get("lease_expires_at"))
+                        if expires_at is None or moment < expires_at:
+                            continue
+                    claim_token = secrets.token_urlsafe(18)
+                    record["state"] = STATE_CLAIMED
+                    record["claim_token"] = claim_token
+                    record["claimed_at"] = _iso(moment)
+                    record["lease_expires_at"] = _iso(moment + timedelta(seconds=self.lease_seconds))
+                    self._save_queue(adapter, binding_id, queue)
+                    return self._record_to_claim(record, claim_token)
             return None
 
     def respond(

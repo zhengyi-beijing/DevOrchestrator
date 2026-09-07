@@ -53,6 +53,7 @@ Submission is idempotent by `(request_id, nonce)`. Reusing a `request_id` with a
 Once Response Consumer has durably recorded a request in `websol-decisions.json`, that decision is also a replay tombstone for the deterministic WORKER_DONE request id. Dispatcher recovery must not re-emit that request even if its own dispatcher ledger or Bridge transport record has subsequently been pruned or recovered independently. A malformed/conflicting tombstone fails closed.
 
 Claim is filtered by exact `(adapter, binding_id)`, returns at most one request, and issues an opaque `claim_token` with a bounded lease. A first response must present the same binding, request id, nonce, and claim token while the claim lease is valid. After acceptance, an exact replay with the same nonce, claim token, and byte-identical response text is idempotent and returns success without mutating the stored response; any conflicting replay is rejected and never changes queue state.
+Fresh `pending` requests are claimed before retrying older claims whose leases have expired. This prevents one historical request with a missing ChatGPT response marker from head-of-line blocking newer review work; expired claims remain retryable after fresh pending work.
 
 A claimed request may renew its lease while ChatGPT is still answering. `renew` requires the exact binding, request id, nonce and claim token of a still-valid active claim, and extends the lease from the renewal moment; wrong/expired identity/token fails closed without mutating state.
 
