@@ -129,6 +129,32 @@ class RemediationActuationTests(unittest.TestCase):
             self.assertIn("Reviewed task identity: P1", backend.started[0].prompt)
             self.assertIn("do not implement that later task", backend.started[0].prompt)
 
+    def test_projected_waiting_review_truth_allows_exact_remediation_when_raw_is_phase_gated(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            head = make_repo(repo, "P1")
+            (repo / "work.txt").write_text("reviewed dirty\n", encoding="utf-8")
+            truth = read_repository_truth(repo)
+            config = base / "projects.json"; self._config(config, repo)
+            request_id = self._decision(runtime, head, truth.status_hash)
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+
+            raw = ready_summary(repo, "P1")
+            raw["projects"][0]["state"] = "WAITING_PHASE_GATE"
+            raw["projects"][0]["telemetry"]["task_id"] = None
+            raw["projects"][0]["next_title"] = "INT2 Fault isolation and graceful teardown reconciliation"
+            projected = ready_summary(repo, "P1")
+            projected["projects"][0]["state"] = "WAITING_REVIEW"
+
+            launches = executor.advance(raw, config, decision_summary=projected)
+            self.assertEqual(len(launches), 1)
+            record = wait_terminal(executor, request_id)
+            self.assertEqual(record["state"], "completed")
+            self.assertEqual(record["task_id"], "P1")
+            self.assertEqual(record["source_kind"], "remediation")
+            self.assertEqual(len(backend.started), 1)
+
     def test_dirty_change_after_review_blocks_remediation(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"

@@ -9,19 +9,21 @@ from dev_orchestrator.daemon import _run_orchestration_tick
 class FakeExecutor:
     def __init__(self):
         self.advance_seen = None
+        self.decision_summary_seen = None
         self.overlay_calls = 0
 
     def overlay_managed_runs(self, summary):
         self.overlay_calls += 1
         return {"projects": [{**summary["projects"][0], "view": "overlay", "overlay_call": self.overlay_calls}]}
 
-    def advance(self, summary, config):
+    def advance(self, summary, config, *, decision_summary=None):
         self.advance_seen = summary
+        self.decision_summary_seen = decision_summary
         return []
 
 
 class DaemonTransitionIntegrationTests(unittest.TestCase):
-    def test_tick_dispatches_overlay_but_advances_raw_summary(self):
+    def test_tick_uses_projected_truth_for_decisions_but_keeps_raw_owner_gates(self):
         raw = {"projects": [{"project_id": "p1", "repo_path": "repo", "view": "raw"}]}
         executor = FakeExecutor()
         phases = []
@@ -41,6 +43,8 @@ class DaemonTransitionIntegrationTests(unittest.TestCase):
         self.assertEqual(dispatched[0]["projects"][0]["view"], "overlay")
         self.assertEqual(consumed[0]["projects"][0]["view"], "overlay")
         self.assertIs(executor.advance_seen, raw)
+        self.assertEqual(executor.decision_summary_seen["projects"][0]["view"], "overlay")
+        self.assertEqual(executor.decision_summary_seen["projects"][0]["overlay_call"], 1)
         self.assertEqual(result["projects"][0]["view"], "overlay")
         self.assertEqual(phases, [
             ("monitor", "raw"),

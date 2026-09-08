@@ -79,7 +79,7 @@ def _run_orchestration_tick(
     write_project_statuses(projected, runtime, phase="dispatch", daemon_state="running", pid=pid)
     consume_websol_responses(projected, bridge_store, runtime)
     write_project_statuses(projected, runtime, phase="decision", daemon_state="running", pid=pid)
-    executor.advance(raw_summary, config)
+    executor.advance(raw_summary, config, decision_summary=projected)
     projected = executor.overlay_managed_runs(raw_summary)
     write_project_statuses(projected, runtime, phase="actuation", daemon_state="running", pid=pid)
     return projected

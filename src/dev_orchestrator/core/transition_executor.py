@@ -849,12 +849,26 @@ class TransitionExecutor:
                 launches.append(launch)
         return launches
 
-    def advance(self, summary: Any, config_path: Path | str) -> list[ActuationLaunch]:
-        """Act on durable decisions, one-shot owner starts, then optional bootstrap."""
+    def advance(
+        self,
+        summary: Any,
+        config_path: Path | str,
+        *,
+        decision_summary: Any = None,
+    ) -> list[ActuationLaunch]:
+        """Act on durable decisions, one-shot owner starts, then optional bootstrap.
+
+        Decision actuation may use the managed-run projected snapshot that was
+        reviewed and consumed in the same daemon tick. Owner-start/bootstrap
+        gates intentionally remain anchored to the raw monitor snapshot.
+        """
         config = load_projects_config(config_path)
         projects = _project_map(config)
-        snapshots = _snapshot_map(summary)
-        launches = self._advance_decisions(projects, snapshots)
-        launches.extend(self._advance_owner_start(projects, snapshots))
-        launches.extend(self._advance_bootstrap(projects, snapshots))
+        raw_snapshots = _snapshot_map(summary)
+        decision_snapshots = _snapshot_map(
+            summary if decision_summary is None else decision_summary
+        )
+        launches = self._advance_decisions(projects, decision_snapshots)
+        launches.extend(self._advance_owner_start(projects, raw_snapshots))
+        launches.extend(self._advance_bootstrap(projects, raw_snapshots))
         return launches

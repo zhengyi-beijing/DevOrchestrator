@@ -320,6 +320,30 @@ class TransitionExecutorActuationTests(unittest.TestCase):
             self.assertEqual(len(backend.started), 1)
             self.assertEqual(executor.advance(ready_summary(repo, "P2"), config), [])
 
+    def test_owner_start_still_uses_raw_monitor_gate_when_decisions_use_projected_truth(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P2")
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            data = json.loads(config.read_text(encoding="utf-8"))
+            data["projects"][0]["execution"]["owner_start"] = {
+                "request_id": "owner-start-p2", "task_id": "P2"
+            }
+            config.write_text(json.dumps(data), encoding="utf-8")
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            raw = ready_summary(repo, "P2")
+            raw["projects"][0]["state"] = "WAITING_PHASE_GATE"
+            projected = ready_summary(repo, "P2")
+
+            self.assertEqual(
+                executor.advance(raw, config, decision_summary=projected), []
+            )
+            record = executor.state()["executions"]["owner-start-p2"]
+            self.assertEqual(record["state"], "blocked")
+            self.assertIn("READY_TO_RUN", record["reason"])
+            self.assertEqual(len(backend.started), 0)
+
     def test_owner_start_task_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"
