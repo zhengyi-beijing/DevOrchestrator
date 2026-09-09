@@ -154,6 +154,7 @@ def _monitor_error_snapshot(
         "repo_path": repo_path,
         "adapter": project.get("adapter"),
         "conversation_binding": project.get("conversation_binding"),
+        "conversation_binding_source": project.get("conversation_binding_source", "none"),
         "orchestration_ready": bool(project.get("orchestration_ready")),
         "observed_at": observed_at.isoformat(),
         "state": "MONITOR_ERROR",
@@ -170,9 +171,14 @@ def run_monitor_once(
     history is idempotent by stable run id.
     """
     from dev_orchestrator.config import load_projects_config
+    from dev_orchestrator.control.binding_resolver import resolve_effective_projects
+    from dev_orchestrator.control.store import ConversationControlStore
 
     config = load_projects_config(config_path)
     runtime = Path(runtime_root)
+    projects = resolve_effective_projects(
+        config.get("projects") or [], ConversationControlStore(runtime)
+    )
     projects_dir = runtime / "projects"
     history_dir = runtime / "history"
     projects_dir.mkdir(parents=True, exist_ok=True)
@@ -182,7 +188,7 @@ def run_monitor_once(
     tick_now = now or utc_now()
 
     snapshots: list[dict[str, Any]] = []
-    for project in config.get("projects") or []:
+    for project in projects:
         project_id = str(project.get("project_id") or "")
         snapshot_path = projects_dir / (project_id + ".json")
         previous: Optional[dict] = None
@@ -196,6 +202,7 @@ def run_monitor_once(
         try:
             adapter = _adapter_for_project(project)
             snapshot = adapter.snapshot(project, runs_path, now=tick_now)
+            snapshot["conversation_binding_source"] = project.get("conversation_binding_source", "none")
         except Exception as exc:  # noqa: BLE001 - match PS MONITOR_ERROR catch-all
             snapshot = _monitor_error_snapshot(project, tick_now, exc)
         event = new_state_event(previous, snapshot)
