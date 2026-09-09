@@ -36,14 +36,16 @@ console.log(a.requestAlreadySubmitted('conv-A','req-1'));
 
     def test_claim_path_checks_duplicate_before_inserting_prompt(self):
         source = SCRIPT.read_text(encoding="utf-8")
+        start = source.index("  function runAdapter()")
+        end = source.index("  function confirmSubmission", start)
+        run_adapter = source[start:end]
         duplicate_check = "requestAlreadySubmitted(bindingId, claim.request_id)"
-        insert_call = "insertAndSubmit(claim.prompt)"
-        confirm_call = "confirmSubmission(bindingId, claim"
+        prepare_call = "prepareComposer(claim.prompt)"
+        submit_call = "submitWhenReady(bindingId, claim"
         direct_mark = "markRequestSubmitted(bindingId, claim.request_id)"
-        self.assertIn(duplicate_check, source)
-        self.assertIn(confirm_call, source)
-        self.assertLess(source.index(duplicate_check), source.index(insert_call))
-        self.assertLess(source.index(insert_call), source.index(confirm_call))
+        self.assertIn(duplicate_check, run_adapter)
+        self.assertLess(run_adapter.index(duplicate_check), run_adapter.index(prepare_call))
+        self.assertLess(run_adapter.index(prepare_call), run_adapter.index(submit_call))
         self.assertNotIn(direct_mark, source)
 
 

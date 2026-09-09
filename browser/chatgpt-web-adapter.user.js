@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.5
+// @version      0.1.10
 // @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge. Derives the binding id from the current /c/<conversation-id> URL, claims only that binding, submits the rendered prompt, waits for a stable matching response marker, and posts the raw assistant text back.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
@@ -33,6 +33,7 @@
   var RENEW_INTERVAL_MS = 20000;
   var WAIT_DEADLINE_MS = 15 * 60 * 1000;
   var RETRY_MS = 2500;
+  var SUBMIT_BUTTON_WAIT_MS = 3000;
   var SUBMISSION_CONFIRM_MS = 10000;
   var REMOTE_SYNC_RELOAD_AFTER_MS = 30000;
   var REMOTE_SYNC_RELOAD_COOLDOWN_MS = 60000;
@@ -229,7 +230,9 @@
     requestAlreadySubmitted: requestAlreadySubmitted,
     userMessageHasRequest: userMessageHasRequest,
     markRequestSubmitted: markRequestSubmitted,
-    shouldRemoteSyncReload: shouldRemoteSyncReload
+    shouldRemoteSyncReload: shouldRemoteSyncReload,
+    isStopComposerButton: isStopComposerButton,
+    findSendButton: findSendButton
   };
 
   // Exposed for the automated adapter test (Node `require`); harmless in a
@@ -370,8 +373,32 @@
     return true;
   }
 
+  function isStopComposerButton(button) {
+    if (!button) { return false; }
+    var parts = [
+      button.getAttribute && button.getAttribute("data-testid"),
+      button.getAttribute && button.getAttribute("aria-label"),
+      button.getAttribute && button.getAttribute("title"),
+      button.innerText
+    ];
+    var text = parts.filter(function (part) { return typeof part === "string"; }).join(" ").toLowerCase();
+    return text.indexOf("stop") !== -1 || text.indexOf("停止") !== -1;
+  }
+
+  function findSendButton() {
+    var legacy = document.querySelector("button[data-testid='send-button']");
+    if (legacy && !isStopComposerButton(legacy)) { return legacy; }
+
+    // ChatGPT's newer composer exposes the submit control by id. The same
+    // control can become "Stop answering" while a turn is streaming, so
+    // never use this fallback unless its accessible/test metadata is non-stop.
+    var composerSubmit = document.querySelector("button#composer-submit-button");
+    if (composerSubmit && !isStopComposerButton(composerSubmit)) { return composerSubmit; }
+    return null;
+  }
+
   function clickSendButton() {
-    var send = document.querySelector("button[data-testid='send-button']");
+    var send = findSendButton();
     if (send && !send.disabled) {
       send.click();
       return true;
@@ -379,7 +406,7 @@
     return false;
   }
 
-  function insertAndSubmit(text) {
+  function prepareComposer(text) {
     if (typeof document === "undefined") {
       return false;
     }
@@ -388,7 +415,21 @@
       return false;
     }
     setComposerText(composer, text);
-    return clickSendButton();
+    return true;
+  }
+
+  function submitWhenReady(bindingId, claim, submitDeadline) {
+    if (clickSendButton()) {
+      setAdapterStatus("CLAIMED", "Send clicked; confirming user turn");
+      confirmSubmission(bindingId, claim, Date.now() + SUBMISSION_CONFIRM_MS);
+      return;
+    }
+    if (Date.now() >= submitDeadline) {
+      setAdapterStatus("IDLE", "Send button not ready; retrying claim loop");
+      schedule(runAdapter, RETRY_MS);
+      return;
+    }
+    schedule(function () { submitWhenReady(bindingId, claim, submitDeadline); }, 100);
   }
 
   function findResponseText(requestId) {
@@ -446,16 +487,16 @@
         waitForResponse(bindingId, claim, Date.now() + WAIT_DEADLINE_MS, makeRenewalState(claim));
         return;
       }
-      if (!insertAndSubmit(claim.prompt)) {
+      if (!prepareComposer(claim.prompt)) {
         // Composer not ready; do not record a submission that never happened.
         schedule(runAdapter, RETRY_MS);
         return;
       }
-      // A send-button click is not proof of submission. Wait until ChatGPT
-      // renders the exact request marker as a user turn before persisting the
-      // submitted mark or waiting for an assistant response.
-      setAdapterStatus("CLAIMED", "Send clicked; confirming user turn");
-      confirmSubmission(bindingId, claim, Date.now() + SUBMISSION_CONFIRM_MS);
+      // ChatGPT updates composer/send-button state asynchronously. Poll the
+      // submit control briefly instead of treating an immediate disabled/missing
+      // button as a failed submission and rewriting the same draft forever.
+      setAdapterStatus("CLAIMED", "Prompt inserted; waiting for send button");
+      submitWhenReady(bindingId, claim, Date.now() + SUBMIT_BUTTON_WAIT_MS);
     });
   }
 

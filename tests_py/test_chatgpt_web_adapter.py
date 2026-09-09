@@ -69,9 +69,29 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "false|true")
         source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("SUBMIT_BUTTON_WAIT_MS", source)
         self.assertIn("SUBMISSION_CONFIRM_MS", source)
         self.assertIn("range.selectNodeContents(composer)", source)
+        self.assertIn("submitWhenReady(bindingId, claim", source)
         self.assertIn("confirmSubmission(bindingId, claim", source)
+
+    def test_userscript_supports_new_composer_submit_id_without_clicking_stop(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "const send={disabled:false,innerText:'',getAttribute:(n)=>n==='aria-label'?'Send prompt':null};"
+            "const stop={disabled:false,innerText:'',getAttribute:(n)=>n==='aria-label'?'Stop answering':(n==='data-testid'?'stop-button':null)};"
+            "globalThis.document={querySelector:(q)=>q===\"button#composer-submit-button\"?send:null,querySelectorAll:()=>[]};"
+            "require(\"" + script + "\");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const sendFound=a.findSendButton()===send;"
+            "globalThis.document.querySelector=(q)=>q===\"button#composer-submit-button\"?stop:null;"
+            "const stopRejected=a.findSendButton()===null;"
+            "console.log(String(sendFound)+'|'+String(stopRejected));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "true|true")
 
     def test_userscript_has_compact_transport_status_badge(self):
         source = SCRIPT.read_text(encoding="utf-8")

@@ -37,3 +37,13 @@ Still owner-gated. Before implementation, freeze a new contract covering
 execution authority, idempotency/replay, project isolation, stop conditions,
 and stage/owner boundaries. Do not infer authorization from a valid Web Sol
 disposition alone.
+
+## Browser acceptance harness hardening
+
+Follow-up from CCP7 live acceptance:
+- add a preflight that verifies the expected process owns Bridge port 8765
+  before a live browser case starts;
+- fail fast if a stale acceptance Bridge or production daemon already owns the
+  port, and report the owning PID/command line;
+- keep this as test-harness hardening only; CCP7 transport acceptance itself is
+  complete.
