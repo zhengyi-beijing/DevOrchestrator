@@ -137,3 +137,18 @@ The existing dashboard stays primarily observational but may link to the Control
 - Claimed Web Sol work cannot be cross-routed by rebind.
 - Owner approval requires a deliberate owner UI action and cannot be triggered by assistant prose.
 - Existing Web Sol queue, Decision Guard, Transition Executor, and all prior tests remain green.
+
+## CCP3 implementation checkpoint
+
+- Added a dedicated loopback-only Control Plane listener, default `127.0.0.1:8766`.
+- Read surface: `GET /v1/health`, `/v1/sessions`, `/v1/bindings`, `/v1/projects`.
+- Mutation surface: `POST /v1/session/heartbeat`, `/v1/bind`, `/v1/rebind`, `/v1/unbind`.
+- `POST /v1/owner-action` is deliberately reserved and returns `501` until CCP6; assistant prose still has no owner authority.
+- The unified daemon owns Web `:8770`, Browser Bridge `:8765`, and Control Plane `:8766` in the same PID and persists `control.json` plus control address/port in `daemon.json`.
+- Control listener configuration is restricted to explicit loopback addresses; no shell, Worker, prompt, or generic workflow endpoint exists.
+- Rebind/unbind re-read the effective project route and fail closed while the current Browser Bridge route has a still-valid `CLAIMED` Web Sol request.
+- Explicit unbind now persists a runtime `unbound` tombstone so legacy static config cannot silently reappear as the effective route.
+- Runtime/static route collisions, unknown projects, undiscovered/stale target conversations, and duplicate effective routes fail closed.
+- Regression evidence on ZXZ-PC: CCP control/daemon targeted tests **8/8 PASS**; full `tests_py` **156/156 PASS**; `node --check` PASS; `git diff --check` PASS.
+
+CCP3 remains software-only and is not deployed into the currently running production daemon yet.

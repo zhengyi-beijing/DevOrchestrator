@@ -25,6 +25,9 @@ from typing import Any, Optional
 
 from dev_orchestrator.bridge.server import make_bridge_server
 from dev_orchestrator.bridge.store import BrowserBridgeStore
+from dev_orchestrator.control.server import make_control_server
+from dev_orchestrator.control.service import ControlPlaneService
+from dev_orchestrator.control.store import ConversationControlStore
 from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
 from dev_orchestrator.core.response_consumer import consume_websol_responses
 from dev_orchestrator.core.transition_executor import TransitionExecutor
@@ -94,6 +97,8 @@ def run_daemon(
     port: int,
     bridge_listen: str = "127.0.0.1",
     bridge_port: int = 8765,
+    control_listen: str = "127.0.0.1",
+    control_port: int = 8766,
 ) -> int:
     """Run the unified daemon until interrupted.
 
@@ -114,12 +119,17 @@ def run_daemon(
 
     server = None
     bridge_server = None
+    control_server = None
     web_thread: Optional[threading.Thread] = None
     bridge_thread: Optional[threading.Thread] = None
+    control_thread: Optional[threading.Thread] = None
     try:
         server = make_server(listen, port, runtime, web_root)
         bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=True)
         bridge_server = make_bridge_server(bridge_listen, bridge_port, bridge_store)
+        control_store = ConversationControlStore(runtime)
+        control_service = ControlPlaneService(config, runtime, control_store, bridge_store)
+        control_server = make_control_server(control_listen, control_port, control_service)
     except Exception:
         # Never leave a live-looking pid file behind when a bind fails.
         try:
@@ -130,6 +140,8 @@ def run_daemon(
             server.server_close()
         if bridge_server is not None:
             bridge_server.server_close()
+        if control_server is not None:
+            control_server.server_close()
         raise
 
     web_thread = threading.Thread(
@@ -144,9 +156,17 @@ def run_daemon(
         name="devorchestrator-bridge",
         daemon=True,
     )
+    control_thread = threading.Thread(
+        target=control_server.serve_forever,
+        kwargs={"poll_interval": 0.5},
+        name="devorchestrator-control",
+        daemon=True,
+    )
     web_thread.start()
     bridge_thread.start()
+    control_thread.start()
     bridge_bound_port = int(bridge_server.server_address[1])
+    control_bound_port = int(control_server.server_address[1])
     transition_executor = TransitionExecutor(runtime)
     try:
         while True:
@@ -166,7 +186,8 @@ def run_daemon(
             write_json(
                 runtime / "daemon.json",
                 {**heartbeat, "listen_address": listen, "port": port,
-                 "bridge_listen_address": bridge_listen, "bridge_port": bridge_bound_port},
+                 "bridge_listen_address": bridge_listen, "bridge_port": bridge_bound_port,
+                 "control_listen_address": control_listen, "control_port": control_bound_port},
             )
             write_json(
                 runtime / "bridge.json",
@@ -175,11 +196,18 @@ def run_daemon(
                     started_at=started_at, last_error=last_error,
                 ),
             )
+            write_json(
+                runtime / "control.json",
+                _bridge_heartbeat(
+                    state=state, pid=pid, listen=control_listen, port=control_bound_port,
+                    started_at=started_at, last_error=last_error,
+                ),
+            )
             time.sleep(interval)
     except KeyboardInterrupt:
         pass
     finally:
-        for runner in (server, bridge_server):
+        for runner in (server, bridge_server, control_server):
             if runner is not None:
                 runner.shutdown()
                 runner.server_close()
@@ -187,6 +215,8 @@ def run_daemon(
             web_thread.join(timeout=2)
         if bridge_thread is not None:
             bridge_thread.join(timeout=2)
+        if control_thread is not None:
+            control_thread.join(timeout=2)
         try:
             (runtime / "daemon.pid").unlink(missing_ok=True)
         except OSError:

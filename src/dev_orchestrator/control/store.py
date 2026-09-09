@@ -108,6 +108,23 @@ class ConversationControlStore:
             write_json(self.sessions_path, sessions, indent=2)
             return dict(record)
 
+    def session_status(
+        self, adapter: str, binding_id: str, *, now: Optional[datetime] = None
+    ) -> dict[str, Any]:
+        adapter = _require_non_blank(adapter, "adapter")
+        binding_id = _require_non_blank(binding_id, "binding_id")
+        moment = _as_utc(now)
+        with self._lock:
+            sessions = self._load_sessions()
+            record = sessions.get(self._session_key(adapter, binding_id))
+        if not isinstance(record, dict):
+            return {"state": "undiscovered", "adapter": adapter, "binding_id": binding_id, "last_seen_at": None}
+        last_seen = parse_utc(record.get("last_seen_at"))
+        live = bool(last_seen and (moment - last_seen).total_seconds() < self.session_presence_seconds)
+        item = dict(record)
+        item["state"] = "live" if live else "stale"
+        return item
+
     def list_sessions(self, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
         moment = _as_utc(now)
         with self._lock:
@@ -132,12 +149,18 @@ class ConversationControlStore:
         result.sort(key=lambda item: (str(item.get("title") or ""), str(item.get("binding_id") or "")))
         return result
 
-    def binding_for_project(self, project_id: str) -> Optional[dict[str, Any]]:
+    def runtime_record_for_project(self, project_id: str) -> Optional[dict[str, Any]]:
         project_id = _require_non_blank(project_id, "project_id")
         with self._lock:
             bindings = self._load_bindings()
             record = bindings.get(project_id)
         return dict(record) if isinstance(record, dict) else None
+
+    def binding_for_project(self, project_id: str) -> Optional[dict[str, Any]]:
+        record = self.runtime_record_for_project(project_id)
+        if not isinstance(record, dict) or record.get("state") == "unbound":
+            return None
+        return record
 
     def project_for_binding(self, adapter: str, binding_id: str) -> Optional[str]:
         adapter = _require_non_blank(adapter, "adapter")
@@ -145,7 +168,7 @@ class ConversationControlStore:
         with self._lock:
             bindings = self._load_bindings()
         for project_id, record in bindings.items():
-            if not isinstance(record, dict):
+            if not isinstance(record, dict) or record.get("state") == "unbound":
                 continue
             if record.get("adapter") == adapter and record.get("binding_id") == binding_id:
                 return str(project_id)
@@ -168,7 +191,7 @@ class ConversationControlStore:
         bindings: dict[str, dict[str, Any]], project_id: str, adapter: str, binding_id: str
     ) -> Optional[str]:
         for other_id, record in bindings.items():
-            if other_id == project_id or not isinstance(record, dict):
+            if other_id == project_id or not isinstance(record, dict) or record.get("state") == "unbound":
                 continue
             if record.get("adapter") == adapter and record.get("binding_id") == binding_id:
                 return str(other_id)
@@ -189,7 +212,7 @@ class ConversationControlStore:
         with self._lock:
             bindings = self._load_bindings()
             current = bindings.get(project_id)
-            if isinstance(current, dict):
+            if isinstance(current, dict) and current.get("state") != "unbound":
                 if current.get("adapter") == adapter and current.get("binding_id") == binding_id:
                     return dict(current)
                 raise ControlConflictError("project already has a different runtime binding; use rebind")
@@ -199,6 +222,7 @@ class ConversationControlStore:
             session = self._session_snapshot(adapter, binding_id)
             record = {
                 "project_id": project_id,
+                "state": "bound",
                 "adapter": adapter,
                 "binding_id": binding_id,
                 "title": session.get("title"),
@@ -211,15 +235,25 @@ class ConversationControlStore:
             write_json(self.bindings_path, bindings, indent=2)
             return dict(record)
 
-    def unbind(self, project_id: str) -> Optional[dict[str, Any]]:
+    def unbind(
+        self, project_id: str, *, now: Optional[datetime] = None
+    ) -> dict[str, Any]:
         project_id = _require_non_blank(project_id, "project_id")
+        moment = _as_utc(now)
         with self._lock:
             bindings = self._load_bindings()
-            record = bindings.pop(project_id, None)
-            if record is None:
-                return None
+            current = bindings.get(project_id)
+            if isinstance(current, dict) and current.get("state") == "unbound":
+                return dict(current)
+            record = {
+                "project_id": project_id,
+                "state": "unbound",
+                "updated_at": _iso(moment),
+                "provenance": "owner_control",
+            }
+            bindings[project_id] = record
             write_json(self.bindings_path, bindings, indent=2)
-            return dict(record) if isinstance(record, dict) else None
+            return dict(record)
 
     def rebind(
         self,
@@ -243,6 +277,7 @@ class ConversationControlStore:
             bound_at = previous.get("bound_at") if isinstance(previous, dict) else None
             record = {
                 "project_id": project_id,
+                "state": "bound",
                 "adapter": adapter,
                 "binding_id": binding_id,
                 "title": session.get("title"),

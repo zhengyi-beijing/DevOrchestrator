@@ -89,9 +89,10 @@ class ConversationControlStoreTests(unittest.TestCase):
         self.heartbeat()
         self.store.bind("labdemo", "chatgpt_web", "conv-A")
         removed = self.store.unbind("labdemo")
-        self.assertEqual(removed["binding_id"], "conv-A")
-        self.assertIsNone(self.store.unbind("labdemo"))
+        self.assertEqual(removed["state"], "unbound")
+        self.assertEqual(self.store.unbind("labdemo"), removed)
         self.assertIsNone(self.store.binding_for_project("labdemo"))
+        self.assertEqual(self.store.runtime_record_for_project("labdemo")["state"], "unbound")
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ from dev_orchestrator.config import (
     resolve_web_root,
 )
 from dev_orchestrator.daemon import run_daemon
+from dev_orchestrator.control.server import validate_control_listen
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.platform.process import (
     executable_path,
@@ -436,6 +437,12 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         _fail("port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
     if not (_PORT_MIN <= args.bridge_port <= _PORT_MAX):
         _fail("bridge port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
+    if not (_PORT_MIN <= args.control_port <= _PORT_MAX):
+        _fail("control port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
+    try:
+        validate_control_listen(args.control_listen)
+    except ValueError as exc:
+        _fail(str(exc))
     config = resolve_config_path(args.config)
     runtime = resolve_runtime_root(args.runtime_root)
     web_root = resolve_web_root(args.web_root)
@@ -449,6 +456,8 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             args.port,
             args.bridge_listen,
             args.bridge_port,
+            args.control_listen,
+            args.control_port,
         )
     except KeyboardInterrupt:
         return 0
@@ -461,6 +470,12 @@ def cmd_start_daemon(args: argparse.Namespace) -> int:
         _fail("port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
     if not (_PORT_MIN <= args.bridge_port <= _PORT_MAX):
         _fail("bridge port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
+    if not (_PORT_MIN <= args.control_port <= _PORT_MAX):
+        _fail("control port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
+    try:
+        validate_control_listen(args.control_listen)
+    except ValueError as exc:
+        _fail(str(exc))
     runtime = resolve_runtime_root(args.runtime_root)
     runtime.mkdir(parents=True, exist_ok=True)
     pid_path = runtime / "daemon.pid"
@@ -494,6 +509,10 @@ def cmd_start_daemon(args: argparse.Namespace) -> int:
             args.bridge_listen,
             "--bridge-port",
             str(args.bridge_port),
+            "--control-listen",
+            args.control_listen,
+            "--control-port",
+            str(args.control_port),
             "--interval",
             str(args.interval),
         ]
@@ -515,6 +534,9 @@ def cmd_start_daemon(args: argparse.Namespace) -> int:
             "port": args.port,
             "interval_seconds": args.interval,
             "url": _display_url(args.listen, args.port),
+            "control_listen_address": args.control_listen,
+            "control_port": args.control_port,
+            "control_url": _display_url(args.control_listen, args.control_port),
         }
     )
     return 0
@@ -551,6 +573,12 @@ def cmd_status_daemon(args: argparse.Namespace) -> int:
             "listen_address": address,
             "port": port,
             "url": _display_url(address, port),
+            "control_listen_address": heartbeat.get("control_listen_address"),
+            "control_port": heartbeat.get("control_port"),
+            "control_url": (
+                _display_url(str(heartbeat.get("control_listen_address")), int(heartbeat.get("control_port")))
+                if heartbeat.get("control_listen_address") and heartbeat.get("control_port") else None
+            ),
         }
     )
     return 0
@@ -682,6 +710,8 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--port", type=int, default=8770)
     daemon.add_argument("--bridge-listen", default="127.0.0.1")
     daemon.add_argument("--bridge-port", type=int, default=8765)
+    daemon.add_argument("--control-listen", default="127.0.0.1")
+    daemon.add_argument("--control-port", type=int, default=8766)
     daemon.add_argument("--interval", type=int, default=60, help="loop interval in seconds (5..3600)")
     daemon.add_argument("--config", default=None)
     daemon.add_argument("--runtime-root", default=None)
@@ -692,6 +722,8 @@ def build_parser() -> argparse.ArgumentParser:
     start_daemon.add_argument("--port", type=int, default=8770)
     start_daemon.add_argument("--bridge-listen", default="127.0.0.1")
     start_daemon.add_argument("--bridge-port", type=int, default=8765)
+    start_daemon.add_argument("--control-listen", default="127.0.0.1")
+    start_daemon.add_argument("--control-port", type=int, default=8766)
     start_daemon.add_argument("--interval", type=int, default=60)
     start_daemon.add_argument("--config", default=None)
     start_daemon.add_argument("--runtime-root", default=None)

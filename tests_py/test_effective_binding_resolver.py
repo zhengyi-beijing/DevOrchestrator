@@ -91,6 +91,15 @@ class EffectiveBindingResolverTests(unittest.TestCase):
         self.assertEqual(project["conversation_binding_source"], "none")
         self.assertFalse(project["orchestration_ready"])
 
+    def test_explicit_runtime_unbind_suppresses_static_fallback(self):
+        self.store.unbind("labdemo")
+        [project] = resolve_effective_projects(
+            [static_project("labdemo", "static-conv")], self.store
+        )
+        self.assertIsNone(project.get("conversation_binding"))
+        self.assertEqual(project["conversation_binding_source"], "runtime_unbound")
+        self.assertFalse(project["orchestration_ready"])
+
     def test_malformed_runtime_record_suppresses_static_fallback(self):
         self.runtime.mkdir(parents=True, exist_ok=True)
         (self.runtime / "conversation-bindings.json").write_text(

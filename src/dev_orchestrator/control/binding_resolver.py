@@ -52,8 +52,13 @@ def resolve_effective_project(
     """Return one project with runtime-first conversation routing metadata."""
     result = dict(project)
     project_id = _non_blank(result.get("project_id"))
-    runtime_record = store.binding_for_project(project_id) if project_id else None
+    runtime_record = store.runtime_record_for_project(project_id) if project_id else None
     if runtime_record is not None:
+        if runtime_record.get("state") == "unbound":
+            result["conversation_binding"] = None
+            result["conversation_binding_source"] = "runtime_unbound"
+            result["orchestration_ready"] = False
+            return result
         route = _runtime_route(runtime_record)
         result["conversation_binding"] = route
         result["conversation_binding_source"] = (

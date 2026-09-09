@@ -637,6 +637,22 @@ class BrowserBridgeStore:
                 state=STATE_CLAIMED,
             )
 
+    def has_active_claim(
+        self, adapter: str, binding_id: str, *, now: Optional[datetime] = None
+    ) -> bool:
+        """Whether the exact binding currently has a still-valid claimed request."""
+        _require_route(adapter, binding_id)
+        moment = _as_utc(now)
+        with self._lock:
+            queue = self._load_queue(adapter, binding_id)
+            for record in queue.values():
+                if not isinstance(record, dict) or record.get("state") != STATE_CLAIMED:
+                    continue
+                expires_at = _parse_iso(record.get("lease_expires_at"))
+                if expires_at is not None and moment < expires_at:
+                    return True
+        return False
+
     def list_responded(self, adapter: str, binding_id: str) -> list[dict[str, Any]]:
         """Return immutable copies of RESPONDED records for the exact binding.
 
