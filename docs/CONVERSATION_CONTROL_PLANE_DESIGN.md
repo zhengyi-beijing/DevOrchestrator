@@ -152,3 +152,53 @@ The existing dashboard stays primarily observational but may link to the Control
 - Regression evidence on ZXZ-PC: CCP control/daemon targeted tests **8/8 PASS**; full `tests_py` **156/156 PASS**; `node --check` PASS; `git diff --check` PASS.
 
 CCP3 remains software-only and is not deployed into the currently running production daemon yet.
+
+## CCP4 implementation checkpoint
+
+- ChatGPT Web adapter advanced to `0.2.0` and now heartbeats the current `/c/<conversation-id>` session to `127.0.0.1:8766` every 15 seconds.
+- A per-tab `tab_instance_id` is persisted in `sessionStorage`; title, URL, adapter, binding id and tab identity are registered without any project id hard-coded in the userscript.
+- The floating badge is now clickable and renders daemon-derived conversation state: `UNBOUND`, `<project> · BOUND`, `STALE`, or `CONTROL OFFLINE`.
+- Clicking the badge opens a compact project-binding panel populated from `GET /v1/projects`; Bind/Rebind/Unbind are sent only from explicit button clicks.
+- No `/v1/owner-action` call or workflow decision logic is present in CCP4; owner-gate actuation remains reserved for CCP6.
+- Existing Browser Bridge claim/renew/response behavior is retained, including the current `0.1.6` composer-submit compatibility fix and stop-button rejection.
+- ChatGPT SPA navigation is tolerated because every heartbeat and transport poll re-derives the binding id from the live URL.
+- Live browser deployment/acceptance is intentionally deferred to CCP7; CCP4 does not restart or modify the currently running production daemon.
+- Regression evidence on ZXZ-PC: CCP4/userscript targeted tests **12/12 PASS**; full `tests_py` **162/162 PASS**; `node --check` PASS; `git diff --check` PASS.
+
+## CCP5 implementation checkpoint
+
+- The read-only dashboard now exposes `GET /api/conversations`, projecting effective project-to-conversation mappings from monitor snapshots plus the runtime binding/session registries.
+- Runtime binding records override stale static snapshot routes immediately; explicit runtime `unbound` tombstones remain authoritative and malformed runtime records fail closed.
+- Each project is rendered as `BOUND`, `STALE`, or `UNBOUND` with binding source, conversation title, binding id, adapter, last-seen time, and active-tab count.
+- For known ChatGPT bindings the dashboard provides a read-only `Open conversation` navigation link; binding mutations remain in the CCP4 ChatGPT panel and the dashboard still accepts only GET/HEAD.
+- Static bindings with no live CCP heartbeat are shown as `STALE`, not falsely `BOUND`; live state is derived from the same CCP1 session-presence policy.
+- CCP5 targeted dashboard/web tests **6/6 PASS**; full `tests_py` **165/165 PASS**; `node --check` PASS; `git diff --check` PASS.
+- CCP5 is not deployed into the currently running production daemon yet.
+
+## CCP6 implementation checkpoint
+
+- `POST /v1/owner-action` now accepts only explicit loopback owner actions: `approve_next_stage`, `start_current_task`, and `stop`.
+- Owner actions must originate from the project's currently bound, live ChatGPT conversation and echo fresh branch/HEAD identity; assistant prose alone has no authority.
+- `approve_next_stage` records an exact approved owner gate but does not start a Worker. `start_current_task` reuses Transition Executor fresh-truth, clean-worktree, READY_TO_RUN, task-id, one-active-run, and backend policy guards.
+- `stop` is a durable pause of future automatic launches; it deliberately does not kill an already-running Worker. Runtime owner state suppresses legacy static `owner_start`/`bootstrap` resurrection.
+- Owner control state is persisted in `runtime/owner-control.json`; action ids are idempotent and project/action scoped.
+- The ChatGPT Userscript exposes owner actions only as deliberate buttons in the bound conversation panel.
+- The read-only Dashboard now projects owner pause and latest owner-gate identity/state alongside each conversation binding.
+- Windows test cleanup now waits for the managed Worker thread to unwind after terminal ledger persistence before deleting temporary Git repositories, eliminating the WinError 32 race.
+- CCP6 targeted control/daemon/transition/UI tests: **34/34 PASS**.
+- Full `tests_py`: **170/170 PASS**; `node --check` for Userscript and Dashboard: PASS; `git diff --check`: PASS.
+- CCP6 remains software-only and is not deployed into the currently running production daemon yet.
+## Fresh technical review checkpoint — CCP4 + CCP5 + CCP6
+
+- Final review scope covered the complete working-tree diff from `210b6dd`, including the four new files that are not represented by ordinary `git diff --stat` until staged.
+- Review disposition: **ACCEPTED / READY TO COMMIT**. No unresolved HIGH/MEDIUM correctness or authority-boundary finding remains.
+- The review hardened owner-action replay to require exact conversation/repository/task-or-gate identity, not only project/action identity.
+- `start_current_task` now persists launch intent before actuation and reconciles the `owner-control:<action_id>` Transition ledger after a crash window without duplicate Worker launch.
+- Gate approval rechecks fresh repository truth server-side and rejects dirty worktrees; pause barriers fail closed when decision timestamps are absent or invalid.
+- `stop` remains available from the currently bound live conversation even if repository HEAD moved, while Start/Approve retain fresh branch/HEAD guards.
+- Final Worker launch is serialized with owner-control state and rechecks pause/static-start suppression immediately before ledger insertion; active Web Sol claims block Start/Approve but never block Stop.
+- Runtime owner-control adoption suppresses legacy static `owner_start`/`bootstrap` before a Start result is known, preventing legacy authority resurrection on failure/retry paths.
+- Fresh targeted CCP4/CCP5/CCP6 verification: **41/41 PASS**; full `tests_py`: **178/178 PASS**.
+- `node --check browser/chatgpt-web-adapter.user.js`: PASS; `node --check web/app.js`: PASS; changed Python modules compile cleanly.
+- Final `git diff --check`: PASS. Only Git's existing LF→CRLF working-copy notices remain for two text files; they are non-blocking and introduce no whitespace error.
+- Final status contains only the intended CCP4/CCP5/CCP6 source, UI, documentation, and test files; no temporary review/patch file remains.

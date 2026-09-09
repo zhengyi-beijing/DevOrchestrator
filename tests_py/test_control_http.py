@@ -116,12 +116,12 @@ class ControlHttpTests(unittest.TestCase):
         status, _ = request(self.port, "POST", "/v1/unbind", {"project_id": "labdemo"})
         self.assertEqual(status, 409)
 
-    def test_owner_action_is_reserved_until_ccp6(self):
+    def test_owner_action_is_ccp6_surface_and_validates_payload(self):
         status, body = request(self.port, "POST", "/v1/owner-action", {
             "project_id": "labdemo", "action": "approve_next_stage"
         })
-        self.assertEqual(status, 501)
-        self.assertIn("CCP6", body["message"])
+        self.assertEqual(status, 400)
+        self.assertIn("requires", body["message"])
 
     def test_control_listener_is_loopback_only(self):
         with self.assertRaises(ValueError):

@@ -104,11 +104,9 @@ class _ControlHandler(BaseHTTPRequestHandler):
             self._error(403, "Forbidden", "control mutations require a loopback client")
             return
         path = self._path()
-        if path == "/v1/owner-action":
-            self._error(501, "Not Implemented", "owner-action is reserved for CCP6")
-            return
         if path not in (
-            "/v1/session/heartbeat", "/v1/bind", "/v1/unbind", "/v1/rebind"
+            "/v1/session/heartbeat", "/v1/bind", "/v1/unbind", "/v1/rebind",
+            "/v1/owner-action"
         ):
             self._error(404, "Not Found", "route not found")
             return
@@ -119,6 +117,8 @@ class _ControlHandler(BaseHTTPRequestHandler):
         try:
             if path == "/v1/session/heartbeat":
                 result = self.server.service.heartbeat(payload)
+            elif path == "/v1/owner-action":
+                result = self.server.service.owner_action(payload)
             elif path == "/v1/bind":
                 result = {"binding": self.server.service.bind(
                     payload.get("project_id"), payload.get("adapter"), payload.get("binding_id")

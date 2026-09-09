@@ -135,6 +135,93 @@ function renderProjects(summary, events) {
   }
 }
 
+
+function bindingTone(state) {
+  const s = String(state || '').toUpperCase();
+  if (s === 'BOUND') return 'ok';
+  if (s === 'STALE') return 'warn';
+  return 'bad';
+}
+
+function renderConversationBindings(payload) {
+  const host = $('conversationBindings');
+  host.replaceChildren();
+  const projects = payload && Array.isArray(payload.projects) ? payload.projects : [];
+  if (!projects.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No conversation binding data.';
+    host.appendChild(empty);
+    return;
+  }
+  for (const item of projects) {
+    const card = document.createElement('article');
+    card.className = `project-card ${bindingTone(item.binding_state)}`;
+    const head = document.createElement('div');
+    head.className = 'project-head';
+    const nameBox = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'project-name';
+    name.textContent = text(item.project_name || item.project_id);
+
+    const state = document.createElement('div');
+    state.className = 'project-state';
+    state.textContent = `${text(item.project_id)} · ${text(item.binding_source)}`;
+    nameBox.append(name, state);
+    const badge = document.createElement('div');
+    badge.className = `badge ${bindingTone(item.binding_state)}`;
+    badge.textContent = text(item.binding_state);
+    head.append(nameBox, badge);
+    card.appendChild(head);
+
+    const conversation = document.createElement('div');
+    conversation.className = 'project-next';
+    const label = document.createElement('div');
+    label.className = 'label';
+    label.textContent = 'Conversation';
+    const value = document.createElement('div');
+    value.className = 'value';
+    value.textContent = text(item.conversation_title || (item.binding_state === 'UNBOUND' ? 'Not bound' : item.binding_id));
+    conversation.append(label, value);
+    card.appendChild(conversation);
+
+    const grid = document.createElement('div');
+    grid.className = 'kv-grid';
+    kv(grid, 'Binding ID', item.binding_id, true);
+    kv(grid, 'Adapter', item.adapter, true);
+    kv(grid, 'Last seen', item.last_seen_at ? ago(item.last_seen_at) : UNKNOWN);
+    kv(grid, 'Active tabs', item.active_tab_count);
+    kv(grid, 'Owner control', item.owner_paused ? 'PAUSED' : 'ACTIVE');
+    if (item.owner_gate) {
+      kv(grid, 'Owner gate', `${text(item.owner_gate.task_id || item.owner_gate.request_id)} · ${String(item.owner_gate.owner_state || 'pending').toUpperCase()}`);
+      kv(grid, 'Gate request', item.owner_gate.request_id, true);
+    } else {
+      kv(grid, 'Owner gate', 'NONE');
+    }
+    card.appendChild(grid);
+
+
+    const actions = document.createElement('div');
+    actions.className = 'conversation-actions';
+    if (item.conversation_url) {
+      const open = document.createElement('a');
+      open.className = 'link-button';
+      open.href = item.conversation_url;
+      open.target = '_blank';
+      open.rel = 'noopener noreferrer';
+      open.textContent = 'Open conversation';
+      actions.appendChild(open);
+    } else {
+      const hint = document.createElement('span');
+      hint.className = 'muted-note';
+      hint.textContent = 'Open a ChatGPT conversation and use its DevOrch badge to bind this project.';
+      actions.appendChild(hint);
+    }
+    card.appendChild(actions);
+    host.appendChild(card);
+  }
+}
+
 function renderTimeline(hostId, items, formatter) {
   const host = $(hostId); host.replaceChildren();
   if (!items.length) {
@@ -187,14 +274,15 @@ function renderOrchestration(orchestration) {
 
 async function refresh() {
   try {
-    const [monitor, summary, eventsPayload, runsPayload, orchestration] = await Promise.all([
-      getJson('/api/monitor'), getJson('/api/summary'), getJson('/api/events?limit=30'), getJson('/api/runs?limit=20'), getJson('/api/orchestration')
+    const [monitor, summary, eventsPayload, runsPayload, orchestration, conversations] = await Promise.all([
+      getJson('/api/monitor'), getJson('/api/summary'), getJson('/api/events?limit=30'), getJson('/api/runs?limit=20'), getJson('/api/orchestration'), getJson('/api/conversations')
     ]);
     const events = Array.isArray(eventsPayload.items) ? eventsPayload.items : [];
     const runs = Array.isArray(runsPayload.items) ? runsPayload.items : [];
     renderMonitor(monitor);
     renderOverview(summary);
     renderProjects(summary, events);
+    renderConversationBindings(conversations);
     renderOrchestration(orchestration);
     renderTimeline('events', events, e => `${text(e.from_state)} → ${text(e.to_state)} · ${text(e.task_id)}`);
     renderTimeline('runs', runs, r => `${text(r.task_id)} · ${text(r.result)} · ${seconds(r.duration_seconds)}`);

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.5
-// @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge. Derives the binding id from the current /c/<conversation-id> URL, claims only that binding, submits the rendered prompt, waits for a stable matching response marker, and posts the raw assistant text back.
+// @version      0.2.1
+// @description  ChatGPT Web adapter for DevOrchestrator Browser Bridge plus the local Conversation Control Plane. Web Sol transport stays automatic; project binding changes require an explicit owner click.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
 // @grant        GM_xmlhttpRequest
@@ -10,9 +10,10 @@
 // @run-at       document-idle
 // ==/UserScript==
 //
-// Transport only. This script performs DOM adaptation and transport
-// acknowledgement: it never decides what happens next in a project workflow,
-// never starts Workers, and never interprets repository or Worker state.
+// Web Sol transport plus explicit local conversation-binding UI. This script
+// never decides what happens next in a project workflow, never starts Workers,
+// and never interprets repository or Worker state. Bind/rebind/unbind mutations
+// occur only after a deliberate owner click in the local Control Plane panel.
 // The binding id is always derived from the live ChatGPT conversation URL, so
 // no project/conversation key is hard-coded here and each tab (conversation)
 // claims only its own project queue. Assistant responses are acknowledged only
@@ -22,6 +23,7 @@
   "use strict";
 
   var BRIDGE_BASE = "http://127.0.0.1:8765";
+  var CONTROL_BASE = "http://127.0.0.1:8766";
   var ADAPTER_ID = "chatgpt_web";
   var CONVERSATION_PATH_RE = /\/c\/([A-Za-z0-9_-]+)/;
   var REQUEST_HEAD = "[DEVORCH_WEB_SOL_REQUEST ";
@@ -29,6 +31,15 @@
   var CLAIM_PATH = "/v1/claim";
   var RENEW_PATH = "/v1/renew";
   var RESPONSE_PATH = "/v1/response";
+  var HEARTBEAT_PATH = "/v1/session/heartbeat";
+  var PROJECTS_PATH = "/v1/projects";
+  var BIND_PATH = "/v1/bind";
+  var REBIND_PATH = "/v1/rebind";
+  var UNBIND_PATH = "/v1/unbind";
+  var OWNER_ACTION_PATH = "/v1/owner-action";
+  var CONTROL_HEARTBEAT_MS = 15000;
+  var CONTROL_RETRY_MS = 5000;
+  var TAB_INSTANCE_STORAGE_KEY = "devorch:control:tab-instance";
   var POLL_MS = 1500;
   var RENEW_INTERVAL_MS = 20000;
   var WAIT_DEADLINE_MS = 15 * 60 * 1000;
@@ -58,26 +69,221 @@
 
 
   var STATUS_ELEMENT_ID = "devorch-web-status";
+  var PANEL_ELEMENT_ID = "devorch-control-panel";
+  var controlHeartbeatTimer = null;
+  var selectedProjectId = "";
+  var transportStatus = { state: "IDLE", detail: "Adapter starting" };
+  var controlStatus = {
+    online: false,
+    projectId: null,
+    bindingState: "offline",
+    bindingId: "",
+    detail: "Control Plane starting",
+    projects: [],
+    session: null
+  };
+
+  function controlBadgeLabel(state) {
+    state = state || {};
+    var projectId = typeof state.projectId === "string" && state.projectId ? state.projectId : "";
+    var bindingState = typeof state.bindingState === "string" && state.bindingState ? state.bindingState.toLowerCase() : "unbound";
+    if (projectId) { return "DevOrch · " + projectId + " · " + bindingState.toUpperCase(); }
+    if (bindingState === "offline") { return "DevOrch · CONTROL OFFLINE"; }
+    if (bindingState === "stale") { return "DevOrch · STALE"; }
+    return "DevOrch · UNBOUND";
+  }
+
+  function chooseBindingAction(project, bindingId) {
+    if (!project || !project.orchestration_ready || !project.conversation_binding) { return "bind"; }
+    var existing = project.conversation_binding.binding_id;
+    if (existing === bindingId) { return "bound"; }
+    return "rebind";
+  }
+
+  function wireStatusBadge(badge) {
+    if (!badge || badge.getAttribute("data-devorch-click-bound") === "1") { return; }
+    badge.setAttribute("data-devorch-click-bound", "1");
+    badge.addEventListener("click", function (event) {
+      if (event && event.stopPropagation) { event.stopPropagation(); }
+      toggleControlPanel();
+    });
+  }
 
   function ensureStatusBadge() {
     if (typeof document === "undefined" || !document.body) { return null; }
     var badge = document.getElementById(STATUS_ELEMENT_ID);
-    if (badge) { return badge; }
-    badge = document.createElement("div");
-    badge.id = STATUS_ELEMENT_ID;
-    badge.style.cssText = "position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:5px 9px;border-radius:7px;font:12px/1.2 system-ui,sans-serif;color:#fff;background:#555;box-shadow:0 1px 5px rgba(0,0,0,.25);pointer-events:none;opacity:.92";
-    document.body.appendChild(badge);
+    if (!badge) {
+      badge = document.createElement("div");
+      badge.id = STATUS_ELEMENT_ID;
+      badge.style.cssText = "position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:5px 9px;border-radius:7px;font:12px/1.2 system-ui,sans-serif;color:#fff;background:#555;box-shadow:0 1px 5px rgba(0,0,0,.25);pointer-events:auto;cursor:pointer;user-select:none;opacity:.92";
+      document.body.appendChild(badge);
+    }
+    wireStatusBadge(badge);
     return badge;
   }
 
-  function setAdapterStatus(state, detail) {
+  function renderStatusBadge() {
     var badge = ensureStatusBadge();
     if (!badge) { return; }
-    var colors = { LIVE: "#237a3b", IDLE: "#555", CLAIMED: "#8a5a00", WAITING: "#2457a6", OFFLINE: "#a32929" };
-    badge.textContent = "DevOrch · " + state;
+    var bindingId = currentBindingId();
+    var label;
+    if (!bindingId) { label = "DevOrch · IDLE"; }
+    else { label = controlBadgeLabel(controlStatus); }
+    var state = (controlStatus.bindingState || "offline").toLowerCase();
+    var colors = { bound: "#237a3b", unbound: "#555", stale: "#8a5a00", offline: "#a32929" };
+    badge.textContent = label;
     badge.style.background = colors[state] || "#555";
-    badge.setAttribute("data-state", state);
-    badge.title = detail || state;
+    badge.setAttribute("data-state", state.toUpperCase());
+    badge.title = (controlStatus.detail || "Control Plane") + " | Transport: " + transportStatus.state + " — " + (transportStatus.detail || "");
+  }
+
+  function setAdapterStatus(state, detail) {
+    transportStatus.state = state;
+    transportStatus.detail = detail || state;
+    renderStatusBadge();
+  }
+
+  function ensureControlPanel() {
+    if (typeof document === "undefined" || !document.body) { return null; }
+    var panel = document.getElementById(PANEL_ELEMENT_ID);
+    if (panel) { return panel; }
+    panel = document.createElement("div");
+    panel.id = PANEL_ELEMENT_ID;
+    panel.style.cssText = "position:fixed;right:12px;bottom:48px;z-index:2147483646;width:320px;max-height:70vh;overflow:auto;padding:12px;border-radius:10px;font:12px/1.4 system-ui,sans-serif;color:#eee;background:#202123;box-shadow:0 5px 24px rgba(0,0,0,.38);display:none";
+    panel.addEventListener("click", function (event) { if (event && event.stopPropagation) { event.stopPropagation(); } });
+    document.body.appendChild(panel);
+    return panel;
+  }
+
+  function appendPanelText(parent, text, cssText) {
+    var row = document.createElement("div");
+    row.textContent = text;
+    if (cssText) { row.style.cssText = cssText; }
+    parent.appendChild(row);
+    return row;
+  }
+
+  function projectById(projectId) {
+    var projects = controlStatus.projects || [];
+    for (var i = 0; i < projects.length; i++) {
+      if (projects[i] && projects[i].project_id === projectId) { return projects[i]; }
+    }
+    return null;
+  }
+
+  function renderControlPanel() {
+    var panel = ensureControlPanel();
+    if (!panel) { return; }
+    while (panel.firstChild) { panel.removeChild(panel.firstChild); }
+
+    var header = document.createElement("div");
+    header.style.cssText = "display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-weight:600";
+    appendPanelText(header, "DevOrchestrator Conversation", "font-size:13px");
+    var close = document.createElement("button");
+    close.textContent = "×";
+    close.style.cssText = "border:0;background:transparent;color:#bbb;font-size:18px;cursor:pointer;padding:0 2px";
+    close.addEventListener("click", function () { panel.style.display = "none"; });
+    header.appendChild(close);
+    panel.appendChild(header);
+
+    var bindingId = currentBindingId();
+    var title = controlStatus.session && controlStatus.session.title ? controlStatus.session.title : currentConversationTitle(bindingId);
+    appendPanelText(panel, "Conversation: " + (title || "—"), "margin-bottom:3px;color:#ddd");
+    appendPanelText(panel, "ID: " + (bindingId || "no stable /c/... URL"), "margin-bottom:3px;color:#aaa;word-break:break-all");
+    appendPanelText(panel, "Current project: " + (controlStatus.projectId || "UNBOUND"), "margin-bottom:8px;color:#ddd");
+
+    var projects = controlStatus.projects || [];
+    if (!selectedProjectId && controlStatus.projectId) { selectedProjectId = controlStatus.projectId; }
+    if (!projectById(selectedProjectId) && projects.length) { selectedProjectId = projects[0].project_id; }
+    var select = document.createElement("select");
+    select.style.cssText = "width:100%;margin-bottom:8px;padding:6px;background:#343541;color:#eee;border:1px solid #555;border-radius:6px";
+    for (var i = 0; i < projects.length; i++) {
+      var option = document.createElement("option");
+      option.value = projects[i].project_id;
+      option.textContent = projects[i].project_id + " · " + String(projects[i].binding_state || "unbound").toUpperCase();
+      select.appendChild(option);
+    }
+    select.value = selectedProjectId;
+    select.addEventListener("change", function () { selectedProjectId = select.value; renderControlPanel(); });
+    panel.appendChild(select);
+
+    var selected = projectById(selectedProjectId);
+    var action = chooseBindingAction(selected, bindingId);
+    var controls = document.createElement("div");
+    controls.style.cssText = "display:flex;gap:7px;margin-bottom:8px";
+    var bindButton = document.createElement("button");
+    bindButton.textContent = action === "rebind" ? "Rebind" : (action === "bound" ? "Bound" : "Bind");
+    bindButton.disabled = !bindingId || !selected || action === "bound" || !controlStatus.online;
+    bindButton.style.cssText = "flex:1;padding:6px;border:1px solid #666;border-radius:6px;background:#343541;color:#eee;cursor:pointer";
+    bindButton.addEventListener("click", function () {
+      if (!bindButton.disabled) { controlMutation(action, selectedProjectId); }
+    });
+    controls.appendChild(bindButton);
+
+    var unbindButton = document.createElement("button");
+    unbindButton.textContent = "Unbind";
+    unbindButton.disabled = !controlStatus.projectId || selectedProjectId !== controlStatus.projectId || !controlStatus.online;
+    unbindButton.style.cssText = "flex:1;padding:6px;border:1px solid #666;border-radius:6px;background:#343541;color:#eee;cursor:pointer";
+    unbindButton.addEventListener("click", function () {
+      if (!unbindButton.disabled) { controlMutation("unbind", controlStatus.projectId); }
+    });
+    controls.appendChild(unbindButton);
+    panel.appendChild(controls);
+
+    var ownerBox = document.createElement("div");
+    ownerBox.style.cssText = "margin:10px 0 8px;padding-top:9px;border-top:1px solid #45464f";
+    appendPanelText(ownerBox, "Owner control", "font-weight:600;margin-bottom:5px");
+    if (selected) {
+      appendPanelText(ownerBox, "Project state: " + String(selected.project_state || "unknown"), "color:#aaa;margin-bottom:2px");
+      appendPanelText(ownerBox, "Task: " + String(selected.current_task_id || "—"), "color:#aaa;margin-bottom:2px");
+      appendPanelText(ownerBox, "Owner pause: " + (selected.owner_paused ? "PAUSED" : "running policy"), "color:#aaa;margin-bottom:5px");
+      if (selected.owner_gate) {
+        appendPanelText(ownerBox, "Gate: " + String(selected.owner_gate.request_id || "—") + " · " + String(selected.owner_gate.owner_state || "pending").toUpperCase(), "color:#d8b45a;margin-bottom:5px;word-break:break-all");
+      }
+    }
+    var ownerControls = document.createElement("div");
+    ownerControls.style.cssText = "display:grid;grid-template-columns:1fr 1fr;gap:7px";
+    var sameOwnerProject = Boolean(selected && controlStatus.projectId === selected.project_id && controlStatus.bindingState === "bound");
+    var approveButton = document.createElement("button");
+    approveButton.textContent = "Approve next stage";
+    approveButton.disabled = !sameOwnerProject || !selected.can_approve_next_stage || !controlStatus.online;
+    approveButton.style.cssText = "padding:6px;border:1px solid #7c6a38;border-radius:6px;background:#343541;color:#eee;cursor:pointer";
+    approveButton.addEventListener("click", function () {
+      if (!approveButton.disabled) { ownerControlMutation("approve_next_stage", selected); }
+    });
+    ownerControls.appendChild(approveButton);
+    var startButton = document.createElement("button");
+    startButton.textContent = "Start current task";
+    startButton.disabled = !sameOwnerProject || !selected.can_start_current_task || !controlStatus.online;
+    startButton.style.cssText = "padding:6px;border:1px solid #4c6f50;border-radius:6px;background:#343541;color:#eee;cursor:pointer";
+    startButton.addEventListener("click", function () {
+      if (!startButton.disabled) { ownerControlMutation("start_current_task", selected); }
+    });
+    ownerControls.appendChild(startButton);
+    var stopButton = document.createElement("button");
+    stopButton.textContent = "Stop / Pause auto-starts";
+    stopButton.disabled = !sameOwnerProject || !controlStatus.online;
+    stopButton.style.cssText = "grid-column:1 / span 2;padding:6px;border:1px solid #7a4a4a;border-radius:6px;background:#343541;color:#eee;cursor:pointer";
+    stopButton.addEventListener("click", function () {
+      if (!stopButton.disabled) { ownerControlMutation("stop", selected); }
+    });
+    ownerControls.appendChild(stopButton);
+    ownerBox.appendChild(ownerControls);
+    panel.appendChild(ownerBox);
+    appendPanelText(panel, "Control: " + (controlStatus.detail || "—"), "color:#aaa;margin-bottom:3px");
+    appendPanelText(panel, "Transport: " + transportStatus.state + " — " + (transportStatus.detail || ""), "color:#888");
+  }
+
+  function toggleControlPanel() {
+    var panel = ensureControlPanel();
+    if (!panel) { return; }
+    if (panel.style.display === "none" || !panel.style.display) {
+      panel.style.display = "block";
+      renderControlPanel();
+      refreshControlProjects();
+    } else {
+      panel.style.display = "none";
+    }
   }
 
   // ------------------------------------------------------------------
@@ -97,6 +303,31 @@
       return "";
     }
     return conversationIdFromUrl(String(window.location.href));
+  }
+
+  function currentConversationTitle(bindingId) {
+    if (typeof document !== "undefined" && typeof document.title === "string" && document.title.trim()) {
+      return document.title.trim();
+    }
+    return bindingId ? "ChatGPT conversation " + bindingId : "ChatGPT conversation";
+  }
+
+  function newTabInstanceId() {
+    if (root.crypto && typeof root.crypto.randomUUID === "function") { return root.crypto.randomUUID(); }
+    return "tab-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  }
+
+  function tabInstanceId() {
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        var existing = sessionStorage.getItem(TAB_INSTANCE_STORAGE_KEY);
+        if (existing) { return existing; }
+        var created = newTabInstanceId();
+        sessionStorage.setItem(TAB_INSTANCE_STORAGE_KEY, created);
+        return created;
+      }
+    } catch (err) {}
+    return newTabInstanceId();
   }
 
   function responseMatches(text, requestId) {
@@ -229,7 +460,12 @@
     requestAlreadySubmitted: requestAlreadySubmitted,
     userMessageHasRequest: userMessageHasRequest,
     markRequestSubmitted: markRequestSubmitted,
-    shouldRemoteSyncReload: shouldRemoteSyncReload
+    shouldRemoteSyncReload: shouldRemoteSyncReload,
+    isStopComposerButton: isStopComposerButton,
+    findSendButton: findSendButton,
+    controlBadgeLabel: controlBadgeLabel,
+    chooseBindingAction: chooseBindingAction,
+    tabInstanceId: tabInstanceId
   };
 
   // Exposed for the automated adapter test (Node `require`); harmless in a
@@ -275,6 +511,52 @@
       }
       finish(0, "");
     });
+  }
+
+  function controlRequest(method, path, payload) {
+    var url = CONTROL_BASE + path;
+    var body = payload === null || typeof payload === "undefined" ? null : JSON.stringify(payload);
+    return new Promise(function (resolve) {
+      var settled = false;
+      function finish(status, text) {
+        if (settled) { return; }
+        settled = true;
+        resolve({ status: status, text: text });
+      }
+      if (typeof GM_xmlhttpRequest === "function") {
+        var options = {
+          method: method,
+          url: url,
+          timeout: 8000,
+          onload: function (response) { finish(response.status, response.responseText); },
+          onerror: function () { finish(0, ""); },
+          ontimeout: function () { finish(0, ""); }
+        };
+        if (body !== null) {
+          options.data = body;
+          options.headers = { "Content-Type": "application/json" };
+        }
+        GM_xmlhttpRequest(options);
+        return;
+      }
+      if (typeof fetch === "function") {
+        var fetchOptions = { method: method, headers: {} };
+        if (body !== null) {
+          fetchOptions.headers["Content-Type"] = "application/json";
+          fetchOptions.body = body;
+        }
+        fetch(url, fetchOptions).then(function (response) {
+          response.text().then(function (text) { finish(response.status, text); });
+        }).catch(function () { finish(0, ""); });
+        return;
+      }
+      finish(0, "");
+    });
+  }
+
+  function scheduleControlHeartbeat(delayMs) {
+    if (controlHeartbeatTimer !== null && typeof clearTimeout === "function") { clearTimeout(controlHeartbeatTimer); }
+    controlHeartbeatTimer = setTimeout(controlHeartbeat, delayMs);
   }
 
   function claimOnce(bindingId) {
@@ -334,6 +616,136 @@
     }
   }
 
+  function refreshControlProjects() {
+    return controlRequest("GET", PROJECTS_PATH, null).then(function (result) {
+      if (!result || result.status !== 200) {
+        controlStatus.detail = "Project list failed: HTTP " + (result ? result.status : 0);
+        renderStatusBadge();
+        renderControlPanel();
+        return false;
+      }
+      var body = parsedJsonText(result);
+      controlStatus.projects = body && Array.isArray(body.projects) ? body.projects : [];
+      if (controlStatus.projectId) {
+        var current = projectById(controlStatus.projectId);
+        if (current && typeof current.binding_state === "string") {
+          controlStatus.bindingState = current.binding_state;
+        }
+      } else {
+        controlStatus.bindingState = "unbound";
+      }
+      renderStatusBadge();
+      renderControlPanel();
+      return true;
+    });
+  }
+
+  function controlHeartbeat() {
+    var bindingId = currentBindingId();
+    if (!bindingId) {
+      controlStatus.online = false;
+      controlStatus.projectId = null;
+      controlStatus.bindingState = "unbound";
+      controlStatus.bindingId = "";
+      controlStatus.detail = "Waiting for a stable /c/<conversation-id> URL";
+      renderStatusBadge();
+      renderControlPanel();
+      scheduleControlHeartbeat(CONTROL_RETRY_MS);
+      return;
+    }
+    var payload = {
+      adapter: ADAPTER_ID,
+      binding_id: bindingId,
+      title: currentConversationTitle(bindingId),
+      url: String(window.location.href),
+      tab_instance_id: tabInstanceId()
+    };
+    controlRequest("POST", HEARTBEAT_PATH, payload).then(function (result) {
+      if (!result || result.status !== 200) {
+        controlStatus.online = false;
+        controlStatus.bindingState = "offline";
+        controlStatus.bindingId = bindingId;
+        controlStatus.detail = "Control Plane unavailable: HTTP " + (result ? result.status : 0);
+        renderStatusBadge();
+        renderControlPanel();
+        scheduleControlHeartbeat(CONTROL_RETRY_MS);
+        return;
+      }
+      var body = parsedJsonText(result) || {};
+      controlStatus.online = true;
+      controlStatus.bindingId = bindingId;
+      controlStatus.projectId = typeof body.project_id === "string" && body.project_id ? body.project_id : null;
+      controlStatus.bindingState = controlStatus.projectId ? "bound" : "unbound";
+      controlStatus.session = body.session && typeof body.session === "object" ? body.session : null;
+      controlStatus.detail = controlStatus.projectId ? "Bound to " + controlStatus.projectId : "Conversation is not bound to a project";
+      renderStatusBadge();
+      renderControlPanel();
+      refreshControlProjects().then(function () { scheduleControlHeartbeat(CONTROL_HEARTBEAT_MS); });
+    });
+  }
+
+  function controlMutation(action, projectId) {
+    var bindingId = currentBindingId();
+    if (!bindingId || !projectId || !controlStatus.online) { return; }
+    var path;
+    var payload = { project_id: projectId };
+    if (action === "bind") {
+      path = BIND_PATH;
+      payload.adapter = ADAPTER_ID;
+      payload.binding_id = bindingId;
+    } else if (action === "rebind") {
+      path = REBIND_PATH;
+      payload.adapter = ADAPTER_ID;
+      payload.binding_id = bindingId;
+    } else if (action === "unbind") {
+      path = UNBIND_PATH;
+    } else {
+      return;
+    }
+    controlStatus.detail = action + " requested for " + projectId;
+    renderControlPanel();
+    controlRequest("POST", path, payload).then(function (result) {
+      if (result && result.status === 200) {
+        selectedProjectId = projectId;
+        controlStatus.detail = action + " accepted by daemon";
+        scheduleControlHeartbeat(0);
+        return;
+      }
+      var body = parsedJsonText(result);
+      controlStatus.detail = body && body.message ? body.message : (action + " failed: HTTP " + (result ? result.status : 0));
+      renderStatusBadge();
+      renderControlPanel();
+    });
+  }
+
+  function ownerControlMutation(action, project) {
+    var bindingId = currentBindingId();
+    if (!bindingId || !project || !controlStatus.online || controlStatus.projectId !== project.project_id) { return; }
+    var payload = {
+      project_id: project.project_id, action: action,
+      action_id: "owner-" + newTabInstanceId(), adapter: ADAPTER_ID,
+      binding_id: bindingId, expected_branch: project.branch, expected_head: project.head
+    };
+    if (action === "start_current_task") { payload.expected_task_id = project.current_task_id; }
+    if (action === "approve_next_stage") {
+      if (!project.owner_gate) { return; }
+      payload.gate_request_id = project.owner_gate.request_id;
+      payload.gate_task_id = project.owner_gate.task_id;
+    }
+    controlStatus.detail = "Owner " + action + " requested for " + project.project_id;
+    renderControlPanel();
+    controlRequest("POST", OWNER_ACTION_PATH, payload).then(function (result) {
+      var body = parsedJsonText(result);
+      if (result && result.status === 200) {
+        controlStatus.detail = "Owner " + action + " accepted by daemon";
+        refreshControlProjects();
+        return;
+      }
+      controlStatus.detail = body && body.message ? body.message : ("Owner action failed: HTTP " + (result ? result.status : 0));
+      renderStatusBadge(); renderControlPanel();
+    });
+  }
+
   // ------------------------------------------------------------------
   // ChatGPT DOM adaptation (best effort; live DOM acceptance is a
   // separate deployment gate - automated tests never touch this path)
@@ -370,8 +782,32 @@
     return true;
   }
 
+  function isStopComposerButton(button) {
+    if (!button) { return false; }
+    var parts = [
+      button.getAttribute && button.getAttribute("data-testid"),
+      button.getAttribute && button.getAttribute("aria-label"),
+      button.getAttribute && button.getAttribute("title"),
+      button.innerText
+    ];
+    var text = parts.filter(function (part) { return typeof part === "string"; }).join(" ").toLowerCase();
+    return text.indexOf("stop") !== -1 || text.indexOf("停止") !== -1;
+  }
+
+  function findSendButton() {
+    var legacy = document.querySelector("button[data-testid='send-button']");
+    if (legacy && !isStopComposerButton(legacy)) { return legacy; }
+
+    // ChatGPT's newer composer exposes the submit control by id. The same
+    // control can become "Stop answering" while a turn is streaming, so
+    // never use this fallback unless its accessible/test metadata is non-stop.
+    var composerSubmit = document.querySelector("button#composer-submit-button");
+    if (composerSubmit && !isStopComposerButton(composerSubmit)) { return composerSubmit; }
+    return null;
+  }
+
   function clickSendButton() {
-    var send = document.querySelector("button[data-testid='send-button']");
+    var send = findSendButton();
     if (send && !send.disabled) {
       send.click();
       return true;
@@ -568,5 +1004,6 @@
   if (typeof document !== "undefined" && !root.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__) {
     setAdapterStatus("IDLE", "Adapter starting");
     schedule(runAdapter, 1000);
+    scheduleControlHeartbeat(250);
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

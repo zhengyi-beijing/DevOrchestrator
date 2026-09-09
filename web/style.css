@@ -74,6 +74,10 @@ main { max-width: 1380px; margin: 0 auto; padding: 26px 24px 42px; }
 .project-next .label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
 .project-next .value { margin-top: 3px; font-weight: 650; }
 .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+.conversation-actions { margin-top: 14px; display: flex; align-items: center; gap: 8px; }
+.link-button { display: inline-block; padding: 7px 10px; border: 1px solid rgba(104,167,255,.35); border-radius: 7px; color: var(--info); text-decoration: none; font-weight: 700; background: rgba(104,167,255,.08); }
+.link-button:hover { background: rgba(104,167,255,.14); }
+.muted-note { color: var(--muted); font-size: 12px; }
 .timeline { display: grid; gap: 8px; }
 .timeline-item { padding: 10px 12px; border-radius: 9px; background: rgba(255,255,255,.025); border: 1px solid rgba(255,255,255,.05); }
 .timeline-item .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }

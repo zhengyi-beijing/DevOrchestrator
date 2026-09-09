@@ -3,7 +3,7 @@
 Contract: methods ``GET``/``HEAD`` only; static allowlist ``/``, ``/app.js``,
 ``/style.css``; API allowlist ``/api/monitor``, ``/api/summary``,
 ``/api/projects/<id>``, ``/api/events?limit=N``, ``/api/runs?limit=N``,
-``/api/orchestration``; history limits clamp to 1..100; unknown routes 404;
+``/api/orchestration``, ``/api/conversations``; history limits clamp to 1..100; unknown routes 404;
 write methods 405 with ``Allow: GET, HEAD``; traversal/malformed paths 400.
 ``Cache-Control: no-store`` and ``X-Content-Type-Options: nosniff`` are always
 present.
@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from dev_orchestrator.control.owner_store import OwnerControlStore
+from dev_orchestrator.control.store import ConversationControlStore
 from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE
 from dev_orchestrator.platform.process import is_pid_alive
 from dev_orchestrator.storage.json_store import (
@@ -130,6 +132,116 @@ def orchestration_payload(runtime_root: Path | str) -> dict[str, Any]:
             "prepared_at": latest.get("prepared_at"),
         }
     return {"projects": projects}
+
+
+def conversation_bindings_payload(runtime_root: Path | str) -> dict[str, Any]:
+    """Read-only project-to-conversation projection for the dashboard."""
+    runtime = Path(runtime_root)
+    summary = read_json(runtime / "summary.json", _default_summary())
+    projects = summary.get("projects") if isinstance(summary, dict) else []
+    if not isinstance(projects, list):
+        projects = []
+    store = ConversationControlStore(runtime)
+    owner_store = OwnerControlStore(runtime)
+    decisions_doc = read_json(runtime / "websol-decisions.json", {})
+    decisions = decisions_doc.get("decisions") if isinstance(decisions_doc, dict) else {}
+    if not isinstance(decisions, dict):
+        decisions = {}
+    session_map = {}
+    for session in store.list_sessions():
+        if not isinstance(session, dict):
+            continue
+        adapter = session.get("adapter")
+        binding_id = session.get("binding_id")
+        if isinstance(adapter, str) and isinstance(binding_id, str):
+            session_map[(adapter, binding_id)] = session
+
+    def latest_owner_gate(project_id: str):
+        matches = [dict(record) for record in decisions.values()
+                   if isinstance(record, dict)
+                   and record.get("project_id") == project_id
+                   and record.get("disposition") == "owner_gate"
+                   and isinstance(record.get("request_id"), str)]
+        if not matches:
+            return None
+        gate = max(matches, key=lambda value: str(value.get("consumed_at") or ""))
+        action = owner_store.latest_action_for_gate(gate["request_id"])
+        gate["owner_state"] = ("approved" if action
+                               and action.get("action") == "approve_next_stage"
+                               and action.get("state") == "accepted" else "pending")
+        return gate
+
+    rows = []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        project_id = str(project.get("project_id") or project.get("id") or "")
+        if not project_id:
+            continue
+        source = str(project.get("conversation_binding_source") or "none")
+        binding = project.get("conversation_binding")
+        runtime_record = store.runtime_record_for_project(project_id)
+
+        route = None
+        runtime_meta = runtime_record if isinstance(runtime_record, dict) else {}
+        if isinstance(runtime_record, dict):
+            if runtime_record.get("state") == "unbound":
+                source = "runtime_unbound"
+            else:
+                adapter = runtime_record.get("adapter")
+                binding_id = runtime_record.get("binding_id")
+                if isinstance(adapter, str) and adapter.strip() and isinstance(binding_id, str) and binding_id.strip():
+                    route = (adapter.strip(), binding_id.strip())
+                    source = "runtime"
+                else:
+                    source = "runtime_invalid"
+        elif isinstance(binding, dict):
+            adapter = binding.get("adapter")
+            binding_id = binding.get("binding_id")
+            if isinstance(adapter, str) and adapter.strip() and isinstance(binding_id, str) and binding_id.strip():
+                route = (adapter.strip(), binding_id.strip())
+
+        session = session_map.get(route) if route else None
+        if route is None:
+            state = "UNBOUND"
+        elif session and session.get("state") == "live":
+            state = "BOUND"
+        else:
+            state = "STALE"
+
+        title = None
+        url = None
+        last_seen_at = None
+        active_tabs = 0
+        if isinstance(session, dict):
+            title = session.get("title")
+            url = session.get("url")
+            last_seen_at = session.get("last_seen_at")
+            active_tabs = int(session.get("active_tab_count") or 0)
+        if not title:
+            title = runtime_meta.get("title")
+        if not url:
+            url = runtime_meta.get("url")
+        if route and not url and route[0] == "chatgpt_web":
+            url = "https://chatgpt.com/c/" + route[1]
+        owner_state = owner_store.project_state(project_id)
+        owner_gate = latest_owner_gate(project_id)
+        rows.append({
+            "project_id": project_id,
+            "project_name": project.get("name"),
+            "binding_state": state,
+            "binding_source": source,
+            "adapter": route[0] if route else None,
+            "binding_id": route[1] if route else None,
+            "conversation_title": title,
+            "conversation_url": url,
+            "last_seen_at": last_seen_at,
+            "active_tab_count": active_tabs,
+            "owner_paused": bool(owner_state.get("paused")),
+            "owner_gate": owner_gate,
+        })
+    return {"observed_at": summary.get("observed_at") if isinstance(summary, dict) else None,
+            "projects": rows}
 
 
 class DevOrchestratorHTTPServer(ThreadingHTTPServer):
@@ -308,6 +420,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             payload = {"items": read_last_jsonl(runtime / "history" / "runs.jsonl", self._query_limit(parsed.query))}
         elif path == "/api/orchestration":
             payload = orchestration_payload(runtime)
+        elif path == "/api/conversations":
+            payload = conversation_bindings_payload(runtime)
         elif path.startswith("/api/projects/"):
             match = _PROJECT_PATH_RE.fullmatch(path)
             if not match:

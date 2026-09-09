@@ -22,11 +22,12 @@ from dev_orchestrator.agents.models import AgentRequest, AgentResult, AgentRole,
 from dev_orchestrator.agents.registry import BackendRegistry
 from dev_orchestrator.agents.router import AgentRouter
 from dev_orchestrator.config import load_projects_config
+from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.project_status import write_execution_status
 from dev_orchestrator.core.websol import NextAction, WebSolEvent, WebSolRole
 from dev_orchestrator.monitor.telemetry import extract_task_id
-from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
+from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now, utc_now_iso, write_json
 
 ACTUATION_FILE = "transition-executor.json"
 _LEDGER_VERSION = 1
@@ -224,10 +225,12 @@ class TransitionExecutor:
         runtime_root: Path | str,
         *,
         backend_overrides: Optional[dict[str, AgentBackend]] = None,
+        owner_store: Optional[OwnerControlStore] = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.ledger_path = self.runtime_root / ACTUATION_FILE
+        self.owner_store = owner_store or OwnerControlStore(self.runtime_root)
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}
         self._backend_overrides: dict[str, AgentBackend] = {}
@@ -305,6 +308,19 @@ class TransitionExecutor:
     def state(self) -> dict[str, Any]:
         with self._lock:
             return copy.deepcopy(self._load_ledger())
+
+    def set_owner_paused(self, project_id: str, paused: bool, *, action_id: str,
+                         action: str, reason: Optional[str] = None) -> dict[str, Any]:
+        """Serialize owner pause changes with the final Worker launch gate."""
+        with self._lock:
+            return self.owner_store.set_paused(
+                project_id, paused, action_id=action_id, action=action, reason=reason)
+
+    def adopt_owner_control(self, project_id: str, *, action_id: str, action: str) -> dict[str, Any]:
+        """Serialize runtime-control adoption with legacy static launch gating."""
+        with self._lock:
+            return self.owner_store.adopt_runtime_control(
+                project_id, action_id=action_id, action=action)
 
     def overlay_managed_runs(self, summary: Any) -> Any:
         """Project managed-run truth onto a deep copy for WORKER_DONE dispatch."""
@@ -464,10 +480,23 @@ class TransitionExecutor:
             return None
 
         with self._lock:
+            project_id = str(project["project_id"])
+            owner_state = self.owner_store.project_state(project_id)
+            if source_kind != "owner_control" and owner_state.get("paused"):
+                self._record_blocked(
+                    source_request_id, project_id, "owner pause blocked Worker launch",
+                    task_id=task_id, source_kind=source_kind)
+                return None
+            if (source_kind in {"owner_start", "bootstrap"}
+                    and owner_state.get("suppress_static_starts")):
+                self._record_blocked(
+                    source_request_id, project_id,
+                    "runtime owner control suppresses legacy static launch",
+                    task_id=task_id, source_kind=source_kind)
+                return None
             ledger = self._load_ledger()
             if source_request_id in ledger["executions"]:
                 return None
-            project_id = str(project["project_id"])
             if self._active_project(ledger, project_id):
                 ledger["executions"][source_request_id] = {
                     "project_id": project_id,
@@ -633,6 +662,43 @@ class TransitionExecutor:
             stderr_path=str(self.runtime_root / "agent-runs" / run.run_id / "stderr.log"),
         )
 
+    def _fresh_owner_snapshot(self, project: dict[str, Any]) -> dict[str, Any]:
+        from dev_orchestrator.adapters import get_project_adapter
+        adapter_id = str(project.get("adapter") or "agent_files")
+        adapter = get_project_adapter(adapter_id)
+        return adapter.snapshot(
+            project, self.runtime_root / "history" / "runs.jsonl", now=utc_now()
+        )
+
+    def owner_control_launch(
+        self, config_path: Path | str, *, project_id: str, action_id: str,
+        expected_task_id: str, expected_branch: str, expected_head: str,
+    ) -> ActuationLaunch:
+        """Explicitly launch one current task after exact owner/UI identity checks."""
+        config = load_projects_config(config_path)
+        project = _project_map(config).get(project_id)
+        if project is None:
+            raise ValueError("project configuration unavailable")
+        policy, error = _execution_policy(project)
+        if policy is None:
+            raise ValueError(error)
+        snapshot = self._fresh_owner_snapshot(project)
+        launch_task, guard_error = self._fresh_guard(
+            project, snapshot, expected_branch=expected_branch, expected_head=expected_head,
+            expected_task_id=expected_task_id,
+        )
+        if launch_task is None:
+            raise ValueError(guard_error)
+        request_id = "owner-control:" + action_id
+        launch = self._launch(
+            project, source_request_id=request_id, source_kind="owner_control",
+            task_id=launch_task, source_task_id=None, branch=expected_branch,
+            head=expected_head, worker_prompt=str(policy["worker_prompt"]), policy=policy,
+        )
+        if launch is None:
+            raise ValueError("owner action did not launch; request may already exist or project is active")
+        return launch
+
     def _load_decisions(self) -> dict[str, dict[str, Any]]:
         data = read_json(self.runtime_root / "websol-decisions.json", None)
         if not isinstance(data, dict) or not isinstance(data.get("decisions"), dict):
@@ -650,6 +716,20 @@ class TransitionExecutor:
             for record in ledger["executions"].values()
             if isinstance(record, dict)
         )
+
+    def _automatic_decision_allowed(self, project_id: str, consumed_at: Any) -> bool:
+        state = self.owner_store.project_state(project_id)
+        if state.get("paused"):
+            return False
+        raw_barrier = state.get("paused_at")
+        if raw_barrier:
+            barrier = parse_utc(raw_barrier)
+            consumed = parse_utc(consumed_at)
+            if barrier is None or consumed is None:
+                return False
+            if consumed <= barrier:
+                return False
+        return True
 
     def _advance_decisions(
         self,
@@ -678,6 +758,8 @@ class TransitionExecutor:
                 continue
             project_id = _non_blank_config(record.get("project_id"))
             if project_id is None:
+                continue
+            if not self._automatic_decision_allowed(project_id, record.get("consumed_at")):
                 continue
             task_id = _non_blank_config(record.get("task_id"))
             branch = _non_blank_config(record.get("branch"))
@@ -773,6 +855,8 @@ class TransitionExecutor:
     ) -> list[ActuationLaunch]:
         launches: list[ActuationLaunch] = []
         for project_id, project in projects.items():
+            if self.owner_store.is_paused(project_id) or self.owner_store.suppress_static_starts(project_id):
+                continue
             policy, _ = _execution_policy(project)
             if policy is None or policy.get("owner_start") is None: continue
             token = policy["owner_start"]; request_id = str(token["request_id"]); task_id = str(token["task_id"])
@@ -795,6 +879,8 @@ class TransitionExecutor:
     ) -> list[ActuationLaunch]:
         launches: list[ActuationLaunch] = []
         for project_id, project in projects.items():
+            if self.owner_store.is_paused(project_id) or self.owner_store.suppress_static_starts(project_id):
+                continue
             policy, _ = _execution_policy(project)
             if policy is None or policy.get("bootstrap") is None:
                 continue

@@ -28,6 +28,7 @@ from dev_orchestrator.bridge.store import BrowserBridgeStore
 from dev_orchestrator.control.server import make_control_server
 from dev_orchestrator.control.service import ControlPlaneService
 from dev_orchestrator.control.store import ConversationControlStore
+from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
 from dev_orchestrator.core.response_consumer import consume_websol_responses
 from dev_orchestrator.core.transition_executor import TransitionExecutor
@@ -128,7 +129,12 @@ def run_daemon(
         bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=True)
         bridge_server = make_bridge_server(bridge_listen, bridge_port, bridge_store)
         control_store = ConversationControlStore(runtime)
-        control_service = ControlPlaneService(config, runtime, control_store, bridge_store)
+        owner_store = OwnerControlStore(runtime)
+        transition_executor = TransitionExecutor(runtime, owner_store=owner_store)
+        control_service = ControlPlaneService(
+            config, runtime, control_store, bridge_store,
+            transition_executor=transition_executor, owner_store=owner_store,
+        )
         control_server = make_control_server(control_listen, control_port, control_service)
     except Exception:
         # Never leave a live-looking pid file behind when a bind fails.
@@ -167,7 +173,6 @@ def run_daemon(
     control_thread.start()
     bridge_bound_port = int(bridge_server.server_address[1])
     control_bound_port = int(control_server.server_address[1])
-    transition_executor = TransitionExecutor(runtime)
     try:
         while True:
             last_error: Optional[str] = None
