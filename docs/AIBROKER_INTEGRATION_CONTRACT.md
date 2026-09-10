@@ -55,3 +55,9 @@ For Broker Workers, daemon restart reconciliation queries persisted Broker dispa
 A daemon-managed interruption may be marked safe for an explicit owner continue only when the Broker interruption reason is the managed-stop reason and repository branch, HEAD, and launch fingerprint are unchanged.
 
 Stopping the daemon terminates the recorded daemon process tree before marking active Broker dispatches interrupted. Broker interruption is not recorded when process-tree termination cannot be verified.
+
+## 2026-09-10 continuous-execution acceptance
+
+The provider-neutral control/execution path has passed a synthetic multi-task lifecycle acceptance covering Worker → Review → next-task Planner → Plan Review → Worker → Review → terminal settle from a single continue intent. Restart/self-heal and historical-worker overlay barriers are included in the accepted behavior.
+
+See `CONTINUOUS_EXECUTION_ACCEPTANCE_2026-09-10.md` for the frozen evidence and current legacy-migration boundary.

@@ -1,29 +1,28 @@
 # DevOrchestrator
 
 Project-neutral local orchestration infrastructure for AI-assisted development.
-One DevOrchestrator service can observe multiple external Git repositories,
-route bounded reasoning events through a Browser Bridge, and persist validated
-decision dispositions without embedding product-specific logic in Core.
+One DevOrchestrator daemon can observe multiple external Git repositories, accept
+stateless project control intents, drive planner/worker/reviewer lifecycle roles,
+and delegate exact AI-resource execution to AIResourceBroker. Browser Bridge is
+retained as a compatibility transport rather than an authoritative state store.
 
 ## Current authority boundary
 
 Implemented:
 
-- multi-project read-only repository/Worker monitoring;
-- one-process daemon with dashboard and Browser Bridge;
-- configuration-driven `ProjectAdapter` selection;
-- WORKER_DONE reasoning-event dispatch;
-- ChatGPT Web binding/claim/renew/response transport;
-- response stability, replay/idempotency and live-binding gates;
-- Response Consumer + repository-truth Decision Guard;
-- AgentBackend registry/router foundation.
+- multi-project repository/Worker monitoring and one-process daemon;
+- stateless `project-status <project_id>` and `project-continue <project_id>` control;
+- continuous lifecycle routing across PLAN / EXECUTE / REVIEW / REMEDIATE boundaries;
+- provider-neutral `AIExecutionPort` integration with AIResourceBroker;
+- independent AIBroker Planner, plan Reviewer, Worker, and Worker Reviewer roles;
+- restart reconciliation, idempotent control history, and fail-closed repository-truth guards;
+- Browser Bridge/Web Sol compatibility path for projects not yet migrated.
 
-Not implemented/authorized:
+DevOrchestrator owns lifecycle semantics. AIResourceBroker owns provider/account/model
+selection and exact provider execution. See `docs/AIBROKER_INTEGRATION_CONTRACT.md`
+and `docs/CONTINUOUS_EXECUTION_ACCEPTANCE_2026-09-10.md`.
 
-- executing a `next_action`;
-- starting/restarting a project Worker from a Web Sol decision;
-- PHASE_AUTO or automatic stage crossing;
-- hardware actions.
+Hardware actions remain outside this generic orchestration authority.
 
 ## Portable external-project onboarding
 
@@ -50,8 +49,9 @@ $env:PYTHONPATH = "$PWD\src"
 python -m dev_orchestrator validate-config --config .\config\projects.json
 ```
 
-A project without a browser conversation binding is valid but monitor-only.
-`validate-config` reports `orchestration_ready=false` explicitly.
+A project may be orchestration-ready without a browser conversation binding when
+it uses the direct AIBroker reviewer/planner path. Legacy browser-bound projects
+remain supported during migration.
 
 ## Run
 
@@ -113,9 +113,10 @@ required for ordinary Core development.
 
 ## Repository ownership boundary
 
-DevOrchestrator owns its configured runtime directory. Monitoring, Bridge
-transport and response validation do not write into observed product
-repositories. Current Worker actuation remains intentionally absent.
+DevOrchestrator owns its configured runtime directory and lifecycle ledgers.
+Managed planning may deterministically freeze an approved plan and managed Workers
+may modify the explicitly configured project repository. Repository-truth guards,
+review independence, and project execution policy bound those writes.
 
 Machine-specific project paths, browser bindings and runtime choices belong in
 the ignored `config/projects.json` or other explicitly selected local config,
