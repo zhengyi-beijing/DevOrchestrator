@@ -402,6 +402,20 @@ class TransitionExecutorActuationTests(unittest.TestCase):
             self.assertEqual(len(backend.started), 0)
             self.assertEqual(executor.advance(summary, config), [])
 
+    def test_legacy_not_ready_block_reconciles_to_settled_when_complete_truth_matches(self):
+        with tempfile.TemporaryDirectory() as td:
+            base=Path(td); repo=base/"repo"; runtime=base/"runtime"
+            make_repo(repo,"P1")
+            (repo/"agent"/"next.md").write_text("# P1 bounded task\nStatus: **COMPLETE**\n",encoding="utf-8")
+            subprocess.run(["git","-C",str(repo),"add","agent/next.md"],check=True)
+            subprocess.run(["git","-C",str(repo),"commit","-m","complete P1"],check=True,stdout=subprocess.DEVNULL)
+            head=subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip()
+            config=base/"projects.json"; write_config(config,repo,bootstrap=False); write_decision(runtime,head=head,task_id="P1")
+            (runtime/"transition-executor.json").write_text(json.dumps({"version":1,"executions":{"worker_done:p1:r1":{"project_id":"p1","source_request_id":"worker_done:p1:r1","source_kind":"decision","task_id":"P1","state":"blocked","reason":"project is not READY_TO_RUN"}}}),encoding="utf-8")
+            summary=ready_summary(repo,"P1"); summary["projects"][0]["state"]="IDLE"; summary["projects"][0]["next_status"]="**COMPLETE**"
+            executor=TransitionExecutor(runtime,backend_overrides={"agy":FakeBackend("agy")}); self.assertEqual(executor.advance(summary,config),[])
+            row=executor.state()["executions"]["worker_done:p1:r1"]; self.assertEqual(row["state"],"settled"); self.assertIn("legacy_reconciled_from",row)
+
     def test_owner_start_launches_current_task_once_after_prior_history(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"

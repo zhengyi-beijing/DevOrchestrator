@@ -141,6 +141,15 @@ def _non_blank_config(value: Any) -> Optional[str]:
     return text or None
 
 
+def _legacy_not_ready_block(record: Any) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("state") == "blocked"
+        and record.get("source_kind") == "decision"
+        and record.get("reason") == "project is not READY_TO_RUN"
+    )
+
+
 def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]], str]:
     raw = project.get("execution")
     if not isinstance(raw, dict):
@@ -469,13 +478,15 @@ class TransitionExecutor:
     ) -> None:
         with self._lock:
             ledger = self._load_ledger()
-            if source_request_id in ledger["executions"]:
+            existing = ledger["executions"].get(source_request_id)
+            if existing is not None and not _legacy_not_ready_block(existing):
                 return
             ledger["executions"][source_request_id] = {
                 "project_id": project_id, "source_request_id": source_request_id,
                 "source_kind": "decision", "task_id": task_id,
                 "state": "settled", "outcome": outcome, "reason": reason,
                 "recorded_at": utc_now_iso(),
+                **({"legacy_reconciled_from": existing} if existing is not None else {}),
             }
             self._save_ledger(ledger)
 
@@ -485,7 +496,8 @@ class TransitionExecutor:
     ) -> None:
         with self._lock:
             ledger = self._load_ledger()
-            if source_request_id in ledger["executions"]:
+            existing = ledger["executions"].get(source_request_id)
+            if existing is not None and not _legacy_not_ready_block(existing):
                 return
             ledger["executions"][source_request_id] = {
                 "project_id": project_id, "source_request_id": source_request_id,
@@ -493,6 +505,7 @@ class TransitionExecutor:
                 "next_task_id": next_task_id, "state": "handoff",
                 "outcome": "planning_required", "reason": reason,
                 "recorded_at": utc_now_iso(),
+                **({"legacy_reconciled_from": existing} if existing is not None else {}),
             }
             self._save_ledger(ledger)
 
@@ -962,7 +975,8 @@ class TransitionExecutor:
         }
         for request_id, record in ordered:
             with self._lock:
-                if request_id in self._load_ledger()["executions"]:
+                existing = self._load_ledger()["executions"].get(request_id)
+                if existing is not None and not _legacy_not_ready_block(existing):
                     continue
             if record.get("disposition") != "apply":
                 continue
