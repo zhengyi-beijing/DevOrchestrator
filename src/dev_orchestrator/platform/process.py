@@ -109,6 +109,27 @@ def terminate_pid(pid: Any) -> bool:
         return False
 
 
+def terminate_process_tree(pid: Any) -> bool:
+    """Terminate a recorded DevOrchestrator process and its descendants."""
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["taskkill", "/PID", str(pid_int), "/T", "/F"],
+            capture_output=True, text=True, check=False, **hidden_subprocess_kwargs(),
+        )
+        return completed.returncode == 0 or not is_pid_alive(pid_int)
+    try:
+        os.killpg(os.getpgid(pid_int), signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
 def hidden_subprocess_kwargs() -> dict[str, int]:
     """Return Popen kwargs that suppress console windows on Windows.
 

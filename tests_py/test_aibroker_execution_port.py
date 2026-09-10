@@ -130,6 +130,23 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         self.assertIn("old-r", argv)
         self.assertNotIn("--excluded-resource-id", argv)
 
+
+    @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
+    def test_status_and_interrupt_use_broker_reconciliation_commands(self, run):
+        running = {"request_id": "req-1", "status": "running", "resource_id": "r1"}
+        failed = {"request_id": "req-1", "status": "failed", "resource_id": "r1",
+                  "execution_error": "stopped"}
+        run.side_effect = [
+            subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(running), stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(failed), stderr=""),
+        ]
+        self.assertEqual(self.port.status("req-1")["status"], "running")
+        self.assertEqual(self.port.interrupt("req-1", "stopped")["status"], "failed")
+        first = run.call_args_list[0].args[0]; second = run.call_args_list[1].args[0]
+        self.assertIn("dispatch-status", first)
+        self.assertIn("interrupt-dispatch", second)
+        self.assertIn("--reason", second)
+
     def test_request_validation_is_fail_closed(self):
         with self.assertRaises(ValueError):
             self.request(quality="ultra")

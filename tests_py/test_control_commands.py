@@ -43,6 +43,23 @@ def write_config(path: Path, repo: Path) -> None:
     }]}), encoding="utf-8")
 
 
+class FakePlanner:
+    def __init__(self):
+        self.calls = []; self.ready = []; self.launched = []
+    def start(self, project, snapshot, command_id):
+        self.calls.append((project["project_id"], command_id))
+        plan_id = "ai_plan:" + command_id
+        self.ready.append({"plan_id":plan_id,"command_id":command_id,"project_id":project["project_id"],"state":"ready"})
+        return plan_id, "planning started"
+    def ready_records(self): return list(self.ready)
+    def terminal_records(self): return []
+    def mark_control_synced(self, plan_id): pass
+    def mark_worker_launched(self, plan_id, source_request_id):
+        self.launched.append((plan_id, source_request_id)); self.ready = [r for r in self.ready if r["plan_id"] != plan_id]
+    def mark_worker_blocked(self, plan_id, reason):
+        self.ready = [r for r in self.ready if r["plan_id"] != plan_id]
+
+
 class ControlCommandTests(unittest.TestCase):
     def test_atomic_inbox_command_is_consumed_once(self):
         with tempfile.TemporaryDirectory() as td:
@@ -80,6 +97,25 @@ class ControlCommandTests(unittest.TestCase):
             self.assertEqual(outcomes[0]["command_id"], command["command_id"])
             self.assertEqual(outcomes[0]["state"], "blocked")
             self.assertEqual(outcomes[0]["reason"], "not ready")
+
+    def test_pending_design_routes_to_planner_then_resumes_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            base=Path(td); repo=base/"repo"; repo.mkdir(); runtime=base/"runtime"
+            config=base/"projects.json"; write_config(config, repo)
+            command=submit_control_command(runtime,"p1","continue")
+            planner=FakePlanner(); executor=FakeExecutor(launch=True)
+            coordinator=ControlCommandCoordinator(runtime, planner)
+            pending={"projects":[{"project_id":"p1","state":"IDLE","next_status":"**PENDING DESIGN**","telemetry":{"task_id":"P1"}}]}
+            first=coordinator.advance(config,pending,executor)
+            self.assertEqual(first[0]["lifecycle_action"],"plan")
+            self.assertEqual(executor.calls,[])
+            ready={"projects":[{"project_id":"p1","state":"READY_TO_RUN","next_status":"**READY_TO_RUN**","telemetry":{"task_id":"P1"}}]}
+            second=coordinator.advance(config,ready,executor)
+            self.assertEqual(second[0]["lifecycle_action"],"execute")
+            self.assertEqual(len(executor.calls),1)
+            self.assertEqual(planner.launched[0][0],"ai_plan:"+command["command_id"])
+            latest=latest_control_result(runtime,"p1")
+            self.assertEqual(latest["lifecycle_action"],"execute")
 
     def test_transition_control_requires_ready_to_run(self):
         with tempfile.TemporaryDirectory() as td:

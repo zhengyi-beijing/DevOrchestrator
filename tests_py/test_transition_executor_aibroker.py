@@ -1,3 +1,4 @@
+import json
 import subprocess
 import tempfile
 import time
@@ -5,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
+from dev_orchestrator.ai.execution_port import MANAGED_INTERRUPT_REASON
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.transition_executor import TransitionExecutor, _execution_policy
 
@@ -27,6 +29,14 @@ class FakePort:
                 "dsh/default/model", "deepseek", "default", "model"
             ),
         )
+
+
+
+class RecoveryPort(FakePort):
+    def __init__(self, fact):
+        super().__init__(); self.fact = fact; self.status_requests = []
+    def status(self, request_id):
+        self.status_requests.append(request_id); return dict(self.fact) if self.fact else None
 
 
 def broker_project(repo: Path):
@@ -52,6 +62,52 @@ class AIBrokerTransitionTests(unittest.TestCase):
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
         return repo
+
+
+    def _write_active_broker_record(self, runtime: Path, repo: Path, truth, *, request_id="worker-1"):
+        runtime.mkdir(parents=True, exist_ok=True)
+        (runtime / "transition-executor.json").write_text(json.dumps({"version": 1, "executions": {
+            request_id: {"project_id": "p1", "source_request_id": request_id, "engine": "aibroker",
+                         "broker_request_id": "ai-worker:" + request_id, "state": "running",
+                         "branch": truth.branch, "head": truth.head, "launch_status_hash": truth.status_hash,
+                         "repo_path": str(repo), "started_at": "2026-09-10T01:00:00+00:00",
+                         "review_state": "pending"}
+        }}), encoding="utf-8")
+
+    def test_restart_recovers_succeeded_broker_as_completed_with_resource_facts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); repo=self.make_repo(root); runtime=root/"runtime"; truth=read_repository_truth(repo)
+            self._write_active_broker_record(runtime, repo, truth)
+            port=RecoveryPort({"status":"succeeded", "dispatch_id":"d1", "decision_id":"q1",
+                               "execution_id":"e1", "resource_id":"r1", "provider":"deepseek",
+                               "account":"a", "model":"m", "finished_at":"2026-09-10T01:02:00+00:00"})
+            record=TransitionExecutor(runtime, ai_execution_port=port).state()["executions"]["worker-1"]
+            self.assertEqual(record["state"], "completed")
+            self.assertEqual(record["execution_id"], "e1")
+            self.assertEqual(record["resource_context"]["resource_id"], "r1")
+
+    def test_restart_managed_interrupt_is_safe_retry_only_when_repo_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); repo=self.make_repo(root); runtime=root/"runtime"; truth=read_repository_truth(repo)
+            self._write_active_broker_record(runtime, repo, truth)
+            fact={"status":"failed", "execution_error":MANAGED_INTERRUPT_REASON, "resource_id":"r1"}
+            record=TransitionExecutor(runtime, ai_execution_port=RecoveryPort(fact)).state()["executions"]["worker-1"]
+            self.assertEqual(record["state"], "recovery_required")
+            self.assertTrue(record["recovery_safe_retry"])
+
+    def test_restart_running_or_changed_repo_never_auto_replays(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); repo=self.make_repo(root); runtime=root/"runtime"; truth=read_repository_truth(repo)
+            self._write_active_broker_record(runtime, repo, truth)
+            (repo/"README.md").write_text("changed\n", encoding="utf-8")
+            fact={"status":"failed", "execution_error":MANAGED_INTERRUPT_REASON, "resource_id":"r1"}
+            record=TransitionExecutor(runtime, ai_execution_port=RecoveryPort(fact)).state()["executions"]["worker-1"]
+            self.assertFalse(record["recovery_safe_retry"])
+            runtime2=root/"runtime2"; truth2=read_repository_truth(repo)
+            self._write_active_broker_record(runtime2, repo, truth2, request_id="worker-2")
+            running=TransitionExecutor(runtime2, ai_execution_port=RecoveryPort({"status":"running", "resource_id":"r1"})).state()["executions"]["worker-2"]
+            self.assertEqual(running["state"], "recovery_required")
+            self.assertFalse(running["recovery_safe_retry"])
 
     def test_policy_accepts_aibroker_without_legacy_backends(self):
         with tempfile.TemporaryDirectory() as td:

@@ -33,6 +33,8 @@ from dev_orchestrator.config import (
     resolve_web_root,
 )
 from dev_orchestrator.daemon import run_daemon
+from dev_orchestrator.ai.execution_port import MANAGED_INTERRUPT_REASON
+from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
 from dev_orchestrator.core.control_commands import latest_control_result, submit_control_command
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.platform.process import (
@@ -40,6 +42,7 @@ from dev_orchestrator.platform.process import (
     is_pid_alive,
     spawn_detached,
     terminate_pid,
+    terminate_process_tree,
 )
 from dev_orchestrator.storage.json_store import (
     read_json,
@@ -589,14 +592,47 @@ def cmd_status_daemon(args: argparse.Namespace) -> int:
     return 0
 
 
+def _interrupt_active_broker_dispatches(runtime: Path) -> list[dict[str, Any]]:
+    ledger = read_json(runtime / "transition-executor.json", {})
+    executions = ledger.get("executions") if isinstance(ledger, dict) else None
+    rows = executions.values() if isinstance(executions, dict) else ()
+    request_ids = sorted({
+        str(row.get("broker_request_id")) for row in rows
+        if isinstance(row, dict) and row.get("engine") == "aibroker"
+        and row.get("state") in {"launching", "running"} and row.get("broker_request_id")
+    })
+    if not request_ids:
+        return []
+    try:
+        port = load_aibroker_execution_port(runtime)
+    except Exception as exc:
+        return [{"state": "reconcile_failed", "error": str(exc)}]
+    if port is None:
+        return [{"state": "reconcile_failed", "error": "AIBroker execution port unavailable"}]
+    results = []
+    for request_id in request_ids:
+        try:
+            fact = port.status(request_id)
+            if isinstance(fact, dict) and fact.get("status") == "running":
+                fact = port.interrupt(request_id, MANAGED_INTERRUPT_REASON)
+            results.append({"request_id": request_id, "fact": fact})
+        except Exception as exc:
+            results.append({"request_id": request_id, "state": "reconcile_failed", "error": str(exc)})
+    return results
+
+
 def cmd_stop_daemon(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
     pid_path = runtime / "daemon.pid"
     heartbeat_path = runtime / "daemon.json"
     pid = _read_pid_file(pid_path) or 0
-    if pid > 0 and is_pid_alive(pid):
-        terminate_pid(pid)
-    stopped = {"state": "stopped", "pid": pid, "stopped_at": utc_now_iso()}
+    daemon_was_alive = pid > 0 and is_pid_alive(pid)
+    tree_stopped = False
+    if daemon_was_alive:
+        tree_stopped = terminate_process_tree(pid)
+    broker_interrupts = _interrupt_active_broker_dispatches(runtime) if daemon_was_alive and tree_stopped else []
+    stopped = {"state": "stopped", "pid": pid, "stopped_at": utc_now_iso(),
+               "tree_stopped": tree_stopped, "broker_interrupts": broker_interrupts}
     write_json(heartbeat_path, stopped)
     try:
         pid_path.unlink(missing_ok=True)

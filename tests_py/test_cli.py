@@ -7,6 +7,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +82,26 @@ class CliLifecycleTests(unittest.TestCase):
             result = run_cli("project-continue", "p1", "--runtime-root", str(runtime))
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("daemon is not running", result.stderr)
+
+    def test_stop_daemon_does_not_interrupt_broker_when_recorded_pid_is_already_dead(self):
+        import dev_orchestrator.cli as cli
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td); (runtime / "daemon.pid").write_text("4242", encoding="utf-8")
+            with patch.object(cli, "is_pid_alive", return_value=False), patch.object(cli, "_interrupt_active_broker_dispatches") as interrupt:
+                cli.cmd_stop_daemon(SimpleNamespace(runtime_root=str(runtime)))
+                interrupt.assert_not_called()
+            payload = json.loads((runtime / "daemon.json").read_text(encoding="utf-8"))
+            self.assertFalse(payload["tree_stopped"]); self.assertEqual(payload["broker_interrupts"], [])
+
+    def test_stop_daemon_interrupts_broker_only_after_verified_tree_stop(self):
+        import dev_orchestrator.cli as cli
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td); (runtime / "daemon.pid").write_text("4242", encoding="utf-8")
+            with patch.object(cli, "is_pid_alive", return_value=True), patch.object(cli, "terminate_process_tree", return_value=True), patch.object(cli, "_interrupt_active_broker_dispatches", return_value=[{"request_id":"r"}]) as interrupt:
+                cli.cmd_stop_daemon(SimpleNamespace(runtime_root=str(runtime)))
+                interrupt.assert_called_once_with(runtime)
+            payload = json.loads((runtime / "daemon.json").read_text(encoding="utf-8"))
+            self.assertTrue(payload["tree_stopped"]); self.assertEqual(payload["broker_interrupts"], [{"request_id":"r"}])
 
 
 if __name__ == "__main__":

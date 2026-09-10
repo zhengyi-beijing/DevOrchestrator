@@ -35,3 +35,23 @@ If the daemon restarts while a managed Broker Worker or direct Reviewer is activ
 Only the latest completed Broker Worker per project is eligible for a new direct review. Historical completed Workers are not bulk-replayed when a project enables the new reviewer path.
 
 Machine-specific Broker paths and Python environment live under ignored runtime configuration (`runtime/aibroker-execution.json`), not project source. Browser transport remains a legacy compatibility adapter, not a required state store for the direct Broker path.
+
+## Planner and stateless continue
+
+`project-continue <project_id>` expresses lifecycle intent; it is not a direct Worker-start command. The client is stateless and does not supply a conversation id, provider, account, model, or exact resource.
+
+For a `PENDING DESIGN` task, DevOrchestrator runs an AIBroker Planner that returns a strict structured plan without modifying the repository. An independent plan Reviewer must use the configured semantic independence constraint against the Planner resource.
+
+Only after plan approval does DevOrchestrator deterministically update `agent/next.md` to `READY_TO_RUN`, append the approved executable design, and create a local plan-freeze commit. The repository branch, HEAD, worktree fingerprint, and original `agent/next.md` must remain unchanged throughout planning or the apply step fails closed.
+
+The same accepted control command then resumes on a later daemon tick and launches the Worker through the existing `TransitionExecutor` guard. A plan failure, owner gate, or restart recovery is synchronized back to control history instead of leaving the command permanently reported as planning.
+
+Control commands use atomic per-command inbox files and bounded safe command IDs. Replay of the same command id is idempotent. A control command cannot bypass an unresolved Broker Worker review or unsafe recovery state.
+
+## Restart reconciliation
+
+For Broker Workers, daemon restart reconciliation queries persisted Broker dispatch facts when available. A Broker-succeeded execution is projected as completed; a provider failure remains failed. Running or ambiguous work becomes `recovery_required` and is never automatically replayed.
+
+A daemon-managed interruption may be marked safe for an explicit owner continue only when the Broker interruption reason is the managed-stop reason and repository branch, HEAD, and launch fingerprint are unchanged.
+
+Stopping the daemon terminates the recorded daemon process tree before marking active Broker dispatches interrupted. Broker interruption is not recorded when process-tree termination cannot be verified.

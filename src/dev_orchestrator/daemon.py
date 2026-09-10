@@ -29,6 +29,7 @@ from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
 from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
 from dev_orchestrator.core.control_commands import ControlCommandCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
+from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.response_consumer import consume_websol_responses
 from dev_orchestrator.core.transition_executor import TransitionExecutor
 from dev_orchestrator.core.project_status import write_project_statuses
@@ -166,7 +167,8 @@ def run_daemon(
     ai_execution_port = load_aibroker_execution_port(runtime)
     transition_executor = TransitionExecutor(runtime, ai_execution_port=ai_execution_port)
     reviewer_coordinator = AIReviewerCoordinator(runtime, ai_execution_port)
-    control_coordinator = ControlCommandCoordinator(runtime)
+    planner_coordinator = AIPlannerCoordinator(runtime, ai_execution_port)
+    control_coordinator = ControlCommandCoordinator(runtime, planner_coordinator)
     try:
         while True:
             last_error: Optional[str] = None

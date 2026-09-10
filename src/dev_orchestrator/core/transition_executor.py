@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dev_orchestrator.ai.contracts import AIRoleRequest
-from dev_orchestrator.ai.execution_port import AIExecutionPort
+from dev_orchestrator.ai.execution_port import AIExecutionPort, MANAGED_INTERRUPT_REASON
 from dev_orchestrator.agents.base import AgentBackend
 from dev_orchestrator.agents.backends.agy import AgyBackend
 from dev_orchestrator.agents.backends.dsh import DshBackend
@@ -315,14 +315,57 @@ class TransitionExecutor:
             ledger = self._load_ledger()
             changed = False
             for record in ledger["executions"].values():
-                if record.get("state") in _ACTIVE_STATES:
+                if record.get("state") not in _ACTIVE_STATES:
+                    continue
+                recovered_at = utc_now_iso()
+                fact = None
+                broker_request_id = record.get("broker_request_id")
+                if record.get("engine") == "aibroker" and broker_request_id and self._ai_execution_port is not None:
+                    status_fn = getattr(self._ai_execution_port, "status", None)
+                    if callable(status_fn):
+                        try:
+                            fact = status_fn(str(broker_request_id))
+                        except Exception as exc:
+                            record["broker_recovery_error"] = str(exc)
+                if isinstance(fact, dict):
+                    record["dispatch_id"] = fact.get("dispatch_id") or record.get("dispatch_id")
+                    record["decision_id"] = fact.get("decision_id") or record.get("decision_id")
+                    record["execution_id"] = fact.get("execution_id") or record.get("execution_id")
+                    record["session_id"] = fact.get("execution_session_id") or record.get("session_id")
+                    if fact.get("resource_id"):
+                        record["resource_context"] = {
+                            "resource_id": fact.get("resource_id"), "provider": fact.get("provider"),
+                            "account": fact.get("account"), "model": fact.get("model"),
+                        }
+                    record["broker_status"] = fact.get("status")
+                    if fact.get("status") == "succeeded":
+                        record["state"] = "completed"
+                        record["completed_at"] = fact.get("finished_at") or recovered_at
+                        record["reason"] = None
+                    elif fact.get("status") == "failed" and fact.get("execution_error") != MANAGED_INTERRUPT_REASON:
+                        record["state"] = "failed"
+                        record["completed_at"] = fact.get("finished_at") or recovered_at
+                        record["reason"] = fact.get("execution_error") or "Broker execution failed before daemon recovery"
+                    else:
+                        truth = read_repository_truth(record.get("repo_path") or "")
+                        unchanged = bool(
+                            truth.valid and truth.branch == record.get("branch") and truth.head == record.get("head")
+                            and truth.status_hash == record.get("launch_status_hash")
+                        )
+                        managed_interrupt = fact.get("status") == "failed" and fact.get("execution_error") == MANAGED_INTERRUPT_REASON
+                        record["state"] = "recovery_required"
+                        record["recovery_safe_retry"] = bool(managed_interrupt and unchanged)
+                        record["reason"] = (
+                            "managed Broker interruption confirmed; repository unchanged; owner continue may retry"
+                            if record["recovery_safe_retry"] else
+                            "Broker recovery is unresolved or repository changed; automatic replay is forbidden"
+                        )
+                else:
                     record["state"] = "recovery_required"
-                    record["reason"] = (
-                        "daemon restarted while managed execution was active; "
-                        "automatic replay is forbidden"
-                    )
-                    record["recovered_at"] = utc_now_iso()
-                    changed = True
+                    record["recovery_safe_retry"] = False
+                    record["reason"] = "daemon restarted while managed execution was active; Broker state is unavailable; automatic replay is forbidden"
+                record["recovered_at"] = recovered_at
+                changed = True
             if changed:
                 self._save_ledger(ledger)
 
@@ -948,16 +991,21 @@ class TransitionExecutor:
             ledger = self._load_ledger()
             broker_rows = [
                 row for row in ledger["executions"].values()
-                if isinstance(row, dict)
-                and row.get("project_id") == project_id
-                and row.get("engine") == "aibroker"
-                and row.get("state") == "completed"
+                if isinstance(row, dict) and row.get("project_id") == project_id and row.get("engine") == "aibroker"
             ]
-            latest_broker = max(
-                broker_rows, key=lambda row: str(row.get("completed_at") or row.get("started_at") or ""),
+            latest_any_broker = max(
+                broker_rows, key=lambda row: str(row.get("completed_at") or row.get("recovered_at") or row.get("started_at") or ""),
                 default=None,
             )
-            if latest_broker is not None:
+            if latest_any_broker is not None and latest_any_broker.get("state") == "recovery_required" and not latest_any_broker.get("recovery_safe_retry"):
+                self._record_blocked(source_request_id, project_id, "latest AIBroker Worker recovery is not safe to retry", source_kind="control")
+                return None
+            completed_broker = [row for row in broker_rows if row.get("state") == "completed"]
+            latest_broker = max(
+                completed_broker, key=lambda row: str(row.get("completed_at") or row.get("started_at") or ""),
+                default=None,
+            )
+            if latest_broker is not None and latest_broker is latest_any_broker:
                 worker_request_id = str(latest_broker.get("source_request_id") or "")
                 review_id = "ai_review:" + worker_request_id
                 reviews_raw = read_json(self.runtime_root / "ai-reviewer.json", {})

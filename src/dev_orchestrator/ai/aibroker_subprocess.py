@@ -74,6 +74,44 @@ class AIBrokerExecutionPort:
             raise AIBrokerInvocationError("broker result must be a JSON object")
         return self._result_from_payload(request, payload)
 
+    def status(self, request_id: str) -> dict[str, Any] | None:
+        payload = self._reconcile_call(["dispatch-status", request_id])
+        return None if payload.get("status") == "not_found" else payload
+
+    def interrupt(self, request_id: str, reason: str) -> dict[str, Any] | None:
+        payload = self._reconcile_call(["interrupt-dispatch", request_id, "--reason", reason])
+        return None if payload.get("status") == "not_found" else payload
+
+    def _reconcile_call(self, args: list[str]) -> dict[str, Any]:
+        argv = [str(self.config.python_executable), "-m", "ai_resource_broker.cli",
+                "--config", str(self.config.config_path)]
+        if self.config.database_path is not None:
+            argv += ["--database", str(self.config.database_path)]
+        argv += args
+        env = dict(os.environ)
+        broker_src = str(self.config.broker_repo / "src")
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = broker_src + (os.pathsep + existing if existing else "")
+        try:
+            completed = subprocess.run(
+                argv, cwd=str(self.config.broker_repo), env=env, text=True,
+                encoding="utf-8", errors="replace", capture_output=True,
+                timeout=min(self.config.process_timeout_seconds, 60.0), check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AIBrokerInvocationError(f"broker reconciliation failed: {exc}") from exc
+        if completed.returncode not in (0, 1):
+            raise AIBrokerInvocationError(
+                f"broker reconciliation rejected request (exit {completed.returncode}): {(completed.stderr or completed.stdout).strip()}"
+            )
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise AIBrokerInvocationError("broker reconciliation returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise AIBrokerInvocationError("broker reconciliation result must be an object")
+        return payload
+
     def _build_argv(self, request: AIRoleRequest) -> list[str]:
         argv = [
             str(self.config.python_executable), "-m", "ai_resource_broker.cli",
