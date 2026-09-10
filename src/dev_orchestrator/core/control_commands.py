@@ -145,10 +145,25 @@ class ControlCommandCoordinator:
             if project_id is None or command_id is None or plan_id is None:
                 continue
             project = projects.get(project_id); snapshot = snapshots.get(project_id)
-            if project is None or snapshot is None or snapshot.get("state") != "READY_TO_RUN":
+            if project is None or snapshot is None:
                 continue
+            launch_snapshot = snapshot
+            if snapshot.get("state") != "READY_TO_RUN":
+                telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+                git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
+                approved_idle = (
+                    snapshot.get("state") == "IDLE"
+                    and "READY_TO_RUN" in str(snapshot.get("next_status") or "").upper()
+                    and _nonblank(telemetry.get("task_id")) == _nonblank(plan.get("task_id"))
+                    and _nonblank(git.get("head")) == _nonblank(plan.get("ready_head"))
+                    and _nonblank(plan.get("ready_head")) is not None
+                )
+                if not approved_idle:
+                    continue
+                launch_snapshot = dict(snapshot)
+                launch_snapshot["state"] = "READY_TO_RUN"
             source_id = command_id + ":execute"
-            launch = executor.start_control(project, snapshot, source_id)
+            launch = executor.start_control(project, launch_snapshot, source_id)
             if launch is None:
                 row = executor.state().get("executions", {}).get(source_id, {})
                 reason = str(row.get("reason") or "approved plan Worker launch failed") if isinstance(row, dict) else "approved plan Worker launch failed"

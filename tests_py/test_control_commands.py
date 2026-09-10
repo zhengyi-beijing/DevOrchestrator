@@ -49,7 +49,9 @@ class FakePlanner:
     def start(self, project, snapshot, command_id):
         self.calls.append((project["project_id"], command_id))
         plan_id = "ai_plan:" + command_id
-        self.ready.append({"plan_id":plan_id,"command_id":command_id,"project_id":project["project_id"],"state":"ready"})
+        telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+        self.ready.append({"plan_id":plan_id,"command_id":command_id,"project_id":project["project_id"],
+                           "task_id":telemetry.get("task_id"),"ready_head":"planned-head","state":"ready"})
         return plan_id, "planning started"
     def ready_records(self): return list(self.ready)
     def terminal_records(self): return []
@@ -109,13 +111,27 @@ class ControlCommandTests(unittest.TestCase):
             first=coordinator.advance(config,pending,executor)
             self.assertEqual(first[0]["lifecycle_action"],"plan")
             self.assertEqual(executor.calls,[])
-            ready={"projects":[{"project_id":"p1","state":"READY_TO_RUN","next_status":"**READY_TO_RUN**","telemetry":{"task_id":"P1"}}]}
+            ready={"projects":[{"project_id":"p1","state":"IDLE","next_status":"**READY_TO_RUN**",
+                                  "telemetry":{"task_id":"P1"},"git":{"head":"planned-head"}}]}
             second=coordinator.advance(config,ready,executor)
             self.assertEqual(second[0]["lifecycle_action"],"execute")
             self.assertEqual(len(executor.calls),1)
+            self.assertEqual(executor.calls[0][1],"READY_TO_RUN")
             self.assertEqual(planner.launched[0][0],"ai_plan:"+command["command_id"])
             latest=latest_control_result(runtime,"p1")
             self.assertEqual(latest["lifecycle_action"],"execute")
+
+    def test_ready_plan_idle_handoff_requires_exact_plan_head(self):
+        with tempfile.TemporaryDirectory() as td:
+            base=Path(td); repo=base/"repo"; repo.mkdir(); runtime=base/"runtime"
+            config=base/"projects.json"; write_config(config, repo)
+            planner=FakePlanner(); executor=FakeExecutor(launch=True); coordinator=ControlCommandCoordinator(runtime, planner)
+            planner.ready=[{"plan_id":"ai_plan:c1","command_id":"c1","project_id":"p1",
+                            "task_id":"P1","ready_head":"approved-head","state":"ready"}]
+            snapshot={"projects":[{"project_id":"p1","state":"IDLE","next_status":"**READY_TO_RUN**",
+                                  "telemetry":{"task_id":"P1"},"git":{"head":"different-head"}}]}
+            self.assertEqual(coordinator.advance(config,snapshot,executor),[])
+            self.assertEqual(executor.calls,[])
 
     def test_transition_control_requires_ready_to_run(self):
         with tempfile.TemporaryDirectory() as td:
