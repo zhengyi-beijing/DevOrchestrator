@@ -54,6 +54,33 @@ class CliLifecycleTests(unittest.TestCase):
             after = run_cli("status-web", *common)
             self.assertFalse(json.loads(after.stdout)["process_alive"])
 
+    def test_project_status_and_continue_are_project_id_scoped(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            (runtime / "projects").mkdir()
+            (runtime / "projects" / "p1.json").write_text(json.dumps({
+                "project_id": "p1", "state": "READY_TO_RUN", "conversation_binding": None,
+            }), encoding="utf-8")
+            (runtime / "daemon.pid").write_text(str(os.getpid()), encoding="utf-8")
+            status = run_cli("project-status", "p1", "--runtime-root", str(runtime))
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertEqual(json.loads(status.stdout)["project_id"], "p1")
+            queued = run_cli("project-continue", "p1", "--runtime-root", str(runtime))
+            self.assertEqual(queued.returncode, 0, queued.stderr)
+            payload = json.loads(queued.stdout)
+            self.assertEqual((payload["project_id"], payload["action"], payload["state"]), ("p1", "continue", "pending"))
+            inbox = list((runtime / "control" / "inbox").glob("*.json"))
+            self.assertEqual(len(inbox), 1)
+            self.assertNotIn("conversation", inbox[0].read_text(encoding="utf-8"))
+
+    def test_project_continue_fails_when_daemon_is_not_running(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td); (runtime / "projects").mkdir()
+            (runtime / "projects" / "p1.json").write_text(json.dumps({"project_id": "p1"}), encoding="utf-8")
+            result = run_cli("project-continue", "p1", "--runtime-root", str(runtime))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("daemon is not running", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

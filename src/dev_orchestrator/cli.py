@@ -33,6 +33,7 @@ from dev_orchestrator.config import (
     resolve_web_root,
 )
 from dev_orchestrator.daemon import run_daemon
+from dev_orchestrator.core.control_commands import latest_control_result, submit_control_command
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.platform.process import (
     executable_path,
@@ -224,6 +225,38 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
         "projects": projects,
     })
     return 0 if all_valid else 1
+
+
+def _validated_project_id(value: str) -> str:
+    text = str(value or "").strip()
+    if not text or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in text):
+        _fail("project_id must contain only letters, digits, underscore, or hyphen")
+    return text
+
+
+def cmd_project_status(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    project_id = _validated_project_id(args.project_id)
+    snapshot = read_json(runtime / "projects" / (project_id + ".json"), None)
+    if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
+        _print_json({"project_id": project_id, "state": "not_found"})
+        return 1
+    payload = dict(snapshot)
+    payload["latest_control"] = latest_control_result(runtime, project_id)
+    _print_json(payload)
+    return 0
+
+
+def cmd_project_continue(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    project_id = _validated_project_id(args.project_id)
+    if _recorded_pid(runtime, "daemon") is None:
+        _fail("DevOrchestrator daemon is not running")
+    snapshot = read_json(runtime / "projects" / (project_id + ".json"), None)
+    if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
+        _fail("project is not present in the current runtime")
+    _print_json(submit_control_command(runtime, project_id, "continue"))
+    return 0
 
 
 def cmd_web(args: argparse.Namespace) -> int:
@@ -639,6 +672,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_config.add_argument("--config", default=None, help="path to projects.json")
 
+    project_status = sub.add_parser("project-status", help="read one project status by project_id")
+    project_status.add_argument("project_id")
+    project_status.add_argument("--runtime-root", default=None)
+
+    project_continue = sub.add_parser("project-continue", help="queue a stateless continue command for one project")
+    project_continue.add_argument("project_id")
+    project_continue.add_argument("--runtime-root", default=None)
+
     monitor = sub.add_parser("monitor", help="run one tick (--once) or the heartbeat loop")
     monitor.add_argument("--once", action="store_true", help="run a single tick and print the summary")
     monitor.add_argument("--interval", type=int, default=60, help="loop interval in seconds (5..3600)")
@@ -708,6 +749,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 _COMMANDS = {
     "validate-config": cmd_validate_config,
+    "project-status": cmd_project_status,
+    "project-continue": cmd_project_continue,
     "monitor": cmd_monitor,
     "web": cmd_web,
     "daemon": cmd_daemon,

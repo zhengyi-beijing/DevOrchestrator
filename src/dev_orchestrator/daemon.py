@@ -27,6 +27,7 @@ from dev_orchestrator.bridge.server import make_bridge_server
 from dev_orchestrator.bridge.store import BrowserBridgeStore
 from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
 from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
+from dev_orchestrator.core.control_commands import ControlCommandCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.response_consumer import consume_websol_responses
 from dev_orchestrator.core.transition_executor import TransitionExecutor
@@ -71,11 +72,14 @@ def _bridge_heartbeat(
 
 def _run_orchestration_tick(
     config: Path | str, runtime: Path, bridge_store: BrowserBridgeStore,
-    executor: TransitionExecutor, reviewer: AIReviewerCoordinator | None = None, *, pid: int,
+    executor: TransitionExecutor, reviewer: AIReviewerCoordinator | None = None,
+    controls: ControlCommandCoordinator | None = None, *, pid: int,
 ) -> dict[str, Any]:
     """Run one ordered control-plane tick and return the projected summary."""
     raw_summary = run_monitor_once(config, runtime)
     write_project_statuses(raw_summary, runtime, phase="monitor", daemon_state="running", pid=pid)
+    if controls is not None:
+        controls.advance(config, raw_summary, executor)
     projected = executor.overlay_managed_runs(raw_summary)
     direct_review_projects = reviewer.enabled_project_ids(config) if reviewer is not None else frozenset()
     if reviewer is not None:
@@ -162,12 +166,14 @@ def run_daemon(
     ai_execution_port = load_aibroker_execution_port(runtime)
     transition_executor = TransitionExecutor(runtime, ai_execution_port=ai_execution_port)
     reviewer_coordinator = AIReviewerCoordinator(runtime, ai_execution_port)
+    control_coordinator = ControlCommandCoordinator(runtime)
     try:
         while True:
             last_error: Optional[str] = None
             try:
                 _run_orchestration_tick(
-                    config, runtime, bridge_store, transition_executor, reviewer_coordinator, pid=pid
+                    config, runtime, bridge_store, transition_executor, reviewer_coordinator,
+                    control_coordinator, pid=pid
                 )
             except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
                 last_error = str(exc)

@@ -931,6 +931,61 @@ class TransitionExecutor:
                 launches.append(launch)
         return launches
 
+    def start_control(
+        self, project: dict[str, Any], snapshot: dict[str, Any], source_request_id: str
+    ) -> Optional[ActuationLaunch]:
+        """Start the current executable task for one stateless owner continue command."""
+        project_id = str(project.get("project_id") or "")
+        policy, error = _execution_policy(project)
+        if policy is None:
+            self._record_blocked(source_request_id, project_id, error, source_kind="control")
+            return None
+        truth = read_repository_truth(project.get("repo_path") or "")
+        if not truth.valid:
+            self._record_blocked(source_request_id, project_id, "repository truth unavailable", source_kind="control")
+            return None
+        with self._lock:
+            ledger = self._load_ledger()
+            broker_rows = [
+                row for row in ledger["executions"].values()
+                if isinstance(row, dict)
+                and row.get("project_id") == project_id
+                and row.get("engine") == "aibroker"
+                and row.get("state") == "completed"
+            ]
+            latest_broker = max(
+                broker_rows, key=lambda row: str(row.get("completed_at") or row.get("started_at") or ""),
+                default=None,
+            )
+            if latest_broker is not None:
+                worker_request_id = str(latest_broker.get("source_request_id") or "")
+                review_id = "ai_review:" + worker_request_id
+                reviews_raw = read_json(self.runtime_root / "ai-reviewer.json", {})
+                reviews = reviews_raw.get("reviews") if isinstance(reviews_raw, dict) else None
+                review = reviews.get(review_id) if isinstance(reviews, dict) else None
+                if not isinstance(review, dict) or review.get("state") != "completed":
+                    self._record_blocked(source_request_id, project_id, "latest AIBroker Worker review is unresolved", source_kind="control")
+                    return None
+                if review_id not in ledger["executions"]:
+                    self._record_blocked(source_request_id, project_id, "latest AIBroker Worker review transition is not yet applied", source_kind="control")
+                    return None
+        task_id = _current_task_id(snapshot)
+        if task_id is None:
+            self._record_blocked(source_request_id, project_id, "current task id is unavailable", source_kind="control")
+            return None
+        launch_task, guard_error = self._fresh_guard(
+            project, snapshot, expected_branch=truth.branch, expected_head=truth.head,
+            expected_task_id=task_id,
+        )
+        if launch_task is None:
+            self._record_blocked(source_request_id, project_id, guard_error, task_id=task_id, source_kind="control")
+            return None
+        return self._launch(
+            project, source_request_id=source_request_id, source_kind="control",
+            task_id=launch_task, source_task_id=None, branch=truth.branch, head=truth.head,
+            worker_prompt=str(policy["worker_prompt"]), policy=policy,
+        )
+
     def _advance_owner_start(
         self, projects: dict[str, dict[str, Any]], snapshots: dict[str, dict[str, Any]],
     ) -> list[ActuationLaunch]:
