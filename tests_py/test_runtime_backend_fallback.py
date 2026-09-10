@@ -35,7 +35,7 @@ def write_config(path: Path, repo: Path) -> None:
         "owner_authorized": True,
         "allowed_next_actions": ["next_task"],
         "preferred_backends": ["agy", "dsh"],
-        "backends": {"agy": {}, "dsh": {}},
+        "backends": {"agy": {"project": "agy-p1"}, "dsh": {}},
         "bootstrap": {"request_id": "owner-p1", "task_id": "P1"},
     }
     path.write_text(

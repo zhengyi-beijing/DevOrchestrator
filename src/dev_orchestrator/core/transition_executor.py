@@ -167,6 +167,11 @@ def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]]
                 return None, "{0} executable must be a non-blank string".format(backend_id)
             normalized["executable"] = executable
         if backend_id == "agy":
+            if "project" in config:
+                provider_project = _non_blank_config(config.get("project"))
+                if provider_project is None:
+                    return None, "agy project must be a non-blank string"
+                normalized["project"] = provider_project
             for key in ("model", "effort", "mode"):
                 value = config.get(key)
                 if value is not None:
@@ -253,7 +258,7 @@ class TransitionExecutor:
             kwargs: dict[str, Any] = {"runtime_root": self.runtime_root}
             if command_prefix is not None:
                 kwargs["command_prefix"] = command_prefix
-            for key in ("model", "effort", "mode", "print_timeout"):
+            for key in ("project", "model", "effort", "mode", "print_timeout"):
                 if key in config:
                     kwargs[key] = config[key]
             return AgyBackend(**kwargs)

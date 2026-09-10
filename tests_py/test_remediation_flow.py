@@ -60,7 +60,7 @@ class RemediationActuationTests(unittest.TestCase):
         execution = {
             "enabled": True, "owner_authorized": True,
             "allowed_next_actions": ["continue_current_stage", "next_task"],
-            "preferred_backends": ["agy"], "backends": {"agy": {}},
+            "preferred_backends": ["agy"], "backends": {"agy": {"project": "agy-p1"}},
         }
         path.write_text(json.dumps({"projects": [{
             "project_id": "p1", "repo_path": str(repo), "execution": execution,

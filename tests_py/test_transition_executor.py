@@ -81,6 +81,7 @@ def valid_project() -> dict:
             "backends": {
                 "agy": {
                     "executable": r"C:\tools\agy.exe",
+                    "project": "agy-p1",
                     "model": "claude-sonnet-4-6",
                     "effort": "high",
                     "mode": "accept-edits",
@@ -98,10 +99,40 @@ class TransitionExecutorPolicyTests(unittest.TestCase):
         policy, error = _execution_policy(valid_project())
         self.assertEqual(error, "")
         self.assertEqual(policy["preferred_backends"], ("agy", "dsh"))
+        self.assertEqual(policy["backends"]["agy"]["project"], "agy-p1")
         self.assertEqual(policy["backends"]["agy"]["model"], "claude-sonnet-4-6")
         self.assertEqual(policy["backends"]["agy"]["print_timeout"], 600)
         self.assertEqual(policy["backends"]["dsh"]["executable"], r"C:\tools\dsh.cmd")
         self.assertEqual(policy["bootstrap"], {"request_id": "owner-p1", "task_id": "P1"})
+
+    def test_unprovisioned_agy_is_policy_valid_but_backend_unavailable(self):
+        project = valid_project()
+        del project["execution"]["backends"]["agy"]["project"]
+        policy, error = _execution_policy(project)
+        self.assertEqual(error, "")
+        self.assertNotIn("project", policy["backends"]["agy"])
+        with tempfile.TemporaryDirectory() as td:
+            backend = TransitionExecutor(Path(td))._backend_for_policy(
+                "agy", policy["backends"]["agy"]
+            )
+            status = backend.probe()
+            self.assertFalse(status.available)
+            self.assertIn("provider project not configured", status.reason)
+
+    def test_unprovisioned_agy_routes_to_other_available_backend(self):
+        project = valid_project()
+        del project["execution"]["backends"]["agy"]["project"]
+        policy, error = _execution_policy(project)
+        self.assertEqual(error, "")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            executor = TransitionExecutor(
+                root / "runtime",
+                backend_overrides={"dsh": FakeBackend("dsh", available=True)},
+            )
+            router, _ = executor._router_for_policy(policy)
+            route = router.route(self._request(root))
+            self.assertEqual(route.selected_backend_id, "dsh")
 
     def test_malformed_authority_or_backend_policy_fails_closed(self):
         cases = []
@@ -114,6 +145,8 @@ class TransitionExecutorPolicyTests(unittest.TestCase):
         p = valid_project(); p["execution"]["preferred_backends"] = ["unknown"]
         cases.append(p)
         p = valid_project(); p["execution"]["backends"]["agy"]["print_timeout"] = 0
+        cases.append(p)
+        p = valid_project(); p["execution"]["backends"]["agy"]["project"] = "   "
         cases.append(p)
         p = valid_project(); p["execution"]["owner_authorized"] = False
         cases.append(p)
@@ -174,6 +207,7 @@ class TransitionExecutorPolicyTests(unittest.TestCase):
                  patch("dev_orchestrator.core.transition_executor.DshBackend", side_effect=make_dsh):
                 executor._router_for_policy(policy)
         self.assertEqual(seen["agy"]["command_prefix"], (r"C:\tools\agy.exe",))
+        self.assertEqual(seen["agy"]["project"], "agy-p1")
         self.assertEqual(seen["agy"]["model"], "claude-sonnet-4-6")
         self.assertEqual(seen["agy"]["effort"], "high")
         self.assertEqual(seen["agy"]["mode"], "accept-edits")
@@ -212,7 +246,7 @@ def write_config(path: Path, repo: Path, *, bootstrap: bool) -> None:
         "owner_authorized": True,
         "allowed_next_actions": ["next_task"],
         "preferred_backends": ["agy"],
-        "backends": {"agy": {}},
+        "backends": {"agy": {"project": "agy-p1"}},
     }
     if bootstrap:
         execution["bootstrap"] = {"request_id": "owner-p1", "task_id": "P1"}

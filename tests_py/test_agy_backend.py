@@ -15,6 +15,7 @@ Covers:
 """
 
 import asyncio
+import json
 import sys
 import tempfile
 import threading
@@ -63,9 +64,9 @@ else:
 
 
 class AgyBackendTests(unittest.IsolatedAsyncioTestCase):
-    def make_request(self, cwd, prompt="HELLO"):
+    def make_request(self, cwd, prompt="HELLO", project_id="fixture"):
         return AgentRequest(
-            project_id="fixture",
+            project_id=project_id,
             role=AgentRole.WORKER,
             prompt=prompt,
             working_directory=cwd,
@@ -84,6 +85,7 @@ class AgyBackendTests(unittest.IsolatedAsyncioTestCase):
         self.backend = AgyBackend(
             runtime_root=self.runtime,
             command_prefix=(sys.executable, str(self.fake)),
+            project="agy-fixture",
         )
 
     async def asyncTearDown(self):
@@ -135,10 +137,31 @@ class AgyBackendTests(unittest.IsolatedAsyncioTestCase):
         idx = argv.index("--add-dir")
         self.assertEqual(Path(argv[idx + 1]), Path(self.work))
 
+    def test_argv_project_uses_provider_project_not_request_project_id(self):
+        request = self.make_request(self.work, "x", project_id="LabDemo")
+        argv = self.backend._build_argv(request)
+        idx = argv.index("--project")
+        self.assertEqual(argv[idx + 1], "agy-fixture")
+
+    async def test_missing_provider_project_is_unavailable_and_start_has_no_artifacts(self):
+        backend = AgyBackend(
+            runtime_root=self.runtime,
+            command_prefix=(sys.executable, str(self.fake)),
+            project="   ",
+        )
+        status = backend.probe()
+        self.assertFalse(status.available)
+        self.assertIn("provider project not configured", status.reason)
+        with self.assertRaisesRegex(ValueError, "non-empty provider project"):
+            await backend.start(self.make_request(self.work, "x"))
+        self.assertEqual(backend._runs, {})
+        self.assertFalse((self.runtime / "agent-runs").exists())
+
     def test_argv_print_timeout_is_configurable(self):
         backend = AgyBackend(
             runtime_root=self.runtime,
             command_prefix=(sys.executable, str(self.fake)),
+            project="agy-fixture",
             print_timeout=60,
         )
         request = self.make_request(self.work, "x")
@@ -156,6 +179,7 @@ class AgyBackendTests(unittest.IsolatedAsyncioTestCase):
         backend = AgyBackend(
             runtime_root=self.runtime,
             command_prefix=(sys.executable, str(self.fake)),
+            project="agy-fixture",
             model="gemini-2.5-pro",
             effort="high",
         )
@@ -211,6 +235,29 @@ class AgyBackendTests(unittest.IsolatedAsyncioTestCase):
             (self.runtime / "agent-runs" / run.run_id / "stderr.log").is_file()
         )
 
+    async def test_two_backends_pass_distinct_provider_projects(self):
+        first_backend = AgyBackend(
+            runtime_root=self.runtime / "a",
+            command_prefix=(sys.executable, str(self.fake)),
+            project="agy-labdemo",
+        )
+        second_backend = AgyBackend(
+            runtime_root=self.runtime / "b",
+            command_prefix=(sys.executable, str(self.fake)),
+            project="agy-xray",
+        )
+        first = await first_backend.start(
+            self.make_request(self.work, "FIRST", project_id="labdemo")
+        )
+        second = await second_backend.start(
+            self.make_request(self.work, "SECOND", project_id="xray-hw-platform")
+        )
+        first_result = await first_backend.collect(first.run_id)
+        second_result = await second_backend.collect(second.run_id)
+        first_argv = json.loads(first_result.stdout.splitlines()[0])["argv"]
+        second_argv = json.loads(second_result.stdout.splitlines()[0])["argv"]
+        self.assertEqual(first_argv[first_argv.index("--project") + 1], "agy-labdemo")
+        self.assertEqual(second_argv[second_argv.index("--project") + 1], "agy-xray")
     def test_collect_completes_from_background_thread_event_loop(self):
         """Managed AGY runs must settle from the executor's worker thread.
 

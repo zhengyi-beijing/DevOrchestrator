@@ -122,6 +122,7 @@ class AgyBackend(AgentBackend):
         self,
         runtime_root: Optional[Path | str] = None,
         command_prefix: Optional[Sequence[str]] = None,
+        project: Optional[str] = None,
         mode: str = _DEFAULT_MODE,
         output_format: str = _DEFAULT_OUTPUT_FORMAT,
         print_timeout: int = _DEFAULT_PRINT_TIMEOUT,
@@ -139,6 +140,10 @@ class AgyBackend(AgentBackend):
             Explicit executable/command prefix (e.g. ``["agy"]`` or a test
             shim).  When *None* ``agy`` is resolved from ``PATH``.  Providing
             an explicit prefix makes the ambient daemon PATH irrelevant.
+        project:
+            Existing Antigravity provider project ID or name. When omitted, the
+            backend reports unavailable; this is intentionally distinct from
+            DevOrchestrator ``project_id``.
         mode:
             Passed verbatim as ``--mode <mode>`` (default ``accept-edits``).
         output_format:
@@ -158,6 +163,8 @@ class AgyBackend(AgentBackend):
             Path(runtime_root) if runtime_root is not None else DEFAULT_RUNTIME_ROOT
         )
         self._command_prefix = _resolve_command_prefix(command_prefix)
+        provider_project = project.strip() if isinstance(project, str) else ""
+        self._project = provider_project or None
         self._mode = mode
         self._output_format = output_format
         self._print_timeout = print_timeout
@@ -193,12 +200,20 @@ class AgyBackend(AgentBackend):
     # -- probe (never sends a prompt) ---------------------------------------
 
     def probe(self) -> BackendStatus:
-        """Run ``<prefix> --version`` only; quota is always reported UNKNOWN.
+        """Report unavailable until an explicit provider project is configured.
+
+        Otherwise run ``<prefix> --version`` only; quota is UNKNOWN.
 
         A successful version probe reports the first output line as the
         version label; failures report an unavailable status with the
         diagnostic reason.
         """
+        if not self._project:
+            return BackendStatus(
+                self.backend_id, False,
+                "provider project not configured; refusing ambient/default AGY context",
+                QuotaState.UNKNOWN,
+            )
         argv = [*self._command_prefix, "--version"]
         try:
             proc = subprocess.run(
@@ -238,7 +253,12 @@ class AgyBackend(AgentBackend):
     # -- run lifecycle ------------------------------------------------------
 
     def _build_argv(self, request: AgentRequest) -> list[str]:
-        """Build the full argv for one non-interactive agy invocation."""
+        """Build one provider-project-isolated non-interactive agy invocation."""
+        if not self._project:
+            raise ValueError(
+                "AgyBackend requires a non-empty provider project; refusing "
+                "ambient/default AGY project context."
+            )
         working_directory = str(Path(request.working_directory))
         workspace_prefix = _WORKSPACE_INSTRUCTION_TEMPLATE.format(
             working_directory=working_directory
@@ -247,6 +267,7 @@ class AgyBackend(AgentBackend):
 
         argv: list[str] = [
             *self._command_prefix,
+            "--project", self._project,
             "--mode", self._mode,
             "--output-format", self._output_format,
             "--print-timeout", "{0}s".format(self._print_timeout),
@@ -266,6 +287,7 @@ class AgyBackend(AgentBackend):
             raise ValueError(
                 "AgyBackend working directory does not exist: {0}".format(cwd)
             )
+        argv = self._build_argv(request)
         run_id = uuid.uuid4().hex
         run_dir = self._runtime_root / _RUNS_DIRNAME / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -274,7 +296,6 @@ class AgyBackend(AgentBackend):
 
         stdout_path = run_dir / _STDOUT_LOG
         stderr_path = run_dir / _STDERR_LOG
-        argv = self._build_argv(request)
         out_handle = stdout_path.open("wb")
         err_handle = stderr_path.open("wb")
         record.stdout_handle = out_handle
