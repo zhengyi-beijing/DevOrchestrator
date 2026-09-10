@@ -125,6 +125,15 @@ def orchestration_payload(runtime_root: Path | str) -> dict[str, Any]:
     for project_id, record in events.items():
         if not isinstance(project_id, str) or not isinstance(record, dict):
             continue
+        snapshot = read_json(runtime / "projects" / (project_id + ".json"), None)
+        if (
+            isinstance(snapshot, dict)
+            and snapshot.get("conversation_binding") is None
+            and snapshot.get("orchestration_ready") is True
+        ):
+            # A current direct-AI project no longer depends on browser transport.
+            # Historical dispatcher records must not surface as stale UNBOUND gates.
+            continue
         occurrences = record.get("occurrences")
         if not isinstance(occurrences, dict):
             continue
