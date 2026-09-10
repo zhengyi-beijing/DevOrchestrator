@@ -29,6 +29,7 @@ from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
 from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
 from dev_orchestrator.core.control_commands import ControlCommandCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
+from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lifecycle
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.response_consumer import consume_websol_responses
 from dev_orchestrator.core.transition_executor import TransitionExecutor
@@ -85,6 +86,14 @@ def _run_orchestration_tick(
     direct_review_projects = reviewer.enabled_project_ids(config) if reviewer is not None else frozenset()
     if reviewer is not None:
         reviewer.advance(config)
+    planner_obj = getattr(controls, "planner", None) if controls is not None else None
+    planner_state_fn = getattr(planner_obj, "state", None)
+    reviewer_state_fn = getattr(reviewer, "state", None) if reviewer is not None else None
+    projected = overlay_orchestration_lifecycle(
+        projected,
+        planner_state=planner_state_fn() if callable(planner_state_fn) else None,
+        reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
+    )
     browser_summary = dict(projected) if isinstance(projected, dict) else projected
     if isinstance(browser_summary, dict) and isinstance(browser_summary.get("projects"), list):
         browser_summary = dict(browser_summary)
@@ -98,7 +107,13 @@ def _run_orchestration_tick(
     write_project_statuses(projected, runtime, phase="decision", daemon_state="running", pid=pid)
     executor.advance(raw_summary, config, decision_summary=projected)
     projected = executor.overlay_managed_runs(raw_summary)
+    projected = overlay_orchestration_lifecycle(
+        projected,
+        planner_state=planner_state_fn() if callable(planner_state_fn) else None,
+        reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
+    )
     write_project_statuses(projected, runtime, phase="actuation", daemon_state="running", pid=pid)
+    write_json(runtime / "summary.json", projected)
     return projected
 
 

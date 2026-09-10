@@ -72,15 +72,19 @@ function renderMonitor(monitor) {
   kv(box, 'Interval', seconds(monitor.interval_seconds));
   kv(box, 'Last error', monitor.last_error || 'none');
 }
+function projectState(project) {
+  return project.lifecycle_state || project.state;
+}
+
 function renderOverview(summary) {
   const box = $('overviewDetails');
   box.replaceChildren();
   const projects = Array.isArray(summary.projects) ? summary.projects : [];
   kv(box, 'Projects', summary.project_count ?? projects.length);
   kv(box, 'Observed', ago(summary.observed_at));
-  kv(box, 'Running', projects.filter(p => p.state === 'WORKER_RUNNING').length);
-  kv(box, 'Review / gate', projects.filter(p => String(p.state).includes('REVIEW') || String(p.state).includes('GATE')).length);
-  kv(box, 'Blocked / failed', projects.filter(p => /BLOCKED|FAILED|LOST|ERROR/.test(String(p.state))).length);
+  kv(box, 'Running', projects.filter(p => projectState(p) === 'EXECUTING' || projectState(p) === 'WORKER_RUNNING').length);
+  kv(box, 'Review / gate', projects.filter(p => String(projectState(p)).includes('REVIEW') || String(projectState(p)).includes('GATE')).length);
+  kv(box, 'Blocked / failed', projects.filter(p => /BLOCKED|FAILED|LOST|ERROR|RECOVERY/.test(String(projectState(p)))).length);
   kv(box, 'Healthy telemetry', projects.filter(p => p.telemetry && p.telemetry.health === 'OK').length);
 }
 
@@ -103,14 +107,14 @@ function renderProjects(summary, events) {
   }
   for (const project of projects) {
     const card = document.createElement('article');
-    card.className = `project-card ${stateTone(project.state, project.telemetry && project.telemetry.health)}`;
+    card.className = `project-card ${stateTone(projectState(project), project.telemetry && project.telemetry.health)}`;
     const head = document.createElement('div'); head.className = 'project-head';
     const nameBox = document.createElement('div');
     const name = document.createElement('div'); name.className = 'project-name'; name.textContent = text(project.name || project.id);
-    const state = document.createElement('div'); state.className = 'project-state'; state.textContent = text(project.state);
+    const state = document.createElement('div'); state.className = 'project-state'; state.textContent = text(projectState(project));
     nameBox.append(name, state);
     const health = document.createElement('div');
-    health.className = `badge ${stateTone(project.state, project.telemetry && project.telemetry.health)}`;
+    health.className = `badge ${stateTone(projectState(project), project.telemetry && project.telemetry.health)}`;
     health.textContent = text(project.telemetry && project.telemetry.health);
     head.append(nameBox, health); card.appendChild(head);
     const next = document.createElement('div'); next.className = 'project-next';

@@ -24,12 +24,20 @@ class FakeExecutor:
     def start_control(self, project, snapshot, command_id):
         self.calls.append((project["project_id"], snapshot["state"], command_id))
         if self.launch:
-            return SimpleNamespace(task_id="P1", backend_id="fake")
+            telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+            return SimpleNamespace(task_id=telemetry.get("task_id") or "P1", backend_id="fake")
         self.records[command_id] = {"state": "blocked", "reason": "not ready"}
         return None
 
     def state(self):
         return {"executions": self.records}
+
+    def mark_handoff_consumed(self, source_request_id, continuation_id, plan_id):
+        row = self.records[source_request_id]
+        row.update({"handoff_consumed": True, "continuation_id": continuation_id, "plan_id": plan_id})
+
+    def mark_handoff_blocked(self, source_request_id, reason):
+        self.records[source_request_id].update({"state": "blocked", "reason": reason})
 
 
 def write_config(path: Path, repo: Path) -> None:
@@ -120,6 +128,25 @@ class ControlCommandTests(unittest.TestCase):
             self.assertEqual(planner.launched[0][0],"ai_plan:"+command["command_id"])
             latest=latest_control_result(runtime,"p1")
             self.assertEqual(latest["lifecycle_action"],"execute")
+
+    def test_review_next_to_pending_design_auto_routes_back_to_planner(self):
+        with tempfile.TemporaryDirectory() as td:
+            base=Path(td); repo=base/"repo"; repo.mkdir(); runtime=base/"runtime"
+            config=base/"projects.json"; write_config(config, repo)
+            planner=FakePlanner(); executor=FakeExecutor(launch=True)
+            executor.records["review-r1"]={"project_id":"p1","state":"handoff","outcome":"planning_required","next_task_id":"P2"}
+            coordinator=ControlCommandCoordinator(runtime, planner)
+            pending={"projects":[{"project_id":"p1","state":"IDLE","next_status":"**PENDING DESIGN**","telemetry":{"task_id":"P2"}}]}
+            first=coordinator.advance(config,pending,executor)
+            self.assertEqual(len(first),1); self.assertEqual(first[0]["lifecycle_action"],"plan")
+            self.assertEqual(first[0]["source"],"automatic_review_handoff")
+            self.assertTrue(executor.records["review-r1"]["handoff_consumed"])
+            self.assertEqual(executor.calls,[])
+            ready={"projects":[{"project_id":"p1","state":"IDLE","next_status":"**READY_TO_RUN**","telemetry":{"task_id":"P2"},"git":{"head":"planned-head"}}]}
+            second=coordinator.advance(config,ready,executor)
+            self.assertEqual(second[0]["lifecycle_action"],"execute")
+            self.assertEqual(executor.calls[0][1],"READY_TO_RUN")
+            self.assertEqual(executor.calls[0][0],"p1")
 
     def test_ready_plan_idle_handoff_requires_exact_plan_head(self):
         with tempfile.TemporaryDirectory() as td:

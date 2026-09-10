@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +93,21 @@ def _current_task_id(snapshot: dict[str, Any]) -> Optional[str]:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return extract_task_id(snapshot.get("next_title"))
+
+
+def _advertised_task_id(snapshot: dict[str, Any]) -> Optional[str]:
+    advertised = extract_task_id(snapshot.get("next_title"))
+    return advertised or _current_task_id(snapshot)
+
+
+def _next_task_ready(snapshot: dict[str, Any]) -> bool:
+    status = str(snapshot.get("next_status") or "")
+    return re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE) is not None
+
+
+def _task_marked_complete(snapshot: dict[str, Any]) -> bool:
+    status = str(snapshot.get("next_status") or "")
+    return re.search(r"\bCOMPLETED?\b", status, re.IGNORECASE) is not None
 
 
 def _external_worker_active(snapshot: dict[str, Any]) -> bool:
@@ -379,9 +395,23 @@ class TransitionExecutor:
         if not isinstance(projected, dict) or not isinstance(projected.get("projects"), list):
             return projected
         latest: dict[str, dict[str, Any]] = {}
-        for record in self.state()["executions"].values():
+        ledger = self.state(); executions = ledger["executions"]
+        reviews_raw = read_json(self.runtime_root / "ai-reviewer.json", {})
+        reviews = reviews_raw.get("reviews") if isinstance(reviews_raw, dict) else None
+        reviews = reviews if isinstance(reviews, dict) else {}
+        for record in executions.values():
             if not isinstance(record, dict) or record.get("state") not in (_ACTIVE_STATES | _TERMINAL_STATES):
                 continue
+            if record.get("engine") == "aibroker" and record.get("state") == "completed":
+                source_id = _non_blank_config(record.get("source_request_id"))
+                review_id = "ai_review:" + source_id if source_id else None
+                review = reviews.get(review_id) if review_id else None
+                transition = executions.get(review_id) if review_id else None
+                if (
+                    isinstance(review, dict) and review.get("state") == "completed"
+                    and isinstance(transition, dict) and transition.get("state") in {"settled", "handoff"}
+                ):
+                    continue
             project_id = _non_blank_config(record.get("project_id"))
             if project_id is None:
                 continue
@@ -431,6 +461,64 @@ class TransitionExecutor:
                 "reason": reason,
                 "recorded_at": utc_now_iso(),
             }
+            self._save_ledger(ledger)
+
+    def _record_settled(
+        self, source_request_id: str, project_id: str, reason: str,
+        *, task_id: Optional[str] = None, outcome: str = "task_complete",
+    ) -> None:
+        with self._lock:
+            ledger = self._load_ledger()
+            if source_request_id in ledger["executions"]:
+                return
+            ledger["executions"][source_request_id] = {
+                "project_id": project_id, "source_request_id": source_request_id,
+                "source_kind": "decision", "task_id": task_id,
+                "state": "settled", "outcome": outcome, "reason": reason,
+                "recorded_at": utc_now_iso(),
+            }
+            self._save_ledger(ledger)
+
+    def _record_handoff(
+        self, source_request_id: str, project_id: str, reviewed_task_id: str,
+        next_task_id: str, reason: str,
+    ) -> None:
+        with self._lock:
+            ledger = self._load_ledger()
+            if source_request_id in ledger["executions"]:
+                return
+            ledger["executions"][source_request_id] = {
+                "project_id": project_id, "source_request_id": source_request_id,
+                "source_kind": "decision", "task_id": reviewed_task_id,
+                "next_task_id": next_task_id, "state": "handoff",
+                "outcome": "planning_required", "reason": reason,
+                "recorded_at": utc_now_iso(),
+            }
+            self._save_ledger(ledger)
+
+    def mark_handoff_consumed(
+        self, source_request_id: str, continuation_id: str, plan_id: str,
+    ) -> None:
+        with self._lock:
+            ledger = self._load_ledger()
+            record = ledger["executions"].get(source_request_id)
+            if not isinstance(record, dict) or record.get("state") != "handoff":
+                return
+            record["handoff_consumed"] = True
+            record["continuation_id"] = continuation_id
+            record["plan_id"] = plan_id
+            record["handoff_consumed_at"] = utc_now_iso()
+            self._save_ledger(ledger)
+
+    def mark_handoff_blocked(self, source_request_id: str, reason: str) -> None:
+        with self._lock:
+            ledger = self._load_ledger()
+            record = ledger["executions"].get(source_request_id)
+            if not isinstance(record, dict) or record.get("state") != "handoff":
+                return
+            record["state"] = "blocked"
+            record["reason"] = reason
+            record["handoff_blocked_at"] = utc_now_iso()
             self._save_ledger(ledger)
 
     def _fresh_guard(
@@ -946,8 +1034,56 @@ class TransitionExecutor:
                     + "requires correcting it."
                 ).format(task_id)
             else:
+                current_task = _advertised_task_id(snapshot)
+                if current_task == task_id and _task_marked_complete(snapshot):
+                    truth = read_repository_truth(project.get("repo_path") or "")
+                    reviewed_hash = _non_blank_config(record.get("review_status_hash"))
+                    if (
+                        not truth.valid or truth.branch != branch or truth.head != head
+                        or truth.dirty or (reviewed_hash is not None and truth.status_hash != reviewed_hash)
+                    ):
+                        self._record_blocked(
+                            request_id, project_id,
+                            "reviewed COMPLETE task repository truth changed before terminal settle",
+                            task_id=task_id, source_kind="decision",
+                        )
+                    else:
+                        self._record_settled(
+                            request_id, project_id,
+                            "reviewed task is COMPLETE and no next executable task is advertised",
+                            task_id=task_id, outcome="task_complete",
+                        )
+                    continue
+                if (
+                    current_task is not None and current_task != task_id
+                    and "PENDING DESIGN" in str(snapshot.get("next_status") or "").upper()
+                ):
+                    truth = read_repository_truth(project.get("repo_path") or "")
+                    reviewed_hash = _non_blank_config(record.get("review_status_hash"))
+                    if (
+                        not truth.valid or truth.branch != branch or truth.head != head
+                        or truth.dirty or (reviewed_hash is not None and truth.status_hash != reviewed_hash)
+                    ):
+                        self._record_blocked(
+                            request_id, project_id,
+                            "next PENDING DESIGN task repository truth changed before lifecycle handoff",
+                            task_id=task_id, source_kind="decision",
+                        )
+                    else:
+                        self._record_handoff(
+                            request_id, project_id, task_id, current_task,
+                            "reviewed task advanced to a PENDING DESIGN task; planner handoff required",
+                        )
+                    continue
+                next_snapshot = snapshot
+                if current_task is not None and current_task != task_id and _next_task_ready(snapshot):
+                    next_snapshot = copy.deepcopy(snapshot)
+                    next_snapshot["state"] = "READY_TO_RUN"
+                    telemetry = next_snapshot.get("telemetry") if isinstance(next_snapshot.get("telemetry"), dict) else {}
+                    telemetry = copy.deepcopy(telemetry); telemetry["task_id"] = current_task
+                    next_snapshot["telemetry"] = telemetry
                 launch_task, guard_error = self._fresh_guard(
-                    project, snapshot,
+                    project, next_snapshot,
                     expected_branch=branch, expected_head=head,
                     must_advance_from=task_id,
                 )

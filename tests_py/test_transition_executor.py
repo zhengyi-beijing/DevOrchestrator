@@ -339,6 +339,69 @@ class TransitionExecutorActuationTests(unittest.TestCase):
                 self.assertTrue(record["reason"])
                 self.assertEqual(len(backend.started), 0)
 
+    def test_projected_review_identity_still_launches_advertised_ready_next_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            head = make_repo(repo, "P2")
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            write_decision(runtime, head=head, task_id="P1")
+            summary = ready_summary(repo, "P2")
+            summary["projects"][0]["state"] = "WAITING_REVIEW"
+            summary["projects"][0]["telemetry"]["task_id"] = "P1"
+            summary["projects"][0]["next_title"] = "P2 bounded task"
+            summary["projects"][0]["next_status"] = "DESIGN READY / EXECUTABLE"
+            backend = FakeBackend("agy"); executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            launches = executor.advance(summary, config)
+            self.assertEqual(len(launches), 1)
+            record = wait_terminal(executor, "worker_done:p1:r1")
+            self.assertEqual(record["task_id"], "P2")
+            self.assertEqual(record["source_task_id"], "P1")
+            self.assertEqual(len(backend.started), 1)
+
+    def test_next_pending_design_task_emits_planner_handoff_instead_of_blocking(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P2")
+            (repo / "agent" / "next.md").write_text(
+                "# P2 bounded task\nStatus: **PENDING DESIGN**\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "agent/next.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "pending P2"], check=True, stdout=subprocess.DEVNULL)
+            head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            write_decision(runtime, head=head, task_id="P1")
+            summary = ready_summary(repo, "P2"); summary["projects"][0]["state"] = "WAITING_REVIEW"
+            summary["projects"][0]["telemetry"]["task_id"] = "P1"
+            summary["projects"][0]["next_title"] = "P2 bounded task"
+            summary["projects"][0]["next_status"] = "**PENDING DESIGN**"
+            backend = FakeBackend("agy"); executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            self.assertEqual(executor.advance(summary, config), [])
+            record = executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual((record["state"], record["outcome"], record["next_task_id"]), ("handoff", "planning_required", "P2"))
+            self.assertEqual(len(backend.started), 0)
+
+    def test_reviewed_complete_task_settles_without_starting_phantom_next_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P1")
+            (repo / "agent" / "next.md").write_text(
+                "# P1 bounded task\nStatus: **COMPLETE**\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "agent/next.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "complete P1"], check=True, stdout=subprocess.DEVNULL)
+            head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            write_decision(runtime, head=head, task_id="P1")
+            summary = ready_summary(repo, "P1"); summary["projects"][0]["state"] = "IDLE"
+            summary["projects"][0]["next_status"] = "**COMPLETE**"
+            backend = FakeBackend("agy"); executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            self.assertEqual(executor.advance(summary, config), [])
+            record = executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual(record["state"], "settled")
+            self.assertEqual(record["outcome"], "task_complete")
+            self.assertEqual(len(backend.started), 0)
+            self.assertEqual(executor.advance(summary, config), [])
+
     def test_owner_start_launches_current_task_once_after_prior_history(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"

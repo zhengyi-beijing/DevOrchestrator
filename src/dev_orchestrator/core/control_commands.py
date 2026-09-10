@@ -1,6 +1,7 @@
 """Stateless local control-command inbox for project-scoped actions."""
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -26,6 +27,11 @@ def _safe_command_id(value: Any) -> str | None:
     if text is None or len(text) > 128 or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in text):
         return None
     return text
+
+
+def _continuation_id(source_request_id: str) -> str:
+    digest = hashlib.sha256(source_request_id.encode("utf-8")).hexdigest()[:24]
+    return "auto-" + digest
 
 
 def _paths(runtime_root: Path | str) -> tuple[Path, Path]:
@@ -98,6 +104,7 @@ class ControlCommandCoordinator:
         outcomes: list[dict[str, Any]] = []
         outcomes.extend(self._sync_planner_terminals())
         outcomes.extend(self._resume_ready_plans(projects, snapshots, executor))
+        outcomes.extend(self._resume_decision_handoffs(projects, snapshots, executor))
         if not self.inbox.is_dir():
             return outcomes
         for path in sorted(self.inbox.glob("*.json"), key=lambda item: item.name):
@@ -113,6 +120,45 @@ class ControlCommandCoordinator:
             path.unlink(missing_ok=True)
             outcomes.append(outcome)
         return outcomes
+    def _resume_decision_handoffs(
+        self, projects: dict[str, dict[str, Any]], snapshots: dict[str, dict[str, Any]], executor: Any,
+    ) -> list[dict[str, Any]]:
+        if self.planner is None:
+            return []
+        raw = executor.state(); executions = raw.get("executions") if isinstance(raw, dict) else None
+        if not isinstance(executions, dict):
+            return []
+        outcomes: list[dict[str, Any]] = []
+        for source_id, row in sorted(executions.items()):
+            if not isinstance(row, dict) or row.get("state") != "handoff" or row.get("outcome") != "planning_required" or row.get("handoff_consumed") is True:
+                continue
+            project_id = _nonblank(row.get("project_id")); next_task_id = _nonblank(row.get("next_task_id"))
+            project = projects.get(project_id or ""); snapshot = snapshots.get(project_id or "")
+            if project is None or snapshot is None or next_task_id is None:
+                continue
+            telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+            if _nonblank(telemetry.get("task_id")) != next_task_id or "PENDING DESIGN" not in str(snapshot.get("next_status") or "").upper():
+                continue
+            continuation_id = _continuation_id(source_id)
+            history_path = self.history / (continuation_id + ".json")
+            existing = read_json(history_path, None)
+            if isinstance(existing, dict) and _nonblank(existing.get("plan_id")):
+                executor.mark_handoff_consumed(source_id, continuation_id, str(existing["plan_id"]))
+                outcomes.append(existing); continue
+            plan_id, reason = self.planner.start(project, snapshot, continuation_id)
+            now = utc_now_iso()
+            if plan_id is None:
+                executor.mark_handoff_blocked(source_id, "automatic planner handoff failed: " + reason)
+                outcome = {"version":CONTROL_VERSION,"command_id":continuation_id,"project_id":project_id,"action":"continue","state":"blocked","source":"automatic_review_handoff","parent_request_id":source_id,"reason":reason,"processed_at":now}
+            else:
+                outcome = {"version":CONTROL_VERSION,"command_id":continuation_id,"project_id":project_id,"action":"continue","state":"accepted","source":"automatic_review_handoff","parent_request_id":source_id,"lifecycle_action":"plan","plan_id":plan_id,"reason":reason,"processed_at":now}
+                write_json(history_path, outcome, indent=2)
+                executor.mark_handoff_consumed(source_id, continuation_id, plan_id)
+            if plan_id is None:
+                write_json(history_path, outcome, indent=2)
+            outcomes.append(outcome)
+        return outcomes
+
     def _sync_planner_terminals(self) -> list[dict[str, Any]]:
         if self.planner is None:
             return []
