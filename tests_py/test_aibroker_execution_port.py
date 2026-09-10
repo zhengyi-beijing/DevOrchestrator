@@ -69,6 +69,14 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         self.assertNotIn("--provider", argv)
 
     @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
+    def test_transport_timeout_covers_long_task_timeout(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(self.payload()), stderr=""
+        )
+        self.port.execute(self.request(timeout_seconds=14400))
+        self.assertEqual(run.call_args.kwargs["timeout"], 14460.0)
+
+    @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
     def test_no_candidate_is_terminal_result_not_transport_retry(self, run):
         payload = self.payload(
             status="no_candidate", resource_id=None, execution_id=None,

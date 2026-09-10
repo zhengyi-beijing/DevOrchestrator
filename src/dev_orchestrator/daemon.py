@@ -25,7 +25,9 @@ from typing import Any, Optional
 
 from dev_orchestrator.bridge.server import make_bridge_server
 from dev_orchestrator.bridge.store import BrowserBridgeStore
+from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
 from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
+from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.response_consumer import consume_websol_responses
 from dev_orchestrator.core.transition_executor import TransitionExecutor
 from dev_orchestrator.core.project_status import write_project_statuses
@@ -69,15 +71,25 @@ def _bridge_heartbeat(
 
 def _run_orchestration_tick(
     config: Path | str, runtime: Path, bridge_store: BrowserBridgeStore,
-    executor: TransitionExecutor, *, pid: int,
+    executor: TransitionExecutor, reviewer: AIReviewerCoordinator | None = None, *, pid: int,
 ) -> dict[str, Any]:
     """Run one ordered control-plane tick and return the projected summary."""
     raw_summary = run_monitor_once(config, runtime)
     write_project_statuses(raw_summary, runtime, phase="monitor", daemon_state="running", pid=pid)
     projected = executor.overlay_managed_runs(raw_summary)
-    dispatch_worker_done_events(projected, bridge_store, runtime)
+    direct_review_projects = reviewer.enabled_project_ids(config) if reviewer is not None else frozenset()
+    if reviewer is not None:
+        reviewer.advance(config)
+    browser_summary = dict(projected) if isinstance(projected, dict) else projected
+    if isinstance(browser_summary, dict) and isinstance(browser_summary.get("projects"), list):
+        browser_summary = dict(browser_summary)
+        browser_summary["projects"] = [
+            item for item in browser_summary["projects"]
+            if not isinstance(item, dict) or str(item.get("project_id") or "") not in direct_review_projects
+        ]
+    dispatch_worker_done_events(browser_summary, bridge_store, runtime)
     write_project_statuses(projected, runtime, phase="dispatch", daemon_state="running", pid=pid)
-    consume_websol_responses(projected, bridge_store, runtime)
+    consume_websol_responses(browser_summary, bridge_store, runtime)
     write_project_statuses(projected, runtime, phase="decision", daemon_state="running", pid=pid)
     executor.advance(raw_summary, config, decision_summary=projected)
     projected = executor.overlay_managed_runs(raw_summary)
@@ -147,13 +159,15 @@ def run_daemon(
     web_thread.start()
     bridge_thread.start()
     bridge_bound_port = int(bridge_server.server_address[1])
-    transition_executor = TransitionExecutor(runtime)
+    ai_execution_port = load_aibroker_execution_port(runtime)
+    transition_executor = TransitionExecutor(runtime, ai_execution_port=ai_execution_port)
+    reviewer_coordinator = AIReviewerCoordinator(runtime, ai_execution_port)
     try:
         while True:
             last_error: Optional[str] = None
             try:
                 _run_orchestration_tick(
-                    config, runtime, bridge_store, transition_executor, pid=pid
+                    config, runtime, bridge_store, transition_executor, reviewer_coordinator, pid=pid
                 )
             except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
                 last_error = str(exc)

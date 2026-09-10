@@ -24,9 +24,9 @@ Rules enforced here:
   conversation bindings must be unique; a duplicate is a configuration error
   because it could cross-route two project workflows into one conversation.
 - ``adapter`` defaults to ``agent_files`` when omitted.
-- A structurally valid ``conversation_binding`` exposes ``orchestration_ready``;
-  a missing or malformed binding stays monitorable but is NOT
-  orchestration-ready (Core fails closed for orchestration).
+- ``orchestration_ready`` is true when either a structurally valid browser
+  ``conversation_binding`` exists or a direct ``ai_roles.reviewer`` is explicitly enabled.
+  Projects with neither route remain monitorable but not orchestration-ready.
 """
 
 from __future__ import annotations
@@ -55,6 +55,17 @@ def resolve_runtime_root(value: Optional[str]) -> Path:
 
 def resolve_web_root(value: Optional[str]) -> Path:
     return Path(value).expanduser() if value else DEFAULT_WEB_ROOT
+
+
+def _direct_reviewer_ready(project: dict[str, Any]) -> bool:
+    execution = project.get("execution")
+    if not isinstance(execution, dict) or execution.get("engine") != "aibroker":
+        return False
+    roles = project.get("ai_roles")
+    if not isinstance(roles, dict):
+        return False
+    reviewer = roles.get("reviewer")
+    return isinstance(reviewer, dict) and reviewer.get("enabled") is True
 
 
 def _binding_ready(binding: Any) -> bool:
@@ -114,7 +125,10 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
     normalized["adapter"] = (
         str(adapter).strip() if isinstance(adapter, str) and adapter.strip() else DEFAULT_ADAPTER_ID
     )
-    normalized["orchestration_ready"] = _binding_ready(normalized.get("conversation_binding"))
+    normalized["orchestration_ready"] = (
+        _binding_ready(normalized.get("conversation_binding"))
+        or _direct_reviewer_ready(normalized)
+    )
     return normalized
 
 

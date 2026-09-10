@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from dev_orchestrator.ai.contracts import AIRoleRequest
+from dev_orchestrator.ai.execution_port import AIExecutionPort
 from dev_orchestrator.agents.base import AgentBackend
 from dev_orchestrator.agents.backends.agy import AgyBackend
 from dev_orchestrator.agents.backends.dsh import DshBackend
@@ -100,6 +102,7 @@ def _external_worker_active(snapshot: dict[str, Any]) -> bool:
 
 
 _SUPPORTED_BACKENDS = frozenset({"agy", "dsh"})
+_SUPPORTED_EXECUTION_ENGINES = frozenset({"legacy", "aibroker"})
 
 _RETRYABLE_PROVIDER_FAILURE_MARKERS = (
     "individual quota reached",
@@ -139,52 +142,63 @@ def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]]
     if len(set(allowed)) != len(allowed):
         return None, "allowed_next_actions must not contain duplicates"
 
-    preferred = raw.get("preferred_backends")
-    if not isinstance(preferred, list) or not preferred:
-        return None, "preferred_backends must be a non-empty list"
-    if any(not isinstance(value, str) or not value.strip() for value in preferred):
-        return None, "preferred_backends entries must be non-blank strings"
-    preferred_ids = [value.strip() for value in preferred]
-    if len(set(preferred_ids)) != len(preferred_ids):
-        return None, "preferred_backends must not contain duplicates"
-    unknown = [value for value in preferred_ids if value not in _SUPPORTED_BACKENDS]
-    if unknown:
-        return None, "unsupported execution backend: {0}".format(unknown[0])
+    engine = raw.get("engine", "legacy")
+    if not isinstance(engine, str) or engine not in _SUPPORTED_EXECUTION_ENGINES:
+        return None, "execution.engine must be legacy or aibroker"
+    worker_quality = raw.get("worker_quality", "balanced")
+    if worker_quality not in ("economy", "balanced", "high"):
+        return None, "execution.worker_quality must be economy, balanced, or high"
+    worker_timeout = raw.get("worker_timeout_seconds", 14400)
+    if isinstance(worker_timeout, bool) or not isinstance(worker_timeout, (int, float)) or worker_timeout <= 0:
+        return None, "execution.worker_timeout_seconds must be positive"
 
-    raw_backends = raw.get("backends", {})
-    if not isinstance(raw_backends, dict):
-        return None, "execution.backends must be an object"
+    preferred_ids: list[str] = []
     backend_configs: dict[str, dict[str, Any]] = {}
-    for backend_id in preferred_ids:
-        config = raw_backends.get(backend_id, {})
-        if not isinstance(config, dict):
-            return None, "execution.backends.{0} must be an object".format(backend_id)
-        normalized: dict[str, Any] = {}
-        executable = config.get("executable")
-        if executable is not None:
-            executable = _non_blank_config(executable)
-            if executable is None:
-                return None, "{0} executable must be a non-blank string".format(backend_id)
-            normalized["executable"] = executable
-        if backend_id == "agy":
-            if "project" in config:
-                provider_project = _non_blank_config(config.get("project"))
-                if provider_project is None:
-                    return None, "agy project must be a non-blank string"
-                normalized["project"] = provider_project
-            for key in ("model", "effort", "mode"):
-                value = config.get(key)
-                if value is not None:
-                    text = _non_blank_config(value)
-                    if text is None:
-                        return None, "agy {0} must be a non-blank string".format(key)
-                    normalized[key] = text
-            timeout = config.get("print_timeout")
-            if timeout is not None:
-                if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
-                    return None, "agy print_timeout must be a positive integer"
-                normalized["print_timeout"] = timeout
-        backend_configs[backend_id] = normalized
+    if engine == "legacy":
+        preferred = raw.get("preferred_backends")
+        if not isinstance(preferred, list) or not preferred:
+            return None, "preferred_backends must be a non-empty list"
+        if any(not isinstance(value, str) or not value.strip() for value in preferred):
+            return None, "preferred_backends entries must be non-blank strings"
+        preferred_ids = [value.strip() for value in preferred]
+        if len(set(preferred_ids)) != len(preferred_ids):
+            return None, "preferred_backends must not contain duplicates"
+        unknown = [value for value in preferred_ids if value not in _SUPPORTED_BACKENDS]
+        if unknown:
+            return None, "unsupported execution backend: {0}".format(unknown[0])
+        raw_backends = raw.get("backends", {})
+        if not isinstance(raw_backends, dict):
+            return None, "execution.backends must be an object"
+        for backend_id in preferred_ids:
+            config = raw_backends.get(backend_id, {})
+            if not isinstance(config, dict):
+                return None, "execution.backends.{0} must be an object".format(backend_id)
+            normalized: dict[str, Any] = {}
+            executable = config.get("executable")
+            if executable is not None:
+                executable = _non_blank_config(executable)
+                if executable is None:
+                    return None, "{0} executable must be a non-blank string".format(backend_id)
+                normalized["executable"] = executable
+            if backend_id == "agy":
+                if "project" in config:
+                    provider_project = _non_blank_config(config.get("project"))
+                    if provider_project is None:
+                        return None, "agy project must be a non-blank string"
+                    normalized["project"] = provider_project
+                for key in ("model", "effort", "mode"):
+                    value = config.get(key)
+                    if value is not None:
+                        text = _non_blank_config(value)
+                        if text is None:
+                            return None, "agy {0} must be a non-blank string".format(key)
+                        normalized[key] = text
+                timeout = config.get("print_timeout")
+                if timeout is not None:
+                    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+                        return None, "agy print_timeout must be a positive integer"
+                    normalized["print_timeout"] = timeout
+            backend_configs[backend_id] = normalized
 
     prompt = raw.get("worker_prompt")
     if not isinstance(prompt, str) or not prompt.strip():
@@ -211,6 +225,9 @@ def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]]
         normalized_owner_start = {"request_id": request_id, "task_id": task_id}
 
     return {
+        "engine": engine,
+        "worker_quality": worker_quality,
+        "worker_timeout_seconds": float(worker_timeout),
         "preferred_backends": tuple(preferred_ids),
         "backends": backend_configs,
         "allowed_next_actions": frozenset(allowed),
@@ -229,12 +246,14 @@ class TransitionExecutor:
         runtime_root: Path | str,
         *,
         backend_overrides: Optional[dict[str, AgentBackend]] = None,
+        ai_execution_port: Optional[AIExecutionPort] = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.ledger_path = self.runtime_root / ACTUATION_FILE
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}
+        self._ai_execution_port = ai_execution_port
         self._backend_overrides: dict[str, AgentBackend] = {}
         for backend_id, backend in (backend_overrides or {}).items():
             if backend_id not in _SUPPORTED_BACKENDS:
@@ -423,6 +442,12 @@ class TransitionExecutor:
         worker_prompt: str,
         policy: dict[str, Any],
     ) -> Optional[ActuationLaunch]:
+        if policy.get("engine") == "aibroker":
+            return self._launch_aibroker(
+                project, source_request_id=source_request_id, source_kind=source_kind,
+                task_id=task_id, source_task_id=source_task_id, branch=branch, head=head,
+                worker_prompt=worker_prompt, policy=policy,
+            )
         request = AgentRequest(
             project_id=str(project["project_id"]),
             role=AgentRole.WORKER,
@@ -520,6 +545,135 @@ class TransitionExecutor:
             task_id=task_id,
             backend_id=route.selected_backend_id,
             state="launching",
+        )
+
+
+    def _launch_aibroker(
+        self,
+        project: dict[str, Any],
+        *,
+        source_request_id: str,
+        source_kind: str,
+        task_id: str,
+        source_task_id: Optional[str],
+        branch: str,
+        head: str,
+        worker_prompt: str,
+        policy: dict[str, Any],
+    ) -> Optional[ActuationLaunch]:
+        project_id = str(project["project_id"])
+        if self._ai_execution_port is None:
+            self._record_blocked(
+                source_request_id, project_id, "AIBroker execution port is not configured",
+                task_id=task_id, source_kind=source_kind,
+            )
+            return None
+        launch_truth = read_repository_truth(project.get("repo_path") or "")
+        if not launch_truth.valid or launch_truth.branch != branch or launch_truth.head != head:
+            self._record_blocked(
+                source_request_id, project_id, "repository changed before Worker launch",
+                task_id=task_id, source_kind=source_kind,
+            )
+            return None
+        role_run_id = "worker-" + source_request_id.replace(":", "-")
+        broker_request_id = "ai-worker:" + source_request_id
+        request = AIRoleRequest(
+            project_id=project_id,
+            task_run_id=task_id,
+            stage_run_id=source_kind,
+            role_run_id=role_run_id,
+            request_id=broker_request_id,
+            role="worker",
+            quality=str(policy.get("worker_quality") or "balanced"),
+            prompt=worker_prompt,
+            working_directory=Path(str(project["repo_path"])),
+            timeout_seconds=float(policy.get("worker_timeout_seconds") or 14400),
+            metadata={"source_request_id": source_request_id, "source_kind": source_kind},
+        )
+        with self._lock:
+            ledger = self._load_ledger()
+            if source_request_id in ledger["executions"]:
+                return None
+            if self._active_project(ledger, project_id):
+                ledger["executions"][source_request_id] = {
+                    "project_id": project_id, "source_request_id": source_request_id,
+                    "source_kind": source_kind, "task_id": task_id, "state": "blocked",
+                    "reason": "another managed Worker is already active", "recorded_at": utc_now_iso(),
+                }
+                self._save_ledger(ledger)
+                return None
+            ledger["executions"][source_request_id] = {
+                "project_id": project_id,
+                "source_request_id": source_request_id,
+                "source_kind": source_kind,
+                "source_task_id": source_task_id,
+                "task_id": task_id,
+                "branch": branch,
+                "head": head,
+                "repo_path": str(project["repo_path"]),
+                "engine": "aibroker",
+                "backend_id": "aibroker",
+                "broker_request_id": broker_request_id,
+                "role_run_id": role_run_id,
+                "state": "launching",
+                "started_at": utc_now_iso(),
+                "review_state": "pending",
+                "launch_status_hash": launch_truth.status_hash,
+            }
+            self._save_ledger(ledger)
+            status_record = copy.deepcopy(ledger["executions"][source_request_id])
+        write_execution_status(status_record, self.runtime_root)
+        thread = threading.Thread(
+            target=self._run_broker_worker_thread,
+            args=(source_request_id, request),
+            name="devorch-broker-worker-" + project_id,
+            daemon=True,
+        )
+        with self._lock:
+            self._threads[source_request_id] = thread
+        thread.start()
+        return ActuationLaunch(project_id, source_request_id, task_id, "aibroker", "launching")
+
+    def _run_broker_worker_thread(self, source_request_id: str, request: AIRoleRequest) -> None:
+        try:
+            result = self._ai_execution_port.execute(request) if self._ai_execution_port else None
+            if result is None:
+                raise RuntimeError("AIBroker execution port became unavailable")
+        except Exception as exc:
+            self._update_record(
+                source_request_id, state="failed",
+                reason="AIBroker worker lifecycle error: {0}".format(exc),
+                completed_at=utc_now_iso(),
+            )
+            return
+        resource = result.resource_context
+        resource_payload = None
+        if resource is not None:
+            resource_payload = {
+                "resource_id": resource.resource_id,
+                "provider": resource.provider,
+                "account": resource.account,
+                "model": resource.model,
+            }
+        if result.status == "succeeded":
+            state = "completed"
+        elif result.status == "cancelled":
+            state = "cancelled"
+        else:
+            state = "failed"
+        self._update_record(
+            source_request_id,
+            state=state,
+            completed_at=utc_now_iso(),
+            broker_status=result.status,
+            dispatch_id=result.dispatch_id,
+            decision_id=result.decision_id,
+            execution_id=result.execution_id,
+            session_id=result.session_id,
+            backend_run_id=result.execution_id or result.dispatch_id,
+            resource_context=resource_payload,
+            usage_source=result.usage_source,
+            reason=result.error,
         )
 
     def _update_record(self, source_request_id: str, **changes: Any) -> None:
@@ -639,14 +793,18 @@ class TransitionExecutor:
         )
 
     def _load_decisions(self) -> dict[str, dict[str, Any]]:
-        data = read_json(self.runtime_root / "websol-decisions.json", None)
-        if not isinstance(data, dict) or not isinstance(data.get("decisions"), dict):
-            return {}
-        return {
-            request_id: record
-            for request_id, record in data["decisions"].items()
-            if isinstance(request_id, str) and isinstance(record, dict)
-        }
+        merged: dict[str, dict[str, Any]] = {}
+        for filename in ("websol-decisions.json", "review-decisions.json"):
+            data = read_json(self.runtime_root / filename, None)
+            if not isinstance(data, dict) or not isinstance(data.get("decisions"), dict):
+                continue
+            for request_id, record in data["decisions"].items():
+                if not isinstance(request_id, str) or not isinstance(record, dict):
+                    continue
+                if request_id in merged and merged[request_id] != record:
+                    raise RuntimeError("conflicting decision identity across decision ledgers")
+                merged[request_id] = record
+        return merged
 
     @staticmethod
     def _project_has_execution_history(ledger: dict[str, Any], project_id: str) -> bool:

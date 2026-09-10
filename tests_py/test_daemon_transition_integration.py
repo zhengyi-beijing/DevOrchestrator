@@ -54,5 +54,30 @@ class DaemonTransitionIntegrationTests(unittest.TestCase):
         ])
 
 
+    def test_direct_reviewer_project_is_excluded_from_browser_dispatch_and_consume(self):
+        raw = {"projects": [
+            {"project_id": "direct", "repo_path": "repo1", "view": "raw"},
+            {"project_id": "legacy", "repo_path": "repo2", "view": "raw"},
+        ]}
+        executor = FakeExecutor()
+        executor.overlay_managed_runs = lambda summary: {"projects": [
+            {**item, "view": "overlay"} for item in summary["projects"]
+        ]}
+        class Reviewer:
+            def enabled_project_ids(self, _config): return frozenset({"direct"})
+            def advance(self, _config): return []
+        dispatched = []
+        consumed = []
+        with tempfile.TemporaryDirectory() as td, \
+             patch("dev_orchestrator.daemon.run_monitor_once", return_value=raw), \
+             patch("dev_orchestrator.daemon.write_project_statuses", return_value=[]), \
+             patch("dev_orchestrator.daemon.dispatch_worker_done_events", side_effect=lambda s, *_: dispatched.append(s)), \
+             patch("dev_orchestrator.daemon.consume_websol_responses", side_effect=lambda s, *_: consumed.append(s)):
+            _run_orchestration_tick("config.json", Path(td), object(), executor, Reviewer(), pid=123)
+        self.assertEqual([p["project_id"] for p in dispatched[0]["projects"]], ["legacy"])
+        self.assertEqual([p["project_id"] for p in consumed[0]["projects"]], ["legacy"])
+
+
+
 if __name__ == "__main__":
     unittest.main()

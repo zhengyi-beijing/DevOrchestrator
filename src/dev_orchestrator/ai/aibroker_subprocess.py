@@ -43,6 +43,9 @@ class AIBrokerExecutionPort:
         broker_src = str(self.config.broker_repo / "src")
         existing = env.get("PYTHONPATH")
         env["PYTHONPATH"] = broker_src + (os.pathsep + existing if existing else "")
+        transport_timeout = self.config.process_timeout_seconds
+        if request.timeout_seconds is not None:
+            transport_timeout = max(transport_timeout, float(request.timeout_seconds) + 60.0)
         try:
             completed = subprocess.run(
                 argv,
@@ -52,7 +55,7 @@ class AIBrokerExecutionPort:
                 encoding="utf-8",
                 errors="replace",
                 capture_output=True,
-                timeout=self.config.process_timeout_seconds,
+                timeout=transport_timeout,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
