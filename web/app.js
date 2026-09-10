@@ -185,16 +185,40 @@ function renderOrchestration(orchestration) {
   }
 }
 
+function renderBrokerResources(payload) {
+  const host = $('brokerResources'); host.replaceChildren();
+  if (!payload.available) { const e=document.createElement('div'); e.className='empty'; e.textContent=`AIBroker unavailable: ${text(payload.error)}`; host.appendChild(e); return; }
+  for (const r of (payload.resources || [])) {
+    const card=document.createElement('article'); card.className=`project-card ${r.enabled && r.state && r.state.available ? 'ok' : 'warn'}`;
+    const h=document.createElement('div'); h.className='project-name'; h.textContent=r.resource_id; card.appendChild(h);
+    const g=document.createElement('div'); g.className='kv-grid'; kv(g,'Provider',r.provider); kv(g,'Account',r.account); kv(g,'Model',r.model); kv(g,'Enabled',r.enabled); kv(g,'Available',r.state && r.state.available); kv(g,'Health',r.state && r.state.health); card.appendChild(g); host.appendChild(card);
+  }
+}
+function renderBrokerExecutions(payload) {
+  const items=payload.available ? (payload.executions || []) : [];
+  renderTimeline('brokerExecutions', items, e => `${text(e.role)} · ${text(e.resource_id)} · ${text(e.status)} · ${seconds(e.duration_seconds)}`);
+}
+function renderBrokerUsage(payload) {
+  const host=$('brokerUsage'); host.replaceChildren();
+  if (!payload.available) { const e=document.createElement('div'); e.className='empty'; e.textContent=`AIBroker unavailable: ${text(payload.error)}`; host.appendChild(e); return; }
+  for (const u of (payload.usage || [])) { const row=document.createElement('div'); row.className='timeline-item'; row.textContent=`${text(u.resource_id)} · executions ${text(u.executions)} · tokens ${u.token_source === 'reported' ? text(u.total_tokens) : 'unknown'}`; host.appendChild(row); }
+  if (!(payload.usage || []).length) { const e=document.createElement('div'); e.className='empty'; e.textContent='No usage records yet.'; host.appendChild(e); }
+}
+
 async function refresh() {
   try {
-    const [monitor, summary, eventsPayload, runsPayload, orchestration] = await Promise.all([
-      getJson('/api/monitor'), getJson('/api/summary'), getJson('/api/events?limit=30'), getJson('/api/runs?limit=20'), getJson('/api/orchestration')
+    const [monitor, summary, eventsPayload, runsPayload, orchestration, brokerResources, brokerExecutions, brokerUsage] = await Promise.all([
+      getJson('/api/monitor'), getJson('/api/summary'), getJson('/api/events?limit=30'), getJson('/api/runs?limit=20'), getJson('/api/orchestration'),
+      getJson('/api/broker/resources'), getJson('/api/broker/executions'), getJson('/api/broker/usage')
     ]);
     const events = Array.isArray(eventsPayload.items) ? eventsPayload.items : [];
     const runs = Array.isArray(runsPayload.items) ? runsPayload.items : [];
     renderMonitor(monitor);
     renderOverview(summary);
     renderProjects(summary, events);
+    renderBrokerResources(brokerResources);
+    renderBrokerExecutions(brokerExecutions);
+    renderBrokerUsage(brokerUsage);
     renderOrchestration(orchestration);
     renderTimeline('events', events, e => `${text(e.from_state)} → ${text(e.to_state)} · ${text(e.task_id)}`);
     renderTimeline('runs', runs, r => `${text(r.task_id)} · ${text(r.result)} · ${seconds(r.duration_seconds)}`);

@@ -26,7 +26,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
+from urllib.error import URLError
 from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.request import urlopen
 
 from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE
 from dev_orchestrator.platform.process import is_pid_alive
@@ -86,6 +88,20 @@ def monitor_payload(runtime_root: Path | str) -> dict[str, Any]:
 
 def _default_summary() -> dict[str, Any]:
     return {"observed_at": None, "project_count": 0, "projects": []}
+
+
+def broker_proxy_payload(runtime_root: Path | str, endpoint: str) -> dict[str, Any]:
+    runtime = Path(runtime_root)
+    config = read_json(runtime / "aibroker.json", {})
+    base_url = config.get("base_url") if isinstance(config, dict) else None
+    if not isinstance(base_url, str) or not base_url.startswith(("http://127.0.0.1:", "http://localhost:")):
+        return {"available": False, "error": "AIBroker endpoint not configured"}
+    try:
+        with urlopen(base_url.rstrip("/") + endpoint, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
+        return {"available": False, "error": str(exc)}
+    return {**payload, "available": True} if isinstance(payload, dict) else {"available": False, "error": "invalid AIBroker response"}
 
 
 def orchestration_payload(runtime_root: Path | str) -> dict[str, Any]:
@@ -308,6 +324,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             payload = {"items": read_last_jsonl(runtime / "history" / "runs.jsonl", self._query_limit(parsed.query))}
         elif path == "/api/orchestration":
             payload = orchestration_payload(runtime)
+        elif path == "/api/broker/resources":
+            payload = broker_proxy_payload(runtime, "/api/resources")
+        elif path == "/api/broker/executions":
+            payload = broker_proxy_payload(runtime, "/api/executions")
+        elif path == "/api/broker/usage":
+            payload = broker_proxy_payload(runtime, "/api/usage")
         elif path.startswith("/api/projects/"):
             match = _PROJECT_PATH_RE.fullmatch(path)
             if not match:
