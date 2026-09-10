@@ -405,6 +405,14 @@ class TransitionExecutor:
             return projected
         latest: dict[str, dict[str, Any]] = {}
         ledger = self.state(); executions = ledger["executions"]
+        lifecycle_barrier: dict[str, str] = {}
+        for row in executions.values():
+            if not isinstance(row, dict) or row.get("state") not in {"settled", "handoff"}:
+                continue
+            project_id = _non_blank_config(row.get("project_id"))
+            stamp = _non_blank_config(row.get("recorded_at"))
+            if project_id and stamp and stamp > lifecycle_barrier.get(project_id, ""):
+                lifecycle_barrier[project_id] = stamp
         reviews_raw = read_json(self.runtime_root / "ai-reviewer.json", {})
         reviews = reviews_raw.get("reviews") if isinstance(reviews_raw, dict) else None
         reviews = reviews if isinstance(reviews, dict) else {}
@@ -423,6 +431,10 @@ class TransitionExecutor:
                     continue
             project_id = _non_blank_config(record.get("project_id"))
             if project_id is None:
+                continue
+            barrier = lifecycle_barrier.get(project_id)
+            record_stamp = str(record.get("completed_at") or record.get("started_at") or "")
+            if barrier and record_stamp and record_stamp <= barrier:
                 continue
             key = (str(record.get("started_at") or ""), str(record.get("source_request_id") or ""))
             previous = latest.get(project_id)
