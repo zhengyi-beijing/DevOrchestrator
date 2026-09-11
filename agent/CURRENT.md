@@ -1,12 +1,12 @@
 # DevOrchestrator Self-Hosted Development State
 
-- Stable controller source: `C:\work\github\DevOrchestrator` at accepted baseline `f6f643d`.
+- Stable controller: `C:\work\github\DevOrchestrator` (must remain untouched by Workers).
 - Development worktree: `C:\work\github\DevOrchestrator-dev`.
-- Development branch: `feature/self-hosted-dev`.
-- Stable controller daemon must continue running from the stable worktree.
-- This development worktree is managed by the stable DevOrchestrator as project `devorchestrator-dev`.
-- Ordinary development execution engine: AIResourceBroker.
-- No current Worker is allowed to restart/promote the stable daemon.
-- Promotion/restart remains an owner/control-plane action after tests/review.
+- Branch: `feature/self-hosted-dev`.
+- D1 Progress Channel + broker-native status implementation is complete at `8c6a04d` with 209 unit tests passing.
+- Final independent review was blocked by a Windows GBK codec error while transporting Unicode reviewer output (`✅`), not by a D1 code finding.
 
-Current state: D1 complete; P6 review gap remediated. Broker-native execution status projected into project-status, transport-only Progress Channel with quiet/normal/verbose levels and deduplication implemented, wired into daemon and adapter. Progress Channel binding propagation gap (P6 review) fixed: binding resolution cache, register_project/register_projects/resolve_binding APIs, coordinator binding propagation, and 7 new regression tests. 209 tests passing. Ready for owner promotion review.
+Current task: **P8 D1 Final Review UTF-8 Remediation**.
+The bounded fix is to force AIBroker child Python I/O to UTF-8, add regression coverage, rerun the D1 verification matrix, and obtain a valid final independent review.
+
+Stable controller promotion remains out of scope until P8 is accepted.

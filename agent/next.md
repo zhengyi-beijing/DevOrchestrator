@@ -1,27 +1,25 @@
-# D1 Self-Hosted DevOrchestrator Integration
+# P8 D1 Final Review UTF-8 Remediation
 
-Status: **COMPLETED** (Ready for owner review and promotion to stable controller)
-Timebox: **Completed within timebox**
+Status: **EXECUTABLE**
+Timebox: **30 minutes maximum**
 
-Goal: complete self-hosting after AIResourceBroker P6/P7 acceptance, while keeping the stable controller isolated.
+Goal: remove the Windows GBK reviewer lifecycle blocker and obtain a clean final independent review for D1.
 
 Scope:
-- make DevO use semantic planner/reviewer dispatch through AIResourceBroker where the broker ChatGPT Web/Sol backend supersedes provider-specific lifecycle routing;
-- project broker-native execution state into `project-status` so an active AIBroker Worker/Reviewer is visible as running instead of stale `READY_TO_RUN`;
-- add a Progress Channel that emits lifecycle milestone notifications to a bound ChatGPT conversation without model inference;
-- default notification level `normal`, with `quiet|normal|verbose` configuration;
-- normal milestones: PLAN_STARTED/ACCEPTED, WORKER_STARTED/DONE, TEST_FAILED, REVIEW_STARTED, REMEDIATE, REVIEW_ACCEPTED, OWNER_GATE/BLOCKED, TASK_COMPLETE, NEXT_TASK;
-- add dedupe/rate-limit/idempotency so restart/reconciliation cannot spam duplicate progress messages;
-- keep progress transport separate from planner/reviewer decision transport and never consume AIBroker model quota.
+- in `src/dev_orchestrator/ai/aibroker_subprocess.py`, force the Broker subprocess/reconciliation environment to UTF-8 (`PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8`) without changing provider selection;
+- add a regression test proving Unicode reviewer output such as `✅` cannot fail due to the Windows locale code page;
+- preserve the existing D1 Progress Channel and broker-native status behavior;
+- run focused tests, full `python -m unittest discover -s tests_py`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check`;
+- update agent files and commit locally; do not push.
 
 Safety boundary:
 - modify only `C:\work\github\DevOrchestrator-dev`;
-- never modify or restart `C:\work\github\DevOrchestrator` stable controller from a Worker;
+- do not modify/restart/promote the stable controller;
 - no physical hardware actions.
 
 Acceptance:
-- broker-native running state is regression-covered;
-- progress messages are transport-only, correlated to project/task/event, deduplicated, and configurable;
-- existing continuous execution, restart reconciliation, and one-active-worker guards remain passing;
-- full DevOrchestrator tests and `git diff --check` pass;
-- update agent files and commit locally; do not push.
+- UTF-8 environment is applied to both dispatch and reconciliation Broker subprocess calls;
+- Unicode regression is covered;
+- all D1 regressions remain green;
+- worktree clean after local commit;
+- independent reviewer returns a valid terminal decision instead of a codec lifecycle error.
