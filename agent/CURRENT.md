@@ -9,4 +9,4 @@
 - No current Worker is allowed to restart/promote the stable daemon.
 - Promotion/restart remains an owner/control-plane action after tests/review.
 
-Current state: waiting for AIResourceBroker P6 broker-side ChatGPT Web/Sol contract before D1 becomes executable.
+Current state: D1 executable. AIResourceBroker P6 ChatGPT Web/Sol backend and P7 production E2E canary are accepted; proceed with broker-native status projection plus transport-only Progress Channel.
