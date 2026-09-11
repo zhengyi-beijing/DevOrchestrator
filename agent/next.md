@@ -1,23 +1,21 @@
-# NEXT — V1 maintenance / future expansion
+# D1 Self-Hosted DevOrchestrator Integration
 
-Status: **MAINTENANCE / NO BOUNDED CORE TASK PENDING**
+Status: **AWAITING AIBROKER P6 CONTRACT**
+Timebox: **90 minutes maximum once executable**
 
-DevOrchestrator V1 is accepted. New managed projects should be onboarded through
-local project configuration and their own `agent/*` contract; no DevOrchestrator
-Core change is required for ordinary onboarding.
+Goal: make DevOrchestrator consume ChatGPT Web/Sol through AIResourceBroker instead of a DevOrchestrator-specific provider path, while preserving continuous-execution and restart-reconciliation guarantees.
 
-Future work is owner-selected, not part of unfinished V1 acceptance:
-- multi-machine central coordinator / fleet view;
-- additional provider backends and richer quota telemetry;
-- explicitly authorized `next_stage` / retry policies;
-- hardware-action authority boundaries;
-- richer dashboard/history/notification UX;
-- broader browser adapters if ChatGPT DOM contracts change.
+Safety boundary:
+- modify only `C:\work\github\DevOrchestrator-dev`;
+- never modify `C:\work\github\DevOrchestrator` from a Worker;
+- never restart or replace the stable controller daemon from a Worker;
+- no physical hardware actions.
 
-Operational default:
-- keep daemon + Browser Bridge running on the host;
-- keep machine-specific project config untracked;
-- use `.devorch/status.json` for quick project status queries;
-- preserve fail-closed branch/HEAD/status-hash and one-active-Worker guards.
+Prerequisite: AIResourceBroker P6 must define and verify the broker-side ChatGPT Web/Sol backend contract.
 
-Start a new DevOrchestrator development slice only after an explicit owner request.
+Acceptance once executable:
+- DevO emits semantic planner/reviewer requests only;
+- provider-specific Web/Sol routing is removed from the lifecycle decision path where superseded;
+- restart reconciliation and one-active-worker guards remain regression-covered;
+- full DevOrchestrator tests pass;
+- update agent files and commit locally; do not push.
