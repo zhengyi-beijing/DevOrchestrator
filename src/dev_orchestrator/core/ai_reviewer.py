@@ -90,6 +90,7 @@ class AIReviewerCoordinator:
         self.transition_path = self.runtime_root / "transition-executor.json"
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}
+        self._project_bindings: dict[str, dict[str, Any]] = {}
         self._recover_interrupted()
 
     def _load_state(self) -> dict[str, Any]:
@@ -154,6 +155,13 @@ class AIReviewerCoordinator:
             return []
         config = load_projects_config(config_path)
         projects = self._project_map(config)
+        with self._lock:
+            for p_id, p in projects.items():
+                b = p.get("conversation_binding")
+                if isinstance(b, dict) and b.get("adapter") and b.get("binding_id"):
+                    self._project_bindings[p_id] = copy.deepcopy(b)
+        if self.progress_channel is not None and hasattr(self.progress_channel, "register_projects"):
+            self.progress_channel.register_projects(projects.values())
         transition_records = self._transition_records()
         latest: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {}
         for source_request_id, worker in transition_records.items():
@@ -195,6 +203,10 @@ class AIReviewerCoordinator:
             if not truth.valid:
                 self._record_terminal(review_id, project_id, source_request_id, "failed", "repository truth unavailable")
                 continue
+            proj_dict = projects.get(project_id, {})
+            binding = proj_dict.get("conversation_binding") or self._project_bindings.get(project_id)
+            if binding is None and isinstance(worker.get("conversation_binding"), dict):
+                binding = worker.get("conversation_binding")
             prompt = self._review_prompt(project_id, task_id, source_request_id, truth)
             request = AIRoleRequest(
                 project_id=project_id, task_run_id=task_id, stage_run_id="review",
@@ -203,9 +215,12 @@ class AIReviewerCoordinator:
                 working_directory=Path(repo_path), quality=policy["quality"],
                 independence=policy["independence"], previous_resource_context=previous,
                 timeout_seconds=policy["timeout_seconds"],
-                metadata={"worker_source_request_id": source_request_id},
+                metadata={
+                    "worker_source_request_id": source_request_id,
+                    "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
+                },
             )
-            self._launch_review(review_id, source_request_id, request, truth)
+            self._launch_review(review_id, source_request_id, request, truth, conversation_binding=binding)
             launched.append(review_id)
         return launched
 
@@ -224,7 +239,14 @@ class AIReviewerCoordinator:
             f"Review branch: {truth.branch}\nReview HEAD: {truth.head}\nReview dirty: {truth.dirty}\n"
         )
 
-    def _launch_review(self, review_id: str, source_request_id: str, request: AIRoleRequest, truth: Any) -> None:
+    def _launch_review(
+        self, review_id: str, source_request_id: str, request: AIRoleRequest, truth: Any,
+        conversation_binding: Optional[dict[str, Any]] = None,
+    ) -> None:
+        if conversation_binding is None and isinstance(request.metadata, dict):
+            conversation_binding = request.metadata.get("conversation_binding")
+        if conversation_binding is None:
+            conversation_binding = self._project_bindings.get(request.project_id)
         with self._lock:
             state = self._load_state()
             if review_id in state["reviews"]:
@@ -241,7 +263,10 @@ class AIReviewerCoordinator:
                 "state": "launching",
                 "started_at": utc_now_iso(),
                 "role_run_id": request.role_run_id,
+                "conversation_binding": copy.deepcopy(conversation_binding) if isinstance(conversation_binding, dict) else None,
             }
+            if conversation_binding and isinstance(conversation_binding, dict):
+                self._project_bindings[request.project_id] = copy.deepcopy(conversation_binding)
             self._save_state(state)
         thread = threading.Thread(
             target=self._run_review,
@@ -253,8 +278,11 @@ class AIReviewerCoordinator:
             self._threads[review_id] = thread
         thread.start()
         if self.progress_channel is not None:
+            payload = {"project_id": request.project_id}
+            if conversation_binding:
+                payload["conversation_binding"] = conversation_binding
             self.progress_channel.emit(
-                {"project_id": request.project_id}, "REVIEW_STARTED",
+                payload, "REVIEW_STARTED",
                 task_id=request.task_run_id, occurrence_key=review_id,
                 details={"review_id": review_id, "worker_source_request_id": source_request_id},
             )
@@ -349,28 +377,39 @@ class AIReviewerCoordinator:
             decision = extra.get("decision")
             task_id = str(record.get("task_id") or "")
             proj_id = str(record.get("project_id") or "")
+            binding = None
+            if isinstance(getattr(request, "metadata", None), dict):
+                binding = request.metadata.get("conversation_binding")
+            if not binding and isinstance(record, dict):
+                binding = record.get("conversation_binding")
+            if not binding:
+                binding = self._project_bindings.get(proj_id)
+            project_payload = {"project_id": proj_id}
+            if binding:
+                project_payload["conversation_binding"] = binding
+
             if state_name == "completed":
                 if decision == "next":
                     self.progress_channel.emit(
-                        {"project_id": proj_id}, "REVIEW_ACCEPTED",
+                        project_payload, "REVIEW_ACCEPTED",
                         task_id=task_id, occurrence_key=review_id,
                         details={"decision": decision, "reason": reason},
                     )
                 elif decision == "remediate":
                     self.progress_channel.emit(
-                        {"project_id": proj_id}, "REMEDIATE",
+                        project_payload, "REMEDIATE",
                         task_id=task_id, occurrence_key=review_id,
                         details={"decision": decision, "reason": reason},
                     )
                 elif decision == "owner_gate":
                     self.progress_channel.emit(
-                        {"project_id": proj_id}, "OWNER_GATE",
+                        project_payload, "OWNER_GATE",
                         task_id=task_id, occurrence_key=review_id,
                         details={"decision": decision, "reason": reason},
                     )
             elif state_name == "failed":
                 self.progress_channel.emit(
-                    {"project_id": proj_id}, "REVIEW_FAILED",
+                    project_payload, "REVIEW_FAILED",
                     task_id=task_id, occurrence_key=review_id,
                     details={"reason": reason},
                 )

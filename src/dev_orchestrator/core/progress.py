@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 from uuid import uuid4
 
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
@@ -93,22 +93,31 @@ class ProgressChannel:
         runtime_root: Path | str,
         bridge_store: Optional[Any] = None,
         rate_limit_seconds: float = 0.0,
+        project_resolver: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.bridge_store = bridge_store
         self.rate_limit_seconds = float(rate_limit_seconds)
+        self.project_resolver = project_resolver
         self.state_file = self.runtime_root / "progress-channel.json"
         self._lock = threading.RLock()
+        self._emitted: dict[str, str] = {}
+        self._last_emitted_by_target: dict[str, str] = {}
+        self._history: list[dict[str, Any]] = []
+        self._project_bindings: dict[str, dict[str, Any]] = {}
+        self._project_configs: dict[str, dict[str, Any]] = {}
         self._load_state()
 
     def _load_state(self) -> None:
         raw = read_json(self.state_file, {})
         if not isinstance(raw, dict):
             raw = {}
-        self._emitted: dict[str, str] = dict(raw.get("emitted", {}))
-        self._last_emitted_by_target: dict[str, str] = dict(raw.get("last_emitted_by_target", {}))
-        self._history: list[dict[str, Any]] = list(raw.get("history", []))
+        self._emitted = dict(raw.get("emitted", {}))
+        self._last_emitted_by_target = dict(raw.get("last_emitted_by_target", {}))
+        self._history = list(raw.get("history", []))
+        self._project_bindings = dict(raw.get("project_bindings", {}))
+        self._project_configs = dict(raw.get("project_configs", {}))
 
     def _save_state(self) -> None:
         write_json(
@@ -118,6 +127,8 @@ class ProgressChannel:
                 "emitted": self._emitted,
                 "last_emitted_by_target": self._last_emitted_by_target,
                 "history": self._history[-200:],
+                "project_bindings": self._project_bindings,
+                "project_configs": self._project_configs,
             },
         )
 
@@ -129,11 +140,150 @@ class ProgressChannel:
                 "history_count": len(self._history),
                 "emitted": dict(self._emitted),
                 "history": list(self._history),
+                "project_bindings": dict(self._project_bindings),
             }
+
+    def set_project_resolver(self, resolver: Optional[Callable[[str], Optional[dict[str, Any]]]]) -> None:
+        with self._lock:
+            self.project_resolver = resolver
+
+    def register_project(self, project: Mapping[str, Any]) -> None:
+        if not isinstance(project, Mapping):
+            return
+        proj_id = str(project.get("project_id") or project.get("id") or "")
+        if not proj_id:
+            return
+        with self._lock:
+            changed = False
+            binding = project.get("conversation_binding")
+            if isinstance(binding, dict) and binding.get("adapter") and binding.get("binding_id"):
+                if self._project_bindings.get(proj_id) != binding:
+                    self._project_bindings[proj_id] = copy.deepcopy(dict(binding))
+                    changed = True
+            cfg = project.get("progress_channel")
+            level = project.get("progress_level")
+            if cfg is not None or level is not None:
+                new_cfg = {
+                    "progress_channel": copy.deepcopy(cfg) if isinstance(cfg, dict) else cfg,
+                    "progress_level": level,
+                }
+                if self._project_configs.get(proj_id) != new_cfg:
+                    self._project_configs[proj_id] = new_cfg
+                    changed = True
+            if changed:
+                self._save_state()
+
+    def register_projects(self, projects: Iterable[Mapping[str, Any]]) -> None:
+        with self._lock:
+            changed = False
+            for project in projects:
+                if not isinstance(project, Mapping):
+                    continue
+                proj_id = str(project.get("project_id") or project.get("id") or "")
+                if not proj_id:
+                    continue
+                binding = project.get("conversation_binding")
+                if isinstance(binding, dict) and binding.get("adapter") and binding.get("binding_id"):
+                    if self._project_bindings.get(proj_id) != binding:
+                        self._project_bindings[proj_id] = copy.deepcopy(dict(binding))
+                        changed = True
+                cfg = project.get("progress_channel")
+                level = project.get("progress_level")
+                if cfg is not None or level is not None:
+                    new_cfg = {
+                        "progress_channel": copy.deepcopy(cfg) if isinstance(cfg, dict) else cfg,
+                        "progress_level": level,
+                    }
+                    if self._project_configs.get(proj_id) != new_cfg:
+                        self._project_configs[proj_id] = new_cfg
+                        changed = True
+            if changed:
+                self._save_state()
+
+    def resolve_binding(self, project_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            cached = self._project_bindings.get(project_id)
+            if isinstance(cached, dict) and cached.get("adapter") and cached.get("binding_id"):
+                return copy.deepcopy(cached)
+            if callable(self.project_resolver):
+                try:
+                    resolved = self.project_resolver(project_id)
+                    if isinstance(resolved, dict):
+                        b = resolved.get("conversation_binding")
+                        if not (isinstance(b, dict) and b.get("adapter") and b.get("binding_id")):
+                            if resolved.get("adapter") and resolved.get("binding_id"):
+                                b = resolved
+                        if isinstance(b, dict) and b.get("adapter") and b.get("binding_id"):
+                            self._project_bindings[project_id] = copy.deepcopy(b)
+                            self._save_state()
+                            return copy.deepcopy(b)
+                except Exception:
+                    pass
+            # Check summary.json
+            summary_path = self.runtime_root / "summary.json"
+            if summary_path.is_file():
+                try:
+                    summary = read_json(summary_path, {})
+                    if isinstance(summary, dict) and isinstance(summary.get("projects"), list):
+                        for item in summary["projects"]:
+                            if isinstance(item, dict) and str(item.get("project_id") or "") == project_id:
+                                b = item.get("conversation_binding")
+                                if isinstance(b, dict) and b.get("adapter") and b.get("binding_id"):
+                                    self._project_bindings[project_id] = copy.deepcopy(b)
+                                    self._save_state()
+                                    return copy.deepcopy(b)
+                except Exception:
+                    pass
+            # Check transition-executor.json
+            texec_path = self.runtime_root / "transition-executor.json"
+            if texec_path.is_file():
+                try:
+                    texec = read_json(texec_path, {})
+                    if isinstance(texec, dict) and isinstance(texec.get("executions"), dict):
+                        for rec in texec["executions"].values():
+                            if isinstance(rec, dict) and rec.get("project_id") == project_id:
+                                b = rec.get("conversation_binding")
+                                if isinstance(b, dict) and b.get("adapter") and b.get("binding_id"):
+                                    self._project_bindings[project_id] = copy.deepcopy(b)
+                                    self._save_state()
+                                    return copy.deepcopy(b)
+                except Exception:
+                    pass
+            # Check ai-planner.json
+            plan_path = self.runtime_root / "ai-planner.json"
+            if plan_path.is_file():
+                try:
+                    plans = read_json(plan_path, {})
+                    if isinstance(plans, dict) and isinstance(plans.get("plans"), dict):
+                        for rec in plans["plans"].values():
+                            if isinstance(rec, dict) and rec.get("project_id") == project_id:
+                                b = rec.get("conversation_binding")
+                                if isinstance(b, dict) and b.get("adapter") and b.get("binding_id"):
+                                    self._project_bindings[project_id] = copy.deepcopy(b)
+                                    self._save_state()
+                                    return copy.deepcopy(b)
+                except Exception:
+                    pass
+            # Check ai-reviewer.json
+            rev_path = self.runtime_root / "ai-reviewer.json"
+            if rev_path.is_file():
+                try:
+                    revs = read_json(rev_path, {})
+                    if isinstance(revs, dict) and isinstance(revs.get("reviews"), dict):
+                        for rec in revs["reviews"].values():
+                            if isinstance(rec, dict) and rec.get("project_id") == project_id:
+                                b = rec.get("conversation_binding")
+                                if isinstance(b, dict) and b.get("adapter") and b.get("binding_id"):
+                                    self._project_bindings[project_id] = copy.deepcopy(b)
+                                    self._save_state()
+                                    return copy.deepcopy(b)
+                except Exception:
+                    pass
+            return None
 
     def emit(
         self,
-        project: dict[str, Any],
+        project: Mapping[str, Any] | str,
         milestone: str,
         *,
         task_id: Optional[str] = None,
@@ -142,23 +292,51 @@ class ProgressChannel:
         details: Optional[dict[str, Any]] = None,
         level: Optional[str] = None,
     ) -> Optional[ProgressNotification]:
-        project_id = str(project.get("project_id") or project.get("id") or "")
+        if isinstance(project, str):
+            project_dict: dict[str, Any] = {"project_id": project}
+        elif isinstance(project, Mapping):
+            project_dict = dict(project)
+        else:
+            return None
+
+        project_id = str(project_dict.get("project_id") or project_dict.get("id") or "")
         if not project_id:
             return None
 
+        binding = project_dict.get("conversation_binding")
+        if isinstance(binding, dict) and binding.get("adapter") and binding.get("binding_id"):
+            with self._lock:
+                if self._project_bindings.get(project_id) != binding:
+                    self._project_bindings[project_id] = copy.deepcopy(dict(binding))
+                    self._save_state()
+        else:
+            resolved_binding = self.resolve_binding(project_id)
+            if resolved_binding:
+                binding = resolved_binding
+                project_dict["conversation_binding"] = resolved_binding
+
+        if project_dict.get("progress_channel") is None and project_dict.get("progress_level") is None:
+            with self._lock:
+                cached_cfg = self._project_configs.get(project_id)
+            if cached_cfg:
+                if cached_cfg.get("progress_channel") is not None:
+                    project_dict["progress_channel"] = cached_cfg["progress_channel"]
+                if cached_cfg.get("progress_level") is not None:
+                    project_dict["progress_level"] = cached_cfg["progress_level"]
+
         # Determine level & enablement
-        progress_cfg = project.get("progress_channel")
+        progress_cfg = project_dict.get("progress_channel")
         enabled = True
         configured_level = PROGRESS_LEVEL_NORMAL
         if isinstance(progress_cfg, dict):
             enabled = bool(progress_cfg.get("enabled", True))
-            raw_level = progress_cfg.get("level") or project.get("progress_level") or PROGRESS_LEVEL_NORMAL
+            raw_level = progress_cfg.get("level") or project_dict.get("progress_level") or PROGRESS_LEVEL_NORMAL
             configured_level = str(raw_level).lower()
         elif isinstance(progress_cfg, bool):
             enabled = progress_cfg
-            configured_level = str(project.get("progress_level") or PROGRESS_LEVEL_NORMAL).lower()
-        elif project.get("progress_level"):
-            configured_level = str(project.get("progress_level")).lower()
+            configured_level = str(project_dict.get("progress_level") or PROGRESS_LEVEL_NORMAL).lower()
+        elif project_dict.get("progress_level"):
+            configured_level = str(project_dict.get("progress_level")).lower()
 
         if not enabled:
             return None
@@ -177,7 +355,7 @@ class ProgressChannel:
             if milestone not in VERBOSE_MILESTONES:
                 return None
 
-        eff_task_id = str(task_id or project.get("telemetry", {}).get("task_id") or project.get("task_id") or "")
+        eff_task_id = str(task_id or project_dict.get("telemetry", {}).get("task_id") or project_dict.get("task_id") or "")
         eff_occurrence = str(occurrence_key or "")
         dedupe_key = f"{project_id}:{eff_task_id}:{milestone}:{eff_occurrence}"
 
@@ -189,7 +367,6 @@ class ProgressChannel:
                 return None
 
             # Rate limiting
-            binding = project.get("conversation_binding")
             binding_key = ""
             if isinstance(binding, dict):
                 binding_key = f"{binding.get('adapter')}:{binding.get('binding_id')}"

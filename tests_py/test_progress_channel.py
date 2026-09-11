@@ -180,6 +180,124 @@ class ProgressChannelTests(unittest.TestCase):
             self.assertEqual(len(claimed2), 0)
 
 
+class ProgressChannelBindingPropagationTests(unittest.TestCase):
+    """Regression tests for P6 review gap: binding propagation and resolution in ProgressChannel."""
+
+    def _binding(self, binding_id: str = "conv-abc") -> dict:
+        return {"transport": "browser", "adapter": "chatgpt_web", "binding_id": binding_id}
+
+    def test_register_project_caches_binding_and_emit_resolves_it(self):
+        """register_project must persist binding so emit() without explicit binding still delivers."""
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=False)
+            channel = ProgressChannel(runtime, bridge_store=bridge_store)
+
+            channel.register_project(
+                {"project_id": "p-reg", "conversation_binding": self._binding("conv-reg")}
+            )
+            # Emit with minimal dict - no binding in call site
+            notif = channel.emit({"project_id": "p-reg"}, "WORKER_STARTED", task_id="T1")
+            self.assertIsNotNone(notif)
+
+            claimed = bridge_store.claim_progress("chatgpt_web", "conv-reg", limit=5)
+            self.assertEqual(len(claimed), 1)
+            self.assertEqual(claimed[0]["milestone"], "WORKER_STARTED")
+
+    def test_register_projects_bulk_caches_bindings(self):
+        """register_projects must cache bindings for multiple projects in one call."""
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=False)
+            channel = ProgressChannel(runtime, bridge_store=bridge_store)
+
+            channel.register_projects([
+                {"project_id": "p1", "conversation_binding": self._binding("conv-p1")},
+                {"project_id": "p2", "conversation_binding": self._binding("conv-p2")},
+            ])
+
+            channel.emit({"project_id": "p1"}, "WORKER_STARTED", task_id="T1")
+            channel.emit({"project_id": "p2"}, "PLAN_STARTED", task_id="T2")
+
+            self.assertEqual(len(bridge_store.claim_progress("chatgpt_web", "conv-p1", limit=5)), 1)
+            self.assertEqual(len(bridge_store.claim_progress("chatgpt_web", "conv-p2", limit=5)), 1)
+
+    def test_resolve_binding_returns_cached_entry(self):
+        """resolve_binding must return the binding stored via register_project."""
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            channel = ProgressChannel(runtime)
+            channel.register_project(
+                {"project_id": "p-lookup", "conversation_binding": self._binding("conv-lu")}
+            )
+            resolved = channel.resolve_binding("p-lookup")
+            self.assertIsNotNone(resolved)
+            self.assertEqual(resolved["binding_id"], "conv-lu")
+
+    def test_resolve_binding_survives_restart(self):
+        """Bindings cached via register_project must be persisted and reloaded after restart."""
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            ch1 = ProgressChannel(runtime)
+            ch1.register_project(
+                {"project_id": "p-persist", "conversation_binding": self._binding("conv-persist")}
+            )
+            # Simulate restart
+            ch2 = ProgressChannel(runtime)
+            resolved = ch2.resolve_binding("p-persist")
+            self.assertIsNotNone(resolved)
+            self.assertEqual(resolved["binding_id"], "conv-persist")
+
+    def test_emit_with_string_project_id(self):
+        """emit() must accept a bare string project ID and resolve binding from cache."""
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=False)
+            channel = ProgressChannel(runtime, bridge_store=bridge_store)
+            channel.register_project(
+                {"project_id": "p-str", "conversation_binding": self._binding("conv-str")}
+            )
+            notif = channel.emit("p-str", "REVIEW_STARTED", task_id="T1")
+            self.assertIsNotNone(notif)
+            claimed = bridge_store.claim_progress("chatgpt_web", "conv-str", limit=5)
+            self.assertEqual(len(claimed), 1)
+
+    def test_emit_explicit_binding_overrides_and_updates_cache(self):
+        """Passing binding explicitly in emit() must update the project cache for future calls."""
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=False)
+            channel = ProgressChannel(runtime, bridge_store=bridge_store)
+
+            project = {
+                "project_id": "p-explicit",
+                "conversation_binding": self._binding("conv-new"),
+            }
+            channel.emit(project, "WORKER_STARTED", task_id="T1")
+
+            # After emit, binding must be in cache; subsequent emit without binding resolves it
+            channel.emit({"project_id": "p-explicit"}, "WORKER_DONE", task_id="T1")
+            all_claimed = bridge_store.claim_progress("chatgpt_web", "conv-new", limit=10)
+            self.assertEqual(len(all_claimed), 2)
+
+    def test_resolve_binding_via_project_resolver(self):
+        """set_project_resolver callback must be invoked for projects not in cache."""
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            binding = self._binding("conv-resolver")
+            resolver_called = []
+
+            def my_resolver(project_id: str):
+                resolver_called.append(project_id)
+                return {"conversation_binding": binding}
+
+            channel = ProgressChannel(runtime, project_resolver=my_resolver)
+            resolved = channel.resolve_binding("p-dynamic")
+            self.assertEqual(len(resolver_called), 1)
+            self.assertIsNotNone(resolved)
+            self.assertEqual(resolved["binding_id"], "conv-resolver")
+
+
 class ProgressHttpBridgeTests(unittest.TestCase):
     def test_progress_http_endpoints(self):
         import urllib.request

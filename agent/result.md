@@ -20,7 +20,16 @@ D1 Self-Hosted DevOrchestrator Integration:
   - Bridge HTTP `/v1/progress` GET and POST endpoints added in `BridgeHTTPServer`.
   - Wired `ProgressChannel` into `TransitionExecutor`, `AIReviewerCoordinator`, `AIPlannerCoordinator`, `ControlCommandCoordinator`, and `daemon.py`.
   - Browser adapter `browser/chatgpt-web-adapter.user.js` polls `/v1/progress` and displays progress toasts without submitting turns to ChatGPT composer.
+- P6 Review Remediation (conversation_binding propagation gap):
+  - Fixed `ProgressChannel.emit()` to resolve `conversation_binding` from an in-memory and persistent cache when not explicitly passed by the caller, so progress events emitted by `AIPlannerCoordinator` and `AIReviewerCoordinator` are delivered to the bound ChatGPT conversation even when only a `project_id` is supplied.
+  - Added `ProgressChannel.register_project` and `register_projects` to cache project bindings and config at coordinator startup; cache is persisted to `runtime/progress-channel.json` and survives daemon restarts.
+  - Added `ProgressChannel.resolve_binding` with layered fallback: in-memory cache → `project_resolver` callback → `summary.json` → `transition-executor.json` → `ai-planner.json` → `ai-reviewer.json`.
+  - Added `ProgressChannel.set_project_resolver` for runtime injection of a project lookup callback.
+  - `emit()` now accepts a bare string `project_id` in addition to a dict.
+  - `AIPlannerCoordinator` and `AIReviewerCoordinator` now propagate `conversation_binding` in all `emit()` calls and populate `_project_bindings` cache on startup and review launch.
+  - `progress-channel.json` schema extended with `project_bindings` and `project_configs` sections.
+  - 7 new regression tests added in `ProgressChannelBindingPropagationTests` covering register, resolve, string-project emit, cross-restart persistence, resolver callback, and explicit-binding cache update.
 - Verification:
-  - 202 unit tests passing cleanly (`python -m unittest discover -s tests_py`).
+  - 209 unit tests passing cleanly (`python -m unittest discover -s tests_py`).
   - `node --check browser/chatgpt-web-adapter.user.js` passing.
   - `git diff --check` clean.

@@ -9,4 +9,4 @@
 - No current Worker is allowed to restart/promote the stable daemon.
 - Promotion/restart remains an owner/control-plane action after tests/review.
 
-Current state: D1 complete. Broker-native execution status projected into project-status, transport-only Progress Channel with quiet/normal/verbose levels and deduplication implemented, wired into daemon and adapter, regression tests passing. Ready for owner promotion review.
+Current state: D1 complete; P6 review gap remediated. Broker-native execution status projected into project-status, transport-only Progress Channel with quiet/normal/verbose levels and deduplication implemented, wired into daemon and adapter. Progress Channel binding propagation gap (P6 review) fixed: binding resolution cache, register_project/register_projects/resolve_binding APIs, coordinator binding propagation, and 7 new regression tests. 209 tests passing. Ready for owner promotion review.

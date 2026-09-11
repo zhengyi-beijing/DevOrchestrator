@@ -112,6 +112,7 @@ class AIPlannerCoordinator:
         self.state_path = self.runtime_root / PLANNER_STATE_FILE
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}
+        self._project_bindings: dict[str, dict[str, Any]] = {}
         self._recover_interrupted()
 
     def _load_state(self) -> dict[str, Any]:
@@ -167,6 +168,7 @@ class AIPlannerCoordinator:
         except OSError:
             return None, "agent/next.md unavailable"
         plan_id = "ai_plan:" + command_id
+        binding = project.get("conversation_binding")
         with self._lock:
             state = self._load_state()
             if plan_id in state["plans"]:
@@ -183,8 +185,13 @@ class AIPlannerCoordinator:
                 "next_text": next_text,
                 "state": "planning",
                 "started_at": utc_now_iso(),
+                "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
             }
+            if binding and isinstance(binding, dict):
+                self._project_bindings[project_id] = copy.deepcopy(binding)
             self._save_state(state)
+        if self.progress_channel is not None and hasattr(self.progress_channel, "register_project"):
+            self.progress_channel.register_project(project)
         thread = threading.Thread(
             target=self._run_cycle,
             args=(plan_id, project, policy),
@@ -314,8 +321,12 @@ class AIPlannerCoordinator:
         if decision != "approve":
             self._finish(plan_id, "failed", "plan rejected: " + reason)
             return
-        self._apply_plan(plan_id, record, plan, reason)
-    def _apply_plan(self, plan_id: str, record: dict[str, Any], plan: dict[str, Any], review_reason: str) -> None:
+        self._apply_plan(plan_id, record, plan, reason, project=project)
+
+    def _apply_plan(
+        self, plan_id: str, record: dict[str, Any], plan: dict[str, Any],
+        review_reason: str, project: Optional[dict[str, Any]] = None,
+    ) -> None:
         with self._lock:
             state = self._load_state()
             current = state["plans"].get(plan_id)
@@ -371,13 +382,26 @@ class AIPlannerCoordinator:
             })
             self._save_state(state)
         if self.progress_channel is not None:
+            binding = (
+                record.get("conversation_binding")
+                or (project.get("conversation_binding") if isinstance(project, dict) else None)
+                or self._project_bindings.get(record["project_id"])
+            )
+            project_payload = {"project_id": record["project_id"]}
+            if binding:
+                project_payload["conversation_binding"] = binding
+            if isinstance(project, dict):
+                if project.get("progress_channel") is not None:
+                    project_payload["progress_channel"] = project["progress_channel"]
+                if project.get("progress_level") is not None:
+                    project_payload["progress_level"] = project["progress_level"]
             self.progress_channel.emit(
-                {"project_id": record["project_id"]}, "PLAN_ACCEPTED",
+                project_payload, "PLAN_ACCEPTED",
                 task_id=record["task_id"], occurrence_key=plan_id,
                 details={"plan_id": plan_id, "reason": review_reason},
             )
             self.progress_channel.emit(
-                {"project_id": record["project_id"]}, "NEXT_TASK",
+                project_payload, "NEXT_TASK",
                 task_id=record["task_id"], occurrence_key=plan_id,
                 details={"plan_id": plan_id, "state": "ready_to_run"},
             )
