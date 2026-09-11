@@ -75,10 +75,14 @@ def latest_control_result(runtime_root: Path | str, project_id: str) -> dict[str
 class ControlCommandCoordinator:
     """Daemon-owned consumer for atomic project control commands."""
 
-    def __init__(self, runtime_root: Path | str, planner: AIPlannerCoordinator | None = None) -> None:
+    def __init__(
+        self, runtime_root: Path | str, planner: AIPlannerCoordinator | None = None,
+        progress_channel: Optional[Any] = None,
+    ) -> None:
         self.runtime_root = Path(runtime_root)
         self.inbox, self.history = _paths(runtime_root)
         self.planner = planner
+        self.progress_channel = progress_channel
     @staticmethod
     def _snapshot_map(summary: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(summary, dict) or not isinstance(summary.get("projects"), list):

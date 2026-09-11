@@ -29,6 +29,7 @@
   var CLAIM_PATH = "/v1/claim";
   var RENEW_PATH = "/v1/renew";
   var RESPONSE_PATH = "/v1/response";
+  var PROGRESS_PATH = "/v1/progress";
   var POLL_MS = 1500;
   var RENEW_INTERVAL_MS = 20000;
   var WAIT_DEADLINE_MS = 15 * 60 * 1000;
@@ -79,6 +80,24 @@
     badge.style.background = colors[state] || "#555";
     badge.setAttribute("data-state", state);
     badge.title = detail || state;
+  }
+
+  function showProgressToast(notification) {
+    if (typeof document === "undefined" || !document.body || !notification) { return null; }
+    var toast = document.createElement("div");
+    toast.className = "devorch-progress-toast";
+    toast.style.cssText = "position:fixed;right:12px;bottom:42px;z-index:2147483646;padding:6px 10px;border-radius:6px;font:11px/1.3 system-ui,sans-serif;color:#fff;background:#1a5276;box-shadow:0 1px 4px rgba(0,0,0,.3);pointer-events:none;opacity:.95;transition:opacity 0.5s ease";
+    var milestone = notification.milestone || "PROGRESS";
+    var msg = notification.message || notification.summary || notification.task_id || "";
+    toast.textContent = "[" + milestone + "] " + msg;
+    document.body.appendChild(toast);
+    setTimeout(function () {
+      toast.style.opacity = "0";
+      setTimeout(function () {
+        if (toast.parentNode) { toast.parentNode.removeChild(toast); }
+      }, 600);
+    }, 5000);
+    return toast;
   }
 
   // ------------------------------------------------------------------
@@ -232,7 +251,9 @@
     markRequestSubmitted: markRequestSubmitted,
     shouldRemoteSyncReload: shouldRemoteSyncReload,
     isStopComposerButton: isStopComposerButton,
-    findSendButton: findSendButton
+    findSendButton: findSendButton,
+    showProgressToast: showProgressToast,
+    pollProgress: pollProgress
   };
 
   // Exposed for the automated adapter test (Node `require`); harmless in a
@@ -307,6 +328,23 @@
       nonce: claim.nonce,
       claim_token: claim.claim_token,
       response_text: responseText
+    });
+  }
+
+  function pollProgress(bindingId) {
+    return bridgePost(PROGRESS_PATH, { adapter: ADAPTER_ID, binding_id: bindingId }).then(function (result) {
+      if (result && result.status === 200 && result.text) {
+        try {
+          var data = JSON.parse(result.text);
+          var items = data ? (data.claimed || data.notifications) : null;
+          if (Array.isArray(items)) {
+            for (var i = 0; i < items.length; i++) {
+              showProgressToast(items[i]);
+            }
+          }
+        } catch (err) {}
+      }
+      return result;
     });
   }
 
@@ -474,6 +512,7 @@
       return;
     }
 
+    pollProgress(bindingId);
     claimOnce(bindingId).then(function (claim) {
       if (!claim) {
         schedule(runAdapter, RETRY_MS);

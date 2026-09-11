@@ -36,6 +36,7 @@ from dev_orchestrator.daemon import run_daemon
 from dev_orchestrator.ai.execution_port import MANAGED_INTERRUPT_REASON
 from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
 from dev_orchestrator.core.control_commands import latest_control_result, submit_control_command
+from dev_orchestrator.core.project_status import project_runtime_status
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.platform.process import (
     executable_path,
@@ -244,7 +245,8 @@ def cmd_project_status(args: argparse.Namespace) -> int:
     if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
         _print_json({"project_id": project_id, "state": "not_found"})
         return 1
-    payload = dict(snapshot)
+    projected = project_runtime_status(snapshot, runtime)
+    payload = dict(projected)
     payload["latest_control"] = latest_control_result(runtime, project_id)
     _print_json(payload)
     return 0

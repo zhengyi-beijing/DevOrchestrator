@@ -272,6 +272,7 @@ class TransitionExecutor:
         *,
         backend_overrides: Optional[dict[str, AgentBackend]] = None,
         ai_execution_port: Optional[AIExecutionPort] = None,
+        progress_channel: Optional[Any] = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
@@ -279,6 +280,7 @@ class TransitionExecutor:
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}
         self._ai_execution_port = ai_execution_port
+        self._progress_channel = progress_channel
         self._backend_overrides: dict[str, AgentBackend] = {}
         for backend_id, backend in (backend_overrides or {}).items():
             if backend_id not in _SUPPORTED_BACKENDS:
@@ -456,6 +458,15 @@ class TransitionExecutor:
             telemetry["task_id"] = record.get("task_id")
             snapshot["telemetry"] = telemetry
             snapshot["state"] = ("WORKER_RUNNING" if state in _ACTIVE_STATES else ("WAITING_REVIEW" if state == "completed" else "WORKER_FAILED"))
+            if record.get("engine") == "aibroker":
+                snapshot["worker"]["engine"] = "aibroker"
+                snapshot["broker_execution"] = {
+                    "broker_request_id": record.get("broker_request_id"),
+                    "role_run_id": record.get("role_run_id"),
+                    "state": state,
+                    "started_at": record.get("started_at"),
+                    "engine": "aibroker",
+                }
         return projected
 
     @staticmethod
@@ -483,6 +494,12 @@ class TransitionExecutor:
                 "recorded_at": utc_now_iso(),
             }
             self._save_ledger(ledger)
+        if self._progress_channel is not None:
+            self._progress_channel.emit(
+                {"project_id": project_id}, "BLOCKED",
+                task_id=task_id, occurrence_key=source_request_id,
+                details={"reason": reason},
+            )
 
     def _record_settled(
         self, source_request_id: str, project_id: str, reason: str,
@@ -501,6 +518,12 @@ class TransitionExecutor:
                 **({"legacy_reconciled_from": existing} if existing is not None else {}),
             }
             self._save_ledger(ledger)
+        if self._progress_channel is not None:
+            self._progress_channel.emit(
+                {"project_id": project_id}, "TASK_COMPLETE",
+                task_id=task_id, occurrence_key=source_request_id,
+                details={"reason": reason},
+            )
 
     def _record_handoff(
         self, source_request_id: str, project_id: str, reviewed_task_id: str,
@@ -520,6 +543,12 @@ class TransitionExecutor:
                 **({"legacy_reconciled_from": existing} if existing is not None else {}),
             }
             self._save_ledger(ledger)
+        if self._progress_channel is not None:
+            self._progress_channel.emit(
+                {"project_id": project_id}, "NEXT_TASK",
+                task_id=next_task_id, occurrence_key=source_request_id,
+                details={"reason": reason, "previous_task_id": reviewed_task_id},
+            )
 
     def mark_handoff_consumed(
         self, source_request_id: str, continuation_id: str, plan_id: str,
@@ -788,10 +817,17 @@ class TransitionExecutor:
         with self._lock:
             self._threads[source_request_id] = thread
         thread.start()
+        if self._progress_channel is not None:
+            self._progress_channel.emit(
+                project, "WORKER_STARTED",
+                task_id=task_id, occurrence_key=source_request_id,
+                details={"source_request_id": source_request_id, "engine": "aibroker"},
+            )
         return ActuationLaunch(project_id, source_request_id, task_id, "aibroker", "launching")
 
     def _run_broker_worker_thread(self, source_request_id: str, request: AIRoleRequest) -> None:
         try:
+            self._update_record(source_request_id, state="running")
             result = self._ai_execution_port.execute(request) if self._ai_execution_port else None
             if result is None:
                 raise RuntimeError("AIBroker execution port became unavailable")
@@ -801,6 +837,12 @@ class TransitionExecutor:
                 reason="AIBroker worker lifecycle error: {0}".format(exc),
                 completed_at=utc_now_iso(),
             )
+            if self._progress_channel is not None:
+                self._progress_channel.emit(
+                    {"project_id": request.project_id}, "WORKER_FAILED",
+                    task_id=request.task_run_id, occurrence_key=source_request_id,
+                    details={"error": str(exc)},
+                )
             return
         resource = result.resource_context
         resource_payload = None
@@ -831,6 +873,21 @@ class TransitionExecutor:
             usage_source=result.usage_source,
             reason=result.error,
         )
+        if self._progress_channel is not None:
+            if state == "completed":
+                self._progress_channel.emit(
+                    {"project_id": request.project_id}, "WORKER_DONE",
+                    task_id=request.task_run_id, occurrence_key=source_request_id,
+                    details={"status": result.status},
+                )
+            elif state == "failed":
+                is_test_fail = "test" in str(result.error or "").lower()
+                self._progress_channel.emit(
+                    {"project_id": request.project_id},
+                    "TEST_FAILED" if is_test_fail else "WORKER_FAILED",
+                    task_id=request.task_run_id, occurrence_key=source_request_id,
+                    details={"error": result.error},
+                )
 
     def _update_record(self, source_request_id: str, **changes: Any) -> None:
         with self._lock:

@@ -105,6 +105,24 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         for forbidden in ("NEXT_STAGE", "NEXT_TASK", "CONTINUE_CURRENT_STAGE", "OWNER_GATE", "validate_websol_response"):
             self.assertNotIn(forbidden, source)
 
+    def test_userscript_has_progress_channel_support(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('var PROGRESS_PATH = "/v1/progress";', source)
+        self.assertIn('devorch-progress-toast', source)
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "const toasts=[];"
+            "globalThis.document={body:{appendChild:(el)=>toasts.push(el)},createElement:(tag)=>({className:'',style:{},textContent:'',parentNode:{removeChild:()=>{}}})};"
+            "require(\"" + script + "\");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const toast=a.showProgressToast({milestone:'WORKER_STARTED',message:'Started task P1'});"
+            "console.log(toast.textContent+'|'+toasts.length);process.exit(0);"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[WORKER_STARTED] Started task P1|1")
+
 
 if __name__ == "__main__":
     unittest.main()

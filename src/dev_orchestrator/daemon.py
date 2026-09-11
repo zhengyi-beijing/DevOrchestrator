@@ -32,6 +32,7 @@ from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lifecycle
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.response_consumer import consume_websol_responses
+from dev_orchestrator.core.progress import ProgressChannel
 from dev_orchestrator.core.transition_executor import TransitionExecutor
 from dev_orchestrator.core.project_status import write_project_statuses
 from dev_orchestrator.monitor.project import run_monitor_once
@@ -180,10 +181,19 @@ def run_daemon(
     bridge_thread.start()
     bridge_bound_port = int(bridge_server.server_address[1])
     ai_execution_port = load_aibroker_execution_port(runtime)
-    transition_executor = TransitionExecutor(runtime, ai_execution_port=ai_execution_port)
-    reviewer_coordinator = AIReviewerCoordinator(runtime, ai_execution_port)
-    planner_coordinator = AIPlannerCoordinator(runtime, ai_execution_port)
-    control_coordinator = ControlCommandCoordinator(runtime, planner_coordinator)
+    progress_channel = ProgressChannel(runtime, bridge_store=bridge_store)
+    transition_executor = TransitionExecutor(
+        runtime, ai_execution_port=ai_execution_port, progress_channel=progress_channel
+    )
+    reviewer_coordinator = AIReviewerCoordinator(
+        runtime, ai_execution_port, progress_channel=progress_channel
+    )
+    planner_coordinator = AIPlannerCoordinator(
+        runtime, ai_execution_port, progress_channel=progress_channel
+    )
+    control_coordinator = ControlCommandCoordinator(
+        runtime, planner_coordinator, progress_channel=progress_channel
+    )
     try:
         while True:
             last_error: Optional[str] = None

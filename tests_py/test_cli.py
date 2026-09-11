@@ -75,6 +75,35 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(len(inbox), 1)
             self.assertNotIn("conversation", inbox[0].read_text(encoding="utf-8"))
 
+    def test_project_status_cli_projects_active_broker_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            (runtime / "projects").mkdir()
+            (runtime / "projects" / "p1.json").write_text(json.dumps({
+                "project_id": "p1", "state": "READY_TO_RUN", "lifecycle_state": "READY_TO_RUN",
+            }), encoding="utf-8")
+            (runtime / "daemon.pid").write_text(str(os.getpid()), encoding="utf-8")
+            (runtime / "transition-executor.json").write_text(json.dumps({
+                "version": 1,
+                "executions": {
+                    "req-1": {
+                        "project_id": "p1",
+                        "source_request_id": "req-1",
+                        "state": "running",
+                        "engine": "aibroker",
+                        "broker_request_id": "brk-99",
+                        "started_at": "2026-09-11T12:00:00+00:00",
+                    }
+                }
+            }), encoding="utf-8")
+            status = run_cli("project-status", "p1", "--runtime-root", str(runtime))
+            self.assertEqual(status.returncode, 0, status.stderr)
+            data = json.loads(status.stdout)
+            self.assertEqual(data["state"], "WORKER_RUNNING")
+            self.assertEqual(data["lifecycle_state"], "EXECUTING")
+            self.assertIn("broker_execution", data)
+            self.assertEqual(data["broker_execution"]["broker_request_id"], "brk-99")
+
     def test_project_continue_fails_when_daemon_is_not_running(self):
         with tempfile.TemporaryDirectory() as td:
             runtime = Path(td); (runtime / "projects").mkdir()

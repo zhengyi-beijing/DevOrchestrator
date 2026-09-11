@@ -53,14 +53,14 @@ from __future__ import annotations
 import json
 import secrets
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
 from dev_orchestrator.core.websol import WebSolRequest
-from dev_orchestrator.storage.json_store import read_json, write_json
+from dev_orchestrator.storage.json_store import append_jsonl, read_json, write_json
 
 _DEFAULT_LEASE_SECONDS = 30
 _DEFAULT_PRESENCE_SECONDS = 300
@@ -688,3 +688,41 @@ class BrowserBridgeStore:
                             response_text=str(record["response_text"]),
                         )
             return None
+
+    def submit_progress(self, adapter: str, binding_id: str, notification: Any) -> dict[str, Any]:
+        """Record a milestone notification in the binding's progress queue (transport only)."""
+        _require_route(adapter, binding_id)
+        with self._lock:
+            progress_dir = self.root / "progress" / _encode_segment(adapter)
+            progress_dir.mkdir(parents=True, exist_ok=True)
+            progress_file = progress_dir / (_encode_segment(binding_id) + ".jsonl")
+            payload = asdict(notification) if hasattr(notification, "__dataclass_fields__") else dict(notification)
+            append_jsonl(progress_file, payload)
+            return payload
+
+    def claim_progress(self, adapter: str, binding_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Read pending progress notifications for the binding without model inference."""
+        _require_route(adapter, binding_id)
+        with self._lock:
+            progress_file = self.root / "progress" / _encode_segment(adapter) / (_encode_segment(binding_id) + ".jsonl")
+            if not progress_file.is_file():
+                return []
+            try:
+                lines = [line.strip() for line in progress_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+            except OSError:
+                return []
+            records: list[dict[str, Any]] = []
+            for line in lines[:limit]:
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    pass
+            remaining = lines[limit:]
+            if remaining:
+                try:
+                    progress_file.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+                except OSError:
+                    pass
+            else:
+                progress_file.unlink(missing_ok=True)
+            return records

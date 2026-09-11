@@ -77,10 +77,14 @@ def _parse_review_output(text: str | None) -> tuple[str, str, str]:
 class AIReviewerCoordinator:
     """Schedule one independent AIBroker reviewer per completed broker Worker."""
 
-    def __init__(self, runtime_root: Path | str, port: AIExecutionPort | None) -> None:
+    def __init__(
+        self, runtime_root: Path | str, port: AIExecutionPort | None,
+        progress_channel: Optional[Any] = None,
+    ) -> None:
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.port = port
+        self.progress_channel = progress_channel
         self.state_path = self.runtime_root / REVIEWER_STATE_FILE
         self.decisions_path = self.runtime_root / REVIEW_DECISIONS_FILE
         self.transition_path = self.runtime_root / "transition-executor.json"
@@ -248,6 +252,12 @@ class AIReviewerCoordinator:
         with self._lock:
             self._threads[review_id] = thread
         thread.start()
+        if self.progress_channel is not None:
+            self.progress_channel.emit(
+                {"project_id": request.project_id}, "REVIEW_STARTED",
+                task_id=request.task_run_id, occurrence_key=review_id,
+                details={"review_id": review_id, "worker_source_request_id": source_request_id},
+            )
 
     def _record_terminal(self, review_id: str, project_id: str, source_request_id: str, state_name: str, reason: str) -> None:
         with self._lock:
@@ -335,6 +345,35 @@ class AIReviewerCoordinator:
                 **extra,
             })
             self._save_state(state)
+        if self.progress_channel is not None:
+            decision = extra.get("decision")
+            task_id = str(record.get("task_id") or "")
+            proj_id = str(record.get("project_id") or "")
+            if state_name == "completed":
+                if decision == "next":
+                    self.progress_channel.emit(
+                        {"project_id": proj_id}, "REVIEW_ACCEPTED",
+                        task_id=task_id, occurrence_key=review_id,
+                        details={"decision": decision, "reason": reason},
+                    )
+                elif decision == "remediate":
+                    self.progress_channel.emit(
+                        {"project_id": proj_id}, "REMEDIATE",
+                        task_id=task_id, occurrence_key=review_id,
+                        details={"decision": decision, "reason": reason},
+                    )
+                elif decision == "owner_gate":
+                    self.progress_channel.emit(
+                        {"project_id": proj_id}, "OWNER_GATE",
+                        task_id=task_id, occurrence_key=review_id,
+                        details={"decision": decision, "reason": reason},
+                    )
+            elif state_name == "failed":
+                self.progress_channel.emit(
+                    {"project_id": proj_id}, "REVIEW_FAILED",
+                    task_id=task_id, occurrence_key=review_id,
+                    details={"reason": reason},
+                )
 
     def _write_decision(
         self,

@@ -101,10 +101,14 @@ def _parse_plan_review(text: str | None) -> tuple[str, str]:
 class AIPlannerCoordinator:
     """Runs one planner and one independent reviewer, then freezes the approved plan."""
 
-    def __init__(self, runtime_root: Path | str, port: AIExecutionPort | None) -> None:
+    def __init__(
+        self, runtime_root: Path | str, port: AIExecutionPort | None,
+        progress_channel: Optional[Any] = None,
+    ) -> None:
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.port = port
+        self.progress_channel = progress_channel
         self.state_path = self.runtime_root / PLANNER_STATE_FILE
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}
@@ -210,6 +214,12 @@ class AIPlannerCoordinator:
             record = copy.deepcopy(self._load_state()["plans"].get(plan_id, {}))
         if not record:
             return
+        if self.progress_channel is not None:
+            self.progress_channel.emit(
+                project, "PLAN_STARTED",
+                task_id=record["task_id"], occurrence_key=plan_id,
+                details={"plan_id": plan_id},
+            )
         planner_request = AIRoleRequest(
             project_id=record["project_id"],
             task_run_id=record["task_id"],
@@ -294,6 +304,12 @@ class AIPlannerCoordinator:
             self._save_state(state)
         if decision == "owner_gate":
             self._finish(plan_id, "owner_gate", reason)
+            if self.progress_channel is not None:
+                self.progress_channel.emit(
+                    project, "OWNER_GATE",
+                    task_id=record["task_id"], occurrence_key=plan_id,
+                    details={"plan_id": plan_id, "reason": reason},
+                )
             return
         if decision != "approve":
             self._finish(plan_id, "failed", "plan rejected: " + reason)
@@ -354,6 +370,17 @@ class AIPlannerCoordinator:
                 "ready_at": utc_now_iso(),
             })
             self._save_state(state)
+        if self.progress_channel is not None:
+            self.progress_channel.emit(
+                {"project_id": record["project_id"]}, "PLAN_ACCEPTED",
+                task_id=record["task_id"], occurrence_key=plan_id,
+                details={"plan_id": plan_id, "reason": review_reason},
+            )
+            self.progress_channel.emit(
+                {"project_id": record["project_id"]}, "NEXT_TASK",
+                task_id=record["task_id"], occurrence_key=plan_id,
+                details={"plan_id": plan_id, "state": "ready_to_run"},
+            )
 
     @staticmethod
     def _render_next(original: str, plan: dict[str, Any], review_reason: str) -> str:

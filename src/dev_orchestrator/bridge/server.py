@@ -121,11 +121,29 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 _json_bytes({"state": "ok", "surface": "v1"}),
             )
             return
+        if path == "/v1/progress":
+            query = urlsplit(self.path).query
+            params = dict(item.split("=", 1) for item in query.split("&") if "=" in item)
+            adapter = params.get("adapter", "")
+            binding_id = params.get("binding_id", "")
+            if not adapter or not binding_id:
+                self._error(400, "Bad Request", "adapter and binding_id query parameters required")
+                return
+            notifs = self.server.store.claim_progress(adapter, binding_id)
+            if not notifs:
+                self._send(204, "No Content", b"")
+                return
+            self._send(
+                200,
+                "OK",
+                _json_bytes({"notifications": notifs, "claimed": notifs, "count": len(notifs)}),
+            )
+            return
         self._error(404, "Not Found", "route not found")
 
     def _route_post(self) -> None:
         path = self._path()
-        if path not in ("/v1/claim", "/v1/renew", "/v1/response"):
+        if path not in ("/v1/claim", "/v1/renew", "/v1/response", "/v1/progress"):
             self._error(404, "Not Found", "route not found")
             return
         payload = self._read_payload()
@@ -137,6 +155,8 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 self._handle_claim(payload)
             elif path == "/v1/renew":
                 self._handle_renew(payload)
+            elif path == "/v1/progress":
+                self._handle_progress(payload)
             else:
                 self._handle_response(payload)
         except BridgeConflictError as exc:
@@ -213,6 +233,19 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             200,
             "OK",
             _json_bytes({"state": stored.state, "request_id": stored.request_id}),
+        )
+
+    def _handle_progress(self, payload: dict) -> None:
+        adapter = self._require_str(payload, "adapter")
+        binding_id = self._require_str(payload, "binding_id")
+        notifs = self.server.store.claim_progress(adapter, binding_id)
+        if not notifs:
+            self._send(204, "No Content", b"")
+            return
+        self._send(
+            200,
+            "OK",
+            _json_bytes({"notifications": notifs, "claimed": notifs, "count": len(notifs)}),
         )
 
 

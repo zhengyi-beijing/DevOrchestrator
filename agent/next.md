@@ -1,7 +1,7 @@
 # D1 Self-Hosted DevOrchestrator Integration
 
-Status: **EXECUTABLE**
-Timebox: **120 minutes maximum**
+Status: **COMPLETED** (Ready for owner review and promotion to stable controller)
+Timebox: **Completed within timebox**
 
 Goal: complete self-hosting after AIResourceBroker P6/P7 acceptance, while keeping the stable controller isolated.
 

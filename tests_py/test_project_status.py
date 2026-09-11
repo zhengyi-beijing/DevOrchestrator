@@ -1,12 +1,19 @@
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
 from dev_orchestrator.core.project_status import (
+    project_runtime_status,
     write_execution_status,
     write_project_status,
+    write_review_status,
 )
 
 
@@ -103,6 +110,113 @@ class ProjectStatusTests(unittest.TestCase):
             self.assertEqual(status["web_sol"]["decision"], "remediate")
             self.assertEqual(status["web_sol"]["disposition"], "apply")
             self.assertEqual(status["web_sol"]["next_action"], "continue_current_stage")
+
+    def test_broker_native_running_state_in_execution_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo); runtime.mkdir()
+            record = {
+                "project_id": "p1", "repo_path": str(repo),
+                "source_request_id": "owner-p1", "source_kind": "bootstrap",
+                "task_id": "P1", "backend_id": "aibroker", "engine": "aibroker",
+                "broker_request_id": "brk-100", "role_run_id": "role-worker-1",
+                "state": "running", "pid": 1234, "started_at": "2026-09-11T01:00:00+00:00",
+            }
+            target = write_execution_status(record, runtime)
+            self.assertIsNotNone(target)
+            status = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(status["phase"], "worker")
+            self.assertEqual(status["status"], "EXECUTING")
+            self.assertEqual(status["lifecycle_state"], "EXECUTING")
+            self.assertEqual(status["worker"]["engine"], "aibroker")
+            self.assertEqual(status["worker"]["state"], "running")
+            self.assertTrue(status["worker"]["process_alive"])
+            self.assertIn("broker_execution", status)
+            self.assertEqual(status["broker_execution"]["broker_request_id"], "brk-100")
+            self.assertEqual(status["broker_execution"]["role_run_id"], "role-worker-1")
+            self.assertEqual(status["broker_execution"]["engine"], "aibroker")
+
+    def test_project_runtime_status_projects_active_broker_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            # Base snapshot with stale READY_TO_RUN
+            snapshot = {
+                "project_id": "p1",
+                "state": "READY_TO_RUN",
+                "lifecycle_state": "READY_TO_RUN",
+                "worker": {"kind": "none", "state": "not_started", "process_alive": False},
+            }
+            # Record an active aibroker execution in transition-executor.json
+            (runtime / "transition-executor.json").write_text(json.dumps({
+                "version": 1,
+                "executions": {
+                    "req-1": {
+                        "project_id": "p1",
+                        "source_request_id": "req-1",
+                        "state": "running",
+                        "engine": "aibroker",
+                        "backend_id": "aibroker",
+                        "broker_request_id": "brk-42",
+                        "role_run_id": "role-run-42",
+                        "started_at": "2026-09-11T12:00:00+00:00",
+                    }
+                }
+            }), encoding="utf-8")
+
+            projected = project_runtime_status(snapshot, runtime)
+            # Projected state must show active broker execution instead of stale READY_TO_RUN
+            self.assertEqual(projected["state"], "WORKER_RUNNING")
+            self.assertEqual(projected["lifecycle_state"], "EXECUTING")
+            self.assertEqual(projected["worker"]["engine"], "aibroker")
+            self.assertEqual(projected["worker"]["state"], "running")
+            self.assertTrue(projected["worker"]["process_alive"])
+            self.assertIn("broker_execution", projected)
+            self.assertEqual(projected["broker_execution"]["broker_request_id"], "brk-42")
+
+    def test_project_runtime_status_projects_active_reviewer_and_planner(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            snapshot = {
+                "project_id": "p1",
+                "state": "READY_TO_RUN",
+                "lifecycle_state": "READY_TO_RUN",
+            }
+            # Active reviewer
+            (runtime / "ai-reviewer.json").write_text(json.dumps({
+                "version": 1,
+                "reviews": {
+                    "rev-1": {
+                        "project_id": "p1",
+                        "review_id": "rev-1",
+                        "state": "running",
+                        "started_at": "2026-09-11T12:00:00+00:00",
+                    }
+                }
+            }), encoding="utf-8")
+
+            projected = project_runtime_status(snapshot, runtime)
+            self.assertEqual(projected["lifecycle_state"], "REVIEWING")
+            self.assertEqual(projected["state"], "REVIEWING")
+            self.assertEqual(projected["reviewer"]["review_id"], "rev-1")
+
+            # Active planner (when no reviewer active)
+            (runtime / "ai-reviewer.json").write_text(json.dumps({"version": 1, "reviews": {}}), encoding="utf-8")
+            (runtime / "ai-planner.json").write_text(json.dumps({
+                "version": 1,
+                "plans": {
+                    "plan-1": {
+                        "project_id": "p1",
+                        "plan_id": "plan-1",
+                        "state": "planning",
+                        "started_at": "2026-09-11T12:05:00+00:00",
+                    }
+                }
+            }), encoding="utf-8")
+
+            projected_plan = project_runtime_status(snapshot, runtime)
+            self.assertEqual(projected_plan["lifecycle_state"], "PLANNING")
+            self.assertEqual(projected_plan["state"], "PLANNING")
+            self.assertEqual(projected_plan["planner"]["plan_id"], "plan-1")
 
 
 if __name__ == "__main__":

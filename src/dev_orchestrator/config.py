@@ -25,7 +25,8 @@ Rules enforced here:
   because it could cross-route two project workflows into one conversation.
 - ``adapter`` defaults to ``agent_files`` when omitted.
 - ``orchestration_ready`` is true when either a structurally valid browser
-  ``conversation_binding`` exists or a direct ``ai_roles.reviewer`` is explicitly enabled.
+  ``conversation_binding`` exists or a direct ``ai_roles.reviewer`` or
+  ``ai_roles.planner`` is explicitly enabled.
   Projects with neither route remain monitorable but not orchestration-ready.
 """
 
@@ -66,6 +67,17 @@ def _direct_reviewer_ready(project: dict[str, Any]) -> bool:
         return False
     reviewer = roles.get("reviewer")
     return isinstance(reviewer, dict) and reviewer.get("enabled") is True
+
+
+def _direct_planner_ready(project: dict[str, Any]) -> bool:
+    execution = project.get("execution")
+    if not isinstance(execution, dict) or execution.get("engine") != "aibroker":
+        return False
+    roles = project.get("ai_roles")
+    if not isinstance(roles, dict):
+        return False
+    planner = roles.get("planner")
+    return isinstance(planner, dict) and planner.get("enabled") is True
 
 
 def _binding_ready(binding: Any) -> bool:
@@ -128,6 +140,7 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
     normalized["orchestration_ready"] = (
         _binding_ready(normalized.get("conversation_binding"))
         or _direct_reviewer_ready(normalized)
+        or _direct_planner_ready(normalized)
     )
     return normalized
 
