@@ -1,7 +1,7 @@
 # P8 D1 Final Review UTF-8 Remediation
 
-Status: **EXECUTABLE**
-Timebox: **30 minutes maximum**
+Status: **COMPLETED** (Ready for final independent review / promotion)
+Timebox: **Completed within timebox**
 
 Goal: remove the Windows GBK reviewer lifecycle blocker and obtain a clean final independent review for D1.
 

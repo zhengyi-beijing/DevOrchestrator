@@ -6,6 +6,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
 from dev_orchestrator.ai import (
     AIBrokerClientConfig,
     AIBrokerExecutionPort,
@@ -62,11 +66,61 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         self.assertEqual(result.dispatch_id, "dispatch-1")
         self.assertEqual(result.execution_id, "execution-1")
         self.assertEqual(result.resource_context.provider, "deepseek")
+        self.assertEqual(run.call_args.kwargs["env"]["PYTHONUTF8"], "1")
+        self.assertEqual(run.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8")
         argv = run.call_args.args[0]
         self.assertIn("ai_resource_broker.cli", argv)
         self.assertEqual(argv.count("dispatch"), 1)
         self.assertIn("--role", argv)
         self.assertNotIn("--provider", argv)
+
+    @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
+    def test_execute_handles_unicode_reviewer_output_with_checkmark(self, run):
+        reviewer_output = "✅ REVIEW ACCEPTED: All requirements met ✓ ✔"
+        payload = self.payload(
+            role="reviewer",
+            output=reviewer_output,
+        )
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(payload, ensure_ascii=False), stderr=""
+        )
+        result = self.port.execute(self.request(role="reviewer"))
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.output, reviewer_output)
+        self.assertEqual(run.call_args.kwargs["env"]["PYTHONUTF8"], "1")
+        self.assertEqual(run.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8")
+
+    def test_child_environment_forces_utf8_for_unicode_reviewer_output(self):
+        env = self.port._build_env()
+        self.assertEqual(env.get("PYTHONUTF8"), "1")
+        self.assertEqual(env.get("PYTHONIOENCODING"), "utf-8")
+
+        # Execute a real child Python process using the configured environment
+        # and verify it emits Unicode reviewer output containing checkmarks without codec error
+        test_script = (
+            "import json; print(json.dumps({'status': 'succeeded', 'output': '✅ REVIEW ACCEPTED: all tests green ✓ ✔'}, ensure_ascii=False))"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", test_script],
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertEqual(proc.returncode, 0, f"Child process failed: {proc.stderr}")
+        data = json.loads(proc.stdout)
+        self.assertEqual(data["output"], "✅ REVIEW ACCEPTED: all tests green ✓ ✔")
+
+        # Verify child Python process stdout encoding is utf-8
+        enc_proc = subprocess.run(
+            [sys.executable, "-c", "import sys; print(sys.stdout.encoding.lower())"],
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertEqual(enc_proc.returncode, 0)
+        self.assertIn("utf-8", enc_proc.stdout.strip())
 
     @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
     def test_transport_timeout_covers_long_task_timeout(self, run):
@@ -146,6 +200,10 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         self.assertIn("dispatch-status", first)
         self.assertIn("interrupt-dispatch", second)
         self.assertIn("--reason", second)
+        self.assertEqual(run.call_args_list[0].kwargs["env"]["PYTHONUTF8"], "1")
+        self.assertEqual(run.call_args_list[0].kwargs["env"]["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(run.call_args_list[1].kwargs["env"]["PYTHONUTF8"], "1")
+        self.assertEqual(run.call_args_list[1].kwargs["env"]["PYTHONIOENCODING"], "utf-8")
 
     def test_request_validation_is_fail_closed(self):
         with self.assertRaises(ValueError):

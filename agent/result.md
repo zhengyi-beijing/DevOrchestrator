@@ -29,7 +29,12 @@ D1 Self-Hosted DevOrchestrator Integration:
   - `AIPlannerCoordinator` and `AIReviewerCoordinator` now propagate `conversation_binding` in all `emit()` calls and populate `_project_bindings` cache on startup and review launch.
   - `progress-channel.json` schema extended with `project_bindings` and `project_configs` sections.
   - 7 new regression tests added in `ProgressChannelBindingPropagationTests` covering register, resolve, string-project emit, cross-restart persistence, resolver callback, and explicit-binding cache update.
+- P8 Review Remediation (Windows GBK Unicode Transport Blocker):
+  - In `src/dev_orchestrator/ai/aibroker_subprocess.py`, forced child Python environment to UTF-8 (`PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8`) across all AIBroker dispatch (`execute`) and reconciliation (`_reconcile_call`: `status`, `interrupt`) calls via `_build_env()`, preserving existing provider selection and PYTHONPATH configuration.
+  - Added regression test `test_execute_handles_unicode_reviewer_output_with_checkmark` in `tests_py/test_aibroker_execution_port.py` verifying reviewer output with checkmarks (`✅`, `✓`, `✔`) is properly received and preserved in `AIRoleResult.output`.
+  - Added real child process regression test `test_child_environment_forces_utf8_for_unicode_reviewer_output` in `tests_py/test_aibroker_execution_port.py` confirming that child Python processes run with UTF-8 stdout encoding and emit Unicode reviewer output without GBK `UnicodeEncodeError`.
+  - Added assertions in `test_success_maps_broker_result_and_preserves_semantics` and `test_status_and_interrupt_use_broker_reconciliation_commands` confirming child environment flags.
 - Verification:
-  - 209 unit tests passing cleanly (`python -m unittest discover -s tests_py`).
+  - 211 unit tests passing cleanly (`python -m unittest discover -s tests_py`).
   - `node --check browser/chatgpt-web-adapter.user.js` passing.
   - `git diff --check` clean.

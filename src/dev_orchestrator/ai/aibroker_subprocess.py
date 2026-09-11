@@ -37,12 +37,18 @@ class AIBrokerExecutionPort:
     def __init__(self, config: AIBrokerClientConfig) -> None:
         self.config = config
 
-    def execute(self, request: AIRoleRequest) -> AIRoleResult:
-        argv = self._build_argv(request)
+    def _build_env(self) -> dict[str, str]:
         env = dict(os.environ)
         broker_src = str(self.config.broker_repo / "src")
         existing = env.get("PYTHONPATH")
         env["PYTHONPATH"] = broker_src + (os.pathsep + existing if existing else "")
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        return env
+
+    def execute(self, request: AIRoleRequest) -> AIRoleResult:
+        argv = self._build_argv(request)
+        env = self._build_env()
         transport_timeout = self.config.process_timeout_seconds
         if request.timeout_seconds is not None:
             transport_timeout = max(transport_timeout, float(request.timeout_seconds) + 60.0)
@@ -88,10 +94,7 @@ class AIBrokerExecutionPort:
         if self.config.database_path is not None:
             argv += ["--database", str(self.config.database_path)]
         argv += args
-        env = dict(os.environ)
-        broker_src = str(self.config.broker_repo / "src")
-        existing = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = broker_src + (os.pathsep + existing if existing else "")
+        env = self._build_env()
         try:
             completed = subprocess.run(
                 argv, cwd=str(self.config.broker_repo), env=env, text=True,
