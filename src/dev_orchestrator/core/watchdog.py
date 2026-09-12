@@ -36,6 +36,10 @@ WATCHDOG_COMMAND_PREFIX = "wd-"
 MAX_TERMINAL_ATTEMPTS_PER_PROJECT = 20
 NONTERMINAL_ATTEMPT_STATES = frozenset({"running", "reserved", "requested"})
 
+# FR-2A: Allow up to this many seconds of clock skew when validating completed_at.
+# A completed_at that is more than this far in the future is treated as invalid/tampered.
+RECOVERY_COMPLETED_AT_CLOCK_SKEW_S = 60
+
 ACTIVE_LIFECYCLE_STATES = frozenset({
     "PLANNING",
     "REVIEWING_PLAN",
@@ -701,38 +705,72 @@ class WatchdogCoordinator:
         return loaded
 
     def _quarantine_corrupt_state(self, reason: str, raw_bytes: bytes) -> dict[str, Any]:
-        # R3-F4: When raw_bytes is empty (file was unreadable), derive the identity from
-        # the error reason rather than hashing empty bytes, which would produce a constant
-        # hash (e3b0c44298fc1c14) and collapse all distinct unreadable errors into one slot.
-        if raw_bytes:
-            file_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
-        else:
-            file_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
         self._preserve_existing_state_file = True
-        # Avoid quarantine-copy growth: skip write if a file with the same content hash exists.
-        already_quarantined = any(
-            file_hash in q.name
-            for q in self.runtime_root.glob("watchdog.json.corrupt-*")
-        )
-        if not already_quarantined:
-            stamp = utc_now_iso().replace(":", "-")
-            quarantine_file = self.runtime_root / f"watchdog.json.corrupt-{stamp}-{file_hash}"
-            try:
-                if raw_bytes:
-                    quarantine_file.write_bytes(raw_bytes)
-                elif self.state_path.exists():
-                    shutil.copy2(self.state_path, quarantine_file)
-            except OSError:
-                pass
+        stamp = utc_now_iso().replace(":", "-")
 
+        if raw_bytes:
+            # Identity is derived directly from the corrupt bytes — deterministic and verifiable.
+            file_hash: Optional[str] = hashlib.sha256(raw_bytes).hexdigest()[:16]
+            already_quarantined = any(
+                q.name.endswith(f"-{file_hash}")
+                for q in self.runtime_root.glob("watchdog.json.corrupt-*")
+            )
+            if not already_quarantined:
+                quarantine_file = self.runtime_root / f"watchdog.json.corrupt-{stamp}-{file_hash}"
+                try:
+                    quarantine_file.write_bytes(raw_bytes)
+                except OSError:
+                    pass
+        else:
+            # FR-3: raw_bytes unavailable (e.g. OSError during read).  Attempt to copy the
+            # state file and derive identity from the copied artifact's bytes so that
+            # clear_degraded can cryptographically verify the artifact later.  If the copy or
+            # the read-back fails, no verifiable artifact is produced; corrupt_identity is set
+            # to None and clear_degraded will remain degraded (fail closed).
+            file_hash = None
+            if self.state_path.exists():
+                # Use a reason-derived preliminary name; rename to content-hash name after copy.
+                reason_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
+                temp_quarantine = self.runtime_root / f"watchdog.json.corrupt-{stamp}-{reason_hash}"
+                try:
+                    shutil.copy2(self.state_path, temp_quarantine)
+                    copied_bytes = temp_quarantine.read_bytes()
+                    real_hash = hashlib.sha256(copied_bytes).hexdigest()[:16]
+                    # Check for an existing quarantine under the real content hash.
+                    already_quarantined = any(
+                        q.name.endswith(f"-{real_hash}")
+                        for q in self.runtime_root.glob("watchdog.json.corrupt-*")
+                        if q != temp_quarantine
+                    )
+                    if already_quarantined:
+                        try:
+                            temp_quarantine.unlink()
+                        except OSError:
+                            pass
+                    else:
+                        final_quarantine = self.runtime_root / f"watchdog.json.corrupt-{stamp}-{real_hash}"
+                        try:
+                            temp_quarantine.rename(final_quarantine)
+                        except OSError:
+                            pass  # leave under temp name; identity still set
+                    file_hash = real_hash
+                except (OSError, IOError):
+                    # Copy or read-back failed — clean up any partial file and leave
+                    # file_hash=None so that clear_degraded remains degraded (fail closed).
+                    try:
+                        temp_quarantine.unlink()
+                    except (OSError, NameError):
+                        pass
+
+        notification_hash = file_hash or hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
         if self.progress_channel is not None and hasattr(self.progress_channel, "emit"):
             try:
                 self.progress_channel.emit(
                     "__controller__",
                     "OWNER_GATE",
-                    occurrence_key=f"corrupt-state:{file_hash}",
+                    occurrence_key=f"corrupt-state:{notification_hash}",
                     message=f"Watchdog state corrupt ({reason}); degraded monitor-only mode active",
-                    details={"source": "watchdog", "gate": "corrupt-state", "reason": reason, "hash": file_hash},
+                    details={"source": "watchdog", "gate": "corrupt-state", "reason": reason, "hash": notification_hash},
                 )
             except Exception:
                 pass
@@ -741,8 +779,9 @@ class WatchdogCoordinator:
             "version": WATCHDOG_SCHEMA_VERSION,
             "degraded": True,
             "degraded_reason": reason,
-            # FR-3: Persist the quarantine artifact identity so clear_degraded can verify
-            # the matching artifact exists and is readable before clearing degraded mode.
+            # FR-3: Persist the quarantine artifact identity (SHA-256[:16] of artifact bytes)
+            # so clear_degraded can cryptographically verify the matching artifact.  None when
+            # no verifiable artifact could be produced (fail-closed: clear_degraded blocked).
             "corrupt_identity": file_hash,
             "last_tick_error": None,
             "quarantined_projects": {},
@@ -844,48 +883,78 @@ class WatchdogCoordinator:
             return copy.deepcopy(p) if isinstance(p, dict) else None
 
     def clear_degraded(self) -> None:
-        """Clear degraded mode only after verifying the matching quarantine artifact is readable.
+        """Clear degraded mode only after cryptographically verifying the quarantine artifact.
 
-        FR-3: The quarantine artifact corresponding to the active corruption identity
-        must exist and be readable before degraded mode may be cleared.  Clearing without
-        a verified artifact would silently discard the evidence of the corruption event.
+        FR-3: corrupt_identity must be present; the quarantine filename must contain the
+        identity as an exact trailing segment (not a substring of a different hash); and the
+        SHA-256[:16] of the artifact bytes must match the stored corrupt_identity.  Any
+        deviation causes clear_degraded to block and remain degraded (fail closed).
         """
         with self._lock:
             if not self._cached_state.get("degraded"):
                 return
             corrupt_identity = self._cached_state.get("corrupt_identity")
-            if corrupt_identity:
-                matching_files = [
-                    f for f in self.runtime_root.glob("watchdog.json.corrupt-*")
-                    if corrupt_identity in f.name
-                ]
-                if not matching_files:
-                    self._emit_milestone(
-                        "__controller__",
-                        "OWNER_GATE",
-                        occurrence_key=f"clear-degraded:no-quarantine:{corrupt_identity}",
-                        details={
-                            "source": "watchdog",
-                            "gate": "clear-degraded-blocked",
-                            "reason": "no_matching_quarantine_artifact",
-                            "corrupt_identity": corrupt_identity,
-                        },
-                    )
-                    return
+            if not corrupt_identity:
+                # FR-3: No verifiable identity stored — cannot confirm the artifact; remain
+                # degraded.  This covers both absent and None corrupt_identity.
+                self._emit_milestone(
+                    "__controller__",
+                    "OWNER_GATE",
+                    occurrence_key="clear-degraded:no-corrupt-identity",
+                    details={
+                        "source": "watchdog",
+                        "gate": "clear-degraded-blocked",
+                        "reason": "corrupt_identity_absent",
+                        "corrupt_identity": None,
+                    },
+                )
+                return
+            # FR-3: Exact segment match — the identity must be the last dash-separated
+            # segment of the filename, not merely a substring anywhere in the name.
+            matching_files = [
+                f for f in self.runtime_root.glob("watchdog.json.corrupt-*")
+                if f.name.endswith(f"-{corrupt_identity}")
+            ]
+            if not matching_files:
+                self._emit_milestone(
+                    "__controller__",
+                    "OWNER_GATE",
+                    occurrence_key=f"clear-degraded:no-quarantine:{corrupt_identity}",
+                    details={
+                        "source": "watchdog",
+                        "gate": "clear-degraded-blocked",
+                        "reason": "no_matching_quarantine_artifact",
+                        "corrupt_identity": corrupt_identity,
+                    },
+                )
+                return
+            # FR-3: Content verification — recompute SHA-256[:16] of artifact bytes and
+            # compare against stored corrupt_identity.  A readable filename is not enough;
+            # the bytes must hash to the stored identity to confirm the correct artifact.
+            verified = False
+            for f in matching_files:
+                try:
+                    artifact_bytes = f.read_bytes()
+                    if artifact_bytes and hashlib.sha256(artifact_bytes).hexdigest()[:16] == corrupt_identity:
+                        verified = True
+                        break
+                except (OSError, IOError):
+                    pass
+            if not verified:
                 readable = any(_is_quarantine_file_readable(f) for f in matching_files)
-                if not readable:
-                    self._emit_milestone(
-                        "__controller__",
-                        "OWNER_GATE",
-                        occurrence_key=f"clear-degraded:unreadable:{corrupt_identity}",
-                        details={
-                            "source": "watchdog",
-                            "gate": "clear-degraded-blocked",
-                            "reason": "quarantine_artifact_unreadable",
-                            "corrupt_identity": corrupt_identity,
-                        },
-                    )
-                    return
+                reason = "quarantine_artifact_unreadable" if not readable else "quarantine_artifact_content_mismatch"
+                self._emit_milestone(
+                    "__controller__",
+                    "OWNER_GATE",
+                    occurrence_key=f"clear-degraded:unreadable:{corrupt_identity}",
+                    details={
+                        "source": "watchdog",
+                        "gate": "clear-degraded-blocked",
+                        "reason": reason,
+                        "corrupt_identity": corrupt_identity,
+                    },
+                )
+                return
             self._cached_state["degraded"] = False
             self._cached_state["degraded_reason"] = None
             self._save_state(self._cached_state)
@@ -1426,8 +1495,12 @@ class WatchdogCoordinator:
                 return
             # R3-F2: Re-probe: current snapshot PID must match the evidence PID to ensure
             # we are recovering the same execution, not a different one that reused the slot.
+            # FR-2B: Absent current PID is not a safe match — fail closed.
             current_pid = current_worker.get("pid")
-            if current_pid is not None and current_pid != ev_pid:
+            if current_pid is None:
+                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_current_pid_absent")
+                return
+            if current_pid != ev_pid:
                 self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_pid_mismatch")
                 return
 
@@ -1440,23 +1513,37 @@ class WatchdogCoordinator:
             # R3-F2: Cross-check evidence PID against the current snapshot worker PID.
             # If the PID changed (new execution started after diagnosis), the stored evidence
             # belongs to a different run and must not trigger recovery for the new one.
+            # FR-2B: Absent current PID is not a safe match — require stable execution
+            # binding; fail closed when the current identity cannot be confirmed.
             current_pid = current_worker.get("pid")
-            if current_pid is not None and current_pid != ev_pid:
+            if current_pid is None:
+                self._emit_owner_gate_once(pid, attempt_record, "process_dead_current_pid_absent")
+                return
+            if current_pid != ev_pid:
                 self._emit_owner_gate_once(pid, attempt_record, "process_dead_pid_mismatch")
                 return
 
-        # R3-F2: Bound evidence age to the cooldown window.  Evidence that is older than
-        # one cooldown period is considered stale; any attempt to recover from it after the
-        # cooldown expires would mean we are acting on a diagnosis from a previous run scope.
+        # FR-2A: completed_at must be present, parseable, not materially future-dated, and
+        # within the configured evidence/recovery age window.  Fail closed on any deviation
+        # to prevent acting on missing, tampered, or stale diagnostic timestamps.
         completed_at_str = attempt_record.get("completed_at")
-        if completed_at_str:
-            completed_dt = parse_utc(completed_at_str)
-            if completed_dt is not None:
-                cooldown_min = float(project_row.get("cooldown_minutes") or policy.get("cooldown_minutes") or 30)
-                age_seconds = (datetime.now(timezone.utc) - completed_dt).total_seconds()
-                if age_seconds > cooldown_min * 60:
-                    self._emit_owner_gate_once(pid, attempt_record, "evidence_stale_beyond_cooldown")
-                    return
+        if not completed_at_str:
+            self._emit_owner_gate_once(pid, attempt_record, "evidence_missing_completed_at")
+            return
+        completed_dt = parse_utc(completed_at_str)
+        if completed_dt is None:
+            self._emit_owner_gate_once(pid, attempt_record, "evidence_unparseable_completed_at")
+            return
+        now_utc = datetime.now(timezone.utc)
+        future_delta = (completed_dt - now_utc).total_seconds()
+        if future_delta > RECOVERY_COMPLETED_AT_CLOCK_SKEW_S:
+            self._emit_owner_gate_once(pid, attempt_record, "evidence_completed_at_future")
+            return
+        cooldown_min = float(project_row.get("cooldown_minutes") or policy.get("cooldown_minutes") or 30)
+        age_seconds = (now_utc - completed_dt).total_seconds()
+        if age_seconds > cooldown_min * 60:
+            self._emit_owner_gate_once(pid, attempt_record, "evidence_stale_beyond_cooldown")
+            return
 
         # Check repository truth
         repo_path = str(project_config.get("repo_path") or snapshot.get("repo_path") or "")

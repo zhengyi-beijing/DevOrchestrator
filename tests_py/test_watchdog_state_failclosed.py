@@ -260,7 +260,7 @@ class WatchdogStateFailclosedTests(unittest.TestCase):
         self.assertEqual(gate_events[0][2]["details"]["reason"], "quarantine_artifact_unreadable")
 
     def test_fr3_clear_degraded_blocked_unreadable_quarantine_file(self):
-        """FR-3: clear_degraded must fail when the matching quarantine file raises IOError."""
+        """FR-3: clear_degraded must fail when reading the matching quarantine file raises IOError."""
         from unittest.mock import patch
 
         self.state_file.write_bytes(b"NOT VALID JSON {[[")
@@ -271,15 +271,16 @@ class WatchdogStateFailclosedTests(unittest.TestCase):
         corrupt_identity = coordinator._cached_state.get("corrupt_identity")
         self.assertIsNotNone(corrupt_identity)
 
-        # Patch _is_quarantine_file_readable to simulate an IOError
-        import dev_orchestrator.core.watchdog as wd_module
-        original_fn = wd_module._is_quarantine_file_readable
+        # Patch Path.read_bytes so that reading the quarantine file raises OSError.
+        original_read_bytes = Path.read_bytes
 
-        def always_unreadable(path):
-            return False
+        def ioerror_for_corrupt_files(path_self: Path):
+            if "watchdog.json.corrupt-" in path_self.name:
+                raise OSError("simulated IOError on quarantine read")
+            return original_read_bytes(path_self)
 
         channel.events.clear()
-        with patch.object(wd_module, "_is_quarantine_file_readable", always_unreadable):
+        with patch.object(Path, "read_bytes", ioerror_for_corrupt_files):
             coordinator.clear_degraded()
 
         self.assertTrue(coordinator.state()["degraded"])
@@ -300,6 +301,109 @@ class WatchdogStateFailclosedTests(unittest.TestCase):
         corrupt_files = list(self.runtime_dir.glob("watchdog.json.corrupt-*"))
         self.assertEqual(len(corrupt_files), 1)
         self.assertIn(corrupt_identity, corrupt_files[0].name)
+
+    # -----------------------------------------------------------------------
+    # P10-FR-3 round-5: additional cryptographic binding tests
+    # -----------------------------------------------------------------------
+
+    def test_fr3_clear_degraded_blocked_when_corrupt_identity_absent(self):
+        """FR-3: clear_degraded must fail closed when corrupt_identity is absent/None.
+        Without a stored identity there is no way to verify the artifact."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        # Manually inject degraded state without a corrupt_identity
+        coordinator._cached_state["degraded"] = True
+        coordinator._cached_state["degraded_reason"] = "injected"
+        coordinator._cached_state["corrupt_identity"] = None
+
+        coordinator.clear_degraded()
+
+        self.assertTrue(coordinator.state()["degraded"])
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "corrupt_identity_absent")
+
+    def test_fr3_clear_degraded_blocked_content_hash_mismatch(self):
+        """FR-3: clear_degraded must fail when a quarantine file has the correct name segment
+        but its content SHA-256 does not match the stored corrupt_identity (wrong-content attack)."""
+        import hashlib
+        self.state_file.write_bytes(b"NOT VALID JSON {[[")
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        self.assertTrue(coordinator.state()["degraded"])
+
+        corrupt_identity = coordinator._cached_state.get("corrupt_identity")
+        self.assertIsNotNone(corrupt_identity)
+
+        # Replace the correct quarantine file content with different bytes while keeping
+        # the filename (which embeds the original hash) — simulates content tampering.
+        for f in self.runtime_dir.glob("watchdog.json.corrupt-*"):
+            f.write_bytes(b"TAMPERED CONTENT")
+        # Sanity check: tampered content has a different SHA-256
+        tampered_hash = hashlib.sha256(b"TAMPERED CONTENT").hexdigest()[:16]
+        self.assertNotEqual(tampered_hash, corrupt_identity)
+
+        channel.events.clear()
+        coordinator.clear_degraded()
+
+        self.assertTrue(coordinator.state()["degraded"])
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "quarantine_artifact_content_mismatch")
+
+    def test_fr3_clear_degraded_succeeds_with_correct_content(self):
+        """FR-3: clear_degraded must succeed when the quarantine file content SHA-256 matches
+        the stored corrupt_identity (correct, unmodified artifact)."""
+        import hashlib
+        raw = b"NOT VALID JSON {[["
+        expected_hash = hashlib.sha256(raw).hexdigest()[:16]
+
+        self.state_file.write_bytes(raw)
+        coordinator = WatchdogCoordinator(self.runtime_dir)
+        self.assertTrue(coordinator.state()["degraded"])
+        self.assertEqual(coordinator._cached_state["corrupt_identity"], expected_hash)
+
+        coordinator.clear_degraded()
+
+        self.assertFalse(coordinator.state()["degraded"])
+
+    def test_fr3_copy_semantics_identity_derived_from_copied_artifact_bytes(self):
+        """FR-3: when raw bytes are unavailable (OSError during read), the quarantine copy
+        is made via shutil.copy2 and corrupt_identity is derived from the copied bytes.
+        A subsequent clear_degraded should succeed when the artifact content matches."""
+        import hashlib
+        raw = b'{"version": 999, "projects": {}}'  # will trigger unsupported version
+        self.state_file.write_bytes(raw)
+
+        original_read_bytes = Path.read_bytes
+
+        def failing_read_bytes(path_self: Path):
+            if path_self == self.state_file:
+                raise OSError("permission denied")
+            return original_read_bytes(path_self)
+
+        with patch("pathlib.Path.read_bytes", new=failing_read_bytes):
+            coordinator = WatchdogCoordinator(self.runtime_dir)
+
+        self.assertTrue(coordinator.state()["degraded"])
+
+        # corrupt_identity must be the SHA-256[:16] of the raw file content (from copied bytes)
+        corrupt_identity = coordinator._cached_state.get("corrupt_identity")
+        self.assertIsNotNone(corrupt_identity, "corrupt_identity must be set even for OSError copy path")
+        expected_identity = hashlib.sha256(raw).hexdigest()[:16]
+        self.assertEqual(corrupt_identity, expected_identity,
+                         "corrupt_identity must be derived from copied artifact bytes, not from reason string")
+
+        # The quarantine filename must embed the content-derived hash
+        corrupt_files = list(self.runtime_dir.glob("watchdog.json.corrupt-*"))
+        self.assertEqual(len(corrupt_files), 1)
+        self.assertTrue(corrupt_files[0].name.endswith(f"-{corrupt_identity}"),
+                        f"Quarantine filename must end with '-{corrupt_identity}'")
+
+        # clear_degraded must now succeed (correct artifact, matching identity)
+        coordinator.clear_degraded()
+        self.assertFalse(coordinator.state()["degraded"],
+                         "clear_degraded must succeed when copied artifact content matches identity")
 
 
 if __name__ == "__main__":

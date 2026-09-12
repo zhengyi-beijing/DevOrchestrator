@@ -1,3 +1,4 @@
+import datetime as _dt
 import json
 import subprocess
 import tempfile
@@ -8,6 +9,13 @@ from dev_orchestrator.core.watchdog import (
     WATCHDOG_COMMAND_PREFIX,
     WatchdogCoordinator,
 )
+
+
+def _recent_completed_at(minutes_ago: float = 5.0) -> str:
+    """Return a recent ISO-8601 UTC timestamp for use in test fixtures."""
+    return (
+        _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=minutes_ago)
+    ).isoformat()
 
 
 class DummyProgressChannel:
@@ -72,6 +80,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
+            # FR-2A: completed_at required for recovery to proceed
+            "completed_at": _recent_completed_at(),
             # R3-F1/F2: evidence must match current snapshot for recovery to proceed
             "evidence_hash": "bc9a67e4be8cf301",
             "evidence": {
@@ -132,6 +142,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "task_id": "T1",
             "state": "completed",
             "diagnosis": "agent_stalled",
+            # FR-2A: completed_at required so check reaches slot verification
+            "completed_at": _recent_completed_at(),
             "evidence_hash": "cacf7f4ba8bc2796",
             "evidence": {
                 "process_liveness": {"process_alive": True, "pid": 9876, "worker_state": "running"},
@@ -347,6 +359,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "process_dead",
             "owner_gate_required": False,
+            # FR-2A: completed_at required; FR-2B: snapshot must supply matching pid
+            "completed_at": _recent_completed_at(),
             "evidence_hash": "46002a75ab06c6c7",
             # Evidence confirms process is truly dead
             "evidence": {
@@ -354,13 +368,16 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
         }
         prow = {"attempts": {"att-f2-confirmed": att_confirmed_dead}}
+        coordinator._cached_state["projects"]["p1"] = prow
         coordinator._check_and_trigger_recovery(
             project_config={
                 "project_id": "p1",
                 "repo_path": str(self.repo_dir),
                 "watchdog": {"enabled": True, "auto_recovery": True},
             },
-            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir)},
+            # FR-2B: worker pid in snapshot must match evidence pid for process_dead
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "worker": {"pid": 5678, "state": "completed"}},
             project_row=prow,
             attempt_key="att-f2-confirmed",
             attempt_record=att_confirmed_dead,
@@ -1031,6 +1048,307 @@ class WatchdogRecoveryTests(unittest.TestCase):
         gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
         self.assertEqual(len(gate_events), 1)
         self.assertIn("inconsistent", gate_events[0][2]["details"]["reason"])
+
+    # -----------------------------------------------------------------------
+    # P10-FR-2A: completed_at must be present, parseable, not future, within window
+    # -----------------------------------------------------------------------
+
+    def test_fr2a_missing_completed_at_blocks_recovery(self):
+        """FR-2A: Recovery must be blocked when completed_at is absent from the attempt record."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 7001, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-fr2a-missing-cat",
+            "run_scope_key": "rscope-fr2a-1",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+            # no completed_at
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2a-missing-cat": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 7001, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-fr2a-missing-cat",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "evidence_missing_completed_at")
+
+    def test_fr2a_malformed_completed_at_blocks_recovery(self):
+        """FR-2A: Recovery must be blocked when completed_at is present but not parseable."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 7002, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-fr2a-malformed-cat",
+            "run_scope_key": "rscope-fr2a-2",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+            "completed_at": "not-a-valid-timestamp",
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2a-malformed-cat": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 7002, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-fr2a-malformed-cat",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "evidence_unparseable_completed_at")
+
+    def test_fr2a_future_completed_at_beyond_clock_skew_blocks_recovery(self):
+        """FR-2A: Recovery must be blocked when completed_at is materially in the future
+        (beyond the documented clock-skew tolerance)."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import RECOVERY_COMPLETED_AT_CLOCK_SKEW_S
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 7003, "worker_state": "running"}}
+        # Set completed_at to well beyond the clock-skew tolerance
+        far_future = (
+            _dt.datetime.now(_dt.timezone.utc)
+            + _dt.timedelta(seconds=RECOVERY_COMPLETED_AT_CLOCK_SKEW_S + 120)
+        ).isoformat()
+        att = {
+            "attempt_key": "att-fr2a-future-cat",
+            "run_scope_key": "rscope-fr2a-3",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+            "completed_at": far_future,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2a-future-cat": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 7003, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-fr2a-future-cat",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "evidence_completed_at_future")
+
+    def test_fr2a_stale_completed_at_blocks_recovery(self):
+        """FR-2A: Recovery must be blocked when completed_at is present and parseable but
+        older than the configured cooldown window."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 7004, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-fr2a-stale-cat",
+            "run_scope_key": "rscope-fr2a-4",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+            "completed_at": "2022-01-01T00:00:00+00:00",  # clearly stale
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2a-stale-cat": att}, "cooldown_minutes": 30}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 7004, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-fr2a-stale-cat",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("stale", gate_events[0][2]["details"]["reason"])
+
+    # -----------------------------------------------------------------------
+    # P10-FR-2B: absent current PID must fail closed for both diagnosis types
+    # -----------------------------------------------------------------------
+
+    def test_fr2b_agent_stalled_absent_current_pid_blocks_recovery(self):
+        """FR-2B: agent_stalled recovery must be blocked when the current snapshot worker has
+        no PID.  Absent identity is not a safe match — prefer safety over recovery availability."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 8001, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-fr2b-stalled-nopid",
+            "run_scope_key": "rscope-fr2b-1",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2b-stalled-nopid": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Current worker has no PID — should fail closed
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING",
+                      "worker": {"state": "running"}},  # no "pid" key
+            project_row=prow,
+            attempt_key="att-fr2b-stalled-nopid",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_current_pid_absent")
+
+    def test_fr2b_agent_stalled_no_worker_in_snapshot_blocks_recovery(self):
+        """FR-2B: agent_stalled recovery must be blocked when the snapshot has no worker at all.
+        The current execution identity cannot be confirmed — fail closed."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 8002, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-fr2b-stalled-noworker",
+            "run_scope_key": "rscope-fr2b-2",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2b-stalled-noworker": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Snapshot has no worker dict at all
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING"},
+            project_row=prow,
+            attempt_key="att-fr2b-stalled-noworker",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_current_pid_absent")
+
+    def test_fr2b_process_dead_absent_current_pid_blocks_recovery(self):
+        """FR-2B: process_dead recovery must be blocked when the current snapshot worker has no PID.
+        Auto-recovery must not proceed without a confirmed current execution identity."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": False, "pid": 8003}}
+        att = {
+            "attempt_key": "att-fr2b-dead-nopid",
+            "run_scope_key": "rscope-fr2b-3",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2b-dead-nopid": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Current snapshot has no worker pid
+            snapshot={"project_id": "p1", "worker": {"state": "completed"}},  # no "pid" key
+            project_row=prow,
+            attempt_key="att-fr2b-dead-nopid",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "process_dead_current_pid_absent")
+
+    def test_fr2b_process_dead_no_worker_in_snapshot_blocks_recovery(self):
+        """FR-2B: process_dead recovery must be blocked when the snapshot has no worker at all
+        (not just absent PID).  Block automatic recovery; prefer safety over recovery availability."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": False, "pid": 8004}}
+        att = {
+            "attempt_key": "att-fr2b-dead-noworker",
+            "run_scope_key": "rscope-fr2b-4",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2b-dead-noworker": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Snapshot has no worker dict at all
+            snapshot={"project_id": "p1"},
+            project_row=prow,
+            attempt_key="att-fr2b-dead-noworker",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "process_dead_current_pid_absent")
 
 
 if __name__ == "__main__":
