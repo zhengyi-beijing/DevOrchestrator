@@ -91,6 +91,9 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "process_liveness": {"process_alive": True, "pid": 1234, "worker_state": "running"},
             },
         }
+        # B-INTEGRITY: seal with record_integrity_hash so the pre-RESERVE check passes
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
         prow = {"attempts": {"att-auto": att}}
         coordinator._cached_state["projects"]["p1"] = prow
 
@@ -376,6 +379,9 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "process_liveness": {"process_alive": False, "pid": 5678},
             },
         }
+        # B-INTEGRITY: seal with record_integrity_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+        att_confirmed_dead["record_integrity_hash"] = compute_record_integrity_hash(att_confirmed_dead)
         prow = {"attempts": {"att-f2-confirmed": att_confirmed_dead}}
         coordinator._cached_state["projects"]["p1"] = prow
         coordinator._check_and_trigger_recovery(
@@ -736,6 +742,9 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             "completed_at": recent_completed,
         }
+        # B-INTEGRITY: seal with record_integrity_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
         prow = {
             "attempts": {"att-f2-fresh": att},
             "cooldown_minutes": 30,
@@ -1303,7 +1312,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         self.assertIsNone(att.get("recovery"))
         gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
         self.assertEqual(len(gate_events), 1)
-        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_current_pid_absent")
+        # P10-R7: absent worker state fails the non-empty active worker check
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_current_worker_not_active")
 
     def test_fr2b_process_dead_absent_current_pid_blocks_recovery(self):
         """FR-2B: process_dead recovery must be blocked when the current snapshot worker has no PID.
@@ -1617,6 +1627,9 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "evidence_hash": compute_ev_hash(evidence),
             "evidence": evidence,
         }
+        # B-INTEGRITY: seal with record_integrity_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
         channel = DummyProgressChannel()
         coordinator = WatchdogCoordinator(
             self.runtime_dir, progress_channel=channel,
@@ -1659,6 +1672,9 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "evidence_hash": compute_ev_hash(evidence),
             "evidence": evidence,
         }
+        # B-INTEGRITY: seal with record_integrity_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
         channel = DummyProgressChannel()
         coordinator = WatchdogCoordinator(
             self.runtime_dir, progress_channel=channel,
@@ -1680,5 +1696,505 @@ class WatchdogRecoveryTests(unittest.TestCase):
         )
         rec = att.get("recovery")
         self.assertIsNotNone(rec, "Recovery must proceed when probe confirms PID dead")
+        self.assertEqual(rec["action"], "continue")
+        self.assertIn(rec["state"], ("requested", "reserved"))
+
+    # -----------------------------------------------------------------------
+    # P10-R7 BLOCKER A regressions: live identity binding
+    # -----------------------------------------------------------------------
+
+    def test_p10r7_agent_stalled_empty_worker_state_blocks_recovery(self):
+        """P10-R7-A: agent_stalled recovery must be blocked when current worker state is
+        empty/absent. An empty state is not a safe match — fail closed to prevent recovering
+        an unknown/indeterminate worker identity."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 11001, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-r7a-emptystate",
+            "run_scope_key": "rscope-r7a-1",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r7a-emptystate": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Worker has no state field (empty) — fails non-empty active worker state check
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 11001}},  # no "state" key
+            project_row=prow,
+            attempt_key="att-r7a-emptystate",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_current_worker_not_active")
+
+    def test_p10r7_agent_stalled_pid_reuse_started_at_mismatch_blocks_recovery(self):
+        """P10-R7-A: agent_stalled recovery must be blocked when evidence started_at differs
+        from current worker started_at.  A reused PID owned by an unrelated/new process has
+        a different started_at — PID equality alone is insufficient."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        evidence = {
+            "process_liveness": {
+                "process_alive": True, "pid": 11002, "worker_state": "running",
+                "started_at": "2026-09-10T01:00:00+00:00",  # original start time
+            }
+        }
+        att = {
+            "attempt_key": "att-r7a-pidreuse",
+            "run_scope_key": "rscope-r7a-2",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r7a-pidreuse": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Same PID but different started_at — PID reuse by a new unrelated process
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {
+                          "pid": 11002, "state": "running",
+                          "started_at": "2026-09-13T00:00:00+00:00",  # different start time
+                      }},
+            project_row=prow,
+            attempt_key="att-r7a-pidreuse",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_started_at_mismatch")
+
+    def test_p10r7_agent_stalled_matching_started_at_proceeds(self):
+        """P10-R7-A happy path: agent_stalled recovery proceeds when evidence started_at
+        matches current worker started_at, confirming the same execution is being recovered."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        evidence = {
+            "process_liveness": {
+                "process_alive": True, "pid": 11003, "worker_state": "running",
+                "started_at": "2026-09-13T06:00:00+00:00",
+            }
+        }
+        att = {
+            "attempt_key": "att-r7a-sameid",
+            "run_scope_key": "rscope-r7a-3",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r7a-sameid": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Same PID and same started_at — same execution, safe to recover
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {
+                          "pid": 11003, "state": "running",
+                          "started_at": "2026-09-13T06:00:00+00:00",  # matches evidence
+                      }},
+            project_row=prow,
+            attempt_key="att-r7a-sameid",
+            attempt_record=att,
+        )
+        rec = att.get("recovery")
+        self.assertIsNotNone(rec, "Recovery must proceed when started_at matches")
+        self.assertEqual(rec["action"], "continue")
+        self.assertIn(rec["state"], ("requested", "reserved"))
+
+    def test_p10r7_process_dead_started_at_mismatch_blocks_recovery(self):
+        """P10-R7-A: process_dead recovery must be blocked when evidence started_at differs
+        from current worker started_at.  Different started_at means a different execution."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        evidence = {
+            "process_liveness": {
+                "process_alive": False, "pid": 11004,
+                "started_at": "2026-09-10T01:00:00+00:00",  # original start time
+            }
+        }
+        att = {
+            "attempt_key": "att-r7a-dead-mismatch",
+            "run_scope_key": "rscope-r7a-4",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: False,
+        )
+        prow = {"attempts": {"att-r7a-dead-mismatch": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Same PID but different started_at — different execution
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "worker": {
+                          "pid": 11004, "state": "running",
+                          "started_at": "2026-09-13T00:00:00+00:00",  # differs from evidence
+                      }},
+            project_row=prow,
+            attempt_key="att-r7a-dead-mismatch",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "process_dead_started_at_mismatch")
+
+    # -----------------------------------------------------------------------
+    # P10-R7 BLOCKER B regressions: complete actuation-record integrity
+    # -----------------------------------------------------------------------
+
+    def test_p10r7_record_integrity_missing_hash_blocks_recovery(self):
+        """P10-R7-B: Recovery must be blocked when record_integrity_hash is absent from a
+        completed attempt record.  Legacy/untrusted records without the field fail closed."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12001, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-r7b-nohash",
+            "run_scope_key": "rscope-r7b-1",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+            # deliberately NO record_integrity_hash
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r7b-nohash": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 12001, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-r7b-nohash",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "malformed_attempt_no_record_hash")
+
+    def test_p10r7_compute_record_integrity_hash_covers_all_fields(self):
+        """P10-R7-B unit test: compute_record_integrity_hash must be sensitive to changes in
+        each of attempt_key, run_scope_key, diagnosis, completed_at, and evidence_hash."""
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        base = {
+            "attempt_key": "att-base",
+            "run_scope_key": "rscope-base",
+            "diagnosis": "agent_stalled",
+            "completed_at": "2026-09-13T01:00:00+00:00",
+            "evidence_hash": "abcdef1234567890",
+        }
+        base_hash = compute_record_integrity_hash(base)
+        for field, value in [
+            ("attempt_key", "att-modified"),
+            ("run_scope_key", "rscope-modified"),
+            ("diagnosis", "process_dead"),
+            ("completed_at", "2026-09-14T01:00:00+00:00"),
+            ("evidence_hash", "0000000000000000"),
+        ]:
+            tampered = dict(base)
+            tampered[field] = value
+            self.assertNotEqual(
+                compute_record_integrity_hash(tampered), base_hash,
+                f"hash must change when {field!r} is tampered",
+            )
+
+    def test_p10r7_record_integrity_tampered_diagnosis_blocked(self):
+        """P10-R7-B: Tampering with diagnosis after record_integrity_hash was sealed must
+        block recovery.  Diagnosis tamper changes which branch is taken; evidence-liveness
+        cross-checks catch the inconsistency before record_integrity_hash when the tamped
+        value conflicts with evidence.  Recovery is still fail-closed."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12002, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-r7b-diag-tamper",
+            "run_scope_key": "rscope-r7b-2",
+            "state": "completed",
+            "diagnosis": "agent_stalled",  # original diagnosis
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
+        att["diagnosis"] = "process_dead"  # tamper: change diagnosis after sealing hash
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: False,
+        )
+        prow = {"attempts": {"att-r7b-diag-tamper": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "worker": {"pid": 12002, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-r7b-diag-tamper",
+            attempt_record=att,
+        )
+        # Tampered diagnosis is caught (by process_alive_ambiguous) before record_integrity_hash
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertGreater(len(gate_events), 0, "tampered diagnosis must emit OWNER_GATE")
+
+    def test_p10r7_record_integrity_tampered_completed_at_quarantines(self):
+        """P10-R7-B: Tampering with completed_at after sealing must quarantine the attempt."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12003, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-r7b-cat-tamper",
+            "run_scope_key": "rscope-r7b-3",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(5),  # original: 5 min ago
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
+        att["completed_at"] = _recent_completed_at(1)  # tamper to a different valid timestamp
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r7b-cat-tamper": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 12003, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-r7b-cat-tamper",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        self.assertEqual(att.get("state"), "quarantined")
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "record_integrity_hash_mismatch")
+
+    def test_p10r7_record_integrity_tampered_attempt_key_in_record_quarantines(self):
+        """P10-R7-B: Tampering with the attempt_key field INSIDE the record (not the parameter)
+        must trigger attempt_key_mismatch before the record_integrity_hash check."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12004, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-r7b-key-tamper",  # original key
+            "run_scope_key": "rscope-r7b-4",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
+        att["attempt_key"] = "att-r7b-FORGED"  # tamper: change the key inside the record
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r7b-key-tamper": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 12004, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-r7b-key-tamper",  # the parameter (original, used for lookup)
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        self.assertEqual(att.get("state"), "quarantined")
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        # attempt_key check fires before record_integrity_hash check
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "attempt_key_mismatch")
+
+    def test_p10r7_record_integrity_tampered_run_scope_key_quarantines(self):
+        """P10-R7-B: Tampering with run_scope_key after sealing must quarantine the attempt."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12005, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-r7b-rscope-tamper",
+            "run_scope_key": "rscope-r7b-original",  # original scope
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
+        att["run_scope_key"] = "rscope-r7b-FORGED"  # tamper: change run_scope_key after sealing
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r7b-rscope-tamper": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 12005, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-r7b-rscope-tamper",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        self.assertEqual(att.get("state"), "quarantined")
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "record_integrity_hash_mismatch")
+
+    def test_p10r7_record_integrity_happy_path(self):
+        """P10-R7-B happy path: recovery proceeds when record_integrity_hash is present,
+        correct, and all fields are authentic.  Existing safe paths preserved."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12010, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-r7b-ok",
+            "run_scope_key": "rscope-r7b-ok",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        att["record_integrity_hash"] = compute_record_integrity_hash(att)
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r7b-ok": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 12010, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-r7b-ok",
+            attempt_record=att,
+        )
+        rec = att.get("recovery")
+        self.assertIsNotNone(rec, "Recovery must proceed when record integrity is valid")
         self.assertEqual(rec["action"], "continue")
         self.assertIn(rec["state"], ("requested", "reserved"))

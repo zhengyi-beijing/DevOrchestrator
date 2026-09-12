@@ -372,6 +372,23 @@ def resolve_attempt_key(run_scope_key: str, progress_fingerprint: str) -> str:
     return hashlib.sha256(f"{run_scope_key}|{progress_fingerprint}".encode("utf-8")).hexdigest()[:16]
 
 
+def compute_record_integrity_hash(attempt_record: dict[str, Any]) -> str:
+    """Stable integrity hash over all fields that affect recovery actuation.
+
+    Covers attempt_key, run_scope_key, diagnosis, completed_at, and evidence_hash.
+    Any field tampered without updating this hash will be detected before RESERVE.
+    """
+    fields = {
+        "attempt_key": str(attempt_record.get("attempt_key") or ""),
+        "completed_at": str(attempt_record.get("completed_at") or ""),
+        "diagnosis": str(attempt_record.get("diagnosis") or ""),
+        "evidence_hash": str(attempt_record.get("evidence_hash") or ""),
+        "run_scope_key": str(attempt_record.get("run_scope_key") or ""),
+    }
+    canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def collect_progress_signals(
     snapshot: dict[str, Any],
     runtime_root: Path | str | None,
@@ -1385,6 +1402,10 @@ class WatchdogCoordinator:
             att["evidence_hash"] = diagnosis.evidence_hash
             att["recommended_action"] = diagnosis.recommended_action
             att["owner_gate_required"] = diagnosis.owner_gate_required
+            # B-INTEGRITY: seal the complete actuation record with an integrity hash so that
+            # any tamper of diagnosis, completed_at, attempt_key, run_scope_key, or
+            # evidence_hash is detectable before RESERVE at recovery time.
+            att["record_integrity_hash"] = compute_record_integrity_hash(att)
 
             prow["last_diagnosis"] = diagnosis.code
             prow["last_evidence_hash"] = diagnosis.evidence_hash
@@ -1498,6 +1519,13 @@ class WatchdogCoordinator:
             if ev_worker_state and ev_worker_state not in ACTIVE_WORKER_STATES:
                 self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_worker_not_active")
                 return
+            # FR2B-LIVE-IDENTITY: require non-empty active current worker identity — an empty
+            # or absent worker state is not a safe match for a stalled-worker diagnosis.
+            # Checked before PID so that an absent worker dict (no state, no PID) fails here.
+            current_worker_state = str(current_worker.get("state") or "").lower()
+            if not current_worker_state or current_worker_state not in ACTIVE_WORKER_STATES:
+                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_current_worker_not_active")
+                return
             # R3-F2: Re-probe: current snapshot PID must match the evidence PID to ensure
             # we are recovering the same execution, not a different one that reused the slot.
             # FR-2B: Absent current PID is not a safe match — fail closed.
@@ -1508,12 +1536,13 @@ class WatchdogCoordinator:
             if current_pid != ev_pid:
                 self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_pid_mismatch")
                 return
-            # FR2B-LIVE-IDENTITY: require active current worker identity and re-probe live
-            # liveness at recovery time.  PID equality against a static snapshot is
-            # insufficient — a stale snapshot could match a dead or reused PID.
-            current_worker_state = str(current_worker.get("state") or "").lower()
-            if current_worker_state and current_worker_state not in ACTIVE_WORKER_STATES:
-                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_current_worker_not_active")
+            # STABLE-IDENTITY: if evidence captured started_at, the current worker must carry
+            # the same value.  A reused PID owned by an unrelated/new process will have a
+            # different started_at — fail closed to prevent acting on a PID collision.
+            ev_started_at = str(proc_liveness.get("started_at") or "").strip()
+            current_started_at = str(current_worker.get("started_at") or "").strip()
+            if ev_started_at and ev_started_at != current_started_at:
+                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_started_at_mismatch")
                 return
             try:
                 _live_alive: Optional[bool] = self._liveness_probe(current_pid)
@@ -1540,6 +1569,14 @@ class WatchdogCoordinator:
                 return
             if current_pid != ev_pid:
                 self._emit_owner_gate_once(pid, attempt_record, "process_dead_pid_mismatch")
+                return
+            # STABLE-IDENTITY: if evidence captured started_at, the current worker must carry
+            # the same value.  A reused PID owned by an unrelated/new process will have a
+            # different started_at — fail closed to prevent acting on a PID collision.
+            ev_started_at = str(proc_liveness.get("started_at") or "").strip()
+            current_started_at = str(current_worker.get("started_at") or "").strip()
+            if ev_started_at and ev_started_at != current_started_at:
+                self._emit_owner_gate_once(pid, attempt_record, "process_dead_started_at_mismatch")
                 return
             # FR2B-LIVE-IDENTITY: re-probe live liveness at recovery time to independently
             # confirm the process is still dead.  If the process has since come back alive
@@ -1591,6 +1628,26 @@ class WatchdogCoordinator:
         recovery_slots = project_row.setdefault("recovery_slots", {})
         if recovery_slots.get(r_scope):
             self._emit_owner_gate_once(pid, attempt_record, "recovery_slot_already_consumed")
+            return
+
+        # B-INTEGRITY: verify internal key consistency and complete record integrity before
+        # RESERVE.  A forged, tampered, or substituted record must never consume a recovery
+        # slot.  Fail closed: missing hash → OWNER_GATE; mismatch or key drift → quarantine.
+        internal_att_key = attempt_record.get("attempt_key")
+        if internal_att_key != attempt_key:
+            attempt_record["state"] = "quarantined"
+            attempt_record["quarantine_reason"] = "attempt_key_mismatch"
+            self._emit_owner_gate_once(pid, attempt_record, "attempt_key_mismatch")
+            return
+        stored_rih = attempt_record.get("record_integrity_hash")
+        if not stored_rih:
+            self._emit_owner_gate_once(pid, attempt_record, "malformed_attempt_no_record_hash")
+            return
+        recomputed_rih = compute_record_integrity_hash(attempt_record)
+        if recomputed_rih != stored_rih:
+            attempt_record["state"] = "quarantined"
+            attempt_record["quarantine_reason"] = "record_integrity_hash_mismatch"
+            self._emit_owner_gate_once(pid, attempt_record, "record_integrity_hash_mismatch")
             return
 
         cid = f"{WATCHDOG_COMMAND_PREFIX}{attempt_key}"

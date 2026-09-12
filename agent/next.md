@@ -1,42 +1,31 @@
-# P10 Remediation Round 4 (FR-1, FR-2, FR-3)
+# P10 Remediation Round 7 (Live Identity Binding + Record Integrity)
 
 Status: **COMPLETED (PENDING REVIEW)**
 
-Goal: Fix all three Sol promotion review blockers for P10 on HEAD 6dcd2e1.
+Goal: Fix two remaining GPT-5.6 Sol promotion blockers on HEAD 935e916.
 
 ## Fixes delivered
 
-### FR-1 HIGH — async diagnostic completion deferred to next advance tick
-- **Root cause**: `_run_diagnostic_worker` called `_check_and_trigger_recovery` directly with the `snapshot` captured at diagnostic start.  If the project transitioned EXECUTING → PLANNING/REVIEWING during the diagnostic window (up to 120 s), recovery would act on a stale lifecycle, run_scope_key, and worker identity.
-- **Fix**: Removed the direct call from `_run_diagnostic_worker`.  The diagnostic worker now only writes the completed attempt and saves state.  The next `advance()` tick finds the completed attempt via the dedup path (`att_key in attempts`) and calls `_check_and_trigger_recovery` with the current snapshot, which may be PLANNING, REVIEWING, or any other fresh lifecycle.
-- **Regression**: `test_fr1_stale_snapshot_not_used_at_diagnostic_completion` — diagnostic starts in EXECUTING, subsequent call to `_check_and_trigger_recovery` with PLANNING and REVIEWING snapshots fires `OWNER_GATE` and enqueues no `wd-` command.
+### BLOCKER A HIGH — live identity binding
 
-### FR-2 HIGH — attempt schema validation and evidence_hash recomputation before RESERVE
-- **Root cause**: `_check_and_trigger_recovery` relied on stored `evidence` and `evidence_hash` without revalidation, could not detect corrupted/tampered persisted attempts, and allowed None PIDs to skip identity checks.
-- **Fix**: Added fail-closed validation immediately after the diag-code guard:
-  1. `evidence` must be a non-null dict (gate: `malformed_attempt_no_evidence`).
-  2. `evidence_hash` must be non-null (gate: `malformed_attempt_no_evidence_hash`).
-  3. `evidence_hash(evidence)` recomputed — must exactly match stored value.  Mismatch marks attempt `state="quarantined"` (gate: `evidence_hash_mismatch`).
-  4. `proc_liveness.pid` must be non-null (gate: `malformed_attempt_missing_pid`).
-  5. `proc_liveness.process_alive` key must be present (gate: `malformed_attempt_missing_process_alive`).
-  6. `agent_stalled` requires `process_alive=True` (gate: `evidence_inconsistent_agent_stalled_dead`).
-- All eleven existing test fixtures updated to carry correct 16-char SHA-256 `evidence_hash` values.
-- **New tests**: `test_fr2_altered_evidence_hash_quarantines_attempt`, `test_fr2_missing_evidence_hash_blocks_recovery`, `test_fr2_missing_pid_blocks_recovery`, `test_fr2_missing_process_alive_blocks_recovery`, `test_fr2_malformed_completed_attempt_no_evidence_dict`, `test_fr2_agent_stalled_with_dead_pid_inconsistent_with_diagnosis`.
+- **Root cause 1**: `agent_stalled` worker state check was conditional (`if current_worker_state and ...`) — an empty or absent worker state silently passed the check without verifying it was active.
+- **Root cause 2**: Recovery bound only to PID equality + liveness; a reused PID from an unrelated/new process could match. No stable execution identity (e.g. `started_at`) was checked.
+- **Fix 1**: Changed `if current_worker_state and current_worker_state not in ACTIVE_WORKER_STATES:` to `if not current_worker_state or current_worker_state not in ACTIVE_WORKER_STATES:`. Moved check BEFORE PID check so absent worker dict fails at `agent_stalled_current_worker_not_active`.
+- **Fix 2**: Added `started_at` identity binding for both `agent_stalled` and `process_dead`. If evidence has `started_at`, the current worker must carry the same value. A reused PID owned by a new process has a different `started_at` — fails closed. New gate reasons: `agent_stalled_started_at_mismatch`, `process_dead_started_at_mismatch`.
+- **Regressions** (4 new tests): empty/absent worker state blocked, PID reuse detected via `started_at` mismatch for both diagnosis types, happy path with matching `started_at` proceeds, updated existing test `test_fr2b_agent_stalled_no_worker_in_snapshot_blocks_recovery` expected reason.
 
-### FR-3 MEDIUM — clear_degraded verifies matching quarantine artifact
-- **Root cause**: `clear_degraded()` reset the degraded flag unconditionally without verifying that the quarantine artifact corresponding to the active corruption event exists and is readable.
-- **Fix**:
-  - `_quarantine_corrupt_state` now stores `corrupt_identity` (the 16-char file hash used in the quarantine filename) in the returned state dict.
-  - `clear_degraded()` locates all `watchdog.json.corrupt-*{corrupt_identity}*` files and requires at least one to be readable (non-empty bytes, no IOError).  On failure, emits `OWNER_GATE` with gate reason `no_matching_quarantine_artifact` or `quarantine_artifact_unreadable` and returns without clearing.
-  - Added module-level helper `_is_quarantine_file_readable(path)`.
-- **New tests**: `test_fr3_clear_degraded_blocked_no_quarantine_file`, `test_fr3_clear_degraded_blocked_wrong_hash_quarantine_file`, `test_fr3_clear_degraded_blocked_empty_quarantine_file`, `test_fr3_clear_degraded_blocked_unreadable_quarantine_file`, `test_fr3_corrupt_identity_stored_in_degraded_state`.
+### BLOCKER B MAJOR — complete actuation-record integrity
+
+- **Root cause**: Only `evidence_hash` was persisted and verified before RESERVE. Tampered `diagnosis`, `completed_at`, `attempt_key`, or `run_scope_key` were undetectable; a substituted record could consume a wrong recovery slot.
+- **Fix**: Added `compute_record_integrity_hash(attempt_record)` — stable SHA-256[:16] over `attempt_key`, `run_scope_key`, `diagnosis`, `completed_at`, `evidence_hash`. Persisted as `record_integrity_hash` in `_run_diagnostic_worker`. Added three pre-RESERVE checks in `_check_and_trigger_recovery`: (1) `attempt_record["attempt_key"] == attempt_key` parameter (gate: `attempt_key_mismatch`, quarantine); (2) `record_integrity_hash` present (gate: `malformed_attempt_no_record_hash`); (3) recomputed hash matches stored (gate: `record_integrity_hash_mismatch`, quarantine). Legacy records without the field fail closed (never silently trusted). Updated 5 existing happy-path tests to include `record_integrity_hash`.
+- **Regressions** (7 new tests): hash covers all fields (unit test), missing hash blocked, tampered `diagnosis` blocked, tampered `completed_at` quarantined, tampered `attempt_key` in record quarantined, tampered `run_scope_key` quarantined, happy-path preserved.
 
 ## Test results
-- **322 unit tests passing** (12 new regressions added, prior: 310).
+- **352 unit tests passing** (11 new regressions added, prior: 341).
 - `node --check browser/chatgpt-web-adapter.user.js` clean.
 - `git diff --check` clean.
 
 ## Scope constraints
 - No changes to stable controller `C:\work\github\DevOrchestrator`.
 - No push, no destructive git, no credential or hardware actions.
-- All changes are surgical within existing abstractions.
+- All changes are surgical within existing watchdog abstractions.
