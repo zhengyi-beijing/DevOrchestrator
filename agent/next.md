@@ -1,27 +1,19 @@
-# P8 D1 Final Review UTF-8 Remediation
+﻿# P9 D2 Durable Project Context Foundation
 
-Status: **COMPLETED** (Owner-authorized promotion to stable completed)
-Timebox: **Completed within timebox**
+Status: **PENDING DESIGN**
 
-Goal: remove the Windows GBK reviewer lifecycle blocker and obtain a clean final independent review for D1.
+Goal: make project-specific durable context a first-class DevOrchestrator input so any control conversation can continue a project without relying on chat memory.
 
-Scope:
-- in `src/dev_orchestrator/ai/aibroker_subprocess.py`, force the Broker subprocess/reconciliation environment to UTF-8 (`PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8`) without changing provider selection;
-- add a regression test proving Unicode reviewer output such as `✅` cannot fail due to the Windows locale code page;
-- preserve the existing D1 Progress Channel and broker-native status behavior;
-- run focused tests, full `python -m unittest discover -s tests_py`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check`;
-- update agent files and commit locally; do not push.
+Required context domains: project goals, architecture/module responsibilities, protected scope and safety constraints, build/test/validation commands, deployment/runtime assumptions, and durable key decisions.
 
-Safety boundary:
-- modify only `C:\work\github\DevOrchestrator-dev`;
-- do not modify/restart/promote the stable controller;
-- no physical hardware actions.
+Design constraints:
+- explicit project/repository context remains authoritative; generated context is supplemental;
+- inject bounded context into Planner, Worker/Remediator, and Reviewer requests without exposing credentials or unrelated user data;
+- preserve project isolation and fail closed on malformed context;
+- Graphify may be used as an optional structure/dependency source, but DevO must not require Graphify at runtime;
+- provide a stable schema/versioning/update path suitable for later automatic onboarding;
+- expose enough context/status metadata for future Control API/dashboard use.
 
-Acceptance:
-- UTF-8 environment is applied to both dispatch and reconciliation Broker subprocess calls;
-- Unicode regression is covered;
-- all D1 regressions remain green;
-- worktree clean after local commit;
-- independent reviewer returns a valid terminal decision instead of a codec lifecycle error.
+Scope: modify only C:\work\github\DevOrchestrator-dev. No stable-controller modification/restart/promotion, no push, and no physical hardware actions.
 
-Final independent Opus review: **ACCEPT** on code commit `6b296d8`; 213 tests, Node syntax check, and `git diff --check` passed on the reviewed worktree.
+Acceptance: focused regressions + full unittest suite + browser userscript syntax check + git diff check; update agent docs and commit locally clean; independent reviewer must accept before any later owner-gated promotion.

@@ -1,12 +1,10 @@
-# DevOrchestrator Self-Hosted Development State
+﻿# DevOrchestrator Self-Hosted Development State
 
-- Stable controller: `C:\work\github\DevOrchestrator` (D1/P8 owner-authorized promotion completed).
+- Stable controller: `C:\work\github\DevOrchestrator` is running the accepted D1/P8 release; Workers must not modify or restart it.
 - Development worktree: `C:\work\github\DevOrchestrator-dev`.
 - Branch: `feature/self-hosted-dev`.
-- D1 Progress Channel + broker-native status implementation, P8 UTF-8 remediation, and final review fixes are accepted; code promotion point is `c6a46aa` with 213 unit tests passing.
-- Final independent Opus review accepted commit `6b296d8`; the Windows GBK transport blocker and all three final D1 findings are closed.
+- D1/P8 is complete and promoted. Current development target is Gate B daily-use readiness.
 
-Current task: **P8 D1 Final Review UTF-8 Remediation** (COMPLETED AND PROMOTED).
-Child Python environment for AIBroker dispatch and reconciliation is forced to UTF-8. Unicode reviewer output regression tested; 213 unit tests pass, browser adapter validation passes, and promotion regression is clean.
+Current task: **P9 D2 Durable Project Context Foundation** (PENDING DESIGN).
 
-Owner-authorized promotion completed on 2026-09-12. Stable branch was fast-forwarded from `f6f643d` to code promotion point `c6a46aa`; stable daemon restarted successfully and Browser Bridge health is OK. No promotion owner gate remains.
+Purpose: establish durable, project-scoped context that survives conversations and is injected into semantic Planner/Worker/Reviewer execution. Graphify can supplement repository structure discovery but must remain optional. Preserve project isolation, secret boundaries, fail-closed validation, and the stable-controller safety boundary.
