@@ -101,6 +101,23 @@ The Browser Bridge, response consumer and Decision Guard remain project-neutral.
 The current implementation can transport/validate reasoning results but does
 not execute `next_action` or start/restart a Worker.
 
+## Durable project context
+
+Projects may declare durable, project-scoped context in `agent/project-context.json` (or a custom repo-relative path) to inject goals, architecture, safety constraints, validation commands, runtime assumptions, and durable decisions into AI Planner, Worker, and Reviewer prompts:
+
+```json
+"project_context": {
+  "enabled": true,
+  "document_path": "agent/project-context.json",
+  "supplement_path": null,
+  "require_valid": true,
+  "max_chars": 6000,
+  "inject_roles": ["planner", "worker", "reviewer"]
+}
+```
+
+The declared repository document is authoritative. An optional `supplement_path` (e.g. from an offline Graphify run) may supplement empty domains without overriding declared content. Malformed context fails closed when `require_valid` is true. See `docs/DURABLE_PROJECT_CONTEXT_DESIGN.md`.
+
 ## Run
 
 One read-only monitor tick:

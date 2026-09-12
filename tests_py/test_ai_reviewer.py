@@ -120,6 +120,105 @@ class DirectReviewerTests(unittest.TestCase):
             self.assertEqual(record["state"], "recovery_required")
             self.assertIn("automatic replay forbidden", record["reason"])
 
+    def test_project_context_injected_into_review_prompt(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = init_repo(root)
+            ctx_payload = {
+                "schema_version": 1,
+                "project_id": "p1",
+                "goals": ["Ship review context"],
+                "architecture": ["Review module"],
+                "protected_scope": ["Production infra"],
+                "safety_constraints": ["Fail closed"],
+                "validation_commands": ["python -m unittest"],
+                "runtime_assumptions": ["Python 3.11"],
+                "key_decisions": ["D1 schema"],
+            }
+            (repo / "agent").mkdir(parents=True, exist_ok=True)
+            (repo / "agent" / "project-context.json").write_text(json.dumps(ctx_payload), encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "ctx"], check=True)
+
+            runtime = root / "runtime"; runtime.mkdir()
+            config = root / "projects.json"
+            config.write_text(json.dumps({"projects": [{
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"reviewer": {"enabled": True, "quality": "high", "independence": "resource"}},
+                "project_context": {
+                    "enabled": True,
+                    "document_path": "agent/project-context.json",
+                    "require_valid": True,
+                },
+            }]}), encoding="utf-8")
+            truth = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=repo, text=True).strip()
+            (runtime / "transition-executor.json").write_text(json.dumps({
+                "version": 1, "executions": {"worker-source": {
+                    "project_id": "p1", "source_request_id": "worker-source",
+                    "task_id": "P1", "repo_path": str(repo), "branch": branch, "head": truth,
+                    "engine": "aibroker", "state": "completed", "completed_at": "2026-09-10T02:00:00+00:00",
+                    "resource_context": {"resource_id": "dsh/default/worker", "provider": "deepseek", "account": "default", "model": "worker"},
+                }}
+            }), encoding="utf-8")
+            port = ReviewerPort()
+            reviewer = AIReviewerCoordinator(runtime, port)
+            launched = reviewer.advance(config)
+            self.assertEqual(launched, ["ai_review:worker-source"])
+            reviewer._threads[launched[0]].join(timeout=2)
+            self.assertFalse(reviewer._threads[launched[0]].is_alive())
+
+            prompt = port.requests[0].prompt
+            self.assertIn("[PROJECT_CONTEXT_BEGIN]", prompt)
+            self.assertIn("## goals\n- Ship review context", prompt)
+            self.assertIn("[PROJECT_CONTEXT_END]", prompt)
+
+            rec = reviewer.state()["reviews"]["ai_review:worker-source"]
+            self.assertEqual(rec["context_state"], "ready")
+            self.assertIsNotNone(rec["context_digest"])
+
+    def test_invalid_context_records_terminal_failure_without_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = init_repo(root)
+            (repo / "agent").mkdir(parents=True, exist_ok=True)
+            (repo / "agent" / "project-context.json").write_text(json.dumps({"schema_version": 99}), encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "bad-ctx"], check=True)
+
+            runtime = root / "runtime"; runtime.mkdir()
+            config = root / "projects.json"
+            config.write_text(json.dumps({"projects": [{
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"reviewer": {"enabled": True, "quality": "high", "independence": "resource"}},
+                "project_context": {
+                    "enabled": True,
+                    "document_path": "agent/project-context.json",
+                    "require_valid": True,
+                },
+            }]}), encoding="utf-8")
+            truth = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=repo, text=True).strip()
+            (runtime / "transition-executor.json").write_text(json.dumps({
+                "version": 1, "executions": {"worker-source": {
+                    "project_id": "p1", "source_request_id": "worker-source",
+                    "task_id": "P1", "repo_path": str(repo), "branch": branch, "head": truth,
+                    "engine": "aibroker", "state": "completed", "completed_at": "2026-09-10T02:00:00+00:00",
+                    "resource_context": {"resource_id": "dsh/default/worker", "provider": "deepseek", "account": "default", "model": "worker"},
+                }}
+            }), encoding="utf-8")
+            port = ReviewerPort()
+            reviewer = AIReviewerCoordinator(runtime, port)
+            launched = reviewer.advance(config)
+            self.assertEqual(launched, [])
+            self.assertEqual(len(port.requests), 0)
+
+            rec = reviewer.state()["reviews"]["ai_review:worker-source"]
+            self.assertEqual(rec["state"], "failed")
+            self.assertIn("durable project context is invalid", rec["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

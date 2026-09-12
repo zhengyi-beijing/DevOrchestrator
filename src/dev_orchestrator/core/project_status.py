@@ -132,7 +132,7 @@ def build_project_status(
             "source_request_id", "source_kind", "source_task_id", "task_id",
             "backend_id", "state", "pid", "started_at", "completed_at", "exit_code", "reason"
         )}
-    return {
+    result = {
         "schema_version": STATUS_SCHEMA_VERSION,
         "project_id": project_id,
         "updated_at": utc_now_iso(),
@@ -150,6 +150,9 @@ def build_project_status(
         "web_sol": web_sol,
         "actuation": actuation_view,
     }
+    if "project_context" in snapshot:
+        result["project_context"] = copy.deepcopy(snapshot["project_context"])
+    return result
 
 
 def write_project_status(snapshot: dict[str, Any], runtime_root: Path | str, **kwargs: Any) -> Path:

@@ -481,6 +481,93 @@ class TransitionExecutorActuationTests(unittest.TestCase):
             self.assertEqual(record["state"], "recovery_required")
             self.assertIn("automatic replay is forbidden", record["reason"])
 
+    def test_project_context_injected_into_legacy_worker_prompt(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P2")
+            ctx_payload = {
+                "schema_version": 1,
+                "project_id": "p1",
+                "goals": ["Ship worker context"],
+                "architecture": ["Core modules"],
+                "protected_scope": ["Production infra"],
+                "safety_constraints": ["Fail closed"],
+                "validation_commands": ["python -m unittest"],
+                "runtime_assumptions": ["Python 3.11"],
+                "key_decisions": ["D1 schema"],
+            }
+            (repo / "agent" / "project-context.json").write_text(json.dumps(ctx_payload), encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "ctx"], check=True)
+
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            data = json.loads(config.read_text(encoding="utf-8"))
+            data["projects"][0]["execution"]["owner_start"] = {"request_id": "owner-start-p2", "task_id": "P2"}
+            data["projects"][0]["project_context"] = {
+                "enabled": True,
+                "document_path": "agent/project-context.json",
+                "require_valid": True,
+            }
+            config.write_text(json.dumps(data), encoding="utf-8")
+            runtime.mkdir()
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            launches = executor.advance(ready_summary(repo, "P2"), config)
+            self.assertEqual(len(launches), 1)
+            record = wait_terminal(executor, "owner-start-p2")
+            self.assertEqual(record["state"], "completed")
+            self.assertEqual(record["context_state"], "ready")
+            self.assertIsNotNone(record["context_digest"])
+            self.assertEqual(len(backend.started), 1)
+            request = backend.started[0]
+            self.assertIn("[PROJECT_CONTEXT_BEGIN]", request.prompt)
+            self.assertIn("## goals\n- Ship worker context", request.prompt)
+            self.assertIn("[PROJECT_CONTEXT_END]", request.prompt)
+
+    def test_invalid_project_context_blocks_worker_launch(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P2")
+            (repo / "agent" / "project-context.json").write_text(json.dumps({"schema_version": 99}), encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "invalid-ctx"], check=True)
+
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            data = json.loads(config.read_text(encoding="utf-8"))
+            data["projects"][0]["execution"]["owner_start"] = {"request_id": "owner-start-p2", "task_id": "P2"}
+            data["projects"][0]["project_context"] = {
+                "enabled": True,
+                "document_path": "agent/project-context.json",
+                "require_valid": True,
+            }
+            config.write_text(json.dumps(data), encoding="utf-8")
+            runtime.mkdir()
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            launches = executor.advance(ready_summary(repo, "P2"), config)
+            self.assertEqual(len(launches), 0)
+            record = executor.state()["executions"]["owner-start-p2"]
+            self.assertEqual(record["state"], "blocked")
+            self.assertIn("durable project context is invalid", record["reason"])
+            self.assertEqual(len(backend.started), 0)
+
+    def test_absent_project_context_leaves_worker_prompt_byte_identical(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P2")
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            data = json.loads(config.read_text(encoding="utf-8"))
+            data["projects"][0]["execution"]["owner_start"] = {"request_id": "owner-start-p2", "task_id": "P2"}
+            config.write_text(json.dumps(data), encoding="utf-8")
+            runtime.mkdir()
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            launches = executor.advance(ready_summary(repo, "P2"), config)
+            self.assertEqual(len(launches), 1)
+            record = wait_terminal(executor, "owner-start-p2")
+            self.assertEqual(record["state"], "completed")
+            self.assertNotIn("[PROJECT_CONTEXT_BEGIN]", backend.started[0].prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -209,7 +209,17 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
             adapter_valid = False
             adapter_error = str(exc)
         truth = read_repository_truth(project.get("repo_path") or "")
-        project_valid = adapter_valid and truth.valid
+
+        from dev_orchestrator.core.project_context import resolve_project_context
+        ctx_decl = project.get("project_context") or {}
+        ctx_enabled = bool(ctx_decl.get("enabled"))
+        ctx_require_valid = bool(ctx_decl.get("require_valid", True))
+        ctx_resolution = resolve_project_context(project)
+        project_context_state = ctx_resolution.state
+        project_context_error = ctx_resolution.reason if ctx_resolution.state == "invalid" else None
+        context_valid = not (ctx_enabled and ctx_require_valid and ctx_resolution.state == "invalid")
+
+        project_valid = adapter_valid and truth.valid and context_valid
         all_valid = all_valid and project_valid
         projects.append({
             "project_id": project.get("project_id"),
@@ -220,6 +230,8 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
             "repository_valid": truth.valid,
             "repository_error": truth.error or None,
             "orchestration_ready": bool(project.get("orchestration_ready")),
+            "project_context_state": project_context_state,
+            "project_context_error": project_context_error,
         })
 
     _print_json({
@@ -229,6 +241,40 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
         "projects": projects,
     })
     return 0 if all_valid else 1
+
+
+def cmd_project_context(args: argparse.Namespace) -> int:
+    config_path = resolve_config_path(args.config)
+    raw_pid = getattr(args, "project_id_opt", None) or getattr(args, "project_id", None)
+    if not raw_pid:
+        _fail("missing required project id (specify --project-id <id> or positional project_id)")
+    project_id = _validated_project_id(raw_pid)
+    try:
+        config = load_projects_config(config_path)
+    except (OSError, ValueError) as exc:
+        _fail("cannot load config: {0}".format(exc))
+    matched = None
+    for p in config.get("projects") or []:
+        if p.get("project_id") == project_id:
+            matched = p
+            break
+    if matched is None:
+        _fail("project {0!r} not found in config {1}".format(project_id, config_path))
+
+    from dev_orchestrator.core.project_context import (
+        context_status,
+        render_context_block,
+        resolve_project_context,
+    )
+    resolution = resolve_project_context(matched)
+    status_payload = dict(context_status(resolution))
+    ctx_decl = matched.get("project_context") if isinstance(matched.get("project_context"), dict) else {}
+    max_chars = ctx_decl.get("max_chars", 6000)
+    rendered = render_context_block(resolution.document, max_chars=max_chars) if resolution.document else ""
+    status_payload["rendered_chars"] = len(rendered)
+    status_payload["truncated"] = "[PROJECT_CONTEXT_TRUNCATED]" in rendered
+    _print_json(status_payload)
+    return 1 if resolution.state == "invalid" else 0
 
 
 def _validated_project_id(value: str) -> str:
@@ -710,6 +756,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_config.add_argument("--config", default=None, help="path to projects.json")
 
+    project_context = sub.add_parser("project-context", help="inspect durable project context resolution")
+    project_context.add_argument("project_id", nargs="?", default=None, help="project id (positional)")
+    project_context.add_argument("--project-id", dest="project_id_opt", default=None, help="project id (named)")
+    project_context.add_argument("--config", default=None, help="path to projects.json")
+
     project_status = sub.add_parser("project-status", help="read one project status by project_id")
     project_status.add_argument("project_id")
     project_status.add_argument("--runtime-root", default=None)
@@ -787,6 +838,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 _COMMANDS = {
     "validate-config": cmd_validate_config,
+    "project-context": cmd_project_context,
     "project-status": cmd_project_status,
     "project-continue": cmd_project_continue,
     "monitor": cmd_monitor,

@@ -149,3 +149,57 @@ class AIBrokerTransitionTests(unittest.TestCase):
             self.assertEqual(record["resource_context"]["provider"], "deepseek")
             self.assertEqual(port.requests[0].role, "worker")
             self.assertEqual(port.requests[0].timeout_seconds, 14400.0)
+
+    def test_project_context_injected_into_aibroker_worker_prompt(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self.make_repo(root)
+            ctx_payload = {
+                "schema_version": 1,
+                "project_id": "p1",
+                "goals": ["Ship broker context"],
+                "architecture": ["Broker worker module"],
+                "protected_scope": ["Production infra"],
+                "safety_constraints": ["Fail closed"],
+                "validation_commands": ["python -m unittest"],
+                "runtime_assumptions": ["Python 3.11"],
+                "key_decisions": ["D1 schema"],
+            }
+            (repo / "agent").mkdir(parents=True, exist_ok=True)
+            (repo / "agent" / "project-context.json").write_text(json.dumps(ctx_payload), encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "ctx"], check=True)
+
+            project = broker_project(repo)
+            project["project_context"] = {
+                "enabled": True,
+                "document_path": "agent/project-context.json",
+                "require_valid": True,
+            }
+            policy, error = _execution_policy(project)
+            self.assertFalse(error)
+            truth = read_repository_truth(repo)
+            port = FakePort()
+            executor = TransitionExecutor(root / "runtime", ai_execution_port=port)
+            launch = executor._launch(
+                project, source_request_id="owner-p1", source_kind="owner_start",
+                task_id="P1", source_task_id=None, branch=truth.branch, head=truth.head,
+                worker_prompt="Return exactly WORKER_OK", policy=policy,
+            )
+            self.assertIsNotNone(launch)
+            deadline = time.time() + 3
+            record = {}
+            while time.time() < deadline:
+                record = executor.state()["executions"]["owner-p1"]
+                if record.get("state") == "completed":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(record["state"], "completed")
+            self.assertEqual(record["context_state"], "ready")
+            self.assertIsNotNone(record["context_digest"])
+            executor._threads["owner-p1"].join(timeout=2)
+            self.assertFalse(executor._threads["owner-p1"].is_alive())
+            prompt = port.requests[0].prompt
+            self.assertIn("[PROJECT_CONTEXT_BEGIN]", prompt)
+            self.assertIn("## goals\n- Ship broker context", prompt)
+            self.assertIn("[PROJECT_CONTEXT_END]", prompt)

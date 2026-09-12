@@ -52,3 +52,30 @@ D1 Self-Hosted DevOrchestrator Integration:
   - Post-promotion verification: 213 unit tests OK, browser userscript syntax OK, promotion diff check OK.
   - Restarted the stable daemon with its original configuration; new PID `24456`, ports 8765/8770 healthy, `last_error=null`, Browser Bridge `/v1/health` reports `ok`.
   - AIBroker remained healthy on port 8875; no active dispatch was interrupted.
+
+D2 Durable Project Context Foundation (P9):
+- Schema and Document Model:
+  - Created `src/dev_orchestrator/core/project_context.py` with `PROJECT_CONTEXT_SCHEMA_VERSION = 1` and seven canonical domains (`goals`, `architecture`, `protected_scope`, `safety_constraints`, `validation_commands`, `runtime_assumptions`, `key_decisions`).
+  - Implemented immutable `ProjectContextDocument` and `ProjectContextResolution` dataclasses.
+  - Implemented strict fail-closed document validator `validate_context_document` enforcing schema keys, types, entry limits (<=40 entries, <=600 chars), secret marker filtering (`password`, `api_key`, `secret`, `token`, `bearer `, `client_secret`, `private_key`, `-----begin`), and `project_id` repository matching.
+  - Implemented path traversal guard `resolve_document_path` prohibiting absolute, drive-qualified, or repo-escaping relative paths.
+  - Implemented precedence resolver `resolve_project_context`: declared document is authoritative; optional supplemental document (e.g. Graphify output) fills empty declared domains only; computes deterministic 16-hex sha256 digest over canonical JSON of merged domains.
+  - Implemented bounded rendering `render_context_block` with standard delimiters `[PROJECT_CONTEXT_BEGIN]` and `[PROJECT_CONTEXT_END]`, provenance indicators (`(supplemental, unverified)`), and truncation boundary marker `[PROJECT_CONTEXT_TRUNCATED]` within configured `max_chars`.
+- Configuration and Role Injection:
+  - Extended `src/dev_orchestrator/config.py` with optional `project_context` declaration (`enabled`, `document_path`, `supplement_path`, `require_valid`, `max_chars`, `inject_roles`), full type/range validation, and default normalization.
+  - Injected context into `AIPlannerCoordinator.start()`: fails closed with explicit reason on invalid context when `require_valid` is true; records context metadata (`context_block`, `context_state`, `context_digest`, `context_sources`) on plan record; appends context block to planner and plan-reviewer prompts.
+  - Injected context into `TransitionExecutor._launch()`: appends context block to worker prompts across both legacy agent and AIBroker dispatch; blocks execution via `_record_blocked()` when context is invalid and `require_valid` is true; records `context_state` and `context_digest` in execution ledger.
+  - Injected context into `AIReviewerCoordinator.advance()`: validates context prior to review launch; fails closed via `_record_terminal()` on invalid context; appends context block to reviewer prompt; records `context_state` and `context_digest` in review record.
+- Observability and CLI:
+  - Surfaced `project_context` status metadata in project monitor ticks (`run_monitor_once`), status file mirror (`.devorch/status.json`), and runtime projections (`project_runtime_status`). Raw prompt text and secret content are never exposed.
+  - Added CLI subcommand `dev-orchestrator project-context` for read-only inspection and validation.
+  - Extended `dev-orchestrator validate-config` with project context status reporting.
+- Documentation and Reference Instance:
+  - Created comprehensive architectural design in `docs/DURABLE_PROJECT_CONTEXT_DESIGN.md`.
+  - Updated `docs/PORTABLE_PROJECT_INTEGRATION.md` and `config/projects.example.json`.
+  - Authored self-hosting reference context in `agent/project-context.json`.
+- Verification:
+  - 16 new unit tests in `tests_py/test_project_context.py`.
+  - Full test suite: 242 tests passing cleanly (`python -m unittest discover -s tests_py`).
+  - Userscript syntax check: `node --check browser/chatgpt-web-adapter.user.js` passed.
+  - Git diff check: `git diff --check` clean (0 formatting defects).

@@ -198,6 +198,20 @@ def run_monitor_once(
             snapshot = adapter.snapshot(project, runs_path, now=tick_now)
         except Exception as exc:  # noqa: BLE001 - match PS MONITOR_ERROR catch-all
             snapshot = _monitor_error_snapshot(project, tick_now, exc)
+        try:
+            from dev_orchestrator.core.project_context import context_status, resolve_project_context
+            snapshot["project_context"] = context_status(resolve_project_context(project))
+        except Exception as exc:  # noqa: BLE001
+            snapshot["project_context"] = {
+                "schema_version": 1,
+                "state": "invalid",
+                "reason": f"context resolution failed: {exc}",
+                "digest": None,
+                "updated_at": None,
+                "document_path": None,
+                "supplement_used": False,
+                "domains": {},
+            }
         event = new_state_event(previous, snapshot)
         if event is not None:
             append_jsonl(events_path, event)

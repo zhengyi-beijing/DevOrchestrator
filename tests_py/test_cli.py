@@ -132,6 +132,82 @@ class CliLifecycleTests(unittest.TestCase):
             payload = json.loads((runtime / "daemon.json").read_text(encoding="utf-8"))
             self.assertTrue(payload["tree_stopped"]); self.assertEqual(payload["broker_interrupts"], [{"request_id":"r"}])
 
+    def test_cli_project_context_and_validate_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "repo"
+            repo.mkdir()
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+            ctx_payload = {
+                "schema_version": 1,
+                "project_id": "p1",
+                "goals": ["Ship CLI context"],
+                "architecture": ["CLI subcommand"],
+                "protected_scope": ["Production infra"],
+                "safety_constraints": ["Fail closed"],
+                "validation_commands": ["python -m unittest"],
+                "runtime_assumptions": ["Python 3.11"],
+                "key_decisions": ["D1 schema"],
+            }
+            (repo / "agent").mkdir(parents=True, exist_ok=True)
+            (repo / "agent" / "project-context.json").write_text(json.dumps(ctx_payload), encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "ctx"], cwd=repo, check=True, capture_output=True)
+
+            config = base / "projects.json"
+            config.write_text(json.dumps({"projects": [{
+                "project_id": "p1",
+                "repo_path": str(repo),
+                "adapter": "agent_files",
+                "project_context": {
+                    "enabled": True,
+                    "document_path": "agent/project-context.json",
+                    "require_valid": True,
+                },
+            }]}), encoding="utf-8")
+
+            # 1. validate-config on valid project
+            val_ok = run_cli("validate-config", "--config", str(config))
+            self.assertEqual(val_ok.returncode, 0, val_ok.stderr)
+            val_data = json.loads(val_ok.stdout)
+            self.assertTrue(val_data["valid"])
+            self.assertEqual(val_data["projects"][0]["project_context_state"], "ready")
+            self.assertIsNone(val_data["projects"][0]["project_context_error"])
+
+            # 2. project-context on valid project (both --project-id and positional)
+            pctx_ok = run_cli("project-context", "--config", str(config), "--project-id", "p1")
+            self.assertEqual(pctx_ok.returncode, 0, pctx_ok.stderr)
+            pctx_data = json.loads(pctx_ok.stdout)
+            self.assertEqual(pctx_data["state"], "ready")
+            self.assertGreater(pctx_data["rendered_chars"], 0)
+            self.assertFalse(pctx_data["truncated"])
+
+            pctx_pos = run_cli("project-context", "p1", "--config", str(config))
+            self.assertEqual(pctx_pos.returncode, 0, pctx_pos.stderr)
+
+            # 3. Invalid context
+            (repo / "agent" / "project-context.json").write_text(json.dumps({"schema_version": 99}), encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "bad-ctx"], cwd=repo, check=True, capture_output=True)
+
+            val_bad = run_cli("validate-config", "--config", str(config))
+            self.assertEqual(val_bad.returncode, 1)
+            val_bad_data = json.loads(val_bad.stdout)
+            self.assertFalse(val_bad_data["valid"])
+            self.assertEqual(val_bad_data["projects"][0]["project_context_state"], "invalid")
+            self.assertIsNotNone(val_bad_data["projects"][0]["project_context_error"])
+
+            pctx_bad = run_cli("project-context", "--config", str(config), "--project-id", "p1")
+            self.assertEqual(pctx_bad.returncode, 1)
+            pctx_bad_data = json.loads(pctx_bad.stdout)
+            self.assertEqual(pctx_bad_data["state"], "invalid")
+
 
 if __name__ == "__main__":
     unittest.main()

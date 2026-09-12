@@ -96,6 +96,126 @@ def _binding_ready(binding: Any) -> bool:
     return True
 
 
+_ALLOWED_CONTEXT_KEYS = frozenset({
+    "enabled",
+    "document_path",
+    "supplement_path",
+    "require_valid",
+    "max_chars",
+    "inject_roles",
+})
+_ALLOWED_INJECT_ROLES = frozenset({"planner", "worker", "reviewer"})
+
+
+def _normalize_project_context(raw: Any, index: int, config_path: Path) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "config {0} project #{1} project_context must be an object".format(config_path, index)
+        )
+    unknown = set(raw.keys()) - _ALLOWED_CONTEXT_KEYS
+    if unknown:
+        raise ValueError(
+            "config {0} project #{1} project_context has unknown keys: {2}".format(
+                config_path, index, sorted(unknown)
+            )
+        )
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "config {0} project #{1} project_context.enabled must be a boolean".format(
+                config_path, index
+            )
+        )
+    doc_path = raw.get("document_path", "agent/project-context.json")
+    if not isinstance(doc_path, str) or not doc_path.strip():
+        raise ValueError(
+            "config {0} project #{1} project_context.document_path must be a non-blank string".format(
+                config_path, index
+            )
+        )
+    doc_path = doc_path.strip()
+    p_doc = Path(doc_path)
+    if p_doc.is_absolute() or p_doc.drive:
+        raise ValueError(
+            "config {0} project #{1} project_context.document_path must be a repo-relative path".format(
+                config_path, index
+            )
+        )
+
+    supp_path = raw.get("supplement_path")
+    if supp_path is not None:
+        if not isinstance(supp_path, str) or not supp_path.strip():
+            raise ValueError(
+                "config {0} project #{1} project_context.supplement_path must be a non-blank string".format(
+                    config_path, index
+                )
+            )
+        supp_path = supp_path.strip()
+        p_supp = Path(supp_path)
+        if p_supp.is_absolute() or p_supp.drive:
+            raise ValueError(
+                "config {0} project #{1} project_context.supplement_path must be a repo-relative path".format(
+                    config_path, index
+                )
+            )
+
+    require_valid = raw.get("require_valid", True)
+    if not isinstance(require_valid, bool):
+        raise ValueError(
+            "config {0} project #{1} project_context.require_valid must be a boolean".format(
+                config_path, index
+            )
+        )
+
+    max_chars = raw.get("max_chars", 6000)
+    if isinstance(max_chars, bool) or not isinstance(max_chars, int):
+        raise ValueError(
+            "config {0} project #{1} project_context.max_chars must be an integer".format(
+                config_path, index
+            )
+        )
+    if max_chars < 500 or max_chars > 20000:
+        raise ValueError(
+            "config {0} project #{1} project_context.max_chars must be between 500 and 20000".format(
+                config_path, index
+            )
+        )
+
+    roles = raw.get("inject_roles")
+    if roles is None:
+        normalized_roles = ["planner", "worker", "reviewer"]
+    else:
+        if not isinstance(roles, list) or not roles:
+            raise ValueError(
+                "config {0} project #{1} project_context.inject_roles must be a non-empty list".format(
+                    config_path, index
+                )
+            )
+        for r in roles:
+            if not isinstance(r, str) or r not in _ALLOWED_INJECT_ROLES:
+                raise ValueError(
+                    "config {0} project #{1} project_context.inject_roles contains invalid role: {2!r}".format(
+                        config_path, index, r
+                    )
+                )
+        if len(set(roles)) != len(roles):
+            raise ValueError(
+                "config {0} project #{1} project_context.inject_roles contains duplicate roles".format(
+                    config_path, index
+                )
+            )
+        normalized_roles = list(roles)
+
+    return {
+        "enabled": enabled,
+        "document_path": doc_path,
+        "supplement_path": supp_path,
+        "require_valid": require_valid,
+        "max_chars": max_chars,
+        "inject_roles": normalized_roles,
+    }
+
+
 def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str, Any]:
     """One project entry -> canonical copy with legacy aliases preserved."""
     if not isinstance(project, dict):
@@ -137,6 +257,9 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
     normalized["adapter"] = (
         str(adapter).strip() if isinstance(adapter, str) and adapter.strip() else DEFAULT_ADAPTER_ID
     )
+    raw_context = project.get("project_context")
+    if raw_context is not None:
+        normalized["project_context"] = _normalize_project_context(raw_context, index, config_path)
     normalized["orchestration_ready"] = (
         _binding_ready(normalized.get("conversation_binding"))
         or _direct_reviewer_ready(normalized)

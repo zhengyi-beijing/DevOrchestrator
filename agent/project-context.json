@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-09-12T12:00:00+08:00",
+  "goals": [
+    "Provide project-neutral local orchestration infrastructure for AI-assisted development across multiple Git repositories.",
+    "Support continuous autonomous lifecycles across PLAN, EXECUTE, REVIEW, and REMEDIATE phases with independent review verification.",
+    "Enable durable, conversation-independent project context injection into Planner, Worker, and Reviewer prompts."
+  ],
+  "architecture": [
+    "src/dev_orchestrator/config.py loads and canonically normalizes multi-project configuration and context declarations.",
+    "src/dev_orchestrator/daemon.py runs the unified single-process daemon combining monitor loop, web dashboard, and browser bridge.",
+    "src/dev_orchestrator/core/project_context.py validates, resolves, and deterministically renders durable project context.",
+    "src/dev_orchestrator/core/transition_executor.py manages Worker execution, ledger persistence, and remediation routing.",
+    "src/dev_orchestrator/core/ai_planner.py coordinates AI planning and independent plan review, freezing accepted designs into agent/next.md.",
+    "src/dev_orchestrator/core/ai_reviewer.py executes independent AI code reviews of completed Worker tasks.",
+    "src/dev_orchestrator/ai/execution_port.py and aibroker_subprocess.py integrate with AIResourceBroker over subprocess CLI.",
+    "src/dev_orchestrator/core/progress.py provides deduplicated, non-model progress notifications to browser and status channels."
+  ],
+  "protected_scope": [
+    "Stable controller worktree at C:\\work\\github\\DevOrchestrator is strictly read-only and must never be modified, stopped, restarted, or replaced by Workers.",
+    "Physical laboratory and hardware automation interfaces remain outside generic orchestration authority.",
+    "Sensitive credentials and private authorization headers must never be committed to repository files or injected into prompts."
+  ],
+  "safety_constraints": [
+    "Always fail closed on configuration invalidity, repository truth mismatch, or corrupted project context.",
+    "Strict project isolation: paths must not escape repository boundaries and context is strictly project-scoped.",
+    "Only one DevOrchestrator daemon may run per computer at any given time.",
+    "Independent review authority: reviewer must operate independently of planner and worker models.",
+    "Clean repository required before planning or launching Workers."
+  ],
+  "validation_commands": [
+    "$env:PYTHONPATH = \"$PWD\\src\"; python -m unittest discover -s tests_py",
+    "node --check .\\browser\\chatgpt-web-adapter.user.js",
+    "git diff --check",
+    "python -m dev_orchestrator validate-config --config .\\config\\projects.example.json"
+  ],
+  "runtime_assumptions": [
+    "Windows operating system with PowerShell and Git installed.",
+    "Python 3.11+ environment with UTF-8 encoding enabled.",
+    "AIResourceBroker running locally on port 8875 when aibroker execution engine is selected.",
+    "DevOrchestrator daemon runs dashboard on port 8770 and Browser Bridge on port 8765 by default."
+  ],
+  "key_decisions": [
+    "D1 architecture: Unified single daemon process per host hosting monitor, dashboard, and browser bridge.",
+    "Continuous lifecycle routing across PLAN, EXECUTE, REVIEW, and REMEDIATE states via stateful ledgers.",
+    "Broker-native running state projection directly reflecting active planner, worker, and reviewer dispatches.",
+    "Transport-only progress channel emitting milestone notifications without consuming model inference quota.",
+    "Durable project context foundation with declared-authoritative repository precedence and optional supplemental input.",
+    "Graphify remains an optional external tool and is never imported, required, or executed at runtime by DevOrchestrator."
+  ]
+}

@@ -614,6 +614,11 @@ class TransitionExecutor:
             return None, "repository is dirty"
         return current_task, ""
 
+    @staticmethod
+    def _project_context_for_worker(project: dict[str, Any]) -> tuple[str, Any]:
+        from dev_orchestrator.core.project_context import context_prompt_block
+        return context_prompt_block(project, "worker")
+
     def _launch(
         self,
         project: dict[str, Any],
@@ -627,16 +632,30 @@ class TransitionExecutor:
         worker_prompt: str,
         policy: dict[str, Any],
     ) -> Optional[ActuationLaunch]:
+        context_block, resolution = self._project_context_for_worker(project)
+        ctx_decl = project.get("project_context") or {}
+        if ctx_decl.get("enabled") and ctx_decl.get("require_valid", True) and resolution.state == "invalid":
+            self._record_blocked(
+                source_request_id, str(project["project_id"]),
+                "durable project context is invalid: {0}".format(resolution.reason),
+                task_id=task_id, source_kind=source_kind,
+            )
+            return None
+
+        effective_worker_prompt = (
+            "{0}\n\n{1}".format(worker_prompt, context_block) if context_block else worker_prompt
+        )
+
         if policy.get("engine") == "aibroker":
             return self._launch_aibroker(
                 project, source_request_id=source_request_id, source_kind=source_kind,
                 task_id=task_id, source_task_id=source_task_id, branch=branch, head=head,
-                worker_prompt=worker_prompt, policy=policy,
+                worker_prompt=effective_worker_prompt, policy=policy, resolution=resolution,
             )
         request = AgentRequest(
             project_id=str(project["project_id"]),
             role=AgentRole.WORKER,
-            prompt=worker_prompt,
+            prompt=effective_worker_prompt,
             working_directory=Path(str(project["repo_path"])),
             required_capabilities=frozenset({"code", "repository"}),
             preferred_backends=tuple(policy["preferred_backends"]),
@@ -710,6 +729,8 @@ class TransitionExecutor:
                 "started_at": started_at,
                 "review_state": "pending",
                 "launch_status_hash": launch_truth.status_hash,
+                "context_state": resolution.state,
+                "context_digest": resolution.document.digest if resolution.document else None,
             }
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])
@@ -745,6 +766,7 @@ class TransitionExecutor:
         head: str,
         worker_prompt: str,
         policy: dict[str, Any],
+        resolution: Optional[Any] = None,
     ) -> Optional[ActuationLaunch]:
         project_id = str(project["project_id"])
         if self._ai_execution_port is None:
@@ -804,6 +826,8 @@ class TransitionExecutor:
                 "started_at": utc_now_iso(),
                 "review_state": "pending",
                 "launch_status_hash": launch_truth.status_hash,
+                "context_state": resolution.state if resolution else None,
+                "context_digest": resolution.document.digest if resolution and resolution.document else None,
             }
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])

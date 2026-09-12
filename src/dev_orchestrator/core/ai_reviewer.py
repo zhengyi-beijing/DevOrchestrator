@@ -204,10 +204,19 @@ class AIReviewerCoordinator:
                 self._record_terminal(review_id, project_id, source_request_id, "failed", "repository truth unavailable")
                 continue
             proj_dict = projects.get(project_id, {})
+            from dev_orchestrator.core.project_context import context_prompt_block
+            context_block, resolution = context_prompt_block(proj_dict, "reviewer")
+            ctx_decl = proj_dict.get("project_context") or {}
+            if ctx_decl.get("enabled") and ctx_decl.get("require_valid", True) and resolution.state == "invalid":
+                self._record_terminal(
+                    review_id, project_id, source_request_id, "failed",
+                    "durable project context is invalid: {0}".format(resolution.reason),
+                )
+                continue
             binding = proj_dict.get("conversation_binding") or self._project_bindings.get(project_id)
             if binding is None and isinstance(worker.get("conversation_binding"), dict):
                 binding = worker.get("conversation_binding")
-            prompt = self._review_prompt(project_id, task_id, source_request_id, truth)
+            prompt = self._review_prompt(project_id, task_id, source_request_id, truth, context_block=context_block)
             request = AIRoleRequest(
                 project_id=project_id, task_run_id=task_id, stage_run_id="review",
                 role_run_id="reviewer-" + source_request_id.replace(":", "-"),
@@ -220,13 +229,19 @@ class AIReviewerCoordinator:
                     "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 },
             )
-            self._launch_review(review_id, source_request_id, request, truth, conversation_binding=binding)
+            self._launch_review(
+                review_id, source_request_id, request, truth,
+                conversation_binding=binding, resolution=resolution,
+            )
             launched.append(review_id)
         return launched
 
     @staticmethod
-    def _review_prompt(project_id: str, task_id: str, source_request_id: str, truth: Any) -> str:
-        return (
+    def _review_prompt(
+        project_id: str, task_id: str, source_request_id: str, truth: Any,
+        context_block: str = "",
+    ) -> str:
+        prompt = (
             "You are the independent reviewer for a completed software-development Worker. "
             "Review only; do not modify files, commit, push, or start another Worker. "
             "Inspect the repository, current diff/status, task evidence, tests, and acceptance criteria. "
@@ -238,10 +253,14 @@ class AIReviewerCoordinator:
             f"Project: {project_id}\nReviewed task: {task_id}\nWorker source: {source_request_id}\n"
             f"Review branch: {truth.branch}\nReview HEAD: {truth.head}\nReview dirty: {truth.dirty}\n"
         )
+        if context_block:
+            prompt += f"\n{context_block}\n"
+        return prompt
 
     def _launch_review(
         self, review_id: str, source_request_id: str, request: AIRoleRequest, truth: Any,
         conversation_binding: Optional[dict[str, Any]] = None,
+        resolution: Optional[Any] = None,
     ) -> None:
         if conversation_binding is None and isinstance(request.metadata, dict):
             conversation_binding = request.metadata.get("conversation_binding")
@@ -264,6 +283,8 @@ class AIReviewerCoordinator:
                 "started_at": utc_now_iso(),
                 "role_run_id": request.role_run_id,
                 "conversation_binding": copy.deepcopy(conversation_binding) if isinstance(conversation_binding, dict) else None,
+                "context_state": resolution.state if resolution else None,
+                "context_digest": resolution.document.digest if resolution and resolution.document else None,
             }
             if conversation_binding and isinstance(conversation_binding, dict):
                 self._project_bindings[request.project_id] = copy.deepcopy(conversation_binding)

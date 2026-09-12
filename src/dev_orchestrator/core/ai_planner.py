@@ -167,6 +167,11 @@ class AIPlannerCoordinator:
             next_text = next_path.read_text(encoding="utf-8")
         except OSError:
             return None, "agent/next.md unavailable"
+        from dev_orchestrator.core.project_context import context_prompt_block
+        context_block, context_resolution = context_prompt_block(project, "planner")
+        ctx_decl = project.get("project_context") or {}
+        if ctx_decl.get("enabled") and ctx_decl.get("require_valid", True) and context_resolution.state == "invalid":
+            return None, f"durable project context is invalid: {context_resolution.reason}"
         plan_id = "ai_plan:" + command_id
         binding = project.get("conversation_binding")
         with self._lock:
@@ -186,6 +191,10 @@ class AIPlannerCoordinator:
                 "state": "planning",
                 "started_at": utc_now_iso(),
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
+                "context_block": context_block,
+                "context_state": context_resolution.state,
+                "context_digest": context_resolution.document.digest if context_resolution.document else None,
+                "context_sources": copy.deepcopy(context_resolution.sources),
             }
             if binding and isinstance(binding, dict):
                 self._project_bindings[project_id] = copy.deepcopy(binding)
@@ -454,7 +463,7 @@ class AIPlannerCoordinator:
         return {"resource_id": resource.resource_id, "provider": resource.provider, "account": resource.account, "model": resource.model}
     @staticmethod
     def _planner_prompt(record: dict[str, Any]) -> str:
-        return (
+        prompt = (
             "You are the software-development Planner for one task. Plan only: do not modify files, commit, push, or run another agent. "
             "Inspect the repository and the supplied agent/next.md task. Convert the pending design into a bounded executable implementation plan. "
             "Return exactly one JSON object and no markdown or extra text with exactly these keys: "
@@ -462,23 +471,35 @@ class AIPlannerCoordinator:
             "Every list must be non-empty. Keep the implementation bounded to the current task and preserve existing acceptance intent.\n\n"
             f"Project: {record['project_id']}\nTask: {record['task_id']}\n"
             f"Planning branch: {record['branch']}\nPlanning HEAD: {record['head']}\n\n"
+        )
+        if record.get("context_block"):
+            prompt += f"{record['context_block']}\n\n"
+        prompt += (
             "Current agent/next.md:\n---BEGIN NEXT---\n"
             + record["next_text"]
             + "\n---END NEXT---\n"
         )
+        return prompt
 
     @staticmethod
     def _review_prompt(record: dict[str, Any], plan: dict[str, Any]) -> str:
-        return (
+        prompt = (
             "You are the independent reviewer of a software implementation plan. Review only; do not modify files, commit, push, or execute the plan. "
             "Check the plan against the repository and the original pending-design task. Reject scope inflation, missing interfaces, weak validation, unsafe sequencing, or unverifiable acceptance. "
             "Return exactly one JSON object and no markdown or extra text with exactly these keys: "
             '{"decision":"approve|reject|owner_gate","reason":"..."}. '
             "Use approve only when the plan is specific enough for a Worker to execute without design guessing. Use owner_gate only for a real owner decision.\n\n"
-            f"Project: {record['project_id']}\nTask: {record['task_id']}\n"
-            "Original task:\n---BEGIN NEXT---\n" + record["next_text"] + "\n---END NEXT---\n\n"
-            "Proposed plan JSON:\n" + json.dumps(plan, ensure_ascii=False, indent=2)
+            f"Project: {record['project_id']}\nTask: {record['task_id']}\n\n"
         )
+        if record.get("context_block"):
+            prompt += f"{record['context_block']}\n\n"
+        else:
+            prompt = prompt[:-1]
+        prompt += (
+            "Original task:\n---BEGIN NEXT---\n" + record["next_text"] + "\n---END NEXT---\n\n"
+            + "Proposed plan JSON:\n" + json.dumps(plan, ensure_ascii=False, indent=2)
+        )
+        return prompt
 
     def _finish(self, plan_id: str, state_name: str, reason: str) -> None:
         with self._lock:

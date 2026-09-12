@@ -112,6 +112,123 @@ class AIPlannerTests(unittest.TestCase):
             self.assertEqual(row["state"], "recovery_required")
             self.assertIn("automatic replay forbidden", row["reason"])
 
+    def test_project_context_injected_into_planner_and_reviewer_prompts(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            ctx_payload = {
+                "schema_version": 1,
+                "project_id": "p1",
+                "goals": ["Build durable context"],
+                "architecture": ["Core context module"],
+                "protected_scope": ["Production infra"],
+                "safety_constraints": ["Fail closed"],
+                "validation_commands": ["unittest"],
+                "runtime_assumptions": ["Python 3.11"],
+                "key_decisions": ["D1 schema"],
+            }
+            (repo / "agent" / "project-context.json").write_text(json.dumps(ctx_payload), encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "context"], check=True)
+            port = FakePort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {
+                    "enabled": True, "quality": "high", "review_quality": "high",
+                    "review_independence": "resource",
+                }},
+                "project_context": {
+                    "enabled": True,
+                    "document_path": "agent/project-context.json",
+                    "require_valid": True,
+                },
+            }
+            snapshot = {
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**PENDING DESIGN**",
+                "telemetry": {"task_id": "P14"},
+            }
+            plan_id, reason = coordinator.start(project, snapshot, "command-ctx")
+            self.assertEqual(plan_id, "ai_plan:command-ctx")
+            deadline = time.time() + 5
+            row = None
+            while time.time() < deadline:
+                row = coordinator.state()["plans"].get(plan_id)
+                if row and row.get("state") not in {"planning", "reviewing", "applying"}:
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(row)
+            self.assertEqual(row["state"], "ready")
+            self.assertEqual(row["context_state"], "ready")
+            self.assertIsNotNone(row["context_digest"])
+
+            # Verify both planner and reviewer prompts contain [PROJECT_CONTEXT_BEGIN]
+            planner_prompt = port.requests[0].prompt
+            reviewer_prompt = port.requests[1].prompt
+            self.assertIn("[PROJECT_CONTEXT_BEGIN]", planner_prompt)
+            self.assertIn("## goals\n- Build durable context", planner_prompt)
+            self.assertIn("[PROJECT_CONTEXT_END]", planner_prompt)
+            self.assertIn("[PROJECT_CONTEXT_BEGIN]", reviewer_prompt)
+            self.assertIn("## goals\n- Build durable context", reviewer_prompt)
+            self.assertIn("[PROJECT_CONTEXT_END]", reviewer_prompt)
+
+    def test_invalid_context_refuses_planner_start_when_required(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            # Create invalid context file (schema_version 99)
+            (repo / "agent" / "project-context.json").write_text(json.dumps({"schema_version": 99}), encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "invalid-context"], check=True)
+            port = FakePort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {"enabled": True}},
+                "project_context": {
+                    "enabled": True,
+                    "document_path": "agent/project-context.json",
+                    "require_valid": True,
+                },
+            }
+            snapshot = {
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**PENDING DESIGN**",
+                "telemetry": {"task_id": "P14"},
+            }
+            plan_id, reason = coordinator.start(project, snapshot, "command-fail")
+            self.assertIsNone(plan_id)
+            self.assertIn("durable project context is invalid", reason)
+
+    def test_absent_context_leaves_prompts_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = FakePort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {"enabled": True}},
+            }
+            snapshot = {
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**PENDING DESIGN**",
+                "telemetry": {"task_id": "P14"},
+            }
+            plan_id, _ = coordinator.start(project, snapshot, "command-absent")
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                row = coordinator.state()["plans"].get(plan_id)
+                if row and row.get("state") not in {"planning", "reviewing", "applying"}:
+                    break
+                time.sleep(0.02)
+            self.assertNotIn("[PROJECT_CONTEXT_BEGIN]", port.requests[0].prompt)
+            self.assertNotIn("[PROJECT_CONTEXT_BEGIN]", port.requests[1].prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

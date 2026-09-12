@@ -6,6 +6,14 @@
       "repo_path": "../../your-project",
       "worker_runtime": "tmp\\worker-dsh",
       "adapter": "agent_files",
+      "project_context": {
+        "enabled": false,
+        "document_path": "agent/project-context.json",
+        "supplement_path": null,
+        "require_valid": true,
+        "max_chars": 6000,
+        "inject_roles": ["planner", "worker", "reviewer"]
+      },
       "eta": {
         "default_worker_minutes": { "min": 30, "max": 90 },
         "historical_min_samples": 3,

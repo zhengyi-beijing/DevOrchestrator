@@ -218,6 +218,41 @@ class ProjectStatusTests(unittest.TestCase):
             self.assertEqual(projected_plan["state"], "PLANNING")
             self.assertEqual(projected_plan["planner"]["plan_id"], "plan-1")
 
+    def test_project_context_reaches_status_json_and_survives_project_runtime_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            head = make_repo(repo); runtime.mkdir()
+            snapshot = {
+                "project_id": "p1", "repo_path": str(repo), "state": "READY_TO_RUN",
+                "orchestration_ready": True, "next_title": "P1 bounded task",
+                "telemetry": {"task_id": "P1", "run_id": None},
+                "worker": {"kind": "none", "state": "not_started", "process_alive": False},
+                "git": {"branch": "master", "head": head, "dirty": False, "changed_entries": 0},
+                "project_context": {
+                    "schema_version": 1,
+                    "state": "ready",
+                    "reason": "context resolved",
+                    "digest": "0123456789abcdef",
+                    "updated_at": "2026-09-12T00:00:00+00:00",
+                    "document_path": "agent/project-context.json",
+                    "supplement_used": False,
+                    "domains": {"goals": 2, "architecture": 3},
+                },
+            }
+            target = write_project_status(
+                snapshot, runtime, phase="monitor", daemon_state="running", pid=123,
+            )
+            status = json.loads(target.read_text(encoding="utf-8"))
+            self.assertIn("project_context", status)
+            self.assertEqual(status["project_context"]["state"], "ready")
+            self.assertEqual(status["project_context"]["digest"], "0123456789abcdef")
+            self.assertEqual(status["project_context"]["domains"]["goals"], 2)
+
+            projected = project_runtime_status(snapshot, runtime)
+            self.assertIn("project_context", projected)
+            self.assertEqual(projected["project_context"]["state"], "ready")
+            self.assertEqual(projected["project_context"]["digest"], "0123456789abcdef")
+
 
 if __name__ == "__main__":
     unittest.main()
