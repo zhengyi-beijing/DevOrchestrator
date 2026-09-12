@@ -49,4 +49,10 @@ class ProjectAdapter(ABC):
         ``project`` is already canonically normalized (``project_id`` /
         ``repo_path`` present). ``runs_path`` points at the DevOrchestrator
         terminal-run history used for telemetry/ETA policy.
+
+        Adapters may optionally emit a top-level ``activity`` block containing
+        ``watchdog_safe`` projection metadata. This block is required for
+        project participation in the progress watchdog; ``MONITOR_ERROR``,
+        ``UNAVAILABLE``, and adapters omitting the block are treated as
+        activity-evidence-unavailable, suppressing automated watchdog attempts.
         """

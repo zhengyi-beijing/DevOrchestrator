@@ -216,6 +216,164 @@ def _normalize_project_context(raw: Any, index: int, config_path: Path) -> dict[
     }
 
 
+_ALLOWED_WATCHDOG_KEYS = frozenset({
+    "enabled",
+    "no_progress_threshold_minutes",
+    "lifecycle_overrides",
+    "cooldown_minutes",
+    "max_attempts_per_run",
+    "diagnostic_timeout_seconds",
+    "auto_recovery",
+})
+
+_ALLOWED_WATCHDOG_LIFECYCLES = frozenset({
+    "PLANNING",
+    "REVIEWING_PLAN",
+    "APPLYING_PLAN",
+    "EXECUTING",
+    "REVIEWING",
+    "REMEDIATING",
+})
+
+
+def _normalize_project_watchdog(raw: Any, index: int, config_path: Path) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "config {0} project #{1} watchdog must be an object".format(config_path, index)
+        )
+    unknown = set(raw.keys()) - _ALLOWED_WATCHDOG_KEYS
+    if unknown:
+        raise ValueError(
+            "config {0} project #{1} watchdog has unknown keys: {2}".format(
+                config_path, index, sorted(unknown)
+            )
+        )
+
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "config {0} project #{1} watchdog.enabled must be a boolean".format(
+                config_path, index
+            )
+        )
+
+    threshold = raw.get("no_progress_threshold_minutes", 15)
+    if isinstance(threshold, bool) or not isinstance(threshold, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.no_progress_threshold_minutes must be an integer".format(
+                config_path, index
+            )
+        )
+    if threshold < 1 or threshold > 1440:
+        raise ValueError(
+            "config {0} project #{1} watchdog.no_progress_threshold_minutes must be between 1 and 1440".format(
+                config_path, index
+            )
+        )
+
+    cooldown = raw.get("cooldown_minutes", 30)
+    if isinstance(cooldown, bool) or not isinstance(cooldown, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.cooldown_minutes must be an integer".format(
+                config_path, index
+            )
+        )
+    if cooldown < 1 or cooldown > 1440:
+        raise ValueError(
+            "config {0} project #{1} watchdog.cooldown_minutes must be between 1 and 1440".format(
+                config_path, index
+            )
+        )
+
+    max_attempts = raw.get("max_attempts_per_run", 3)
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.max_attempts_per_run must be an integer".format(
+                config_path, index
+            )
+        )
+    if max_attempts < 1 or max_attempts > 10:
+        raise ValueError(
+            "config {0} project #{1} watchdog.max_attempts_per_run must be between 1 and 10".format(
+                config_path, index
+            )
+        )
+
+    timeout = raw.get("diagnostic_timeout_seconds", 120)
+    if isinstance(timeout, bool) or not isinstance(timeout, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.diagnostic_timeout_seconds must be an integer".format(
+                config_path, index
+            )
+        )
+    if timeout < 10 or timeout > 600:
+        raise ValueError(
+            "config {0} project #{1} watchdog.diagnostic_timeout_seconds must be between 10 and 600".format(
+                config_path, index
+            )
+        )
+
+    auto_recovery = raw.get("auto_recovery", False)
+    if not isinstance(auto_recovery, bool):
+        raise ValueError(
+            "config {0} project #{1} watchdog.auto_recovery must be a boolean".format(
+                config_path, index
+            )
+        )
+
+    raw_overrides = raw.get("lifecycle_overrides", {})
+    if not isinstance(raw_overrides, dict):
+        raise ValueError(
+            "config {0} project #{1} watchdog.lifecycle_overrides must be an object".format(
+                config_path, index
+            )
+        )
+    normalized_overrides: dict[str, int] = {}
+    for raw_k, val in raw_overrides.items():
+        if not isinstance(raw_k, str) or not raw_k.strip():
+            raise ValueError(
+                "config {0} project #{1} watchdog.lifecycle_overrides has invalid state key: {2!r}".format(
+                    config_path, index, raw_k
+                )
+            )
+        norm_k = raw_k.strip().upper()
+        if norm_k in normalized_overrides:
+            raise ValueError(
+                "config {0} project #{1} watchdog.lifecycle_overrides has duplicate normalized key {2!r}".format(
+                    config_path, index, norm_k
+                )
+            )
+        if norm_k not in _ALLOWED_WATCHDOG_LIFECYCLES:
+            raise ValueError(
+                "config {0} project #{1} watchdog.lifecycle_overrides key {2!r} is not an allowed lifecycle state {3}".format(
+                    config_path, index, raw_k, sorted(_ALLOWED_WATCHDOG_LIFECYCLES)
+                )
+            )
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise ValueError(
+                "config {0} project #{1} watchdog.lifecycle_overrides[{2!r}] must be an integer".format(
+                    config_path, index, raw_k
+                )
+            )
+        if val < 1 or val > 1440:
+            raise ValueError(
+                "config {0} project #{1} watchdog.lifecycle_overrides[{2!r}] must be between 1 and 1440".format(
+                    config_path, index, raw_k
+                )
+            )
+        normalized_overrides[norm_k] = val
+
+    return {
+        "enabled": enabled,
+        "no_progress_threshold_minutes": threshold,
+        "lifecycle_overrides": normalized_overrides,
+        "cooldown_minutes": cooldown,
+        "max_attempts_per_run": max_attempts,
+        "diagnostic_timeout_seconds": timeout,
+        "auto_recovery": auto_recovery,
+    }
+
+
 def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str, Any]:
     """One project entry -> canonical copy with legacy aliases preserved."""
     if not isinstance(project, dict):
@@ -260,6 +418,9 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
     raw_context = project.get("project_context")
     if raw_context is not None:
         normalized["project_context"] = _normalize_project_context(raw_context, index, config_path)
+    raw_watchdog = project.get("watchdog")
+    if raw_watchdog is not None:
+        normalized["watchdog"] = _normalize_project_watchdog(raw_watchdog, index, config_path)
     normalized["orchestration_ready"] = (
         _binding_ready(normalized.get("conversation_binding"))
         or _direct_reviewer_ready(normalized)

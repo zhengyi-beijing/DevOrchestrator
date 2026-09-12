@@ -51,7 +51,7 @@ from dev_orchestrator.storage.json_store import (
     write_json,
     write_text,
 )
-from dev_orchestrator.web.server import monitor_payload, run_web
+from dev_orchestrator.web.server import monitor_payload, run_web, watchdog_payload
 
 _INTERVAL_MIN = 5
 _INTERVAL_MAX = 3600
@@ -307,6 +307,22 @@ def cmd_project_continue(args: argparse.Namespace) -> int:
     if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
         _fail("project is not present in the current runtime")
     _print_json(submit_control_command(runtime, project_id, "continue"))
+    return 0
+
+
+def cmd_watchdog_status(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    payload = watchdog_payload(runtime)
+    raw_pid = getattr(args, "project_id", None)
+    if raw_pid:
+        project_id = _validated_project_id(raw_pid)
+        projects = payload.get("projects") or {}
+        if project_id not in projects:
+            _print_json({"project_id": project_id, "state": "not_found"})
+            return 1
+        _print_json(projects[project_id])
+        return 0
+    _print_json(payload)
     return 0
 
 
@@ -765,6 +781,11 @@ def build_parser() -> argparse.ArgumentParser:
     project_status.add_argument("project_id")
     project_status.add_argument("--runtime-root", default=None)
 
+    watchdog_status = sub.add_parser("watchdog-status", help="report progress watchdog status")
+    watchdog_status.add_argument("--config", default=None, help="path to projects.json")
+    watchdog_status.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+    watchdog_status.add_argument("--project-id", default=None, help="optional project id to filter")
+
     project_continue = sub.add_parser("project-continue", help="queue a stateless continue command for one project")
     project_continue.add_argument("project_id")
     project_continue.add_argument("--runtime-root", default=None)
@@ -840,6 +861,7 @@ _COMMANDS = {
     "validate-config": cmd_validate_config,
     "project-context": cmd_project_context,
     "project-status": cmd_project_status,
+    "watchdog-status": cmd_watchdog_status,
     "project-continue": cmd_project_continue,
     "monitor": cmd_monitor,
     "web": cmd_web,

@@ -70,10 +70,10 @@ def git_info(root: Path) -> dict[str, Any]:
     }
 
 
-def git_changed_activity_utc(root: Path) -> Optional[datetime]:
-    """Most recent LastWriteTime of any file reported changed by Git."""
+def git_changed_entries(root: Path) -> list[dict[str, str]]:
+    """Raw changed-entry rows reported by Git porcelain v1."""
     proc = _run_git(root, "status", "--porcelain", "--untracked-files=all")
-    latest: Optional[datetime] = None
+    entries: list[dict[str, str]] = []
     for line in proc.stdout.splitlines():
         # Porcelain v1 entries are fixed-column "<XY> <path>": the two status
         # columns (index, worktree) must be preserved, so slice at index 3 on
@@ -90,11 +90,22 @@ def git_changed_activity_utc(root: Path) -> Optional[datetime]:
         try:
             if candidate.is_file():
                 mtime = datetime.fromtimestamp(candidate.stat().st_mtime).astimezone()
-                if latest is None or mtime > latest:
-                    latest = mtime
+                entries.append({
+                    "relative": relative,
+                    "path": str(candidate.resolve()),
+                    "mtime_iso": mtime.isoformat(),
+                })
         except OSError:
             continue
-    return latest
+    return entries
+
+
+def git_changed_activity_utc(root: Path) -> Optional[datetime]:
+    """Most recent LastWriteTime of any file reported changed by Git."""
+    entries = git_changed_entries(root)
+    if not entries:
+        return None
+    return max(datetime.fromisoformat(entry["mtime_iso"]) for entry in entries)
 
 
 def resolve_monitor_state(
@@ -132,11 +143,14 @@ def resolve_monitor_state(
     return "IDLE"
 
 
-def _adapter_for_project(project: dict) -> Any:
+def _adapter_for_project(project: dict, runtime_root: Optional[Path | str] = None) -> Any:
     """Select the configured ProjectAdapter; unknown ids fail closed."""
-    from dev_orchestrator.adapters import get_project_adapter
+    from dev_orchestrator.adapters import get_project_adapter, DEFAULT_ADAPTER_ID
+    from dev_orchestrator.adapters.agent_files import AgentFilesAdapter
 
-    adapter_id = str(project.get("adapter") or "agent_files")
+    adapter_id = str(project.get("adapter") or DEFAULT_ADAPTER_ID)
+    if adapter_id == DEFAULT_ADAPTER_ID:
+        return AgentFilesAdapter(runtime_root=runtime_root)
     return get_project_adapter(adapter_id)
 
 
@@ -194,7 +208,7 @@ def run_monitor_once(
             except (OSError, ValueError):
                 previous = None
         try:
-            adapter = _adapter_for_project(project)
+            adapter = _adapter_for_project(project, runtime_root=runtime)
             snapshot = adapter.snapshot(project, runs_path, now=tick_now)
         except Exception as exc:  # noqa: BLE001 - match PS MONITOR_ERROR catch-all
             snapshot = _monitor_error_snapshot(project, tick_now, exc)

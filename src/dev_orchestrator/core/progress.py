@@ -39,6 +39,9 @@ NORMAL_MILESTONES = QUIET_MILESTONES | frozenset({
     "REMEDIATE",
     "REVIEW_ACCEPTED",
     "NEXT_TASK",
+    "STALL_DETECTED",
+    "DIAGNOSTIC_RESULT",
+    "RECOVERY_STARTED",
 })
 
 VERBOSE_MILESTONES = NORMAL_MILESTONES | frozenset({
@@ -51,6 +54,7 @@ VERBOSE_MILESTONES = NORMAL_MILESTONES | frozenset({
     "TICK",
     "IDLE",
     "HEARTBEAT",
+    "DIAGNOSTIC_STARTED",
 })
 
 
@@ -67,6 +71,10 @@ class ProgressMilestone(str, Enum):
     BLOCKED = "BLOCKED"
     TASK_COMPLETE = "TASK_COMPLETE"
     NEXT_TASK = "NEXT_TASK"
+    STALL_DETECTED = "STALL_DETECTED"
+    DIAGNOSTIC_STARTED = "DIAGNOSTIC_STARTED"
+    DIAGNOSTIC_RESULT = "DIAGNOSTIC_RESULT"
+    RECOVERY_STARTED = "RECOVERY_STARTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +450,10 @@ class ProgressChannel:
             "BLOCKED": "Execution blocked",
             "TASK_COMPLETE": "Task successfully completed",
             "NEXT_TASK": "Advancing to next task",
+            "STALL_DETECTED": "Progress stall detected",
+            "DIAGNOSTIC_STARTED": "Watchdog diagnostic task started",
+            "DIAGNOSTIC_RESULT": "Watchdog diagnostic completed",
+            "RECOVERY_STARTED": "Watchdog automatic recovery initiated",
         }
         desc = descs.get(milestone, f"Milestone {milestone}")
         reason = details.get("reason") if isinstance(details, dict) and details.get("reason") else ""

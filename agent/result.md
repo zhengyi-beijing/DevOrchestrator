@@ -86,3 +86,47 @@ P9 independent final review (2026-09-12):
 - Reviewer could not rerun the Python suite because its safe-mode permission layer denied test execution, but repository evidence records 242 passing tests; reviewer independently confirmed `git diff --check` clean and found no blocking defect.
 - Non-blocking follow-up: the design-doc example contains the word `tokens`, which the current broad secret-marker heuristic would reject; narrow/document that heuristic in a later bounded cleanup, not in P10.
 
+P10 Active-Project Progress Watchdog and Automatic Read-Only Diagnostics:
+- Architecture and Policy Design:
+  - Authored and frozen complete V5 design specification in `docs/PROGRESS_WATCHDOG_DIAGNOSTICS_DESIGN.md`.
+  - Defined pure policy in `src/dev_orchestrator/core/watchdog.py`: `ACTIVE_LIFECYCLE_STATES` (`PLANNING`, `REVIEWING_PLAN`, `APPLYING_PLAN`, `EXECUTING`, `REVIEWING`, `REMEDIATING`), `LIFECYCLE_OVERRIDE_FAMILY` mapping, `resolve_watchdog_policy`, and `resolve_threshold_seconds`.
+- Canonical Path Identity and Dual Provenance:
+  - Implemented `canonical_path(p) = os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(p))))`.
+  - Implemented `path_contains(root, candidate)` using `os.path.commonpath`, catching `ValueError` across drives safely.
+  - Re-implemented `is_watchdog_owned_path(repo_root, candidate, *, runtime_root=None)` with exact and glob filtering without string prefix matching.
+  - In `src/dev_orchestrator/adapters/agent_files.py`, refactored activity collection to preserve raw `ActivityEntry` tuples and compute dual aggregation: unfiltered legacy aggregate (`last_activity_at`, `last_activity_age_seconds`) + `watchdog_safe` projection carrying dual cryptographic provenance fingerprints (`repo_root_fingerprint`, `runtime_root_fingerprint`, `repo_scope`, `runtime_scope`).
+- Clock-Free Fingerprint Purity:
+  - Frozen `FINGERPRINT_FIELDS` allowlist and strict `FINGERPRINT_FORBIDDEN` / timing token validation in `build_progress_fingerprint`.
+  - Derived stable `run_key` (`norun:<hash>` fallback), `run_scope_key`, and `attempt_key`.
+- Read-Only Diagnostics and Classification:
+  - Implemented `src/dev_orchestrator/core/diagnostics.py` under monotonic deadline budget without model inference or destructive actions.
+  - Implemented deterministic rule-based `classify_evidence` for the 7 frozen codes: `healthy_slow`, `agent_stalled`, `process_dead`, `provider_or_quota_blocked`, `state_desync`, `external_wait`, `unknown`.
+  - Implemented stable `evidence_hash` and bounded 500-char secret-redacted log tailing.
+- Fail-Closed Persistence and Generation Fencing:
+  - Implemented durable `watchdog.json` persistence with corrupt-state quarantine (`watchdog.json.corrupt-<stamp>`), `degraded` flag, single OWNER_GATE emission, and per-project row quarantine.
+  - Generation token fencing (`fence_token = f"{att_key}:{generation}"`) with hard deadline reaping (`_reap_overdue_attempts`) and late result discard.
+  - Interrupted in-flight attempt marking upon coordinator restart.
+- Safe Two-Phase Recovery:
+  - Crash-atomic two-phase protocol: `RESERVE` (recording `command_id = wd-<attempt_key>` in durable state) -> `ENQUEUE` (writing control command into `runtime/control/inbox` with milestone `RECOVERY_STARTED`) -> `RECONCILE` (`_reconcile_recoveries` against inbox/history).
+  - Explicit opt-in (`auto_recovery=true`), restricted exclusively to non-destructive `continue`, with single recovery per run scope.
+- Observability, CLI, and Daemon Integration:
+  - Added read-only `GET /api/watchdog` route in Web dashboard server.
+  - Added CLI subcommand `watchdog-status [--config PATH] [--runtime-root PATH] [--project-id ID]`.
+  - Integrated `WatchdogCoordinator` into `_run_orchestration_tick` and `run_daemon` in `src/dev_orchestrator/daemon.py`.
+- Comprehensive Verification:
+  - 10 new dedicated test suites with 39 new unit tests:
+    - `tests_py/test_activity_evidence.py`
+    - `tests_py/test_watchdog_owned_paths.py`
+    - `tests_py/test_watchdog_fingerprint.py`
+    - `tests_py/test_watchdog_self_exclusion.py`
+    - `tests_py/test_watchdog.py`
+    - `tests_py/test_watchdog_state_failclosed.py`
+    - `tests_py/test_watchdog_diagnostics.py`
+    - `tests_py/test_watchdog_timeout_fencing.py`
+    - `tests_py/test_watchdog_recovery.py`
+    - `tests_py/test_watchdog_concurrency.py`
+  - Full test suite: 281 tests passing cleanly (`python -m unittest discover -s tests_py`).
+  - Userscript syntax check: `node --check browser/chatgpt-web-adapter.user.js` passed.
+  - Git diff check: `git diff --check` clean.
+  - Config validation smoke test passed.
+  - Static guard verified: zero forbidden APIs in watchdog/diagnostics modules.

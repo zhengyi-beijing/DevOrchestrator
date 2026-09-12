@@ -16,6 +16,7 @@ Implemented:
 - provider-neutral `AIExecutionPort` integration with AIResourceBroker;
 - independent AIBroker Planner, plan Reviewer, Worker, and Worker Reviewer roles;
 - restart reconciliation, idempotent control history, and fail-closed repository-truth guards;
+- active-project progress watchdog, automatic read-only diagnostics, and safe two-phase recovery;
 - Browser Bridge/Web Sol compatibility path for projects not yet migrated.
 
 DevOrchestrator owns lifecycle semantics. AIResourceBroker owns provider/account/model
@@ -80,6 +81,7 @@ Status / stop:
 
 ```powershell
 python -m dev_orchestrator status-daemon --runtime-root .\runtime
+python -m dev_orchestrator watchdog-status --runtime-root .\runtime
 python -m dev_orchestrator stop-daemon --runtime-root .\runtime
 ```
 

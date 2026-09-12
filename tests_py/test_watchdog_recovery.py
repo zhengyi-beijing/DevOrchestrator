@@ -1,0 +1,203 @@
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from dev_orchestrator.core.watchdog import (
+    WATCHDOG_COMMAND_PREFIX,
+    WatchdogCoordinator,
+)
+
+
+class DummyProgressChannel:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, project_id, milestone, **kwargs):
+        self.events.append((project_id, milestone, kwargs))
+
+
+def _init_git_repo(root: Path) -> None:
+    subprocess.run(["git", "-C", str(root), "init"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    (root / "README.md").write_text("# Test", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "-C", str(root), "commit", "-m", "initial"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class WatchdogRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp_dir.name)
+        self.repo_dir = self.root / "repo"
+        self.runtime_dir = self.root / "runtime"
+        self.repo_dir.mkdir(parents=True)
+        self.runtime_dir.mkdir(parents=True)
+        _init_git_repo(self.repo_dir)
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def test_auto_recovery_disabled_no_command(self):
+        """When auto_recovery is disabled (default), no recovery command is queued."""
+        coordinator = WatchdogCoordinator(self.runtime_dir)
+        prow = {"attempts": {}}
+        att = {
+            "attempt_key": "att-1",
+            "run_scope_key": "rscope-1",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": True,
+        }
+        coordinator._check_and_trigger_recovery(
+            project_config={"project_id": "p1", "repo_path": str(self.repo_dir)},
+            snapshot={"project_id": "p1"},
+            project_row=prow,
+            attempt_key="att-1",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        inbox_files = list((self.runtime_dir / "control" / "inbox").glob("*.json"))
+        self.assertEqual(len(inbox_files), 0)
+
+    def test_two_phase_recovery_execution(self):
+        """Eligible stall with auto_recovery=true executes reserve and enqueue."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {}}
+        att = {
+            "attempt_key": "att-auto",
+            "run_scope_key": "rscope-1",
+            "task_id": "T1",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+        }
+        coordinator._cached_state["projects"]["p1"] = prow
+
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir)},
+            project_row=prow,
+            attempt_key="att-auto",
+            attempt_record=att,
+        )
+
+        # 1. RESERVE check
+        expected_cid = f"{WATCHDOG_COMMAND_PREFIX}att-auto"
+        self.assertEqual(prow["recovery_slots"]["rscope-1"], expected_cid)
+        rec = att.get("recovery")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["action"], "continue")
+        self.assertEqual(rec["command_id"], expected_cid)
+        self.assertEqual(rec["state"], "requested")
+
+        # 2. ENQUEUE check: file in control inbox
+        inbox_file = self.runtime_dir / "control" / "inbox" / f"{expected_cid}.json"
+        self.assertTrue(inbox_file.is_file())
+        cmd_data = json.loads(inbox_file.read_text(encoding="utf-8"))
+        self.assertEqual(cmd_data["action"], "continue")
+        self.assertEqual(cmd_data["project_id"], "p1")
+        self.assertEqual(cmd_data["command_id"], expected_cid)
+
+        # 3. RECOVERY_STARTED milestone emitted
+        rec_events = [e for e in channel.events if e[1] == "RECOVERY_STARTED"]
+        self.assertEqual(len(rec_events), 1)
+        self.assertEqual(rec_events[0][2]["details"]["command_id"], expected_cid)
+
+    def test_single_recovery_per_run_scope_budget(self):
+        """Second recovery attempt in same run scope is blocked with OWNER_GATE."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {
+            "recovery_slots": {"rscope-1": "wd-prior-attempt"},
+            "attempts": {},
+        }
+        att2 = {
+            "attempt_key": "att-second",
+            "run_scope_key": "rscope-1",
+            "task_id": "T1",
+            "diagnosis": "agent_stalled",
+        }
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir)},
+            project_row=prow,
+            attempt_key="att-second",
+            attempt_record=att2,
+        )
+        self.assertIsNone(att2.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "recovery_slot_already_consumed")
+
+    def test_reconcile_crashed_before_enqueue(self):
+        """If coordinator crashed after RESERVE but before ENQUEUE, reconcile marks unresolved."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        cid = "wd-crashed-before-enqueue"
+        att = {
+            "attempt_key": "att-crash",
+            "run_scope_key": "rscope-1",
+            "recovery": {
+                "action": "continue",
+                "state": "reserved",
+                "command_id": cid,
+            },
+        }
+        coordinator._cached_state["projects"]["p1"] = {
+            "attempts": {"att-crash": att},
+            "recovery_slots": {"rscope-1": cid},
+        }
+
+        # Neither inbox nor history has the file!
+        coordinator._reconcile_recoveries()
+
+        self.assertEqual(att["recovery"]["state"], "unresolved")
+        self.assertIn("never enqueued", att["recovery"]["reason"])
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["gate"], "recovery-unresolved")
+
+    def test_reconcile_completed_from_history(self):
+        """If recovery command was executed and moved to history, reconcile marks completed."""
+        coordinator = WatchdogCoordinator(self.runtime_dir)
+
+        cid = "wd-att-finished"
+        history_dir = self.runtime_dir / "control" / "history"
+        history_dir.mkdir(parents=True)
+        (history_dir / f"{cid}.json").write_text(
+            json.dumps({"command_id": cid, "state": "applied"}),
+            encoding="utf-8",
+        )
+
+        att = {
+            "attempt_key": "att-finished",
+            "recovery": {
+                "action": "continue",
+                "state": "requested",
+                "command_id": cid,
+            },
+        }
+        coordinator._cached_state["projects"]["p1"] = {
+            "attempts": {"att-finished": att},
+            "recovery_slots": {"rscope-1": cid},
+        }
+
+        coordinator._reconcile_recoveries()
+
+        self.assertEqual(att["recovery"]["state"], "completed")
+        self.assertIn("applied", att["recovery"]["reason"])
+
+
+if __name__ == "__main__":
+    unittest.main()

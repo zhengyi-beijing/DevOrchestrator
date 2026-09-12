@@ -14,6 +14,15 @@
         "max_chars": 6000,
         "inject_roles": ["planner", "worker", "reviewer"]
       },
+      "watchdog": {
+        "enabled": true,
+        "no_progress_threshold_minutes": 15,
+        "lifecycle_overrides": {},
+        "cooldown_minutes": 30,
+        "max_attempts_per_run": 3,
+        "diagnostic_timeout_seconds": 120,
+        "auto_recovery": false
+      },
       "eta": {
         "default_worker_minutes": { "min": 30, "max": 90 },
         "historical_min_samples": 3,

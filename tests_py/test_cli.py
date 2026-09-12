@@ -208,6 +208,47 @@ class CliLifecycleTests(unittest.TestCase):
             pctx_bad_data = json.loads(pctx_bad.stdout)
             self.assertEqual(pctx_bad_data["state"], "invalid")
 
+    def test_watchdog_status_cli(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+
+            # Empty runtime returns default payload
+            res_empty = run_cli("watchdog-status", "--runtime-root", str(runtime))
+            self.assertEqual(res_empty.returncode, 0, res_empty.stderr)
+            data_empty = json.loads(res_empty.stdout)
+            self.assertEqual(data_empty["projects"], {})
+            self.assertFalse(data_empty["degraded"])
+
+            # Nonexistent project filter returns 1 with not_found
+            res_nf = run_cli("watchdog-status", "--runtime-root", str(runtime), "--project-id", "p_missing")
+            self.assertEqual(res_nf.returncode, 1)
+            self.assertEqual(json.loads(res_nf.stdout)["state"], "not_found")
+
+            # With watchdog.json present
+            state = {
+                "version": 1,
+                "degraded": False,
+                "projects": {
+                    "p1": {
+                        "last_checked_at": "2026-09-12T10:00:00Z",
+                        "cooldown_minutes": 30,
+                        "attempts": {},
+                    }
+                },
+            }
+            (runtime / "watchdog.json").write_text(json.dumps(state), encoding="utf-8")
+
+            res_full = run_cli("watchdog-status", "--runtime-root", str(runtime))
+            self.assertEqual(res_full.returncode, 0, res_full.stderr)
+            data_full = json.loads(res_full.stdout)
+            self.assertIn("p1", data_full["projects"])
+
+            # Filtered by project_id
+            res_p1 = run_cli("watchdog-status", "--runtime-root", str(runtime), "--project-id", "p1")
+            self.assertEqual(res_p1.returncode, 0, res_p1.stderr)
+            data_p1 = json.loads(res_p1.stdout)
+            self.assertEqual(data_p1["schema_version"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

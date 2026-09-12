@@ -1,6 +1,6 @@
 # P10 Active-Project Progress Watchdog and Automatic Diagnostics
 
-Status: **PENDING DESIGN**
+Status: **COMPLETED (PENDING REVIEW)**
 
 Goal: make DevOrchestrator detect active projects that have exceeded a configurable no-progress threshold and automatically launch one bounded diagnostic task instead of silently remaining in a running state.
 

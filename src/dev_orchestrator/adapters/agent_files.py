@@ -19,20 +19,35 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+import hashlib
+from dataclasses import dataclass
 from dev_orchestrator.adapters.base import DEFAULT_ADAPTER_ID, ProjectAdapter
+from dev_orchestrator.core.watchdog import (
+    canonical_path,
+    is_watchdog_owned_path,
+    path_contains,
+)
 from dev_orchestrator.monitor.project import (
-    git_changed_activity_utc,
+    git_changed_entries,
     git_info,
     resolve_monitor_state,
 )
 from dev_orchestrator.monitor.telemetry import extract_task_id, worker_telemetry
 from dev_orchestrator.platform.process import is_pid_alive
-from dev_orchestrator.storage.json_store import read_text_strict, utc_now
+from dev_orchestrator.storage.json_store import parse_utc, read_text_strict, utc_now
 
 _NEXT_TITLE_RE = re.compile(r"^# ")
 _NEXT_STATUS_RE = re.compile(r"^Status:", re.IGNORECASE)
 _PHASE_HINT_RE = re.compile(r"^- P[0-9].*(?:DESIGN READY|NOT STARTED|BLOCKED|RUNNING)", re.IGNORECASE)
 _WORKER_COPY_FIELDS = ("pid", "started_at", "updated_at", "exit_code", "command", "model")
+
+
+@dataclass(frozen=True)
+class ActivityEntry:
+    kind: str
+    relative: str
+    path: str
+    mtime: datetime
 
 
 def _first_matching_line(text: str, pattern: re.Pattern) -> Optional[str]:
@@ -79,39 +94,106 @@ def _worker_info(root: Path, relative_runtime: str) -> dict[str, Any]:
     return info
 
 
-def _activity_candidates(root: Path, relative_runtime: str) -> list[Path]:
+def _collect_activity_entries(root: Path, relative_runtime: str) -> list[ActivityEntry]:
+    """Collect raw path-identifiable activity entries in one pass."""
+    entries: list[ActivityEntry] = []
     run_root = root / relative_runtime
-    return [
+    worker_files = [
         run_root / "status.json",
         run_root / "stdout.log",
         run_root / "stderr.log",
+    ]
+    for p in worker_files:
+        try:
+            if p.is_file():
+                mtime = datetime.fromtimestamp(p.stat().st_mtime).astimezone()
+                rel = os.path.relpath(p, root).replace("\\", "/")
+                entries.append(ActivityEntry("worker_runtime", rel, str(p.resolve()), mtime))
+        except OSError:
+            pass
+
+    agent_files = [
         root / "agent" / "CURRENT.md",
         root / "agent" / "next.md",
         root / "agent" / "result.md",
     ]
+    for p in agent_files:
+        try:
+            if p.is_file():
+                mtime = datetime.fromtimestamp(p.stat().st_mtime).astimezone()
+                rel = os.path.relpath(p, root).replace("\\", "/")
+                entries.append(ActivityEntry("agent_file", rel, str(p.resolve()), mtime))
+        except OSError:
+            pass
+
+    for row in git_changed_entries(root):
+        try:
+            mtime = datetime.fromisoformat(row["mtime_iso"])
+            entries.append(ActivityEntry("git_changed", row["relative"], row["path"], mtime))
+        except (KeyError, ValueError):
+            pass
+
+    return entries
+
+
+def aggregate_activity(
+    entries: list[ActivityEntry],
+    *,
+    exclude: Optional[Callable[[ActivityEntry], bool]] = None,
+) -> tuple[Optional[str], Optional[ActivityEntry], dict[str, Any], list[ActivityEntry]]:
+    """Pure aggregation of activity entries; order-independent."""
+    per_kind: dict[str, Any] = {
+        "worker_runtime": {"last_activity_at": None, "path": None, "considered": 0, "excluded_self": 0},
+        "agent_file": {"last_activity_at": None, "path": None, "considered": 0, "excluded_self": 0},
+        "git_changed": {"last_activity_at": None, "path": None, "considered": 0, "excluded_self": 0},
+    }
+    excluded: list[ActivityEntry] = []
+    considered: list[ActivityEntry] = []
+
+    for entry in entries:
+        if exclude is not None and exclude(entry):
+            excluded.append(entry)
+            kind_stats = per_kind.setdefault(entry.kind, {
+                "last_activity_at": None, "path": None, "considered": 0, "excluded_self": 0
+            })
+            kind_stats["excluded_self"] += 1
+            continue
+
+        considered.append(entry)
+        kind_stats = per_kind.setdefault(entry.kind, {
+            "last_activity_at": None, "path": None, "considered": 0, "excluded_self": 0
+        })
+        kind_stats["considered"] += 1
+        curr_kind_latest = kind_stats["last_activity_at"]
+        if curr_kind_latest is None:
+            kind_stats["last_activity_at"] = entry.mtime.isoformat()
+            kind_stats["path"] = entry.relative
+        else:
+            prev_dt = parse_utc(curr_kind_latest)
+            if prev_dt is not None and entry.mtime > prev_dt:
+                kind_stats["last_activity_at"] = entry.mtime.isoformat()
+                kind_stats["path"] = entry.relative
+
+    newest: Optional[ActivityEntry] = None
+    if considered:
+        newest = max(considered, key=lambda e: e.mtime)
+
+    last_activity_at = newest.mtime.isoformat() if newest is not None else None
+    return last_activity_at, newest, per_kind, excluded
 
 
 def _last_activity_utc(root: Path, relative_runtime: str) -> Optional[str]:
-    """Newest mtime across worker logs, agent files and changed Git files."""
-    latest: Optional[datetime] = None
-    for path in _activity_candidates(root, relative_runtime):
-        try:
-            if path.is_file():
-                mtime = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
-                if latest is None or mtime > latest:
-                    latest = mtime
-        except OSError:
-            continue
-    git_activity = git_changed_activity_utc(root)
-    if git_activity is not None and (latest is None or git_activity > latest):
-        latest = git_activity
-    if latest is None:
-        return None
-    return latest.astimezone().isoformat()
+    """Legacy helper: newest mtime across worker logs, agent files and Git."""
+    entries = _collect_activity_entries(root, relative_runtime)
+    last_act, _, _, _ = aggregate_activity(entries)
+    return last_act
 
 
 class AgentFilesAdapter(ProjectAdapter):
     """Default adapter for the ``agent/*.md + worker status.json`` contract."""
+
+    def __init__(self, *, runtime_root: Path | str | None = None) -> None:
+        self.runtime_root = Path(runtime_root) if runtime_root is not None else None
 
     @property
     def adapter_id(self) -> str:
@@ -123,6 +205,7 @@ class AgentFilesAdapter(ProjectAdapter):
         runs_path: Path | str,
         *,
         now: Optional[datetime] = None,
+        runtime_root: Path | str | None = None,
     ) -> dict[str, Any]:
         """One read-only projection for a canonically normalized project."""
         now = now or utc_now()
@@ -131,6 +214,7 @@ class AgentFilesAdapter(ProjectAdapter):
         project_name = project.get("name")
         root_text = str(project.get("repo_path") or "")
         root = Path(os.path.abspath(root_text))
+        eff_runtime_root = runtime_root or self.runtime_root
 
         common = {
             "id": project_id,
@@ -182,12 +266,69 @@ class AgentFilesAdapter(ProjectAdapter):
 
         worker = _worker_info(root, relative_runtime)
         state = resolve_monitor_state(worker, next_status, next_updated_at)
-        last_activity = _last_activity_utc(root, relative_runtime)
+
+        # Activity collection and dual aggregation (unfiltered vs watchdog_safe)
+        entries = _collect_activity_entries(root, relative_runtime)
+        unfiltered_last_activity, _, _, _ = aggregate_activity(entries)
+        (
+            filtered_last_activity,
+            newest_filtered,
+            per_kind_rollup,
+            excluded_entries,
+        ) = aggregate_activity(
+            entries,
+            exclude=lambda e: is_watchdog_owned_path(root, e.path, runtime_root=eff_runtime_root),
+        )
+
+        sorted_excluded = sorted({e.relative for e in excluded_entries})
+        now_dt = now or utc_now()
+        age_seconds: Optional[float] = None
+        if filtered_last_activity:
+            f_dt = parse_utc(filtered_last_activity)
+            if f_dt:
+                age_seconds = round(max(0.0, (now_dt - f_dt).total_seconds()), 1)
+
+        c_root = canonical_path(root)
+        repo_root_fp = hashlib.sha256(c_root.encode("utf-8")).hexdigest()[:16]
+        repo_scope = "canonical"
+
+        runtime_root_fp: Optional[str] = None
+        runtime_scope = "unknown"
+        if eff_runtime_root is not None:
+            c_rt = canonical_path(eff_runtime_root)
+            runtime_root_fp = hashlib.sha256(c_rt.encode("utf-8")).hexdigest()[:16]
+            runtime_scope = "runtime-aware" if path_contains(root, eff_runtime_root) else "runtime-external"
+
+        activity_block = {
+            "schema_version": 1,
+            "last_activity_at": unfiltered_last_activity,
+            "watchdog_safe": {
+                "last_activity_at": filtered_last_activity,
+                "age_seconds": age_seconds,
+                "newest_kind": newest_filtered.kind if newest_filtered else None,
+                "newest_path": newest_filtered.relative if newest_filtered else None,
+                "sources": per_kind_rollup,
+                "changed_entries_considered": per_kind_rollup.get("git_changed", {}).get("considered", 0),
+                "excluded_paths": sorted_excluded[:20],
+                "excluded_count": len(excluded_entries),
+                "repo_root_fingerprint": repo_root_fp,
+                "repo_scope": repo_scope,
+                "runtime_root_fingerprint": runtime_root_fp,
+                "runtime_scope": runtime_scope,
+            },
+        }
+
         task_id = extract_task_id(next_title)
         if task_id is None:
             task_id = extract_task_id(next_text)
         telemetry = worker_telemetry(
-            project, worker, task_id, last_activity, runs_path, now=now
+            project,
+            worker,
+            task_id,
+            unfiltered_last_activity,
+            runs_path,
+            now=now,
+            watchdog_safe_activity_at=filtered_last_activity,
         )
         return {
             **common,
@@ -196,7 +337,8 @@ class AgentFilesAdapter(ProjectAdapter):
             "git": git_info(root),
             "worker": worker,
             "telemetry": telemetry,
-            "last_activity_at": last_activity,
+            "last_activity_at": unfiltered_last_activity,
+            "activity": activity_block,
             "next_title": next_title,
             "next_status": next_status,
             "next_updated_at": next_updated_at,

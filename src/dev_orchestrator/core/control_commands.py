@@ -39,23 +39,34 @@ def _paths(runtime_root: Path | str) -> tuple[Path, Path]:
     return root / "inbox", root / "history"
 
 
-def submit_control_command(runtime_root: Path | str, project_id: str, action: str) -> dict[str, Any]:
+def submit_control_command(
+    runtime_root: Path | str,
+    project_id: str,
+    action: str,
+    *,
+    command_id: Optional[str] = None,
+) -> dict[str, Any]:
     project = _nonblank(project_id)
     if project is None:
         raise ValueError("project_id must be nonblank")
     if action not in _SUPPORTED_ACTIONS:
         raise ValueError("unsupported control action")
     inbox, _ = _paths(runtime_root)
-    command_id = str(uuid4())
+    if command_id is not None:
+        cid = _safe_command_id(command_id)
+        if cid is None:
+            raise ValueError(f"invalid command_id: {command_id!r}")
+    else:
+        cid = str(uuid4())
     record = {
         "version": CONTROL_VERSION,
-        "command_id": command_id,
+        "command_id": cid,
         "project_id": project,
         "action": action,
         "state": "pending",
         "requested_at": utc_now_iso(),
     }
-    write_json(inbox / (command_id + ".json"), record, indent=2)
+    write_json(inbox / (cid + ".json"), record, indent=2)
     return record
 
 

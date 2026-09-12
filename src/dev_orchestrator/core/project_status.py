@@ -12,10 +12,148 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dev_orchestrator.platform.process import hidden_subprocess_kwargs
-from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
+from dev_orchestrator.storage.json_store import (
+    parse_utc,
+    read_json,
+    utc_now,
+    utc_now_iso,
+    write_json,
+)
 
 STATUS_RELATIVE_PATH = Path(".devorch") / "status.json"
 STATUS_SCHEMA_VERSION = 1
+
+
+def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
+    state_file = runtime / "watchdog.json"
+    if not state_file.is_file():
+        return None
+
+    data = read_json(state_file, None)
+    if not isinstance(data, dict):
+        return {
+            "schema_version": 1,
+            "state": "degraded",
+            "degraded_reason": "unreadable watchdog state",
+        }
+
+    if data.get("degraded"):
+        return {
+            "schema_version": 1,
+            "state": "degraded",
+            "degraded_reason": data.get("degraded_reason") or "coordinator state degraded",
+        }
+
+    quarantined = data.get("quarantined_projects")
+    if isinstance(quarantined, dict) and project_id in quarantined:
+        return {
+            "schema_version": 1,
+            "state": "degraded",
+            "degraded_reason": quarantined[project_id],
+        }
+
+    projects = data.get("projects")
+    prow = projects.get(project_id) if isinstance(projects, dict) else None
+    if not isinstance(prow, dict):
+        return None
+
+    now_dt = utc_now()
+    sig_sources = prow.get("signal_sources") if isinstance(prow.get("signal_sources"), dict) else {}
+    ev_state = prow.get("activity_evidence", "available")
+    ev_reason = prow.get("activity_evidence_reason")
+
+    attempts_dict = prow.get("attempts") if isinstance(prow.get("attempts"), dict) else {}
+    total_attempts = len(attempts_dict)
+
+    stall = prow.get("stall") if isinstance(prow.get("stall"), dict) else None
+    run_scope_key = stall.get("run_scope_key") if stall else None
+    attempt_counts = prow.get("attempt_counts") if isinstance(prow.get("attempt_counts"), dict) else {}
+    attempts_this_run = int(attempt_counts.get(run_scope_key, 0)) if run_scope_key else 0
+
+    is_diagnosing = any(
+        isinstance(a, dict) and a.get("state") == "running"
+        for a in attempts_dict.values()
+    )
+
+    cooldown_until_str = prow.get("cooldown_until")
+    cooldown_until_dt = parse_utc(cooldown_until_str)
+    in_cooldown = cooldown_until_dt is not None and now_dt < cooldown_until_dt
+
+    owner_gate = prow.get("owner_gate")
+
+    if prow.get("disabled"):
+        wd_state = "disabled"
+    elif ev_state != "available":
+        wd_state = "evidence_unavailable"
+    elif owner_gate:
+        wd_state = "owner_gate"
+    elif is_diagnosing:
+        wd_state = "diagnosing"
+    elif in_cooldown:
+        wd_state = "cooldown"
+    elif stall and stall.get("no_progress_seconds") is not None:
+        thresh = float(stall.get("threshold_minutes", 15)) * 60.0
+        if float(stall["no_progress_seconds"]) >= thresh:
+            wd_state = "stalled"
+        else:
+            wd_state = "ok"
+    else:
+        wd_state = "ok"
+
+    last_recovery = None
+    recoveries = [
+        a.get("recovery")
+        for a in attempts_dict.values()
+        if isinstance(a, dict) and isinstance(a.get("recovery"), dict)
+    ]
+    if recoveries:
+        rec = max(
+            recoveries,
+            key=lambda r: str(r.get("resolved_at") or r.get("requested_at") or r.get("reserved_at") or "")
+        )
+        last_recovery = {
+            "action": rec.get("action"),
+            "state": rec.get("state"),
+            "reason": rec.get("reason"),
+            "command_id": rec.get("command_id"),
+        }
+
+    excluded_paths = sig_sources.get("excluded_paths") or []
+    excluded_count = sig_sources.get("excluded_count", len(excluded_paths))
+    newest_path = None
+    sources_dict = sig_sources.get("sources") if isinstance(sig_sources.get("sources"), dict) else {}
+    for s_val in sources_dict.values():
+        if isinstance(s_val, dict) and s_val.get("path"):
+            newest_path = s_val["path"]
+
+    snapshot_activity = read_json(runtime / "projects" / f"{project_id}.json", {}).get("activity", {})
+    runtime_scope = (
+        snapshot_activity.get("watchdog_safe", {}).get("runtime_scope")
+        if isinstance(snapshot_activity, dict)
+        else "unknown"
+    )
+
+    return {
+        "schema_version": 1,
+        "state": wd_state,
+        "last_progress_at": prow.get("last_progress_at"),
+        "no_progress_seconds": stall.get("no_progress_seconds") if stall else None,
+        "threshold_minutes": stall.get("threshold_minutes") if stall else prow.get("no_progress_threshold_minutes", 15),
+        "activity_evidence": {
+            "state": ev_state,
+            "reason": ev_reason,
+            "newest_path": newest_path,
+            "excluded_count": excluded_count,
+            "runtime_scope": runtime_scope,
+        },
+        "last_diagnosis": prow.get("last_diagnosis"),
+        "evidence_hash": prow.get("last_evidence_hash"),
+        "attempts": total_attempts,
+        "attempts_this_run": attempts_this_run,
+        "cooldown_until": cooldown_until_str,
+        "last_recovery": last_recovery,
+        "degraded_reason": prow.get("last_error"),
+    }
 
 
 def _git_path(repo: Path, relative: str) -> Optional[Path]:
@@ -152,6 +290,9 @@ def build_project_status(
     }
     if "project_context" in snapshot:
         result["project_context"] = copy.deepcopy(snapshot["project_context"])
+    watchdog_view = _watchdog_view(runtime, project_id)
+    if watchdog_view is not None:
+        result["watchdog"] = watchdog_view
     return result
 
 

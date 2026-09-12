@@ -34,6 +34,7 @@ from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.response_consumer import consume_websol_responses
 from dev_orchestrator.core.progress import ProgressChannel
 from dev_orchestrator.core.transition_executor import TransitionExecutor
+from dev_orchestrator.core.watchdog import WatchdogCoordinator
 from dev_orchestrator.core.project_status import write_project_statuses
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.storage.json_store import utc_now_iso, write_json, write_text
@@ -76,7 +77,8 @@ def _bridge_heartbeat(
 def _run_orchestration_tick(
     config: Path | str, runtime: Path, bridge_store: BrowserBridgeStore,
     executor: TransitionExecutor, reviewer: AIReviewerCoordinator | None = None,
-    controls: ControlCommandCoordinator | None = None, *, pid: int,
+    controls: ControlCommandCoordinator | None = None,
+    watchdog: WatchdogCoordinator | None = None, *, pid: int,
 ) -> dict[str, Any]:
     """Run one ordered control-plane tick and return the projected summary."""
     raw_summary = run_monitor_once(config, runtime)
@@ -113,6 +115,11 @@ def _run_orchestration_tick(
         planner_state=planner_state_fn() if callable(planner_state_fn) else None,
         reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
     )
+    if watchdog is not None:
+        try:
+            watchdog.advance(config, projected, executor=executor)
+        except Exception:
+            pass
     write_project_statuses(projected, runtime, phase="actuation", daemon_state="running", pid=pid)
     write_json(runtime / "summary.json", projected)
     return projected
@@ -192,13 +199,16 @@ def run_daemon(
         runtime, ai_execution_port, progress_channel=progress_channel
     )
     control_coordinator = ControlCommandCoordinator(runtime, planner_coordinator)
+    watchdog_coordinator = WatchdogCoordinator(
+        runtime, ai_execution_port=ai_execution_port, progress_channel=progress_channel
+    )
     try:
         while True:
             last_error: Optional[str] = None
             try:
                 _run_orchestration_tick(
                     config, runtime, bridge_store, transition_executor, reviewer_coordinator,
-                    control_coordinator, pid=pid
+                    control_coordinator, watchdog=watchdog_coordinator, pid=pid
                 )
             except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
                 last_error = str(exc)

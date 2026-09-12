@@ -131,6 +131,7 @@ def worker_telemetry(
     runs_path: Path | str,
     *,
     now: Optional[datetime] = None,
+    watchdog_safe_activity_at: Any = None,
 ) -> dict[str, Any]:
     """Derive worker telemetry exactly per the P1 policy.
 
@@ -146,6 +147,7 @@ def worker_telemetry(
     started = parse_utc(worker.get("started_at")) if is_task else None
     updated = parse_utc(worker.get("updated_at")) if is_task else None
     activity = parse_utc(last_activity_at)
+    watchdog_safe_activity = parse_utc(watchdog_safe_activity_at)
 
     elapsed: Optional[float] = None
     if started is not None:
@@ -155,6 +157,11 @@ def worker_telemetry(
         elapsed = _to_seconds((endpoint - started).total_seconds())
 
     activity_age = _to_seconds((now - activity).total_seconds()) if activity is not None else None
+    watchdog_safe_age = (
+        _to_seconds((now - watchdog_safe_activity).total_seconds())
+        if watchdog_safe_activity is not None
+        else None
+    )
 
     min_total = float(policy["min_minutes"]) * 60.0
     max_total = float(policy["max_minutes"]) * 60.0
@@ -182,6 +189,7 @@ def worker_telemetry(
         "task_id": task_id,
         "elapsed_seconds": elapsed,
         "last_activity_age_seconds": activity_age,
+        "watchdog_safe_activity_age_seconds": watchdog_safe_age,
         "health": health,
         "eta": {
             "total_min_seconds": round(min_total, 1),

@@ -3,7 +3,7 @@
 Contract: methods ``GET``/``HEAD`` only; static allowlist ``/``, ``/app.js``,
 ``/style.css``; API allowlist ``/api/monitor``, ``/api/summary``,
 ``/api/projects/<id>``, ``/api/events?limit=N``, ``/api/runs?limit=N``,
-``/api/orchestration``; history limits clamp to 1..100; unknown routes 404;
+``/api/orchestration``, ``/api/watchdog``; history limits clamp to 1..100; unknown routes 404;
 write methods 405 with ``Allow: GET, HEAD``; traversal/malformed paths 400.
 ``Cache-Control: no-store`` and ``X-Content-Type-Options: nosniff`` are always
 present.
@@ -155,6 +155,43 @@ def orchestration_payload(runtime_root: Path | str) -> dict[str, Any]:
             "prepared_at": latest.get("prepared_at"),
         }
     return {"projects": projects}
+
+
+def watchdog_payload(runtime_root: Path | str) -> dict[str, Any]:
+    """Return the read-only projection of the progress watchdog state."""
+    runtime = Path(runtime_root)
+    state_file = runtime / "watchdog.json"
+    if not state_file.is_file():
+        return {"projects": {}, "degraded": False}
+
+    from dev_orchestrator.core.project_status import _watchdog_view
+    data = read_json(state_file, None)
+    if not isinstance(data, dict):
+        return {"projects": {}, "degraded": True, "degraded_reason": "unreadable state"}
+
+    degraded = bool(data.get("degraded", False))
+    projects_dict: dict[str, Any] = {}
+    projects_data = data.get("projects")
+    if isinstance(projects_data, dict):
+        for pid in projects_data.keys():
+            view = _watchdog_view(runtime, pid)
+            if view is not None:
+                projects_dict[pid] = view
+
+    quarantined = data.get("quarantined_projects")
+    if isinstance(quarantined, dict):
+        for pid, reason in quarantined.items():
+            if pid not in projects_dict:
+                projects_dict[pid] = {
+                    "schema_version": 1,
+                    "state": "degraded",
+                    "degraded_reason": reason,
+                }
+
+    res: dict[str, Any] = {"projects": projects_dict, "degraded": degraded}
+    if data.get("degraded_reason"):
+        res["degraded_reason"] = data.get("degraded_reason")
+    return res
 
 
 class DevOrchestratorHTTPServer(ThreadingHTTPServer):
@@ -333,6 +370,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             payload = {"items": read_last_jsonl(runtime / "history" / "runs.jsonl", self._query_limit(parsed.query))}
         elif path == "/api/orchestration":
             payload = orchestration_payload(runtime)
+        elif path == "/api/watchdog":
+            payload = watchdog_payload(runtime)
         elif path == "/api/broker/resources":
             payload = broker_proxy_payload(runtime, "/api/resources")
         elif path == "/api/broker/executions":
