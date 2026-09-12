@@ -16,3 +16,4 @@ Status:
 - Git diff formatting verified clean.
 - Reference context authored in `agent/project-context.json`.
 - Comprehensive design documented in `docs/DURABLE_PROJECT_CONTEXT_DESIGN.md`.
+- P9 D2 Durable Project Context accepted by independent native Claude Opus 5 at `f48e2c9`; next task is P10 active-project progress watchdog and automatic diagnostics.

@@ -79,3 +79,10 @@ D2 Durable Project Context Foundation (P9):
   - Full test suite: 242 tests passing cleanly (`python -m unittest discover -s tests_py`).
   - Userscript syntax check: `node --check browser/chatgpt-web-adapter.user.js` passed.
   - Git diff check: `git diff --check` clean (0 formatting defects).
+
+P9 independent final review (2026-09-12):
+- Native Claude Opus 5 reviewed clean commit `f48e2c9` read-only and returned `next / next_task`.
+- Review accepted the schema, project isolation/secret rejection, declared-authoritative supplement behavior, bounded Planner/Worker/Remediator/Reviewer injection, fail-closed invalid-context behavior, status/CLI surfaces, Graphify runtime independence, backward compatibility, and clean local commit.
+- Reviewer could not rerun the Python suite because its safe-mode permission layer denied test execution, but repository evidence records 242 passing tests; reviewer independently confirmed `git diff --check` clean and found no blocking defect.
+- Non-blocking follow-up: the design-doc example contains the word `tokens`, which the current broad secret-marker heuristic would reject; narrow/document that heuristic in a later bounded cleanup, not in P10.
+
