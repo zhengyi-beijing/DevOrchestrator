@@ -26,7 +26,7 @@ The watchdog monitors project progress solely by inspecting durable state artifa
 2. `git.head`: The current Git commit SHA-1 of the repository.
 3. `activity.watchdog_safe.changed_entries_considered`: The count of porcelain changed entries excluding watchdog-owned paths.
 4. Role records: The latest execution record timestamp and id in `ai-planner.json`, `ai-reviewer.json`, and `transition-executor.json` where `metadata.source != "watchdog"`.
-5. Progress Channel: The newest notification entry in `history/progress.json` where `milestone` is NOT in `WATCHDOG_MILESTONES` and `details.source != "watchdog"`.
+5. Progress Channel: The newest notification entry in `runtime/progress-channel.json` under the `"history"` array where `milestone` is NOT in `WATCHDOG_MILESTONES` and `details.source != "watchdog"`.
 
 ### 2.2 Watchdog-Generated Excluded Signals
 The following signals are authored by the watchdog and MUST be excluded from progress evaluation:

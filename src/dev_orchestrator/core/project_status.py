@@ -37,6 +37,16 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
             "degraded_reason": "unreadable watchdog state",
         }
 
+    # Expose degraded for future schema versions (valid JSON but unsupported version)
+    from dev_orchestrator.core.watchdog import WATCHDOG_SCHEMA_VERSION
+    version = data.get("version")
+    if isinstance(version, int) and not isinstance(version, bool) and version > WATCHDOG_SCHEMA_VERSION:
+        return {
+            "schema_version": 1,
+            "state": "degraded",
+            "degraded_reason": f"unsupported watchdog schema version {version}",
+        }
+
     if data.get("degraded"):
         return {
             "schema_version": 1,
@@ -46,10 +56,13 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
 
     quarantined = data.get("quarantined_projects")
     if isinstance(quarantined, dict) and project_id in quarantined:
+        q_entry = quarantined[project_id]
+        # Entry may be a string (legacy) or dict {"reason": ..., "raw": ...}
+        q_reason = q_entry.get("reason") if isinstance(q_entry, dict) else str(q_entry)
         return {
             "schema_version": 1,
             "state": "degraded",
-            "degraded_reason": quarantined[project_id],
+            "degraded_reason": q_reason,
         }
 
     projects = data.get("projects")
@@ -120,24 +133,22 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
 
     excluded_paths = sig_sources.get("excluded_paths") or []
     excluded_count = sig_sources.get("excluded_count", len(excluded_paths))
-    newest_path = None
-    newest_ts = None
-    sources_dict = sig_sources.get("sources") if isinstance(sig_sources.get("sources"), dict) else {}
-    for s_val in sources_dict.values():
-        if not isinstance(s_val, dict) or not s_val.get("path") or not s_val.get("last_activity_at"):
-            continue
-        source_ts = str(s_val.get("last_activity_at"))
-        if newest_ts is None:
-            newest_ts = source_ts
-            newest_path = s_val["path"]
-            continue
-        source_dt = parse_utc(source_ts)
-        newest_dt = parse_utc(newest_ts)
-        if (source_dt is not None and newest_dt is not None and source_dt > newest_dt) or (
-            (source_dt is not None and newest_dt is None) or (source_dt is None and newest_dt is None and source_ts > newest_ts)
-        ):
-            newest_ts = source_ts
-            newest_path = s_val["path"]
+    # Prefer pre-computed newest_path from fingerprint_inputs; fall back to sources iteration
+    # for stored state that predates the fingerprint_inputs field.
+    fingerprint_inputs = sig_sources.get("fingerprint_inputs") if isinstance(sig_sources.get("fingerprint_inputs"), dict) else {}
+    newest_path = fingerprint_inputs.get("newest_path")
+    if newest_path is None:
+        newest_ts = None
+        sources_dict = sig_sources.get("sources") if isinstance(sig_sources.get("sources"), dict) else {}
+        for s_val in sources_dict.values():
+            if not isinstance(s_val, dict) or not s_val.get("path") or not s_val.get("last_activity_at"):
+                continue
+            source_ts = str(s_val.get("last_activity_at"))
+            if newest_ts is None or parse_utc(source_ts) is not None and (
+                parse_utc(newest_ts) is None or parse_utc(source_ts) > parse_utc(newest_ts)
+            ):
+                newest_ts = source_ts
+                newest_path = s_val["path"]
 
     snapshot_activity = read_json(runtime / "projects" / f"{project_id}.json", {}).get("activity", {})
     runtime_scope = (

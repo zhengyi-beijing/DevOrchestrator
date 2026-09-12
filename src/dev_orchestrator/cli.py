@@ -326,6 +326,26 @@ def cmd_watchdog_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watchdog_clear_degraded(args: argparse.Namespace) -> int:
+    """Clear watchdog degraded mode and persist a fresh valid state.
+
+    This is the production recovery path after resolving a corrupt or
+    future-version watchdog.json. Run this command while the daemon is stopped;
+    the daemon will re-initialize with a clean state on next start.
+    """
+    from dev_orchestrator.core.watchdog import WatchdogCoordinator
+    runtime = resolve_runtime_root(args.runtime_root)
+    coordinator = WatchdogCoordinator(runtime)
+    was_degraded = bool(coordinator.state().get("degraded"))
+    coordinator.clear_degraded()
+    _print_json({
+        "runtime_root": str(runtime),
+        "was_degraded": was_degraded,
+        "state": "cleared" if was_degraded else "not_degraded",
+    })
+    return 0
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     if not (_PORT_MIN <= args.port <= _PORT_MAX):
         _fail("port must be between {0} and {1}".format(_PORT_MIN, _PORT_MAX))
@@ -786,6 +806,12 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog_status.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
     watchdog_status.add_argument("--project-id", default=None, help="optional project id to filter")
 
+    watchdog_clear_degraded = sub.add_parser(
+        "watchdog-clear-degraded",
+        help="clear watchdog degraded mode after resolving corrupt/future-version state (run while daemon is stopped)",
+    )
+    watchdog_clear_degraded.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     project_continue = sub.add_parser("project-continue", help="queue a stateless continue command for one project")
     project_continue.add_argument("project_id")
     project_continue.add_argument("--runtime-root", default=None)
@@ -862,6 +888,7 @@ _COMMANDS = {
     "project-context": cmd_project_context,
     "project-status": cmd_project_status,
     "watchdog-status": cmd_watchdog_status,
+    "watchdog-clear-degraded": cmd_watchdog_clear_degraded,
     "project-continue": cmd_project_continue,
     "monitor": cmd_monitor,
     "web": cmd_web,

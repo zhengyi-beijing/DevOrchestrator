@@ -148,6 +148,66 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         diag = classify_evidence(evidence, DummyAssessment(lifecycle_state="PLANNING", no_progress_seconds=2000.0))
         self.assertEqual(diag.code, "unknown")
 
+    def test_f1_stale_worker_state_running_plus_dead_pid_in_planner_reviewer_never_process_dead(self):
+        """F1 regression: stale worker.state='running' + dead PID must NOT classify as process_dead
+        during PLANNING, REVIEWING, REVIEWING_PLAN, or APPLYING_PLAN lifecycles."""
+        non_execution_lifecycles = ("PLANNING", "REVIEWING", "REVIEWING_PLAN", "APPLYING_PLAN")
+        for lifecycle in non_execution_lifecycles:
+            evidence = {
+                "process_liveness": {
+                    "process_alive": False,
+                    "pid": 9999,
+                    # stale worker_state from executor ledger - must be ignored for classification
+                    "worker_state": "running",
+                    "kind": "worker",
+                },
+                "repository_truth": {"valid": True, "dirty": False, "uncommitted_files": []},
+                "agent_files": {},
+            }
+            diag = classify_evidence(
+                evidence,
+                DummyAssessment(lifecycle_state=lifecycle, no_progress_seconds=2000.0),
+            )
+            self.assertNotEqual(
+                diag.code,
+                "process_dead",
+                msg=f"process_dead must not fire in {lifecycle} with stale worker_state='running'",
+            )
+
+    def test_f1_dead_pid_in_executing_classifies_process_dead(self):
+        """F1 regression: dead PID in EXECUTING must still classify as process_dead."""
+        evidence = {
+            "process_liveness": {
+                "process_alive": False,
+                "pid": 9999,
+                "worker_state": "running",
+                "kind": "worker",
+            },
+            "repository_truth": {"valid": True, "dirty": False, "uncommitted_files": []},
+            "agent_files": {},
+        }
+        diag = classify_evidence(
+            evidence,
+            DummyAssessment(lifecycle_state="EXECUTING", no_progress_seconds=2000.0),
+        )
+        self.assertEqual(diag.code, "process_dead")
+
+    def test_f1_dead_pid_in_remediating_classifies_process_dead(self):
+        """F1 regression: dead PID in REMEDIATING must still classify as process_dead."""
+        evidence = {
+            "process_liveness": {
+                "process_alive": False,
+                "pid": 8888,
+                "worker_state": "running",
+            },
+            "repository_truth": {"valid": True},
+        }
+        diag = classify_evidence(
+            evidence,
+            DummyAssessment(lifecycle_state="REMEDIATING", no_progress_seconds=2000.0),
+        )
+        self.assertEqual(diag.code, "process_dead")
+
     def test_static_api_guards_against_destructive_calls(self):
         """Static analysis: watchdog.py and diagnostics.py must NOT import or call process-killing or git-write APIs."""
         code_dir = Path(__file__).resolve().parent.parent / "src" / "dev_orchestrator" / "core"

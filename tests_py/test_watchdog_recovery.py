@@ -277,6 +277,114 @@ class WatchdogRecoveryTests(unittest.TestCase):
         self.assertNotEqual(gate_keys[0], gate_keys[1])
         self.assertTrue(gate_keys[0].startswith("att-gate:gate:"))
 
+    def test_f2_process_dead_recovery_uses_evidence_not_snapshot_worker(self):
+        """F2 regression: process_dead recovery must consult process_liveness from diagnostic
+        evidence (actual PID probe), NOT snapshot.worker.process_alive from executor ledger."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        # snapshot.worker.process_alive=False (stale ledger value) but evidence says alive=True
+        stale_snapshot = {
+            "project_id": "p1",
+            "repo_path": str(self.repo_dir),
+            "worker": {"kind": "task", "state": "running", "process_alive": False, "pid": 1234},
+        }
+        att_stale_alive = {
+            "attempt_key": "att-f2-stale-alive",
+            "run_scope_key": "rscope-f2",
+            "task_id": "T1",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "evidence_hash": "testhash1",
+            # Actual PID probe says alive=True (contradicts stale snapshot)
+            "evidence": {
+                "process_liveness": {"process_alive": True, "pid": 1234},
+            },
+        }
+        prow = {"attempts": {"att-f2-stale-alive": att_stale_alive}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot=stale_snapshot,
+            project_row=prow,
+            attempt_key="att-f2-stale-alive",
+            attempt_record=att_stale_alive,
+        )
+        # Must NOT recover - evidence says alive, ignore stale snapshot.worker.process_alive
+        self.assertIsNone(att_stale_alive.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "process_alive_ambiguous")
+
+    def test_f2_process_dead_recovery_proceeds_when_evidence_confirms_dead(self):
+        """F2 regression: process_dead recovery proceeds when evidence.process_liveness confirms dead PID."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        att_confirmed_dead = {
+            "attempt_key": "att-f2-confirmed",
+            "run_scope_key": "rscope-f2b",
+            "task_id": "T1",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "evidence_hash": "testhash2",
+            # Evidence confirms process is truly dead
+            "evidence": {
+                "process_liveness": {"process_alive": False, "pid": 5678},
+            },
+        }
+        prow = {"attempts": {"att-f2-confirmed": att_confirmed_dead}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir)},
+            project_row=prow,
+            attempt_key="att-f2-confirmed",
+            attempt_record=att_confirmed_dead,
+        )
+        # Must recover since evidence.process_liveness.process_alive is False
+        rec = att_confirmed_dead.get("recovery")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["action"], "continue")
+        self.assertIn(rec["state"], ("requested", "reserved"))
+
+    def test_f2_overlay_managed_runs_sets_process_alive_false_for_completed(self):
+        """F2 regression: overlay_managed_runs sets worker.process_alive=False for completed runs.
+        Watchdog recovery must use diagnostic evidence, not this stale overlay field."""
+        from dev_orchestrator.core.transition_executor import TransitionExecutor
+
+        ledger_data = {"version": 1, "executions": {
+            "run-p1": {
+                "project_id": "p1", "source_request_id": "run-p1",
+                "source_kind": "control", "task_id": "T10",
+                "backend_id": "dsh", "state": "completed",
+                "started_at": "2026-09-10T01:00:00+00:00",
+                "completed_at": "2026-09-10T01:30:00+00:00",
+            }
+        }}
+        (self.runtime_dir / "transition-executor.json").write_text(
+            json.dumps(ledger_data), encoding="utf-8"
+        )
+
+        raw = {"projects": [{"project_id": "p1", "state": "WORKER_RUNNING",
+                              "worker": {"kind": "task", "state": "running", "process_alive": True},
+                              "telemetry": {"task_id": "T10", "run_id": None}}]}
+        executor = TransitionExecutor(self.runtime_dir)
+        overlaid = executor.overlay_managed_runs(raw)
+        # After overlay, worker.process_alive should be False for completed run
+        snap = overlaid["projects"][0]
+        self.assertFalse(snap["worker"]["process_alive"])
+        # process_alive=False in snapshot must NOT cause recovery without evidence
+        # - watchdog reads evidence.process_liveness, not snapshot.worker.process_alive
+
 
 if __name__ == "__main__":
     unittest.main()

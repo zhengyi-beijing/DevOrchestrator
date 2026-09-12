@@ -29,7 +29,9 @@ DIAGNOSIS_CODES = (
     "unknown",
 )
 WORKER_EXPECTED_LIFECYCLE_STATES = frozenset({"EXECUTING", "REMEDIATING"})
-ACTIVE_WORKER_STATES = frozenset({"running", "active", "launching"})
+# Vocabulary of active worker states from the executor ledger and overlay projection.
+# "starting" is the overlay mapping for "launching" (see transition_executor.overlay_managed_runs).
+ACTIVE_WORKER_STATES = frozenset({"running", "active", "launching", "starting"})
 
 _SECRET_PATTERN = re.compile(
     r"(?i)(api[_-]?key|secret|token|password|bearer|sk-[a-z0-9]{20,})[:=]\s*([^\s]{4,})"
@@ -225,12 +227,12 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
     proc = evidence.get("process_liveness") if isinstance(evidence.get("process_liveness"), dict) else {}
     pid = proc.get("pid")
     is_alive = proc.get("process_alive")
-    worker_state = str(proc.get("worker_state") or "").lower()
     lifecycle = str(getattr(assessment, "lifecycle_state", "")).upper()
-    worker_active = (
-        worker_state in ACTIVE_WORKER_STATES
-        or lifecycle in WORKER_EXPECTED_LIFECYCLE_STATES
-    )
+    # A worker process is expected ONLY when the lifecycle is an execution-phase state.
+    # Worker.state from the executor ledger is not used here because it may be stale from a
+    # prior EXECUTING run and would otherwise cause spurious process_dead during PLANNING /
+    # REVIEWING_PLAN / APPLYING_PLAN / REVIEWING.
+    worker_active = lifecycle in WORKER_EXPECTED_LIFECYCLE_STATES
 
     # Check process_dead
     if pid is not None and is_alive is False and worker_active:

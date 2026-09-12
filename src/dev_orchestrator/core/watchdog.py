@@ -331,7 +331,7 @@ def resolve_run_key(snapshot: dict[str, Any], executor_state: dict[str, Any] | N
             for rec in executions.values():
                 if isinstance(rec, dict) and str(rec.get("project_id") or "") == project_id:
                     rec_state = str(rec.get("state") or "").lower()
-                    if rec_state in ("completed", "failed", "cancelled", "handoff", "blocked"):
+                    if rec_state in ("completed", "failed", "cancelled", "handoff", "blocked", "settled"):
                         continue
                     active_id = rec.get("execution_id") or rec.get("request_id") or rec.get("run_id")
                     if active_id:
@@ -655,14 +655,17 @@ class WatchdogCoordinator:
 
         quarantined_projects = data.get("quarantined_projects") if isinstance(data.get("quarantined_projects"), dict) else {}
         validated_projects: dict[str, Any] = {}
+        newly_quarantined_pids: list[str] = []
 
         for pid, prow in projects.items():
             if not isinstance(prow, dict) or not isinstance(prow.get("attempts"), dict):
-                quarantined_projects[pid] = "malformed project row structure"
+                # Preserve raw row data for diagnostics; store as {"reason": ..., "raw": ...}
+                quarantined_projects[pid] = {"reason": "malformed project row structure", "raw": prow}
+                newly_quarantined_pids.append(pid)
                 continue
             validated_projects[pid] = prow
 
-        return {
+        loaded = {
             "version": version,
             "degraded": bool(data.get("degraded", False)),
             "degraded_reason": data.get("degraded_reason"),
@@ -671,19 +674,41 @@ class WatchdogCoordinator:
             "projects": validated_projects,
         }
 
-    def _quarantine_corrupt_state(self, reason: str, raw_bytes: bytes) -> dict[str, Any]:
-        stamp = utc_now_iso().replace(":", "-")
-        quarantine_file = self.runtime_root / f"watchdog.json.corrupt-{stamp}"
-        self._preserve_existing_state_file = True
-        try:
-            if raw_bytes:
-                quarantine_file.write_bytes(raw_bytes)
-            elif self.state_path.exists():
-                shutil.copy2(self.state_path, quarantine_file)
-        except OSError:
-            pass
+        # Emit OWNER_GATE per design for each newly quarantined project row
+        if newly_quarantined_pids and self.progress_channel is not None and hasattr(self.progress_channel, "emit"):
+            for pid in newly_quarantined_pids:
+                try:
+                    self.progress_channel.emit(
+                        pid,
+                        "OWNER_GATE",
+                        occurrence_key=f"quarantined-project:{pid}",
+                        message=f"Watchdog project row for {pid!r} was quarantined due to malformed structure",
+                        details={"source": "watchdog", "gate": "quarantined-project", "project_id": pid},
+                    )
+                except Exception:
+                    pass
 
+        return loaded
+
+    def _quarantine_corrupt_state(self, reason: str, raw_bytes: bytes) -> dict[str, Any]:
         file_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
+        self._preserve_existing_state_file = True
+        # Avoid quarantine-copy growth: skip write if a file with the same content hash exists.
+        already_quarantined = any(
+            file_hash in q.name
+            for q in self.runtime_root.glob("watchdog.json.corrupt-*")
+        )
+        if not already_quarantined:
+            stamp = utc_now_iso().replace(":", "-")
+            quarantine_file = self.runtime_root / f"watchdog.json.corrupt-{stamp}-{file_hash}"
+            try:
+                if raw_bytes:
+                    quarantine_file.write_bytes(raw_bytes)
+                elif self.state_path.exists():
+                    shutil.copy2(self.state_path, quarantine_file)
+            except OSError:
+                pass
+
         if self.progress_channel is not None and hasattr(self.progress_channel, "emit"):
             try:
                 self.progress_channel.emit(
@@ -732,7 +757,14 @@ class WatchdogCoordinator:
                 if state_name in NONTERMINAL_ATTEMPT_STATES:
                     kept_attempts[att_key] = att
                 else:
-                    terminal_items.append((att_key, att))
+                    # Preserve terminal attempts whose recovery is still in-flight to
+                    # prevent pruning from dropping the in-progress reserve/enqueue record
+                    # and allowing a duplicate recovery slot for the same run scope.
+                    rec = att.get("recovery")
+                    if isinstance(rec, dict) and rec.get("state") in ("reserved", "requested"):
+                        kept_attempts[att_key] = att
+                    else:
+                        terminal_items.append((att_key, att))
             terminal_items.sort(key=lambda item: _attempt_sort_key(item[1]), reverse=True)
             for att_key, att in terminal_items[:MAX_TERMINAL_ATTEMPTS_PER_PROJECT]:
                 kept_attempts[att_key] = att
@@ -962,9 +994,6 @@ class WatchdogCoordinator:
                 executor_state = None
 
         with self._lock:
-            # Re-read state in case of out-of-band edit
-            if self._cached_state.get("degraded") and not self._cached_state.get("degraded_reason"):
-                pass
             self._reap_overdue_attempts(tick_now)
             self._reconcile_recoveries()
 
@@ -1273,8 +1302,11 @@ class WatchdogCoordinator:
             return
 
         if diag_code == "process_dead":
-            worker = snapshot.get("worker") if isinstance(snapshot.get("worker"), dict) else {}
-            if worker.get("process_alive") is not False:
+            # Use the actual PID probe from diagnostic evidence, not snapshot.worker.process_alive
+            # which is derived from the executor ledger and may be stale.
+            evidence = attempt_record.get("evidence") if isinstance(attempt_record.get("evidence"), dict) else {}
+            proc_liveness = evidence.get("process_liveness") if isinstance(evidence.get("process_liveness"), dict) else {}
+            if proc_liveness.get("process_alive") is not False:
                 self._emit_owner_gate_once(pid, attempt_record, "process_alive_ambiguous")
                 return
 
