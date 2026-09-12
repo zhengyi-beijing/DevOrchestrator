@@ -72,7 +72,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
     def test_two_phase_recovery_execution(self):
         """Eligible stall with auto_recovery=true executes reserve and enqueue."""
         channel = DummyProgressChannel()
-        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,  # FR2B-LIVE-IDENTITY: stub confirms PID alive
+        )
         att = {
             "attempt_key": "att-auto",
             "run_scope_key": "rscope-1",
@@ -131,7 +134,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
     def test_single_recovery_per_run_scope_budget(self):
         """Second recovery attempt in same run scope is blocked with OWNER_GATE."""
         channel = DummyProgressChannel()
-        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,  # FR2B-LIVE-IDENTITY: stub confirms PID alive
+        )
         prow = {
             "recovery_slots": {"rscope-1": "wd-prior-attempt"},
             "attempts": {},
@@ -350,7 +356,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
     def test_f2_process_dead_recovery_proceeds_when_evidence_confirms_dead(self):
         """F2 regression: process_dead recovery proceeds when evidence.process_liveness confirms dead PID."""
         channel = DummyProgressChannel()
-        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: False,  # FR2B-LIVE-IDENTITY: stub confirms PID dead
+        )
 
         att_confirmed_dead = {
             "attempt_key": "att-f2-confirmed",
@@ -658,7 +667,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
         """R3-F2: recovery blocked when evidence is older than cooldown window.
         Prevents auto_recovery toggled on long after diagnosis from consuming stale evidence."""
         channel = DummyProgressChannel()
-        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,  # FR2B-LIVE-IDENTITY: stub confirms PID alive
+        )
 
         # completed_at is in the past beyond any cooldown (simulated by old timestamp)
         att = {
@@ -700,7 +712,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
         """R3-F2: if auto_recovery is toggled on within the cooldown window (fresh evidence),
         recovery DOES proceed (PID matches, lifecycle matches, evidence fresh)."""
         channel = DummyProgressChannel()
-        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,  # FR2B-LIVE-IDENTITY: stub confirms PID alive
+        )
 
         import datetime as dt
         # completed 5 minutes ago, within 30-minute cooldown
@@ -1069,7 +1084,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
             # no completed_at
         }
         channel = DummyProgressChannel()
-        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,  # FR2B-LIVE-IDENTITY: stub so check reaches FR-2A
+        )
         prow = {"attempts": {"att-fr2a-missing-cat": att}}
         coordinator._check_and_trigger_recovery(
             project_config={
@@ -1104,7 +1122,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "completed_at": "not-a-valid-timestamp",
         }
         channel = DummyProgressChannel()
-        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,  # FR2B-LIVE-IDENTITY: stub so check reaches FR-2A
+        )
         prow = {"attempts": {"att-fr2a-malformed-cat": att}}
         coordinator._check_and_trigger_recovery(
             project_config={
@@ -1146,7 +1167,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "completed_at": far_future,
         }
         channel = DummyProgressChannel()
-        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,  # FR2B-LIVE-IDENTITY: stub so check reaches FR-2A
+        )
         prow = {"attempts": {"att-fr2a-future-cat": att}}
         coordinator._check_and_trigger_recovery(
             project_config={
@@ -1182,7 +1206,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "completed_at": "2022-01-01T00:00:00+00:00",  # clearly stale
         }
         channel = DummyProgressChannel()
-        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,  # FR2B-LIVE-IDENTITY: stub so check reaches FR-2A
+        )
         prow = {"attempts": {"att-fr2a-stale-cat": att}, "cooldown_minutes": 30}
         coordinator._check_and_trigger_recovery(
             project_config={
@@ -1350,6 +1377,308 @@ class WatchdogRecoveryTests(unittest.TestCase):
         self.assertEqual(len(gate_events), 1)
         self.assertEqual(gate_events[0][2]["details"]["reason"], "process_dead_current_pid_absent")
 
+    # -----------------------------------------------------------------------
+    # P10-FR2B-LIVE-IDENTITY: live liveness re-probe at recovery actuation time
+    # -----------------------------------------------------------------------
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_fr2b_live_agent_stalled_pid_dead_at_recovery(self):
+        """FR2B-LIVE-IDENTITY: agent_stalled recovery must be blocked when the live re-probe
+        at recovery time reveals the PID is no longer alive (process died after snapshot or
+        PID was reused and the prior process ended).  Snapshot match alone is insufficient."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 9001, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-live-stalled-dead",
+            "run_scope_key": "rscope-live-1",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            # Live re-probe says process is dead (died after snapshot was captured)
+            liveness_probe=lambda p: False,
+        )
+        prow = {"attempts": {"att-live-stalled-dead": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 9001, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-live-stalled-dead",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_pid_not_alive_at_recovery")
+
+    def test_fr2b_live_agent_stalled_current_worker_not_active(self):
+        """FR2B-LIVE-IDENTITY: agent_stalled recovery must be blocked when the current snapshot
+        worker state is terminal/inactive at recovery time.  A sufficiently current active Worker
+        identity is required before enqueuing recovery."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 9002, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-live-stalled-inactive",
+            "run_scope_key": "rscope-live-2",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,  # probe would pass; gate is worker state check
+        )
+        prow = {"attempts": {"att-live-stalled-inactive": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Current snapshot: worker state is "completed" (terminal), not an active state
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 9002, "state": "completed"}},
+            project_row=prow,
+            attempt_key="att-live-stalled-inactive",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_current_worker_not_active")
+
+    def test_fr2b_live_agent_stalled_liveness_probe_unavailable(self):
+        """FR2B-LIVE-IDENTITY: agent_stalled recovery must fail closed when the liveness probe
+        raises an exception.  An unavailable probe must not be treated as a safe match."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 9003, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-live-stalled-probe-err",
+            "run_scope_key": "rscope-live-3",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+
+        def _raise_probe(p):
+            raise OSError("kernel probe unavailable")
+
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=_raise_probe,
+        )
+        prow = {"attempts": {"att-live-stalled-probe-err": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 9003, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-live-stalled-probe-err",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        # Probe exception → live_alive=None → not True → same gate as dead PID
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_pid_not_alive_at_recovery")
+
+    def test_fr2b_live_process_dead_pid_alive_at_recovery(self):
+        """FR2B-LIVE-IDENTITY: process_dead recovery must be blocked when the live re-probe
+        at recovery time reveals the PID is now alive (PID reused by a new process after the
+        snapshot, or worker unexpectedly restarted).  Stale evidence must not trigger recovery."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": False, "pid": 9004}}
+        att = {
+            "attempt_key": "att-live-dead-alive",
+            "run_scope_key": "rscope-live-4",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            # Live re-probe says process is now alive (PID reuse or restart after snapshot)
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-live-dead-alive": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "worker": {"pid": 9004, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-live-dead-alive",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "process_dead_pid_alive_at_recovery")
+
+    def test_fr2b_live_process_dead_liveness_probe_unavailable(self):
+        """FR2B-LIVE-IDENTITY: process_dead recovery must fail closed when the liveness probe
+        raises an exception.  An unavailable probe means liveness cannot be freshly verified —
+        fail closed and do not enqueue recovery."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": False, "pid": 9005}}
+        att = {
+            "attempt_key": "att-live-dead-probe-err",
+            "run_scope_key": "rscope-live-5",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+
+        def _raise_probe(p):
+            raise PermissionError("liveness probe denied")
+
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=_raise_probe,
+        )
+        prow = {"attempts": {"att-live-dead-probe-err": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "worker": {"pid": 9005, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-live-dead-probe-err",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "process_dead_liveness_probe_unavailable")
+
+    def test_fr2b_live_agent_stalled_proceeds_when_probe_confirms_alive(self):
+        """FR2B-LIVE-IDENTITY: agent_stalled recovery proceeds when the live probe confirms
+        the PID is still alive and the current worker state is active.  Existing safe recovery
+        paths must be preserved when fresh evidence and current identity agree."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 9010, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-live-stalled-ok",
+            "run_scope_key": "rscope-live-10",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,  # confirms PID alive
+        )
+        prow = {"attempts": {"att-live-stalled-ok": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 9010, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-live-stalled-ok",
+            attempt_record=att,
+        )
+        rec = att.get("recovery")
+        self.assertIsNotNone(rec, "Recovery must proceed when probe confirms PID alive and worker active")
+        self.assertEqual(rec["action"], "continue")
+        self.assertIn(rec["state"], ("requested", "reserved"))
+
+    def test_fr2b_live_process_dead_proceeds_when_probe_confirms_dead(self):
+        """FR2B-LIVE-IDENTITY: process_dead recovery proceeds when the live probe confirms
+        the PID is still dead.  Existing safe recovery paths must be preserved when fresh
+        evidence and current identity agree."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": False, "pid": 9011}}
+        att = {
+            "attempt_key": "att-live-dead-ok",
+            "run_scope_key": "rscope-live-11",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: False,  # confirms PID dead
+        )
+        prow = {"attempts": {"att-live-dead-ok": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "worker": {"pid": 9011, "state": "completed"}},
+            project_row=prow,
+            attempt_key="att-live-dead-ok",
+            attempt_record=att,
+        )
+        rec = att.get("recovery")
+        self.assertIsNotNone(rec, "Recovery must proceed when probe confirms PID dead")
+        self.assertEqual(rec["action"], "continue")
+        self.assertIn(rec["state"], ("requested", "reserved"))

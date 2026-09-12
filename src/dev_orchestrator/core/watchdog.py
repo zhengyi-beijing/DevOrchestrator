@@ -28,6 +28,7 @@ from dev_orchestrator.core.diagnostics import (
     evidence_hash,
 )
 from dev_orchestrator.core.repository import read_repository_truth
+from dev_orchestrator.platform.process import is_pid_alive
 from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
 WATCHDOG_SCHEMA_VERSION = 1
@@ -617,11 +618,15 @@ class WatchdogCoordinator:
         *,
         ai_execution_port: Any = None,
         progress_channel: Any = None,
+        liveness_probe: Optional[Callable[[Any], bool]] = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.state_path = self.runtime_root / WATCHDOG_STATE_FILE
         self.ai_execution_port = ai_execution_port
         self.progress_channel = progress_channel
+        # FR2B-LIVE-IDENTITY: injectable liveness probe so tests can supply deterministic stubs;
+        # production code defaults to the platform is_pid_alive abstraction.
+        self._liveness_probe: Callable[[Any], bool] = liveness_probe if liveness_probe is not None else is_pid_alive
         self._lock = threading.RLock()
         self._advance_lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
@@ -1503,6 +1508,20 @@ class WatchdogCoordinator:
             if current_pid != ev_pid:
                 self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_pid_mismatch")
                 return
+            # FR2B-LIVE-IDENTITY: require active current worker identity and re-probe live
+            # liveness at recovery time.  PID equality against a static snapshot is
+            # insufficient — a stale snapshot could match a dead or reused PID.
+            current_worker_state = str(current_worker.get("state") or "").lower()
+            if current_worker_state and current_worker_state not in ACTIVE_WORKER_STATES:
+                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_current_worker_not_active")
+                return
+            try:
+                _live_alive: Optional[bool] = self._liveness_probe(current_pid)
+            except Exception:
+                _live_alive = None
+            if _live_alive is not True:
+                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_pid_not_alive_at_recovery")
+                return
 
         if diag_code == "process_dead":
             # Use the actual PID probe from diagnostic evidence, not snapshot.worker.process_alive
@@ -1521,6 +1540,21 @@ class WatchdogCoordinator:
                 return
             if current_pid != ev_pid:
                 self._emit_owner_gate_once(pid, attempt_record, "process_dead_pid_mismatch")
+                return
+            # FR2B-LIVE-IDENTITY: re-probe live liveness at recovery time to independently
+            # confirm the process is still dead.  If the process has since come back alive
+            # (PID reuse, unexpected restart), the stale evidence must not trigger recovery.
+            # If the probe itself is unavailable, fail closed.
+            try:
+                _live_alive = self._liveness_probe(ev_pid)
+            except Exception:
+                _live_alive = None
+            if _live_alive is not False:
+                _pd_reason = (
+                    "process_dead_pid_alive_at_recovery" if _live_alive is True
+                    else "process_dead_liveness_probe_unavailable"
+                )
+                self._emit_owner_gate_once(pid, attempt_record, _pd_reason)
                 return
 
         # FR-2A: completed_at must be present, parseable, not materially future-dated, and
