@@ -65,14 +65,15 @@ class WatchdogRecoveryTests(unittest.TestCase):
         """Eligible stall with auto_recovery=true executes reserve and enqueue."""
         channel = DummyProgressChannel()
         coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
-        prow = {"attempts": {}}
         att = {
             "attempt_key": "att-auto",
             "run_scope_key": "rscope-1",
             "task_id": "T1",
+            "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
         }
+        prow = {"attempts": {"att-auto": att}}
         coordinator._cached_state["projects"]["p1"] = prow
 
         coordinator._check_and_trigger_recovery(
@@ -121,6 +122,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "attempt_key": "att-second",
             "run_scope_key": "rscope-1",
             "task_id": "T1",
+            "state": "completed",
             "diagnosis": "agent_stalled",
         }
         coordinator._check_and_trigger_recovery(
@@ -176,7 +178,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
         history_dir = self.runtime_dir / "control" / "history"
         history_dir.mkdir(parents=True)
         (history_dir / f"{cid}.json").write_text(
-            json.dumps({"command_id": cid, "state": "applied"}),
+            json.dumps({"command_id": cid, "state": "accepted"}),
             encoding="utf-8",
         )
 
@@ -196,7 +198,84 @@ class WatchdogRecoveryTests(unittest.TestCase):
         coordinator._reconcile_recoveries()
 
         self.assertEqual(att["recovery"]["state"], "completed")
-        self.assertIn("applied", att["recovery"]["reason"])
+        self.assertIn("accepted", att["recovery"]["reason"])
+
+    def test_reconcile_history_state_mapping_uses_real_control_vocabulary(self):
+        coordinator = WatchdogCoordinator(self.runtime_dir)
+        history_dir = self.runtime_dir / "control" / "history"
+        history_dir.mkdir(parents=True)
+        for cid, outcome in {
+            "wd-accepted": "accepted",
+            "wd-blocked": "blocked",
+            "wd-owner-gate": "owner_gate",
+            "wd-unknown": "mystery_state",
+        }.items():
+            (history_dir / f"{cid}.json").write_text(
+                json.dumps({"command_id": cid, "state": outcome}),
+                encoding="utf-8",
+            )
+
+        attempts = {}
+        for index, cid in enumerate(("wd-accepted", "wd-blocked", "wd-owner-gate", "wd-unknown"), start=1):
+            attempts[f"att-{index}"] = {
+                "attempt_key": f"att-{index}",
+                "recovery": {"action": "continue", "state": "requested", "command_id": cid},
+            }
+        coordinator._cached_state["projects"]["p1"] = {
+            "attempts": attempts,
+            "recovery_slots": {},
+        }
+
+        coordinator._reconcile_recoveries()
+
+        self.assertEqual(attempts["att-1"]["recovery"]["state"], "completed")
+        self.assertEqual(attempts["att-2"]["recovery"]["state"], "blocked")
+        self.assertEqual(attempts["att-3"]["recovery"]["state"], "blocked")
+        self.assertEqual(attempts["att-4"]["recovery"]["state"], "unknown")
+
+    def test_running_attempt_does_not_trigger_recovery_or_gate(self):
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        att = {
+            "attempt_key": "att-running",
+            "run_scope_key": "rscope-1",
+            "state": "running",
+            "diagnosis": None,
+            "owner_gate_required": False,
+        }
+
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir)},
+            project_row={"attempts": {"att-running": att}},
+            attempt_key="att-running",
+            attempt_record=att,
+        )
+
+        self.assertIsNone(att.get("recovery"))
+        self.assertEqual([event for event in channel.events if event[1] == "OWNER_GATE"], [])
+
+    def test_owner_gate_occurrence_keys_are_reason_specific(self):
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        attempt = {
+            "attempt_key": "att-gate",
+            "task_id": "T1",
+            "diagnosis": "unknown",
+            "evidence_hash": "abcd1234",
+        }
+
+        coordinator._emit_owner_gate_once("p1", attempt, "diagnosis_unknown_requires_owner")
+        coordinator._emit_owner_gate_once("p1", attempt, "process_alive_ambiguous")
+
+        gate_keys = [event[2]["occurrence_key"] for event in channel.events if event[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_keys), 2)
+        self.assertNotEqual(gate_keys[0], gate_keys[1])
+        self.assertTrue(gate_keys[0].startswith("att-gate:gate:"))
 
 
 if __name__ == "__main__":

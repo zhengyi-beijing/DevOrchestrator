@@ -109,6 +109,46 @@ class WatchdogFingerprintTests(unittest.TestCase):
         rk3 = resolve_run_key(snapshot_other_task)
         self.assertNotEqual(rk1, rk3)
 
+    def test_resolve_run_key_prefers_newest_active_executor_record(self):
+        snapshot = {"project_id": "p1", "task_id": "P1.0", "state": "EXECUTING"}
+        executor_state = {
+            "executions": {
+                "stale-completed": {
+                    "project_id": "p1",
+                    "execution_id": "exec-stale",
+                    "state": "completed",
+                    "updated_at": "2026-09-12T12:00:00Z",
+                },
+                "older-active": {
+                    "project_id": "p1",
+                    "execution_id": "exec-old",
+                    "state": "running",
+                    "updated_at": "2026-09-12T11:00:00Z",
+                },
+                "newer-active": {
+                    "project_id": "p1",
+                    "execution_id": "exec-new",
+                    "state": "launching",
+                    "updated_at": "2026-09-12T12:30:00Z",
+                },
+            }
+        }
+        self.assertEqual(resolve_run_key(snapshot, executor_state), "exec-new")
+
+    def test_resolve_run_key_ignores_terminal_executor_record(self):
+        snapshot = {"project_id": "p1", "task_id": "P1.0", "state": "EXECUTING"}
+        executor_state = {
+            "executions": {
+                "only-terminal": {
+                    "project_id": "p1",
+                    "execution_id": "exec-stale",
+                    "state": "completed",
+                    "updated_at": "2026-09-12T12:00:00Z",
+                }
+            }
+        }
+        self.assertTrue(resolve_run_key(snapshot, executor_state).startswith("norun:"))
+
     def test_resolve_run_scope_and_attempt_keys(self):
         """run_scope_key and attempt_key are deterministic sha256 derivations."""
         r_scope_1 = resolve_run_scope_key("p1", "T1", "EXECUTING", "run-1")

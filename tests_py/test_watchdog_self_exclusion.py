@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ from pathlib import Path
 from dev_orchestrator.adapters.agent_files import AgentFilesAdapter
 from dev_orchestrator.core.watchdog import (
     WATCHDOG_MILESTONES,
+    canonical_path,
     collect_progress_signals,
     is_watchdog_owned_path,
 )
@@ -28,41 +30,113 @@ class WatchdogSelfExclusionTests(unittest.TestCase):
     def tearDown(self):
         self.tmp_dir.cleanup()
 
+    def _snapshot(self, last_activity_at: str) -> dict:
+        repo_fp = hashlib.sha256(canonical_path(self.repo_dir).encode("utf-8")).hexdigest()[:16]
+        runtime_fp = hashlib.sha256(canonical_path(self.runtime_dir).encode("utf-8")).hexdigest()[:16]
+        return {
+            "project_id": "test-p",
+            "repo_path": str(self.repo_dir),
+            "state": "EXECUTING",
+            "activity": {
+                "watchdog_safe": {
+                    "last_activity_at": last_activity_at,
+                    "newest_kind": "agent_file",
+                    "newest_path": "agent/next.md",
+                    "sources": {
+                        "agent_file": {
+                            "last_activity_at": last_activity_at,
+                            "path": "agent/next.md",
+                        }
+                    },
+                    "changed_entries_considered": 1,
+                    "repo_root_fingerprint": repo_fp,
+                    "repo_scope": "canonical",
+                    "runtime_root_fingerprint": runtime_fp,
+                    "runtime_scope": "canonical",
+                }
+            },
+            "git": {"head": "abc123"},
+        }
+
+    def test_progress_channel_history_schema_is_read(self):
+        progress_file = self.runtime_dir / "progress-channel.json"
+        progress_file.write_text(json.dumps({
+            "history": [
+                {
+                    "notification_id": "legit-history-1",
+                    "project_id": "test-p",
+                    "task_id": "T1",
+                    "milestone": "TASK_STARTED",
+                    "message": "started",
+                    "timestamp": "2026-09-12T10:00:00Z",
+                    "level": "info",
+                    "binding_id": "b1",
+                    "adapter": "chatgpt_web",
+                    "details": {"source": "worker"},
+                }
+            ]
+        }), encoding="utf-8")
+
+        last_prog_at, _, signals = collect_progress_signals(
+            self._snapshot("2026-09-12T09:50:00Z"),
+            self.runtime_dir,
+        )
+        self.assertEqual(last_prog_at, "2026-09-12T10:00:00Z")
+        self.assertEqual(signals["progress_entry"]["id"], "legit-history-1")
+
     def test_watchdog_milestones_and_source_self_excluded(self):
         """Milestones in WATCHDOG_MILESTONES and source=watchdog do not count as progress."""
-        history_dir = self.runtime_dir / "history"
-        history_dir.mkdir(parents=True)
-        progress_file = history_dir / "progress.json"
+        progress_file = self.runtime_dir / "progress-channel.json"
 
         # Write progress notifications: one legitimate earlier event and several watchdog events with newer timestamps
         progress_data = {
-            "notifications": [
+            "history": [
                 {
                     "notification_id": "legit-1",
                     "project_id": "test-p",
+                    "task_id": "T1",
                     "milestone": "TASK_STARTED",
+                    "message": "started",
                     "timestamp": "2026-09-12T10:00:00Z",
+                    "level": "info",
+                    "binding_id": "b1",
+                    "adapter": "chatgpt_web",
                     "details": {"source": "worker"},
                 },
                 {
                     "notification_id": "wd-stall",
                     "project_id": "test-p",
+                    "task_id": "T1",
                     "milestone": "STALL_DETECTED",
+                    "message": "stalled",
                     "timestamp": "2026-09-12T10:30:00Z",
+                    "level": "warning",
+                    "binding_id": "b1",
+                    "adapter": "chatgpt_web",
                     "details": {"source": "watchdog"},
                 },
                 {
                     "notification_id": "wd-diag",
                     "project_id": "test-p",
+                    "task_id": "T1",
                     "milestone": "DIAGNOSTIC_RESULT",
+                    "message": "diagnosed",
                     "timestamp": "2026-09-12T10:31:00Z",
+                    "level": "info",
+                    "binding_id": "b1",
+                    "adapter": "chatgpt_web",
                     "details": {"source": "watchdog"},
                 },
                 {
                     "notification_id": "wd-gate",
                     "project_id": "test-p",
+                    "task_id": "T1",
                     "milestone": "OWNER_GATE",
+                    "message": "gated",
                     "timestamp": "2026-09-12T10:32:00Z",
+                    "level": "warning",
+                    "binding_id": "b1",
+                    "adapter": "chatgpt_web",
                     "details": {"source": "watchdog"},
                 },
             ]
@@ -84,6 +158,42 @@ class WatchdogSelfExclusionTests(unittest.TestCase):
         self.assertEqual(prog_entry.get("id"), "legit-1")
         self.assertEqual(prog_entry.get("milestone"), "TASK_STARTED")
         self.assertEqual(prog_entry.get("timestamp"), "2026-09-12T10:00:00Z")
+
+    def test_mixed_offset_timestamps_choose_newest_utc_timestamp(self):
+        (self.runtime_dir / "ai-planner.json").write_text(json.dumps({
+            "version": 1,
+            "plans": {
+                "plan-1": {
+                    "project_id": "test-p",
+                    "plan_id": "plan-1",
+                    "state": "planning",
+                    "started_at": "2026-09-12T02:30:00Z",
+                }
+            },
+        }), encoding="utf-8")
+        (self.runtime_dir / "progress-channel.json").write_text(json.dumps({
+            "history": [
+                {
+                    "notification_id": "legit-older",
+                    "project_id": "test-p",
+                    "task_id": "T1",
+                    "milestone": "TASK_STARTED",
+                    "message": "older event",
+                    "timestamp": "2026-09-12T08:45:00+08:00",
+                    "level": "info",
+                    "binding_id": "b1",
+                    "adapter": "chatgpt_web",
+                    "details": {"source": "worker"},
+                }
+            ],
+        }), encoding="utf-8")
+
+        last_prog_at, _, signals = collect_progress_signals(
+            self._snapshot("2026-09-12T08:50:00+08:00"),
+            self.runtime_dir,
+        )
+        self.assertEqual(last_prog_at, "2026-09-12T02:30:00Z")
+        self.assertEqual(signals["role_records"]["ai-planner.json"]["timestamp"], "2026-09-12T02:30:00Z")
 
     def test_status_mirrors_and_commands_self_excluded(self):
         """Status mirror, corrupt files, and wd-* command files never qualify as progress."""

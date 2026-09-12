@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,8 @@ from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_is
 WATCHDOG_SCHEMA_VERSION = 1
 WATCHDOG_STATE_FILE = "watchdog.json"
 WATCHDOG_COMMAND_PREFIX = "wd-"
+MAX_TERMINAL_ATTEMPTS_PER_PROJECT = 20
+NONTERMINAL_ATTEMPT_STATES = frozenset({"running", "reserved", "requested"})
 
 ACTIVE_LIFECYCLE_STATES = frozenset({
     "PLANNING",
@@ -129,6 +132,54 @@ def path_contains(root: Path | str, candidate: Path | str) -> bool:
         return False
 
 
+def _glob_match_no_cross(rel: str, pattern: str) -> bool:
+    """Match a glob without allowing basename wildcards to cross directories."""
+    rel_path = Path(str(rel).replace("\\", "/"))
+    pat_path = Path(str(pattern).replace("\\", "/"))
+    if rel_path.parent != pat_path.parent:
+        return False
+    return fnmatch.fnmatch(rel_path.name, pat_path.name)
+
+
+def _timestamp_is_newer(candidate: Any, current: Any) -> bool:
+    """Compare timestamps by parsed UTC time, falling back to string order."""
+    cand_text = str(candidate or "").strip()
+    curr_text = str(current or "").strip()
+    cand_dt = parse_utc(cand_text)
+    curr_dt = parse_utc(curr_text)
+    if cand_dt is not None:
+        if curr_dt is None:
+            return True
+        if cand_dt != curr_dt:
+            return cand_dt > curr_dt
+    elif curr_dt is not None:
+        return False
+    return cand_text > curr_text
+
+
+def _latest_timestamp_value(values: Sequence[Any]) -> Optional[str]:
+    latest: Optional[str] = None
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if latest is None or _timestamp_is_newer(text, latest):
+            latest = text
+    return latest
+
+
+def _attempt_sort_key(attempt: dict[str, Any]) -> tuple[datetime, str, str]:
+    stamp = (
+        attempt.get("completed_at")
+        or attempt.get("started_at")
+        or attempt.get("deadline_at")
+        or attempt.get("requested_at")
+        or ""
+    )
+    parsed = parse_utc(stamp) or datetime.min.replace(tzinfo=timezone.utc)
+    return parsed, str(stamp or ""), str(attempt.get("attempt_key") or "")
+
+
 def is_watchdog_owned_path(
     repo_root: Path | str,
     candidate: Path | str,
@@ -158,7 +209,7 @@ def is_watchdog_owned_path(
         try:
             rel = os.path.relpath(c_cand, c_repo).replace("\\", "/")
             for g in WATCHDOG_OWNED_REPO_GLOBS:
-                if fnmatch.fnmatch(rel, g):
+                if _glob_match_no_cross(rel, g):
                     return True
         except ValueError:
             pass
@@ -173,7 +224,7 @@ def is_watchdog_owned_path(
             try:
                 rel_rt = os.path.relpath(c_cand, c_rt).replace("\\", "/")
                 for g in WATCHDOG_OWNED_RUNTIME_GLOBS:
-                    if fnmatch.fnmatch(rel_rt, g):
+                    if _glob_match_no_cross(rel_rt, g):
                         return True
             except ValueError:
                 pass
@@ -275,11 +326,26 @@ def resolve_run_key(snapshot: dict[str, Any], executor_state: dict[str, Any] | N
     if isinstance(executor_state, dict):
         executions = executor_state.get("executions")
         if isinstance(executions, dict):
+            latest_active_id: Optional[str] = None
+            latest_active_ts: Optional[str] = None
             for rec in executions.values():
                 if isinstance(rec, dict) and str(rec.get("project_id") or "") == project_id:
+                    rec_state = str(rec.get("state") or "").lower()
+                    if rec_state in ("completed", "failed", "cancelled", "handoff", "blocked"):
+                        continue
                     active_id = rec.get("execution_id") or rec.get("request_id") or rec.get("run_id")
                     if active_id:
-                        return str(active_id).strip()
+                        rec_ts = (
+                            rec.get("updated_at")
+                            or rec.get("started_at")
+                            or rec.get("requested_at")
+                            or rec.get("created_at")
+                        )
+                        if latest_active_id is None or _timestamp_is_newer(rec_ts, latest_active_ts):
+                            latest_active_id = str(active_id).strip()
+                            latest_active_ts = str(rec_ts or "")
+            if latest_active_id:
+                return latest_active_id
 
     role_run_id = snapshot.get("role_run_id")
     if role_run_id:
@@ -389,23 +455,22 @@ def collect_progress_signals(
                                 rid = rec.get("plan_id") or rec.get("review_id") or rec.get("execution_id") or rec.get("request_id")
                                 if ts and rid:
                                     existing = role_records_summary.get(ledger_name)
-                                    if existing is None or ts > str(existing.get("timestamp") or ""):
+                                    if existing is None or _timestamp_is_newer(ts, existing.get("timestamp")):
                                         role_records_summary[ledger_name] = {
                                             "id": str(rid),
                                             "timestamp": str(ts),
                                         }
-                                        if latest_role_timestamp is None or str(ts) > latest_role_timestamp:
-                                            latest_role_timestamp = str(ts)
+                                        latest_role_timestamp = _latest_timestamp_value((latest_role_timestamp, ts))
 
     # Progress channel history
     progress_summary: Optional[dict[str, Any]] = None
     latest_progress_timestamp: Optional[str] = None
     if runtime_root is not None:
-        prog_file = Path(runtime_root) / "history" / "progress.json"
+        prog_file = Path(runtime_root) / "progress-channel.json"
         if prog_file.is_file():
             prog_data = read_json(prog_file, {})
-            if isinstance(prog_data, dict) and isinstance(prog_data.get("notifications"), list):
-                for item in prog_data["notifications"]:
+            if isinstance(prog_data, dict) and isinstance(prog_data.get("history"), list):
+                for item in prog_data["history"]:
                     if not isinstance(item, dict) or str(item.get("project_id") or "") != project_id:
                         continue
                     mstone = item.get("milestone")
@@ -417,18 +482,16 @@ def collect_progress_signals(
                     ts = item.get("timestamp")
                     nid = item.get("notification_id")
                     if ts and nid:
-                        if progress_summary is None or str(ts) > str(progress_summary.get("timestamp") or ""):
+                        if progress_summary is None or _timestamp_is_newer(ts, progress_summary.get("timestamp")):
                             progress_summary = {
                                 "id": str(nid),
                                 "timestamp": str(ts),
                                 "milestone": str(mstone),
                             }
-                            if latest_progress_timestamp is None or str(ts) > latest_progress_timestamp:
-                                latest_progress_timestamp = str(ts)
+                            latest_progress_timestamp = _latest_timestamp_value((latest_progress_timestamp, ts))
 
     # Determine latest durable progress timestamp
-    valid_ts = [t for t in (safe_last_activity, latest_role_timestamp, latest_progress_timestamp) if t]
-    last_progress_at = max(valid_ts) if valid_ts else None
+    last_progress_at = _latest_timestamp_value((safe_last_activity, latest_role_timestamp, latest_progress_timestamp))
 
     # Assemble fingerprint payload strictly from allowlisted fields
     sources_summary: dict[str, Any] = {}
@@ -549,13 +612,15 @@ class WatchdogCoordinator:
         self._advance_lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
         self._cached_state: dict[str, Any] = {}
+        self._preserve_existing_state_file = False
         self._init_state()
 
     def _init_state(self) -> None:
         with self._lock:
             self._cached_state = self._load_state()
             self._recover_interrupted()
-            self._save_state(self._cached_state)
+            if not self._preserve_existing_state_file:
+                self._save_state(self._cached_state)
 
     def _load_state(self) -> dict[str, Any]:
         """Load durable state fail-closed with quarantine on corrupt or future version."""
@@ -564,6 +629,7 @@ class WatchdogCoordinator:
                 "version": WATCHDOG_SCHEMA_VERSION,
                 "degraded": False,
                 "degraded_reason": None,
+                "last_tick_error": None,
                 "quarantined_projects": {},
                 "projects": {},
             }
@@ -600,6 +666,7 @@ class WatchdogCoordinator:
             "version": version,
             "degraded": bool(data.get("degraded", False)),
             "degraded_reason": data.get("degraded_reason"),
+            "last_tick_error": data.get("last_tick_error"),
             "quarantined_projects": quarantined_projects,
             "projects": validated_projects,
         }
@@ -607,8 +674,12 @@ class WatchdogCoordinator:
     def _quarantine_corrupt_state(self, reason: str, raw_bytes: bytes) -> dict[str, Any]:
         stamp = utc_now_iso().replace(":", "-")
         quarantine_file = self.runtime_root / f"watchdog.json.corrupt-{stamp}"
+        self._preserve_existing_state_file = True
         try:
-            quarantine_file.write_bytes(raw_bytes)
+            if raw_bytes:
+                quarantine_file.write_bytes(raw_bytes)
+            elif self.state_path.exists():
+                shutil.copy2(self.state_path, quarantine_file)
         except OSError:
             pass
 
@@ -629,12 +700,65 @@ class WatchdogCoordinator:
             "version": WATCHDOG_SCHEMA_VERSION,
             "degraded": True,
             "degraded_reason": reason,
+            "last_tick_error": None,
             "quarantined_projects": {},
             "projects": {},
         }
 
     def _save_state(self, state: dict[str, Any]) -> None:
+        self._prune_state(state)
+        if state.get("degraded") and self._preserve_existing_state_file:
+            return
         write_json(self.state_path, state, indent=2)
+        self._preserve_existing_state_file = False
+
+    def _prune_state(self, state: dict[str, Any]) -> None:
+        state.setdefault("last_tick_error", None)
+        projects = state.get("projects")
+        if not isinstance(projects, dict):
+            return
+        for prow in projects.values():
+            if not isinstance(prow, dict):
+                continue
+            attempts = prow.get("attempts")
+            if not isinstance(attempts, dict):
+                continue
+            kept_attempts: dict[str, Any] = {}
+            terminal_items: list[tuple[str, dict[str, Any]]] = []
+            for att_key, att in attempts.items():
+                if not isinstance(att, dict):
+                    continue
+                state_name = str(att.get("state") or "").lower()
+                if state_name in NONTERMINAL_ATTEMPT_STATES:
+                    kept_attempts[att_key] = att
+                else:
+                    terminal_items.append((att_key, att))
+            terminal_items.sort(key=lambda item: _attempt_sort_key(item[1]), reverse=True)
+            for att_key, att in terminal_items[:MAX_TERMINAL_ATTEMPTS_PER_PROJECT]:
+                kept_attempts[att_key] = att
+            prow["attempts"] = kept_attempts
+            keep_run_scopes = {
+                str(att.get("run_scope_key"))
+                for att in kept_attempts.values()
+                if isinstance(att, dict) and att.get("run_scope_key")
+            }
+            stall = prow.get("stall")
+            if isinstance(stall, dict) and stall.get("run_scope_key"):
+                keep_run_scopes.add(str(stall.get("run_scope_key")))
+            attempt_counts = prow.get("attempt_counts")
+            if isinstance(attempt_counts, dict):
+                prow["attempt_counts"] = {
+                    str(key): value
+                    for key, value in attempt_counts.items()
+                    if str(key) in keep_run_scopes
+                }
+            recovery_slots = prow.get("recovery_slots")
+            if isinstance(recovery_slots, dict):
+                prow["recovery_slots"] = {
+                    str(key): value
+                    for key, value in recovery_slots.items()
+                    if str(key) in keep_run_scopes
+                }
 
     def _recover_interrupted(self) -> None:
         """Mark in-flight attempts interrupted after process restart."""
@@ -658,6 +782,20 @@ class WatchdogCoordinator:
         with self._lock:
             p = (self._cached_state.get("projects") or {}).get(project_id)
             return copy.deepcopy(p) if isinstance(p, dict) else None
+
+    def clear_degraded(self) -> None:
+        """Explicitly clear degraded mode and persist a fresh valid state."""
+        with self._lock:
+            if self._cached_state.get("degraded"):
+                self._cached_state["degraded"] = False
+                self._cached_state["degraded_reason"] = None
+                self._save_state(self._cached_state)
+
+    def record_tick_error(self, exc: Exception) -> None:
+        """Persist the latest watchdog tick error for status visibility."""
+        with self._lock:
+            self._cached_state["last_tick_error"] = str(exc)
+            self._save_state(self._cached_state)
 
     def _reap_overdue_attempts(self, now: datetime) -> None:
         """Fencing: reap any attempt whose deadline_at expired."""
@@ -710,7 +848,7 @@ class WatchdogCoordinator:
                 if not isinstance(rec, dict):
                     continue
                 rec_state = rec.get("state")
-                if rec_state in ("completed", "blocked", "unresolved"):
+                if rec_state in ("completed", "blocked", "unresolved", "unknown"):
                     continue
 
                 cid = rec.get("command_id")
@@ -723,7 +861,12 @@ class WatchdogCoordinator:
                 if hist_file.is_file():
                     hdata = read_json(hist_file, {})
                     outcome = hdata.get("state") if isinstance(hdata, dict) else "unknown"
-                    rec["state"] = "completed" if outcome == "applied" else "blocked"
+                    if outcome == "accepted":
+                        rec["state"] = "completed"
+                    elif outcome in ("blocked", "owner_gate"):
+                        rec["state"] = "blocked"
+                    else:
+                        rec["state"] = "unknown"
                     rec["resolved_at"] = utc_now_iso()
                     rec["reason"] = f"reconciled from history: {outcome}"
                     prow["last_recovery_result"] = rec["state"]
@@ -915,7 +1058,8 @@ class WatchdogCoordinator:
                 # Guard 1: Deduplication
                 if att_key in attempts:
                     existing = attempts[att_key]
-                    self._check_and_trigger_recovery(pcfg, snapshot, prow, att_key, existing)
+                    if existing.get("state") == "completed" and existing.get("diagnosis") is not None:
+                        self._check_and_trigger_recovery(pcfg, snapshot, prow, att_key, existing)
                     results.append({"project_id": pid, "status": "deduplicated", "attempt_key": att_key})
                     continue
 
@@ -1002,6 +1146,7 @@ class WatchdogCoordinator:
 
                 results.append({"project_id": pid, "status": "attempt_started", "attempt_key": att_key})
 
+            self._cached_state["last_tick_error"] = None
             self._save_state(self._cached_state)
 
         return results
@@ -1110,6 +1255,8 @@ class WatchdogCoordinator:
         attempt_record: dict[str, Any],
     ) -> None:
         """Run two-phase reserve/enqueue recovery under explicit safety guards."""
+        if attempt_record.get("state") != "completed" or attempt_record.get("diagnosis") is None:
+            return
         if attempt_record.get("recovery") is not None:
             return  # Already reserved or executed for this attempt
 
@@ -1182,11 +1329,12 @@ class WatchdogCoordinator:
 
     def _emit_owner_gate_once(self, project_id: str, attempt_record: dict[str, Any], reason: str) -> None:
         att_key = attempt_record.get("attempt_key", "")
+        reason_slug = re.sub(r"[^a-z0-9-]", "-", str(reason or "reason").lower()).strip("-")[:32] or "reason"
         self._emit_milestone(
             project_id,
             "OWNER_GATE",
             task_id=attempt_record.get("task_id"),
-            occurrence_key=f"{att_key}:gate",
+            occurrence_key=f"{att_key}:gate:{reason_slug}",
             details={
                 "source": "watchdog",
                 "gate": "recovery-blocked",

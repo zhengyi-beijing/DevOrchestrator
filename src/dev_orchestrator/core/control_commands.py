@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 from dev_orchestrator.config import load_projects_config

@@ -28,6 +28,8 @@ DIAGNOSIS_CODES = (
     "external_wait",
     "unknown",
 )
+WORKER_EXPECTED_LIFECYCLE_STATES = frozenset({"EXECUTING", "REMEDIATING"})
+ACTIVE_WORKER_STATES = frozenset({"running", "active", "launching"})
 
 _SECRET_PATTERN = re.compile(
     r"(?i)(api[_-]?key|secret|token|password|bearer|sk-[a-z0-9]{20,})[:=]\s*([^\s]{4,})"
@@ -223,13 +225,19 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
     proc = evidence.get("process_liveness") if isinstance(evidence.get("process_liveness"), dict) else {}
     pid = proc.get("pid")
     is_alive = proc.get("process_alive")
+    worker_state = str(proc.get("worker_state") or "").lower()
+    lifecycle = str(getattr(assessment, "lifecycle_state", "")).upper()
+    worker_active = (
+        worker_state in ACTIVE_WORKER_STATES
+        or lifecycle in WORKER_EXPECTED_LIFECYCLE_STATES
+    )
 
     # Check process_dead
-    if pid is not None and is_alive is False:
+    if pid is not None and is_alive is False and worker_active:
         return Diagnosis(
             code="process_dead",
             confidence=1.0,
-            reason=f"worker process (PID {pid}) is dead while lifecycle is {getattr(assessment, 'lifecycle_state', 'active')}",
+            reason=f"worker process (PID {pid}) is dead while lifecycle is {lifecycle or 'active'}",
             recommended_action="launch safe continue recovery to restart worker",
             owner_gate_required=False,
             evidence=evidence,

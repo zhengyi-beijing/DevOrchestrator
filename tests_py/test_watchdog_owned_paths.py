@@ -77,6 +77,12 @@ class WatchdogOwnedPathsTests(unittest.TestCase):
         self.assertFalse(is_watchdog_owned_path(self.repo_dir, self.repo_dir / "agent" / "CURRENT.md"))
         self.assertFalse(is_watchdog_owned_path(self.repo_dir, self.repo_dir / "agent" / "next.md"))
         self.assertFalse(is_watchdog_owned_path(self.repo_dir, self.repo_dir / "src" / "main.py"))
+        self.assertFalse(
+            is_watchdog_owned_path(
+                self.repo_dir,
+                self.repo_dir / ".devorch" / "watchdog" / "nested.json",
+            )
+        )
 
     def test_is_watchdog_owned_path_internal_runtime_patterns(self):
         """Verify runtime-owned watchdog files are recognized when runtime is inside repo."""
@@ -93,6 +99,13 @@ class WatchdogOwnedPathsTests(unittest.TestCase):
         # Runtime state files
         self.assertTrue(is_watchdog_owned_path(self.repo_dir, self.internal_runtime / "watchdog.json", runtime_root=self.internal_runtime))
         self.assertTrue(is_watchdog_owned_path(self.repo_dir, self.internal_runtime / "watchdog.json.corrupt-abc", runtime_root=self.internal_runtime))
+        self.assertFalse(
+            is_watchdog_owned_path(
+                self.repo_dir,
+                self.internal_runtime / "control" / "history" / "wd-att12345" / "nested.json",
+                runtime_root=self.internal_runtime,
+            )
+        )
 
     def test_external_runtime_isolation(self):
         """When runtime_root is outside repo_root, runtime-owned rules remain inert."""

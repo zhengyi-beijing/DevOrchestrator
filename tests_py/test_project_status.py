@@ -10,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from dev_orchestrator.core.project_status import (
+    _watchdog_view,
     project_runtime_status,
     write_execution_status,
     write_project_status,
@@ -252,6 +253,44 @@ class ProjectStatusTests(unittest.TestCase):
             self.assertIn("project_context", projected)
             self.assertEqual(projected["project_context"]["state"], "ready")
             self.assertEqual(projected["project_context"]["digest"], "0123456789abcdef")
+
+    def test_watchdog_view_uses_newest_source_timestamp_not_dict_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            (runtime / "watchdog.json").write_text(json.dumps({
+                "version": 1,
+                "degraded": False,
+                "projects": {
+                    "p1": {
+                        "signal_sources": {
+                            "sources": {
+                                "late-in-order": {
+                                    "path": "agent/older.md",
+                                    "last_activity_at": "2026-09-12T10:00:00Z",
+                                },
+                                "early-in-order": {
+                                    "path": "agent/newer.md",
+                                    "last_activity_at": "2026-09-12T11:00:00Z",
+                                },
+                            }
+                        },
+                        "activity_evidence": "available",
+                        "activity_evidence_reason": None,
+                        "attempts": {},
+                        "attempt_counts": {},
+                    }
+                }
+            }), encoding="utf-8")
+            projects_dir = runtime / "projects"
+            projects_dir.mkdir()
+            (projects_dir / "p1.json").write_text(json.dumps({
+                "activity": {"watchdog_safe": {"runtime_scope": "canonical"}}
+            }), encoding="utf-8")
+
+            view = _watchdog_view(runtime, "p1")
+
+            self.assertIsNotNone(view)
+            self.assertEqual(view["activity_evidence"]["newest_path"], "agent/newer.md")
 
 
 if __name__ == "__main__":

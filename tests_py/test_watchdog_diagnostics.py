@@ -134,6 +134,20 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         self.assertEqual(evidence["repository_truth"]["status"], "skipped_deadline")
         self.assertEqual(evidence["process_liveness"]["status"], "skipped_deadline")
 
+    def test_dead_pid_in_planning_without_active_worker_does_not_classify_process_dead(self):
+        evidence = {
+            "process_liveness": {
+                "process_alive": False,
+                "pid": 1234,
+                "worker_state": "not_started",
+                "kind": "planner",
+            },
+            "repository_truth": {"valid": True, "dirty": False, "uncommitted_files": []},
+            "agent_files": {},
+        }
+        diag = classify_evidence(evidence, DummyAssessment(lifecycle_state="PLANNING", no_progress_seconds=2000.0))
+        self.assertEqual(diag.code, "unknown")
+
     def test_static_api_guards_against_destructive_calls(self):
         """Static analysis: watchdog.py and diagnostics.py must NOT import or call process-killing or git-write APIs."""
         code_dir = Path(__file__).resolve().parent.parent / "src" / "dev_orchestrator" / "core"

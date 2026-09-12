@@ -121,9 +121,22 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
     excluded_paths = sig_sources.get("excluded_paths") or []
     excluded_count = sig_sources.get("excluded_count", len(excluded_paths))
     newest_path = None
+    newest_ts = None
     sources_dict = sig_sources.get("sources") if isinstance(sig_sources.get("sources"), dict) else {}
     for s_val in sources_dict.values():
-        if isinstance(s_val, dict) and s_val.get("path"):
+        if not isinstance(s_val, dict) or not s_val.get("path") or not s_val.get("last_activity_at"):
+            continue
+        source_ts = str(s_val.get("last_activity_at"))
+        if newest_ts is None:
+            newest_ts = source_ts
+            newest_path = s_val["path"]
+            continue
+        source_dt = parse_utc(source_ts)
+        newest_dt = parse_utc(newest_ts)
+        if (source_dt is not None and newest_dt is not None and source_dt > newest_dt) or (
+            (source_dt is not None and newest_dt is None) or (source_dt is None and newest_dt is None and source_ts > newest_ts)
+        ):
+            newest_ts = source_ts
             newest_path = s_val["path"]
 
     snapshot_activity = read_json(runtime / "projects" / f"{project_id}.json", {}).get("activity", {})

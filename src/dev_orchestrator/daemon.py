@@ -81,6 +81,7 @@ def _run_orchestration_tick(
     watchdog: WatchdogCoordinator | None = None, *, pid: int,
 ) -> dict[str, Any]:
     """Run one ordered control-plane tick and return the projected summary."""
+    watchdog_error: Optional[str] = None
     raw_summary = run_monitor_once(config, runtime)
     write_project_statuses(raw_summary, runtime, phase="monitor", daemon_state="running", pid=pid)
     if controls is not None:
@@ -118,10 +119,14 @@ def _run_orchestration_tick(
     if watchdog is not None:
         try:
             watchdog.advance(config, projected, executor=executor)
-        except Exception:
-            pass
+        except Exception as _wd_exc:
+            watchdog.record_tick_error(_wd_exc)
+            watchdog_error = str(_wd_exc)
     write_project_statuses(projected, runtime, phase="actuation", daemon_state="running", pid=pid)
     write_json(runtime / "summary.json", projected)
+    if watchdog_error is not None:
+        projected = dict(projected) if isinstance(projected, dict) else {"projects": [], "summary": projected}
+        projected["_watchdog_tick_error"] = watchdog_error
     return projected
 
 
@@ -206,10 +211,12 @@ def run_daemon(
         while True:
             last_error: Optional[str] = None
             try:
-                _run_orchestration_tick(
+                tick_result = _run_orchestration_tick(
                     config, runtime, bridge_store, transition_executor, reviewer_coordinator,
                     control_coordinator, watchdog=watchdog_coordinator, pid=pid
                 )
+                if isinstance(tick_result, dict) and tick_result.get("_watchdog_tick_error"):
+                    last_error = str(tick_result["_watchdog_tick_error"])
             except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
                 last_error = str(exc)
             state = "degraded" if last_error else "running"
