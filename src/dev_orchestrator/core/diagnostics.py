@@ -303,8 +303,26 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
                 evidence_hash=ev_hash,
             )
 
-    # Check agent_stalled (process is alive, but no progress within threshold)
+    # Check agent_stalled (process is alive, but no progress within threshold).
+    # R3-F1: Only valid in worker-expected lifecycle states (EXECUTING / REMEDIATING).
+    # In non-worker lifecycles a live PID is likely stale or reused from a prior execution;
+    # classifying it as agent_stalled would allow spurious wd-continue recovery that could
+    # launch a second planner cycle or interfere with an in-progress review/plan phase.
     if is_alive is True:
+        if not worker_active:
+            return Diagnosis(
+                code="unknown",
+                confidence=0.3,
+                reason=(
+                    f"worker process (PID {pid}) is alive but lifecycle {lifecycle!r} is not "
+                    f"a worker-expected execution state (EXECUTING/REMEDIATING); PID may be "
+                    f"stale or reused from a prior run"
+                ),
+                recommended_action="inspect system state and require owner gate",
+                owner_gate_required=True,
+                evidence=evidence,
+                evidence_hash=ev_hash,
+            )
         return Diagnosis(
             code="agent_stalled",
             confidence=0.9,

@@ -335,8 +335,30 @@ def cmd_watchdog_clear_degraded(args: argparse.Namespace) -> int:
     """
     from dev_orchestrator.core.watchdog import WatchdogCoordinator
     runtime = resolve_runtime_root(args.runtime_root)
+
+    # R3-F5: Fail closed if the daemon is currently live.  Clearing degraded state while
+    # the daemon is running risks a race where the daemon overwrites the freshly-cleared
+    # state file, so we refuse the operation to protect operator intent.
+    daemon_pid = _recorded_pid(runtime, "daemon")
+    if daemon_pid is not None and is_pid_alive(daemon_pid):
+        _fail(
+            "Daemon is running (PID {0}). Stop the daemon before clearing watchdog degraded mode.".format(daemon_pid)
+        )
+
     coordinator = WatchdogCoordinator(runtime)
     was_degraded = bool(coordinator.state().get("degraded"))
+
+    # R3-F5: Require at least one verified quarantine file before overwriting.
+    # If no quarantine file exists and the coordinator is degraded, the corrupt original
+    # was never preserved — refuse to clear to prevent silent data loss.
+    if was_degraded:
+        quarantine_files = list(runtime.glob("watchdog.json.corrupt-*"))
+        if not quarantine_files:
+            _fail(
+                "Watchdog is degraded but no quarantine backup (watchdog.json.corrupt-*) was found. "
+                "Cannot safely clear degraded mode without a verified quarantine copy."
+            )
+
     coordinator.clear_degraded()
     _print_json({
         "runtime_root": str(runtime),

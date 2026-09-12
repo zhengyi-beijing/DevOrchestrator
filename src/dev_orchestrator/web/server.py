@@ -165,9 +165,22 @@ def watchdog_payload(runtime_root: Path | str) -> dict[str, Any]:
         return {"projects": {}, "degraded": False}
 
     from dev_orchestrator.core.project_status import _watchdog_view
+    from dev_orchestrator.core.watchdog import WATCHDOG_SCHEMA_VERSION
     data = read_json(state_file, None)
     if not isinstance(data, dict):
         return {"projects": {}, "degraded": True, "degraded_reason": "unreadable state"}
+
+    # R3-F3: Validate schema version before trusting the file's degraded flag.
+    # If the coordinator loaded a future-version file, it ran degraded in memory but
+    # _preserve_existing_state_file prevented it from writing the degraded flag back.
+    # Reading degraded directly from the original file would miss the degraded state.
+    version = data.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version > WATCHDOG_SCHEMA_VERSION:
+        return {
+            "projects": {},
+            "degraded": True,
+            "degraded_reason": f"unsupported or invalid watchdog schema version: {version!r}",
+        }
 
     degraded = bool(data.get("degraded", False))
     projects_dict: dict[str, Any] = {}

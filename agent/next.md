@@ -1,20 +1,37 @@
-# P10 Active-Project Progress Watchdog and Automatic Diagnostics
+# P10 Remediation Round 3 (R3-F1..F6)
 
 Status: **COMPLETED (PENDING REVIEW)**
 
-Goal: make DevOrchestrator detect active projects that have exceeded a configurable no-progress threshold and automatically launch one bounded diagnostic task instead of silently remaining in a running state.
+Goal: Fix all primary (R3-F1, R3-F2) and low-risk (R3-F3..F6) blockers from Opus review 3 of the P10 progress watchdog implementation.
 
-Required behavior:
-- monitor only active lifecycle states such as PLANNING, EXECUTING, REVIEWING, and REMEDIATING;
-- reuse existing durable progress signals (`last_activity_at`, lifecycle/role state, AIBroker dispatch state, Progress Channel events, Git/agent-file changes) rather than introducing a second heartbeat system;
-- support a configurable default no-progress threshold (initial target 15 minutes) plus per-project/per-lifecycle overrides;
-- on threshold breach, create exactly one diagnostic attempt for the current project/task/lifecycle run, with durable deduplication and cooldown so daemon ticks cannot fan out duplicate diagnostics;
-- diagnostic execution is read-only by default and must inspect DevO lifecycle state, AIBroker dispatch/resource/quota state, relevant process liveness, Git truth, recent role output and agent files;
-- return a structured diagnosis such as `healthy_slow`, `agent_stalled`, `process_dead`, `provider_or_quota_blocked`, `state_desync`, `external_wait`, or `unknown`, with evidence and recommended next action;
-- permit only normal DevO lifecycle recovery (`retry`, `reconcile`, bounded remediation) when the diagnosis proves a safe recovery path; destructive Git actions, arbitrary process termination, credential changes, hardware actions, scope expansion or ambiguous recovery require OWNER_GATE;
-- emit Progress Channel milestones for STALL_DETECTED, DIAGNOSTIC_STARTED, DIAGNOSTIC_RESULT, RECOVERY_STARTED and OWNER_GATE;
-- persist last diagnosis, evidence hash, cooldown/attempt count and recovery result across restart and surface them through project status for the future 8770 dashboard.
+## Fixes delivered
 
-Scope: modify only `C:\work\github\DevOrchestrator-dev`. Do not modify/restart/promote the stable controller at `C:\work\github\DevOrchestrator`, do not push, and perform no physical hardware actions.
+### R3-F1 — agent_stalled lifecycle and worker guard
+- `diagnostics.py` `classify_evidence`: alive PID in non-worker lifecycle (not EXECUTING/REMEDIATING) now returns `unknown` + `owner_gate_required=True` instead of `agent_stalled`. This prevents stale/reused PIDs from the prior execution from being misclassified.
+- `watchdog.py` `_check_and_trigger_recovery`: before RESERVE, verifies (a) current snapshot `lifecycle_state` ∈ `WORKER_EXPECTED_LIFECYCLE_STATES`, (b) evidence `worker_state` ∈ `ACTIVE_WORKER_STATES`. Non-worker lifecycle → `agent_stalled_non_worker_lifecycle` owner_gate; inactive worker state → `agent_stalled_worker_not_active` owner_gate.
+- End-to-end test: PLANNING + PENDING DESIGN + stale alive PID never enqueues `wd-continue`.
 
-Acceptance: focused watchdog/diagnostic/recovery regressions + full unittest suite + browser userscript syntax check + git diff check; update agent docs and commit locally clean; independent reviewer must accept before any later owner-gated promotion.
+### R3-F2 — stale evidence bounding before RESERVE
+- `watchdog.py` `_check_and_trigger_recovery`: re-probes current active-run PID against evidence PID. Mismatch → `agent_stalled_pid_mismatch` / `process_dead_pid_mismatch` owner_gate. Evidence older than `cooldown_minutes` → `evidence_stale_beyond_cooldown` owner_gate. Auto_recovery toggled on within cooldown proceeds normally (evidence is fresh).
+
+### R3-F3 — watchdog_payload schema validation
+- `web/server.py` `watchdog_payload`: validates schema version before using the file's `degraded` flag. Future-version or invalid version files return `degraded=True` even when the coordinator could not write its in-memory state back due to `_preserve_existing_state_file`.
+
+### R3-F4 — quarantine identity for unreadable files
+- `watchdog.py` `_quarantine_corrupt_state`: uses reason-based SHA-256 hash (not constant empty-bytes hash `e3b0c44298fc1c14`) when `raw_bytes` is empty, so distinct unreadable error types get distinct quarantine identities.
+
+### R3-F5 — clear-degraded CLI fail-closed
+- `cli.py` `cmd_watchdog_clear_degraded`: refuses to run if daemon PID is alive; also requires at least one `watchdog.json.corrupt-*` quarantine file to exist before overwriting state.
+
+### R3-F6 — prune retains consumed recovery budgets
+- `watchdog.py` `_prune_state`: adds consumed (non-null) `recovery_slots` keys to `keep_run_scopes` before pruning, so long-lived projects that exceed `MAX_TERMINAL_ATTEMPTS_PER_PROJECT` cannot silently lose their per-run-scope single-recovery budget.
+
+## Test results
+- 310 unit tests passing (11 new regressions added).
+- `node --check browser/chatgpt-web-adapter.user.js` clean.
+- `git diff --check` clean.
+
+## Scope constraints
+- No changes to stable controller `C:\work\github\DevOrchestrator`.
+- No push, no destructive git, no credential or hardware actions.
+- Architecture unchanged; all changes are surgical within existing abstractions.

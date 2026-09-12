@@ -5,22 +5,18 @@
 - Branch: `feature/self-hosted-dev`.
 - D1/P8 is complete and promoted. Current development target is Gate B daily-use readiness.
 
-Current task: **P10 Active-Project Progress Watchdog and Automatic Diagnostics** (COMPLETED, pending review).
+Current task: **P10 Remediation Round 3 (R3-F1..F6)** (COMPLETED, pending review).
 
-Purpose: make DevOrchestrator detect active projects exceeding a configurable no-progress threshold, gather deterministic read-only diagnostics without model inference, and safely trigger recovery or escalate to OWNER_GATE without false progress self-refresh loops or clock leakage.
+Purpose: remediate all primary (R3-F1, R3-F2) and low-risk (R3-F3..F6) blockers from Opus review 3 of the P10 progress watchdog and automatic diagnostics implementation.
 
 Status:
-- Comprehensive design documented and frozen in `docs/PROGRESS_WATCHDOG_DIAGNOSTICS_DESIGN.md` (V5 Accepted Design).
-- Complete watchdog coordinator and bounded read-only diagnostics implemented in `src/dev_orchestrator/core/watchdog.py` and `src/dev_orchestrator/core/diagnostics.py`.
-- Source-level activity filtering and dual aggregation implemented in `src/dev_orchestrator/adapters/agent_files.py`.
-- Canonical path resolution and commonpath containment with dual provenance verification.
-- Clock-free progress fingerprint purity strictly enforced with frozen allowlist and forbidden timing/age denylist.
-- Fail-closed state persistence with corruption quarantine (`watchdog.json.corrupt-<stamp>`) and degraded mode.
-- Two-phase safe recovery (`RESERVE` -> `ENQUEUE` -> `RECONCILE`) with deterministic `wd-<attempt_key>` command IDs and single recovery per run scope.
-- Read-only web projection `GET /api/watchdog` and CLI subcommand `watchdog-status`.
-- Full daemon integration in `src/dev_orchestrator/daemon.py`.
-- 281 unit tests passing cleanly in full test suite discovery (`tests_py/`).
-- Browser adapter userscript syntax validated (`node --check browser/chatgpt-web-adapter.user.js`).
-- Git diff formatting verified clean (`git diff --check`).
-- Config validation smoke-tested (`python -m dev_orchestrator validate-config`).
-- Static analysis guards verified: zero destructive process killing or Git write commands in watchdog or diagnostics.
+- **R3-F1 FIXED**: `agent_stalled` classification and recovery now restricted to EXECUTING/REMEDIATING lifecycles. Alive stale/reused PIDs in PLANNING, REVIEWING, REVIEWING_PLAN, APPLYING_PLAN return `unknown` + owner_gate. Recovery guard in `_check_and_trigger_recovery` checks current snapshot lifecycle against WORKER_EXPECTED_LIFECYCLE_STATES and evidence `worker_state` against ACTIVE_WORKER_STATES before enqueuing any `wd-` command.
+- **R3-F2 FIXED**: Before RESERVE, re-probes current active-run PID against evidence PID (for both agent_stalled and process_dead). Evidence age bounded by cooldown window (`completed_at + cooldown_minutes`). Auto_recovery toggled on within cooldown proceeds (fresh evidence); stale evidence beyond cooldown blocks with owner_gate.
+- **R3-F3 FIXED**: `watchdog_payload` validates schema version before trusting file's degraded flag — catches future-version files where `_preserve_existing_state_file` prevented the coordinator from writing its degraded state back.
+- **R3-F4 FIXED**: `_quarantine_corrupt_state` uses reason-based hash (not constant empty-bytes hash) when `raw_bytes` is empty (file unreadable), so distinct unreadable errors get distinct quarantine identities.
+- **R3-F5 FIXED**: `watchdog-clear-degraded` CLI now fails closed if daemon is alive (checks `daemon.pid`) and requires at least one verified quarantine file to exist before overwriting state.
+- **R3-F6 FIXED**: `_prune_state` retains recovery_slots for all run scopes with consumed (non-null) slots, even when the corresponding attempt falls off the MAX_TERMINAL_ATTEMPTS_PER_PROJECT window.
+- End-to-end regression `test_f1_planning_pending_design_stale_pid_cannot_enqueue_wd` demonstrates PLANNING + PENDING DESIGN + stale alive PID cannot enqueue wd- or trigger second planner.
+- 310 unit tests passing (added 11 new regression tests).
+- Browser adapter userscript syntax validated (`node --check`).
+- Git diff check clean.

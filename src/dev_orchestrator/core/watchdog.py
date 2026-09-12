@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from dev_orchestrator.core.diagnostics import (
+    ACTIVE_WORKER_STATES,
     DIAGNOSIS_CODES,
     Diagnosis,
+    WORKER_EXPECTED_LIFECYCLE_STATES,
     classify_evidence,
     collect_evidence,
     evidence_hash,
@@ -691,7 +693,13 @@ class WatchdogCoordinator:
         return loaded
 
     def _quarantine_corrupt_state(self, reason: str, raw_bytes: bytes) -> dict[str, Any]:
-        file_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
+        # R3-F4: When raw_bytes is empty (file was unreadable), derive the identity from
+        # the error reason rather than hashing empty bytes, which would produce a constant
+        # hash (e3b0c44298fc1c14) and collapse all distinct unreadable errors into one slot.
+        if raw_bytes:
+            file_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
+        else:
+            file_hash = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
         self._preserve_existing_state_file = True
         # Avoid quarantine-copy growth: skip write if a file with the same content hash exists.
         already_quarantined = any(
@@ -786,6 +794,15 @@ class WatchdogCoordinator:
                 }
             recovery_slots = prow.get("recovery_slots")
             if isinstance(recovery_slots, dict):
+                # R3-F6: Retain consumed live-scope recovery budgets even when the
+                # corresponding attempt falls off the MAX_TERMINAL_ATTEMPTS_PER_PROJECT
+                # pruning window.  A non-null slot means a recovery was already issued for
+                # that run scope; removing it would silently allow a duplicate recovery.
+                keep_run_scopes.update(
+                    str(key)
+                    for key, value in recovery_slots.items()
+                    if value  # non-null means the slot was consumed
+                )
                 prow["recovery_slots"] = {
                     str(key): value
                     for key, value in recovery_slots.items()
@@ -1301,14 +1318,64 @@ class WatchdogCoordinator:
             self._emit_owner_gate_once(pid, attempt_record, f"diagnosis_{diag_code}_requires_owner")
             return
 
+        # Shared pre-RESERVE evidence references used by both diagnosis checks below.
+        evidence = attempt_record.get("evidence") if isinstance(attempt_record.get("evidence"), dict) else {}
+        proc_liveness = evidence.get("process_liveness") if isinstance(evidence.get("process_liveness"), dict) else {}
+        current_worker = snapshot.get("worker") if isinstance(snapshot.get("worker"), dict) else {}
+        current_lifecycle = str(
+            snapshot.get("lifecycle_state") or snapshot.get("status") or snapshot.get("state") or ""
+        ).strip().upper()
+
+        if diag_code == "agent_stalled":
+            # R3-F1: agent_stalled recovery is only valid when the current snapshot lifecycle
+            # is a worker-expected state (EXECUTING / REMEDIATING).  A stale or reused alive
+            # PID from a previous run during PLANNING / REVIEWING / REVIEWING_PLAN /
+            # APPLYING_PLAN must not trigger recovery and must not enqueue a wd-continue
+            # command that would start a second planner cycle.
+            if current_lifecycle not in WORKER_EXPECTED_LIFECYCLE_STATES:
+                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_non_worker_lifecycle")
+                return
+            # R3-F1: Verify that the PID in evidence was in an active execution state when
+            # evidence was collected (not a stale completed/stopped worker).
+            ev_worker_state = str(proc_liveness.get("worker_state") or "").lower()
+            if ev_worker_state and ev_worker_state not in ACTIVE_WORKER_STATES:
+                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_worker_not_active")
+                return
+            # R3-F2: Re-probe: current snapshot PID must match the evidence PID to ensure
+            # we are recovering the same execution, not a different one that reused the slot.
+            current_pid = current_worker.get("pid")
+            ev_pid = proc_liveness.get("pid")
+            if current_pid is not None and ev_pid is not None and current_pid != ev_pid:
+                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_pid_mismatch")
+                return
+
         if diag_code == "process_dead":
             # Use the actual PID probe from diagnostic evidence, not snapshot.worker.process_alive
             # which is derived from the executor ledger and may be stale.
-            evidence = attempt_record.get("evidence") if isinstance(attempt_record.get("evidence"), dict) else {}
-            proc_liveness = evidence.get("process_liveness") if isinstance(evidence.get("process_liveness"), dict) else {}
             if proc_liveness.get("process_alive") is not False:
                 self._emit_owner_gate_once(pid, attempt_record, "process_alive_ambiguous")
                 return
+            # R3-F2: Cross-check evidence PID against the current snapshot worker PID.
+            # If the PID changed (new execution started after diagnosis), the stored evidence
+            # belongs to a different run and must not trigger recovery for the new one.
+            current_pid = current_worker.get("pid")
+            ev_pid = proc_liveness.get("pid")
+            if current_pid is not None and ev_pid is not None and current_pid != ev_pid:
+                self._emit_owner_gate_once(pid, attempt_record, "process_dead_pid_mismatch")
+                return
+
+        # R3-F2: Bound evidence age to the cooldown window.  Evidence that is older than
+        # one cooldown period is considered stale; any attempt to recover from it after the
+        # cooldown expires would mean we are acting on a diagnosis from a previous run scope.
+        completed_at_str = attempt_record.get("completed_at")
+        if completed_at_str:
+            completed_dt = parse_utc(completed_at_str)
+            if completed_dt is not None:
+                cooldown_min = float(project_row.get("cooldown_minutes") or policy.get("cooldown_minutes") or 30)
+                age_seconds = (datetime.now(timezone.utc) - completed_dt).total_seconds()
+                if age_seconds > cooldown_min * 60:
+                    self._emit_owner_gate_once(pid, attempt_record, "evidence_stale_beyond_cooldown")
+                    return
 
         # Check repository truth
         repo_path = str(project_config.get("repo_path") or snapshot.get("repo_path") or "")

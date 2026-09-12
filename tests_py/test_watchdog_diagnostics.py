@@ -206,7 +206,61 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
             evidence,
             DummyAssessment(lifecycle_state="REMEDIATING", no_progress_seconds=2000.0),
         )
-        self.assertEqual(diag.code, "process_dead")
+
+    def test_f1_alive_pid_in_non_worker_lifecycle_classifies_unknown(self):
+        """R3-F1 regression: alive PID in any non-worker lifecycle must classify as unknown,
+        not agent_stalled, to prevent spurious wd-continue recovery and second planner cycles."""
+        non_worker_lifecycles = (
+            "PLANNING", "REVIEWING", "REVIEWING_PLAN", "APPLYING_PLAN",
+            "READY_TO_RUN", "IDLE", "UNKNOWN",
+        )
+        for lifecycle in non_worker_lifecycles:
+            evidence = {
+                "process_liveness": {"process_alive": True, "pid": 1234},
+                "repository_truth": {"valid": True, "dirty": False},
+                "agent_files": {},
+            }
+            diag = classify_evidence(
+                evidence,
+                DummyAssessment(lifecycle_state=lifecycle, no_progress_seconds=2000.0),
+            )
+            self.assertEqual(
+                diag.code,
+                "unknown",
+                msg=f"agent_stalled must not fire in {lifecycle!r} with alive PID; got {diag.code!r}",
+            )
+            self.assertTrue(
+                diag.owner_gate_required,
+                msg=f"owner_gate_required must be True for unknown in lifecycle {lifecycle!r}",
+            )
+
+    def test_f1_alive_pid_in_executing_still_classifies_agent_stalled(self):
+        """R3-F1 regression: alive PID in EXECUTING must still classify as agent_stalled."""
+        evidence = {
+            "process_liveness": {"process_alive": True, "pid": 9999},
+            "repository_truth": {"valid": True, "dirty": False},
+            "agent_files": {},
+        }
+        diag = classify_evidence(
+            evidence,
+            DummyAssessment(lifecycle_state="EXECUTING", no_progress_seconds=2000.0),
+        )
+        self.assertEqual(diag.code, "agent_stalled")
+        self.assertFalse(diag.owner_gate_required)
+
+    def test_f1_alive_pid_in_remediating_still_classifies_agent_stalled(self):
+        """R3-F1 regression: alive PID in REMEDIATING must still classify as agent_stalled."""
+        evidence = {
+            "process_liveness": {"process_alive": True, "pid": 7777},
+            "repository_truth": {"valid": True, "dirty": False},
+            "agent_files": {},
+        }
+        diag = classify_evidence(
+            evidence,
+            DummyAssessment(lifecycle_state="REMEDIATING", no_progress_seconds=3000.0),
+        )
+        self.assertEqual(diag.code, "agent_stalled")
+        self.assertFalse(diag.owner_gate_required)
 
     def test_static_api_guards_against_destructive_calls(self):
         """Static analysis: watchdog.py and diagnostics.py must NOT import or call process-killing or git-write APIs."""

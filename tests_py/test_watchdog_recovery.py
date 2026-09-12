@@ -72,6 +72,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
+            # R3-F1/F2: evidence must match current snapshot for recovery to proceed
+            "evidence": {
+                "process_liveness": {"process_alive": True, "pid": 1234, "worker_state": "running"},
+            },
         }
         prow = {"attempts": {"att-auto": att}}
         coordinator._cached_state["projects"]["p1"] = prow
@@ -82,7 +86,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "repo_path": str(self.repo_dir),
                 "watchdog": {"enabled": True, "auto_recovery": True},
             },
-            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir)},
+            # R3-F1: snapshot must show EXECUTING lifecycle for agent_stalled recovery
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 1234, "state": "running"}},
             project_row=prow,
             attempt_key="att-auto",
             attempt_record=att,
@@ -124,6 +131,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "task_id": "T1",
             "state": "completed",
             "diagnosis": "agent_stalled",
+            # R3-F1/F2: include evidence and matching snapshot fields
+            "evidence": {
+                "process_liveness": {"process_alive": True, "pid": 9876, "worker_state": "running"},
+            },
         }
         coordinator._check_and_trigger_recovery(
             project_config={
@@ -131,7 +142,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "repo_path": str(self.repo_dir),
                 "watchdog": {"enabled": True, "auto_recovery": True},
             },
-            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir)},
+            # R3-F1: EXECUTING lifecycle so agent_stalled check passes before slot check
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 9876, "state": "running"}},
             project_row=prow,
             attempt_key="att-second",
             attempt_record=att2,
@@ -384,6 +398,369 @@ class WatchdogRecoveryTests(unittest.TestCase):
         self.assertFalse(snap["worker"]["process_alive"])
         # process_alive=False in snapshot must NOT cause recovery without evidence
         # - watchdog reads evidence.process_liveness, not snapshot.worker.process_alive
+
+    # -----------------------------------------------------------------------
+    # R3-F1 regressions
+    # -----------------------------------------------------------------------
+
+    def test_f1_agent_stalled_recovery_requires_worker_lifecycle_state(self):
+        """R3-F1: agent_stalled recovery must be blocked when current snapshot lifecycle
+        is not a worker-expected state (EXECUTING / REMEDIATING).  A stale alive PID
+        from a previous execution in PLANNING must not enqueue a wd- continue command."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        att = {
+            "attempt_key": "att-f1-planning",
+            "run_scope_key": "rscope-f1",
+            "task_id": "T1",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": "eh-f1",
+            "evidence": {
+                "process_liveness": {"process_alive": True, "pid": 1234, "worker_state": "running"},
+            },
+            "completed_at": "2099-01-01T00:00:00+00:00",  # far future → evidence not stale
+        }
+        prow = {"attempts": {"att-f1-planning": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Current snapshot: lifecycle is PLANNING (not EXECUTING/REMEDIATING)
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "state": "PLANNING", "lifecycle_state": "PLANNING",
+                      "worker": {"pid": 1234, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-f1-planning",
+            attempt_record=att,
+        )
+        # Must NOT enqueue wd- because lifecycle is PLANNING
+        self.assertIsNone(att.get("recovery"))
+        inbox_files = list((self.runtime_dir / "control" / "inbox").glob("wd-*.json"))
+        self.assertEqual(len(inbox_files), 0)
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("non_worker_lifecycle", gate_events[0][2]["details"]["reason"])
+
+    def test_f1_agent_stalled_worker_state_not_active_blocks_recovery(self):
+        """R3-F1: agent_stalled recovery blocked when evidence worker_state is not active."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        att = {
+            "attempt_key": "att-f1-completed-worker",
+            "run_scope_key": "rscope-f1b",
+            "task_id": "T2",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": "eh-f1b",
+            "evidence": {
+                "process_liveness": {
+                    "process_alive": True, "pid": 5678,
+                    "worker_state": "completed",  # not an active execution state
+                },
+            },
+            "completed_at": "2099-01-01T00:00:00+00:00",
+        }
+        prow = {"attempts": {"att-f1-completed-worker": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 5678, "state": "completed"}},
+            project_row=prow,
+            attempt_key="att-f1-completed-worker",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("worker_not_active", gate_events[0][2]["details"]["reason"])
+
+    def test_f1_planning_pending_design_stale_pid_cannot_enqueue_wd(self):
+        """R3-F1 end-to-end: PLANNING + PENDING DESIGN + alive stale PID cannot result in
+        wd-continue being enqueued or a second planner cycle being started.
+
+        Scenario:
+          1. Project previously EXECUTING with PID=1234.
+          2. Watchdog diagnosed agent_stalled for that execution (evidence: PID=1234 alive).
+          3. Worker completed normally, review finished, project now PLANNING + PENDING DESIGN.
+          4. Stale PID=1234 still alive (OS reuse or long-lived monitor process).
+          5. Dedup path fires (same fingerprint) with auto_recovery=True.
+          6. Expected: owner_gate emitted, no wd- command enqueued, no planner started.
+        """
+        from dev_orchestrator.core.control_commands import ControlCommandCoordinator
+
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        att = {
+            "attempt_key": "att-f1-e2e",
+            "run_scope_key": "rscope-e2e",
+            "task_id": "T99",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": "eh-e2e",
+            "evidence": {
+                "process_liveness": {"process_alive": True, "pid": 1234, "worker_state": "running"},
+            },
+            "completed_at": "2099-01-01T00:00:00+00:00",
+        }
+        prow = {"attempts": {"att-f1-e2e": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+
+        planning_snapshot = {
+            "project_id": "p1",
+            "repo_path": str(self.repo_dir),
+            "state": "PLANNING",
+            "lifecycle_state": "PLANNING",
+            "next_status": "PENDING DESIGN: implement feature X",
+            "worker": {"pid": 1234},  # stale PID still in snapshot
+        }
+
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot=planning_snapshot,
+            project_row=prow,
+            attempt_key="att-f1-e2e",
+            attempt_record=att,
+        )
+
+        # 1. No recovery was reserved
+        self.assertIsNone(att.get("recovery"))
+        # 2. No wd- command was enqueued
+        inbox_files = list((self.runtime_dir / "control" / "inbox").glob("wd-*.json"))
+        self.assertEqual(len(inbox_files), 0, "wd- command must not be enqueued for PLANNING lifecycle")
+        # 3. OWNER_GATE was emitted
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertGreater(len(gate_events), 0, "OWNER_GATE must be emitted for PLANNING+stale PID scenario")
+        # 4. ControlCommandCoordinator has nothing to process
+        ctrl = ControlCommandCoordinator(self.runtime_dir)
+        inbox_dir = self.runtime_dir / "control" / "inbox"
+        if inbox_dir.exists():
+            self.assertEqual(list(inbox_dir.glob("*.json")), [])
+
+    # -----------------------------------------------------------------------
+    # R3-F2 regressions
+    # -----------------------------------------------------------------------
+
+    def test_f2_agent_stalled_recovery_blocked_when_pid_differs(self):
+        """R3-F2: agent_stalled recovery blocked when current snapshot PID differs from evidence PID.
+        A new execution started after diagnosis with a different PID must not be recovered
+        using stale evidence from the old execution."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        att = {
+            "attempt_key": "att-f2-pid-diff",
+            "run_scope_key": "rscope-f2a",
+            "task_id": "T3",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": "eh-f2a",
+            "evidence": {
+                "process_liveness": {"process_alive": True, "pid": 1111, "worker_state": "running"},
+            },
+            "completed_at": "2099-01-01T00:00:00+00:00",
+        }
+        prow = {"attempts": {"att-f2-pid-diff": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # New execution with different PID
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 9999, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-f2-pid-diff",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("pid_mismatch", gate_events[0][2]["details"]["reason"])
+
+    def test_f2_process_dead_recovery_blocked_when_pid_differs(self):
+        """R3-F2: process_dead recovery blocked when current snapshot PID differs from evidence PID."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        att = {
+            "attempt_key": "att-f2-dead-pid-diff",
+            "run_scope_key": "rscope-f2b",
+            "task_id": "T4",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "evidence_hash": "eh-f2b",
+            "evidence": {
+                "process_liveness": {"process_alive": False, "pid": 2222},
+            },
+            "completed_at": "2099-01-01T00:00:00+00:00",
+        }
+        prow = {"attempts": {"att-f2-dead-pid-diff": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # New execution started with different PID
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 8888, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-f2-dead-pid-diff",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("pid_mismatch", gate_events[0][2]["details"]["reason"])
+
+    def test_f2_evidence_stale_beyond_cooldown_blocks_recovery(self):
+        """R3-F2: recovery blocked when evidence is older than cooldown window.
+        Prevents auto_recovery toggled on long after diagnosis from consuming stale evidence."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        # completed_at is in the past beyond any cooldown (simulated by old timestamp)
+        att = {
+            "attempt_key": "att-f2-stale",
+            "run_scope_key": "rscope-f2c",
+            "task_id": "T5",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": "eh-f2c",
+            "evidence": {
+                "process_liveness": {"process_alive": True, "pid": 3333, "worker_state": "running"},
+            },
+            "completed_at": "2020-01-01T00:00:00+00:00",  # very old evidence
+        }
+        prow = {
+            "attempts": {"att-f2-stale": att},
+            "cooldown_minutes": 30,
+        }
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 3333, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-f2-stale",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("stale", gate_events[0][2]["details"]["reason"])
+
+    def test_f2_auto_recovery_toggled_on_within_cooldown_allows_recovery(self):
+        """R3-F2: if auto_recovery is toggled on within the cooldown window (fresh evidence),
+        recovery DOES proceed (PID matches, lifecycle matches, evidence fresh)."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        import datetime as dt
+        # completed 5 minutes ago, within 30-minute cooldown
+        recent_completed = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)
+        ).isoformat()
+
+        att = {
+            "attempt_key": "att-f2-fresh",
+            "run_scope_key": "rscope-f2d",
+            "task_id": "T6",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": "eh-f2d",
+            "evidence": {
+                "process_liveness": {"process_alive": True, "pid": 4444, "worker_state": "running"},
+            },
+            "completed_at": recent_completed,
+        }
+        prow = {
+            "attempts": {"att-f2-fresh": att},
+            "cooldown_minutes": 30,
+        }
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 4444, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-f2-fresh",
+            attempt_record=att,
+        )
+        # Should succeed (evidence is fresh, PID matches, lifecycle correct)
+        rec = att.get("recovery")
+        self.assertIsNotNone(rec, "Recovery should proceed with fresh evidence and matching PID")
+        self.assertEqual(rec["action"], "continue")
+        self.assertIn(rec["state"], ("requested", "reserved"))
+
+    def test_f6_prune_retains_consumed_recovery_slot_beyond_attempt_window(self):
+        """R3-F6: pruning must not discard recovery_slots for run scopes whose attempt fell
+        off the MAX_TERMINAL_ATTEMPTS_PER_PROJECT window.  The slot guards against duplicate
+        recovery within the same run scope."""
+        from dev_orchestrator.core.watchdog import MAX_TERMINAL_ATTEMPTS_PER_PROJECT
+
+        coordinator = WatchdogCoordinator(self.runtime_dir)
+        prow = {
+            "attempts": {},
+            "attempt_counts": {},
+            "recovery_slots": {"rscope-old": "wd-old-attempt"},  # consumed slot, attempt already pruned
+        }
+        coordinator._cached_state["projects"]["p1"] = prow
+
+        # Fill up the terminal window with MAX+1 fake terminal attempts for a different scope
+        for i in range(MAX_TERMINAL_ATTEMPTS_PER_PROJECT + 1):
+            prow["attempts"][f"att-{i}"] = {
+                "attempt_key": f"att-{i}",
+                "run_scope_key": "rscope-new",
+                "state": "completed",
+                "completed_at": f"2026-01-0{max(1, i % 9)}T00:00:00+00:00",
+            }
+
+        coordinator._save_state(coordinator._cached_state)
+
+        # After pruning (triggered by _save_state), the slot for rscope-old must survive
+        state = coordinator.state()
+        slots = state["projects"]["p1"].get("recovery_slots", {})
+        self.assertIn(
+            "rscope-old",
+            slots,
+            "Consumed recovery slot must be retained even when corresponding attempt is pruned",
+        )
+        self.assertEqual(slots["rscope-old"], "wd-old-attempt")
 
 
 if __name__ == "__main__":
