@@ -1,6 +1,6 @@
 # P8 D1 Final Review UTF-8 Remediation
 
-Status: **COMPLETED** (Ready for final independent review / promotion)
+Status: **COMPLETED ? FINAL REVIEW ACCEPTED** (Ready for owner-gated promotion)
 Timebox: **Completed within timebox**
 
 Goal: remove the Windows GBK reviewer lifecycle blocker and obtain a clean final independent review for D1.
@@ -23,3 +23,5 @@ Acceptance:
 - all D1 regressions remain green;
 - worktree clean after local commit;
 - independent reviewer returns a valid terminal decision instead of a codec lifecycle error.
+
+Final independent Opus review: **ACCEPT** on code commit `6b296d8`; 213 tests, Node syntax check, and `git diff --check` passed on the reviewed worktree.
