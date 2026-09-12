@@ -193,6 +193,114 @@ class WatchdogStateFailclosedTests(unittest.TestCase):
         self.assertIn("rscope-running", saved["attempt_counts"])
         self.assertNotIn("rscope-00", saved["attempt_counts"])
 
+    # -----------------------------------------------------------------------
+    # P10-FR-3 regressions: clear_degraded quarantine identity verification
+    # -----------------------------------------------------------------------
+
+    def test_fr3_clear_degraded_blocked_no_quarantine_file(self):
+        """FR-3: clear_degraded must fail when no quarantine file matching corrupt_identity exists."""
+        self.state_file.write_bytes(b"NOT VALID JSON {[[")
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        self.assertTrue(coordinator.state()["degraded"])
+
+        # Remove the quarantine file that was just created
+        for f in self.runtime_dir.glob("watchdog.json.corrupt-*"):
+            f.unlink()
+
+        channel.events.clear()
+        coordinator.clear_degraded()
+
+        # Still degraded — no quarantine file
+        self.assertTrue(coordinator.state()["degraded"])
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "no_matching_quarantine_artifact")
+
+    def test_fr3_clear_degraded_blocked_wrong_hash_quarantine_file(self):
+        """FR-3: clear_degraded must fail when only an unrelated quarantine file exists."""
+        self.state_file.write_bytes(b"NOT VALID JSON {[[")
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        self.assertTrue(coordinator.state()["degraded"])
+
+        # Replace the correct quarantine file with one whose name contains a wrong hash
+        for f in self.runtime_dir.glob("watchdog.json.corrupt-*"):
+            f.unlink()
+        (self.runtime_dir / "watchdog.json.corrupt-2026-01-01-wronghash0000").write_bytes(b"irrelevant")
+
+        channel.events.clear()
+        coordinator.clear_degraded()
+
+        self.assertTrue(coordinator.state()["degraded"])
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "no_matching_quarantine_artifact")
+
+    def test_fr3_clear_degraded_blocked_empty_quarantine_file(self):
+        """FR-3: clear_degraded must fail when the matching quarantine file is empty (0 bytes)."""
+        self.state_file.write_bytes(b"NOT VALID JSON {[[")
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        self.assertTrue(coordinator.state()["degraded"])
+
+        corrupt_identity = coordinator._cached_state.get("corrupt_identity")
+        self.assertIsNotNone(corrupt_identity, "corrupt_identity must be set in degraded state")
+
+        # Overwrite the quarantine file with 0 bytes
+        for f in self.runtime_dir.glob("watchdog.json.corrupt-*"):
+            f.write_bytes(b"")
+
+        channel.events.clear()
+        coordinator.clear_degraded()
+
+        self.assertTrue(coordinator.state()["degraded"])
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "quarantine_artifact_unreadable")
+
+    def test_fr3_clear_degraded_blocked_unreadable_quarantine_file(self):
+        """FR-3: clear_degraded must fail when the matching quarantine file raises IOError."""
+        from unittest.mock import patch
+
+        self.state_file.write_bytes(b"NOT VALID JSON {[[")
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        self.assertTrue(coordinator.state()["degraded"])
+
+        corrupt_identity = coordinator._cached_state.get("corrupt_identity")
+        self.assertIsNotNone(corrupt_identity)
+
+        # Patch _is_quarantine_file_readable to simulate an IOError
+        import dev_orchestrator.core.watchdog as wd_module
+        original_fn = wd_module._is_quarantine_file_readable
+
+        def always_unreadable(path):
+            return False
+
+        channel.events.clear()
+        with patch.object(wd_module, "_is_quarantine_file_readable", always_unreadable):
+            coordinator.clear_degraded()
+
+        self.assertTrue(coordinator.state()["degraded"])
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "quarantine_artifact_unreadable")
+
+    def test_fr3_corrupt_identity_stored_in_degraded_state(self):
+        """FR-3: corrupt_identity is stored in _cached_state when degraded, and matches
+        the hash in the quarantine filename."""
+        self.state_file.write_bytes(b"NOT VALID JSON {[[")
+        coordinator = WatchdogCoordinator(self.runtime_dir)
+
+        corrupt_identity = coordinator._cached_state.get("corrupt_identity")
+        self.assertIsNotNone(corrupt_identity, "corrupt_identity must be set when degraded")
+        self.assertEqual(len(corrupt_identity), 16, "corrupt_identity must be a 16-char hash")
+
+        corrupt_files = list(self.runtime_dir.glob("watchdog.json.corrupt-*"))
+        self.assertEqual(len(corrupt_files), 1)
+        self.assertIn(corrupt_identity, corrupt_files[0].name)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,37 +1,42 @@
-# P10 Remediation Round 3 (R3-F1..F6)
+# P10 Remediation Round 4 (FR-1, FR-2, FR-3)
 
 Status: **COMPLETED (PENDING REVIEW)**
 
-Goal: Fix all primary (R3-F1, R3-F2) and low-risk (R3-F3..F6) blockers from Opus review 3 of the P10 progress watchdog implementation.
+Goal: Fix all three Sol promotion review blockers for P10 on HEAD 6dcd2e1.
 
 ## Fixes delivered
 
-### R3-F1 — agent_stalled lifecycle and worker guard
-- `diagnostics.py` `classify_evidence`: alive PID in non-worker lifecycle (not EXECUTING/REMEDIATING) now returns `unknown` + `owner_gate_required=True` instead of `agent_stalled`. This prevents stale/reused PIDs from the prior execution from being misclassified.
-- `watchdog.py` `_check_and_trigger_recovery`: before RESERVE, verifies (a) current snapshot `lifecycle_state` ∈ `WORKER_EXPECTED_LIFECYCLE_STATES`, (b) evidence `worker_state` ∈ `ACTIVE_WORKER_STATES`. Non-worker lifecycle → `agent_stalled_non_worker_lifecycle` owner_gate; inactive worker state → `agent_stalled_worker_not_active` owner_gate.
-- End-to-end test: PLANNING + PENDING DESIGN + stale alive PID never enqueues `wd-continue`.
+### FR-1 HIGH — async diagnostic completion deferred to next advance tick
+- **Root cause**: `_run_diagnostic_worker` called `_check_and_trigger_recovery` directly with the `snapshot` captured at diagnostic start.  If the project transitioned EXECUTING → PLANNING/REVIEWING during the diagnostic window (up to 120 s), recovery would act on a stale lifecycle, run_scope_key, and worker identity.
+- **Fix**: Removed the direct call from `_run_diagnostic_worker`.  The diagnostic worker now only writes the completed attempt and saves state.  The next `advance()` tick finds the completed attempt via the dedup path (`att_key in attempts`) and calls `_check_and_trigger_recovery` with the current snapshot, which may be PLANNING, REVIEWING, or any other fresh lifecycle.
+- **Regression**: `test_fr1_stale_snapshot_not_used_at_diagnostic_completion` — diagnostic starts in EXECUTING, subsequent call to `_check_and_trigger_recovery` with PLANNING and REVIEWING snapshots fires `OWNER_GATE` and enqueues no `wd-` command.
 
-### R3-F2 — stale evidence bounding before RESERVE
-- `watchdog.py` `_check_and_trigger_recovery`: re-probes current active-run PID against evidence PID. Mismatch → `agent_stalled_pid_mismatch` / `process_dead_pid_mismatch` owner_gate. Evidence older than `cooldown_minutes` → `evidence_stale_beyond_cooldown` owner_gate. Auto_recovery toggled on within cooldown proceeds normally (evidence is fresh).
+### FR-2 HIGH — attempt schema validation and evidence_hash recomputation before RESERVE
+- **Root cause**: `_check_and_trigger_recovery` relied on stored `evidence` and `evidence_hash` without revalidation, could not detect corrupted/tampered persisted attempts, and allowed None PIDs to skip identity checks.
+- **Fix**: Added fail-closed validation immediately after the diag-code guard:
+  1. `evidence` must be a non-null dict (gate: `malformed_attempt_no_evidence`).
+  2. `evidence_hash` must be non-null (gate: `malformed_attempt_no_evidence_hash`).
+  3. `evidence_hash(evidence)` recomputed — must exactly match stored value.  Mismatch marks attempt `state="quarantined"` (gate: `evidence_hash_mismatch`).
+  4. `proc_liveness.pid` must be non-null (gate: `malformed_attempt_missing_pid`).
+  5. `proc_liveness.process_alive` key must be present (gate: `malformed_attempt_missing_process_alive`).
+  6. `agent_stalled` requires `process_alive=True` (gate: `evidence_inconsistent_agent_stalled_dead`).
+- All eleven existing test fixtures updated to carry correct 16-char SHA-256 `evidence_hash` values.
+- **New tests**: `test_fr2_altered_evidence_hash_quarantines_attempt`, `test_fr2_missing_evidence_hash_blocks_recovery`, `test_fr2_missing_pid_blocks_recovery`, `test_fr2_missing_process_alive_blocks_recovery`, `test_fr2_malformed_completed_attempt_no_evidence_dict`, `test_fr2_agent_stalled_with_dead_pid_inconsistent_with_diagnosis`.
 
-### R3-F3 — watchdog_payload schema validation
-- `web/server.py` `watchdog_payload`: validates schema version before using the file's `degraded` flag. Future-version or invalid version files return `degraded=True` even when the coordinator could not write its in-memory state back due to `_preserve_existing_state_file`.
-
-### R3-F4 — quarantine identity for unreadable files
-- `watchdog.py` `_quarantine_corrupt_state`: uses reason-based SHA-256 hash (not constant empty-bytes hash `e3b0c44298fc1c14`) when `raw_bytes` is empty, so distinct unreadable error types get distinct quarantine identities.
-
-### R3-F5 — clear-degraded CLI fail-closed
-- `cli.py` `cmd_watchdog_clear_degraded`: refuses to run if daemon PID is alive; also requires at least one `watchdog.json.corrupt-*` quarantine file to exist before overwriting state.
-
-### R3-F6 — prune retains consumed recovery budgets
-- `watchdog.py` `_prune_state`: adds consumed (non-null) `recovery_slots` keys to `keep_run_scopes` before pruning, so long-lived projects that exceed `MAX_TERMINAL_ATTEMPTS_PER_PROJECT` cannot silently lose their per-run-scope single-recovery budget.
+### FR-3 MEDIUM — clear_degraded verifies matching quarantine artifact
+- **Root cause**: `clear_degraded()` reset the degraded flag unconditionally without verifying that the quarantine artifact corresponding to the active corruption event exists and is readable.
+- **Fix**:
+  - `_quarantine_corrupt_state` now stores `corrupt_identity` (the 16-char file hash used in the quarantine filename) in the returned state dict.
+  - `clear_degraded()` locates all `watchdog.json.corrupt-*{corrupt_identity}*` files and requires at least one to be readable (non-empty bytes, no IOError).  On failure, emits `OWNER_GATE` with gate reason `no_matching_quarantine_artifact` or `quarantine_artifact_unreadable` and returns without clearing.
+  - Added module-level helper `_is_quarantine_file_readable(path)`.
+- **New tests**: `test_fr3_clear_degraded_blocked_no_quarantine_file`, `test_fr3_clear_degraded_blocked_wrong_hash_quarantine_file`, `test_fr3_clear_degraded_blocked_empty_quarantine_file`, `test_fr3_clear_degraded_blocked_unreadable_quarantine_file`, `test_fr3_corrupt_identity_stored_in_degraded_state`.
 
 ## Test results
-- 310 unit tests passing (11 new regressions added).
+- **322 unit tests passing** (12 new regressions added, prior: 310).
 - `node --check browser/chatgpt-web-adapter.user.js` clean.
 - `git diff --check` clean.
 
 ## Scope constraints
 - No changes to stable controller `C:\work\github\DevOrchestrator`.
 - No push, no destructive git, no credential or hardware actions.
-- Architecture unchanged; all changes are surgical within existing abstractions.
+- All changes are surgical within existing abstractions.

@@ -73,6 +73,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
             # R3-F1/F2: evidence must match current snapshot for recovery to proceed
+            "evidence_hash": "bc9a67e4be8cf301",
             "evidence": {
                 "process_liveness": {"process_alive": True, "pid": 1234, "worker_state": "running"},
             },
@@ -131,7 +132,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "task_id": "T1",
             "state": "completed",
             "diagnosis": "agent_stalled",
-            # R3-F1/F2: include evidence and matching snapshot fields
+            "evidence_hash": "cacf7f4ba8bc2796",
             "evidence": {
                 "process_liveness": {"process_alive": True, "pid": 9876, "worker_state": "running"},
             },
@@ -310,7 +311,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "process_dead",
             "owner_gate_required": False,
-            "evidence_hash": "testhash1",
+            "evidence_hash": "8b115b0d4538629a",
             # Actual PID probe says alive=True (contradicts stale snapshot)
             "evidence": {
                 "process_liveness": {"process_alive": True, "pid": 1234},
@@ -346,7 +347,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "process_dead",
             "owner_gate_required": False,
-            "evidence_hash": "testhash2",
+            "evidence_hash": "46002a75ab06c6c7",
             # Evidence confirms process is truly dead
             "evidence": {
                 "process_liveness": {"process_alive": False, "pid": 5678},
@@ -417,7 +418,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
-            "evidence_hash": "eh-f1",
+            "evidence_hash": "bc9a67e4be8cf301",
             "evidence": {
                 "process_liveness": {"process_alive": True, "pid": 1234, "worker_state": "running"},
             },
@@ -458,7 +459,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
-            "evidence_hash": "eh-f1b",
+            "evidence_hash": "f4bf04ef9f2c66f7",
             "evidence": {
                 "process_liveness": {
                     "process_alive": True, "pid": 5678,
@@ -510,7 +511,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
-            "evidence_hash": "eh-e2e",
+            "evidence_hash": "bc9a67e4be8cf301",
             "evidence": {
                 "process_liveness": {"process_alive": True, "pid": 1234, "worker_state": "running"},
             },
@@ -572,7 +573,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
-            "evidence_hash": "eh-f2a",
+            "evidence_hash": "9d5dbaeb4fcb643e",
             "evidence": {
                 "process_liveness": {"process_alive": True, "pid": 1111, "worker_state": "running"},
             },
@@ -610,7 +611,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "process_dead",
             "owner_gate_required": False,
-            "evidence_hash": "eh-f2b",
+            "evidence_hash": "9ad1184a878e181d",
             "evidence": {
                 "process_liveness": {"process_alive": False, "pid": 2222},
             },
@@ -650,7 +651,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
-            "evidence_hash": "eh-f2c",
+            "evidence_hash": "341c0da696fd584b",
             "evidence": {
                 "process_liveness": {"process_alive": True, "pid": 3333, "worker_state": "running"},
             },
@@ -697,7 +698,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
-            "evidence_hash": "eh-f2d",
+            "evidence_hash": "d1237131c6857856",
             "evidence": {
                 "process_liveness": {"process_alive": True, "pid": 4444, "worker_state": "running"},
             },
@@ -761,6 +762,275 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "Consumed recovery slot must be retained even when corresponding attempt is pruned",
         )
         self.assertEqual(slots["rscope-old"], "wd-old-attempt")
+
+    # -----------------------------------------------------------------------
+    # P10-FR-1 regressions
+    # -----------------------------------------------------------------------
+
+    def test_fr1_stale_snapshot_not_used_at_diagnostic_completion(self):
+        """P10-FR-1: Diagnostic starts in EXECUTING, lifecycle transitions to PLANNING and
+        REVIEWING before completion.  Recovery actuation is deferred to the next advance tick
+        which supplies a fresh snapshot.  No wd-continue must be reserved or enqueued when
+        the fresh snapshot shows a non-worker lifecycle."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 2020, "worker_state": "running"}}
+        eh = compute_ev_hash(evidence)
+
+        for lifecycle in ("PLANNING", "REVIEWING"):
+            with self.subTest(lifecycle=lifecycle):
+                channel = DummyProgressChannel()
+                coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+                att = {
+                    "attempt_key": "att-fr1-deferred",
+                    "run_scope_key": "rscope-fr1",
+                    "task_id": "T-fr1",
+                    "state": "completed",
+                    "diagnosis": "agent_stalled",
+                    "owner_gate_required": False,
+                    "evidence_hash": eh,
+                    "evidence": evidence,
+                    "completed_at": "2099-01-01T00:00:00+00:00",
+                }
+                prow = {"attempts": {"att-fr1-deferred": att}}
+                coordinator._cached_state["projects"]["p1"] = prow
+
+                # Simulate the next advance() tick supplying a fresh snapshot with changed lifecycle
+                coordinator._check_and_trigger_recovery(
+                    project_config={
+                        "project_id": "p1",
+                        "repo_path": str(self.repo_dir),
+                        "watchdog": {"enabled": True, "auto_recovery": True},
+                    },
+                    snapshot={
+                        "project_id": "p1",
+                        "repo_path": str(self.repo_dir),
+                        "lifecycle_state": lifecycle,
+                        "worker": {"pid": 2020, "state": "running"},
+                    },
+                    project_row=prow,
+                    attempt_key="att-fr1-deferred",
+                    attempt_record=att,
+                )
+
+                self.assertIsNone(att.get("recovery"), f"No recovery expected when lifecycle={lifecycle}")
+                inbox_files = list((self.runtime_dir / "control" / "inbox").glob("wd-*.json"))
+                self.assertEqual(len(inbox_files), 0, f"No wd- command expected when lifecycle={lifecycle}")
+                gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+                self.assertGreater(len(gate_events), 0, f"OWNER_GATE must fire when lifecycle={lifecycle}")
+                self.assertIn("non_worker_lifecycle", gate_events[0][2]["details"]["reason"])
+
+    # -----------------------------------------------------------------------
+    # P10-FR-2 regressions
+    # -----------------------------------------------------------------------
+
+    def test_fr2_altered_evidence_hash_quarantines_attempt(self):
+        """P10-FR-2: If stored evidence_hash does not match recomputed hash, the attempt is
+        quarantined and recovery is blocked."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        att = {
+            "attempt_key": "att-fr2-altered",
+            "run_scope_key": "rscope-fr2a",
+            "task_id": "T-fr2",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": "deadbeefdeadbeef",  # deliberately wrong hash
+            "evidence": {
+                "process_liveness": {"process_alive": True, "pid": 5000, "worker_state": "running"},
+            },
+            "completed_at": "2099-01-01T00:00:00+00:00",
+        }
+        prow = {"attempts": {"att-fr2-altered": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING", "worker": {"pid": 5000}},
+            project_row=prow,
+            attempt_key="att-fr2-altered",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        self.assertEqual(att.get("state"), "quarantined")
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "evidence_hash_mismatch")
+
+    def test_fr2_missing_evidence_hash_blocks_recovery(self):
+        """P10-FR-2: Attempt without evidence_hash is blocked with owner gate."""
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+
+        att = {
+            "attempt_key": "att-fr2-nohash",
+            "run_scope_key": "rscope-fr2b",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            # no evidence_hash field
+            "evidence": {
+                "process_liveness": {"process_alive": True, "pid": 5001, "worker_state": "running"},
+            },
+            "completed_at": "2099-01-01T00:00:00+00:00",
+        }
+        prow = {"attempts": {"att-fr2-nohash": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING"},
+            project_row=prow,
+            attempt_key="att-fr2-nohash",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("evidence_hash", gate_events[0][2]["details"]["reason"])
+
+    def test_fr2_missing_pid_blocks_recovery(self):
+        """P10-FR-2: Evidence without pid in process_liveness is blocked with owner gate."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True}}  # no pid
+        att = {
+            "attempt_key": "att-fr2-nopid",
+            "run_scope_key": "rscope-fr2c",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+            "completed_at": "2099-01-01T00:00:00+00:00",
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2-nopid": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING"},
+            project_row=prow,
+            attempt_key="att-fr2-nopid",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("missing_pid", gate_events[0][2]["details"]["reason"])
+
+    def test_fr2_missing_process_alive_blocks_recovery(self):
+        """P10-FR-2: Evidence without process_alive key in process_liveness is blocked."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"pid": 5002}}  # no process_alive
+        att = {
+            "attempt_key": "att-fr2-noalive",
+            "run_scope_key": "rscope-fr2d",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+            "completed_at": "2099-01-01T00:00:00+00:00",
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2-noalive": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING"},
+            project_row=prow,
+            attempt_key="att-fr2-noalive",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("missing_process_alive", gate_events[0][2]["details"]["reason"])
+
+    def test_fr2_malformed_completed_attempt_no_evidence_dict(self):
+        """P10-FR-2: Attempt with non-dict evidence is blocked with owner gate (fail closed)."""
+        att = {
+            "attempt_key": "att-fr2-noev",
+            "run_scope_key": "rscope-fr2e",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": "somevalue",
+            "evidence": "corrupted-string-not-a-dict",
+            "completed_at": "2099-01-01T00:00:00+00:00",
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2-noev": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING"},
+            project_row=prow,
+            attempt_key="att-fr2-noev",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("no_evidence", gate_events[0][2]["details"]["reason"])
+
+    def test_fr2_agent_stalled_with_dead_pid_inconsistent_with_diagnosis(self):
+        """P10-FR-2: agent_stalled diagnosis with process_alive=False is blocked (liveness
+        inconsistent with diagnosis — agent_stalled requires a live process)."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": False, "pid": 5003}}
+        att = {
+            "attempt_key": "att-fr2-dead-stalled",
+            "run_scope_key": "rscope-fr2f",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+            "completed_at": "2099-01-01T00:00:00+00:00",
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        prow = {"attempts": {"att-fr2-dead-stalled": att}}
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 5003}},
+            project_row=prow,
+            attempt_key="att-fr2-dead-stalled",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertIn("inconsistent", gate_events[0][2]["details"]["reason"])
 
 
 if __name__ == "__main__":

@@ -596,6 +596,14 @@ def evaluate_stall(
     )
 
 
+def _is_quarantine_file_readable(path: Path) -> bool:
+    """Return True if path is a non-empty, readable regular file."""
+    try:
+        return path.is_file() and path.stat().st_size > 0 and len(path.read_bytes()) > 0
+    except (OSError, IOError):
+        return False
+
+
 class WatchdogCoordinator:
     """Daemon-owned progress watchdog and automatic diagnostics coordinator."""
 
@@ -733,6 +741,9 @@ class WatchdogCoordinator:
             "version": WATCHDOG_SCHEMA_VERSION,
             "degraded": True,
             "degraded_reason": reason,
+            # FR-3: Persist the quarantine artifact identity so clear_degraded can verify
+            # the matching artifact exists and is readable before clearing degraded mode.
+            "corrupt_identity": file_hash,
             "last_tick_error": None,
             "quarantined_projects": {},
             "projects": {},
@@ -833,12 +844,51 @@ class WatchdogCoordinator:
             return copy.deepcopy(p) if isinstance(p, dict) else None
 
     def clear_degraded(self) -> None:
-        """Explicitly clear degraded mode and persist a fresh valid state."""
+        """Clear degraded mode only after verifying the matching quarantine artifact is readable.
+
+        FR-3: The quarantine artifact corresponding to the active corruption identity
+        must exist and be readable before degraded mode may be cleared.  Clearing without
+        a verified artifact would silently discard the evidence of the corruption event.
+        """
         with self._lock:
-            if self._cached_state.get("degraded"):
-                self._cached_state["degraded"] = False
-                self._cached_state["degraded_reason"] = None
-                self._save_state(self._cached_state)
+            if not self._cached_state.get("degraded"):
+                return
+            corrupt_identity = self._cached_state.get("corrupt_identity")
+            if corrupt_identity:
+                matching_files = [
+                    f for f in self.runtime_root.glob("watchdog.json.corrupt-*")
+                    if corrupt_identity in f.name
+                ]
+                if not matching_files:
+                    self._emit_milestone(
+                        "__controller__",
+                        "OWNER_GATE",
+                        occurrence_key=f"clear-degraded:no-quarantine:{corrupt_identity}",
+                        details={
+                            "source": "watchdog",
+                            "gate": "clear-degraded-blocked",
+                            "reason": "no_matching_quarantine_artifact",
+                            "corrupt_identity": corrupt_identity,
+                        },
+                    )
+                    return
+                readable = any(_is_quarantine_file_readable(f) for f in matching_files)
+                if not readable:
+                    self._emit_milestone(
+                        "__controller__",
+                        "OWNER_GATE",
+                        occurrence_key=f"clear-degraded:unreadable:{corrupt_identity}",
+                        details={
+                            "source": "watchdog",
+                            "gate": "clear-degraded-blocked",
+                            "reason": "quarantine_artifact_unreadable",
+                            "corrupt_identity": corrupt_identity,
+                        },
+                    )
+                    return
+            self._cached_state["degraded"] = False
+            self._cached_state["degraded_reason"] = None
+            self._save_state(self._cached_state)
 
     def record_tick_error(self, exc: Exception) -> None:
         """Persist the latest watchdog tick error for status visibility."""
@@ -1288,8 +1338,12 @@ class WatchdogCoordinator:
                 },
             )
 
-            # Check and trigger safe automatic recovery if applicable
-            self._check_and_trigger_recovery(project_config, snapshot, prow, attempt_key, att)
+            # FR-1: Recovery actuation is deferred to the next watchdog advance tick,
+            # where it uses the latest projected snapshot via the dedup path.  Calling
+            # _check_and_trigger_recovery here — with the snapshot captured at diagnostic
+            # start — risks acting on a stale lifecycle, run_scope_key, or worker identity
+            # if the project transitioned (e.g. EXECUTING → PLANNING/REVIEWING) while the
+            # diagnostic was running.  The next advance() will call it with fresh state.
             self._save_state(self._cached_state)
 
     def _check_and_trigger_recovery(
@@ -1318,9 +1372,34 @@ class WatchdogCoordinator:
             self._emit_owner_gate_once(pid, attempt_record, f"diagnosis_{diag_code}_requires_owner")
             return
 
-        # Shared pre-RESERVE evidence references used by both diagnosis checks below.
-        evidence = attempt_record.get("evidence") if isinstance(attempt_record.get("evidence"), dict) else {}
+        # FR-2: Validate persisted attempt schema and evidence integrity before any recovery.
+        # All checks must pass before RESERVE to prevent acting on corrupted, tampered, or
+        # structurally invalid attempt records loaded from disk.
+        evidence = attempt_record.get("evidence") if isinstance(attempt_record.get("evidence"), dict) else None
+        stored_ev_hash = attempt_record.get("evidence_hash")
+        if not evidence:
+            self._emit_owner_gate_once(pid, attempt_record, "malformed_attempt_no_evidence")
+            return
+        if not stored_ev_hash:
+            self._emit_owner_gate_once(pid, attempt_record, "malformed_attempt_no_evidence_hash")
+            return
+        recomputed_ev_hash = evidence_hash(evidence)
+        if recomputed_ev_hash != stored_ev_hash:
+            # Quarantine the attempt to prevent repeated processing of a corrupted record.
+            attempt_record["state"] = "quarantined"
+            attempt_record["quarantine_reason"] = "evidence_hash_mismatch"
+            self._emit_owner_gate_once(pid, attempt_record, "evidence_hash_mismatch")
+            return
         proc_liveness = evidence.get("process_liveness") if isinstance(evidence.get("process_liveness"), dict) else {}
+        ev_pid = proc_liveness.get("pid")
+        if ev_pid is None:
+            self._emit_owner_gate_once(pid, attempt_record, "malformed_attempt_missing_pid")
+            return
+        if "process_alive" not in proc_liveness:
+            self._emit_owner_gate_once(pid, attempt_record, "malformed_attempt_missing_process_alive")
+            return
+        process_alive = proc_liveness.get("process_alive")
+
         current_worker = snapshot.get("worker") if isinstance(snapshot.get("worker"), dict) else {}
         current_lifecycle = str(
             snapshot.get("lifecycle_state") or snapshot.get("status") or snapshot.get("state") or ""
@@ -1335,6 +1414,10 @@ class WatchdogCoordinator:
             if current_lifecycle not in WORKER_EXPECTED_LIFECYCLE_STATES:
                 self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_non_worker_lifecycle")
                 return
+            # FR-2: diagnosis-consistent liveness — agent_stalled requires process_alive=True.
+            if process_alive is not True:
+                self._emit_owner_gate_once(pid, attempt_record, "evidence_inconsistent_agent_stalled_dead")
+                return
             # R3-F1: Verify that the PID in evidence was in an active execution state when
             # evidence was collected (not a stale completed/stopped worker).
             ev_worker_state = str(proc_liveness.get("worker_state") or "").lower()
@@ -1344,23 +1427,21 @@ class WatchdogCoordinator:
             # R3-F2: Re-probe: current snapshot PID must match the evidence PID to ensure
             # we are recovering the same execution, not a different one that reused the slot.
             current_pid = current_worker.get("pid")
-            ev_pid = proc_liveness.get("pid")
-            if current_pid is not None and ev_pid is not None and current_pid != ev_pid:
+            if current_pid is not None and current_pid != ev_pid:
                 self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_pid_mismatch")
                 return
 
         if diag_code == "process_dead":
             # Use the actual PID probe from diagnostic evidence, not snapshot.worker.process_alive
             # which is derived from the executor ledger and may be stale.
-            if proc_liveness.get("process_alive") is not False:
+            if process_alive is not False:
                 self._emit_owner_gate_once(pid, attempt_record, "process_alive_ambiguous")
                 return
             # R3-F2: Cross-check evidence PID against the current snapshot worker PID.
             # If the PID changed (new execution started after diagnosis), the stored evidence
             # belongs to a different run and must not trigger recovery for the new one.
             current_pid = current_worker.get("pid")
-            ev_pid = proc_liveness.get("pid")
-            if current_pid is not None and ev_pid is not None and current_pid != ev_pid:
+            if current_pid is not None and current_pid != ev_pid:
                 self._emit_owner_gate_once(pid, attempt_record, "process_dead_pid_mismatch")
                 return
 
