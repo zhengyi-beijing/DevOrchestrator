@@ -1,6 +1,6 @@
 # P8 D1 Final Review UTF-8 Remediation
 
-Status: **COMPLETED ? FINAL REVIEW ACCEPTED** (Ready for owner-gated promotion)
+Status: **COMPLETED** (Owner-authorized promotion to stable completed)
 Timebox: **Completed within timebox**
 
 Goal: remove the Windows GBK reviewer lifecycle blocker and obtain a clean final independent review for D1.

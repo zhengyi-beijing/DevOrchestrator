@@ -45,3 +45,10 @@ D1 Self-Hosted DevOrchestrator Integration:
   - `git diff --check` clean.
 
 - Final independent Opus review: **ACCEPT** for code commit `6b296d8`; all three final D1 findings closed with no outstanding defect in the reviewed diff/blast radius.
+
+- Stable promotion (owner-authorized, 2026-09-12):
+  - Fast-forwarded `feature/browser-bridge-multiproject` from `f6f643d` to accepted code/docs point `c6a46aa`; created rollback branch `backup/pre-d1-promotion-20260912`.
+  - Preserved the pre-existing local `docs/backlog.md` modification and Graphify/agent untracked files; none were included in the promotion.
+  - Post-promotion verification: 213 unit tests OK, browser userscript syntax OK, promotion diff check OK.
+  - Restarted the stable daemon with its original configuration; new PID `24456`, ports 8765/8770 healthy, `last_error=null`, Browser Bridge `/v1/health` reports `ok`.
+  - AIBroker remained healthy on port 8875; no active dispatch was interrupted.
