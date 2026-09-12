@@ -355,7 +355,10 @@ class ProgressChannel:
             if milestone not in VERBOSE_MILESTONES:
                 return None
 
-        eff_task_id = str(task_id or project_dict.get("telemetry", {}).get("task_id") or project_dict.get("task_id") or "")
+        telemetry = project_dict.get("telemetry")
+        if not isinstance(telemetry, Mapping):
+            telemetry = {}
+        eff_task_id = str(task_id or telemetry.get("task_id") or project_dict.get("task_id") or "")
         eff_occurrence = str(occurrence_key or "")
         dedupe_key = f"{project_id}:{eff_task_id}:{milestone}:{eff_occurrence}"
 

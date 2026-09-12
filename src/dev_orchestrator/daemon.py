@@ -191,9 +191,7 @@ def run_daemon(
     planner_coordinator = AIPlannerCoordinator(
         runtime, ai_execution_port, progress_channel=progress_channel
     )
-    control_coordinator = ControlCommandCoordinator(
-        runtime, planner_coordinator, progress_channel=progress_channel
-    )
+    control_coordinator = ControlCommandCoordinator(runtime, planner_coordinator)
     try:
         while True:
             last_error: Optional[str] = None

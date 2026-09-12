@@ -70,6 +70,16 @@ class ProgressChannelTests(unittest.TestCase):
             notif_failed = channel.emit(project, "WORKER_FAILED", task_id="T1")
             self.assertIsNone(notif_failed)
 
+    def test_emit_tolerates_none_telemetry(self):
+        with tempfile.TemporaryDirectory() as td:
+            channel = ProgressChannel(Path(td))
+            notif = channel.emit(
+                {"project_id": "proj-none", "telemetry": None},
+                "WORKER_STARTED",
+            )
+            self.assertIsNotNone(notif)
+            self.assertEqual(notif.task_id, "")
+
     def test_quiet_and_verbose_configuration(self):
         with tempfile.TemporaryDirectory() as td:
             runtime = Path(td)
@@ -299,6 +309,45 @@ class ProgressChannelBindingPropagationTests(unittest.TestCase):
 
 
 class ProgressHttpBridgeTests(unittest.TestCase):
+    def test_progress_get_url_decodes_binding_id(self):
+        import threading
+        import urllib.request
+        from urllib.parse import urlencode
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=False)
+            server = make_bridge_server("127.0.0.1", 0, bridge_store)
+            port = server.server_address[1]
+            th = threading.Thread(target=server.serve_forever, daemon=True)
+            th.start()
+            try:
+                binding_id = "conv +/%"
+                channel = ProgressChannel(runtime, bridge_store=bridge_store)
+                channel.emit(
+                    {
+                        "project_id": "http-encoded",
+                        "conversation_binding": {
+                            "transport": "browser",
+                            "adapter": "chatgpt_web",
+                            "binding_id": binding_id,
+                        },
+                    },
+                    "PLAN_STARTED",
+                    task_id="Plan-encoded",
+                )
+                query = urlencode({"adapter": "chatgpt_web", "binding_id": binding_id})
+                url = f"http://127.0.0.1:{port}/v1/progress?{query}"
+                with urllib.request.urlopen(urllib.request.Request(url, method="GET")) as resp:
+                    self.assertEqual(resp.status, 200)
+                    body = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(body["count"], 1)
+                    self.assertEqual(body["claimed"][0]["binding_id"], binding_id)
+            finally:
+                server.shutdown()
+                server.server_close()
+                th.join(timeout=2)
+
     def test_progress_http_endpoints(self):
         import urllib.request
         with tempfile.TemporaryDirectory() as td:

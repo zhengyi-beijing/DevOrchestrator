@@ -18,7 +18,7 @@ D1 Self-Hosted DevOrchestrator Integration:
   - Added deduplication, rate-limiting, and restart-safe idempotency via `runtime/progress-channel.json`.
   - Isolated progress transport: `BrowserBridgeStore.submit_progress` and `claim_progress` routing through `runtime/bridge/progress/<adapter>/<binding_id>.jsonl` completely distinct from decision queues (`runtime/bridge/queues/`). Never triggers model inference and consumes zero AIBroker quota.
   - Bridge HTTP `/v1/progress` GET and POST endpoints added in `BridgeHTTPServer`.
-  - Wired `ProgressChannel` into `TransitionExecutor`, `AIReviewerCoordinator`, `AIPlannerCoordinator`, `ControlCommandCoordinator`, and `daemon.py`.
+  - Wired `ProgressChannel` into the lifecycle emitters that own milestones: `TransitionExecutor`, `AIReviewerCoordinator`, `AIPlannerCoordinator`, and `daemon.py`; `ControlCommandCoordinator` delegates lifecycle events to those owners and does not carry a redundant ProgressChannel dependency.
   - Browser adapter `browser/chatgpt-web-adapter.user.js` polls `/v1/progress` and displays progress toasts without submitting turns to ChatGPT composer.
 - P6 Review Remediation (conversation_binding propagation gap):
   - Fixed `ProgressChannel.emit()` to resolve `conversation_binding` from an in-memory and persistent cache when not explicitly passed by the caller, so progress events emitted by `AIPlannerCoordinator` and `AIReviewerCoordinator` are delivered to the bound ChatGPT conversation even when only a `project_id` is supplied.
@@ -34,7 +34,12 @@ D1 Self-Hosted DevOrchestrator Integration:
   - Added regression test `test_execute_handles_unicode_reviewer_output_with_checkmark` in `tests_py/test_aibroker_execution_port.py` verifying reviewer output with checkmarks (`✅`, `✓`, `✔`) is properly received and preserved in `AIRoleResult.output`.
   - Added real child process regression test `test_child_environment_forces_utf8_for_unicode_reviewer_output` in `tests_py/test_aibroker_execution_port.py` confirming that child Python processes run with UTF-8 stdout encoding and emit Unicode reviewer output without GBK `UnicodeEncodeError`.
   - Added assertions in `test_success_maps_broker_result_and_preserves_semantics` and `test_status_and_interrupt_use_broker_reconciliation_commands` confirming child environment flags.
+- Final D1 review remediation:
+  - Replaced manual `/v1/progress` GET query parsing with `urllib.parse.parse_qs`, so percent-encoded `binding_id` values resolve to the original binding before filesystem-safe encoding.
+  - Removed the unused `ProgressChannel` dependency from `ControlCommandCoordinator`; lifecycle milestone emission remains owned by `TransitionExecutor`, `AIPlannerCoordinator`, and `AIReviewerCoordinator`, avoiding duplicate notifications.
+  - Hardened `ProgressChannel.emit()` against non-mapping/`None` telemetry before resolving the fallback `task_id`.
+  - Added regressions for URL-decoded progress bindings and `telemetry=None`.
 - Verification:
-  - 211 unit tests passing cleanly (`python -m unittest discover -s tests_py`).
+  - 213 unit tests passing cleanly (`python -m unittest discover -s tests_py`).
   - `node --check browser/chatgpt-web-adapter.user.js` passing.
   - `git diff --check` clean.

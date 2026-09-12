@@ -31,7 +31,7 @@ import json
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from dev_orchestrator.bridge.store import BridgeConflictError, BrowserBridgeStore
 
@@ -123,9 +123,9 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/progress":
             query = urlsplit(self.path).query
-            params = dict(item.split("=", 1) for item in query.split("&") if "=" in item)
-            adapter = params.get("adapter", "")
-            binding_id = params.get("binding_id", "")
+            params = parse_qs(query, keep_blank_values=True)
+            adapter = (params.get("adapter") or [""])[0]
+            binding_id = (params.get("binding_id") or [""])[0]
             if not adapter or not binding_id:
                 self._error(400, "Bad Request", "adapter and binding_id query parameters required")
                 return
