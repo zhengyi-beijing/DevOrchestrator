@@ -52,8 +52,15 @@ class WatchdogPolicyAndLifecycleTests(unittest.TestCase):
         self.assertEqual(resolve_threshold_seconds(pol2, "REVIEWING_PLAN"), 600.0)
         # Family fallback: APPLYING_PLAN -> PLANNING (10 min = 600s)
         self.assertEqual(resolve_threshold_seconds(pol2, "APPLYING_PLAN"), 600.0)
+        # Family fallback: REMEDIATING_PLAN -> PLANNING (10 min = 600s)
+        self.assertEqual(resolve_threshold_seconds(pol2, "REMEDIATING_PLAN"), 600.0)
         # Unspecified state falls back to project default (25 min = 1500s)
         self.assertEqual(resolve_threshold_seconds(pol2, "REVIEWING"), 1500.0)
+
+    def test_remediating_plan_active_and_in_planning_family(self):
+        from dev_orchestrator.core.watchdog import LIFECYCLE_OVERRIDE_FAMILY
+        self.assertIn("REMEDIATING_PLAN", ACTIVE_LIFECYCLE_STATES)
+        self.assertEqual(LIFECYCLE_OVERRIDE_FAMILY.get("REMEDIATING_PLAN"), "PLANNING")
 
     def test_active_lifecycle_states_monitored(self):
         """Only ACTIVE_LIFECYCLE_STATES are monitored; other states are ignored."""

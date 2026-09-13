@@ -527,19 +527,32 @@ def project_runtime_status(snapshot: dict[str, Any], runtime_root: Path | str) -
         ]
         active_plans = [
             p for p in matching_plans
-            if p.get("state") in {"planning", "reviewing", "applying"}
+            if p.get("state") in {"planning", "reviewing", "applying", "remediating"}
         ]
         if active_plans and projected.get("lifecycle_state") != "EXECUTING":
             latest_plan = max(active_plans, key=lambda p: str(p.get("started_at") or ""))
             p_state = latest_plan.get("state")
-            lifecycle = "PLANNING" if p_state == "planning" else ("REVIEWING_PLAN" if p_state == "reviewing" else "APPLYING_PLAN")
+            if p_state == "planning":
+                lifecycle = "PLANNING"
+            elif p_state == "reviewing":
+                lifecycle = "REVIEWING_PLAN"
+            elif p_state == "remediating":
+                lifecycle = "REMEDIATING_PLAN"
+            else:
+                lifecycle = "APPLYING_PLAN"
             projected["lifecycle_state"] = lifecycle
             if projected.get("state") in {"READY_TO_RUN", "IDLE"}:
                 projected["state"] = lifecycle
-            projected["planner"] = {
+            planner_view: dict[str, Any] = {
                 "plan_id": latest_plan.get("plan_id"),
                 "state": p_state,
                 "started_at": latest_plan.get("started_at"),
             }
+            if "remediation_round" in latest_plan:
+                planner_view["remediation_round"] = latest_plan.get("remediation_round")
+            if "rejection_chain" in latest_plan:
+                chain = latest_plan.get("rejection_chain")
+                planner_view["rejection_chain_length"] = len(chain) if isinstance(chain, list) else 0
+            projected["planner"] = planner_view
 
     return projected

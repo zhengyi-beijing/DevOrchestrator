@@ -18,7 +18,7 @@ def _latest(rows: Any, project_id: str) -> dict[str, Any] | None:
         stamp = ""
         for name in (
             "completed_at", "review_completed_at", "worker_launched_at",
-            "ready_at", "planner_completed_at", "recovered_at", "started_at",
+            "ready_at", "planner_completed_at", "remediation_started_at", "recovered_at", "started_at",
         ):
             value = row.get(name)
             if isinstance(value, str) and value:
@@ -52,6 +52,8 @@ def overlay_orchestration_lifecycle(
             lifecycle = "PLANNING"
         elif isinstance(plan, dict) and plan.get("state") == "reviewing":
             lifecycle = "REVIEWING_PLAN"
+        elif isinstance(plan, dict) and plan.get("state") == "remediating":
+            lifecycle = "REMEDIATING_PLAN"
         elif isinstance(plan, dict) and plan.get("state") == "applying":
             lifecycle = "APPLYING_PLAN"
         elif isinstance(plan, dict) and plan.get("state") == "ready":
