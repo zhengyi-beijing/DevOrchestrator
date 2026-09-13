@@ -128,7 +128,7 @@ def resolve_monitor_state(
     if re.search(r"ACCEPTED|awaiting", status_text, re.IGNORECASE):
         return "WAITING_PHASE_GATE"
     if kind == "task" and state == "completed":
-        if re.search(r"DESIGN READY|EXECUTABLE", status_text, re.IGNORECASE):
+        if re.search(r"READY[_ -]?TO[_ -]?RUN|DESIGN READY|EXECUTABLE", status_text, re.IGNORECASE):
             worker_updated = parse_utc(worker.get("updated_at"))
             next_updated = parse_utc(next_updated_at)
             if (
@@ -138,7 +138,7 @@ def resolve_monitor_state(
             ):
                 return "READY_TO_RUN"
         return "WAITING_REVIEW"
-    if re.search(r"DESIGN READY|EXECUTABLE", status_text, re.IGNORECASE):
+    if re.search(r"READY[_ -]?TO[_ -]?RUN|DESIGN READY|EXECUTABLE", status_text, re.IGNORECASE):
         return "READY_TO_RUN"
     return "IDLE"
 
