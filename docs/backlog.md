@@ -47,3 +47,10 @@ Follow-up from CCP7 live acceptance:
   port, and report the owning PID/command line;
 - keep this as test-harness hardening only; CCP7 transport acceptance itself is
   complete.
+
+## P11 staged roadmap
+
+- **P11-A — Bounded plan-review remediation loop:** bootstrap lifecycle fix. Reviewer rejection auto-revises/re-reviews for at most 3 rounds, then OWNER_GATE. This is the current task.
+- **P11-B — Execution accounting foundation:** durable lifecycle/test/retry/accepted-work timing, Effective Development Ratio, plan-review churn, and failure-memory foundation.
+- **P11-C — Provider/context/RDC evidence:** context continuity, quota/failover latency, RDC invocation metrics and multi-project isolation probes with deterministic classification.
+- **P11-D — Reporting and acceptance:** 8770 dashboard, bottleneck diagnoses, representative-day DevO + xray-hw-platform evidence, and quantitative acceptance gates.
