@@ -5,20 +5,18 @@
 - Development branch: `feature/self-hosted-dev`.
 - Stable branch: `feature/browser-bridge-multiproject`.
 
-Current task: **P10 Active-Project Progress Watchdog and Automatic Diagnostics** — **COMPLETED / ACCEPTED / PROMOTED**.
+Current task: **P11-A Bounded Plan-Review Remediation Loop** — **COMPLETED / READY FOR REVIEW**.
 
-Accepted code HEAD: `8550c3ca2476f2b11a1bb5b317dd4c5e0a68fcca`.
-
-Final acceptance evidence:
-- Independent GPT-5.6 Sol promotion review: `approve`, zero blockers, `reviewed_head` exactly `8550c3ca2476f2b11a1bb5b317dd4c5e0a68fcca`.
-- Exact-HEAD development regression: 359 tests PASS.
-- Post-promotion stable regression: 359 tests PASS.
-- `node --check browser/chatgpt-web-adapter.user.js`: PASS.
-- `git diff --check`: PASS.
-- `validate-config`: PASS for all 5 configured projects.
-- Stable watchdog API: healthy, `degraded=false`, all 5 configured projects report `state=ok`.
-- Browser Bridge health: `ok`.
-- Stable daemon restarted successfully with `last_error=null`.
-- Rollback ref: `backup/pre-p10-promotion-20260913`.
-
-Owner instruction: **stop execution after P10 completion. Do not start P11 automatically.**
+Implementation summary:
+- Added `max_plan_remediation_rounds` (default 3, valid range 1..5) policy validation to `_planner_policy` in `src/dev_orchestrator/core/ai_planner.py`.
+- Added `'remediating'` to `_ACTIVE_STATES` in `ai_planner.py` for crash-atomic `recovery_required` transition on restart.
+- Refactored `_run_cycle` into `_run_planner_attempts`, `_run_plan_review`, and bounded remediation loop.
+- Ensured unique request IDs per round (`:planner:remediate-R`, `:reviewer:remediate-R`) and prompt remediation context injection with exact reviewer rejection reason, prior plan JSON, task ID, planning HEAD, and prior planner resource.
+- Recorded durable `rejection_chain` tracking round, reason, prior plan, dispatch/execution IDs, resource payloads, and timestamps.
+- Emitted progress milestones `REMEDIATE` on automatic revision and `OWNER_GATE` on bounded exhaustion.
+- Mapped plan state `'remediating'` to `REMEDIATING_PLAN` in `lifecycle_projection.py` and `project_status.py` (exposing `remediation_round` and `rejection_chain_length`).
+- Added `REMEDIATING_PLAN` to watchdog `ACTIVE_LIFECYCLE_STATES` (in `PLANNING` family) and `_ALLOWED_WATCHDOG_LIFECYCLES` in `config.py`.
+- 6 new dedicated unit tests in `tests_py/test_ai_planner.py` plus regression tests in `test_lifecycle_projection.py`, `test_project_status.py`, `test_watchdog.py`, and `test_project_config_contract.py`.
+- Full test suite: 372 unit tests passing (`python -m unittest discover -s tests_py`).
+- Userscript syntax check: `node --check browser/chatgpt-web-adapter.user.js` passed.
+- Repository hygiene: `git diff --check` clean.

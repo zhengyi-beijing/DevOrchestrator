@@ -71,6 +71,23 @@ class ProjectConfigContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "between 500 and 20000"):
                 load_projects_config(path)
 
+    def test_watchdog_lifecycle_overrides_accepts_remediating_plan(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "projects.json"
+            path.write_text(json.dumps({"projects": [
+                {
+                    "project_id": "p1", "repo_path": "A",
+                    "watchdog": {
+                        "enabled": True,
+                        "lifecycle_overrides": {"REMEDIATING_PLAN": 20},
+                    },
+                },
+            ]}), encoding="utf-8")
+            cfg = load_projects_config(path)
+            self.assertEqual(
+                cfg["projects"][0]["watchdog"]["lifecycle_overrides"]["REMEDIATING_PLAN"], 20
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,7 @@ from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_js
 
 PLANNER_STATE_FILE = "ai-planner.json"
 _STATE_VERSION = 1
-_ACTIVE_STATES = frozenset({"planning", "reviewing", "applying"})
+_ACTIVE_STATES = frozenset({"planning", "reviewing", "remediating", "applying"})
 
 
 def _nonblank(value: Any) -> str | None:
@@ -42,6 +42,7 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     timeout = raw.get("timeout_seconds", 900)
     review_timeout = raw.get("review_timeout_seconds", 600)
     max_attempts = raw.get("max_attempts", 3)
+    max_plan_remediation_rounds = raw.get("max_plan_remediation_rounds", 3)
     if quality not in {"economy", "balanced", "high"}:
         return None, "planner quality invalid"
     if review_quality not in {"economy", "balanced", "high"}:
@@ -53,6 +54,12 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
             return None, f"planner {name} must be positive"
     if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or not 1 <= max_attempts <= 5:
         return None, "planner max_attempts must be an integer from 1 to 5"
+    if (
+        isinstance(max_plan_remediation_rounds, bool)
+        or not isinstance(max_plan_remediation_rounds, int)
+        or not 1 <= max_plan_remediation_rounds <= 5
+    ):
+        return None, "planner max_plan_remediation_rounds must be an integer from 1 to 5"
     return {
         "quality": quality,
         "review_quality": review_quality,
@@ -60,6 +67,7 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
         "timeout_seconds": float(timeout),
         "review_timeout_seconds": float(review_timeout),
         "max_attempts": max_attempts,
+        "max_plan_remediation_rounds": max_plan_remediation_rounds,
     }, ""
 
 
@@ -199,6 +207,8 @@ class AIPlannerCoordinator:
                 "context_state": context_resolution.state,
                 "context_digest": context_resolution.document.digest if context_resolution.document else None,
                 "context_sources": copy.deepcopy(context_resolution.sources),
+                "rejection_chain": [],
+                "remediation_round": 0,
             }
             if binding and isinstance(binding, dict):
                 self._project_bindings[project_id] = copy.deepcopy(binding)
@@ -229,42 +239,76 @@ class AIPlannerCoordinator:
                 record["worker_source_request_id"] = source_request_id
                 record["worker_launched_at"] = utc_now_iso()
                 self._save_state(state)
-    def _run_cycle(self, plan_id: str, project: dict[str, Any], policy: dict[str, Any]) -> None:
-        with self._lock:
-            record = copy.deepcopy(self._load_state()["plans"].get(plan_id, {}))
-        if not record:
-            return
-        if self.progress_channel is not None:
-            self.progress_channel.emit(
-                project, "PLAN_STARTED",
-                task_id=record["task_id"], occurrence_key=plan_id,
-                details={"plan_id": plan_id},
-            )
+    def _project_payload(self, record: dict[str, Any], project: dict[str, Any] | None) -> dict[str, Any]:
+        binding = (
+            record.get("conversation_binding")
+            or (project.get("conversation_binding") if isinstance(project, dict) else None)
+            or self._project_bindings.get(record["project_id"])
+        )
+        payload: dict[str, Any] = {"project_id": record["project_id"]}
+        if binding:
+            payload["conversation_binding"] = binding
+        if isinstance(project, dict):
+            if project.get("progress_channel") is not None:
+                payload["progress_channel"] = project["progress_channel"]
+            if project.get("progress_level") is not None:
+                payload["progress_level"] = project["progress_level"]
+        return payload
+
+    def _run_planner_attempts(
+        self,
+        plan_id: str,
+        record: dict[str, Any],
+        policy: dict[str, Any],
+        round_no: int,
+        rejection: str | None = None,
+        prior_plan: dict[str, Any] | None = None,
+        prior_resource: ResourceContext | None = None,
+    ) -> tuple[dict[str, Any], Any] | None:
         max_attempts = policy["max_attempts"]
         planner_result = None
         plan = None
-        previous_attempt_resource = None
+        previous_attempt_resource = prior_resource if round_no > 0 else None
         failure_reason = None
+        remediation_data = None
+        if round_no > 0:
+            remediation_data = {
+                "round": round_no,
+                "rejection": rejection,
+                "prior_plan": prior_plan,
+                "prior_resource": prior_resource,
+            }
+        base_req_id = plan_id + ":planner" if round_no == 0 else f"{plan_id}:planner:remediate-{round_no}"
+
         for attempt in range(1, max_attempts + 1):
             retry_suffix = "" if attempt == 1 else f":retry-{attempt - 1}"
+            metadata: dict[str, Any] = {
+                "control_command_id": record["command_id"],
+                "planner_attempt": attempt,
+                "planner_max_attempts": max_attempts,
+            }
+            if round_no > 0:
+                metadata["remediation_round"] = round_no
+
             planner_request = AIRoleRequest(
                 project_id=record["project_id"],
                 task_run_id=record["task_id"],
                 stage_run_id="plan",
                 role_run_id="planner-" + record["command_id"],
-                request_id=plan_id + ":planner" + retry_suffix,
+                request_id=base_req_id + retry_suffix,
                 role="planner",
-                prompt=self._planner_prompt(record, retry_reason=failure_reason, attempt=attempt),
+                prompt=self._planner_prompt(
+                    record,
+                    retry_reason=failure_reason,
+                    attempt=attempt,
+                    remediation=remediation_data,
+                ),
                 working_directory=Path(record["repo_path"]),
                 quality=policy["quality"],
                 independence="none",
                 previous_resource_context=previous_attempt_resource,
                 timeout_seconds=policy["timeout_seconds"],
-                metadata={
-                    "control_command_id": record["command_id"],
-                    "planner_attempt": attempt,
-                    "planner_max_attempts": max_attempts,
-                },
+                metadata=metadata,
             )
             attempt_result = None
             attempt_reason = None
@@ -281,12 +325,12 @@ class AIPlannerCoordinator:
                     raise RuntimeError("planner resource context missing")
                 planner_result = attempt_result
             except InterruptedError as exc:
-                self._record_planner_attempt(plan_id, attempt, planner_request, attempt_result, str(exc))
+                self._record_planner_attempt(plan_id, attempt, planner_request, attempt_result, str(exc), round_no=round_no)
                 self._finish(plan_id, "failed", f"planner cancelled: {exc}")
-                return
+                return None
             except Exception as exc:
                 attempt_reason = str(exc)
-                self._record_planner_attempt(plan_id, attempt, planner_request, attempt_result, attempt_reason)
+                self._record_planner_attempt(plan_id, attempt, planner_request, attempt_result, attempt_reason, round_no=round_no)
                 if attempt_result is not None and attempt_result.resource_context is not None:
                     previous_attempt_resource = attempt_result.resource_context
                 failure_reason = attempt_reason
@@ -296,37 +340,36 @@ class AIPlannerCoordinator:
                         "failed",
                         f"planner failed after {max_attempts} attempts: {attempt_reason}",
                     )
-                    return
+                    return None
                 continue
-            self._record_planner_attempt(plan_id, attempt, planner_request, planner_result, None)
+            self._record_planner_attempt(plan_id, attempt, planner_request, planner_result, None, round_no=round_no)
             break
+
         if planner_result is None or plan is None:
             self._finish(plan_id, "failed", "planner retry loop ended without a valid plan")
-            return
-        previous = planner_result.resource_context
-        if previous is None:
-            self._finish(plan_id, "failed", "planner resource context missing")
-            return
-        with self._lock:
-            state = self._load_state()
-            current = state["plans"].get(plan_id)
-            if not isinstance(current, dict):
-                return
-            current.update({
-                "state": "reviewing",
-                "plan": plan,
-                "planner_dispatch_id": planner_result.dispatch_id,
-                "planner_execution_id": planner_result.execution_id,
-                "planner_resource": self._resource_payload(previous),
-                "planner_completed_at": utc_now_iso(),
-            })
-            self._save_state(state)
+            return None
+        return plan, planner_result
+
+    def _run_plan_review(
+        self,
+        plan_id: str,
+        record: dict[str, Any],
+        policy: dict[str, Any],
+        plan: dict[str, Any],
+        previous: ResourceContext | None,
+        round_no: int,
+    ) -> tuple[str, str, Any] | None:
+        request_id = plan_id + ":reviewer" if round_no == 0 else f"{plan_id}:reviewer:remediate-{round_no}"
+        metadata: dict[str, Any] = {"control_command_id": record["command_id"], "review_kind": "plan"}
+        if round_no > 0:
+            metadata["remediation_round"] = round_no
+
         review_request = AIRoleRequest(
             project_id=record["project_id"],
             task_run_id=record["task_id"],
             stage_run_id="plan_review",
             role_run_id="plan-reviewer-" + record["command_id"],
-            request_id=plan_id + ":reviewer",
+            request_id=request_id,
             role="reviewer",
             prompt=self._review_prompt(record, plan),
             working_directory=Path(record["repo_path"]),
@@ -334,7 +377,7 @@ class AIPlannerCoordinator:
             independence=policy["review_independence"],
             previous_resource_context=previous,
             timeout_seconds=policy["review_timeout_seconds"],
-            metadata={"control_command_id": record["command_id"], "review_kind": "plan"},
+            metadata=metadata,
         )
         try:
             review_result = self.port.execute(review_request) if self.port is not None else None
@@ -345,35 +388,175 @@ class AIPlannerCoordinator:
             decision, reason = _parse_plan_review(review_result.output)
         except Exception as exc:
             self._finish(plan_id, "failed", f"plan review failed: {exc}")
-            return
-        review_resource = review_result.resource_context
+            return None
+        return decision, reason, review_result
+
+    def _run_cycle(self, plan_id: str, project: dict[str, Any], policy: dict[str, Any]) -> None:
         with self._lock:
-            state = self._load_state()
-            current = state["plans"].get(plan_id)
-            if not isinstance(current, dict):
+            record = copy.deepcopy(self._load_state()["plans"].get(plan_id, {}))
+        if not record:
+            return
+        if self.progress_channel is not None:
+            self.progress_channel.emit(
+                self._project_payload(record, project), "PLAN_STARTED",
+                task_id=record["task_id"], occurrence_key=plan_id,
+                details={"plan_id": plan_id},
+            )
+
+        max_remediation_rounds = policy["max_plan_remediation_rounds"]
+        rejection: str | None = None
+        prior_plan: dict[str, Any] | None = None
+        prior_resource: ResourceContext | None = None
+
+        for round_no in range(max_remediation_rounds + 1):
+            attempts_res = self._run_planner_attempts(
+                plan_id, record, policy, round_no,
+                rejection=rejection,
+                prior_plan=prior_plan,
+                prior_resource=prior_resource,
+            )
+            if attempts_res is None:
                 return
-            current.update({
-                "review_decision": decision,
-                "review_reason": reason,
-                "review_dispatch_id": review_result.dispatch_id,
-                "review_execution_id": review_result.execution_id,
-                "review_resource": self._resource_payload(review_resource),
-                "review_completed_at": utc_now_iso(),
-            })
-            self._save_state(state)
-        if decision == "owner_gate":
-            self._finish(plan_id, "owner_gate", reason)
+            plan, planner_result = attempts_res
+            previous = planner_result.resource_context
+            if previous is None:
+                self._finish(plan_id, "failed", "planner resource context missing")
+                return
+
+            planner_completed_at = utc_now_iso()
+            with self._lock:
+                state = self._load_state()
+                current = state["plans"].get(plan_id)
+                if not isinstance(current, dict):
+                    return
+                current.update({
+                    "state": "reviewing",
+                    "plan": plan,
+                    "planner_dispatch_id": planner_result.dispatch_id,
+                    "planner_execution_id": planner_result.execution_id,
+                    "planner_resource": self._resource_payload(previous),
+                    "planner_completed_at": planner_completed_at,
+                })
+                self._save_state(state)
+
+            review_res = self._run_plan_review(
+                plan_id, record, policy, plan, previous, round_no,
+            )
+            if review_res is None:
+                return
+            decision, reason, review_result = review_res
+            review_completed_at = utc_now_iso()
+            review_resource = review_result.resource_context
+
+            with self._lock:
+                state = self._load_state()
+                current = state["plans"].get(plan_id)
+                if not isinstance(current, dict):
+                    return
+                current.update({
+                    "review_decision": decision,
+                    "review_reason": reason,
+                    "review_dispatch_id": review_result.dispatch_id,
+                    "review_execution_id": review_result.execution_id,
+                    "review_resource": self._resource_payload(review_resource),
+                    "review_completed_at": review_completed_at,
+                })
+                self._save_state(state)
+
+            if decision == "owner_gate":
+                self._finish(plan_id, "owner_gate", reason)
+                if self.progress_channel is not None:
+                    self.progress_channel.emit(
+                        self._project_payload(record, project), "OWNER_GATE",
+                        task_id=record["task_id"], occurrence_key=plan_id,
+                        details={"plan_id": plan_id, "reason": reason},
+                    )
+                return
+
+            if decision == "approve":
+                self._apply_plan(plan_id, record, plan, reason, project=project)
+                return
+
+            if decision != "reject":
+                self._finish(plan_id, "failed", f"unexpected plan review decision: {decision}")
+                return
+
+            # Review decision is 'reject'
+            rejection_entry = {
+                "round": round_no,
+                "reason": reason,
+                "prior_plan": plan,
+                "planner_dispatch_id": planner_result.dispatch_id,
+                "planner_execution_id": planner_result.execution_id,
+                "reviewer_dispatch_id": review_result.dispatch_id,
+                "reviewer_execution_id": review_result.execution_id,
+                "planner_resource": self._resource_payload(previous),
+                "reviewer_resource": self._resource_payload(review_resource),
+                "planner_completed_at": planner_completed_at,
+                "review_completed_at": review_completed_at,
+                "rejected_at": utc_now_iso(),
+            }
+
+            if round_no < max_remediation_rounds:
+                with self._lock:
+                    state = self._load_state()
+                    current = state["plans"].get(plan_id)
+                    if not isinstance(current, dict):
+                        return
+                    chain = current.setdefault("rejection_chain", [])
+                    chain.append(rejection_entry)
+                    current.update({
+                        "state": "remediating",
+                        "remediation_round": round_no + 1,
+                        "review_reason": reason,
+                        "remediation_started_at": utc_now_iso(),
+                    })
+                    self._save_state(state)
+
+                if self.progress_channel is not None:
+                    self.progress_channel.emit(
+                        self._project_payload(record, project),
+                        "REMEDIATE",
+                        task_id=record["task_id"],
+                        occurrence_key=f"{plan_id}:remediate-{round_no + 1}",
+                        details={
+                            "plan_id": plan_id,
+                            "round": round_no + 1,
+                            "reason": reason,
+                        },
+                    )
+
+                rejection = reason
+                prior_plan = plan
+                prior_resource = previous
+                continue
+
+            # round_no == max_remediation_rounds (bound exhausted)
+            with self._lock:
+                state = self._load_state()
+                current = state["plans"].get(plan_id)
+                if not isinstance(current, dict):
+                    return
+                chain = current.setdefault("rejection_chain", [])
+                chain.append(rejection_entry)
+                chain_len = len(chain)
+                self._save_state(state)
+
+            exhaust_reason = f"plan remediation hit its bound after {max_remediation_rounds} rounds (exhausted); last rejection: {reason}"
+            self._finish(plan_id, "owner_gate", exhaust_reason)
             if self.progress_channel is not None:
                 self.progress_channel.emit(
-                    project, "OWNER_GATE",
-                    task_id=record["task_id"], occurrence_key=plan_id,
-                    details={"plan_id": plan_id, "reason": reason},
+                    self._project_payload(record, project),
+                    "OWNER_GATE",
+                    task_id=record["task_id"],
+                    occurrence_key=f"{plan_id}:owner_gate:exhausted",
+                    details={
+                        "plan_id": plan_id,
+                        "reason": exhaust_reason,
+                        "rejection_chain_length": chain_len,
+                    },
                 )
             return
-        if decision != "approve":
-            self._finish(plan_id, "failed", "plan rejected: " + reason)
-            return
-        self._apply_plan(plan_id, record, plan, reason, project=project)
 
     def _apply_plan(
         self, plan_id: str, record: dict[str, Any], plan: dict[str, Any],
@@ -434,19 +617,7 @@ class AIPlannerCoordinator:
             })
             self._save_state(state)
         if self.progress_channel is not None:
-            binding = (
-                record.get("conversation_binding")
-                or (project.get("conversation_binding") if isinstance(project, dict) else None)
-                or self._project_bindings.get(record["project_id"])
-            )
-            project_payload = {"project_id": record["project_id"]}
-            if binding:
-                project_payload["conversation_binding"] = binding
-            if isinstance(project, dict):
-                if project.get("progress_channel") is not None:
-                    project_payload["progress_channel"] = project["progress_channel"]
-                if project.get("progress_level") is not None:
-                    project_payload["progress_level"] = project["progress_level"]
+            project_payload = self._project_payload(record, project)
             self.progress_channel.emit(
                 project_payload, "PLAN_ACCEPTED",
                 task_id=record["task_id"], occurrence_key=plan_id,
@@ -506,6 +677,7 @@ class AIPlannerCoordinator:
         return {"resource_id": resource.resource_id, "provider": resource.provider, "account": resource.account, "model": resource.model}
     def _record_planner_attempt(
         self, plan_id: str, attempt: int, request: AIRoleRequest, result: Any, reason: str | None,
+        round_no: int = 0,
     ) -> None:
         with self._lock:
             state = self._load_state()
@@ -516,7 +688,7 @@ class AIPlannerCoordinator:
             if not isinstance(attempts, list):
                 attempts = []
                 record["planner_attempts"] = attempts
-            attempts.append({
+            entry: dict[str, Any] = {
                 "attempt": attempt,
                 "request_id": request.request_id,
                 "completed_at": utc_now_iso(),
@@ -525,7 +697,10 @@ class AIPlannerCoordinator:
                 "dispatch_id": getattr(result, "dispatch_id", None),
                 "execution_id": getattr(result, "execution_id", None),
                 "resource": self._resource_payload(getattr(result, "resource_context", None)),
-            })
+            }
+            if round_no > 0:
+                entry["round"] = round_no
+            attempts.append(entry)
             record["planner_attempt_count"] = attempt
             record["planner_retry_count"] = max(0, attempt - 1)
             if reason is not None:
@@ -534,7 +709,12 @@ class AIPlannerCoordinator:
             self._save_state(state)
 
     @staticmethod
-    def _planner_prompt(record: dict[str, Any], retry_reason: str | None = None, attempt: int = 1) -> str:
+    def _planner_prompt(
+        record: dict[str, Any],
+        retry_reason: str | None = None,
+        attempt: int = 1,
+        remediation: dict[str, Any] | None = None,
+    ) -> str:
         prompt = (
             "You are the software-development Planner for one task. Plan only: do not modify files, commit, push, or run another agent. "
             "Inspect the repository and the supplied agent/next.md task. Convert the pending design into a bounded executable implementation plan. "
@@ -544,6 +724,32 @@ class AIPlannerCoordinator:
             f"Project: {record['project_id']}\nTask: {record['task_id']}\n"
             f"Planning branch: {record['branch']}\nPlanning HEAD: {record['head']}\n\n"
         )
+        if remediation:
+            rem_round = remediation.get("round")
+            rejection = str(remediation.get("rejection") or "")
+            prior_plan = remediation.get("prior_plan")
+            prior_plan_str = json.dumps(prior_plan, ensure_ascii=False, indent=2) if isinstance(prior_plan, dict) else str(prior_plan or "")
+            prior_res = remediation.get("prior_resource")
+            res_payload = (
+                AIPlannerCoordinator._resource_payload(prior_res)
+                if isinstance(prior_res, ResourceContext)
+                else (prior_res if isinstance(prior_res, dict) else None)
+            )
+            prompt += (
+                "[PLAN_REMEDIATION]\n"
+                f"Remediation round {rem_round}.\n"
+                f"Task ID: {record['task_id']}\n"
+                f"Planning HEAD: {record['head']}\n"
+                f"Reviewer rejection reason:\n{rejection}\n\n"
+                f"Prior plan JSON:\n{prior_plan_str}\n\n"
+            )
+            if res_payload:
+                prompt += f"Prior planner resource:\n{json.dumps(res_payload, ensure_ascii=False, indent=2)}\n\n"
+            prompt += (
+                "Revise the plan to address the reviewer's rejection while staying bounded to the task. "
+                "Return exactly one JSON object with the required schema; "
+                "do not add markdown, commentary, code fences, or any text outside the JSON object.\n\n"
+            )
         if retry_reason is not None:
             prompt += (
                 "[PLANNER_RETRY]\n"

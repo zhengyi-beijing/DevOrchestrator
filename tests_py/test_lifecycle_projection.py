@@ -40,3 +40,15 @@ class LifecycleProjectionTests(unittest.TestCase):
             projected["projects"][0]["lifecycle_state"],
             "EXECUTING",
         )
+
+    def test_remediating_plan_overlay_state(self):
+        raw = {"projects": [{"project_id": "p1", "state": "IDLE"}]}
+        projected = overlay_orchestration_lifecycle(
+            raw,
+            planner_state={"plans": {"p1": {
+                "project_id": "p1", "plan_id": "p1", "state": "remediating",
+                "started_at": "2026-09-10T01:00:00+00:00",
+                "remediation_started_at": "2026-09-10T01:05:00+00:00",
+            }}},
+        )
+        self.assertEqual(projected["projects"][0]["lifecycle_state"], "REMEDIATING_PLAN")

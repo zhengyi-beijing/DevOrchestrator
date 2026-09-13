@@ -163,3 +163,21 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
 - Existing stable `docs/backlog.md` modification and untracked agent/Graphify files were preserved and excluded from promotion.
 - No push was performed.
 - Owner boundary: P10 is complete. Stop execution here; do not start P11 automatically.
+
+## P11-A Bounded Plan-Review Remediation Loop (2026-09-13)
+
+- Implemented bounded plan-review remediation loop preventing rejection from dropping to IDLE:
+  - Validated `max_plan_remediation_rounds` (default 3, range 1..5) in `_planner_policy` (`src/dev_orchestrator/core/ai_planner.py`).
+  - Added `'remediating'` to `_ACTIVE_STATES` in `ai_planner.py` ensuring restart safety (`recovery_required`).
+  - Refactored `_run_cycle` into modular helpers `_run_planner_attempts` and `_run_plan_review` with unique request IDs across rounds (`:planner:remediate-R`, `:reviewer:remediate-R`).
+  - Extended `_planner_prompt` with `[PLAN_REMEDIATION]` block carrying round, exact reviewer rejection reason, prior plan JSON, task ID, planning HEAD, and prior planner resource context.
+  - Propagated `previous_resource_context` to remediation planner calls.
+  - Implemented durable `rejection_chain` in plan records capturing round, reason, prior plan, planner/reviewer dispatch & execution IDs, resource payloads, and timestamps.
+  - Emitted progress milestones: `REMEDIATE` on each automatic revision round; `OWNER_GATE` with bounded exhaustion reason after N rounds.
+  - Projected `'remediating'` as `REMEDIATING_PLAN` in `lifecycle_projection.py` and `project_status.py` (with `remediation_round` and `rejection_chain_length`).
+  - Integrated `REMEDIATING_PLAN` into watchdog `ACTIVE_LIFECYCLE_STATES` (`PLANNING` family fallback) and config `_ALLOWED_WATCHDOG_LIFECYCLES`.
+- Verification:
+  - 13 unit tests passing in `tests_py/test_ai_planner.py` (including 6 new tests covering single rejection remediation, bounded exhaustion, prompt/resource propagation, request ID uniqueness, restart recovery, policy validation, and reviewer transport failure).
+  - 372 tests passing in full test suite (`python -m unittest discover -s tests_py`).
+  - Userscript syntax check passed (`node --check browser/chatgpt-web-adapter.user.js`).
+  - Git diff check clean (`git diff --check`).

@@ -292,6 +292,37 @@ class ProjectStatusTests(unittest.TestCase):
             self.assertIsNotNone(view)
             self.assertEqual(view["activity_evidence"]["newest_path"], "agent/newer.md")
 
+    def test_project_runtime_status_remediating_plan(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            (runtime / "ai-planner.json").write_text(json.dumps({
+                "version": 1,
+                "plans": {
+                    "p1": {
+                        "project_id": "p1",
+                        "plan_id": "ai_plan:p1",
+                        "state": "remediating",
+                        "started_at": "2026-09-13T10:00:00Z",
+                        "remediation_round": 2,
+                        "rejection_chain": [
+                            {"round": 0, "reason": "first rejection"},
+                            {"round": 1, "reason": "second rejection"},
+                        ],
+                    }
+                }
+            }), encoding="utf-8")
+            snapshot = {
+                "project_id": "p1",
+                "state": "IDLE",
+                "telemetry": {"task_id": "P1"},
+            }
+            projected = project_runtime_status(snapshot, runtime)
+            self.assertEqual(projected["lifecycle_state"], "REMEDIATING_PLAN")
+            self.assertEqual(projected["state"], "REMEDIATING_PLAN")
+            self.assertEqual(projected["planner"]["state"], "remediating")
+            self.assertEqual(projected["planner"]["remediation_round"], 2)
+            self.assertEqual(projected["planner"]["rejection_chain_length"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
