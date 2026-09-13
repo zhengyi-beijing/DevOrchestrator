@@ -16,3 +16,9 @@ Final closure:
 - No push performed.
 
 Execution boundary: **STOP HERE per owner instruction. Do not begin P11 or any subsequent backlog task automatically.**
+
+Queued roadmap after this stop boundary:
+- **P11 — Execution accounting and bottleneck profiling**: instrument and quantify wall-clock loss, context churn, quota/failover delay, RDC/transport overhead and lifecycle/reviewer stalls before changing scheduler policy.
+- **P12 — Unified AI Control Surface**: complete the stable Control API and make 8770 the primary unified project + AI-resource control plane; retain 8875 for AIBroker-specialist configuration/diagnostics.
+
+Do not begin either phase automatically; wait for the next owner command.

@@ -22,3 +22,7 @@ Final acceptance evidence:
 - Rollback ref: `backup/pre-p10-promotion-20260913`.
 
 Owner instruction: **stop execution after P10 completion. Do not start P11 automatically.**
+
+Queued roadmap after the stop boundary:
+- **P11**: Execution accounting and bottleneck profiling.
+- **P12**: Unified AI Control Surface (8770 primary control plane + stable Control API, with AIBroker 8875 retained for broker-specialist configuration/diagnostics).
