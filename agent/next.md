@@ -35,3 +35,12 @@ Acceptance:
 Planner schema guard for this task: keep every planner list at 20 entries or fewer and every list entry under 800 characters.
 
 Execution instruction: begin P11 now through the normal DevOrchestrator lifecycle. Continue automatically through planning, implementation, verification, review and bounded remediation until P11 reaches an accepted phase gate or an OWNER_GATE condition.
+Required redesign constraints from independent plan review (must be resolved in the next plan, not deferred):
+- Define concrete observable sources and schemas for test timing, accepted/rejected work, queue wait, retry, planning rounds and review outcomes; do not claim a metric that cannot be observed from current runtime signals.
+- Add durable session-continuity identity and request/result correlation for Context Hit Rate, or explicitly narrow the metric until such identity exists.
+- Specify deterministic interval mathematics: overlap union/deduplication, category precedence, clock-skew handling, missing-end handling, window clipping and data-quality flags.
+- Define an explicit event taxonomy including test, retry, planning, review, queue/provider/model/transport/owner/idle events and the timestamps needed to derive each interval.
+- Make event persistence concurrency-safe for daemon and Worker threads, with corruption recovery and scalable time-window reads that are not silently capped at 100 records.
+- Fresh-context acceptance must exercise the real dispatch/context-injection path and observe command construction; a fake Worker assertion is insufficient.
+- Real representative-day DevO + xray-hw-platform evidence is required to confirm/reject production bottleneck hypotheses; synthetic/replay data may validate analysis mechanics only.
+- Keep the design implementable in bounded phases: instrument missing observables first, then derive metrics, then dashboard/reporting, then representative-day acceptance.
