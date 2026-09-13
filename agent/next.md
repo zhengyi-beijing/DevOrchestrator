@@ -1,18 +1,25 @@
-# P10 Active-Project Progress Watchdog and Automatic Diagnostics
+# P11 Execution Accounting and Bottleneck Profiling
 
-Status: **COMPLETED / ACCEPTED / PROMOTED**
+Status: **PENDING DESIGN**
 
-Accepted code HEAD: `8550c3ca2476f2b11a1bb5b317dd4c5e0a68fcca`.
+Owner authorization: **START P11 / 2026-09-13**
 
-Final closure:
-- Round 8 closed the remaining live-identity and diagnostic-timeout promotion blockers.
-- Independent GPT-5.6 Sol final review approved the exact accepted HEAD with zero blockers.
-- 359 development tests passed on the exact accepted HEAD.
-- Stable was fast-forward promoted from `fbe1536` to `8550c3c` with rollback ref `backup/pre-p10-promotion-20260913`.
-- 359 post-promotion stable tests passed.
-- Userscript syntax, diff-check, and config validation passed.
-- Stable daemon restarted; ports 8770/8765 healthy; watchdog reports `degraded=false` and all configured projects `state=ok`.
-- Pre-existing stable local `docs/backlog.md` changes and untracked agent/Graphify files were preserved and not included in promotion.
-- No push performed.
+Goal: quantify DevOrchestrator development wall-clock cost before changing scheduling policy, using P10 watchdog data as one input and adding finer-grained execution accounting.
 
-Execution boundary: **STOP HERE per owner instruction. Do not begin P11 or any subsequent backlog task automatically.**
+Scope:
+- Persist queue/provider/context/model/test/review/retry/quota/owner/transport/idle timing per project/task/role.
+- Track provider, model and session continuity; compute Context Hit Rate and identify context churn caused by resource/model/session switching.
+- Measure failover latency from quota/rate-limit/provider-unhealthy detection to fallback execution start and expose avoidable waiting/retry.
+- Measure RDC/transport invocation count, command size, first-output latency, duration, output size and failure/retry count.
+- Detect lifecycle overhead: repeated planning, unresolved reviews, prolonged REVIEWING/BLOCKED, repository-truth churn and no-progress intervals.
+- Compute Effective Development Ratio and longest no-progress interval.
+- Add 8770 views for time breakdown, top bottlenecks, context hit rate, provider switches, failover latency, RDC statistics and longest stall.
+- Produce evidence-backed diagnoses such as reviewer_stall, quota_failover_delay, context_churn, transport_overhead and lifecycle_churn.
+
+Acceptance:
+- Analyze a representative DevO + xray-hw-platform development day.
+- Quantitatively confirm or reject: RDC large-command overhead, AI context churn, quota-without-timely-failover, and lifecycle/reviewer stall hypotheses.
+- Instrument and measure first. Do not perform broad scheduler optimization in P11; use measured bottlenecks to define later remediation.
+- Preserve self-hosting isolation: modify only `C:\work\github\DevOrchestrator-dev`; do not modify/restart/replace the stable controller except through the established promotion flow after acceptance.
+
+Execution instruction: begin P11 now through the normal DevOrchestrator lifecycle. Continue automatically through planning, implementation, verification, review and bounded remediation until P11 reaches an accepted phase gate or an OWNER_GATE condition.
