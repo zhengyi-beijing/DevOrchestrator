@@ -1230,11 +1230,19 @@ class TransitionExecutor:
         if not truth.valid:
             self._record_blocked(source_request_id, project_id, "repository truth unavailable", source_kind="control")
             return None
+        task_id = _current_task_id(snapshot)
+        if task_id is None:
+            self._record_blocked(source_request_id, project_id, "current task id is unavailable", source_kind="control")
+            return None
         with self._lock:
             ledger = self._load_ledger()
             broker_rows = [
                 row for row in ledger["executions"].values()
-                if isinstance(row, dict) and row.get("project_id") == project_id and row.get("engine") == "aibroker"
+                if isinstance(row, dict)
+                and row.get("project_id") == project_id
+                and row.get("engine") == "aibroker"
+                and (not row.get("task_id") or row.get("task_id") == task_id)
+                and (not row.get("head") or row.get("head") == truth.head)
             ]
             latest_any_broker = max(
                 broker_rows, key=lambda row: str(row.get("completed_at") or row.get("recovered_at") or row.get("started_at") or ""),
@@ -1260,10 +1268,6 @@ class TransitionExecutor:
                 if review_id not in ledger["executions"]:
                     self._record_blocked(source_request_id, project_id, "latest AIBroker Worker review transition is not yet applied", source_kind="control")
                     return None
-        task_id = _current_task_id(snapshot)
-        if task_id is None:
-            self._record_blocked(source_request_id, project_id, "current task id is unavailable", source_kind="control")
-            return None
         launch_task, guard_error = self._fresh_guard(
             project, snapshot, expected_branch=truth.branch, expected_head=truth.head,
             expected_task_id=task_id,
