@@ -16,10 +16,22 @@ Scope:
 - Add 8770 views for time breakdown, top bottlenecks, context hit rate, provider switches, failover latency, RDC statistics and longest stall.
 - Produce evidence-backed diagnoses such as reviewer_stall, quota_failover_delay, context_churn, transport_overhead and lifecycle_churn.
 
+Execution Lessons / Failure Memory foundation:
+- Persist structured verified lessons independently of chat memory, including failure fingerprint, scope, environment predicates, symptom, root cause, preferred and avoided actions, confidence, verification state, timestamps, and occurrence count.
+- Support global and project-scoped lessons; match deterministically from host, transport, shell, project, and runtime context.
+- Inject only relevant verified lessons into Planner, Worker/Remediator, and Reviewer context before dispatch, with bounded size and provenance.
+- Detect recurrence of a verified fingerprint as repeated_known_failure and include its wasted wall-clock, transport, and retry cost in P11 accounting.
+- Seed a verified lesson for the observed RDC PowerShell command-chaining incompatibility so a fresh execution context receives the shell-specific rule before constructing commands.
+- Keep automatic remediation conservative; broad scheduler and policy optimization remains outside P11.
+
 Acceptance:
 - Analyze a representative DevO + xray-hw-platform development day.
 - Quantitatively confirm or reject: RDC large-command overhead, AI context churn, quota-without-timely-failover, and lifecycle/reviewer stall hypotheses.
+- Demonstrate that a fresh execution context receives the applicable verified shell/transport lesson before command construction and does not repeat the seeded known failure.
+- Demonstrate that a synthetic or replayed recurrence is classified as repeated_known_failure and appears in accounting/dashboard evidence.
 - Instrument and measure first. Do not perform broad scheduler optimization in P11; use measured bottlenecks to define later remediation.
 - Preserve self-hosting isolation: modify only `C:\work\github\DevOrchestrator-dev`; do not modify/restart/replace the stable controller except through the established promotion flow after acceptance.
+
+Planner schema guard for this task: keep every planner list at 20 entries or fewer and every list entry under 800 characters.
 
 Execution instruction: begin P11 now through the normal DevOrchestrator lifecycle. Continue automatically through planning, implementation, verification, review and bounded remediation until P11 reaches an accepted phase gate or an OWNER_GATE condition.
