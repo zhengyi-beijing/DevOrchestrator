@@ -109,6 +109,37 @@ class AIBrokerTransitionTests(unittest.TestCase):
             self.assertEqual(running["state"], "recovery_required")
             self.assertFalse(running["recovery_safe_retry"])
 
+    def test_start_control_ignores_unsafe_recovery_from_stale_head(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            truth = read_repository_truth(repo); runtime.mkdir()
+            stale = {"project_id": "p1", "source_request_id": "old-worker", "engine": "aibroker",
+                     "task_id": "P11x", "state": "recovery_required", "recovery_safe_retry": False,
+                     "branch": truth.branch, "head": "stale-head", "started_at": "2026-09-13T01:00:00+00:00"}
+            (runtime / "transition-executor.json").write_text(json.dumps({"version": 1, "executions": {"old-worker": stale}}), encoding="utf-8")
+            port = FakePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            snapshot = {"state": "READY_TO_RUN", "telemetry": {"task_id": "P11x"},
+                        "worker": {"state": "not_started", "process_alive": False}}
+            launch = executor.start_control(broker_project(repo), snapshot, "new-control")
+            self.assertIsNotNone(launch)
+            executor._threads["new-control"].join(timeout=2)
+            self.assertEqual(len(port.requests), 1)
+
+    def test_start_control_blocks_unsafe_recovery_for_same_task_and_head(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            truth = read_repository_truth(repo); runtime.mkdir()
+            current = {"project_id": "p1", "source_request_id": "old-worker", "engine": "aibroker",
+                       "task_id": "P11x", "state": "recovery_required", "recovery_safe_retry": False,
+                       "branch": truth.branch, "head": truth.head, "started_at": "2026-09-13T01:00:00+00:00"}
+            (runtime / "transition-executor.json").write_text(json.dumps({"version": 1, "executions": {"old-worker": current}}), encoding="utf-8")
+            port = FakePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            snapshot = {"state": "READY_TO_RUN", "telemetry": {"task_id": "P11x"},
+                        "worker": {"state": "not_started", "process_alive": False}}
+            launch = executor.start_control(broker_project(repo), snapshot, "new-control")
+            self.assertIsNone(launch)
+            self.assertEqual(port.requests, [])
+
     def test_policy_accepts_aibroker_without_legacy_backends(self):
         with tempfile.TemporaryDirectory() as td:
             policy, error = _execution_policy(broker_project(Path(td)))
