@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,7 +121,7 @@ def collect_evidence(
             "branch": truth.branch,
             "head": truth.head,
             "dirty": truth.dirty,
-            "uncommitted_files": truth.uncommitted_files[:20],
+            "uncommitted_files": list(truth.dirty_entries[:20]),
             "error": truth.error,
         }
 
@@ -153,11 +154,32 @@ def collect_evidence(
             request_id = worker["request_id"]
 
         if ai_execution_port is not None and request_id:
-            try:
-                b_status = ai_execution_port.status(request_id)
-                broker_info = {"available": True, "request_id": request_id, "status": b_status}
-            except Exception as exc:
-                broker_info = {"available": False, "request_id": request_id, "error": str(exc)}
+            # Wrap status() in a daemon thread with a hard deadline so a blocking
+            # ai_execution_port implementation can never cause collect_evidence to
+            # run past the diagnostic deadline and permanently hold the single-flight slot.
+            broker_timeout = max(1.0, eff_deadline - time.monotonic())
+            _result: list[Any] = [None]
+            _exc: list[Optional[Exception]] = [None]
+
+            def _do_status() -> None:
+                try:
+                    _result[0] = ai_execution_port.status(request_id)
+                except Exception as e:
+                    _exc[0] = e
+
+            _bt = threading.Thread(target=_do_status, daemon=True, name="diag-broker-status")
+            _bt.start()
+            _bt.join(timeout=broker_timeout)
+            if _bt.is_alive():
+                broker_info = {
+                    "available": False,
+                    "request_id": request_id,
+                    "error": "status_call_timed_out",
+                }
+            elif _exc[0] is not None:
+                broker_info = {"available": False, "request_id": request_id, "error": str(_exc[0])}
+            else:
+                broker_info = {"available": True, "request_id": request_id, "status": _result[0]}
         else:
             broker_info = {"available": False, "reason": "no_request_id_or_port"}
         evidence["broker"] = broker_info

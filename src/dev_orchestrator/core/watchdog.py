@@ -1013,6 +1013,11 @@ class WatchdogCoordinator:
                     prow["last_diagnosis"] = "unknown"
                     cooldown_delta = (now.timestamp() + float(cooldown_min) * 60.0)
                     prow["cooldown_until"] = datetime.fromtimestamp(cooldown_delta, timezone.utc).isoformat()
+                    # Release the single-flight slot so the next advance() tick can start a
+                    # fresh diagnostic.  The blocked worker thread (if any) will eventually
+                    # acquire the lock, find state != "running" and fence_token stale, and
+                    # discard its late result — preserving existing late-result fencing.
+                    self._threads.pop(pid, None)
                     self._emit_milestone(
                         pid,
                         "DIAGNOSTIC_RESULT",
@@ -1536,12 +1541,20 @@ class WatchdogCoordinator:
             if current_pid != ev_pid:
                 self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_pid_mismatch")
                 return
-            # STABLE-IDENTITY: if evidence captured started_at, the current worker must carry
-            # the same value.  A reused PID owned by an unrelated/new process will have a
-            # different started_at — fail closed to prevent acting on a PID collision.
+            # STABLE-IDENTITY: fail closed unless both evidence and current snapshot carry a
+            # non-empty, matching started_at.  PID alone cannot distinguish a reused PID
+            # (OS recycled the slot for an unrelated process) or a race where a new execution
+            # began under the same PID.  Missing started_at in either direction is not a safe
+            # match — require both sides to be present and equal.
             ev_started_at = str(proc_liveness.get("started_at") or "").strip()
             current_started_at = str(current_worker.get("started_at") or "").strip()
-            if ev_started_at and ev_started_at != current_started_at:
+            if not ev_started_at:
+                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_evidence_started_at_absent")
+                return
+            if not current_started_at:
+                self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_current_started_at_absent")
+                return
+            if ev_started_at != current_started_at:
                 self._emit_owner_gate_once(pid, attempt_record, "agent_stalled_started_at_mismatch")
                 return
             try:
@@ -1570,12 +1583,19 @@ class WatchdogCoordinator:
             if current_pid != ev_pid:
                 self._emit_owner_gate_once(pid, attempt_record, "process_dead_pid_mismatch")
                 return
-            # STABLE-IDENTITY: if evidence captured started_at, the current worker must carry
-            # the same value.  A reused PID owned by an unrelated/new process will have a
-            # different started_at — fail closed to prevent acting on a PID collision.
+            # STABLE-IDENTITY: fail closed unless both evidence and current snapshot carry a
+            # non-empty, matching started_at.  Missing started_at in either direction is not
+            # a safe match — a reused PID or new execution after the dead-process snapshot
+            # may share the same PID with a completely different started_at.
             ev_started_at = str(proc_liveness.get("started_at") or "").strip()
             current_started_at = str(current_worker.get("started_at") or "").strip()
-            if ev_started_at and ev_started_at != current_started_at:
+            if not ev_started_at:
+                self._emit_owner_gate_once(pid, attempt_record, "process_dead_evidence_started_at_absent")
+                return
+            if not current_started_at:
+                self._emit_owner_gate_once(pid, attempt_record, "process_dead_current_started_at_absent")
+                return
+            if ev_started_at != current_started_at:
                 self._emit_owner_gate_once(pid, attempt_record, "process_dead_started_at_mismatch")
                 return
             # FR2B-LIVE-IDENTITY: re-probe live liveness at recovery time to independently

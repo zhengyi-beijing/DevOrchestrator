@@ -130,3 +130,20 @@ P10 Active-Project Progress Watchdog and Automatic Read-Only Diagnostics:
   - Git diff check: `git diff --check` clean.
   - Config validation smoke test passed.
   - Static guard verified: zero forbidden APIs in watchdog/diagnostics modules.
+
+P10 R8 Bounded Remediation (two high-severity blockers closed):
+- Blocker 1 — live worker identity binding (agent_stalled + process_dead):
+  - Changed both STABLE-IDENTITY checks in `_check_and_trigger_recovery` from conditional mismatch to fail-closed: recovery is now blocked unless BOTH `ev_started_at` (from evidence `process_liveness`) AND `current_started_at` (from snapshot `worker`) are present, non-empty, and equal.
+  - New gate codes: `agent_stalled_evidence_started_at_absent`, `agent_stalled_current_started_at_absent`, `process_dead_evidence_started_at_absent`, `process_dead_current_started_at_absent`.
+  - 20 existing tests updated to include matching `started_at` in evidence and snapshot fixtures; 5 new regression tests added covering all absent/mismatch combinations for both classes.
+- Blocker 2 — diagnostic timeout / single-flight permanence:
+  - In `collect_evidence` (`diagnostics.py`): wrapped `ai_execution_port.status(request_id)` in a daemon thread with `join(timeout=remaining_budget)` so the broker call cannot block indefinitely.  At most one orphaned broker thread per diagnostic (bounded by project count); late threads discard via existing late-result fence.
+  - In `_reap_overdue_attempts` (`watchdog.py`): after marking an attempt `timed_out`, call `self._threads.pop(pid, None)` to release the single-flight slot, allowing the next `advance()` tick to start a fresh diagnostic even if the old thread is still alive.
+  - Also fixed pre-existing `RepositoryTruth.uncommitted_files` AttributeError in `collect_evidence` (correct attribute is `dirty_entries`).
+  - 2 new regression tests added: `test_r8b2_single_flight_released_after_timeout_allows_new_diagnostic` (proves slot release + late-result fence), `test_r8b2_broker_status_call_is_bounded_by_deadline` (proves bounded broker call).
+- Verification:
+  - 359 tests passing cleanly (`python -m pytest tests_py/`).
+  - `node --check browser/chatgpt-web-adapter.user.js` passed.
+  - `git diff --check` clean (CRLF warnings on Windows only, no whitespace errors).
+  - Config validation: no regression.
+  - Static guard: zero forbidden APIs in watchdog/diagnostics modules.

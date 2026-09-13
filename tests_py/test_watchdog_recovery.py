@@ -76,6 +76,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
             self.runtime_dir, progress_channel=channel,
             liveness_probe=lambda p: True,  # FR2B-LIVE-IDENTITY: stub confirms PID alive
         )
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+        _started = "2026-09-13T06:00:00+00:00"
+        _ev = {"process_liveness": {"process_alive": True, "pid": 1234, "worker_state": "running", "started_at": _started}}
         att = {
             "attempt_key": "att-auto",
             "run_scope_key": "rscope-1",
@@ -86,13 +90,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
             # FR-2A: completed_at required for recovery to proceed
             "completed_at": _recent_completed_at(),
             # R3-F1/F2: evidence must match current snapshot for recovery to proceed
-            "evidence_hash": "bc9a67e4be8cf301",
-            "evidence": {
-                "process_liveness": {"process_alive": True, "pid": 1234, "worker_state": "running"},
-            },
+            "evidence_hash": compute_ev_hash(_ev),
+            "evidence": _ev,
         }
         # B-INTEGRITY: seal with record_integrity_hash so the pre-RESERVE check passes
-        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
         att["record_integrity_hash"] = compute_record_integrity_hash(att)
         prow = {"attempts": {"att-auto": att}}
         coordinator._cached_state["projects"]["p1"] = prow
@@ -106,7 +107,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             # R3-F1: snapshot must show EXECUTING lifecycle for agent_stalled recovery
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 1234, "state": "running"}},
+                      "worker": {"pid": 1234, "state": "running", "started_at": _started}},
             project_row=prow,
             attempt_key="att-auto",
             attempt_record=att,
@@ -145,6 +146,9 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "recovery_slots": {"rscope-1": "wd-prior-attempt"},
             "attempts": {},
         }
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        _started2 = "2026-09-13T06:00:00+00:00"
+        _ev2 = {"process_liveness": {"process_alive": True, "pid": 9876, "worker_state": "running", "started_at": _started2}}
         att2 = {
             "attempt_key": "att-second",
             "run_scope_key": "rscope-1",
@@ -153,10 +157,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "diagnosis": "agent_stalled",
             # FR-2A: completed_at required so check reaches slot verification
             "completed_at": _recent_completed_at(),
-            "evidence_hash": "cacf7f4ba8bc2796",
-            "evidence": {
-                "process_liveness": {"process_alive": True, "pid": 9876, "worker_state": "running"},
-            },
+            "evidence_hash": compute_ev_hash(_ev2),
+            "evidence": _ev2,
         }
         coordinator._check_and_trigger_recovery(
             project_config={
@@ -167,7 +169,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             # R3-F1: EXECUTING lifecycle so agent_stalled check passes before slot check
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 9876, "state": "running"}},
+                      "worker": {"pid": 9876, "state": "running", "started_at": _started2}},
             project_row=prow,
             attempt_key="att-second",
             attempt_record=att2,
@@ -364,6 +366,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
             liveness_probe=lambda p: False,  # FR2B-LIVE-IDENTITY: stub confirms PID dead
         )
 
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+        _started_dead = "2026-09-13T06:00:00+00:00"
+        _ev_dead = {"process_liveness": {"process_alive": False, "pid": 5678, "started_at": _started_dead}}
         att_confirmed_dead = {
             "attempt_key": "att-f2-confirmed",
             "run_scope_key": "rscope-f2b",
@@ -373,14 +379,11 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "owner_gate_required": False,
             # FR-2A: completed_at required; FR-2B: snapshot must supply matching pid
             "completed_at": _recent_completed_at(),
-            "evidence_hash": "46002a75ab06c6c7",
+            "evidence_hash": compute_ev_hash(_ev_dead),
             # Evidence confirms process is truly dead
-            "evidence": {
-                "process_liveness": {"process_alive": False, "pid": 5678},
-            },
+            "evidence": _ev_dead,
         }
         # B-INTEGRITY: seal with record_integrity_hash
-        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
         att_confirmed_dead["record_integrity_hash"] = compute_record_integrity_hash(att_confirmed_dead)
         prow = {"attempts": {"att-f2-confirmed": att_confirmed_dead}}
         coordinator._cached_state["projects"]["p1"] = prow
@@ -392,7 +395,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             # FR-2B: worker pid in snapshot must match evidence pid for process_dead
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
-                      "worker": {"pid": 5678, "state": "completed"}},
+                      "worker": {"pid": 5678, "state": "completed", "started_at": _started_dead}},
             project_row=prow,
             attempt_key="att-f2-confirmed",
             attempt_record=att_confirmed_dead,
@@ -679,6 +682,9 @@ class WatchdogRecoveryTests(unittest.TestCase):
         )
 
         # completed_at is in the past beyond any cooldown (simulated by old timestamp)
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        _started_stale = "2026-09-13T06:00:00+00:00"
+        _ev_stale = {"process_liveness": {"process_alive": True, "pid": 3333, "worker_state": "running", "started_at": _started_stale}}
         att = {
             "attempt_key": "att-f2-stale",
             "run_scope_key": "rscope-f2c",
@@ -686,10 +692,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
-            "evidence_hash": "341c0da696fd584b",
-            "evidence": {
-                "process_liveness": {"process_alive": True, "pid": 3333, "worker_state": "running"},
-            },
+            "evidence_hash": compute_ev_hash(_ev_stale),
+            "evidence": _ev_stale,
             "completed_at": "2020-01-01T00:00:00+00:00",  # very old evidence
         }
         prow = {
@@ -704,7 +708,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 3333, "state": "running"}},
+                      "worker": {"pid": 3333, "state": "running", "started_at": _started_stale}},
             project_row=prow,
             attempt_key="att-f2-stale",
             attempt_record=att,
@@ -729,6 +733,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
             dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)
         ).isoformat()
 
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+        _started_f2d = "2026-09-13T06:00:00+00:00"
+        _ev_f2d = {"process_liveness": {"process_alive": True, "pid": 4444, "worker_state": "running", "started_at": _started_f2d}}
         att = {
             "attempt_key": "att-f2-fresh",
             "run_scope_key": "rscope-f2d",
@@ -736,14 +744,11 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "state": "completed",
             "diagnosis": "agent_stalled",
             "owner_gate_required": False,
-            "evidence_hash": "d1237131c6857856",
-            "evidence": {
-                "process_liveness": {"process_alive": True, "pid": 4444, "worker_state": "running"},
-            },
+            "evidence_hash": compute_ev_hash(_ev_f2d),
+            "evidence": _ev_f2d,
             "completed_at": recent_completed,
         }
         # B-INTEGRITY: seal with record_integrity_hash
-        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
         att["record_integrity_hash"] = compute_record_integrity_hash(att)
         prow = {
             "attempts": {"att-f2-fresh": att},
@@ -758,7 +763,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 4444, "state": "running"}},
+                      "worker": {"pid": 4444, "state": "running", "started_at": _started_f2d}},
             project_row=prow,
             attempt_key="att-f2-fresh",
             attempt_record=att,
@@ -1081,7 +1086,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         """FR-2A: Recovery must be blocked when completed_at is absent from the attempt record."""
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 7001, "worker_state": "running"}}
+        _started_7001 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 7001, "worker_state": "running", "started_at": _started_7001}}
         att = {
             "attempt_key": "att-fr2a-missing-cat",
             "run_scope_key": "rscope-fr2a-1",
@@ -1105,7 +1111,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "watchdog": {"enabled": True, "auto_recovery": True},
             },
             snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 7001, "state": "running"}},
+                      "worker": {"pid": 7001, "state": "running", "started_at": _started_7001}},
             project_row=prow,
             attempt_key="att-fr2a-missing-cat",
             attempt_record=att,
@@ -1119,7 +1125,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         """FR-2A: Recovery must be blocked when completed_at is present but not parseable."""
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 7002, "worker_state": "running"}}
+        _started_7002 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 7002, "worker_state": "running", "started_at": _started_7002}}
         att = {
             "attempt_key": "att-fr2a-malformed-cat",
             "run_scope_key": "rscope-fr2a-2",
@@ -1143,7 +1150,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "watchdog": {"enabled": True, "auto_recovery": True},
             },
             snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 7002, "state": "running"}},
+                      "worker": {"pid": 7002, "state": "running", "started_at": _started_7002}},
             project_row=prow,
             attempt_key="att-fr2a-malformed-cat",
             attempt_record=att,
@@ -1159,7 +1166,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
         from dev_orchestrator.core.watchdog import RECOVERY_COMPLETED_AT_CLOCK_SKEW_S
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 7003, "worker_state": "running"}}
+        _started_7003 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 7003, "worker_state": "running", "started_at": _started_7003}}
         # Set completed_at to well beyond the clock-skew tolerance
         far_future = (
             _dt.datetime.now(_dt.timezone.utc)
@@ -1188,7 +1196,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "watchdog": {"enabled": True, "auto_recovery": True},
             },
             snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 7003, "state": "running"}},
+                      "worker": {"pid": 7003, "state": "running", "started_at": _started_7003}},
             project_row=prow,
             attempt_key="att-fr2a-future-cat",
             attempt_record=att,
@@ -1203,7 +1211,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         older than the configured cooldown window."""
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 7004, "worker_state": "running"}}
+        _started_7004 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 7004, "worker_state": "running", "started_at": _started_7004}}
         att = {
             "attempt_key": "att-fr2a-stale-cat",
             "run_scope_key": "rscope-fr2a-4",
@@ -1227,7 +1236,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "watchdog": {"enabled": True, "auto_recovery": True},
             },
             snapshot={"project_id": "p1", "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 7004, "state": "running"}},
+                      "worker": {"pid": 7004, "state": "running", "started_at": _started_7004}},
             project_row=prow,
             attempt_key="att-fr2a-stale-cat",
             attempt_record=att,
@@ -1397,7 +1406,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         PID was reused and the prior process ended).  Snapshot match alone is insufficient."""
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 9001, "worker_state": "running"}}
+        _started_9001 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 9001, "worker_state": "running", "started_at": _started_9001}}
         att = {
             "attempt_key": "att-live-stalled-dead",
             "run_scope_key": "rscope-live-1",
@@ -1424,7 +1434,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 9001, "state": "running"}},
+                      "worker": {"pid": 9001, "state": "running", "started_at": _started_9001}},
             project_row=prow,
             attempt_key="att-live-stalled-dead",
             attempt_record=att,
@@ -1482,7 +1492,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         raises an exception.  An unavailable probe must not be treated as a safe match."""
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 9003, "worker_state": "running"}}
+        _started_9003 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 9003, "worker_state": "running", "started_at": _started_9003}}
         att = {
             "attempt_key": "att-live-stalled-probe-err",
             "run_scope_key": "rscope-live-3",
@@ -1512,7 +1523,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 9003, "state": "running"}},
+                      "worker": {"pid": 9003, "state": "running", "started_at": _started_9003}},
             project_row=prow,
             attempt_key="att-live-stalled-probe-err",
             attempt_record=att,
@@ -1529,7 +1540,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         snapshot, or worker unexpectedly restarted).  Stale evidence must not trigger recovery."""
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
 
-        evidence = {"process_liveness": {"process_alive": False, "pid": 9004}}
+        _started_9004 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": False, "pid": 9004, "started_at": _started_9004}}
         att = {
             "attempt_key": "att-live-dead-alive",
             "run_scope_key": "rscope-live-4",
@@ -1555,7 +1567,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "watchdog": {"enabled": True, "auto_recovery": True},
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
-                      "worker": {"pid": 9004, "state": "running"}},
+                      "worker": {"pid": 9004, "state": "running", "started_at": _started_9004}},
             project_row=prow,
             attempt_key="att-live-dead-alive",
             attempt_record=att,
@@ -1571,7 +1583,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         fail closed and do not enqueue recovery."""
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
 
-        evidence = {"process_liveness": {"process_alive": False, "pid": 9005}}
+        _started_9005 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": False, "pid": 9005, "started_at": _started_9005}}
         att = {
             "attempt_key": "att-live-dead-probe-err",
             "run_scope_key": "rscope-live-5",
@@ -1600,7 +1613,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "watchdog": {"enabled": True, "auto_recovery": True},
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
-                      "worker": {"pid": 9005, "state": "running"}},
+                      "worker": {"pid": 9005, "state": "running", "started_at": _started_9005}},
             project_row=prow,
             attempt_key="att-live-dead-probe-err",
             attempt_record=att,
@@ -1615,8 +1628,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
         the PID is still alive and the current worker state is active.  Existing safe recovery
         paths must be preserved when fresh evidence and current identity agree."""
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 9010, "worker_state": "running"}}
+        _started_9010 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 9010, "worker_state": "running", "started_at": _started_9010}}
         att = {
             "attempt_key": "att-live-stalled-ok",
             "run_scope_key": "rscope-live-10",
@@ -1628,7 +1643,6 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "evidence": evidence,
         }
         # B-INTEGRITY: seal with record_integrity_hash
-        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
         att["record_integrity_hash"] = compute_record_integrity_hash(att)
         channel = DummyProgressChannel()
         coordinator = WatchdogCoordinator(
@@ -1645,7 +1659,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 9010, "state": "running"}},
+                      "worker": {"pid": 9010, "state": "running", "started_at": _started_9010}},
             project_row=prow,
             attempt_key="att-live-stalled-ok",
             attempt_record=att,
@@ -1660,8 +1674,10 @@ class WatchdogRecoveryTests(unittest.TestCase):
         the PID is still dead.  Existing safe recovery paths must be preserved when fresh
         evidence and current identity agree."""
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
 
-        evidence = {"process_liveness": {"process_alive": False, "pid": 9011}}
+        _started_9011 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": False, "pid": 9011, "started_at": _started_9011}}
         att = {
             "attempt_key": "att-live-dead-ok",
             "run_scope_key": "rscope-live-11",
@@ -1673,7 +1689,6 @@ class WatchdogRecoveryTests(unittest.TestCase):
             "evidence": evidence,
         }
         # B-INTEGRITY: seal with record_integrity_hash
-        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
         att["record_integrity_hash"] = compute_record_integrity_hash(att)
         channel = DummyProgressChannel()
         coordinator = WatchdogCoordinator(
@@ -1689,7 +1704,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 "watchdog": {"enabled": True, "auto_recovery": True},
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
-                      "worker": {"pid": 9011, "state": "completed"}},
+                      "worker": {"pid": 9011, "state": "completed", "started_at": _started_9011}},
             project_row=prow,
             attempt_key="att-live-dead-ok",
             attempt_record=att,
@@ -1913,7 +1928,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         completed attempt record.  Legacy/untrusted records without the field fail closed."""
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 12001, "worker_state": "running"}}
+        _started_12001 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12001, "worker_state": "running", "started_at": _started_12001}}
         att = {
             "attempt_key": "att-r7b-nohash",
             "run_scope_key": "rscope-r7b-1",
@@ -1940,7 +1956,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 12001, "state": "running"}},
+                      "worker": {"pid": 12001, "state": "running", "started_at": _started_12001}},
             project_row=prow,
             attempt_key="att-r7b-nohash",
             attempt_record=att,
@@ -2027,7 +2043,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
         from dev_orchestrator.core.watchdog import compute_record_integrity_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 12003, "worker_state": "running"}}
+        _started_12003 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12003, "worker_state": "running", "started_at": _started_12003}}
         att = {
             "attempt_key": "att-r7b-cat-tamper",
             "run_scope_key": "rscope-r7b-3",
@@ -2055,7 +2072,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 12003, "state": "running"}},
+                      "worker": {"pid": 12003, "state": "running", "started_at": _started_12003}},
             project_row=prow,
             attempt_key="att-r7b-cat-tamper",
             attempt_record=att,
@@ -2072,7 +2089,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
         from dev_orchestrator.core.watchdog import compute_record_integrity_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 12004, "worker_state": "running"}}
+        _started_12004 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12004, "worker_state": "running", "started_at": _started_12004}}
         att = {
             "attempt_key": "att-r7b-key-tamper",  # original key
             "run_scope_key": "rscope-r7b-4",
@@ -2100,7 +2118,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 12004, "state": "running"}},
+                      "worker": {"pid": 12004, "state": "running", "started_at": _started_12004}},
             project_row=prow,
             attempt_key="att-r7b-key-tamper",  # the parameter (original, used for lookup)
             attempt_record=att,
@@ -2117,7 +2135,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
         from dev_orchestrator.core.watchdog import compute_record_integrity_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 12005, "worker_state": "running"}}
+        _started_12005 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12005, "worker_state": "running", "started_at": _started_12005}}
         att = {
             "attempt_key": "att-r7b-rscope-tamper",
             "run_scope_key": "rscope-r7b-original",  # original scope
@@ -2145,7 +2164,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 12005, "state": "running"}},
+                      "worker": {"pid": 12005, "state": "running", "started_at": _started_12005}},
             project_row=prow,
             attempt_key="att-r7b-rscope-tamper",
             attempt_record=att,
@@ -2162,7 +2181,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
         from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
         from dev_orchestrator.core.watchdog import compute_record_integrity_hash
 
-        evidence = {"process_liveness": {"process_alive": True, "pid": 12010, "worker_state": "running"}}
+        _started_12010 = "2026-09-13T06:00:00+00:00"
+        evidence = {"process_liveness": {"process_alive": True, "pid": 12010, "worker_state": "running", "started_at": _started_12010}}
         att = {
             "attempt_key": "att-r7b-ok",
             "run_scope_key": "rscope-r7b-ok",
@@ -2189,7 +2209,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
             },
             snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
                       "lifecycle_state": "EXECUTING",
-                      "worker": {"pid": 12010, "state": "running"}},
+                      "worker": {"pid": 12010, "state": "running", "started_at": _started_12010}},
             project_row=prow,
             attempt_key="att-r7b-ok",
             attempt_record=att,
@@ -2198,3 +2218,219 @@ class WatchdogRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(rec, "Recovery must proceed when record integrity is valid")
         self.assertEqual(rec["action"], "continue")
         self.assertIn(rec["state"], ("requested", "reserved"))
+
+    # -----------------------------------------------------------------------
+    # P10-R8 BLOCKER 1 regressions: fail-closed started_at for both recovery classes
+    # -----------------------------------------------------------------------
+
+    def test_r8b1_agent_stalled_missing_evidence_started_at_fails_closed(self):
+        """R8-B1: agent_stalled recovery must fail closed when evidence process_liveness
+        lacks started_at.  PID alone is insufficient — absent started_at is not a safe match."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 13001, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-r8b1-nostartev",
+            "run_scope_key": "rscope-r8b1-1",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r8b1-nostartev": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 13001, "state": "running", "started_at": "2026-09-13T06:00:00+00:00"}},
+            project_row=prow,
+            attempt_key="att-r8b1-nostartev",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_evidence_started_at_absent")
+
+    def test_r8b1_agent_stalled_missing_current_started_at_fails_closed(self):
+        """R8-B1: agent_stalled recovery must fail closed when the current snapshot worker
+        lacks started_at.  A worker without started_at cannot be positively identified."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 13002, "worker_state": "running",
+                                          "started_at": "2026-09-13T06:00:00+00:00"}}
+        att = {
+            "attempt_key": "att-r8b1-nostartsnap",
+            "run_scope_key": "rscope-r8b1-2",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r8b1-nostartsnap": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Snapshot worker has no started_at — cannot confirm identity
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 13002, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-r8b1-nostartsnap",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_current_started_at_absent")
+
+    def test_r8b1_agent_stalled_both_started_at_absent_fails_closed(self):
+        """R8-B1: agent_stalled recovery must fail closed when both evidence and snapshot
+        worker lack started_at.  Neither PID alone is a safe identity match."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": True, "pid": 13003, "worker_state": "running"}}
+        att = {
+            "attempt_key": "att-r8b1-bothnostart",
+            "run_scope_key": "rscope-r8b1-3",
+            "state": "completed",
+            "diagnosis": "agent_stalled",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: True,
+        )
+        prow = {"attempts": {"att-r8b1-bothnostart": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "lifecycle_state": "EXECUTING",
+                      "worker": {"pid": 13003, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-r8b1-bothnostart",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        # Both absent: evidence gate fires first (it's checked before snapshot)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "agent_stalled_evidence_started_at_absent")
+
+    def test_r8b1_process_dead_missing_evidence_started_at_fails_closed(self):
+        """R8-B1: process_dead recovery must fail closed when evidence process_liveness
+        lacks started_at.  A dead process cannot be identified without its start time."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": False, "pid": 13004}}
+        att = {
+            "attempt_key": "att-r8b1-dead-nostartev",
+            "run_scope_key": "rscope-r8b1-4",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: False,
+        )
+        prow = {"attempts": {"att-r8b1-dead-nostartev": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "worker": {"pid": 13004, "state": "running", "started_at": "2026-09-13T06:00:00+00:00"}},
+            project_row=prow,
+            attempt_key="att-r8b1-dead-nostartev",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "process_dead_evidence_started_at_absent")
+
+    def test_r8b1_process_dead_missing_current_started_at_fails_closed(self):
+        """R8-B1: process_dead recovery must fail closed when current snapshot worker
+        lacks started_at.  Cannot confirm the dead evidence belongs to the current execution."""
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+
+        evidence = {"process_liveness": {"process_alive": False, "pid": 13005,
+                                          "started_at": "2026-09-13T06:00:00+00:00"}}
+        att = {
+            "attempt_key": "att-r8b1-dead-nostartsnap",
+            "run_scope_key": "rscope-r8b1-5",
+            "state": "completed",
+            "diagnosis": "process_dead",
+            "owner_gate_required": False,
+            "completed_at": _recent_completed_at(),
+            "evidence_hash": compute_ev_hash(evidence),
+            "evidence": evidence,
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(
+            self.runtime_dir, progress_channel=channel,
+            liveness_probe=lambda p: False,
+        )
+        prow = {"attempts": {"att-r8b1-dead-nostartsnap": att}}
+        coordinator._cached_state["projects"]["p1"] = prow
+        coordinator._check_and_trigger_recovery(
+            project_config={
+                "project_id": "p1",
+                "repo_path": str(self.repo_dir),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            },
+            # Snapshot worker has no started_at
+            snapshot={"project_id": "p1", "repo_path": str(self.repo_dir),
+                      "worker": {"pid": 13005, "state": "running"}},
+            project_row=prow,
+            attempt_key="att-r8b1-dead-nostartsnap",
+            attempt_record=att,
+        )
+        self.assertIsNone(att.get("recovery"))
+        gate_events = [e for e in channel.events if e[1] == "OWNER_GATE"]
+        self.assertEqual(len(gate_events), 1)
+        self.assertEqual(gate_events[0][2]["details"]["reason"], "process_dead_current_started_at_absent")
+
+
+if __name__ == "__main__":
+    unittest.main()

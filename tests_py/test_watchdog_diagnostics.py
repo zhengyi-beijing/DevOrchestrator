@@ -288,6 +288,65 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
                     msg=f"Forbidden API/command {forbidden!r} found in {fname}",
                 )
 
+    def test_r8b2_broker_status_call_is_bounded_by_deadline(self):
+        """R8-B2 regression: collect_evidence must not block indefinitely on
+        ai_execution_port.status().  When the port call takes longer than the remaining
+        deadline budget, collect_evidence returns with a timeout error in broker evidence
+        and does NOT block the diagnostic worker thread forever."""
+        import threading as _threading
+        import time
+
+        # A port whose status() call blocks until we allow it
+        _unblock = _threading.Event()
+
+        class _BlockingPort:
+            def status(self, request_id):
+                _unblock.wait(timeout=30)  # simulates a very long blocking call
+                return "late"
+
+        snapshot = {
+            "project_id": "p1",
+            "actuation": {"source_request_id": "req-block-1"},
+        }
+        project = {"project_id": "p1", "repo_path": ""}  # empty path → repo truth fails quickly
+
+        # Case 1: deadline already exhausted → broker section skipped entirely, must not block
+        past_deadline = time.monotonic() - 1.0
+        ev1 = collect_evidence(
+            project=project,
+            snapshot=snapshot,
+            runtime_root=self.runtime_dir,
+            ai_execution_port=_BlockingPort(),
+            deadline=past_deadline,
+        )
+        self.assertIsNotNone(ev1, "collect_evidence must return even when deadline exhausted")
+        # All sections skipped due to past deadline
+        self.assertEqual(ev1.get("repository_truth", {}).get("status"), "skipped_deadline")
+
+        # Case 2: very tight deadline (only budget for the broker section) but broker blocks.
+        # collect_evidence must return promptly with a timed-out broker entry.
+        tight_deadline = time.monotonic() + 0.3  # 300ms max budget
+
+        ev2 = collect_evidence(
+            project=project,
+            snapshot=snapshot,
+            runtime_root=self.runtime_dir,
+            ai_execution_port=_BlockingPort(),
+            deadline=tight_deadline,
+        )
+        broker2 = ev2.get("broker", {})
+        # Either skipped (deadline exhausted before broker) or timed out during broker call
+        if isinstance(broker2, dict) and broker2.get("status") != "skipped_deadline":
+            self.assertFalse(
+                broker2.get("available", True),
+                "broker must report unavailable when status() call timed out or skipped",
+            )
+        # In either case: function must have returned — if we reached here, it did not block
+        self.assertIsNotNone(ev2)
+
+        # Cleanup: release all blocking threads spawned above
+        _unblock.set()
+
 
 if __name__ == "__main__":
     unittest.main()
