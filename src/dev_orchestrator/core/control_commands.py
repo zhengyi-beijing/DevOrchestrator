@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import re
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -158,7 +159,7 @@ class ControlCommandCoordinator:
             else:
                 if (
                     _nonblank(telemetry.get("task_id")) != _nonblank(row.get("task_id"))
-                    or "COMPLETE" not in str(snapshot.get("next_status") or "").upper()
+                    or not re.search(r"\bCOMPLETED?\b", str(snapshot.get("next_status") or ""), re.IGNORECASE)
                     or staged_successor != next_task_id
                 ):
                     continue
