@@ -33,3 +33,12 @@ Out of scope:
 - Arbitrary AI selection of backlog items or free-form backlog parsing.
 - Reordering the staged roadmap without an owner-approved manifest change.
 - P11b accounting implementation itself, provider routing changes, or resuming paused projects.
+
+Fixed design constraints from the first independent review:
+- Missing manifest is NOT end-of-roadmap. Missing, malformed, or inconsistent staged definitions must block. End-of-roadmap is valid only when a valid manifest explicitly contains the completed task with `successor: null`.
+- Exactly-once must use a durable two-phase ledger state, not an in-memory/file rollback heuristic.
+- Before mutating `agent/next.md`, persist a `materializing` intent keyed by the accepted review `source_request_id`, including reviewed branch/HEAD/status hash, completed task id, successor id, staged spec path/digest, and original next.md digest.
+- After the intent is durable, atomically replace `agent/next.md`, commit only that file locally, then finalize the same ledger record to existing `handoff/planning_required` with the materialized commit HEAD.
+- Recovery of `materializing` must be deterministic: if repo is still at reviewed HEAD with original next.md, resume materialization; if repo is exactly the one expected materialization commit descendant and next.md/spec digest match, finalize handoff without another commit; any unrelated HEAD/content change blocks.
+- Never try to 'undo' a successful git commit by only restoring file bytes. Post-commit recovery must reconcile from the durable intent.
+- Keep all planner JSON entries concise enough to satisfy the existing bounded-string schema; do not restate the whole task in one list item.
