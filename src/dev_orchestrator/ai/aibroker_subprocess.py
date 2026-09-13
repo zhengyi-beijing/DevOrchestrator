@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,23 +48,26 @@ class AIBrokerExecutionPort:
         return env
 
     def execute(self, request: AIRoleRequest) -> AIRoleResult:
-        argv = self._build_argv(request)
         env = self._build_env()
         transport_timeout = self.config.process_timeout_seconds
         if request.timeout_seconds is not None:
             transport_timeout = max(transport_timeout, float(request.timeout_seconds) + 60.0)
         try:
-            completed = subprocess.run(
-                argv,
-                cwd=str(self.config.broker_repo),
-                env=env,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                timeout=transport_timeout,
-                check=False,
-            )
+            with tempfile.TemporaryDirectory(prefix="devorch-aibroker-") as temp_dir:
+                prompt_file = Path(temp_dir) / "prompt.txt"
+                prompt_file.write_text(request.prompt, encoding="utf-8")
+                argv = self._build_argv(request, prompt_file)
+                completed = subprocess.run(
+                    argv,
+                    cwd=str(self.config.broker_repo),
+                    env=env,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                    timeout=transport_timeout,
+                    check=False,
+                )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AIBrokerInvocationError(f"broker invocation failed: {exc}") from exc
 
@@ -115,7 +119,7 @@ class AIBrokerExecutionPort:
             raise AIBrokerInvocationError("broker reconciliation result must be an object")
         return payload
 
-    def _build_argv(self, request: AIRoleRequest) -> list[str]:
+    def _build_argv(self, request: AIRoleRequest, prompt_file: Path) -> list[str]:
         argv = [
             str(self.config.python_executable), "-m", "ai_resource_broker.cli",
             "--config", str(self.config.config_path),
@@ -124,7 +128,7 @@ class AIBrokerExecutionPort:
             argv += ["--database", str(self.config.database_path)]
         argv += [
             "dispatch", "--role", request.role, "--quality", request.quality,
-            "--independence", request.independence, "--prompt", request.prompt,
+            "--independence", request.independence, "--prompt-file", str(prompt_file),
             "--request-id", request.request_id,
             "--cwd", str(request.working_directory),
         ]
