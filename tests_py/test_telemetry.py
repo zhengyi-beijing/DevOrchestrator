@@ -29,6 +29,7 @@ class TelemetryParityTests(unittest.TestCase):
     def test_task_id_and_state_parity(self):
         self.assertEqual(extract_task_id("P4.2.3b DESIGN READY"), "P4.2.3b")
         self.assertEqual(resolve_monitor_state({"kind": "none", "state": "not_started", "process_alive": False}, "STATUS: DESIGN READY", None), "READY_TO_RUN")
+        self.assertEqual(resolve_monitor_state({"kind": "none", "state": "not_started", "process_alive": False}, "Status: **READY_TO_RUN**", None), "READY_TO_RUN")
         self.assertEqual(resolve_monitor_state({"kind": "task", "state": "failed", "process_alive": False}, "", None), "WORKER_FAILED")
         self.assertEqual(resolve_monitor_state({"kind": "task", "state": "running", "process_alive": False}, "", None), "WORKER_LOST")
 
