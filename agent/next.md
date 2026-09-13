@@ -11,6 +11,9 @@ Scope:
 - Track provider, model and session continuity; compute Context Hit Rate and identify context churn caused by resource/model/session switching.
 - Measure failover latency from quota/rate-limit/provider-unhealthy detection to fallback execution start and expose avoidable waiting/retry.
 - Measure RDC/transport invocation count, command size, first-output latency, duration, output size and failure/retry count.
+- Audit multi-project RDC execution isolation before attributing stalls to RDC itself: determine whether projects share a command shell, request queue, transport lock, or interactive Windows session; distinguish true deadlock from head-of-line blocking, starvation, session coupling, and transport serialization.
+- Add bounded concurrency probes: while project A runs a long blocking/streaming command, projects B/C must still complete short commands promptly; cancelling A must not terminate or corrupt B/C; reconnect/recovery must not cross-contaminate project execution state. Record queue wait, start latency, execution identity, cancellation scope, and reconnect effects as P11 evidence.
+- If shared-session serialization is observed, treat per-project execution context/process isolation, asynchronous long-command handling, and scoped timeout/cancel as remediation candidates derived from evidence; do not assume an RDC product limitation or perform a broad execution-layer rewrite before the audit establishes the failure boundary.
 - Detect lifecycle overhead: repeated planning, unresolved reviews, prolonged REVIEWING/BLOCKED, repository-truth churn and no-progress intervals.
 - Compute Effective Development Ratio and longest no-progress interval.
 - Add 8770 views for time breakdown, top bottlenecks, context hit rate, provider switches, failover latency, RDC statistics and longest stall.
@@ -27,6 +30,7 @@ Execution Lessons / Failure Memory foundation:
 Acceptance:
 - Analyze a representative DevO + xray-hw-platform development day.
 - Quantitatively confirm or reject: RDC large-command overhead, AI context churn, quota-without-timely-failover, and lifecycle/reviewer stall hypotheses.
+- Quantitatively classify multi-project RDC behavior as isolated concurrency, head-of-line blocking/serialization, session coupling, starvation, or true deadlock where evidence supports it; demonstrate the A-long/B-C-short, scoped-cancel, and reconnect-isolation probes and identify whether the limiting boundary is DevO, the RDC transport/API, or the Windows interactive session.
 - Demonstrate that a fresh execution context receives the applicable verified shell/transport lesson before command construction and does not repeat the seeded known failure.
 - Demonstrate that a synthetic or replayed recurrence is classified as repeated_known_failure and appears in accounting/dashboard evidence.
 - Instrument and measure first. Do not perform broad scheduler optimization in P11; use measured bottlenecks to define later remediation.
