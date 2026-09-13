@@ -181,3 +181,24 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - 372 tests passing in full test suite (`python -m unittest discover -s tests_py`).
   - Userscript syntax check passed (`node --check browser/chatgpt-web-adapter.user.js`).
   - Git diff check clean (`git diff --check`).
+
+## P11x Deferred Staged Handoff (Planner-Owned Materialization) (2026-09-14)
+
+- Implemented planner-owned staged handoff allowing automatic progression to staged successors without pre-approval repo mutation:
+  - Pure roadmap reader `src/dev_orchestrator/core/staged_roadmap.py` (`read_successor()`, `read_raw()`, `sha256_bytes()`, `RoadmapResult`) importing `extract_task_id` from `telemetry.py`.
+  - Fail-closed validation for `agent/staged/roadmap.json` against schema v1, POSIX paths under `agent/staged/`, non-null parity, duplicate/self task ID guards, and strict UTF-8 LF-only spec contracts.
+  - Extended `TransitionExecutor._record_handoff()` to capture `staged_successor`, `staged_spec_path`, `staged_spec_sha256`, `reviewed_branch`, and `reviewed_head` without repo writes or storing raw spec text.
+  - Integrated reviewer-'next' COMPLETE path in `TransitionExecutor.advance()` with `read_successor()`: blocks fail-closed on invalid roadmap, settles on absent or null successor, and records staged handoff on valid successor after repository-truth guard passes.
+  - Extended `ControlCommandCoordinator._resume_decision_handoffs()` to recognize staged handoffs and delegate to `AIPlannerCoordinator.start_deferred()`.
+  - Refactored `AIPlannerCoordinator.start()` through shared `_begin_lifecycle()`, and added `start_deferred()` enforcing strict repository truth, clean worktree, branch/head match, predecessor `agent/next.md` digest, and staged spec digest validation.
+  - Implemented `AIPlannerCoordinator._task_source()` returning staged successor spec and audit header for deferred records while preserving exact byte-identical prompt output for non-deferred runs across initial planner, retry, remediation, and review prompts.
+  - Implemented `_apply_deferred_plan()` in `AIPlannerCoordinator` with strict pre-write digest re-checks, TOCTOU repository truth re-read, atomic write of rendered spec to `agent/next.md`, single commit via `_commit_plan()`, and reset-free predecessor byte restoration recovery (`git add -- agent/next.md`) if write/commit fails.
+  - Real staged roadmap verified: `P11x -> P11b -> P11c -> P11d -> null` with machine-distinct IDs and staged specs.
+- Comprehensive Verification:
+  - 22 unit tests in `tests_py/test_staged_roadmap.py`.
+  - 3 new unit tests in `tests_py/test_transition_executor.py`.
+  - 2 new unit tests in `tests_py/test_control_commands.py`.
+  - 11 comprehensive unit and integration tests in `tests_py/test_staged_handoff.py`.
+  - Full test suite: 415 tests and 16 subtests passing cleanly (`python -m pytest tests_py -q`).
+  - Userscript syntax check: `node --check browser/chatgpt-web-adapter.user.js` passed.
+  - Git diff check: `git diff --check` clean.

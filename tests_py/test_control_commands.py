@@ -61,6 +61,12 @@ class FakePlanner:
         self.ready.append({"plan_id":plan_id,"command_id":command_id,"project_id":project["project_id"],
                            "task_id":telemetry.get("task_id"),"ready_head":"planned-head","state":"ready"})
         return plan_id, "planning started"
+    def start_deferred(self, project, snapshot, command_id, handoff):
+        self.calls.append(("deferred", project["project_id"], command_id, handoff.get("staged_successor")))
+        plan_id = "ai_plan:" + command_id
+        self.ready.append({"plan_id":plan_id,"command_id":command_id,"project_id":project["project_id"],
+                           "task_id":handoff.get("staged_successor"),"ready_head":"planned-head","state":"ready"})
+        return plan_id, "planning started"
     def ready_records(self): return list(self.ready)
     def terminal_records(self): return []
     def mark_control_synced(self, plan_id): pass
@@ -147,6 +153,59 @@ class ControlCommandTests(unittest.TestCase):
             self.assertEqual(second[0]["lifecycle_action"],"execute")
             self.assertEqual(executor.calls[0][1],"READY_TO_RUN")
             self.assertEqual(executor.calls[0][0],"p1")
+
+    def test_staged_decision_handoff_calls_start_deferred_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; repo.mkdir(); runtime = base / "runtime"
+            config = base / "projects.json"; write_config(config, repo)
+            planner = FakePlanner(); executor = FakeExecutor(launch=True)
+            executor.records["review-r1"] = {
+                "project_id": "p1", "state": "handoff", "outcome": "planning_required",
+                "task_id": "P1", "next_task_id": "P2", "staged_successor": "P2",
+                "staged_spec_path": "agent/staged/P2.md", "staged_spec_sha256": "abc",
+                "reviewed_branch": "main", "reviewed_head": "head1",
+            }
+            coordinator = ControlCommandCoordinator(runtime, planner)
+            snapshot = {"projects": [{"project_id": "p1", "state": "IDLE", "next_status": "**COMPLETE**", "telemetry": {"task_id": "P1"}}]}
+            first = coordinator.advance(config, snapshot, executor)
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0]["lifecycle_action"], "plan")
+            self.assertEqual(first[0]["source"], "automatic_review_handoff")
+            self.assertTrue(executor.records["review-r1"]["handoff_consumed"])
+            self.assertEqual(planner.calls[0][0], "deferred")
+            self.assertEqual(planner.calls[0][1], "p1")
+            self.assertEqual(planner.calls[0][3], "P2")
+            self.assertTrue(planner.calls[0][2].startswith("auto-"))
+
+            # Second tick on same coordinator
+            second = coordinator.advance(config, snapshot, executor)
+            self.assertEqual(len(planner.calls), 1)
+
+            # Recreate coordinator instance
+            coordinator2 = ControlCommandCoordinator(runtime, planner)
+            third = coordinator2.advance(config, snapshot, executor)
+            self.assertEqual(len(planner.calls), 1)
+
+    def test_staged_decision_handoff_skips_when_snapshot_mismatches(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; repo.mkdir(); runtime = base / "runtime"
+            config = base / "projects.json"; write_config(config, repo)
+            planner = FakePlanner(); executor = FakeExecutor(launch=True)
+            executor.records["review-r1"] = {
+                "project_id": "p1", "state": "handoff", "outcome": "planning_required",
+                "task_id": "P1", "next_task_id": "P2", "staged_successor": "P2",
+            }
+            coordinator = ControlCommandCoordinator(runtime, planner)
+            # Mismatch task_id
+            mismatch_task = {"projects": [{"project_id": "p1", "state": "IDLE", "next_status": "**COMPLETE**", "telemetry": {"task_id": "P2"}}]}
+            self.assertEqual(coordinator.advance(config, mismatch_task, executor), [])
+            self.assertNotIn("handoff_consumed", executor.records["review-r1"])
+
+            # Mismatch status
+            mismatch_status = {"projects": [{"project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P1"}}]}
+            self.assertEqual(coordinator.advance(config, mismatch_status, executor), [])
+            self.assertNotIn("handoff_consumed", executor.records["review-r1"])
+            self.assertEqual(len(planner.calls), 0)
 
     def test_ready_plan_idle_handoff_requires_exact_plan_head(self):
         with tempfile.TemporaryDirectory() as td:

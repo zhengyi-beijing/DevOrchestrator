@@ -402,6 +402,89 @@ class TransitionExecutorActuationTests(unittest.TestCase):
             self.assertEqual(len(backend.started), 0)
             self.assertEqual(executor.advance(summary, config), [])
 
+    def test_reviewed_complete_task_with_staged_successor_emits_staged_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P1")
+            (repo / "agent" / "next.md").write_text(
+                "# P1 bounded task\nStatus: **COMPLETE**\n", encoding="utf-8"
+            )
+            staged = repo / "agent" / "staged"; staged.mkdir(parents=True, exist_ok=True)
+            (staged / "roadmap.json").write_text(
+                json.dumps({"schema_version": 1, "tasks": [{"task_id": "P1", "successor": "P2", "successor_spec_path": "agent/staged/P2.md"}]}),
+                encoding="utf-8",
+            )
+            spec_bytes = b"# P2 Bounded Task\n\nStatus: **PENDING DESIGN**\n\nGoal: test.\n"
+            (staged / "P2.md").write_bytes(spec_bytes)
+            subprocess.run(["git", "-C", str(repo), "add", "agent/"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "complete P1 with roadmap"], check=True, stdout=subprocess.DEVNULL)
+            head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            write_decision(runtime, head=head, task_id="P1")
+            summary = ready_summary(repo, "P1"); summary["projects"][0]["state"] = "IDLE"
+            summary["projects"][0]["next_status"] = "**COMPLETE**"
+            backend = FakeBackend("agy"); executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            self.assertEqual(executor.advance(summary, config), [])
+            record = executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual((record["state"], record["outcome"], record["next_task_id"]), ("handoff", "planning_required", "P2"))
+            self.assertEqual(record["staged_successor"], "P2")
+            self.assertEqual(record["staged_spec_path"], "agent/staged/P2.md")
+            self.assertEqual(record["reviewed_head"], head)
+            self.assertIsNotNone(record["staged_spec_sha256"])
+            self.assertNotIn("spec_text", record)
+            cur_head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            self.assertEqual(cur_head, head)
+            self.assertEqual((repo / "agent" / "next.md").read_text(encoding="utf-8"), "# P1 bounded task\nStatus: **COMPLETE**\n")
+
+    def test_reviewed_complete_task_with_invalid_roadmap_blocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P1")
+            (repo / "agent" / "next.md").write_text(
+                "# P1 bounded task\nStatus: **COMPLETE**\n", encoding="utf-8"
+            )
+            staged = repo / "agent" / "staged"; staged.mkdir(parents=True, exist_ok=True)
+            (staged / "roadmap.json").write_text("{bad json", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "complete P1 with bad roadmap"], check=True, stdout=subprocess.DEVNULL)
+            head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            write_decision(runtime, head=head, task_id="P1")
+            summary = ready_summary(repo, "P1"); summary["projects"][0]["state"] = "IDLE"
+            summary["projects"][0]["next_status"] = "**COMPLETE**"
+            backend = FakeBackend("agy"); executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            self.assertEqual(executor.advance(summary, config), [])
+            record = executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual(record["state"], "blocked")
+            self.assertIn("staged roadmap invalid", record["reason"])
+            cur_head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            self.assertEqual(cur_head, head)
+
+    def test_reviewed_complete_task_with_end_of_roadmap_settles(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P1")
+            (repo / "agent" / "next.md").write_text(
+                "# P1 bounded task\nStatus: **COMPLETE**\n", encoding="utf-8"
+            )
+            staged = repo / "agent" / "staged"; staged.mkdir(parents=True, exist_ok=True)
+            (staged / "roadmap.json").write_text(
+                json.dumps({"schema_version": 1, "tasks": [{"task_id": "P1", "successor": None, "successor_spec_path": None}]}),
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "agent/"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "complete P1 with null successor"], check=True, stdout=subprocess.DEVNULL)
+            head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            write_decision(runtime, head=head, task_id="P1")
+            summary = ready_summary(repo, "P1"); summary["projects"][0]["state"] = "IDLE"
+            summary["projects"][0]["next_status"] = "**COMPLETE**"
+            backend = FakeBackend("agy"); executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            self.assertEqual(executor.advance(summary, config), [])
+            record = executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual(record["state"], "settled")
+            self.assertEqual(record["outcome"], "task_complete")
+
     def test_legacy_not_ready_block_reconciles_to_settled_when_complete_truth_matches(self):
         with tempfile.TemporaryDirectory() as td:
             base=Path(td); repo=base/"repo"; runtime=base/"runtime"
