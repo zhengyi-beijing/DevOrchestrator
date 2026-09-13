@@ -147,3 +147,19 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - `git diff --check` clean (CRLF warnings on Windows only, no whitespace errors).
   - Config validation: no regression.
   - Static guard: zero forbidden APIs in watchdog/diagnostics modules.
+
+## P10 Final Acceptance and Stable Promotion (2026-09-13)
+
+- Accepted P10 code HEAD: `8550c3ca2476f2b11a1bb5b317dd4c5e0a68fcca`.
+- Independent GPT-5.6 Sol final promotion review returned `approve` with zero blockers and exact matching `reviewed_head`.
+- Development exact-HEAD regression: 359 tests PASS.
+- Stable controller fast-forward promoted from `fbe153698337d4f38c46074fe1901db807fd173b` to `8550c3ca2476f2b11a1bb5b317dd4c5e0a68fcca`.
+- Rollback ref created: `backup/pre-p10-promotion-20260913`.
+- Post-promotion stable regression: 359 tests PASS.
+- Browser userscript syntax, `git diff --check`, and five-project `validate-config` all PASS.
+- Stable daemon restarted successfully; runtime PID `12980`, `last_error=null`.
+- Port 8770 watchdog API reports `degraded=false`; all five configured projects report `state=ok`.
+- Port 8765 Browser Bridge health reports `ok`.
+- Existing stable `docs/backlog.md` modification and untracked agent/Graphify files were preserved and excluded from promotion.
+- No push was performed.
+- Owner boundary: P10 is complete. Stop execution here; do not start P11 automatically.
