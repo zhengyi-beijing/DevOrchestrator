@@ -44,6 +44,41 @@ class FakePort:
         )
 
 
+class FailOncePlannerPort(FakePort):
+    def __init__(self):
+        super().__init__()
+        self.failed_once = False
+
+    def execute(self, request):
+        if request.role == "planner" and not self.failed_once:
+            self.requests.append(request)
+            self.failed_once = True
+            return AIRoleResult(
+                request_id=request.request_id,
+                role_run_id=request.role_run_id,
+                status="failed",
+                error="claude did not emit a JSON result",
+                dispatch_id="dispatch-bad",
+                execution_id="execution-bad",
+                resource_context=ResourceContext("bad-r", "p1", "a1", "m1"),
+            )
+        return super().execute(request)
+
+
+class AlwaysFailPlannerPort(FakePort):
+    def execute(self, request):
+        self.requests.append(request)
+        return AIRoleResult(
+            request_id=request.request_id,
+            role_run_id=request.role_run_id,
+            status="failed",
+            error="claude did not emit a JSON result",
+            dispatch_id="dispatch-bad",
+            execution_id="execution-bad",
+            resource_context=ResourceContext("bad-r", "p1", "a1", "m1"),
+        )
+
+
 def make_repo(repo: Path) -> None:
     (repo / "agent").mkdir(parents=True)
     (repo / "agent" / "next.md").write_text(
@@ -101,6 +136,70 @@ class AIPlannerTests(unittest.TestCase):
             self.assertEqual(status.stdout.strip(), "")
             log = subprocess.run(["git", "-C", str(repo), "log", "-1", "--pretty=%s"], capture_output=True, text=True, check=True)
             self.assertEqual(log.stdout.strip(), "plan(P14): freeze executable design")
+
+    def test_planner_failure_retries_and_recovers_without_new_control(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = FailOncePlannerPort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {
+                    "enabled": True, "quality": "high", "review_quality": "high",
+                    "review_independence": "resource", "max_attempts": 3,
+                }},
+            }
+            snapshot = {"project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P14"}}
+            plan_id, _ = coordinator.start(project, snapshot, "command-retry")
+            deadline = time.time() + 5
+            row = None
+            while time.time() < deadline:
+                row = coordinator.state()["plans"].get(plan_id)
+                if row and row.get("state") not in {"planning", "reviewing", "applying"}:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(row["state"], "ready", row)
+            self.assertEqual([r.role for r in port.requests], ["planner", "planner", "reviewer"])
+            self.assertTrue(port.requests[1].request_id.endswith(":planner:retry-1"))
+            self.assertEqual(port.requests[1].previous_resource_context.resource_id, "bad-r")
+            self.assertIn("[PLANNER_RETRY]", port.requests[1].prompt)
+            self.assertIn("claude did not emit a JSON result", port.requests[1].prompt)
+            self.assertEqual(row["planner_attempt_count"], 2)
+            self.assertEqual(row["planner_retry_count"], 1)
+            self.assertEqual(len(row["planner_attempts"]), 2)
+            self.assertEqual(row["planner_attempts"][0]["reason"], "claude did not emit a JSON result")
+            self.assertIsNone(row["planner_attempts"][1]["reason"])
+
+    def test_planner_retry_exhaustion_fails_bounded(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = AlwaysFailPlannerPort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {"enabled": True, "max_attempts": 2}},
+            }
+            snapshot = {"project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P14"}}
+            plan_id, _ = coordinator.start(project, snapshot, "command-exhaust")
+            deadline = time.time() + 5
+            row = None
+            while time.time() < deadline:
+                row = coordinator.state()["plans"].get(plan_id)
+                if row and row.get("state") not in {"planning", "reviewing", "applying"}:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(row["state"], "failed", row)
+            self.assertIn("planner failed after 2 attempts", row["reason"])
+            self.assertEqual([r.role for r in port.requests], ["planner", "planner"])
+            self.assertEqual(row["planner_attempt_count"], 2)
+            self.assertEqual(row["planner_retry_count"], 1)
+            self.assertEqual(len(row["planner_attempts"]), 2)
+            self.assertIn("PENDING DESIGN", (repo / "agent" / "next.md").read_text(encoding="utf-8"))
+
 
     def test_restart_marks_active_plan_recovery_required(self):
         with tempfile.TemporaryDirectory() as td:
