@@ -150,15 +150,28 @@ class ControlCommandCoordinator:
             if project is None or snapshot is None or next_task_id is None:
                 continue
             telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
-            if _nonblank(telemetry.get("task_id")) != next_task_id or "PENDING DESIGN" not in str(snapshot.get("next_status") or "").upper():
-                continue
+            staged_successor = _nonblank(row.get("staged_successor"))
+            is_staged = staged_successor is not None
+            if not is_staged:
+                if _nonblank(telemetry.get("task_id")) != next_task_id or "PENDING DESIGN" not in str(snapshot.get("next_status") or "").upper():
+                    continue
+            else:
+                if (
+                    _nonblank(telemetry.get("task_id")) != _nonblank(row.get("task_id"))
+                    or "COMPLETE" not in str(snapshot.get("next_status") or "").upper()
+                    or staged_successor != next_task_id
+                ):
+                    continue
             continuation_id = _continuation_id(source_id)
             history_path = self.history / (continuation_id + ".json")
             existing = read_json(history_path, None)
             if isinstance(existing, dict) and _nonblank(existing.get("plan_id")):
                 executor.mark_handoff_consumed(source_id, continuation_id, str(existing["plan_id"]))
                 outcomes.append(existing); continue
-            plan_id, reason = self.planner.start(project, snapshot, continuation_id)
+            if is_staged:
+                plan_id, reason = self.planner.start_deferred(project, snapshot, continuation_id, row)
+            else:
+                plan_id, reason = self.planner.start(project, snapshot, continuation_id)
             now = utc_now_iso()
             if plan_id is None:
                 executor.mark_handoff_blocked(source_id, "automatic planner handoff failed: " + reason)

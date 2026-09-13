@@ -11,6 +11,7 @@ from typing import Any
 from dev_orchestrator.ai.contracts import AIRoleRequest, ResourceContext
 from dev_orchestrator.ai.execution_port import AIExecutionPort
 from dev_orchestrator.core.repository import read_repository_truth
+from dev_orchestrator.core.staged_roadmap import read_raw, read_successor, sha256_bytes
 from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
@@ -157,6 +158,65 @@ class AIPlannerCoordinator:
         with self._lock:
             return copy.deepcopy(self._load_state())
 
+    def _begin_lifecycle(
+        self,
+        project: dict[str, Any],
+        policy: dict[str, Any],
+        command_id: str,
+        task_id: str,
+        truth: Any,
+        base_fields: dict[str, Any],
+    ) -> tuple[str | None, str]:
+        from dev_orchestrator.core.project_context import context_prompt_block
+        context_block, context_resolution = context_prompt_block(project, "planner")
+        ctx_decl = project.get("project_context") or {}
+        if ctx_decl.get("enabled") and ctx_decl.get("require_valid", True) and context_resolution.state == "invalid":
+            return None, f"durable project context is invalid: {context_resolution.reason}"
+        plan_id = "ai_plan:" + command_id
+        project_id = str(project.get("project_id") or "")
+        repo_text = str(project.get("repo_path") or "")
+        binding = project.get("conversation_binding")
+        with self._lock:
+            state = self._load_state()
+            if plan_id in state["plans"]:
+                return plan_id, "planner lifecycle already exists"
+            record: dict[str, Any] = {
+                "plan_id": plan_id,
+                "command_id": command_id,
+                "project_id": project_id,
+                "task_id": task_id,
+                "repo_path": repo_text,
+                "branch": truth.branch,
+                "head": truth.head,
+                "status_hash": truth.status_hash,
+                "state": "planning",
+                "started_at": utc_now_iso(),
+                "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
+                "context_block": context_block,
+                "context_state": context_resolution.state,
+                "context_digest": context_resolution.document.digest if context_resolution.document else None,
+                "context_sources": copy.deepcopy(context_resolution.sources),
+                "rejection_chain": [],
+                "remediation_round": 0,
+            }
+            record.update(base_fields)
+            state["plans"][plan_id] = record
+            if binding and isinstance(binding, dict):
+                self._project_bindings[project_id] = copy.deepcopy(binding)
+            self._save_state(state)
+        if self.progress_channel is not None and hasattr(self.progress_channel, "register_project"):
+            self.progress_channel.register_project(project)
+        thread = threading.Thread(
+            target=self._run_cycle,
+            args=(plan_id, project, policy),
+            name="devorch-plan-" + project_id,
+            daemon=True,
+        )
+        with self._lock:
+            self._threads[plan_id] = thread
+        thread.start()
+        return plan_id, "planning started"
+
     def start(self, project: dict[str, Any], snapshot: dict[str, Any], command_id: str) -> tuple[str | None, str]:
         if self.port is None:
             return None, "AIBroker execution port unavailable"
@@ -179,52 +239,82 @@ class AIPlannerCoordinator:
             next_text = next_path.read_text(encoding="utf-8")
         except OSError:
             return None, "agent/next.md unavailable"
-        from dev_orchestrator.core.project_context import context_prompt_block
-        context_block, context_resolution = context_prompt_block(project, "planner")
-        ctx_decl = project.get("project_context") or {}
-        if ctx_decl.get("enabled") and ctx_decl.get("require_valid", True) and context_resolution.state == "invalid":
-            return None, f"durable project context is invalid: {context_resolution.reason}"
-        plan_id = "ai_plan:" + command_id
-        binding = project.get("conversation_binding")
-        with self._lock:
-            state = self._load_state()
-            if plan_id in state["plans"]:
-                return plan_id, "planner lifecycle already exists"
-            state["plans"][plan_id] = {
-                "plan_id": plan_id,
-                "command_id": command_id,
-                "project_id": project_id,
-                "task_id": task_id,
-                "repo_path": repo_text,
-                "branch": truth.branch,
-                "head": truth.head,
-                "status_hash": truth.status_hash,
-                "next_text": next_text,
-                "state": "planning",
-                "started_at": utc_now_iso(),
-                "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
-                "context_block": context_block,
-                "context_state": context_resolution.state,
-                "context_digest": context_resolution.document.digest if context_resolution.document else None,
-                "context_sources": copy.deepcopy(context_resolution.sources),
-                "rejection_chain": [],
-                "remediation_round": 0,
-            }
-            if binding and isinstance(binding, dict):
-                self._project_bindings[project_id] = copy.deepcopy(binding)
-            self._save_state(state)
-        if self.progress_channel is not None and hasattr(self.progress_channel, "register_project"):
-            self.progress_channel.register_project(project)
-        thread = threading.Thread(
-            target=self._run_cycle,
-            args=(plan_id, project, policy),
-            name="devorch-plan-" + project_id,
-            daemon=True,
+        return self._begin_lifecycle(
+            project, policy, command_id, task_id, truth, {"next_text": next_text}
         )
-        with self._lock:
-            self._threads[plan_id] = thread
-        thread.start()
-        return plan_id, "planning started"
+
+    def start_deferred(
+        self,
+        project: dict[str, Any],
+        snapshot: dict[str, Any],
+        command_id: str,
+        handoff: dict[str, Any],
+    ) -> tuple[str | None, str]:
+        if self.port is None:
+            return None, "AIBroker execution port unavailable"
+        policy, error = _planner_policy(project)
+        if policy is None:
+            return None, error
+        project_id = _nonblank(project.get("project_id"))
+        repo_text = _nonblank(project.get("repo_path"))
+        if project_id is None or repo_text is None:
+            return None, "planner project identity incomplete"
+
+        staged_successor = _nonblank(handoff.get("staged_successor"))
+        staged_spec_path = _nonblank(handoff.get("staged_spec_path"))
+        staged_spec_sha256 = _nonblank(handoff.get("staged_spec_sha256"))
+        reviewed_branch = _nonblank(handoff.get("reviewed_branch"))
+        reviewed_head = _nonblank(handoff.get("reviewed_head"))
+        handoff_task_id = _nonblank(handoff.get("task_id"))
+        if (
+            staged_successor is None
+            or staged_spec_path is None
+            or staged_spec_sha256 is None
+            or reviewed_branch is None
+            or reviewed_head is None
+            or handoff_task_id is None
+        ):
+            return None, "staged handoff metadata incomplete"
+
+        repo = Path(repo_text)
+        truth = read_repository_truth(repo)
+        if not truth.valid or truth.dirty:
+            return None, "planner requires a clean repository"
+        if truth.branch != reviewed_branch or truth.head != reviewed_head:
+            return None, "repository moved since review"
+
+        predecessor_bytes = read_raw(repo, "agent/next.md")
+        if predecessor_bytes is None:
+            return None, "agent/next.md unavailable"
+        try:
+            predecessor_text = predecessor_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "agent/next.md unavailable"
+
+        rm_res = read_successor(repo, handoff_task_id)
+        if rm_res.kind != "successor":
+            if rm_res.kind == "invalid":
+                return None, f"staged roadmap invalid: {rm_res.reason}"
+            return None, f"staged roadmap invalid: expected successor, got {rm_res.kind}"
+        if (
+            rm_res.successor_task_id != staged_successor
+            or rm_res.spec_path != staged_spec_path
+            or rm_res.spec_sha256 != staged_spec_sha256
+        ):
+            return None, "staged spec changed since handoff"
+
+        base_fields = {
+            "deferred": True,
+            "predecessor_task_id": handoff_task_id,
+            "predecessor_next_sha256": sha256_bytes(predecessor_bytes),
+            "next_text": predecessor_text,
+            "staged_spec_path": staged_spec_path,
+            "staged_spec_sha256": staged_spec_sha256,
+            "staged_spec_text": rm_res.spec_text,
+        }
+        return self._begin_lifecycle(
+            project, policy, command_id, staged_successor, truth, base_fields
+        )
 
     def ready_records(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -578,6 +668,9 @@ class AIPlannerCoordinator:
         ):
             self._finish(plan_id, "failed", "repository changed during planning")
             return
+        if record.get("deferred"):
+            self._apply_deferred_plan(plan_id, record, plan, review_reason, project)
+            return
         next_path = repo / "agent" / "next.md"
         try:
             original = next_path.read_text(encoding="utf-8")
@@ -599,6 +692,74 @@ class AIPlannerCoordinator:
                 pass
             self._finish(plan_id, "failed", f"plan apply failed: {exc}")
             return
+        self._record_ready_and_emit(plan_id, record, repo, commit, review_reason, project)
+
+    def _apply_deferred_plan(
+        self, plan_id: str, record: dict[str, Any], plan: dict[str, Any],
+        review_reason: str, project: Optional[dict[str, Any]] = None,
+    ) -> None:
+        repo = Path(record["repo_path"])
+        cur_next = read_raw(repo, "agent/next.md")
+        if cur_next is None:
+            self._finish(plan_id, "failed", "agent/next.md unavailable during plan apply")
+            return
+        if sha256_bytes(cur_next) != record.get("predecessor_next_sha256"):
+            self._finish(plan_id, "failed", "agent/next.md changed during planning")
+            return
+        staged_spec_path = str(record.get("staged_spec_path") or "")
+        cur_spec = read_raw(repo, staged_spec_path)
+        if cur_spec is None or sha256_bytes(cur_spec) != record.get("staged_spec_sha256"):
+            self._finish(plan_id, "failed", "staged spec changed during planning")
+            return
+        try:
+            spec_text = cur_spec.decode("utf-8")
+            updated = self._render_next(spec_text, plan, review_reason)
+        except Exception as exc:
+            self._finish(plan_id, "failed", f"plan apply failed: {exc}")
+            return
+        pre_write_truth = read_repository_truth(repo)
+        if (
+            not pre_write_truth.valid or pre_write_truth.dirty
+            or pre_write_truth.branch != record["branch"]
+            or pre_write_truth.head != record["head"]
+            or pre_write_truth.status_hash != record["status_hash"]
+        ):
+            self._finish(plan_id, "failed", "repository changed during planning")
+            return
+        next_path = repo / "agent" / "next.md"
+        try:
+            next_path.write_bytes(updated.encode("utf-8"))
+            commit = self._commit_plan(repo, record["task_id"])
+        except Exception as exc:
+            recovery_truth = read_repository_truth(repo)
+            if recovery_truth.valid and recovery_truth.head == record["head"]:
+                try:
+                    next_path.write_bytes(cur_next)
+                    subprocess.run(
+                        ["git", "-C", str(repo), "add", "--", "agent/next.md"],
+                        capture_output=True, timeout=15, **hidden_subprocess_kwargs(),
+                    )
+                except Exception:
+                    pass
+                after_restore_truth = read_repository_truth(repo)
+                if (
+                    not after_restore_truth.valid
+                    or after_restore_truth.dirty
+                    or after_restore_truth.status_hash != record["status_hash"]
+                ):
+                    self._finish(plan_id, "failed", f"plan apply failed: {exc}; repository not restored cleanly")
+                    return
+                self._finish(plan_id, "failed", f"plan apply failed: {exc}")
+                return
+            else:
+                self._finish(plan_id, "failed", f"plan apply failed: {exc}")
+                return
+        self._record_ready_and_emit(plan_id, record, repo, commit, review_reason, project)
+
+    def _record_ready_and_emit(
+        self, plan_id: str, record: dict[str, Any], repo: Path, commit: str,
+        review_reason: str, project: Optional[dict[str, Any]] = None,
+    ) -> None:
         final_truth = read_repository_truth(repo)
         if not final_truth.valid or final_truth.dirty or final_truth.head == record["head"]:
             self._finish(plan_id, "failed", "plan commit did not produce a clean new HEAD")
@@ -709,6 +870,16 @@ class AIPlannerCoordinator:
             self._save_state(state)
 
     @staticmethod
+    def _task_source(record: dict[str, Any]) -> tuple[str, str]:
+        if record.get("deferred"):
+            path = str(record.get("staged_spec_path") or "")
+            pred_id = str(record.get("predecessor_task_id") or "")
+            heading = f"Staged successor task spec ({path}; agent/next.md still advertises completed predecessor {pred_id} and must not be used as the task)"
+            text = str(record.get("staged_spec_text") or "")
+            return heading, text
+        return "Current agent/next.md", str(record.get("next_text") or "")
+
+    @staticmethod
     def _planner_prompt(
         record: dict[str, Any],
         retry_reason: str | None = None,
@@ -760,9 +931,10 @@ class AIPlannerCoordinator:
             )
         if record.get("context_block"):
             prompt += f"{record['context_block']}\n\n"
+        heading, task_text = AIPlannerCoordinator._task_source(record)
         prompt += (
-            "Current agent/next.md:\n---BEGIN NEXT---\n"
-            + record["next_text"]
+            f"{heading}:\n---BEGIN NEXT---\n"
+            + task_text
             + "\n---END NEXT---\n"
         )
         return prompt
@@ -781,8 +953,10 @@ class AIPlannerCoordinator:
             prompt += f"{record['context_block']}\n\n"
         else:
             prompt = prompt[:-1]
+        heading, task_text = AIPlannerCoordinator._task_source(record)
+        task_heading = heading if record.get("deferred") else "Original task"
         prompt += (
-            "Original task:\n---BEGIN NEXT---\n" + record["next_text"] + "\n---END NEXT---\n\n"
+            f"{task_heading}:\n---BEGIN NEXT---\n" + task_text + "\n---END NEXT---\n\n"
             + "Proposed plan JSON:\n" + json.dumps(plan, ensure_ascii=False, indent=2)
         )
         return prompt

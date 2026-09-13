@@ -26,6 +26,7 @@ from dev_orchestrator.agents.registry import BackendRegistry
 from dev_orchestrator.agents.router import AgentRouter
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.core.repository import read_repository_truth
+from dev_orchestrator.core.staged_roadmap import read_successor
 from dev_orchestrator.core.project_status import write_execution_status
 from dev_orchestrator.core.websol import NextAction, WebSolEvent, WebSolRole
 from dev_orchestrator.monitor.telemetry import extract_task_id
@@ -528,13 +529,17 @@ class TransitionExecutor:
     def _record_handoff(
         self, source_request_id: str, project_id: str, reviewed_task_id: str,
         next_task_id: str, reason: str,
+        *,
+        staged: Any = None,
+        reviewed_branch: str | None = None,
+        reviewed_head: str | None = None,
     ) -> None:
         with self._lock:
             ledger = self._load_ledger()
             existing = ledger["executions"].get(source_request_id)
             if existing is not None and not _legacy_not_ready_block(existing):
                 return
-            ledger["executions"][source_request_id] = {
+            row: dict[str, Any] = {
                 "project_id": project_id, "source_request_id": source_request_id,
                 "source_kind": "decision", "task_id": reviewed_task_id,
                 "next_task_id": next_task_id, "state": "handoff",
@@ -542,6 +547,13 @@ class TransitionExecutor:
                 "recorded_at": utc_now_iso(),
                 **({"legacy_reconciled_from": existing} if existing is not None else {}),
             }
+            if staged is not None:
+                row["staged_successor"] = staged.successor_task_id
+                row["staged_spec_path"] = staged.spec_path
+                row["staged_spec_sha256"] = staged.spec_sha256
+                row["reviewed_branch"] = reviewed_branch
+                row["reviewed_head"] = reviewed_head
+            ledger["executions"][source_request_id] = row
             self._save_ledger(ledger)
         if self._progress_channel is not None:
             self._progress_channel.emit(
@@ -1143,7 +1155,16 @@ class TransitionExecutor:
             else:
                 current_task = _advertised_task_id(snapshot)
                 if current_task == task_id and _task_marked_complete(snapshot):
-                    truth = read_repository_truth(project.get("repo_path") or "")
+                    repo_dir = project.get("repo_path") or ""
+                    rm_res = read_successor(repo_dir, task_id)
+                    if rm_res.kind == "invalid":
+                        self._record_blocked(
+                            request_id, project_id,
+                            f"staged roadmap invalid: {rm_res.reason}",
+                            task_id=task_id, source_kind="decision",
+                        )
+                        continue
+                    truth = read_repository_truth(repo_dir)
                     reviewed_hash = _non_blank_config(record.get("review_status_hash"))
                     if (
                         not truth.valid or truth.branch != branch or truth.head != head
@@ -1153,6 +1174,15 @@ class TransitionExecutor:
                             request_id, project_id,
                             "reviewed COMPLETE task repository truth changed before terminal settle",
                             task_id=task_id, source_kind="decision",
+                        )
+                    elif rm_res.kind == "successor":
+                        self._record_handoff(
+                            request_id, project_id, task_id,
+                            str(rm_res.successor_task_id),
+                            "staged roadmap specifies successor task; planner handoff required",
+                            staged=rm_res,
+                            reviewed_branch=truth.branch,
+                            reviewed_head=truth.head,
                         )
                     else:
                         self._record_settled(
