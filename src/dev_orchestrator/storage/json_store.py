@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -56,6 +57,39 @@ def ensure_dir(path: PathLike) -> Path:
     return target
 
 
+def _windows_replace_file(source: Path, target: Path) -> bool:
+    """Try Windows ReplaceFileW; return False for transient sharing conflicts."""
+    import ctypes
+
+    replace_file = ctypes.WinDLL("kernel32", use_last_error=True).ReplaceFileW
+    replace_file.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p]
+    replace_file.restype = ctypes.c_int
+    if replace_file(str(target), str(source), None, 0, None, None):
+        return True
+    error = ctypes.get_last_error()
+    if error in (5, 32, 33):
+        return False
+    raise OSError(error, "ReplaceFileW failed", str(target))
+
+
+def _atomic_replace(source: PathLike, target: PathLike) -> None:
+    """Atomically replace a runtime file, tolerating bounded Windows sharing races."""
+    source_path = Path(source)
+    target_path = Path(target)
+    delays = (0.02, 0.05, 0.10, 0.20)
+    for attempt in range(len(delays) + 1):
+        try:
+            os.replace(source_path, target_path)
+            return
+        except PermissionError as exc:
+            if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32, 33):
+                raise
+            if target_path.exists() and _windows_replace_file(source_path, target_path):
+                return
+            if attempt >= len(delays):
+                raise
+            time.sleep(delays[attempt])
+
 def write_json(path: PathLike, value: Any, indent: Optional[int] = None) -> None:
     """Atomically write ``value`` as UTF-8 JSON to ``path``."""
     target = Path(path)
@@ -69,7 +103,7 @@ def write_json(path: PathLike, value: Any, indent: Optional[int] = None) -> None
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_name, target)
+        _atomic_replace(tmp_name, target)
     except BaseException:
         try:
             os.unlink(tmp_name)
@@ -104,7 +138,7 @@ def write_text(path: PathLike, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
-        os.replace(tmp_name, target)
+        _atomic_replace(tmp_name, target)
     except BaseException:
         try:
             os.unlink(tmp_name)
