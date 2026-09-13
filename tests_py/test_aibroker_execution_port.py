@@ -75,6 +75,24 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         self.assertNotIn("--provider", argv)
 
     @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
+    def test_long_prompt_uses_temp_file_not_command_line(self, run):
+        seen = {}
+        def fake_run(argv, **kwargs):
+            prompt_path = Path(argv[argv.index("--prompt-file") + 1])
+            seen["prompt"] = prompt_path.read_text(encoding="utf-8")
+            seen["argv"] = list(argv)
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=json.dumps(self.payload()), stderr=""
+            )
+        run.side_effect = fake_run
+        prompt = "review ✓ " + ("x" * 40000)
+        result = self.port.execute(self.request(prompt=prompt))
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(seen["prompt"], prompt)
+        self.assertNotIn(prompt, seen["argv"])
+        self.assertIn("--prompt-file", seen["argv"])
+
+    @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
     def test_execute_handles_unicode_reviewer_output_with_checkmark(self, run):
         reviewer_output = "✅ REVIEW ACCEPTED: All requirements met ✓ ✔"
         payload = self.payload(
