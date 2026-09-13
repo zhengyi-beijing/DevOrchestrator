@@ -42,3 +42,11 @@ Fixed design constraints from the first independent review:
 - Recovery of `materializing` must be deterministic: if repo is still at reviewed HEAD with original next.md, resume materialization; if repo is exactly the one expected materialization commit descendant and next.md/spec digest match, finalize handoff without another commit; any unrelated HEAD/content change blocks.
 - Never try to 'undo' a successful git commit by only restoring file bytes. Post-commit recovery must reconcile from the durable intent.
 - Keep all planner JSON entries concise enough to satisfy the existing bounded-string schema; do not restate the whole task in one list item.
+
+Owner resolution after bounded review gate:
+- Successor spec status is a closed interface: require exactly one line whose trimmed text is exactly `Status: **PENDING DESIGN**`. Missing, duplicate, negated, lowercase/alternate wording, extra prose on the Status line, or any noncanonical form blocks. Reuse the exact sentinel expected by `AIPlannerCoordinator`; do not broaden planner parsing.
+- Add tests for canonical status, missing status, duplicate status, `NOT PENDING DESIGN`, lowercase/noncanonical variants, and extra text after the canonical marker.
+- Pre-commit cleanup/restore is not terminal unless repository truth is proven restored. If temp cleanup, index reset, or original `agent/next.md` restoration fails, keep the durable row in `materializing`, record a bounded materialization failure/degraded reason, and let reconciliation own recovery on the next tick.
+- Transition `materializing -> blocked` only after fresh truth proves HEAD is still the reviewed HEAD, index/worktree are clean, original `next.md` digest matches, and no materialization temp artifact remains. If those invariants cannot be proved, remain `materializing` and surface degraded status.
+- Add deterministic tests where restore, reset/index cleanup, and temp-file cleanup each fail. Assert no terminal blocked row is written until repository invariants are restored; repeated ticks reconcile or remain owner-visible degraded without creating a second commit/handoff.
+- Keep planner implementation_steps/interfaces/validation list entries concise and below the existing bounded-string limits.
