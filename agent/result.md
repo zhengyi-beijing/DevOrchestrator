@@ -197,8 +197,16 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
 - Comprehensive Verification:
   - 22 unit tests in `tests_py/test_staged_roadmap.py`.
   - 3 new unit tests in `tests_py/test_transition_executor.py`.
-  - 2 new unit tests in `tests_py/test_control_commands.py`.
-  - 11 comprehensive unit and integration tests in `tests_py/test_staged_handoff.py`.
-  - Full test suite: 415 tests and 16 subtests passing cleanly (`python -m pytest tests_py -q`).
+  - 2 new unit tests in `tests_py/test_control_commands.py` plus regression test for `INCOMPLETE` rejection.
+  - 14 comprehensive unit and integration tests in `tests_py/test_staged_handoff.py`.
+  - Full test suite: 418 tests and 16 subtests passing cleanly (`python -m pytest tests_py -q`).
   - Userscript syntax check: `node --check browser/chatgpt-web-adapter.user.js` passed.
   - Git diff check: `git diff --check` clean.
+
+- P11x Review Remediation:
+  - Tightened staged-row eligibility check in `ControlCommandCoordinator._resume_decision_handoffs` with `re.search(r"\bCOMPLETED?\b", ...)` regex word boundaries to reject non-matching statuses such as `INCOMPLETE`.
+  - Added deferred apply guard test `test_deferred_apply_new_commit_fails` (`tests_py/test_staged_handoff.py`) proving a concurrent commit fails with `'repository changed during planning'` with HEAD and `agent/next.md` bytes unchanged.
+  - Added recovery test `test_deferred_recovery_when_head_moved_leaves_worktree_untouched` (`tests_py/test_staged_handoff.py`) proving that if commit succeeds and post-commit failure raises, worktree is left untouched at the new commit without prohibited git commands.
+  - Added restart/idempotency test `test_restart_idempotency_after_deferred_start_before_apply` (`tests_py/test_staged_handoff.py`) proving restart between deferred start and apply transitions in-flight plan to `recovery_required`, re-running ticks does not duplicate planner, makes no new port calls, produces no commit, and leaves `agent/next.md` predecessor bytes untouched.
+  - Added `INCOMPLETE` status rejection regression test in `tests_py/test_control_commands.py`.
+  - Added `sys.path` and module cache purging to `tests_py/test_control_commands.py` for direct unittest execution.

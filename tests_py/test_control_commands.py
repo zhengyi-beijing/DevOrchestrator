@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -204,6 +205,12 @@ class ControlCommandTests(unittest.TestCase):
             # Mismatch status
             mismatch_status = {"projects": [{"project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P1"}}]}
             self.assertEqual(coordinator.advance(config, mismatch_status, executor), [])
+            self.assertNotIn("handoff_consumed", executor.records["review-r1"])
+            self.assertEqual(len(planner.calls), 0)
+
+            # Incomplete status must not match COMPLETE
+            incomplete_status = {"projects": [{"project_id": "p1", "state": "IDLE", "next_status": "**INCOMPLETE**", "telemetry": {"task_id": "P1"}}]}
+            self.assertEqual(coordinator.advance(config, incomplete_status, executor), [])
             self.assertNotIn("handoff_consumed", executor.records["review-r1"])
             self.assertEqual(len(planner.calls), 0)
 

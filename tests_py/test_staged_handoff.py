@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -315,6 +316,43 @@ class TestStagedHandoffPlannerGuards(unittest.TestCase):
         self.assertEqual(state["state"], "failed")
         self.assertIn("staged spec changed during planning", state["reason"])
 
+    def test_deferred_apply_new_commit_fails(self):
+        record = {
+            "plan_id": "ai_plan:cmd1",
+            "command_id": "cmd1",
+            "project_id": "p1",
+            "task_id": "P11b",
+            "repo_path": str(self.repo),
+            "branch": self.handoff["reviewed_branch"],
+            "head": self.head,
+            "status_hash": read_repository_truth(self.repo).status_hash,
+            "deferred": True,
+            "predecessor_task_id": "P11x",
+            "predecessor_next_sha256": sha256_bytes((self.repo / "agent" / "next.md").read_bytes()),
+            "staged_spec_path": self.spec_path,
+            "staged_spec_sha256": self.handoff["staged_spec_sha256"],
+        }
+        plan = {
+            "task_id": "P11b", "summary": "s", "implementation_steps": ["i"],
+            "interfaces": ["c"], "validation": ["v"], "risks": ["r"], "out_of_scope": ["o"],
+        }
+        orig_next_bytes = (self.repo / "agent" / "next.md").read_bytes()
+        # Create a new commit before apply
+        subprocess.run(["git", "-C", str(self.repo), "commit", "--allow-empty", "-m", "concurrent commit"], check=True, capture_output=True)
+        new_head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+        self.assertNotEqual(new_head, self.head)
+
+        self.planner._save_state({"version": 1, "plans": {"ai_plan:cmd1": copy.deepcopy(record)}})
+        self.planner._apply_deferred_plan("ai_plan:cmd1", record, plan, "Approved")
+        state = self.planner.state()["plans"].get("ai_plan:cmd1")
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("repository changed during planning", state["reason"])
+
+        # Check HEAD and agent/next.md bytes stay unchanged by the failed apply
+        cur_head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(cur_head, new_head)
+        self.assertEqual((self.repo / "agent" / "next.md").read_bytes(), orig_next_bytes)
+
     def test_deferred_apply_pre_write_truth_race_fails(self):
         truth = read_repository_truth(self.repo)
         record = {
@@ -434,6 +472,65 @@ class TestStagedHandoffPlannerGuards(unittest.TestCase):
         self.assertFalse(restored_truth.dirty)
         self.assertEqual(restored_truth.head, self.head)
         self.assertEqual(restored_truth.status_hash, truth.status_hash)
+
+    def test_deferred_recovery_when_head_moved_leaves_worktree_untouched(self):
+        truth = read_repository_truth(self.repo)
+        record = {
+            "plan_id": "ai_plan:cmd1",
+            "command_id": "cmd1",
+            "project_id": "p1",
+            "task_id": "P11b",
+            "repo_path": str(self.repo),
+            "branch": self.handoff["reviewed_branch"],
+            "head": self.head,
+            "status_hash": truth.status_hash,
+            "deferred": True,
+            "predecessor_task_id": "P11x",
+            "predecessor_next_sha256": sha256_bytes((self.repo / "agent" / "next.md").read_bytes()),
+            "staged_spec_path": self.spec_path,
+            "staged_spec_sha256": self.handoff["staged_spec_sha256"],
+        }
+        plan = {
+            "task_id": "P11b", "summary": "s", "implementation_steps": ["i"],
+            "interfaces": ["c"], "validation": ["v"], "risks": ["r"], "out_of_scope": ["o"],
+        }
+
+        recorded_subprocesses = []
+        real_commit = self.planner._commit_plan
+
+        def commit_then_raise(repo, task_id):
+            real_commit(repo, task_id)
+            raise RuntimeError("simulated post-commit failure")
+
+        orig_sp_run = subprocess.run
+        def logged_sp_run(*args, **kwargs):
+            if args:
+                recorded_subprocesses.append(list(args[0]))
+            return orig_sp_run(*args, **kwargs)
+
+        self.planner._save_state({"version": 1, "plans": {"ai_plan:cmd1": copy.deepcopy(record)}})
+        with patch.object(self.planner, "_commit_plan", side_effect=commit_then_raise), \
+             patch("subprocess.run", side_effect=logged_sp_run):
+            self.planner._apply_deferred_plan("ai_plan:cmd1", record, plan, "Approved")
+
+        state = self.planner.state()["plans"].get("ai_plan:cmd1")
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("plan apply failed: simulated post-commit failure", state["reason"])
+
+        # Verify no prohibited commands
+        for cmd in recorded_subprocesses:
+            self.assertNotIn("reset", cmd)
+            self.assertNotIn("restore", cmd)
+            self.assertNotIn("checkout", cmd)
+
+        # Worktree left untouched: HEAD moved, agent/next.md has rendered content, repo is clean
+        cur_truth = read_repository_truth(self.repo)
+        self.assertTrue(cur_truth.valid)
+        self.assertFalse(cur_truth.dirty)
+        self.assertNotEqual(cur_truth.head, self.head)
+        rendered_next = (self.repo / "agent" / "next.md").read_text(encoding="utf-8")
+        self.assertIn("Status: **READY_TO_RUN**", rendered_next)
+        self.assertIn("## Approved executable design", rendered_next)
 
 
 class TestStagedHandoffEndToEnd(unittest.TestCase):
@@ -576,6 +673,115 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
             head_after_restart = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
             self.assertEqual(head_after_restart, new_head)
             self.assertEqual(len(new_planner.state()["plans"]), 1)
+
+    def test_restart_idempotency_after_deferred_start_before_apply(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "repo"
+            head = make_git_repo(repo, "P11x")
+            spec_path, spec_bytes = setup_staged_spec(repo, "P11b")
+            setup_roadmap(repo, "P11x", "P11b", spec_path)
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "setup staged"], check=True, capture_output=True)
+            reviewed_head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+            runtime = base / "runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            port = FakeHandoffPort("P11b")
+            planner = AIPlannerCoordinator(runtime, port)
+            config_path = base / "projects.json"
+            config_data = {
+                "projects": [{
+                    "project_id": "p1",
+                    "repo_path": str(repo),
+                    "adapter": "agent_files",
+                    "execution": {
+                        "enabled": True,
+                        "engine": "aibroker",
+                        "owner_authorized": True,
+                        "allowed_next_actions": ["next_task"],
+                    },
+                    "ai_roles": {"planner": {"enabled": True}},
+                }]
+            }
+            config_path.write_text(json.dumps(config_data), encoding="utf-8")
+
+            # Write websol-decisions.json for P11x COMPLETE
+            repo_truth = read_repository_truth(repo)
+            record = {
+                "project_id": "p1", "request_id": "worker_done:p1:r1",
+                "disposition": "apply", "decision": "next", "next_action": "next_task",
+                "task_id": "P11x", "stage_id": None,
+                "branch": repo_truth.branch, "head": reviewed_head,
+                "role": "reviewer", "event": "worker_done",
+                "consumed_at": "2026-09-05T00:00:00+00:00",
+            }
+            (runtime / "websol-decisions.json").write_text(
+                json.dumps({"version": 1, "decisions": {"worker_done:p1:r1": record}}), encoding="utf-8"
+            )
+
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": FakeBackend("agy")})
+            control = ControlCommandCoordinator(runtime, planner)
+
+            summary = {
+                "projects": [{
+                    "project_id": "p1",
+                    "state": "IDLE",
+                    "next_status": "**COMPLETE**",
+                    "telemetry": {"task_id": "P11x"},
+                    "git": {"head": reviewed_head},
+                }]
+            }
+
+            # 1. Executor tick records staged handoff
+            executor.advance(summary, config_path)
+            exec_row = executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual(exec_row["state"], "handoff")
+            self.assertEqual(exec_row["staged_successor"], "P11b")
+
+            # 2. Control tick resumes handoff and starts deferred planner;
+            # patch _run_cycle so the plan stays in active 'planning' state before apply
+            with patch.object(planner, "_run_cycle"):
+                outcomes = control.advance(config_path, summary, executor)
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0]["lifecycle_action"], "plan")
+                self.assertTrue(executor.state()["executions"]["worker_done:p1:r1"]["handoff_consumed"])
+                plan_id = outcomes[0]["plan_id"]
+                self.assertEqual(planner.state()["plans"][plan_id]["state"], "planning")
+
+            initial_port_requests = len(port.requests)
+
+            # 3. Recreate executor and coordinators AFTER start and BEFORE apply
+            new_planner = AIPlannerCoordinator(runtime, port)
+            new_executor = TransitionExecutor(runtime, backend_overrides={"agy": FakeBackend("agy")})
+            new_control = ControlCommandCoordinator(runtime, new_planner)
+
+            # Startup reconciliation marks the in-flight plan as recovery_required
+            restarted_plan = new_planner.state()["plans"][plan_id]
+            self.assertEqual(restarted_plan["state"], "recovery_required")
+            self.assertIn("daemon restarted during planner lifecycle", restarted_plan["reason"])
+
+            # 4. Re-run ticks on recreated coordinators
+            outcomes2 = new_control.advance(config_path, summary, new_executor)
+            self.assertEqual(len(outcomes2), 1)
+            self.assertEqual(outcomes2[0]["state"], "blocked")
+
+            # Verify no second planner started, port call count unchanged
+            self.assertEqual(len(new_planner.state()["plans"]), 1)
+            self.assertEqual(len(port.requests), initial_port_requests)
+
+            # Verify no commit produced, HEAD equals reviewed_head, agent/next.md unchanged
+            cur_head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            self.assertEqual(cur_head, reviewed_head)
+            rev_list = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-list", f"{reviewed_head}..HEAD"], text=True
+            ).strip()
+            self.assertEqual(rev_list, "")
+            self.assertEqual(
+                (repo / "agent" / "next.md").read_bytes(),
+                b"# P11x Predecessor Task\nStatus: **COMPLETE**\n\nGoal: completed.\n",
+            )
+            self.assertEqual((repo / spec_path).read_bytes(), spec_bytes)
 
 
 if __name__ == "__main__":
