@@ -48,3 +48,12 @@ Required redesign constraints from independent plan review (must be resolved in 
 - Fresh-context acceptance must exercise the real dispatch/context-injection path and observe command construction; a fake Worker assertion is insufficient.
 - Real representative-day DevO + xray-hw-platform evidence is required to confirm/reject production bottleneck hypotheses; synthetic/replay data may validate analysis mechanics only.
 - Keep the design implementable in bounded phases: instrument missing observables first, then derive metrics, then dashboard/reporting, then representative-day acceptance.
+
+Plan review/remediation loop requirement:
+- Treat plan-review rejection with actionable redesign feedback as a non-terminal lifecycle transition, not generic `failed/blocked`: `PLANNING -> REVIEWING_PLAN -> REMEDIATING_PLAN -> REVIEWING_PLAN` until approval, OWNER_GATE, provider/system failure, or a bounded retry limit.
+- Feed the exact reviewer rejection, prior plan, task identity, repository HEAD, and prior planner resource/session context into each plan-remediation round; avoid restarting from zero when continuity is available.
+- Distinguish design rejection from infrastructure/provider/schema failure. Only owner decisions go to OWNER_GATE; bounded design defects should auto-remediate.
+- Instrument plan-review reject count, remediation-round count, reject-to-remediation latency, remediation duration, repeated-planning wall time, planner/reviewer resource switches, context continuity, and manual-intervention count.
+- Diagnose repeated rejection without convergence as `plan_review_churn`; include its wall-clock and AI/resource cost in lifecycle-overhead accounting.
+- Use a configurable bounded retry policy; exhausting the bound must preserve the full rejection chain and escalate to OWNER_GATE rather than loop indefinitely.
+- Acceptance: force at least one deterministic plan rejection in an isolated test and prove DevO automatically revises and re-reviews without a new user `project-continue`; verify approval proceeds to READY_TO_RUN and retry exhaustion reaches OWNER_GATE with complete provenance.
