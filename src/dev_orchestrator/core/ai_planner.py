@@ -41,6 +41,7 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     review_independence = raw.get("review_independence", "resource")
     timeout = raw.get("timeout_seconds", 900)
     review_timeout = raw.get("review_timeout_seconds", 600)
+    max_attempts = raw.get("max_attempts", 3)
     if quality not in {"economy", "balanced", "high"}:
         return None, "planner quality invalid"
     if review_quality not in {"economy", "balanced", "high"}:
@@ -50,12 +51,15 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     for name, value in (("timeout_seconds", timeout), ("review_timeout_seconds", review_timeout)):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             return None, f"planner {name} must be positive"
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or not 1 <= max_attempts <= 5:
+        return None, "planner max_attempts must be an integer from 1 to 5"
     return {
         "quality": quality,
         "review_quality": review_quality,
         "review_independence": review_independence,
         "timeout_seconds": float(timeout),
         "review_timeout_seconds": float(review_timeout),
+        "max_attempts": max_attempts,
     }, ""
 
 
@@ -236,29 +240,68 @@ class AIPlannerCoordinator:
                 task_id=record["task_id"], occurrence_key=plan_id,
                 details={"plan_id": plan_id},
             )
-        planner_request = AIRoleRequest(
-            project_id=record["project_id"],
-            task_run_id=record["task_id"],
-            stage_run_id="plan",
-            role_run_id="planner-" + record["command_id"],
-            request_id=plan_id + ":planner",
-            role="planner",
-            prompt=self._planner_prompt(record),
-            working_directory=Path(record["repo_path"]),
-            quality=policy["quality"],
-            independence="none",
-            timeout_seconds=policy["timeout_seconds"],
-            metadata={"control_command_id": record["command_id"]},
-        )
-        try:
-            planner_result = self.port.execute(planner_request) if self.port is not None else None
-            if planner_result is None:
-                raise RuntimeError("planner execution port unavailable")
-            if planner_result.status != "succeeded":
-                raise RuntimeError(planner_result.error or f"planner_{planner_result.status}")
-            plan = _parse_plan(planner_result.output, record["task_id"])
-        except Exception as exc:
-            self._finish(plan_id, "failed", f"planner failed: {exc}")
+        max_attempts = policy["max_attempts"]
+        planner_result = None
+        plan = None
+        previous_attempt_resource = None
+        failure_reason = None
+        for attempt in range(1, max_attempts + 1):
+            retry_suffix = "" if attempt == 1 else f":retry-{attempt - 1}"
+            planner_request = AIRoleRequest(
+                project_id=record["project_id"],
+                task_run_id=record["task_id"],
+                stage_run_id="plan",
+                role_run_id="planner-" + record["command_id"],
+                request_id=plan_id + ":planner" + retry_suffix,
+                role="planner",
+                prompt=self._planner_prompt(record, retry_reason=failure_reason, attempt=attempt),
+                working_directory=Path(record["repo_path"]),
+                quality=policy["quality"],
+                independence="none",
+                previous_resource_context=previous_attempt_resource,
+                timeout_seconds=policy["timeout_seconds"],
+                metadata={
+                    "control_command_id": record["command_id"],
+                    "planner_attempt": attempt,
+                    "planner_max_attempts": max_attempts,
+                },
+            )
+            attempt_result = None
+            attempt_reason = None
+            try:
+                attempt_result = self.port.execute(planner_request) if self.port is not None else None
+                if attempt_result is None:
+                    raise RuntimeError("planner execution port unavailable")
+                if attempt_result.status == "cancelled":
+                    raise InterruptedError(attempt_result.error or "planner_cancelled")
+                if attempt_result.status != "succeeded":
+                    raise RuntimeError(attempt_result.error or f"planner_{attempt_result.status}")
+                plan = _parse_plan(attempt_result.output, record["task_id"])
+                if attempt_result.resource_context is None:
+                    raise RuntimeError("planner resource context missing")
+                planner_result = attempt_result
+            except InterruptedError as exc:
+                self._record_planner_attempt(plan_id, attempt, planner_request, attempt_result, str(exc))
+                self._finish(plan_id, "failed", f"planner cancelled: {exc}")
+                return
+            except Exception as exc:
+                attempt_reason = str(exc)
+                self._record_planner_attempt(plan_id, attempt, planner_request, attempt_result, attempt_reason)
+                if attempt_result is not None and attempt_result.resource_context is not None:
+                    previous_attempt_resource = attempt_result.resource_context
+                failure_reason = attempt_reason
+                if attempt >= max_attempts:
+                    self._finish(
+                        plan_id,
+                        "failed",
+                        f"planner failed after {max_attempts} attempts: {attempt_reason}",
+                    )
+                    return
+                continue
+            self._record_planner_attempt(plan_id, attempt, planner_request, planner_result, None)
+            break
+        if planner_result is None or plan is None:
+            self._finish(plan_id, "failed", "planner retry loop ended without a valid plan")
             return
         previous = planner_result.resource_context
         if previous is None:
@@ -461,8 +504,37 @@ class AIPlannerCoordinator:
         if resource is None:
             return None
         return {"resource_id": resource.resource_id, "provider": resource.provider, "account": resource.account, "model": resource.model}
+    def _record_planner_attempt(
+        self, plan_id: str, attempt: int, request: AIRoleRequest, result: Any, reason: str | None,
+    ) -> None:
+        with self._lock:
+            state = self._load_state()
+            record = state["plans"].get(plan_id)
+            if not isinstance(record, dict):
+                return
+            attempts = record.setdefault("planner_attempts", [])
+            if not isinstance(attempts, list):
+                attempts = []
+                record["planner_attempts"] = attempts
+            attempts.append({
+                "attempt": attempt,
+                "request_id": request.request_id,
+                "completed_at": utc_now_iso(),
+                "status": getattr(result, "status", None),
+                "reason": reason,
+                "dispatch_id": getattr(result, "dispatch_id", None),
+                "execution_id": getattr(result, "execution_id", None),
+                "resource": self._resource_payload(getattr(result, "resource_context", None)),
+            })
+            record["planner_attempt_count"] = attempt
+            record["planner_retry_count"] = max(0, attempt - 1)
+            if reason is not None:
+                record["planner_last_failure"] = reason
+                record["planner_last_failure_at"] = utc_now_iso()
+            self._save_state(state)
+
     @staticmethod
-    def _planner_prompt(record: dict[str, Any]) -> str:
+    def _planner_prompt(record: dict[str, Any], retry_reason: str | None = None, attempt: int = 1) -> str:
         prompt = (
             "You are the software-development Planner for one task. Plan only: do not modify files, commit, push, or run another agent. "
             "Inspect the repository and the supplied agent/next.md task. Convert the pending design into a bounded executable implementation plan. "
@@ -472,6 +544,14 @@ class AIPlannerCoordinator:
             f"Project: {record['project_id']}\nTask: {record['task_id']}\n"
             f"Planning branch: {record['branch']}\nPlanning HEAD: {record['head']}\n\n"
         )
+        if retry_reason is not None:
+            prompt += (
+                "[PLANNER_RETRY]\n"
+                f"Corrective attempt {attempt}. The previous planner attempt failed contract validation: "
+                f"{retry_reason[:800]}\n"
+                "Correct only that failure. Return exactly one JSON object with the required schema; "
+                "do not add markdown, commentary, code fences, or any text outside the JSON object.\n\n"
+            )
         if record.get("context_block"):
             prompt += f"{record['context_block']}\n\n"
         prompt += (
