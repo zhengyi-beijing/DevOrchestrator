@@ -213,7 +213,8 @@ class AIPlannerCoordinator:
             policy, _ = _planner_policy(project)
             if policy is None or not policy.get("adjudication_enabled"):
                 continue
-            if record.get("state") != "failed" or record.get("adjudication_attempted_at"):
+            attempts = int(record.get("adjudication_attempt_count") or (1 if record.get("adjudication_attempted_at") else 0))
+            if record.get("state") != "failed" or record.get("adjudication_decision") or attempts >= 2:
                 continue
             chain = record.get("rejection_chain")
             if not isinstance(chain, list) or len(chain) < policy["adjudication_min_rejections"]:
@@ -228,9 +229,13 @@ class AIPlannerCoordinator:
         with self._lock:
             state = self._load_state()
             record = state["plans"].get(plan_id)
-            if not isinstance(record, dict) or record.get("state") != "failed" or record.get("adjudication_attempted_at"):
+            if not isinstance(record, dict) or record.get("state") != "failed" or record.get("adjudication_decision"):
+                return False
+            attempts = int(record.get("adjudication_attempt_count") or (1 if record.get("adjudication_attempted_at") else 0))
+            if attempts >= 2:
                 return False
             record["state"] = "adjudicating"
+            record["adjudication_attempt_count"] = attempts + 1
             record["adjudication_attempted_at"] = utc_now_iso()
             self._save_state(state)
         thread = threading.Thread(target=self._run_adjudication, args=(plan_id, copy.deepcopy(project), copy.deepcopy(policy)), name="devorch-adjudicate-" + str(project.get("project_id") or "project"), daemon=True)
@@ -278,10 +283,21 @@ class AIPlannerCoordinator:
 
     def _adjudication_prompt(self, record: dict[str, Any]) -> str:
         source_heading, source_text = self._task_source(record)
-        payload = {"current_plan": record.get("plan"), "rejection_chain": record.get("rejection_chain") or [], "last_failure": record.get("reason"), "last_review_reason": record.get("review_reason")}
+        chain = record.get("rejection_chain") or []
+        compact_chain = [
+            {"round": item.get("round"), "reason": item.get("reason")}
+            for item in chain if isinstance(item, dict)
+        ]
+        payload = {
+            "current_plan": record.get("plan"),
+            "rejection_reasons": compact_chain,
+            "last_failure": record.get("reason"),
+            "last_review_reason": record.get("review_reason"),
+        }
         return (
-            "You are the final bounded adjudicator after repeated Planner/Reviewer disagreement. Do not reopen issues already resolved in the rejection chain and do not broaden scope. Resolve only remaining contract ambiguities. Return exactly one JSON object with keys decision, reason, resolved_plan. decision is approve_with_notes, contract_patch, or owner_gate. For approve_with_notes or contract_patch, resolved_plan must be a complete planner-schema object for the same task and should minimally change the current plan. For owner_gate, resolved_plan must be null.\n\n"
-            + source_heading + ":\n" + source_text + "\n\nAdjudication evidence:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+            "You are the final bounded adjudicator after repeated Planner/Reviewer disagreement. Do not reopen issues already resolved and do not broaden scope. Resolve only remaining contract ambiguities. Return exactly one JSON object with keys decision, reason, resolved_plan. decision is approve_with_notes, contract_patch, or owner_gate. For approve_with_notes or contract_patch, resolved_plan must be a complete planner-schema object for the same task and should minimally change the current plan. For owner_gate, resolved_plan must be null.\n\n"
+            + source_heading + ":\n" + source_text + "\n\nAdjudication evidence:\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         )
 
     def _begin_lifecycle(
