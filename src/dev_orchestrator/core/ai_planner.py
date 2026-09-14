@@ -128,7 +128,25 @@ def _parse_adjudication(text: str | None, task_id: str) -> tuple[str, str, dict[
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise ValueError("adjudicator output must be one JSON object") from exc
+        decoder = json.JSONDecoder()
+        candidates = []
+        pos = 0
+        required = {"decision", "reason", "resolved_plan"}
+        while True:
+            start = body.find("{", pos)
+            if start < 0:
+                break
+            try:
+                candidate, end = decoder.raw_decode(body[start:])
+            except json.JSONDecodeError:
+                pos = start + 1
+                continue
+            if isinstance(candidate, dict) and set(candidate) == required:
+                candidates.append(candidate)
+            pos = start + max(end, 1)
+        if len(candidates) != 1:
+            raise ValueError("adjudicator output must contain exactly one adjudication JSON object") from exc
+        payload = candidates[0]
     if not isinstance(payload, dict) or set(payload) != {"decision", "reason", "resolved_plan"}:
         raise ValueError("adjudicator JSON schema mismatch")
     decision = _nonblank(payload.get("decision"))
