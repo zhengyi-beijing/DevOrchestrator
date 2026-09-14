@@ -10,6 +10,7 @@ from typing import Any
 
 from dev_orchestrator.ai.contracts import AIRoleRequest, ResourceContext
 from dev_orchestrator.ai.execution_port import AIExecutionPort
+from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_raw, read_successor, sha256_bytes
 from dev_orchestrator.platform.process import hidden_subprocess_kwargs
@@ -17,7 +18,7 @@ from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_js
 
 PLANNER_STATE_FILE = "ai-planner.json"
 _STATE_VERSION = 1
-_ACTIVE_STATES = frozenset({"planning", "reviewing", "remediating", "applying"})
+_ACTIVE_STATES = frozenset({"planning", "reviewing", "remediating", "adjudicating", "applying"})
 
 
 def _nonblank(value: Any) -> str | None:
@@ -44,6 +45,18 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     review_timeout = raw.get("review_timeout_seconds", 600)
     max_attempts = raw.get("max_attempts", 3)
     max_plan_remediation_rounds = raw.get("max_plan_remediation_rounds", 3)
+    adjudication_enabled = raw.get("adjudication_enabled", False)
+    adjudication_quality = raw.get("adjudication_quality", "high")
+    adjudication_timeout = raw.get("adjudication_timeout_seconds", 1800)
+    adjudication_min_rejections = raw.get("adjudication_min_rejections", 3)
+    if not isinstance(adjudication_enabled, bool):
+        return None, "planner adjudication_enabled must be a boolean"
+    if adjudication_quality not in {"economy", "balanced", "high"}:
+        return None, "planner adjudication quality invalid"
+    if isinstance(adjudication_timeout, bool) or not isinstance(adjudication_timeout, (int, float)) or adjudication_timeout <= 0:
+        return None, "planner adjudication_timeout_seconds must be positive"
+    if isinstance(adjudication_min_rejections, bool) or not isinstance(adjudication_min_rejections, int) or not 1 <= adjudication_min_rejections <= 5:
+        return None, "planner adjudication_min_rejections must be an integer from 1 to 5"
     if quality not in {"economy", "balanced", "high"}:
         return None, "planner quality invalid"
     if review_quality not in {"economy", "balanced", "high"}:
@@ -69,6 +82,10 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
         "review_timeout_seconds": float(review_timeout),
         "max_attempts": max_attempts,
         "max_plan_remediation_rounds": max_plan_remediation_rounds,
+        "adjudication_enabled": adjudication_enabled,
+        "adjudication_quality": adjudication_quality,
+        "adjudication_timeout_seconds": float(adjudication_timeout),
+        "adjudication_min_rejections": adjudication_min_rejections,
     }, ""
 
 
@@ -93,6 +110,29 @@ def _parse_plan(text: str | None, task_id: str) -> dict[str, Any]:
         if any(_nonblank(item) is None or len(str(item)) > 1000 for item in value):
             raise ValueError(f"planner {key} entries must be bounded strings")
     return payload
+
+
+def _parse_adjudication(text: str | None, task_id: str) -> tuple[str, str, dict[str, Any] | None]:
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("adjudicator output is empty")
+    try:
+        payload = json.loads(text.strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError("adjudicator output must be one JSON object") from exc
+    if not isinstance(payload, dict) or set(payload) != {"decision", "reason", "resolved_plan"}:
+        raise ValueError("adjudicator JSON schema mismatch")
+    decision = _nonblank(payload.get("decision"))
+    reason = _nonblank(payload.get("reason"))
+    if decision not in {"approve_with_notes", "contract_patch", "owner_gate"} or reason is None:
+        raise ValueError("invalid adjudicator decision")
+    resolved = payload.get("resolved_plan")
+    if decision == "owner_gate":
+        if resolved is not None:
+            raise ValueError("owner_gate adjudication must not include resolved_plan")
+        return decision, reason, None
+    if not isinstance(resolved, dict):
+        raise ValueError("adjudication resolved_plan must be an object")
+    return decision, reason, _parse_plan(json.dumps(resolved), task_id)
 
 
 def _parse_plan_review(text: str | None) -> tuple[str, str]:
@@ -157,6 +197,92 @@ class AIPlannerCoordinator:
     def state(self) -> dict[str, Any]:
         with self._lock:
             return copy.deepcopy(self._load_state())
+
+    def advance_adjudications(self, config_path: Path | str) -> list[str]:
+        if self.port is None:
+            return []
+        config = load_projects_config(config_path)
+        projects = {str(p.get("project_id")): p for p in (config.get("projects") or []) if isinstance(p, dict) and p.get("project_id")}
+        launched: list[str] = []
+        with self._lock:
+            snapshot = copy.deepcopy(self._load_state()["plans"])
+        for plan_id, record in snapshot.items():
+            project = projects.get(str(record.get("project_id") or ""))
+            if project is None:
+                continue
+            policy, _ = _planner_policy(project)
+            if policy is None or not policy.get("adjudication_enabled"):
+                continue
+            if record.get("state") != "failed" or record.get("adjudication_attempted_at"):
+                continue
+            chain = record.get("rejection_chain")
+            if not isinstance(chain, list) or len(chain) < policy["adjudication_min_rejections"]:
+                continue
+            if not isinstance(record.get("plan"), dict):
+                continue
+            if self._start_adjudication(plan_id, project, policy):
+                launched.append(plan_id)
+        return launched
+
+    def _start_adjudication(self, plan_id: str, project: dict[str, Any], policy: dict[str, Any]) -> bool:
+        with self._lock:
+            state = self._load_state()
+            record = state["plans"].get(plan_id)
+            if not isinstance(record, dict) or record.get("state") != "failed" or record.get("adjudication_attempted_at"):
+                return False
+            record["state"] = "adjudicating"
+            record["adjudication_attempted_at"] = utc_now_iso()
+            self._save_state(state)
+        thread = threading.Thread(target=self._run_adjudication, args=(plan_id, copy.deepcopy(project), copy.deepcopy(policy)), name="devorch-adjudicate-" + str(project.get("project_id") or "project"), daemon=True)
+        with self._lock:
+            self._threads[plan_id + ":adjudicator"] = thread
+        thread.start()
+        return True
+
+    def _run_adjudication(self, plan_id: str, project: dict[str, Any], policy: dict[str, Any]) -> None:
+        with self._lock:
+            record = copy.deepcopy(self._load_state()["plans"].get(plan_id, {}))
+        if not record:
+            return
+        repo = Path(record["repo_path"])
+        truth = read_repository_truth(repo)
+        if not truth.valid or truth.dirty or truth.branch != record.get("branch") or truth.head != record.get("head") or truth.status_hash != record.get("status_hash"):
+            self._finish(plan_id, "failed", "repository changed before adjudication")
+            return
+        request = AIRoleRequest(
+            project_id=record["project_id"], task_run_id=record["task_id"], stage_run_id="plan_adjudication",
+            role_run_id="plan-adjudicator-" + record["command_id"], request_id=plan_id + ":adjudicator",
+            role="adjudicator", prompt=self._adjudication_prompt(record), working_directory=repo,
+            quality=policy["adjudication_quality"], independence="none", timeout_seconds=policy["adjudication_timeout_seconds"],
+            metadata={"control_command_id": record["command_id"], "adjudication_kind": "bounded_plan"},
+        )
+        try:
+            result = self.port.execute(request) if self.port is not None else None
+            if result is None or result.status != "succeeded":
+                raise RuntimeError((getattr(result, "error", None) if result is not None else None) or "adjudicator execution failed")
+            decision, reason, resolved_plan = _parse_adjudication(result.output, record["task_id"])
+        except Exception as exc:
+            self._finish(plan_id, "failed", f"plan adjudication failed: {exc}")
+            return
+        with self._lock:
+            state = self._load_state(); current = state["plans"].get(plan_id)
+            if not isinstance(current, dict):
+                return
+            current.update({"adjudication_decision": decision, "adjudication_reason": reason, "adjudication_completed_at": utc_now_iso(), "adjudication_dispatch_id": result.dispatch_id, "adjudication_execution_id": result.execution_id, "adjudication_resource": self._resource_payload(result.resource_context)})
+            self._save_state(state)
+        if decision == "owner_gate":
+            self._finish(plan_id, "owner_gate", reason)
+            return
+        assert resolved_plan is not None
+        self._apply_plan(plan_id, record, resolved_plan, f"adjudicated {decision}: {reason}", project=project)
+
+    def _adjudication_prompt(self, record: dict[str, Any]) -> str:
+        source_heading, source_text = self._task_source(record)
+        payload = {"current_plan": record.get("plan"), "rejection_chain": record.get("rejection_chain") or [], "last_failure": record.get("reason"), "last_review_reason": record.get("review_reason")}
+        return (
+            "You are the final bounded adjudicator after repeated Planner/Reviewer disagreement. Do not reopen issues already resolved in the rejection chain and do not broaden scope. Resolve only remaining contract ambiguities. Return exactly one JSON object with keys decision, reason, resolved_plan. decision is approve_with_notes, contract_patch, or owner_gate. For approve_with_notes or contract_patch, resolved_plan must be a complete planner-schema object for the same task and should minimally change the current plan. For owner_gate, resolved_plan must be null.\n\n"
+            + source_heading + ":\n" + source_text + "\n\nAdjudication evidence:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+        )
 
     def _begin_lifecycle(
         self,

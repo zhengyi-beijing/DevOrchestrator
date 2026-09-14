@@ -54,6 +54,8 @@ def overlay_orchestration_lifecycle(
             lifecycle = "REVIEWING_PLAN"
         elif isinstance(plan, dict) and plan.get("state") == "remediating":
             lifecycle = "REMEDIATING_PLAN"
+        elif isinstance(plan, dict) and plan.get("state") == "adjudicating":
+            lifecycle = "ADJUDICATING_PLAN"
         elif isinstance(plan, dict) and plan.get("state") == "applying":
             lifecycle = "APPLYING_PLAN"
         elif isinstance(plan, dict) and plan.get("state") == "ready":

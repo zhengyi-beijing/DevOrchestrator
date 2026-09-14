@@ -84,13 +84,15 @@ def _run_orchestration_tick(
     watchdog_error: Optional[str] = None
     raw_summary = run_monitor_once(config, runtime)
     write_project_statuses(raw_summary, runtime, phase="monitor", daemon_state="running", pid=pid)
+    planner_obj = getattr(controls, "planner", None) if controls is not None else None
     if controls is not None:
         controls.advance(config, raw_summary, executor)
+    if planner_obj is not None and hasattr(planner_obj, "advance_adjudications"):
+        planner_obj.advance_adjudications(config)
     projected = executor.overlay_managed_runs(raw_summary)
     direct_review_projects = reviewer.enabled_project_ids(config) if reviewer is not None else frozenset()
     if reviewer is not None:
         reviewer.advance(config)
-    planner_obj = getattr(controls, "planner", None) if controls is not None else None
     planner_state_fn = getattr(planner_obj, "state", None)
     reviewer_state_fn = getattr(reviewer, "state", None) if reviewer is not None else None
     projected = overlay_orchestration_lifecycle(
