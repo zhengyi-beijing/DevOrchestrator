@@ -1,9 +1,10 @@
 """Minimal deterministic Worker -> Reviewer -> NEXT orchestration loop."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from dev_orchestrator.ai import AIExecutionPort, AIRoleRequest, AIRoleResult
+from dev_orchestrator.core.workflow_policy import inject_workflow_policy
 
 
 def _final_review_token(output: str | None) -> str:
@@ -43,7 +44,11 @@ class MinimalAIRoleLoop:
         if not reviewer_prompt.strip() or not pass_token.strip():
             raise ValueError("reviewer_prompt and pass_token must be nonblank")
 
-        worker = self.port.execute(worker_request)
+        effective_worker_request = replace(
+            worker_request,
+            prompt=inject_workflow_policy(worker_request.prompt, "worker"),
+        )
+        worker = self.port.execute(effective_worker_request)
         if worker.status != "succeeded":
             return MinimalLoopOutcome(
                 "stopped", worker, None, None, f"worker_{worker.status}"
@@ -53,7 +58,12 @@ class MinimalAIRoleLoop:
                 "stopped", worker, None, None, "worker_resource_context_missing"
             )
 
-        review_text = (reviewer_prompt.rstrip() + "\n\n[WORKER_OUTPUT_BEGIN]\n" + (worker.output or "") + "\n[WORKER_OUTPUT_END]\n")
+        review_text = (
+            inject_workflow_policy(reviewer_prompt, "technical_reviewer")
+            + "\n\n[WORKER_OUTPUT_BEGIN]\n"
+            + (worker.output or "")
+            + "\n[WORKER_OUTPUT_END]\n"
+        )
         reviewer_request = AIRoleRequest(
             project_id=worker_request.project_id,
             task_run_id=worker_request.task_run_id,

@@ -14,6 +14,7 @@ from dev_orchestrator.ai.execution_port import AIExecutionPort
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_raw, read_successor, sha256_bytes
+from dev_orchestrator.core.workflow_policy import workflow_policy_prompt
 from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
@@ -45,7 +46,7 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     timeout = raw.get("timeout_seconds", 900)
     review_timeout = raw.get("review_timeout_seconds", 600)
     max_attempts = raw.get("max_attempts", 3)
-    max_plan_remediation_rounds = raw.get("max_plan_remediation_rounds", 3)
+    max_plan_remediation_rounds = raw.get("max_plan_remediation_rounds", 2)
     if quality not in {"economy", "balanced", "high"}:
         return None, "planner quality invalid"
     if review_quality not in {"economy", "balanced", "high"}:
@@ -1090,6 +1091,7 @@ class AIPlannerCoordinator:
             "Return exactly one JSON object and no markdown or extra text with exactly these keys: "
             '{"task_id":"...","summary":"...","implementation_steps":["..."],"interfaces":["..."],"validation":["..."],"risks":["..."],"out_of_scope":["..."]}. '
             "Every list must be non-empty. Keep the implementation bounded to the current task and preserve existing acceptance intent.\n\n"
+            f"{workflow_policy_prompt('planner')}\n\n"
             f"Project: {record['project_id']}\nTask: {record['task_id']}\n"
             f"Planning branch: {record['branch']}\nPlanning HEAD: {record['head']}\n\n"
         )
@@ -1147,6 +1149,7 @@ class AIPlannerCoordinator:
             "Return exactly one JSON object and no markdown or extra text with exactly these keys: "
             '{"decision":"approve|reject|owner_gate","reason":"..."}. '
             "Use approve only when the plan is specific enough for a Worker to execute without design guessing. Use owner_gate only for a real owner decision.\n\n"
+            f"{workflow_policy_prompt('plan_reviewer')}\n\n"
             f"Project: {record['project_id']}\nTask: {record['task_id']}\n\n"
         )
         if record.get("context_block"):

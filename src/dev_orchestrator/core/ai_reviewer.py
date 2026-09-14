@@ -13,6 +13,7 @@ from dev_orchestrator.ai.execution_port import AIExecutionPort
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.core.repository import read_repository_truth
+from dev_orchestrator.core.workflow_policy import workflow_policy_prompt
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 REVIEWER_STATE_FILE = "ai-reviewer.json"
@@ -272,6 +273,7 @@ class AIReviewerCoordinator:
             "Allowed pairs are next/next_task, remediate/continue_current_stage, owner_gate/stop, stop/stop. "
             "Use next only when the reviewed task is actually complete and repository evidence supports advancing. "
             "Use remediate for bounded fixable gaps in this reviewed task; owner_gate only when owner input is genuinely required.\n\n"
+            f"{workflow_policy_prompt('technical_reviewer')}\n\n"
             f"Project: {project_id}\nReviewed task: {task_id}\nWorker source: {source_request_id}\n"
             f"Review branch: {truth.branch}\nReview HEAD: {truth.head}\nReview dirty: {truth.dirty}\n"
         )

@@ -65,6 +65,7 @@ from dev_orchestrator.accounting import (
     environment_for_project,
 )
 from dev_orchestrator.core.repository import read_repository_truth
+from dev_orchestrator.core.workflow_policy import inject_workflow_policy
 from dev_orchestrator.core.websol import WebSolEvent, WebSolRequest, WebSolRole
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
@@ -425,7 +426,9 @@ def _dispatch_one(
         nonce=_nonce(project_id, run_id),
     )
     context = _worker_done_evidence(snapshot, truth, worker, task_id, stage_id, run_id)
-    prompt = render_websol_prompt(request, context)
+    prompt = inject_workflow_policy(
+        render_websol_prompt(request, context), "technical_reviewer"
+    )
     if failure_memory is not None:
         prompt = failure_memory.inject_prompt(
             prompt,

@@ -51,10 +51,12 @@ class MinimalAIRoleLoopTests(unittest.TestCase):
         self.assertEqual(outcome.state, "next")
         self.assertEqual(outcome.next_action, "NEXT")
         self.assertEqual(len(port.requests), 2)
+        self.assertIn("[WORKFLOW_POLICY role=worker]", port.requests[0].prompt)
         review_request = port.requests[1]
         self.assertEqual(review_request.role, "reviewer")
         self.assertEqual(review_request.independence, "resource")
         self.assertEqual(review_request.previous_resource_context.resource_id, "worker-r")
+        self.assertIn("[WORKFLOW_POLICY role=technical_reviewer]", review_request.prompt)
         self.assertIn("WORKER_OK", review_request.prompt)
 
     def test_worker_failure_stops_before_review(self):

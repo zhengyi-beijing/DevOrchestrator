@@ -29,6 +29,7 @@ from dev_orchestrator.agents.router import AgentRouter
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_successor
+from dev_orchestrator.core.workflow_policy import inject_workflow_policy
 from dev_orchestrator.core.project_status import write_execution_status
 from dev_orchestrator.core.websol import NextAction, WebSolEvent, WebSolRole
 from dev_orchestrator.monitor.telemetry import extract_task_id
@@ -676,9 +677,10 @@ class TransitionExecutor:
             return None
 
         failure_environment = environment_for_project(project)
-        effective_worker_prompt = (
-            "{0}\n\n{1}".format(worker_prompt, context_block) if context_block else worker_prompt
-        )
+        policy_role = "remediator" if source_kind == "remediation" else "worker"
+        effective_worker_prompt = inject_workflow_policy(worker_prompt, policy_role)
+        if context_block:
+            effective_worker_prompt += "\n\n" + context_block
         if self.failure_memory is not None:
             failure_block = self.failure_memory.prompt_block(
                 failure_environment, max_chars=self.failure_memory_max_chars
