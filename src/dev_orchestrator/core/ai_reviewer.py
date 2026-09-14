@@ -4,11 +4,13 @@ from __future__ import annotations
 import copy
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 from dev_orchestrator.ai.contracts import AIRoleRequest, ResourceContext
 from dev_orchestrator.ai.execution_port import AIExecutionPort
+from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
@@ -80,11 +82,17 @@ class AIReviewerCoordinator:
     def __init__(
         self, runtime_root: Path | str, port: AIExecutionPort | None,
         progress_channel: Optional[Any] = None,
+        accounting: ExecutionRecorder | None = None,
+        failure_memory: FailureMemory | None = None,
+        failure_memory_max_chars: int = 2000,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.port = port
         self.progress_channel = progress_channel
+        self.accounting = accounting
+        self.failure_memory = failure_memory
+        self.failure_memory_max_chars = failure_memory_max_chars
         self.state_path = self.runtime_root / REVIEWER_STATE_FILE
         self.decisions_path = self.runtime_root / REVIEW_DECISIONS_FILE
         self.transition_path = self.runtime_root / "transition-executor.json"
@@ -216,7 +224,19 @@ class AIReviewerCoordinator:
             binding = proj_dict.get("conversation_binding") or self._project_bindings.get(project_id)
             if binding is None and isinstance(worker.get("conversation_binding"), dict):
                 binding = worker.get("conversation_binding")
-            prompt = self._review_prompt(project_id, task_id, source_request_id, truth, context_block=context_block)
+            failure_memory_block = ""
+            if self.failure_memory is not None:
+                failure_memory_block = self.failure_memory.prompt_block(
+                    environment_for_project(proj_dict), max_chars=self.failure_memory_max_chars
+                )
+            prompt = self._review_prompt(
+                project_id,
+                task_id,
+                source_request_id,
+                truth,
+                context_block=context_block,
+                failure_memory_block=failure_memory_block,
+            )
             request = AIRoleRequest(
                 project_id=project_id, task_run_id=task_id, stage_run_id="review",
                 role_run_id="reviewer-" + source_request_id.replace(":", "-"),
@@ -227,6 +247,7 @@ class AIReviewerCoordinator:
                 metadata={
                     "worker_source_request_id": source_request_id,
                     "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
+                    "failure_environment": environment_for_project(proj_dict),
                 },
             )
             self._launch_review(
@@ -240,6 +261,7 @@ class AIReviewerCoordinator:
     def _review_prompt(
         project_id: str, task_id: str, source_request_id: str, truth: Any,
         context_block: str = "",
+        failure_memory_block: str = "",
     ) -> str:
         prompt = (
             "You are the independent reviewer for a completed software-development Worker. "
@@ -255,6 +277,8 @@ class AIReviewerCoordinator:
         )
         if context_block:
             prompt += f"\n{context_block}\n"
+        if failure_memory_block:
+            prompt += f"\n{failure_memory_block}\n"
         return prompt
 
     def _launch_review(
@@ -328,14 +352,89 @@ class AIReviewerCoordinator:
                 return
             record["state"] = "running"
             self._save_state(state)
+        source_request_id = str(request.metadata.get("worker_source_request_id") or "")
+        review_started = time.monotonic()
+        if self.accounting is not None:
+            self.accounting.start_interval(
+                "technical_review",
+                review_id,
+                project_id=request.project_id,
+                task_id=request.task_run_id,
+                role="reviewer",
+                request_id=review_id,
+                stage_run_id=request.stage_run_id,
+                role_run_id=request.role_run_id,
+                source_request_id=source_request_id or None,
+                attempt_id=source_request_id or None,
+            )
+        result = None
         try:
             result = self.port.execute(request) if self.port is not None else None
             if result is None:
                 raise RuntimeError("AIBroker reviewer port unavailable")
         except Exception as exc:
-            self._record_terminal(review_id, request.project_id, str(request.metadata.get("worker_source_request_id") or ""), "failed", f"reviewer lifecycle error: {exc}")
+            if self.accounting is not None:
+                self.accounting.end_interval(
+                    "technical_review",
+                    review_id,
+                    outcome="failed",
+                    project_id=request.project_id,
+                    task_id=request.task_run_id,
+                    role="reviewer",
+                    request_id=review_id,
+                    stage_run_id=request.stage_run_id,
+                    role_run_id=request.role_run_id,
+                    source_request_id=source_request_id or None,
+                    attempt_id=source_request_id or None,
+                )
+            if self.failure_memory is not None:
+                self.failure_memory.record_matching_recurrences(
+                    request.metadata.get("failure_environment", {}),
+                    str(exc),
+                    time.monotonic() - review_started,
+                    project_id=request.project_id,
+                    task_id=request.task_run_id,
+                    role="reviewer",
+                    request_id=review_id,
+                    source_request_id=source_request_id or None,
+                )
+            self._record_terminal(review_id, request.project_id, source_request_id, "failed", f"reviewer lifecycle error: {exc}")
             return
+        if self.accounting is not None:
+            resource = result.resource_context
+            self.accounting.end_interval(
+                "technical_review",
+                review_id,
+                outcome="accepted" if result.status == "succeeded" else "failed",
+                project_id=request.project_id,
+                task_id=request.task_run_id,
+                role="reviewer",
+                request_id=review_id,
+                stage_run_id=request.stage_run_id,
+                role_run_id=request.role_run_id,
+                source_request_id=source_request_id or None,
+                attempt_id=source_request_id or None,
+                dispatch_id=result.dispatch_id,
+                decision_id=result.decision_id,
+                execution_id=result.execution_id,
+                session_id=result.session_id,
+                resource_id=resource.resource_id if resource else None,
+                provider=resource.provider if resource else None,
+                account=resource.account if resource else None,
+                model=resource.model if resource else None,
+            )
         if result.status != "succeeded":
+            if self.failure_memory is not None:
+                self.failure_memory.record_matching_recurrences(
+                    request.metadata.get("failure_environment", {}),
+                    str(result.error or ""),
+                    time.monotonic() - review_started,
+                    project_id=request.project_id,
+                    task_id=request.task_run_id,
+                    role="reviewer",
+                    request_id=review_id,
+                    source_request_id=source_request_id or None,
+                )
             self._finish_result(review_id, result, "failed", result.error or f"reviewer_{result.status}")
             return
         try:
@@ -371,6 +470,30 @@ class AIReviewerCoordinator:
         except Exception as exc:
             self._finish_result(review_id, result, "failed", f"decision persistence failed: {exc}")
             return
+        if self.accounting is not None and decision in {"next", "remediate", "stop"}:
+            self.accounting.record_attempt_outcome(
+                source_request_id,
+                "accepted" if decision == "next" else "rejected",
+                project_id=request.project_id,
+                task_id=request.task_run_id,
+                role="reviewer",
+                request_id=review_id,
+                source_request_id=source_request_id,
+                dispatch_id=result.dispatch_id,
+                decision_id=result.decision_id,
+                execution_id=result.execution_id,
+                session_id=result.session_id,
+                metadata={"review_kind": "technical", "decision": decision, "reason": reason},
+            )
+        if self.accounting is not None and decision == "owner_gate":
+            self.accounting.open_owner_gate(
+                review_id,
+                project_id=request.project_id,
+                task_id=request.task_run_id,
+                role="owner",
+                request_id=review_id,
+                source_request_id=source_request_id or None,
+            )
         self._finish_result(review_id, result, "completed", reason, decision=decision, next_action=next_action)
 
     def _finish_result(self, review_id: str, result: Any, state_name: str, reason: str, **extra: Any) -> None:
@@ -398,11 +521,7 @@ class AIReviewerCoordinator:
             decision = extra.get("decision")
             task_id = str(record.get("task_id") or "")
             proj_id = str(record.get("project_id") or "")
-            binding = None
-            if isinstance(getattr(request, "metadata", None), dict):
-                binding = request.metadata.get("conversation_binding")
-            if not binding and isinstance(record, dict):
-                binding = record.get("conversation_binding")
+            binding = record.get("conversation_binding")
             if not binding:
                 binding = self._project_bindings.get(proj_id)
             project_payload = {"project_id": proj_id}

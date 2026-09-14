@@ -5,11 +5,13 @@ import copy
 import json
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 from dev_orchestrator.ai.contracts import AIRoleRequest, ResourceContext
 from dev_orchestrator.ai.execution_port import AIExecutionPort
+from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_raw, read_successor, sha256_bytes
 from dev_orchestrator.platform.process import hidden_subprocess_kwargs
@@ -117,11 +119,17 @@ class AIPlannerCoordinator:
     def __init__(
         self, runtime_root: Path | str, port: AIExecutionPort | None,
         progress_channel: Optional[Any] = None,
+        accounting: ExecutionRecorder | None = None,
+        failure_memory: FailureMemory | None = None,
+        failure_memory_max_chars: int = 2000,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.port = port
         self.progress_channel = progress_channel
+        self.accounting = accounting
+        self.failure_memory = failure_memory
+        self.failure_memory_max_chars = failure_memory_max_chars
         self.state_path = self.runtime_root / PLANNER_STATE_FILE
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}
@@ -176,6 +184,11 @@ class AIPlannerCoordinator:
         project_id = str(project.get("project_id") or "")
         repo_text = str(project.get("repo_path") or "")
         binding = project.get("conversation_binding")
+        failure_memory_block = ""
+        if self.failure_memory is not None:
+            failure_memory_block = self.failure_memory.prompt_block(
+                environment_for_project(project), max_chars=self.failure_memory_max_chars
+            )
         with self._lock:
             state = self._load_state()
             if plan_id in state["plans"]:
@@ -199,6 +212,9 @@ class AIPlannerCoordinator:
                 "rejection_chain": [],
                 "remediation_round": 0,
             }
+            if failure_memory_block:
+                record["failure_memory_block"] = failure_memory_block
+                record["failure_environment"] = environment_for_project(project)
             record.update(base_fields)
             state["plans"][plan_id] = record
             if binding and isinstance(binding, dict):
@@ -402,6 +418,24 @@ class AIPlannerCoordinator:
             )
             attempt_result = None
             attempt_reason = None
+            attempt_started = time.monotonic()
+            accounting_phase = (
+                "retry" if attempt > 1
+                else ("plan_remediation" if round_no > 0 else "planning")
+            )
+            if self.accounting is not None:
+                self.accounting.start_interval(
+                    accounting_phase,
+                    planner_request.request_id,
+                    project_id=record["project_id"],
+                    task_id=record["task_id"],
+                    role="planner",
+                    request_id=planner_request.request_id,
+                    stage_run_id=planner_request.stage_run_id,
+                    role_run_id=planner_request.role_run_id,
+                    source_request_id=record["command_id"],
+                    attempt_id=f"{plan_id}:plan-round-{round_no}",
+                )
             try:
                 attempt_result = self.port.execute(planner_request) if self.port is not None else None
                 if attempt_result is None:
@@ -415,6 +449,7 @@ class AIPlannerCoordinator:
                     raise RuntimeError("planner resource context missing")
                 planner_result = attempt_result
             except InterruptedError as exc:
+                attempt_reason = str(exc)
                 self._record_planner_attempt(plan_id, attempt, planner_request, attempt_result, str(exc), round_no=round_no)
                 self._finish(plan_id, "failed", f"planner cancelled: {exc}")
                 return None
@@ -432,6 +467,58 @@ class AIPlannerCoordinator:
                     )
                     return None
                 continue
+            finally:
+                if self.accounting is not None:
+                    self.accounting.end_interval(
+                        accounting_phase,
+                        planner_request.request_id,
+                        outcome=(
+                            "accepted"
+                            if attempt_result is not None
+                            and attempt_result.status == "succeeded"
+                            and attempt_reason is None
+                            else "failed"
+                        ),
+                        project_id=record["project_id"],
+                        task_id=record["task_id"],
+                        role="planner",
+                        request_id=planner_request.request_id,
+                        stage_run_id=planner_request.stage_run_id,
+                        role_run_id=planner_request.role_run_id,
+                        source_request_id=record["command_id"],
+                        attempt_id=f"{plan_id}:plan-round-{round_no}",
+                        dispatch_id=getattr(attempt_result, "dispatch_id", None),
+                        decision_id=getattr(attempt_result, "decision_id", None),
+                        execution_id=getattr(attempt_result, "execution_id", None),
+                        session_id=getattr(attempt_result, "session_id", None),
+                        resource_id=(
+                            attempt_result.resource_context.resource_id
+                            if attempt_result is not None and attempt_result.resource_context else None
+                        ),
+                        provider=(
+                            attempt_result.resource_context.provider
+                            if attempt_result is not None and attempt_result.resource_context else None
+                        ),
+                        account=(
+                            attempt_result.resource_context.account
+                            if attempt_result is not None and attempt_result.resource_context else None
+                        ),
+                        model=(
+                            attempt_result.resource_context.model
+                            if attempt_result is not None and attempt_result.resource_context else None
+                        ),
+                    )
+                if self.failure_memory is not None and attempt_reason:
+                    self.failure_memory.record_matching_recurrences(
+                        record.get("failure_environment", {}),
+                        attempt_reason,
+                        time.monotonic() - attempt_started,
+                        project_id=record["project_id"],
+                        task_id=record["task_id"],
+                        role="planner",
+                        request_id=planner_request.request_id,
+                        source_request_id=record["command_id"],
+                    )
             self._record_planner_attempt(plan_id, attempt, planner_request, planner_result, None, round_no=round_no)
             break
 
@@ -469,6 +556,23 @@ class AIPlannerCoordinator:
             timeout_seconds=policy["review_timeout_seconds"],
             metadata=metadata,
         )
+        review_result = None
+        review_outcome = "failed"
+        review_failure = None
+        review_started = time.monotonic()
+        if self.accounting is not None:
+            self.accounting.start_interval(
+                "plan_review",
+                review_request.request_id,
+                project_id=record["project_id"],
+                task_id=record["task_id"],
+                role="plan_reviewer",
+                request_id=review_request.request_id,
+                stage_run_id=review_request.stage_run_id,
+                role_run_id=review_request.role_run_id,
+                source_request_id=record["command_id"],
+                attempt_id=f"{plan_id}:plan-round-{round_no}",
+            )
         try:
             review_result = self.port.execute(review_request) if self.port is not None else None
             if review_result is None:
@@ -476,9 +580,57 @@ class AIPlannerCoordinator:
             if review_result.status != "succeeded":
                 raise RuntimeError(review_result.error or f"plan_reviewer_{review_result.status}")
             decision, reason = _parse_plan_review(review_result.output)
+            review_outcome = "accepted"
         except Exception as exc:
+            review_failure = str(exc)
             self._finish(plan_id, "failed", f"plan review failed: {exc}")
             return None
+        finally:
+            if self.accounting is not None:
+                self.accounting.end_interval(
+                    "plan_review",
+                    review_request.request_id,
+                    outcome=review_outcome,
+                    project_id=record["project_id"],
+                    task_id=record["task_id"],
+                    role="plan_reviewer",
+                    request_id=review_request.request_id,
+                    stage_run_id=review_request.stage_run_id,
+                    role_run_id=review_request.role_run_id,
+                    source_request_id=record["command_id"],
+                    attempt_id=f"{plan_id}:plan-round-{round_no}",
+                    dispatch_id=getattr(review_result, "dispatch_id", None),
+                    decision_id=getattr(review_result, "decision_id", None),
+                    execution_id=getattr(review_result, "execution_id", None),
+                    session_id=getattr(review_result, "session_id", None),
+                    resource_id=(
+                        review_result.resource_context.resource_id
+                        if review_result is not None and review_result.resource_context else None
+                    ),
+                    provider=(
+                        review_result.resource_context.provider
+                        if review_result is not None and review_result.resource_context else None
+                    ),
+                    account=(
+                        review_result.resource_context.account
+                        if review_result is not None and review_result.resource_context else None
+                    ),
+                    model=(
+                        review_result.resource_context.model
+                        if review_result is not None and review_result.resource_context else None
+                    ),
+                )
+            if self.failure_memory is not None and review_failure:
+                self.failure_memory.record_matching_recurrences(
+                    record.get("failure_environment", {}),
+                    review_failure,
+                    time.monotonic() - review_started,
+                    project_id=record["project_id"],
+                    task_id=record["task_id"],
+                    role="plan_reviewer",
+                    request_id=review_request.request_id,
+                    source_request_id=record["command_id"],
+                )
         return decision, reason, review_result
 
     def _run_cycle(self, plan_id: str, project: dict[str, Any], policy: dict[str, Any]) -> None:
@@ -555,6 +707,15 @@ class AIPlannerCoordinator:
 
             if decision == "owner_gate":
                 self._finish(plan_id, "owner_gate", reason)
+                if self.accounting is not None:
+                    self.accounting.open_owner_gate(
+                        plan_id,
+                        project_id=record["project_id"],
+                        task_id=record["task_id"],
+                        role="owner",
+                        request_id=plan_id,
+                        source_request_id=record["command_id"],
+                    )
                 if self.progress_channel is not None:
                     self.progress_channel.emit(
                         self._project_payload(record, project), "OWNER_GATE",
@@ -564,6 +725,20 @@ class AIPlannerCoordinator:
                 return
 
             if decision == "approve":
+                if self.accounting is not None:
+                    self.accounting.record_attempt_outcome(
+                        f"{plan_id}:plan-round-{round_no}",
+                        "accepted",
+                        project_id=record["project_id"],
+                        task_id=record["task_id"],
+                        role="plan_reviewer",
+                        request_id=(
+                            f"{plan_id}:reviewer"
+                            if round_no == 0
+                            else f"{plan_id}:reviewer:remediate-{round_no}"
+                        ),
+                        metadata={"review_kind": "plan", "decision": decision},
+                    )
                 self._apply_plan(plan_id, record, plan, reason, project=project)
                 return
 
@@ -572,6 +747,20 @@ class AIPlannerCoordinator:
                 return
 
             # Review decision is 'reject'
+            if self.accounting is not None:
+                self.accounting.record_attempt_outcome(
+                    f"{plan_id}:plan-round-{round_no}",
+                    "rejected",
+                    project_id=record["project_id"],
+                    task_id=record["task_id"],
+                    role="plan_reviewer",
+                    request_id=(
+                        f"{plan_id}:reviewer"
+                        if round_no == 0
+                        else f"{plan_id}:reviewer:remediate-{round_no}"
+                    ),
+                    metadata={"review_kind": "plan", "decision": decision, "reason": reason},
+                )
             rejection_entry = {
                 "round": round_no,
                 "reason": reason,
@@ -634,6 +823,15 @@ class AIPlannerCoordinator:
 
             exhaust_reason = f"plan remediation hit its bound after {max_remediation_rounds} rounds (exhausted); last rejection: {reason}"
             self._finish(plan_id, "owner_gate", exhaust_reason)
+            if self.accounting is not None:
+                self.accounting.open_owner_gate(
+                    plan_id,
+                    project_id=record["project_id"],
+                    task_id=record["task_id"],
+                    role="owner",
+                    request_id=plan_id,
+                    source_request_id=record["command_id"],
+                )
             if self.progress_channel is not None:
                 self.progress_channel.emit(
                     self._project_payload(record, project),
@@ -931,6 +1129,8 @@ class AIPlannerCoordinator:
             )
         if record.get("context_block"):
             prompt += f"{record['context_block']}\n\n"
+        if record.get("failure_memory_block"):
+            prompt += f"{record['failure_memory_block']}\n\n"
         heading, task_text = AIPlannerCoordinator._task_source(record)
         prompt += (
             f"{heading}:\n---BEGIN NEXT---\n"
@@ -953,6 +1153,10 @@ class AIPlannerCoordinator:
             prompt += f"{record['context_block']}\n\n"
         else:
             prompt = prompt[:-1]
+        if record.get("failure_memory_block"):
+            if not prompt.endswith("\n\n"):
+                prompt += "\n"
+            prompt += f"{record['failure_memory_block']}\n\n"
         heading, task_text = AIPlannerCoordinator._task_source(record)
         task_heading = heading if record.get("deferred") else "Original task"
         prompt += (

@@ -8,6 +8,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from dev_orchestrator.config import load_projects_config
+from dev_orchestrator.accounting import ExecutionRecorder
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
@@ -46,6 +47,7 @@ def submit_control_command(
     action: str,
     *,
     command_id: Optional[str] = None,
+    gate_id: Optional[str] = None,
 ) -> dict[str, Any]:
     project = _nonblank(project_id)
     if project is None:
@@ -59,6 +61,9 @@ def submit_control_command(
             raise ValueError(f"invalid command_id: {command_id!r}")
     else:
         cid = str(uuid4())
+    gate = _nonblank(gate_id)
+    if gate_id is not None and gate is None:
+        raise ValueError("gate_id must be nonblank when present")
     record = {
         "version": CONTROL_VERSION,
         "command_id": cid,
@@ -67,6 +72,8 @@ def submit_control_command(
         "state": "pending",
         "requested_at": utc_now_iso(),
     }
+    if gate is not None:
+        record["gate_id"] = gate
     write_json(inbox / (cid + ".json"), record, indent=2)
     return record
 
@@ -89,10 +96,12 @@ class ControlCommandCoordinator:
 
     def __init__(
         self, runtime_root: Path | str, planner: AIPlannerCoordinator | None = None,
+        accounting: ExecutionRecorder | None = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.inbox, self.history = _paths(runtime_root)
         self.planner = planner
+        self.accounting = accounting
     @staticmethod
     def _snapshot_map(summary: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(summary, dict) or not isinstance(summary.get("projects"), list):
@@ -274,6 +283,17 @@ class ControlCommandCoordinator:
         snapshot = snapshots.get(project_id)
         if snapshot is None:
             return self._blocked(command_id, project_id, action, "project snapshot is unavailable", now, record)
+        gate_id = _nonblank(record.get("gate_id"))
+        if gate_id is not None and self.accounting is not None:
+            telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+            self.accounting.close_owner_gate(
+                gate_id,
+                occurred_at=str(record.get("requested_at") or now),
+                project_id=project_id,
+                task_id=_nonblank(telemetry.get("task_id")),
+                role="owner",
+                request_id=command_id,
+            )
         next_status = str(snapshot.get("next_status") or "").upper()
         if "PENDING DESIGN" in next_status:
             if self.planner is None:

@@ -210,3 +210,23 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Added restart/idempotency test `test_restart_idempotency_after_deferred_start_before_apply` (`tests_py/test_staged_handoff.py`) proving restart between deferred start and apply transitions in-flight plan to `recovery_required`, re-running ticks does not duplicate planner, makes no new port calls, produces no commit, and leaves `agent/next.md` predecessor bytes untouched.
   - Added `INCOMPLETE` status rejection regression test in `tests_py/test_control_commands.py`.
   - Added `sys.path` and module cache purging to `tests_py/test_control_commands.py` for direct unittest execution.
+
+## P11b Execution Accounting Foundation / EDR / Failure Memory (2026-09-14)
+
+- Added the opt-in `dev_orchestrator.accounting` foundation:
+  - Cross-thread/process serialized and fsynced append-only JSONL ledger with contiguous sequences, deterministic replay IDs, strict stored-row validation, bounded corruption evidence, and explicit torn-tail quarantine/recovery.
+  - Closed event, phase, role and outcome taxonomies with observed project/task/request/source/dispatch/decision/execution/session/resource correlations.
+  - Deterministic interval pairing, clipping, right-censoring, precedence resolution and idle filling, producing an exclusive wall-clock breakdown without double counting.
+- Added accounting metrics for phase time, plan-review churn, retry wall time, owner wait, longest no-progress span, rejected attempt time and EDR.
+  - EDR counts only Worker/remediation AI execution and managed validation associated with an explicit accepted technical-review outcome.
+  - Direct and Browser Reviewer paths retain the real Worker source/attempt identity; missing identities remain absent rather than inferred.
+- Added structured failure memory with canonical SHA-256 fingerprints, deterministic environment predicates, verification/provenance, capped prompt injection, recurrence count/cost and fail-closed state loading.
+  - Seeded the verified Windows PowerShell 5.1 `&&`/`||` lesson and injected matching lessons into Planner, plan Reviewer, Worker/remediation Worker, direct Reviewer and Browser Reviewer prompts.
+- Instrumented Planner, plan review/remediation/retry, Broker and legacy Worker execution, legacy fallback retry, direct/browser technical review, browser queue and explicit owner-gate boundaries.
+- Added top-level `execution_accounting` configuration and optional `project-continue --gate-id`; missing or disabled accounting preserves existing calls, prompts and runtime file behavior.
+- Added `docs/EXECUTION_ACCOUNTING_CONTRACT.md` plus focused concurrency, corruption, interval/EDR, failure-memory, runtime compatibility and instrumentation tests.
+- Verification:
+  - Focused P11b and adjacent lifecycle suites passed.
+  - Full suite: 453 tests and 16 subtests passed (`python -m pytest tests_py -q`).
+  - Python compilation, userscript syntax and `git diff --check` passed.
+  - Graphify AST update completed successfully with 2327 nodes, 6163 edges and 128 communities; newly generated untracked Graphify output was excluded because this worktree has no tracked graph baseline.

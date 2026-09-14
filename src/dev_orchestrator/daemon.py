@@ -26,6 +26,7 @@ from typing import Any, Optional
 from dev_orchestrator.bridge.server import make_bridge_server
 from dev_orchestrator.bridge.store import BrowserBridgeStore
 from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
+from dev_orchestrator.accounting.runtime import load_accounting_runtime
 from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
 from dev_orchestrator.core.control_commands import ControlCommandCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
@@ -105,9 +106,28 @@ def _run_orchestration_tick(
             item for item in browser_summary["projects"]
             if not isinstance(item, dict) or str(item.get("project_id") or "") not in direct_review_projects
         ]
-    dispatch_worker_done_events(browser_summary, bridge_store, runtime)
+    accounting = getattr(executor, "accounting", None)
+    failure_memory = getattr(executor, "failure_memory", None)
+    if accounting is None and failure_memory is None:
+        dispatch_worker_done_events(browser_summary, bridge_store, runtime)
+    else:
+        dispatch_worker_done_events(
+            browser_summary,
+            bridge_store,
+            runtime,
+            accounting=accounting,
+            failure_memory=failure_memory,
+            failure_memory_max_chars=getattr(
+                executor, "failure_memory_max_chars", 2000
+            ),
+        )
     write_project_statuses(projected, runtime, phase="dispatch", daemon_state="running", pid=pid)
-    consume_websol_responses(browser_summary, bridge_store, runtime)
+    if accounting is None:
+        consume_websol_responses(browser_summary, bridge_store, runtime)
+    else:
+        consume_websol_responses(
+            browser_summary, bridge_store, runtime, accounting=accounting
+        )
     write_project_statuses(projected, runtime, phase="decision", daemon_state="running", pid=pid)
     executor.advance(raw_summary, config, decision_summary=projected)
     projected = executor.overlay_managed_runs(raw_summary)
@@ -193,17 +213,40 @@ def run_daemon(
     bridge_thread.start()
     bridge_bound_port = int(bridge_server.server_address[1])
     ai_execution_port = load_aibroker_execution_port(runtime)
+    accounting_runtime = load_accounting_runtime(runtime, config)
+    accounting = accounting_runtime.recorder if accounting_runtime is not None else None
+    failure_memory = accounting_runtime.failure_memory if accounting_runtime is not None else None
+    failure_memory_max_chars = (
+        accounting_runtime.prompt_max_chars if accounting_runtime is not None else 2000
+    )
     progress_channel = ProgressChannel(runtime, bridge_store=bridge_store)
     transition_executor = TransitionExecutor(
-        runtime, ai_execution_port=ai_execution_port, progress_channel=progress_channel
+        runtime,
+        ai_execution_port=ai_execution_port,
+        progress_channel=progress_channel,
+        accounting=accounting,
+        failure_memory=failure_memory,
+        failure_memory_max_chars=failure_memory_max_chars,
     )
     reviewer_coordinator = AIReviewerCoordinator(
-        runtime, ai_execution_port, progress_channel=progress_channel
+        runtime,
+        ai_execution_port,
+        progress_channel=progress_channel,
+        accounting=accounting,
+        failure_memory=failure_memory,
+        failure_memory_max_chars=failure_memory_max_chars,
     )
     planner_coordinator = AIPlannerCoordinator(
-        runtime, ai_execution_port, progress_channel=progress_channel
+        runtime,
+        ai_execution_port,
+        progress_channel=progress_channel,
+        accounting=accounting,
+        failure_memory=failure_memory,
+        failure_memory_max_chars=failure_memory_max_chars,
     )
-    control_coordinator = ControlCommandCoordinator(runtime, planner_coordinator)
+    control_coordinator = ControlCommandCoordinator(
+        runtime, planner_coordinator, accounting=accounting
+    )
     watchdog_coordinator = WatchdogCoordinator(
         runtime, ai_execution_port=ai_execution_port, progress_channel=progress_channel
     )

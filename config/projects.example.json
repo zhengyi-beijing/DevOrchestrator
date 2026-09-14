@@ -1,4 +1,10 @@
 {
+  "execution_accounting": {
+    "enabled": false,
+    "failure_memory": true,
+    "prompt_max_chars": 2000,
+    "event_path": "execution-accounting/events.jsonl"
+  },
   "projects": [
     {
       "project_id": "your-project",

@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dev_orchestrator.bridge.store import BrowserBridgeStore
+from dev_orchestrator.accounting import ExecutionRecorder
 from dev_orchestrator.core.decision import DecisionDisposition, validate_websol_response
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.websol import (
@@ -90,6 +91,7 @@ class WebSolConsumption:
     project_id: str
     request_id: str
     disposition: DecisionDisposition
+    source_request_id: Optional[str] = None
     next_action: Optional[NextAction] = None
     decision: Optional[WebSolDecision] = None
     reason: str = ""
@@ -273,23 +275,30 @@ def _save_decisions(path: Path, ledger: dict) -> None:
 # --------------------------------------------------------------------------
 
 
-def _reviewed_status_hash(path: Path, project_id: str, request_id: str) -> Optional[str]:
+def _reviewed_context(
+    path: Path, project_id: str, request_id: str
+) -> tuple[Optional[str], Optional[str]]:
     data = read_json(path.with_name("dispatcher-state.json"), None)
     if not isinstance(data, dict):
-        return None
+        return None, None
     worker_done = data.get("worker_done")
     project = worker_done.get(project_id) if isinstance(worker_done, dict) else None
     occurrences = project.get("occurrences") if isinstance(project, dict) else None
     if not isinstance(occurrences, dict):
-        return None
-    for occurrence in occurrences.values():
+        return None, None
+    for run_id, occurrence in occurrences.items():
         if isinstance(occurrence, dict) and occurrence.get("request_id") == request_id:
-            return _non_blank(occurrence.get("review_status_hash"))
-    return None
+            source_request_id = _non_blank(run_id)
+            return _non_blank(occurrence.get("review_status_hash")), source_request_id
+    return None, None
 
 
 def _consume_one(
-    snapshot: dict, record: dict, repo_path: str, reviewed_status_hash: Optional[str] = None
+    snapshot: dict,
+    record: dict,
+    repo_path: str,
+    reviewed_status_hash: Optional[str] = None,
+    source_request_id: Optional[str] = None,
 ) -> WebSolConsumption:
     """Turn one RESPONDED Bridge record into a persisted disposition.
 
@@ -329,6 +338,7 @@ def _consume_one(
             project_id=request.project_id,
             request_id=request.request_id,
             disposition=DecisionDisposition.STOP,
+            source_request_id=source_request_id,
             next_action=None,
             reason=_brief(exc),
             task_id=request.task_id,
@@ -347,6 +357,7 @@ def _consume_one(
         project_id=request.project_id,
         request_id=request.request_id,
         disposition=verdict.disposition,
+        source_request_id=source_request_id,
         next_action=verdict.next_action,
         decision=response.decision,
         reason=verdict.reason,
@@ -361,7 +372,11 @@ def _consume_one(
 
 
 def _consume_project(
-    snapshot: Any, store: BrowserBridgeStore, path: Path, ledger: dict
+    snapshot: Any,
+    store: BrowserBridgeStore,
+    path: Path,
+    ledger: dict,
+    accounting: ExecutionRecorder | None = None,
 ) -> list[WebSolConsumption]:
     """Consume every newly responded request under one project's binding."""
     if not isinstance(snapshot, dict):
@@ -381,11 +396,22 @@ def _consume_project(
         request_id = _non_blank(record.get("request_id"))
         if request_id is None or request_id in ledger["decisions"]:
             continue
-        reviewed_status_hash = _reviewed_status_hash(path, str(snapshot.get("project_id") or ""), request_id)
-        outcome = _consume_one(snapshot, record, repo_path, reviewed_status_hash)
+        reviewed_status_hash, source_request_id = _reviewed_context(
+            path, str(snapshot.get("project_id") or ""), request_id
+        )
+        outcome = _consume_one(
+            snapshot,
+            record,
+            repo_path,
+            reviewed_status_hash,
+            source_request_id,
+        )
+        if accounting is not None:
+            _record_browser_review_events(accounting, record, outcome)
         ledger["decisions"][outcome.request_id] = {
             "project_id": outcome.project_id,
             "request_id": outcome.request_id,
+            "source_request_id": outcome.source_request_id,
             "disposition": outcome.disposition.value,
             "next_action": outcome.next_action.value if outcome.next_action is not None else None,
             "decision": outcome.decision.value if outcome.decision is not None else None,
@@ -410,7 +436,10 @@ def _consume_project(
 
 
 def consume_websol_responses(
-    summary: Any, store: BrowserBridgeStore, runtime: Any
+    summary: Any,
+    store: BrowserBridgeStore,
+    runtime: Any,
+    accounting: ExecutionRecorder | None = None,
 ) -> list[WebSolConsumption]:
     """Consume newly RESPONDED Bridge responses into guard dispositions.
 
@@ -434,5 +463,86 @@ def consume_websol_responses(
     ledger = _load_decisions(path)
     outcomes: list[WebSolConsumption] = []
     for snapshot in projects:
-        outcomes.extend(_consume_project(snapshot, store, path, ledger))
+        outcomes.extend(_consume_project(snapshot, store, path, ledger, accounting))
     return outcomes
+
+
+def _record_browser_review_events(
+    accounting: ExecutionRecorder,
+    record: dict[str, Any],
+    outcome: WebSolConsumption,
+) -> None:
+    """Materialize Bridge timestamps without guessing missing boundaries."""
+    claimed_at = _non_blank(record.get("claimed_at"))
+    responded_at = _non_blank(record.get("responded_at"))
+    attempt_id = outcome.source_request_id
+    if claimed_at is not None:
+        accounting.end_interval(
+            "queue",
+            "browser-review-queue:" + outcome.request_id,
+            occurred_at=claimed_at,
+            outcome="accepted",
+            event_id="browser-review-queue-end:" + outcome.request_id,
+            project_id=outcome.project_id,
+            task_id=outcome.task_id,
+            role="reviewer",
+            request_id=outcome.request_id,
+            source_request_id=outcome.source_request_id,
+            attempt_id=attempt_id,
+        )
+    if claimed_at is not None:
+        accounting.start_interval(
+            "technical_review",
+            "browser-review:" + outcome.request_id,
+            occurred_at=claimed_at,
+            event_id="browser-review-start:" + outcome.request_id,
+            project_id=outcome.project_id,
+            task_id=outcome.task_id,
+            role="reviewer",
+            request_id=outcome.request_id,
+            source_request_id=outcome.source_request_id,
+            attempt_id=attempt_id,
+        )
+    if claimed_at is not None and responded_at is not None:
+        accounting.end_interval(
+            "technical_review",
+            "browser-review:" + outcome.request_id,
+            occurred_at=responded_at,
+            outcome="accepted",
+            event_id="browser-review-end:" + outcome.request_id,
+            project_id=outcome.project_id,
+            task_id=outcome.task_id,
+            role="reviewer",
+            request_id=outcome.request_id,
+            source_request_id=outcome.source_request_id,
+            attempt_id=attempt_id,
+        )
+    decision = outcome.decision.value if outcome.decision is not None else None
+    if (
+        responded_at is not None
+        and attempt_id is not None
+        and decision in {"next", "remediate", "stop"}
+    ):
+        accounting.record_attempt_outcome(
+            attempt_id,
+            "accepted" if decision == "next" else "rejected",
+            occurred_at=responded_at,
+            event_id="browser-review-outcome:" + outcome.request_id,
+            project_id=outcome.project_id,
+            task_id=outcome.task_id,
+            role="reviewer",
+            request_id=outcome.request_id,
+            source_request_id=outcome.source_request_id,
+            metadata={"review_kind": "technical", "decision": decision},
+        )
+    if responded_at is not None and decision == "owner_gate":
+        accounting.open_owner_gate(
+            "browser-review:" + outcome.request_id,
+            occurred_at=responded_at,
+            event_id="browser-owner-gate:" + outcome.request_id,
+            project_id=outcome.project_id,
+            task_id=outcome.task_id,
+            role="owner",
+            request_id=outcome.request_id,
+            source_request_id=outcome.source_request_id,
+        )

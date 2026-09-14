@@ -306,7 +306,14 @@ def cmd_project_continue(args: argparse.Namespace) -> int:
     snapshot = read_json(runtime / "projects" / (project_id + ".json"), None)
     if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
         _fail("project is not present in the current runtime")
-    _print_json(submit_control_command(runtime, project_id, "continue"))
+    _print_json(
+        submit_control_command(
+            runtime,
+            project_id,
+            "continue",
+            gate_id=getattr(args, "gate_id", None),
+        )
+    )
     return 0
 
 
@@ -837,6 +844,11 @@ def build_parser() -> argparse.ArgumentParser:
     project_continue = sub.add_parser("project-continue", help="queue a stateless continue command for one project")
     project_continue.add_argument("project_id")
     project_continue.add_argument("--runtime-root", default=None)
+    project_continue.add_argument(
+        "--gate-id",
+        default=None,
+        help="explicit owner-gate correlation id for wait-time accounting",
+    )
 
     monitor = sub.add_parser("monitor", help="run one tick (--once) or the heartbeat loop")
     monitor.add_argument("--once", action="store_true", help="run a single tick and print the summary")

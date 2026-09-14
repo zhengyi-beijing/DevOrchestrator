@@ -59,6 +59,11 @@ from typing import Any, Optional
 
 from dev_orchestrator.bridge.prompt import render_websol_prompt
 from dev_orchestrator.bridge.store import BrowserBridgeStore
+from dev_orchestrator.accounting import (
+    ExecutionRecorder,
+    FailureMemory,
+    environment_for_project,
+)
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.websol import WebSolEvent, WebSolRequest, WebSolRole
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
@@ -340,7 +345,13 @@ def _submit_prepared(
 
 
 def _dispatch_one(
-    snapshot: Any, store: BrowserBridgeStore, ledger: dict, path: Path
+    snapshot: Any,
+    store: BrowserBridgeStore,
+    ledger: dict,
+    path: Path,
+    accounting: ExecutionRecorder | None = None,
+    failure_memory: FailureMemory | None = None,
+    failure_memory_max_chars: int = 2000,
 ) -> Optional[WorkerDoneDispatch]:
     """Dispatch one completed Worker occurrence, idempotently across crashes."""
     if not isinstance(snapshot, dict):
@@ -415,6 +426,12 @@ def _dispatch_one(
     )
     context = _worker_done_evidence(snapshot, truth, worker, task_id, stage_id, run_id)
     prompt = render_websol_prompt(request, context)
+    if failure_memory is not None:
+        prompt = failure_memory.inject_prompt(
+            prompt,
+            environment_for_project(snapshot),
+            max_chars=failure_memory_max_chars,
+        )
 
     # Freeze the occurrence exactly once, before any delivery decision. The
     # frozen identity/prompt is what a later binding or live presence resumes;
@@ -440,6 +457,20 @@ def _dispatch_one(
         occurrence["adapter"] = adapter
         occurrence["binding_id"] = binding_id
     occurrences[run_id] = occurrence
+    queue_started_at = _non_blank(worker.get("updated_at")) or _non_blank(worker.get("started_at"))
+    if accounting is not None and queue_started_at is not None:
+        accounting.start_interval(
+            "queue",
+            "browser-review-queue:" + request.request_id,
+            occurred_at=queue_started_at,
+            event_id="browser-review-queue-start:" + request.request_id,
+            project_id=project_id,
+            task_id=task_id,
+            role="reviewer",
+            request_id=request.request_id,
+            source_request_id=run_id,
+            attempt_id=run_id,
+        )
     _save_ledger(path, ledger)
 
     if route is not None and ready and _delivery_allowed(store, route[1], route[2]):
@@ -452,7 +483,14 @@ def _dispatch_one(
 # --------------------------------------------------------------------------
 
 
-def dispatch_worker_done_events(summary: Any, store: BrowserBridgeStore, runtime: Any) -> list:
+def dispatch_worker_done_events(
+    summary: Any,
+    store: BrowserBridgeStore,
+    runtime: Any,
+    accounting: ExecutionRecorder | None = None,
+    failure_memory: FailureMemory | None = None,
+    failure_memory_max_chars: int = 2000,
+) -> list:
     """Submit one WORKER_DONE request per newly completed Worker occurrence.
 
     ``summary`` is one monitor summary (``{"projects": [snapshot, ...]}``).
@@ -475,7 +513,15 @@ def dispatch_worker_done_events(summary: Any, store: BrowserBridgeStore, runtime
     ledger = _load_ledger(path)
     dispatched: list[WorkerDoneDispatch] = []
     for snapshot in projects:
-        outcome = _dispatch_one(snapshot, store, ledger, path)
+        outcome = _dispatch_one(
+            snapshot,
+            store,
+            ledger,
+            path,
+            accounting,
+            failure_memory,
+            failure_memory_max_chars,
+        )
         if outcome is not None:
             dispatched.append(outcome)
     return dispatched

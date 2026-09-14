@@ -5,29 +5,21 @@
 - Development branch: `feature/self-hosted-dev`.
 - Stable branch: `feature/browser-bridge-multiproject`.
 
-Current task: **P11x Deferred Staged Handoff (Planner-Owned Materialization)** — **REMEDIATED / READY FOR REVIEW**.
+Current task: **P11b Execution Accounting Foundation / EDR / Failure Memory** — **COMPLETE**.
 
 Implementation summary:
-- Added pure staged-roadmap reader `src/dev_orchestrator/core/staged_roadmap.py` with `RoadmapResult`, `read_successor()`, `read_raw()`, and `sha256_bytes()` using existing `extract_task_id` telemetry helper.
-- Validated `agent/staged/roadmap.json` against strict schema v1, relative POSIX spec paths under `agent/staged/`, non-null parity, duplicate/self task ID guards, and strict UTF-8 LF-only spec contracts.
-- Extended `TransitionExecutor._record_handoff()` to capture `staged_successor`, `staged_spec_path`, `staged_spec_sha256`, `reviewed_branch`, and `reviewed_head` without mutating repository state or storing raw spec text.
-- Wired reviewer-'next' COMPLETE path in `TransitionExecutor.advance()` to inspect `read_successor()`: fail-closed on invalid roadmap, settle on absent or `successor: null`, and record staged handoff on successor.
-- Extended `ControlCommandCoordinator._resume_decision_handoffs()` to recognize staged handoff rows and invoke `AIPlannerCoordinator.start_deferred()`.
-- Refactored `AIPlannerCoordinator.start()` via shared `_begin_lifecycle()`, and added `start_deferred()` enforcing strict repository truth, clean worktree, branch/head match, predecessor `agent/next.md` digest, and staged spec digest validation.
-- Implemented `AIPlannerCoordinator._task_source()` returning staged successor spec and audit header for deferred records while preserving exact byte-identical prompt output for non-deferred runs across initial planner, retry, remediation, and review prompts.
-- Implemented `_apply_deferred_plan()` in `AIPlannerCoordinator` with strict pre-write digest re-checks, TOCTOU repository truth re-read, atomic write of rendered spec to `agent/next.md`, single commit via `_commit_plan()`, and reset-free predecessor byte restoration recovery (`git add -- agent/next.md`) if write/commit fails.
-- P11x Review Remediation:
-  - Tightened staged-row eligibility check in `ControlCommandCoordinator._resume_decision_handoffs` using `re.search(r"\bCOMPLETED?\b", ...)` regex word boundaries to reject non-matching statuses such as `INCOMPLETE`.
-  - Added regression test in `tests_py/test_control_commands.py` proving `INCOMPLETE` is rejected and not consumed.
-  - Added deferred apply guard test `test_deferred_apply_new_commit_fails` in `tests_py/test_staged_handoff.py` proving a concurrent commit fails with `'repository changed during planning'` with HEAD and `agent/next.md` bytes unchanged.
-  - Added recovery test `test_deferred_recovery_when_head_moved_leaves_worktree_untouched` in `tests_py/test_staged_handoff.py` proving that if commit succeeds and post-commit failure raises, the worktree is left untouched at the new commit without prohibited git commands.
-  - Added restart/idempotency test `test_restart_idempotency_after_deferred_start_before_apply` in `tests_py/test_staged_handoff.py` proving restart between deferred start and apply transitions in-flight plan to `recovery_required`, re-running ticks does not duplicate planner, makes no new port calls, produces no commit, and leaves `agent/next.md` predecessor bytes untouched.
-- Unit and integration tests:
-  - `tests_py/test_staged_roadmap.py` (22 tests): absent file, malformed JSON, schema version, duplicate/blank tasks, path traversal, non-POSIX, CRLF, non-UTF-8, heading mismatch, non-PENDING status, approved marker, end-of-roadmap, and real-repo roadmap validation (`P11x -> P11b -> P11c -> P11d -> null`).
-  - `tests_py/test_transition_executor.py`: staged handoff row emission, invalid roadmap fail-closed blocking, and end-of-roadmap terminal settlement.
-  - `tests_py/test_control_commands.py`: staged handoff resumption, idempotency across ticks/instances, snapshot task/status mismatch filtering, and `INCOMPLETE` rejection.
-  - `tests_py/test_staged_handoff.py` (14 tests): deferred prompt generation, start_deferred guards (head moved, dirty worktree, branch mismatch, digest mismatch, missing metadata), apply pre-write guards, pre-write truth race condition, concurrent commit failure, reset-free recovery without prohibited git commands, post-commit failure with moved HEAD leaving worktree untouched, end-to-end handoff execution, and restart/idempotency both before and after apply.
-  - `tests_py/conftest.py`: ensures local repository `src/` is prioritized on `sys.path`.
-- Full test suite: 418 passed, 16 subtests passed (`python -m pytest tests_py -q`).
-- Userscript syntax check: `node --check browser/chatgpt-web-adapter.user.js` passed.
-- Repository hygiene: `git diff --check` clean.
+- Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
+- Added deterministic exclusive interval construction with clipping, right-censoring, overlap precedence, idle filling, explicit owner-gate correlation and no wall-clock double counting.
+- Added accounting summaries for phase time, plan-review churn, retry wall time, owner wait, longest no-progress interval, rejected attempt time and EDR.
+- EDR counts only AI execution and managed validation linked to an explicit technically accepted Worker/remediation attempt; rejected and unresolved attempts do not enter the numerator.
+- Added structured, predicate-matched failure memory with canonical fingerprints, verification/provenance, capped prompt rendering, recurrence count/cost and fail-closed state loading.
+- Seeded and injected the verified Windows PowerShell 5.1 `&&`/`||` lesson into matching Planner, Worker and Reviewer prompts when accounting is enabled.
+- Instrumented Planner, plan review/remediation/retry, Broker/legacy Worker, legacy fallback retry, direct/browser technical review, browser queue and explicit owner-gate boundaries with observed correlation/resource identity.
+- Added top-level `execution_accounting` opt-in and optional `project-continue --gate-id`; missing/disabled accounting preserves existing orchestration calls and prompts.
+- Added the contract document `docs/EXECUTION_ACCOUNTING_CONTRACT.md` and dedicated concurrency, accounting, failure-memory, runtime and instrumentation test suites.
+
+Verification status:
+- Focused P11b and adjacent lifecycle regression suites pass.
+- Full `python -m pytest tests_py -q`: 453 tests and 16 subtests passed.
+- `python -m compileall -q src tests_py`, userscript syntax and `git diff --check` passed.
+- Graphify AST update completed successfully: 2327 nodes, 6163 edges and 128 communities. Because the worktree had no tracked Graphify baseline, its newly generated cache/output was kept out of the P11b commit.

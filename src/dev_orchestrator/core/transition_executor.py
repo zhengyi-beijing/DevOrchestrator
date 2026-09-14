@@ -12,12 +12,14 @@ import asyncio
 import copy
 import re
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from dev_orchestrator.ai.contracts import AIRoleRequest
 from dev_orchestrator.ai.execution_port import AIExecutionPort, MANAGED_INTERRUPT_REASON
+from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.agents.base import AgentBackend
 from dev_orchestrator.agents.backends.agy import AgyBackend
 from dev_orchestrator.agents.backends.dsh import DshBackend
@@ -285,6 +287,9 @@ class TransitionExecutor:
         backend_overrides: Optional[dict[str, AgentBackend]] = None,
         ai_execution_port: Optional[AIExecutionPort] = None,
         progress_channel: Optional[Any] = None,
+        accounting: ExecutionRecorder | None = None,
+        failure_memory: FailureMemory | None = None,
+        failure_memory_max_chars: int = 2000,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
@@ -293,6 +298,9 @@ class TransitionExecutor:
         self._threads: dict[str, threading.Thread] = {}
         self._ai_execution_port = ai_execution_port
         self._progress_channel = progress_channel
+        self.accounting = accounting
+        self.failure_memory = failure_memory
+        self.failure_memory_max_chars = failure_memory_max_chars
         self._backend_overrides: dict[str, AgentBackend] = {}
         for backend_id, backend in (backend_overrides or {}).items():
             if backend_id not in _SUPPORTED_BACKENDS:
@@ -667,9 +675,16 @@ class TransitionExecutor:
             )
             return None
 
+        failure_environment = environment_for_project(project)
         effective_worker_prompt = (
             "{0}\n\n{1}".format(worker_prompt, context_block) if context_block else worker_prompt
         )
+        if self.failure_memory is not None:
+            failure_block = self.failure_memory.prompt_block(
+                failure_environment, max_chars=self.failure_memory_max_chars
+            )
+            if failure_block:
+                effective_worker_prompt = effective_worker_prompt.rstrip() + "\n\n" + failure_block
 
         if policy.get("engine") == "aibroker":
             return self._launch_aibroker(
@@ -684,6 +699,12 @@ class TransitionExecutor:
             working_directory=Path(str(project["repo_path"])),
             required_capabilities=frozenset({"code", "repository"}),
             preferred_backends=tuple(policy["preferred_backends"]),
+            metadata={
+                "source_request_id": source_request_id,
+                "task_id": task_id,
+                "source_kind": source_kind,
+                "failure_environment": failure_environment,
+            },
         )
         try:
             router, backends = self._router_for_policy(policy)
@@ -820,7 +841,11 @@ class TransitionExecutor:
             prompt=worker_prompt,
             working_directory=Path(str(project["repo_path"])),
             timeout_seconds=float(policy.get("worker_timeout_seconds") or 14400),
-            metadata={"source_request_id": source_request_id, "source_kind": source_kind},
+            metadata={
+                "source_request_id": source_request_id,
+                "source_kind": source_kind,
+                "failure_environment": environment_for_project(project),
+            },
         )
         with self._lock:
             ledger = self._load_ledger()
@@ -875,12 +900,53 @@ class TransitionExecutor:
         return ActuationLaunch(project_id, source_request_id, task_id, "aibroker", "launching")
 
     def _run_broker_worker_thread(self, source_request_id: str, request: AIRoleRequest) -> None:
+        accounting_started = time.monotonic()
+        worker_role = "remediation_worker" if request.stage_run_id == "remediation" else "worker"
+        if self.accounting is not None:
+            self.accounting.start_interval(
+                "ai_execution",
+                request.request_id,
+                project_id=request.project_id,
+                task_id=request.task_run_id,
+                role=worker_role,
+                request_id=request.request_id,
+                stage_run_id=request.stage_run_id,
+                role_run_id=request.role_run_id,
+                source_request_id=source_request_id,
+                attempt_id=source_request_id,
+            )
+        result = None
         try:
             self._update_record(source_request_id, state="running")
             result = self._ai_execution_port.execute(request) if self._ai_execution_port else None
             if result is None:
                 raise RuntimeError("AIBroker execution port became unavailable")
         except Exception as exc:
+            if self.accounting is not None:
+                self.accounting.end_interval(
+                    "ai_execution",
+                    request.request_id,
+                    outcome="failed",
+                    project_id=request.project_id,
+                    task_id=request.task_run_id,
+                    role=worker_role,
+                    request_id=request.request_id,
+                    stage_run_id=request.stage_run_id,
+                    role_run_id=request.role_run_id,
+                    source_request_id=source_request_id,
+                    attempt_id=source_request_id,
+                )
+            if self.failure_memory is not None:
+                self.failure_memory.record_matching_recurrences(
+                    request.metadata.get("failure_environment", {}),
+                    str(exc),
+                    time.monotonic() - accounting_started,
+                    project_id=request.project_id,
+                    task_id=request.task_run_id,
+                    role=worker_role,
+                    request_id=request.request_id,
+                    source_request_id=source_request_id,
+                )
             self._update_record(
                 source_request_id, state="failed",
                 reason="AIBroker worker lifecycle error: {0}".format(exc),
@@ -908,6 +974,39 @@ class TransitionExecutor:
             state = "cancelled"
         else:
             state = "failed"
+        if self.accounting is not None:
+            self.accounting.end_interval(
+                "ai_execution",
+                request.request_id,
+                outcome={"completed": "accepted", "cancelled": "cancelled"}.get(state, "failed"),
+                project_id=request.project_id,
+                task_id=request.task_run_id,
+                role=worker_role,
+                request_id=request.request_id,
+                stage_run_id=request.stage_run_id,
+                role_run_id=request.role_run_id,
+                source_request_id=source_request_id,
+                attempt_id=source_request_id,
+                dispatch_id=result.dispatch_id,
+                decision_id=result.decision_id,
+                execution_id=result.execution_id,
+                session_id=result.session_id,
+                resource_id=resource.resource_id if resource else None,
+                provider=resource.provider if resource else None,
+                account=resource.account if resource else None,
+                model=resource.model if resource else None,
+            )
+        if self.failure_memory is not None and state == "failed":
+            self.failure_memory.record_matching_recurrences(
+                request.metadata.get("failure_environment", {}),
+                str(result.error or ""),
+                time.monotonic() - accounting_started,
+                project_id=request.project_id,
+                task_id=request.task_run_id,
+                role=worker_role,
+                request_id=request.request_id,
+                source_request_id=source_request_id,
+            )
         self._update_record(
             source_request_id,
             state=state,
@@ -953,11 +1052,68 @@ class TransitionExecutor:
         self, source_request_id: str, request: AgentRequest, backend: AgentBackend,
         backends: dict[str, AgentBackend], fallback_ids: tuple[str, ...],
     ) -> None:
+        accounting_started = time.monotonic()
+        with self._lock:
+            record = copy.deepcopy(
+                self._load_ledger()["executions"].get(source_request_id, {})
+            )
+        worker_role = "remediation_worker" if record.get("source_kind") == "remediation" else "worker"
+        interval_id = "legacy-worker:" + source_request_id
+        if self.accounting is not None:
+            self.accounting.start_interval(
+                "ai_execution",
+                interval_id,
+                project_id=request.project_id,
+                task_id=record.get("task_id"),
+                role=worker_role,
+                source_request_id=source_request_id,
+                attempt_id=source_request_id,
+            )
         try:
             asyncio.run(
                 self._run_worker(source_request_id, request, backend, backends, fallback_ids)
             )
+            with self._lock:
+                terminal = self._load_ledger()["executions"].get(source_request_id, {})
+            outcome = {
+                "completed": "accepted",
+                "cancelled": "cancelled",
+            }.get(str(terminal.get("state") or ""), "failed")
+            if self.accounting is not None:
+                self.accounting.end_interval(
+                    "ai_execution",
+                    interval_id,
+                    outcome=outcome,
+                    project_id=request.project_id,
+                    task_id=record.get("task_id"),
+                    role=worker_role,
+                    source_request_id=source_request_id,
+                    attempt_id=source_request_id,
+                    execution_id=terminal.get("backend_run_id"),
+                    metadata={"backend_id": terminal.get("backend_id")},
+                )
         except Exception as exc:  # fail closed; never auto-retry
+            if self.accounting is not None:
+                self.accounting.end_interval(
+                    "ai_execution",
+                    interval_id,
+                    outcome="failed",
+                    project_id=request.project_id,
+                    task_id=record.get("task_id"),
+                    role=worker_role,
+                    source_request_id=source_request_id,
+                    attempt_id=source_request_id,
+                )
+            if self.failure_memory is not None:
+                self.failure_memory.record_matching_recurrences(
+                    request.metadata.get("failure_environment", {}),
+                    str(exc),
+                    time.monotonic() - accounting_started,
+                    project_id=request.project_id,
+                    task_id=record.get("task_id"),
+                    role=worker_role,
+                    source_request_id=source_request_id,
+                )
             self._update_record(
                 source_request_id,
                 state="failed",
@@ -1035,12 +1191,49 @@ class TransitionExecutor:
                 fallback_attempted_at=utc_now_iso(),
                 backend_id=fallback.backend_id,
             )
+            retry_interval_id = "legacy-retry:" + source_request_id
+            if self.accounting is not None:
+                self.accounting.start_interval(
+                    "retry",
+                    retry_interval_id,
+                    project_id=request.project_id,
+                    task_id=record.get("task_id"),
+                    role=(
+                        "remediation_worker"
+                        if record.get("source_kind") == "remediation"
+                        else "worker"
+                    ),
+                    source_request_id=source_request_id,
+                    attempt_id=source_request_id,
+                    metadata={
+                        "fallback_from": backend.backend_id,
+                        "fallback_to": fallback.backend_id,
+                    },
+                )
             run = await fallback.start(request)
             self._update_record(
                 source_request_id, state=run.state.value, backend_run_id=run.run_id,
                 pid=run.pid, backend_id=run.backend_id,
             )
             result = await fallback.collect(run.run_id)
+            if self.accounting is not None:
+                self.accounting.end_interval(
+                    "retry",
+                    retry_interval_id,
+                    outcome=(
+                        "accepted" if result.state is AgentRunState.COMPLETED else "failed"
+                    ),
+                    project_id=request.project_id,
+                    task_id=record.get("task_id"),
+                    role=(
+                        "remediation_worker"
+                        if record.get("source_kind") == "remediation"
+                        else "worker"
+                    ),
+                    source_request_id=source_request_id,
+                    attempt_id=source_request_id,
+                    execution_id=run.run_id,
+                )
 
         terminal = result.state.value
         if result.state not in (
