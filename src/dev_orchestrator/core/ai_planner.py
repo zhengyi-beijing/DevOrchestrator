@@ -18,6 +18,7 @@ from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_js
 
 PLANNER_STATE_FILE = "ai-planner.json"
 _STATE_VERSION = 1
+_INTERRUPTED_ADJUDICATION_REASON = "DevOrchestrator daemon restart interrupted adjudication; process tree confirmed stopped"
 _ACTIVE_STATES = frozenset({"planning", "reviewing", "remediating", "adjudicating", "applying"})
 
 
@@ -241,6 +242,11 @@ class AIPlannerCoordinator:
             policy, _ = _planner_policy(project)
             if policy is None or not policy.get("adjudication_enabled"):
                 continue
+            if record.get("state") == "recovery_required":
+                if not self._recover_interrupted_adjudication(plan_id):
+                    continue
+                with self._lock:
+                    record = copy.deepcopy(self._load_state()["plans"].get(plan_id, {}))
             attempts = int(record.get("adjudication_attempt_count") or (1 if record.get("adjudication_attempted_at") else 0))
             if record.get("state") != "failed" or record.get("adjudication_decision") or attempts >= policy["adjudication_max_attempts"]:
                 continue
@@ -252,6 +258,38 @@ class AIPlannerCoordinator:
             if self._start_adjudication(plan_id, project, policy):
                 launched.append(plan_id)
         return launched
+
+    def _recover_interrupted_adjudication(self, plan_id: str) -> bool:
+        if self.port is None or not hasattr(self.port, "status"):
+            return False
+        try:
+            fact = self.port.status(plan_id + ":adjudicator")
+        except Exception:
+            return False
+        if not isinstance(fact, dict) or fact.get("status") != "failed":
+            return False
+        if fact.get("execution_error") != _INTERRUPTED_ADJUDICATION_REASON:
+            return False
+        dispatch_id = fact.get("dispatch_id")
+        if not isinstance(dispatch_id, str) or not dispatch_id.strip():
+            return False
+        with self._lock:
+            state = self._load_state()
+            current = state["plans"].get(plan_id)
+            if not isinstance(current, dict) or current.get("state") != "recovery_required" or current.get("adjudication_decision"):
+                return False
+            if current.get("adjudication_recovered_dispatch_id") == dispatch_id:
+                return False
+            attempts = int(current.get("adjudication_attempt_count") or 0)
+            if attempts < 1:
+                return False
+            current["state"] = "failed"
+            current["reason"] = "recovering daemon-interrupted adjudication attempt"
+            current["adjudication_attempt_count"] = attempts - 1
+            current["adjudication_recovered_dispatch_id"] = dispatch_id
+            current["adjudication_recovered_at"] = utc_now_iso()
+            self._save_state(state)
+        return True
 
     def _start_adjudication(self, plan_id: str, project: dict[str, Any], policy: dict[str, Any]) -> bool:
         with self._lock:

@@ -161,3 +161,67 @@ def test_adjudication_accepts_json_markdown_fence_only():
     assert decision == "contract_patch"
     assert reason == "resolved"
     assert plan["task_id"] == "P14"
+
+
+class InterruptedAdjudicationPort(AdjudicationPort):
+    def __init__(self, execution_error):
+        super().__init__("contract_patch")
+        self.execution_error = execution_error
+
+    def status(self, request_id):
+        return {
+            "request_id": request_id,
+            "dispatch_id": "dispatch-interrupted",
+            "status": "failed",
+            "execution_error": self.execution_error,
+        }
+
+
+def _mark_recovery_required(runtime, plan_id, attempts=5):
+    coordinator = AIPlannerCoordinator(runtime, None)
+    state = coordinator.state()
+    row = state["plans"][plan_id]
+    row["state"] = "recovery_required"
+    row["adjudication_attempt_count"] = attempts
+    row["reason"] = "daemon restarted during planner lifecycle; automatic replay forbidden"
+    coordinator._save_state(state)
+
+
+def test_daemon_interrupted_adjudication_reuses_same_attempt():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+        make_repo(repo)
+        plan_id = seed_failed_plan(runtime, repo)
+        _mark_recovery_required(runtime, plan_id, attempts=5)
+        config = base / "projects.json"; write_config(config, repo)
+        data = json.loads(config.read_text(encoding="utf-8"))
+        data["projects"][0]["ai_roles"]["planner"]["adjudication_max_attempts"] = 5
+        config.write_text(json.dumps(data), encoding="utf-8")
+        reason = "DevOrchestrator daemon restart interrupted adjudication; process tree confirmed stopped"
+        port = InterruptedAdjudicationPort(reason)
+        coordinator = AIPlannerCoordinator(runtime, port)
+        assert coordinator.advance_adjudications(config) == [plan_id]
+        row = wait_terminal(coordinator, plan_id)
+        assert row["state"] == "ready"
+        assert row["adjudication_attempt_count"] == 5
+        assert row["adjudication_recovered_dispatch_id"] == "dispatch-interrupted"
+        assert len(port.requests) == 1
+
+
+def test_non_interrupt_recovery_required_is_not_replayed():
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+        make_repo(repo)
+        plan_id = seed_failed_plan(runtime, repo)
+        _mark_recovery_required(runtime, plan_id, attempts=5)
+        config = base / "projects.json"; write_config(config, repo)
+        data = json.loads(config.read_text(encoding="utf-8"))
+        data["projects"][0]["ai_roles"]["planner"]["adjudication_max_attempts"] = 5
+        config.write_text(json.dumps(data), encoding="utf-8")
+        port = InterruptedAdjudicationPort("provider schema failure")
+        coordinator = AIPlannerCoordinator(runtime, port)
+        assert coordinator.advance_adjudications(config) == []
+        row = coordinator.state()["plans"][plan_id]
+        assert row["state"] == "recovery_required"
+        assert row["adjudication_attempt_count"] == 5
+        assert port.requests == []
