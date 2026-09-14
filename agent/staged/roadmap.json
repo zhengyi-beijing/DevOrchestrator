@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {"task_id": "P11x", "successor": "P11b", "successor_spec_path": "agent/staged/P11b.md"},
+    {"task_id": "P11b", "successor": "P11c", "successor_spec_path": "agent/staged/P11c.md"},
+    {"task_id": "P11c", "successor": "P11d", "successor_spec_path": "agent/staged/P11d.md"},
+    {"task_id": "P11d", "successor": null, "successor_spec_path": null}
+  ]
+}
