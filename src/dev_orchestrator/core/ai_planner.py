@@ -59,8 +59,8 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
         return None, "planner adjudication_timeout_seconds must be positive"
     if isinstance(adjudication_min_rejections, bool) or not isinstance(adjudication_min_rejections, int) or not 1 <= adjudication_min_rejections <= 5:
         return None, "planner adjudication_min_rejections must be an integer from 1 to 5"
-    if isinstance(adjudication_max_attempts, bool) or not isinstance(adjudication_max_attempts, int) or not 1 <= adjudication_max_attempts <= 6:
-        return None, "planner adjudication_max_attempts must be an integer from 1 to 6"
+    if isinstance(adjudication_max_attempts, bool) or not isinstance(adjudication_max_attempts, int) or not 1 <= adjudication_max_attempts <= 7:
+        return None, "planner adjudication_max_attempts must be an integer from 1 to 7"
     if quality not in {"economy", "balanced", "high"}:
         return None, "planner quality invalid"
     if review_quality not in {"economy", "balanced", "high"}:
