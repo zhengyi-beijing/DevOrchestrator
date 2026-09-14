@@ -5,7 +5,9 @@
 - Development branch: `feature/self-hosted-dev`.
 - Stable branch: `feature/browser-bridge-multiproject`.
 
-Current task: **P11b Execution Accounting Foundation / EDR / Failure Memory** — **COMPLETE**.
+Current task: **P11c Provider Context and RDC Evidence** — **COMPLETE**.
+
+Next staged task: **P11d Reporting and Quantitative Acceptance**.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
@@ -23,3 +25,15 @@ Verification status:
 - Full `python -m pytest tests_py -q`: 453 tests and 16 subtests passed.
 - `python -m compileall -q src tests_py`, userscript syntax and `git diff --check` passed.
 - Graphify AST update completed successfully: 2327 nodes, 6163 edges and 128 communities. Because the worktree had no tracked Graphify baseline, its newly generated cache/output was kept out of the P11b commit.
+
+P11c result:
+- AIBroker results now emit durable, idempotent provider evidence with exact
+  request/dispatch/execution/resource/session correlation and optional explicit
+  timing, quota, rate-limit, and first-output facts.
+- Provider summaries report resource/provider/account/model/session continuity,
+  unknown fields, resource switches, and evidence-qualified failover latency.
+- Normalized RDC JSON/JSONL evidence can be imported into the accounting ledger;
+  deterministic classifiers cover isolated concurrency, HOL blocking,
+  starvation, session coupling, reconnect contamination, and no-output deadlock.
+- Recovery target calculation is project-scoped and read-only.
+- Focused P11c tests and the full Python regression suite pass.

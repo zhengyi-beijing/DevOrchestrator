@@ -52,5 +52,5 @@ Follow-up from CCP7 live acceptance:
 
 - **P11-A — Bounded plan-review remediation loop (complete):** bootstrap lifecycle fix. Reviewer rejection auto-revises/re-reviews for at most 3 rounds, then OWNER_GATE.
 - **P11-B — Execution accounting foundation (complete):** durable lifecycle/test/retry/accepted-work timing, Effective Development Ratio, plan-review churn, and failure-memory foundation.
-- **P11-C — Provider/context/RDC evidence (next staged task):** context continuity, quota/failover latency, RDC invocation metrics and multi-project isolation probes with deterministic classification.
-- **P11-D — Reporting and acceptance:** 8770 dashboard, bottleneck diagnoses, representative-day DevO + xray-hw-platform evidence, and quantitative acceptance gates.
+- **P11-C — Provider/context/RDC evidence (complete):** context continuity, quota/failover latency, RDC invocation metrics and multi-project isolation probes with deterministic classification.
+- **P11-D — Reporting and acceptance (next staged task):** 8770 dashboard, bottleneck diagnoses, representative DevOrchestrator evidence, and quantitative acceptance gates. xray-hw-platform remains paused unless separately authorized.

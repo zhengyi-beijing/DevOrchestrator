@@ -212,13 +212,13 @@ def run_daemon(
     web_thread.start()
     bridge_thread.start()
     bridge_bound_port = int(bridge_server.server_address[1])
-    ai_execution_port = load_aibroker_execution_port(runtime)
     accounting_runtime = load_accounting_runtime(runtime, config)
     accounting = accounting_runtime.recorder if accounting_runtime is not None else None
     failure_memory = accounting_runtime.failure_memory if accounting_runtime is not None else None
     failure_memory_max_chars = (
         accounting_runtime.prompt_max_chars if accounting_runtime is not None else 2000
     )
+    ai_execution_port = load_aibroker_execution_port(runtime, accounting=accounting)
     progress_channel = ProgressChannel(runtime, bridge_store=bridge_store)
     transition_executor = TransitionExecutor(
         runtime,

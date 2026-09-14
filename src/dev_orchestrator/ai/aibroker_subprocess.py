@@ -7,9 +7,12 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .contracts import AIRoleRequest, AIRoleResult, ResourceContext
+
+if TYPE_CHECKING:
+    from dev_orchestrator.accounting.events import ExecutionRecorder
 
 
 class AIBrokerInvocationError(RuntimeError):
@@ -35,8 +38,14 @@ class AIBrokerClientConfig:
 class AIBrokerExecutionPort:
     """Invoke AIBroker P2.5 dispatch in its own Python environment."""
 
-    def __init__(self, config: AIBrokerClientConfig) -> None:
+    def __init__(
+        self,
+        config: AIBrokerClientConfig,
+        *,
+        accounting: "ExecutionRecorder | None" = None,
+    ) -> None:
         self.config = config
+        self.accounting = accounting
 
     def _build_env(self) -> dict[str, str]:
         env = dict(os.environ)
@@ -82,7 +91,67 @@ class AIBrokerExecutionPort:
             raise AIBrokerInvocationError("broker returned invalid JSON") from exc
         if not isinstance(payload, dict):
             raise AIBrokerInvocationError("broker result must be a JSON object")
-        return self._result_from_payload(request, payload)
+        result = self._result_from_payload(request, payload)
+        self._record_provider_evidence(request, result)
+        return result
+
+    def _record_provider_evidence(self, request: AIRoleRequest, result: AIRoleResult) -> None:
+        """Record only fields returned by Broker or carried by the exact request."""
+        if self.accounting is None:
+            return
+        resource = result.resource_context
+        previous = request.previous_resource_context
+        previous_payload = None
+        if previous is not None:
+            previous_payload = {
+                "resource_id": previous.resource_id,
+                "provider": previous.provider,
+                "account": previous.account,
+                "model": previous.model,
+            }
+        request_metadata = request.metadata if isinstance(request.metadata, Mapping) else {}
+        correlation_group = next(
+            (
+                str(request_metadata[key])
+                for key in ("source_request_id", "control_command_id", "worker_source_request_id")
+                if isinstance(request_metadata.get(key), str) and str(request_metadata[key]).strip()
+            ),
+            request.task_run_id or request.role_run_id or request.request_id,
+        )
+        if request.stage_run_id == "plan_review":
+            accounting_role = "plan_reviewer"
+        elif request.role == "worker" and request.stage_run_id == "remediation":
+            accounting_role = "remediation_worker"
+        else:
+            accounting_role = request.role
+        self.accounting.record_provider_result(
+            request.request_id,
+            result.status,
+            occurred_at=result.finished_at,
+            started_at=result.started_at,
+            finished_at=result.finished_at,
+            first_output_at=result.first_output_at,
+            quota_observation=result.quota_observation,
+            rate_limit_observation=result.rate_limit_observation,
+            event_id="provider-result:" + request.request_id,
+            project_id=request.project_id,
+            task_id=request.task_run_id or None,
+            role=accounting_role,
+            stage_run_id=request.stage_run_id or None,
+            role_run_id=request.role_run_id or None,
+            dispatch_id=result.dispatch_id,
+            decision_id=result.decision_id,
+            execution_id=result.execution_id,
+            session_id=result.session_id,
+            resource_id=resource.resource_id if resource else None,
+            provider=resource.provider if resource else None,
+            account=resource.account if resource else None,
+            model=resource.model if resource else None,
+            metadata={
+                "correlation_group": correlation_group,
+                **({"previous_resource_context": previous_payload} if previous_payload else {}),
+            },
+        )
 
     def status(self, request_id: str) -> dict[str, Any] | None:
         payload = self._reconcile_call(["dispatch-status", request_id])
@@ -171,6 +240,14 @@ class AIBrokerExecutionPort:
                 decision_id=payload.get("decision_id"), execution_id=payload.get("execution_id"),
                 session_id=payload.get("session_id"), resource_context=context,
                 usage=payload.get("usage"), usage_source=payload.get("usage_source", "unknown"),
+                started_at=payload.get("started_at"), finished_at=payload.get("finished_at"),
+                first_output_at=payload.get("first_output_at"),
+                quota_observation=payload.get("quota_observation"),
+                rate_limit_observation=(
+                    payload.get("rate_limit_observation")
+                    if payload.get("rate_limit_observation") is not None
+                    else payload.get("rate_limit")
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise AIBrokerInvocationError(f"invalid broker result: {exc}") from exc

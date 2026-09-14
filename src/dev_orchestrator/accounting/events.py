@@ -55,6 +55,8 @@ EVENT_TYPES = frozenset(
         "owner_gate_opened",
         "owner_gate_closed",
         "failure_recurrence",
+        "provider_result_observed",
+        "rdc_invocation_observed",
     }
 )
 OUTCOMES = frozenset({"accepted", "rejected", "failed", "cancelled", "unknown"})
@@ -219,6 +221,8 @@ def _validated_payload(event: Mapping[str, Any]) -> dict[str, Any]:
         "attempt_id",
         "gate_id",
         "event_id",
+        "invocation_id",
+        "connection_id",
     ):
         if key in payload:
             value = _nonblank_optional(payload[key], key)
@@ -255,6 +259,49 @@ def _validated_payload(event: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("failure_recurrence cost_seconds must be a number")
         if not math.isfinite(float(cost)) or float(cost) < 0:
             raise ValueError("failure_recurrence cost_seconds must be finite and non-negative")
+    if event_type == "provider_result_observed":
+        if "request_id" not in payload:
+            raise ValueError("provider_result_observed requires request_id")
+        metadata_value = payload.get("metadata")
+        if not isinstance(metadata_value, Mapping):
+            raise ValueError("provider_result_observed requires metadata")
+        metadata = dict(metadata_value)
+        payload["metadata"] = metadata
+        if metadata.get("status") not in {"succeeded", "failed", "cancelled", "no_candidate"}:
+            raise ValueError("provider_result_observed has invalid status")
+        for key in ("started_at", "finished_at", "first_output_at"):
+            if metadata.get(key) is not None:
+                metadata[key] = _validate_timestamp(metadata[key], key)
+        for key in ("quota_observation", "rate_limit_observation"):
+            if metadata.get(key) is not None and not isinstance(metadata[key], Mapping):
+                raise ValueError(f"provider_result_observed {key} must be an object")
+    if event_type == "rdc_invocation_observed":
+        if "project_id" not in payload or "invocation_id" not in payload:
+            raise ValueError("rdc_invocation_observed requires project_id and invocation_id")
+        metadata_value = payload.get("metadata")
+        if not isinstance(metadata_value, Mapping):
+            raise ValueError("rdc_invocation_observed requires metadata")
+        metadata = dict(metadata_value)
+        payload["metadata"] = metadata
+        if metadata.get("status") not in {
+            "queued", "running", "succeeded", "failed", "cancelled", "unknown"
+        }:
+            raise ValueError("rdc_invocation_observed has invalid status")
+        for key in ("submitted_at", "started_at", "first_output_at", "finished_at", "cancel_requested_at", "reconnect_at"):
+            if metadata.get(key) is not None:
+                metadata[key] = _validate_timestamp(metadata[key], key)
+        for key in ("command_bytes", "command_count", "connection_generation"):
+            value = metadata.get(key)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"rdc_invocation_observed {key} must be a non-negative integer")
+        affected = metadata.get("affected_invocation_ids")
+        if affected is not None and (
+            not isinstance(affected, list)
+            or any(not isinstance(item, str) or not item.strip() for item in affected)
+        ):
+            raise ValueError("rdc_invocation_observed affected_invocation_ids must be a string array")
     payload.pop("sequence", None)
     payload.pop("recorded_at", None)
     payload.pop("schema_version", None)
@@ -513,6 +560,69 @@ class ExecutionRecorder:
                 "attempt_id": attempt_id,
                 "outcome": outcome,
                 "occurred_at": occurred_at or self.now(),
+                **self._correlation(**correlation),
+            }
+        )
+
+    def record_provider_result(
+        self,
+        request_id: str,
+        status: str,
+        *,
+        occurred_at: str | None = None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+        first_output_at: str | None = None,
+        quota_observation: Mapping[str, Any] | None = None,
+        rate_limit_observation: Mapping[str, Any] | None = None,
+        **correlation: Any,
+    ) -> dict[str, Any]:
+        """Persist one exact Broker result without synthesizing missing facts."""
+        metadata = {
+            **self._correlation(
+                started_at=started_at,
+                finished_at=finished_at,
+                first_output_at=first_output_at,
+                quota_observation=dict(quota_observation) if quota_observation is not None else None,
+                rate_limit_observation=(
+                    dict(rate_limit_observation) if rate_limit_observation is not None else None
+                ),
+            ),
+            "status": status,
+        }
+        extra_metadata = correlation.pop("metadata", None)
+        if extra_metadata is not None:
+            if not isinstance(extra_metadata, Mapping):
+                raise ValueError("metadata must be an object")
+            metadata = {**dict(extra_metadata), **metadata}
+        return self.store.append(
+            {
+                "event_type": "provider_result_observed",
+                "request_id": request_id,
+                "occurred_at": occurred_at or finished_at or self.now(),
+                "metadata": metadata,
+                **self._correlation(**correlation),
+            }
+        )
+
+    def record_rdc_invocation(
+        self,
+        project_id: str,
+        invocation_id: str,
+        *,
+        status: str,
+        occurred_at: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        **correlation: Any,
+    ) -> dict[str, Any]:
+        """Persist one normalized RDC observation with project-scoped identity."""
+        return self.store.append(
+            {
+                "event_type": "rdc_invocation_observed",
+                "project_id": project_id,
+                "invocation_id": invocation_id,
+                "occurred_at": occurred_at or self.now(),
+                "metadata": {**dict(metadata or {}), "status": status},
                 **self._correlation(**correlation),
             }
         )

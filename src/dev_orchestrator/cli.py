@@ -35,6 +35,9 @@ from dev_orchestrator.config import (
 from dev_orchestrator.daemon import run_daemon
 from dev_orchestrator.ai.execution_port import MANAGED_INTERRUPT_REASON
 from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
+from dev_orchestrator.accounting.evidence import import_rdc_evidence
+from dev_orchestrator.accounting.events import EventWriteError
+from dev_orchestrator.accounting.runtime import load_accounting_runtime
 from dev_orchestrator.core.control_commands import latest_control_result, submit_control_command
 from dev_orchestrator.core.project_status import project_runtime_status
 from dev_orchestrator.monitor.project import run_monitor_once
@@ -61,6 +64,49 @@ _PORT_MAX = 65535
 
 class CliError(Exception):
     """Fatal CLI error printed to stderr before exiting non-zero."""
+
+
+def _read_rdc_input(path: Path) -> list[dict[str, Any]]:
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise CliError(f"cannot read RDC evidence input {path}: {exc}") from exc
+    try:
+        if text.lstrip().startswith("["):
+            value = json.loads(text)
+            if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+                raise ValueError("JSON input must be an array of objects")
+            return value
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+        if any(not isinstance(item, dict) for item in rows):
+            raise ValueError("JSONL records must be objects")
+        return rows
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise CliError(f"invalid RDC evidence input {path}: {exc}") from exc
+
+
+def cmd_import_rdc_evidence(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    config = resolve_config_path(args.config)
+    try:
+        accounting_runtime = load_accounting_runtime(runtime, config)
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+    if accounting_runtime is None:
+        raise CliError("execution_accounting must be enabled to import RDC evidence")
+    rows = _read_rdc_input(Path(args.input))
+    try:
+        records = import_rdc_evidence(accounting_runtime.recorder, rows)
+    except (TypeError, ValueError, OSError, EventWriteError) as exc:
+        raise CliError(f"RDC evidence import failed: {exc}") from exc
+    _print_json(
+        {
+            "imported": len(records),
+            "first_sequence": records[0]["sequence"] if records else None,
+            "last_sequence": records[-1]["sequence"] if records else None,
+        }
+    )
+    return 0
 
 
 def _print_json(value: Any) -> None:
@@ -850,6 +896,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicit owner-gate correlation id for wait-time accounting",
     )
 
+    import_rdc = sub.add_parser(
+        "import-rdc-evidence",
+        help="import normalized RDC invocation evidence into the accounting ledger",
+    )
+    import_rdc.add_argument("--input", required=True, help="JSON array or JSONL evidence path")
+    import_rdc.add_argument("--config", default=None, help="path to projects.json")
+    import_rdc.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     monitor = sub.add_parser("monitor", help="run one tick (--once) or the heartbeat loop")
     monitor.add_argument("--once", action="store_true", help="run a single tick and print the summary")
     monitor.add_argument("--interval", type=int, default=60, help="loop interval in seconds (5..3600)")
@@ -924,6 +978,7 @@ _COMMANDS = {
     "watchdog-status": cmd_watchdog_status,
     "watchdog-clear-degraded": cmd_watchdog_clear_degraded,
     "project-continue": cmd_project_continue,
+    "import-rdc-evidence": cmd_import_rdc_evidence,
     "monitor": cmd_monitor,
     "web": cmd_web,
     "daemon": cmd_daemon,

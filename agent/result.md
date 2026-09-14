@@ -230,3 +230,12 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Full suite: 453 tests and 16 subtests passed (`python -m pytest tests_py -q`).
   - Python compilation, userscript syntax and `git diff --check` passed.
   - Graphify AST update completed successfully with 2327 nodes, 6163 edges and 128 communities; newly generated untracked Graphify output was excluded because this worktree has no tracked graph baseline.
+
+## P11c Provider Context and RDC Evidence (2026-09-14)
+
+- Added durable `provider_result_observed` events at the central AIBroker subprocess boundary. Exact request/dispatch/decision/execution and resource/provider/account/model/session facts are preserved, together with Broker-supplied timing, first-output, quota, and rate-limit observations when available.
+- Added deterministic provider summaries for resource/provider/account/model/session continuity, unknown fields, resource switches, explicit quota and rate-limit counts, and evidence-qualified failover latency.
+- Added strict normalized RDC evidence ingestion through both Python and the `import-rdc-evidence` JSON/JSONL CLI. Deterministic event IDs make replay idempotent and conflicting evidence fail closed.
+- Added explicit-threshold classifiers for isolated concurrency, head-of-line blocking, starvation, session coupling, reconnect contamination, and no-output deadlock, plus read-only project-isolated recovery targeting.
+- Added `docs/PROVIDER_RDC_EVIDENCE_CONTRACT.md` and focused synthetic fixtures covering provider/context/failover calculations, every RDC classification, import durability, and cross-project isolation.
+- Verification: focused suites passed; final full suite passed with 470 tests and 16 subtests. Python compilation, userscript syntax, `git diff --check`, and Graphify AST refresh also passed.
