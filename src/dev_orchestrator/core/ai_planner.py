@@ -49,7 +49,7 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     adjudication_quality = raw.get("adjudication_quality", "high")
     adjudication_timeout = raw.get("adjudication_timeout_seconds", 1800)
     adjudication_min_rejections = raw.get("adjudication_min_rejections", 3)
-    adjudication_max_attempts = raw.get("adjudication_max_attempts", 2)
+    adjudication_max_attempts = raw.get("adjudication_max_attempts", 4)
     if not isinstance(adjudication_enabled, bool):
         return None, "planner adjudication_enabled must be a boolean"
     if adjudication_quality not in {"economy", "balanced", "high"}:
@@ -119,8 +119,14 @@ def _parse_plan(text: str | None, task_id: str) -> dict[str, Any]:
 def _parse_adjudication(text: str | None, task_id: str) -> tuple[str, str, dict[str, Any] | None]:
     if not isinstance(text, str) or not text.strip():
         raise ValueError("adjudicator output is empty")
+    body = text.strip()
+    if body.startswith("```"):
+        lines = body.splitlines()
+        if len(lines) < 3 or lines[0].strip().casefold() not in {"```", "```json"} or lines[-1].strip() != "```":
+            raise ValueError("adjudicator output must be one JSON object")
+        body = "\n".join(lines[1:-1]).strip()
     try:
-        payload = json.loads(text.strip())
+        payload = json.loads(body)
     except json.JSONDecodeError as exc:
         raise ValueError("adjudicator output must be one JSON object") from exc
     if not isinstance(payload, dict) or set(payload) != {"decision", "reason", "resolved_plan"}:

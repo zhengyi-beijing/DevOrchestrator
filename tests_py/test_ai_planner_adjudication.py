@@ -146,3 +146,18 @@ class AdjudicationRecoveryTests(unittest.TestCase):
             self.assertEqual(read_repository_truth(repo).head, old_head)
             self.assertEqual((repo / "agent" / "next.md").read_bytes(), old_next)
             self.assertEqual([r.role for r in port.requests], ["adjudicator"])
+
+
+def test_adjudication_accepts_json_markdown_fence_only():
+    from dev_orchestrator.core.ai_planner import _parse_adjudication
+    payload = {
+        "decision": "contract_patch",
+        "reason": "resolved",
+        "resolved_plan": plan_payload("P14"),
+    }
+    decision, reason, plan = _parse_adjudication(
+        "```json\n" + json.dumps(payload) + "\n```", "P14"
+    )
+    assert decision == "contract_patch"
+    assert reason == "resolved"
+    assert plan["task_id"] == "P14"
