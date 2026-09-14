@@ -5,9 +5,9 @@
 - Development branch: `feature/self-hosted-dev`.
 - Stable branch: `feature/browser-bridge-multiproject`.
 
-Current task: **P11d Reporting and Quantitative Acceptance** — **COMPLETE**.
+Current task: **P12 Unified AI Control Surface** — **DESIGN COMPLETE / OWNER START REQUIRED**.
 
-Next staged task: **none** (`P11d -> null` in the staged roadmap).
+Staged roadmap: `P11d -> P12 -> null`. P12 implementation has not been authorized or started.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
@@ -45,3 +45,11 @@ P11d result:
 - Custom event-ledger paths are published by the enabled runtime; explicit CLI config reads remain side-effect free.
 - Representative DevOrchestrator and deterministic DOM fixtures cover the report and rendered dashboard. Full regression passed with 487 tests and 16 subtests.
 - Python compilation, both JavaScript syntax checks, `git diff --check`, and Graphify AST refresh (2512 nodes, 6675 edges, 131 communities) passed.
+
+P12 design result:
+- Froze one 8770 Control API architecture with the daemon and existing `ControlCommandCoordinator` as the sole lifecycle mutation authority.
+- Split delivery into unified reads, authenticated/idempotent command transport, guarded actions/conversation consolidation, and operator UI/representative acceptance.
+- Defined loopback-plus-secret/session security, CSRF/origin guards, exact state revisions, atomic replay/conflict behavior, crash recovery and always-on redacted audit evidence.
+- Defined selective forward-porting from `feature/conversation-control-plane`; no wholesale branch merge and no second 8766 lifecycle-control authority.
+- Design verification passed: staged-roadmap suite 22/22; full Python suite 487 tests plus 16 subtests; Python/JavaScript syntax, whitespace, and Graphify AST refresh passed.
+- P12 remains owner-gated for implementation. `xray-hw-platform` remains paused and unchanged.

@@ -1,41 +1,62 @@
-# P11d Reporting and Quantitative Acceptance (P11-D)
+# P12 Unified AI Control Surface
 
-Status: **COMPLETE**
+Status: **DESIGN COMPLETE / OWNER START REQUIRED**
 
-Owner authorization: **START P11d / 2026-09-13**
+Design authorization: **DESIGN P12 / 2026-09-15**
 
-Goal: expose P11 evidence in the 8770 dashboard and turn it into quantitative bottleneck diagnoses and acceptance criteria.
+Implementation authorization: **not yet granted**
 
-Scope:
-- Add project/task/role time breakdown, EDR, plan-review churn, retry/owner-wait/idle time, context/provider switching, quota/failover and RDC contention evidence to the dashboard/API.
-- Highlight the dominant bottleneck with source-backed evidence and unknown-data warnings.
-- Add representative-run acceptance using DevOrchestrator itself; do not resume xray-hw-platform unless separately authorized.
-- Compare measured time loss against the original hypotheses: oversized RDC commands, AI/context switching, quota waits, lifecycle/reviewer stalls and multi-project contention.
-- Produce actionable thresholds and follow-up recommendations without changing scheduler/provider policy in this phase.
-
-Acceptance:
-- Dashboard renders deterministic fixture data and clearly distinguishes measured, inferred-disabled and unavailable values.
-- Representative DevOrchestrator run produces a complete report with EDR, top bottlenecks and evidence links/correlation ids.
-- Quantitative acceptance gates are documented and machine-testable where feasible.
-- Full regression and `git diff --check` pass; commit locally only, no push.
-
-Out of scope:
-- Broad scheduler/routing optimization.
-- Resuming paused projects without owner authorization.
+Goal: make port 8770 the primary day-to-day project and AI-resource control surface while keeping AIBroker port 8875 as the broker-specialist configuration and diagnostic surface.
 
 ## Approved executable design
 
-- Add a dependency-light reporting layer that combines the existing accounting interval summary with P11c provider/context and RDC analyses over one explicit UTC window and optional project/task/role filters.
-- Preserve measured, derived, and unavailable provenance per metric; never turn absent provider or RDC evidence into zero-valued measured facts.
-- Rank bottlenecks from exclusive accounting durations and explicit provider/RDC evidence, retaining correlation IDs that point back to durable ledger rows.
-- Add read-only `/api/accounting` reporting on port 8770 and dashboard sections for EDR, phase time, provider/context, RDC contention, dominant bottleneck, warnings, and evidence links.
-- Add a CLI report path for deterministic representative-run fixtures and machine-readable quantitative gates.
-- Document default acceptance thresholds and make overrides explicit in report inputs; do not modify scheduler or provider policy based on the report.
+- Keep the daemon as the only lifecycle authority. Port 8770 handlers may project state or durably enqueue a command; only the existing daemon-owned `ControlCommandCoordinator` consumes commands and invokes guarded Planner, Transition Executor, Reviewer, Watchdog or AIBroker adapters.
+- Introduce stable `/api/v1/control/*` envelopes and one-call overview projection across project/task/lifecycle, active AI roles, watchdog/diagnostics, owner gates, P11 evidence, conversation bindings, broker resources and executions. Preserve available/stale/unavailable and unknown provenance.
+- Preserve current `/api/*` GET routes. Standalone `start-web` stays read-only; command POST is wired only by the unified daemon.
+- Require a loopback peer plus bearer or same-origin browser-session authentication, CSRF/origin/Host checks, bounded JSON schemas and no wildcard CORS. P12 does not expose a public remote control service.
+- Make command submission cross-process atomic. A command id is bound to one canonical request hash: exact replay returns the existing record and different content conflicts. Persist request before acknowledgement, use deterministic downstream ids, persist result before inbox removal and append an always-on redacted audit trail.
+- Require the exact server-returned project state revision and action-specific branch/HEAD/task/lifecycle/gate identity. Capabilities drive client UX but the daemon always re-reads and revalidates fresh truth.
+- Implement only closed lifecycle actions (`continue`, `pause`, `resume`, `stop`, `retry`, `reconcile`, `approve_owner_gate`) and closed binding actions (`bind_conversation`, `unbind_conversation`, `rebind_conversation`). An action remains unavailable until its existing authority adapter supports safe, idempotent semantics and deterministic tests.
+- Selectively forward-port conversation session/binding and owner-control safety contracts from `feature/conversation-control-plane` under 8770. Do not merge that branch wholesale and do not restore a second 8766 lifecycle authority.
 
-## Completion evidence
+## Execution sequence
 
-- Added deterministic unified reporting, project/task/role time rows, original-hypothesis comparisons, evidence-backed bottleneck ranking, and quantitative gates.
-- Added read-only CLI and port-8770 API/dashboard surfaces, including custom-ledger discovery without mutating report reads.
-- Representative DevOrchestrator fixtures exercise accounting, provider/context, quota/failover, RDC, unknown-data, and rendered-dashboard behavior.
-- Full regression passed with 487 tests and 16 subtests; Python/JavaScript syntax, `git diff --check`, and Graphify AST refresh passed.
-- P11d has no staged successor. `xray-hw-platform` remains paused and unchanged.
+1. **P12.1 - Contract and unified reads:** add pure serializers and versioned read routes; aggregate current runtime/P11/AIBroker evidence; isolate broker failures; keep all mutation disabled.
+2. **P12.2 - Command transport/auth/audit:** harden the current inbox/history into an atomic store; add exact replay/conflict, bearer/browser session, CSRF/origin guards, status reads and daemon-only POST; migrate `continue` unchanged first.
+3. **P12.3 - Actions and conversations:** add action adapters one by one; consolidate prior session/binding work under 8770; update CLI and ChatGPT/RDC clients to the shared contract.
+4. **P12.4 - Operator UI and acceptance:** render capabilities, resources/executions, bindings, gates, P11 evidence and command results; run deterministic UI/API tests and one representative software-only DevOrchestrator scenario.
+
+Each phase must pass its focused tests and a compatibility regression before the next begins. P12 is COMPLETE only after all four phase exit gates and the full suite pass.
+
+## Interfaces and contracts
+
+- Read routes: `/api/v1/control/overview`, `/projects`, `/projects/{project_id}`, `/resources`, `/executions`, `/commands/{command_id}`, `/sessions`, `/bindings`; `POST /browser-sessions` creates the same-origin CSRF session, short-lived pairing create/redeem/revoke routes provision a hash-only heartbeat capability, and adapter telemetry uses `POST /session-heartbeats`.
+- Mutation route: `POST /api/v1/control/commands` with `schema_version`, client-generated `command_id`, `project_id`, closed `action`, complete `expected` identity and an action-specific closed `target`.
+- Successful read envelope: `schema_version`, `generated_at`, `data`, `warnings`, `sources`.
+- Command dispositions: `pending`, `accepted`, `blocked`, `failed`. Accepted means the operator effect was accepted; linked Planner/Worker completion is reported separately.
+- Authentication secrets never appear in overview, logs, audit, command history or errors.
+- Detailed frozen contract: `docs/UNIFIED_AI_CONTROL_SURFACE_DESIGN.md`.
+
+## Validation plan
+
+- Schema snapshots and legacy GET compatibility.
+- Broker unavailable/timeout/malformed/stale/unknown fixtures.
+- Thread and subprocess submission races plus every queue/result crash boundary.
+- Loopback/auth/session/CSRF/Origin/Fetch-Metadata/Host/body/content-type/method cases.
+- Fresh and stale branch/HEAD/task/lifecycle/gate identity for every action.
+- Replay/conflict, restart, unsupported action and cross-project isolation for every advertised capability.
+- Conversation uniqueness, tombstone, liveness and claimed-request rebind guards.
+- Dashboard DOM behavior, confirmations, pending polling and failure recovery.
+- `python -m pytest tests_py -q`, Python compilation, JavaScript syntax, `git diff --check`, and `graphify update .`.
+
+## Out of scope
+
+- Public exposure, built-in TLS, multi-user RBAC or general remote access.
+- AIBroker provider/account configuration or replacement of 8875 diagnostics.
+- Arbitrary prompt, shell, file, patch or generic state-mutation endpoints.
+- Scheduler/provider-policy redesign, inferred quota/cost, PID killing, weakened owner/hardware gates, or resuming `xray-hw-platform`.
+- Wholesale merges from old feature branches.
+
+## Blocking rule
+
+Only a contradiction to single-daemon authority, a non-idempotent irreversible action contract, or a required product decision beyond the frozen loopback/trusted-ingress boundary may stop implementation. Local schema layout, names, pagination, exceptions, UI details and edge tests are non-blocking and must converge through implementation and tests.

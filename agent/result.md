@@ -249,4 +249,15 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
 - Extended the 8770 dashboard with EDR, bottleneck, provider/context, RDC, hypothesis, scope-breakdown, gate and warning panels. Deterministic Node DOM fixtures verify measured, derived, inference-disabled and unavailable rendering.
 - Documented reporting semantics and default thresholds in `docs/P11_REPORTING_ACCEPTANCE.md`; no scheduler, routing, provider, cancellation or project lifecycle policy was changed.
 - Verification: 36 focused tests passed; full suite passed with 487 tests and 16 subtests. Python compilation, `web/app.js` and browser userscript syntax, `git diff --check`, and Graphify AST refresh (2512 nodes, 6675 edges, 131 communities) passed.
-- No push was performed. P11d has no staged successor, and `xray-hw-platform` remains paused and unchanged.
+- No push was performed. P11d had no staged successor at completion; P12 was staged later by explicit design authorization. `xray-hw-platform` remains paused and unchanged.
+
+## P12 Unified AI Control Surface design (2026-09-15)
+
+- Materialized the historical P12 backlog into an executable, four-gate design and added `P12` as the staged successor of completed `P11d`.
+- Froze `/api/v1/control/*` as the versioned 8770 contract while preserving existing GET routes and the 8875 broker-specialist surface.
+- Kept all lifecycle effects behind the daemon-owned `ControlCommandCoordinator`; HTTP only projects state or durably enqueues authenticated commands.
+- Defined cross-process idempotency, canonical replay/conflict, exact state-revision guards, crash recovery, redacted audit, broker failure isolation and explicit unknown provenance.
+- Defined safe semantics for capability-advertised lifecycle and conversation-binding actions; unsupported actions remain unavailable rather than gaining a weaker fallback.
+- Defined selective consolidation of prior conversation-control work under 8770 without a second 8766 authority or wholesale branch merge.
+- Verification passed: staged-roadmap suite 22/22; full Python suite 487 tests plus 16 subtests; Python compilation, both JavaScript syntax checks, `git diff --check`, and Graphify AST refresh (2542 nodes, 6703 edges, 129 communities).
+- Implementation was not started because the owner authorized P12 design only. `xray-hw-platform` remains paused and unchanged.

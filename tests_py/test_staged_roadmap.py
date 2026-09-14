@@ -306,8 +306,13 @@ class TestStagedRoadmap(unittest.TestCase):
         self.assertEqual(res_c.spec_path, "agent/staged/P11d.md")
 
         res_d = read_successor(checkout_root, "P11d")
-        self.assertEqual(res_d.kind, "end_of_roadmap")
-        self.assertIsNone(res_d.successor_task_id)
+        self.assertEqual(res_d.kind, "successor")
+        self.assertEqual(res_d.successor_task_id, "P12")
+        self.assertEqual(res_d.spec_path, "agent/staged/P12.md")
+
+        res_12 = read_successor(checkout_root, "P12")
+        self.assertEqual(res_12.kind, "end_of_roadmap")
+        self.assertIsNone(res_12.successor_task_id)
 
 
 if __name__ == "__main__":
