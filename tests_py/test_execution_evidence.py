@@ -183,7 +183,7 @@ def test_rdc_classifiers_distinguish_expected_contention_modes() -> None:
         rdc("starved", "p3", "succeeded", occurred=45, connection="starve", generation=1, submitted=0, started=40, output=41, finished=45),
         rdc("overtake-1", "p3", "succeeded", occurred=10, connection="starve", generation=1, submitted=5, started=5, output=6, finished=10),
         rdc("overtake-2", "p3", "succeeded", occurred=15, connection="starve", generation=1, submitted=10, started=10, output=11, finished=15),
-        rdc("dead", "p4", "running", occurred=0, connection="dead", generation=1, started=0),
+        rdc("dead", "p4", "running", occurred=300, connection="dead", generation=1, started=0),
         rdc("coupled", "p2", "cancelled", occurred=30, connection="shared", generation=1, started=10, finished=30, cancelled_by_project_id="p1"),
         rdc("reconnect", "p1", "failed", occurred=31, connection="shared", generation=2, started=10, finished=31, reconnect_at=ts(25), affected_invocation_ids=["other-project"]),
         rdc("other-project", "p2", "failed", occurred=31, connection="shared", generation=1, started=10, finished=31),
@@ -220,6 +220,14 @@ def test_rdc_recovery_targets_are_project_isolated() -> None:
     assert plan_rdc_recovery(rows, "p1", "cancel") == ("p1-running",)
     assert plan_rdc_recovery(rows, "p1", "reconnect") == ("p1-running",)
     assert json.dumps(rows, sort_keys=True) == before
+
+
+def test_rdc_deadlock_never_extends_past_the_observation_horizon() -> None:
+    stale = rdc("stale", "p1", "running", occurred=10, started=0)
+    result = classify_rdc_evidence(
+        [stale], window_end=ts(1000), thresholds=RDCThresholds(deadlock_seconds=120)
+    )
+    assert all(item.kind != "deadlock" for item in result.findings)
 
 
 @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")

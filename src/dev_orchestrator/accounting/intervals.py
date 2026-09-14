@@ -341,6 +341,7 @@ def summarize_accounting(
         for event in materialized
         if event.get("event_type") == "attempt_outcome"
         and event.get("outcome") == "rejected"
+        and start <= _time(str(event.get("occurred_at"))) <= end
         and (
             event.get("role") == "plan_reviewer"
             or (isinstance(event.get("metadata"), Mapping) and event["metadata"].get("review_kind") == "plan")

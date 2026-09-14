@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from dev_orchestrator.accounting.runtime import load_accounting_runtime
+from dev_orchestrator.accounting.runtime import load_accounting_runtime, load_accounting_settings
+from dev_orchestrator.accounting import reporting_event_store
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.transition_executor import TransitionExecutor
@@ -38,6 +39,46 @@ def test_enabled_runtime_seeds_verified_lesson_and_honors_cap(tmp_path: Path) ->
     assert runtime is not None
     assert runtime.prompt_max_chars == 700
     assert len(runtime.failure_memory.lessons()) == 1
+
+
+def test_enabled_runtime_publishes_custom_event_path_for_read_only_reporting(tmp_path: Path) -> None:
+    config = tmp_path / "projects.json"
+    write_config(config, {
+        "enabled": True,
+        "failure_memory": False,
+        "event_path": "custom/evidence.jsonl",
+    })
+    runtime_root = tmp_path / "runtime"
+    runtime = load_accounting_runtime(runtime_root, config)
+    assert runtime is not None
+    assert reporting_event_store(runtime_root).path == runtime_root / "custom" / "evidence.jsonl"
+
+
+def test_reporting_manifest_path_is_reserved_from_event_storage(tmp_path: Path) -> None:
+    config = tmp_path / "projects.json"
+    write_config(config, {
+        "enabled": True,
+        "event_path": "execution-accounting/runtime.json",
+    })
+    try:
+        load_accounting_runtime(tmp_path / "runtime", config)
+    except ValueError as exc:
+        assert "reserved" in str(exc)
+    else:
+        raise AssertionError("reserved report manifest path was accepted")
+
+
+def test_accounting_settings_load_is_read_only(tmp_path: Path) -> None:
+    config = tmp_path / "projects.json"
+    write_config(config, {
+        "enabled": True,
+        "event_path": "custom/evidence.jsonl",
+    })
+    runtime_root = tmp_path / "runtime"
+    settings = load_accounting_settings(config)
+    assert settings is not None
+    assert settings.event_path == "custom/evidence.jsonl"
+    assert not runtime_root.exists()
 
 
 def test_verified_lessons_can_be_injected_into_all_three_role_prompts(tmp_path: Path, monkeypatch) -> None:

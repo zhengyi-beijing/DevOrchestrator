@@ -44,6 +44,14 @@ from .intervals import (
     construct_intervals,
     summarize_accounting,
 )
+from .reporting import (
+    AcceptanceGate,
+    AcceptanceThresholds,
+    Bottleneck,
+    P11Report,
+    build_p11_report,
+    reporting_event_store,
+)
 
 __all__ = [
     "EVENT_TYPES",
@@ -51,6 +59,9 @@ __all__ = [
     "ROLES",
     "AccountedInterval",
     "AccountingSummary",
+    "AcceptanceGate",
+    "AcceptanceThresholds",
+    "Bottleneck",
     "CorruptionReport",
     "DimensionContinuity",
     "EventCorruptionError",
@@ -64,11 +75,13 @@ __all__ = [
     "InterProcessFileLock",
     "IntervalBuildResult",
     "ProviderEvidenceSummary",
+    "P11Report",
     "RDCAnalysis",
     "RDCFinding",
     "RDCInvocationEvidence",
     "RDCThresholds",
     "build_intervals",
+    "build_p11_report",
     "construct_intervals",
     "classify_rdc_evidence",
     "environment_for_project",
@@ -76,6 +89,7 @@ __all__ = [
     "import_rdc_evidence",
     "normalize_rdc_observation",
     "plan_rdc_recovery",
+    "reporting_event_store",
     "summarize_provider_evidence",
     "summarize_accounting",
 ]

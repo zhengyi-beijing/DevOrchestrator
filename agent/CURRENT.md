@@ -5,9 +5,9 @@
 - Development branch: `feature/self-hosted-dev`.
 - Stable branch: `feature/browser-bridge-multiproject`.
 
-Current task: **P11c Provider Context and RDC Evidence** — **COMPLETE**.
+Current task: **P11d Reporting and Quantitative Acceptance** — **COMPLETE**.
 
-Next staged task: **P11d Reporting and Quantitative Acceptance**.
+Next staged task: **none** (`P11d -> null` in the staged roadmap).
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
@@ -37,3 +37,11 @@ P11c result:
   starvation, session coupling, reconnect contamination, and no-output deadlock.
 - Recovery target calculation is project-scoped and read-only.
 - Focused P11c tests and the full Python regression suite pass.
+
+P11d result:
+- Added one deterministic P11 report across accounting, provider/context and RDC evidence, with explicit source provenance, unknown-data warnings and no inferred facts.
+- Added project/task/role time breakdown, original-hypothesis comparison, ranked evidence-backed bottlenecks and seven machine-testable default acceptance gates.
+- Added read-only `execution-report`, `/api/accounting`, and 8770 dashboard views for EDR, phase loss, provider/failover, RDC findings, hypotheses, gates and evidence IDs.
+- Custom event-ledger paths are published by the enabled runtime; explicit CLI config reads remain side-effect free.
+- Representative DevOrchestrator and deterministic DOM fixtures cover the report and rendered dashboard. Full regression passed with 487 tests and 16 subtests.
+- Python compilation, both JavaScript syntax checks, `git diff --check`, and Graphify AST refresh (2512 nodes, 6675 edges, 131 communities) passed.

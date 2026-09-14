@@ -3,7 +3,7 @@
 Contract: methods ``GET``/``HEAD`` only; static allowlist ``/``, ``/app.js``,
 ``/style.css``; API allowlist ``/api/monitor``, ``/api/summary``,
 ``/api/projects/<id>``, ``/api/events?limit=N``, ``/api/runs?limit=N``,
-``/api/orchestration``, ``/api/watchdog``; history limits clamp to 1..100; unknown routes 404;
+``/api/orchestration``, ``/api/watchdog``, ``/api/accounting``; history limits clamp to 1..100; unknown routes 404;
 write methods 405 with ``Allow: GET, HEAD``; traversal/malformed paths 400.
 ``Cache-Control: no-store`` and ``X-Content-Type-Options: nosniff`` are always
 present.
@@ -23,6 +23,7 @@ import json
 import os
 import re
 import threading
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
@@ -31,6 +32,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import urlopen
 
 from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE
+from dev_orchestrator.accounting import ROLES, build_p11_report, reporting_event_store
+from dev_orchestrator.accounting.events import EventWriteError
 from dev_orchestrator.platform.process import is_pid_alive
 from dev_orchestrator.storage.json_store import (
     parse_utc,
@@ -205,6 +208,66 @@ def watchdog_payload(runtime_root: Path | str) -> dict[str, Any]:
     if data.get("degraded_reason"):
         res["degraded_reason"] = data.get("degraded_reason")
     return res
+
+
+def accounting_payload(runtime_root: Path | str, query: str = "") -> dict[str, Any]:
+    """Build the read-only P11 report exposed by the 8770 dashboard."""
+    values = parse_qs(query)
+    project_id = values.get("project_id", [None])[0]
+    task_id = values.get("task_id", [None])[0]
+    role = values.get("role", [None])[0]
+    if role is not None and role not in ROLES:
+        raise ValueError("invalid accounting role filter")
+    try:
+        read = reporting_event_store(runtime_root).read()
+    except (ValueError, EventWriteError) as exc:
+        return {"available": False, "error": str(exc), "data_status": "unavailable"}
+    if read.corruptions:
+        return {
+            "available": False,
+            "error": "execution accounting ledger is corrupt",
+            "data_status": "unavailable",
+            "corruptions": [
+                {
+                    "offset": item.offset,
+                    "line_number": item.line_number,
+                    "reason": item.reason,
+                    "sample_hex": item.sample_hex,
+                    "byte_count": item.byte_count,
+                    "sample_truncated": item.sample_truncated,
+                    "torn_tail": item.torn_tail,
+                }
+                for item in read.corruptions
+            ],
+        }
+    scoped = [
+        event for event in read.events
+        if (project_id is None or event.get("project_id") == project_id)
+        and (task_id is None or event.get("task_id") == task_id)
+        and (role is None or event.get("role") == role)
+    ]
+    end_text = values.get("end", [None])[0]
+    start_text = values.get("start", [None])[0]
+    now = utc_now()
+    default_end = end_text is None
+    if default_end:
+        end_text = now.isoformat()
+    if start_text is None:
+        observed = [parse_utc(event.get("occurred_at")) for event in scoped]
+        observed = [item for item in observed if item is not None]
+        start_moment = min(observed) if observed else now - timedelta(seconds=1)
+        if default_end and start_moment >= now:
+            end_text = (start_moment + timedelta(seconds=1)).isoformat()
+        start_text = start_moment.isoformat()
+    report = build_p11_report(
+        read.events,
+        start_text,
+        end_text,
+        project_id=project_id,
+        task_id=task_id,
+        role=role,
+    ).as_dict()
+    return {"available": True, **report}
 
 
 class DevOrchestratorHTTPServer(ThreadingHTTPServer):
@@ -385,6 +448,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             payload = orchestration_payload(runtime)
         elif path == "/api/watchdog":
             payload = watchdog_payload(runtime)
+        elif path == "/api/accounting":
+            try:
+                payload = accounting_payload(runtime, parsed.query)
+            except ValueError as exc:
+                self._error(400, "Bad Request", str(exc), head_only)
+                return
         elif path == "/api/broker/resources":
             payload = broker_proxy_payload(runtime, "/api/resources")
         elif path == "/api/broker/executions":

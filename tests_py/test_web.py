@@ -5,8 +5,11 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
+from dev_orchestrator.accounting import ExecutionEventStore
 from dev_orchestrator.web.server import make_server
+from test_p11_reporting import representative_events, ts
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +79,25 @@ class WebContractTests(unittest.TestCase):
         self.assertEqual(post_headers["Allow"], "GET, HEAD")
         self.assertEqual(self.request("GET", "/%2e%2e/README.md")[0], 400)
         self.assertTrue((self.runtime / "web.json").is_file())
+
+    def test_accounting_api_renders_scoped_evidence_and_rejects_bad_role(self):
+        store = ExecutionEventStore(self.runtime)
+        for event in representative_events():
+            store.append(event)
+        query = urlencode({
+            "project_id": "devorchestrator",
+            "task_id": "P11d",
+            "start": ts(0),
+            "end": ts(200),
+        })
+        status, _, body = self.request("GET", "/api/accounting?" + query)
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["accounting"]["accepted_productive_seconds"], 40)
+        self.assertEqual(payload["provider"]["context_switches"], 1)
+        self.assertEqual(payload["dominant_bottleneck"]["kind"], "rdc_deadlock")
+        self.assertEqual(self.request("GET", "/api/accounting?role=not-a-role")[0], 400)
 
 
 if __name__ == "__main__":

@@ -234,6 +234,8 @@ class RDCInvocationEvidence:
     invocation_id: str
     status: str
     occurred_at: datetime
+    task_id: str | None = None
+    role: str | None = None
     request_id: str | None = None
     connection_id: str | None = None
     connection_generation: int | None = None
@@ -271,6 +273,8 @@ class RDCInvocationEvidence:
         return {
             "project_id": self.project_id,
             "invocation_id": self.invocation_id,
+            "task_id": self.task_id,
+            "role": self.role,
             "request_id": self.request_id,
             "status": self.status,
             "occurred_at": _iso(self.occurred_at),
@@ -315,6 +319,8 @@ def normalize_rdc_observation(value: Mapping[str, Any]) -> RDCInvocationEvidence
         invocation_id=str(invocation_id),
         status=str(status),
         occurred_at=occurred_at,
+        task_id=_nonblank(source.get("task_id"), "task_id", optional=True),
+        role=_nonblank(source.get("role"), "role", optional=True),
         request_id=_nonblank(source.get("request_id"), "request_id", optional=True),
         connection_id=_nonblank(source.get("connection_id"), "connection_id", optional=True),
         connection_generation=_optional_nonnegative_int(source.get("connection_generation"), "connection_generation"),
@@ -347,7 +353,7 @@ def import_rdc_evidence(
     records: list[dict[str, Any]] = []
     for item in normalized:
         payload = item.as_dict()
-        for key in ("project_id", "invocation_id", "request_id", "occurred_at", "status"):
+        for key in ("project_id", "invocation_id", "task_id", "role", "request_id", "occurred_at", "status"):
             payload.pop(key, None)
         payload = {key: value for key, value in payload.items() if value is not None}
         records.append(
@@ -357,6 +363,8 @@ def import_rdc_evidence(
                 status=item.status,
                 occurred_at=_iso(item.occurred_at),
                 event_id=f"rdc:{item.project_id}:{item.invocation_id}",
+                task_id=item.task_id,
+                role=item.role,
                 request_id=item.request_id,
                 connection_id=item.connection_id,
                 session_id=item.session_id,
@@ -474,7 +482,11 @@ def classify_rdc_evidence(
         )
 
     for item in rows:
-        age = (end - item.started_at).total_seconds() if item.started_at is not None else None
+        evidence_horizon = min(end, item.occurred_at)
+        age = (
+            (evidence_horizon - item.started_at).total_seconds()
+            if item.started_at is not None else None
+        )
         if (
             item.started_at is not None
             and item.finished_at is None

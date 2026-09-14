@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from dev_orchestrator.storage.json_store import write_json
+
 from .events import ExecutionEventStore, ExecutionRecorder
 from .failure_memory import FailureMemory
 
@@ -18,10 +20,15 @@ class AccountingRuntime:
     prompt_max_chars: int
 
 
-def load_accounting_runtime(
-    runtime_root: Path | str, config_path: Path | str
-) -> AccountingRuntime | None:
-    """Load the top-level ``execution_accounting`` opt-in.
+@dataclass(frozen=True, slots=True)
+class AccountingSettings:
+    event_path: str
+    failure_memory: bool
+    prompt_max_chars: int
+
+
+def load_accounting_settings(config_path: Path | str) -> AccountingSettings | None:
+    """Validate the top-level ``execution_accounting`` opt-in without writes.
 
     Missing configuration is deliberately disabled, preserving all historical
     orchestration and prompt behaviour.
@@ -54,11 +61,28 @@ def load_accounting_runtime(
     rel = Path(event_path)
     if rel.is_absolute() or rel.drive or ".." in rel.parts or rel in {Path(""), Path(".")}:
         raise ValueError("execution_accounting.event_path must stay below the runtime root")
+    if rel.as_posix().casefold() == "execution-accounting/runtime.json":
+        raise ValueError("execution_accounting.event_path is reserved for reporting metadata")
     failure_enabled = config.get("failure_memory", True)
     if not isinstance(failure_enabled, bool):
         raise ValueError("execution_accounting.failure_memory must be a boolean")
+    return AccountingSettings(event_path.replace("\\", "/"), failure_enabled, max_chars)
+
+
+def load_accounting_runtime(
+    runtime_root: Path | str, config_path: Path | str
+) -> AccountingRuntime | None:
+    """Create the enabled accounting runtime and publish its reporting path."""
+    settings = load_accounting_settings(config_path)
+    if settings is None:
+        return None
     recorder = ExecutionRecorder(
-        ExecutionEventStore(runtime_root, relative_path=event_path.replace("\\", "/"))
+        ExecutionEventStore(runtime_root, relative_path=settings.event_path)
     )
-    memory = FailureMemory(runtime_root, recorder=recorder) if failure_enabled else None
-    return AccountingRuntime(recorder, memory, max_chars)
+    write_json(
+        Path(runtime_root) / "execution-accounting" / "runtime.json",
+        {"schema_version": 1, "event_path": settings.event_path},
+        indent=2,
+    )
+    memory = FailureMemory(runtime_root, recorder=recorder) if settings.failure_memory else None
+    return AccountingRuntime(recorder, memory, settings.prompt_max_chars)

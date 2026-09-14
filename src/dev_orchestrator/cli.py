@@ -36,8 +36,9 @@ from dev_orchestrator.daemon import run_daemon
 from dev_orchestrator.ai.execution_port import MANAGED_INTERRUPT_REASON
 from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
 from dev_orchestrator.accounting.evidence import import_rdc_evidence
-from dev_orchestrator.accounting.events import EventWriteError
-from dev_orchestrator.accounting.runtime import load_accounting_runtime
+from dev_orchestrator.accounting.events import ROLES, EventWriteError, ExecutionEventStore
+from dev_orchestrator.accounting.reporting import build_p11_report, reporting_event_store
+from dev_orchestrator.accounting.runtime import load_accounting_runtime, load_accounting_settings
 from dev_orchestrator.core.control_commands import latest_control_result, submit_control_command
 from dev_orchestrator.core.project_status import project_runtime_status
 from dev_orchestrator.monitor.project import run_monitor_once
@@ -90,7 +91,7 @@ def cmd_import_rdc_evidence(args: argparse.Namespace) -> int:
     config = resolve_config_path(args.config)
     try:
         accounting_runtime = load_accounting_runtime(runtime, config)
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         raise CliError(str(exc)) from exc
     if accounting_runtime is None:
         raise CliError("execution_accounting must be enabled to import RDC evidence")
@@ -106,6 +107,41 @@ def cmd_import_rdc_evidence(args: argparse.Namespace) -> int:
             "last_sequence": records[-1]["sequence"] if records else None,
         }
     )
+    return 0
+
+
+def cmd_execution_report(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    store = None
+    if args.config is not None:
+        config = resolve_config_path(args.config)
+        try:
+            settings = load_accounting_settings(config)
+        except (OSError, ValueError) as exc:
+            raise CliError(str(exc)) from exc
+        if settings is None:
+            raise CliError("execution_accounting must be enabled to use the configured report path")
+        store = ExecutionEventStore(runtime, relative_path=settings.event_path)
+    try:
+        read = (store or reporting_event_store(runtime)).read()
+    except (ValueError, EventWriteError) as exc:
+        raise CliError(f"cannot read execution evidence: {exc}") from exc
+    if read.corruptions:
+        raise CliError("execution accounting ledger is corrupt; report refused")
+    try:
+        report = build_p11_report(
+            read.events,
+            args.window_start,
+            args.window_end,
+            project_id=args.project_id,
+            task_id=args.task_id,
+            role=args.role,
+        ).as_dict()
+    except ValueError as exc:
+        raise CliError(f"cannot build execution report: {exc}") from exc
+    _print_json(report)
+    if args.fail_on_gate and report["acceptance"]["status"] != "pass":
+        return 1
     return 0
 
 
@@ -904,6 +940,19 @@ def build_parser() -> argparse.ArgumentParser:
     import_rdc.add_argument("--config", default=None, help="path to projects.json")
     import_rdc.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
+    execution_report = sub.add_parser(
+        "execution-report",
+        help="render a P11 accounting/provider/RDC report and quantitative gates",
+    )
+    execution_report.add_argument("--window-start", required=True, help="inclusive ISO-8601 start")
+    execution_report.add_argument("--window-end", required=True, help="inclusive ISO-8601 end")
+    execution_report.add_argument("--project-id", default=None)
+    execution_report.add_argument("--task-id", default=None)
+    execution_report.add_argument("--role", choices=tuple(sorted(ROLES)), default=None)
+    execution_report.add_argument("--config", default=None, help="optional projects.json for custom event path")
+    execution_report.add_argument("--runtime-root", default=None)
+    execution_report.add_argument("--fail-on-gate", action="store_true")
+
     monitor = sub.add_parser("monitor", help="run one tick (--once) or the heartbeat loop")
     monitor.add_argument("--once", action="store_true", help="run a single tick and print the summary")
     monitor.add_argument("--interval", type=int, default=60, help="loop interval in seconds (5..3600)")
@@ -979,6 +1028,7 @@ _COMMANDS = {
     "watchdog-clear-degraded": cmd_watchdog_clear_degraded,
     "project-continue": cmd_project_continue,
     "import-rdc-evidence": cmd_import_rdc_evidence,
+    "execution-report": cmd_execution_report,
     "monitor": cmd_monitor,
     "web": cmd_web,
     "daemon": cmd_daemon,

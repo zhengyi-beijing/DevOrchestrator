@@ -18,6 +18,11 @@ function seconds(value) {
   return `${h}h ${m % 60}m`;
 }
 
+function ratio(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return UNKNOWN;
+  return `${(Number(value) * 100).toFixed(1)}%`;
+}
+
 function ago(iso) {
   if (!iso) return UNKNOWN;
   const t = Date.parse(iso);
@@ -209,11 +214,124 @@ function renderBrokerUsage(payload) {
   if (!(payload.usage || []).length) { const e=document.createElement('div'); e.className='empty'; e.textContent='No usage records yet.'; host.appendChild(e); }
 }
 
+function renderAccounting(payload) {
+  const summary = $('accountingSummary'); summary.replaceChildren();
+  const bottleneck = $('accountingBottleneck'); bottleneck.replaceChildren();
+  const provider = $('providerEvidence'); provider.replaceChildren();
+  const rdc = $('rdcEvidence'); rdc.replaceChildren();
+  const hypotheses = $('hypothesisEvidence'); hypotheses.replaceChildren();
+  const breakdown = $('scopeBreakdown'); breakdown.replaceChildren();
+  const gates = $('acceptanceGates'); gates.replaceChildren();
+  const warnings = $('evidenceWarnings'); warnings.replaceChildren();
+  if (!payload.available) {
+    for (const host of [summary, bottleneck, provider, rdc, hypotheses, breakdown, gates, warnings]) {
+      const item = document.createElement('div'); item.className = 'empty';
+      item.textContent = `Execution evidence unavailable: ${text(payload.error)}`;
+      host.appendChild(item);
+    }
+    return;
+  }
+  const status = payload.data_status || {};
+  const accounting = payload.accounting || {};
+  const phases = accounting.duration_by_phase || {};
+  kv(summary, 'Accounting evidence', status.accounting);
+  kv(summary, 'EDR', status.accounting === 'measured' ? ratio(accounting.edr) : 'unavailable');
+  kv(summary, 'Accepted productive', status.accounting === 'measured' ? seconds(accounting.accepted_productive_seconds) : 'unavailable');
+  kv(summary, 'Rejected work', status.accounting === 'measured' ? seconds(accounting.rejected_attempt_seconds) : 'unavailable');
+  kv(summary, 'Owner wait', status.accounting === 'measured' ? seconds(accounting.owner_wait_seconds) : 'unavailable');
+  kv(summary, 'Retry wall time', status.accounting === 'measured' ? seconds(accounting.retry_wall_time_seconds) : 'unavailable');
+  kv(summary, 'Idle', status.accounting === 'measured' ? seconds(phases.idle) : 'unavailable');
+  kv(summary, 'Plan-review churn', status.accounting === 'measured' ? accounting.plan_review_churn : 'unavailable');
+  kv(summary, 'Inference', payload.inference);
+
+  const dominant = payload.dominant_bottleneck;
+  if (dominant) {
+    kv(bottleneck, 'Kind', dominant.kind);
+    kv(bottleneck, 'Lost time', seconds(dominant.lost_seconds));
+    kv(bottleneck, 'Provenance', dominant.provenance);
+    kv(bottleneck, 'Evidence', (dominant.evidence_ids || []).join(', '), true);
+    kv(bottleneck, 'Action', dominant.recommendation);
+  } else {
+    const item = document.createElement('div'); item.className = 'empty';
+    item.textContent = 'No measured bottleneck for this window.'; bottleneck.appendChild(item);
+  }
+
+  const providerData = payload.provider || {};
+  kv(provider, 'Evidence', status.provider);
+  kv(provider, 'Results', status.provider === 'measured' ? providerData.result_count : 'unavailable');
+  kv(provider, 'Context hits', status.provider === 'measured' ? providerData.context_hits : 'unavailable');
+  kv(provider, 'Context switches', status.provider === 'measured' ? providerData.context_switches : 'unavailable');
+  kv(provider, 'Resource switches', status.provider === 'measured' ? providerData.resource_switches : 'unavailable');
+  kv(provider, 'Failover latency', status.provider === 'measured' ? seconds(providerData.failover_latency_seconds) : 'unavailable');
+  kv(provider, 'Quota observations', status.provider === 'measured' ? providerData.quota_observation_count : 'unavailable');
+  kv(provider, 'Rate limits', status.provider === 'measured' ? providerData.rate_limit_observation_count : 'unavailable');
+
+  const classifications = payload.rdc && payload.rdc.classifications || [];
+  if (status.rdc !== 'measured') {
+    const item = document.createElement('div'); item.className = 'empty'; item.textContent = 'RDC evidence unavailable.'; rdc.appendChild(item);
+  } else if (!classifications.length) {
+    const item = document.createElement('div'); item.className = 'empty'; item.textContent = 'No RDC contention classified.'; rdc.appendChild(item);
+  } else {
+    for (const finding of classifications) {
+      const row = document.createElement('div'); row.className = 'timeline-item';
+      const main = document.createElement('div'); main.textContent = text(finding.kind);
+      const meta = document.createElement('div'); meta.className = 'meta';
+      meta.textContent = `${(finding.project_ids || []).join(', ')} · ${(finding.invocation_ids || []).join(', ')}`;
+      row.append(main, meta); rdc.appendChild(row);
+    }
+  }
+
+  for (const [name, hypothesis] of Object.entries(payload.hypotheses || {})) {
+    const row = document.createElement('div'); row.className = 'timeline-item';
+    const main = document.createElement('div');
+    const result = hypothesis.observed === null || hypothesis.observed === undefined
+      ? 'UNAVAILABLE' : (hypothesis.observed ? 'OBSERVED' : 'NOT OBSERVED');
+    main.textContent = `${text(name)} · ${result}`;
+    const meta = document.createElement('div'); meta.className = 'meta';
+    const evidence = (hypothesis.evidence_ids || []).join(', ') || 'no evidence ids';
+    meta.textContent = `${text(hypothesis.status)} · ${evidence}`;
+    row.append(main, meta); hypotheses.appendChild(row);
+  }
+  if (!Object.keys(payload.hypotheses || {}).length) {
+    const item = document.createElement('div'); item.className = 'empty'; item.textContent = 'No hypothesis comparison.'; hypotheses.appendChild(item);
+  }
+
+  for (const item of (payload.time_breakdown || [])) {
+    const row = document.createElement('div'); row.className = 'timeline-item';
+    const main = document.createElement('div');
+    main.textContent = `${text(item.project_id)} / ${text(item.task_id)} / ${text(item.role)}`;
+    const meta = document.createElement('div'); meta.className = 'meta';
+    meta.textContent = `EDR ${ratio(item.edr)} · accepted ${seconds(item.accepted_productive_seconds)} · rejected ${seconds(item.rejected_attempt_seconds)} · ${text(item.provenance)}`;
+    row.append(main, meta); breakdown.appendChild(row);
+  }
+  if (!(payload.time_breakdown || []).length) {
+    const item = document.createElement('div'); item.className = 'empty'; item.textContent = 'No measured project/task/role time.'; breakdown.appendChild(item);
+  }
+
+  const acceptance = payload.acceptance || {};
+  for (const gate of (acceptance.gates || [])) {
+    const row = document.createElement('div'); row.className = `timeline-item gate-${text(gate.state)}`;
+    const main = document.createElement('div'); main.textContent = `${text(gate.name)} · ${text(gate.state).toUpperCase()}`;
+    const meta = document.createElement('div'); meta.className = 'meta';
+    meta.textContent = `${text(gate.actual)} ${text(gate.operator)} ${text(gate.threshold)} · ${text(gate.provenance)}`;
+    row.append(main, meta); gates.appendChild(row);
+  }
+  if (!(acceptance.gates || []).length) {
+    const item = document.createElement('div'); item.className = 'empty'; item.textContent = 'No acceptance gates.'; gates.appendChild(item);
+  }
+  for (const warning of (payload.warnings || [])) {
+    const row = document.createElement('div'); row.className = 'timeline-item'; row.textContent = text(warning); warnings.appendChild(row);
+  }
+  if (!(payload.warnings || []).length) {
+    const item = document.createElement('div'); item.className = 'empty'; item.textContent = 'No evidence warnings.'; warnings.appendChild(item);
+  }
+}
+
 async function refresh() {
   try {
-    const [monitor, summary, eventsPayload, runsPayload, orchestration, brokerResources, brokerExecutions, brokerUsage] = await Promise.all([
+    const [monitor, summary, eventsPayload, runsPayload, orchestration, brokerResources, brokerExecutions, brokerUsage, accounting] = await Promise.all([
       getJson('/api/monitor'), getJson('/api/summary'), getJson('/api/events?limit=30'), getJson('/api/runs?limit=20'), getJson('/api/orchestration'),
-      getJson('/api/broker/resources'), getJson('/api/broker/executions'), getJson('/api/broker/usage')
+      getJson('/api/broker/resources'), getJson('/api/broker/executions'), getJson('/api/broker/usage'), getJson('/api/accounting')
     ]);
     const events = Array.isArray(eventsPayload.items) ? eventsPayload.items : [];
     const runs = Array.isArray(runsPayload.items) ? runsPayload.items : [];
@@ -223,6 +341,7 @@ async function refresh() {
     renderBrokerResources(brokerResources);
     renderBrokerExecutions(brokerExecutions);
     renderBrokerUsage(brokerUsage);
+    renderAccounting(accounting);
     renderOrchestration(orchestration);
     renderTimeline('events', events, e => `${text(e.from_state)} → ${text(e.to_state)} · ${text(e.task_id)}`);
     renderTimeline('runs', runs, r => `${text(r.task_id)} · ${text(r.result)} · ${seconds(r.duration_seconds)}`);
@@ -235,5 +354,10 @@ async function refresh() {
   }
 }
 
-refresh();
-setInterval(refresh, 10000);
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { renderAccounting };
+}
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  refresh();
+  setInterval(refresh, 10000);
+}

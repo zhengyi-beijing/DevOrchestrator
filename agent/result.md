@@ -239,3 +239,14 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
 - Added explicit-threshold classifiers for isolated concurrency, head-of-line blocking, starvation, session coupling, reconnect contamination, and no-output deadlock, plus read-only project-isolated recovery targeting.
 - Added `docs/PROVIDER_RDC_EVIDENCE_CONTRACT.md` and focused synthetic fixtures covering provider/context/failover calculations, every RDC classification, import durability, and cross-project isolation.
 - Verification: focused suites passed; final full suite passed with 470 tests and 16 subtests. Python compilation, userscript syntax, `git diff --check`, and Graphify AST refresh also passed.
+
+## P11d Reporting and Quantitative Acceptance (2026-09-15)
+
+- Added `build_p11_report()` as the deterministic P11 reporting boundary over an explicit UTC window and optional project/task/role scope.
+- The report combines EDR and exclusive phase time, accepted/rejected work, plan-review churn, retry/owner-wait/idle loss, provider/context continuity, quota/rate-limit and failover evidence, and RDC classifications.
+- Added project/task/role time rows, five explicit original-hypothesis results, unknown-data warnings, ranked bottlenecks with durable evidence IDs and bounded recommendations, and seven quantitative gates with pass/fail/unavailable states.
+- Added the read-only `execution-report` CLI and `/api/accounting` endpoint. Custom accounting ledger paths are discovered through runtime metadata; explicit config reads do not initialize Failure Memory or write runtime state.
+- Extended the 8770 dashboard with EDR, bottleneck, provider/context, RDC, hypothesis, scope-breakdown, gate and warning panels. Deterministic Node DOM fixtures verify measured, derived, inference-disabled and unavailable rendering.
+- Documented reporting semantics and default thresholds in `docs/P11_REPORTING_ACCEPTANCE.md`; no scheduler, routing, provider, cancellation or project lifecycle policy was changed.
+- Verification: 36 focused tests passed; full suite passed with 487 tests and 16 subtests. Python compilation, `web/app.js` and browser userscript syntax, `git diff --check`, and Graphify AST refresh (2512 nodes, 6675 edges, 131 communities) passed.
+- No push was performed. P11d has no staged successor, and `xray-hw-platform` remains paused and unchanged.

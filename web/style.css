@@ -77,6 +77,10 @@ main { max-width: 1380px; margin: 0 auto; padding: 26px 24px 42px; }
 .timeline { display: grid; gap: 8px; }
 .timeline-item { padding: 10px 12px; border-radius: 9px; background: rgba(255,255,255,.025); border: 1px solid rgba(255,255,255,.05); }
 .timeline-item .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
+.evidence-grid { margin-top: 14px; }
+.gate-pass { border-left: 3px solid var(--ok); }
+.gate-fail { border-left: 3px solid var(--bad); }
+.gate-unavailable { border-left: 3px solid var(--muted); }
 .empty { color: var(--muted); padding: 14px 0; }
 footer {
   max-width: 1380px;

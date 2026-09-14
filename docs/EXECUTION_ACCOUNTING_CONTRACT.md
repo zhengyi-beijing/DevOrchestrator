@@ -66,3 +66,7 @@ The initial verified lesson covers Windows PowerShell 5.1: do not use `&&` or
 `||` directly; use PowerShell-safe sequencing and exit-code checks, or invoke
 `cmd.exe` when cmd syntax is required. Matching repeated failures update the
 lesson and append a correlated `failure_recurrence` cost event.
+
+Provider/context/RDC evidence is defined in
+`docs/PROVIDER_RDC_EVIDENCE_CONTRACT.md`. Unified dashboard/CLI reporting and
+machine-testable gates are defined in `docs/P11_REPORTING_ACCEPTANCE.md`.

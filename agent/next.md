@@ -1,6 +1,6 @@
 # P11d Reporting and Quantitative Acceptance (P11-D)
 
-Status: **READY TO RUN**
+Status: **COMPLETE**
 
 Owner authorization: **START P11d / 2026-09-13**
 
@@ -31,3 +31,11 @@ Out of scope:
 - Add read-only `/api/accounting` reporting on port 8770 and dashboard sections for EDR, phase time, provider/context, RDC contention, dominant bottleneck, warnings, and evidence links.
 - Add a CLI report path for deterministic representative-run fixtures and machine-readable quantitative gates.
 - Document default acceptance thresholds and make overrides explicit in report inputs; do not modify scheduler or provider policy based on the report.
+
+## Completion evidence
+
+- Added deterministic unified reporting, project/task/role time rows, original-hypothesis comparisons, evidence-backed bottleneck ranking, and quantitative gates.
+- Added read-only CLI and port-8770 API/dashboard surfaces, including custom-ledger discovery without mutating report reads.
+- Representative DevOrchestrator fixtures exercise accounting, provider/context, quota/failover, RDC, unknown-data, and rendered-dashboard behavior.
+- Full regression passed with 487 tests and 16 subtests; Python/JavaScript syntax, `git diff --check`, and Graphify AST refresh passed.
+- P11d has no staged successor. `xray-hw-platform` remains paused and unchanged.
