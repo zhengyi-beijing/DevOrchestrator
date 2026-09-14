@@ -436,6 +436,34 @@ class TransitionExecutorActuationTests(unittest.TestCase):
             self.assertEqual(cur_head, head)
             self.assertEqual((repo / "agent" / "next.md").read_text(encoding="utf-8"), "# P1 bounded task\nStatus: **COMPLETE**\n")
 
+    def test_legacy_no_next_settle_reconciles_to_staged_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            base=Path(td); repo=base/"repo"; runtime=base/"runtime"; make_repo(repo,"P1")
+            (repo/"agent"/"next.md").write_text("# P1 bounded task\nStatus: **COMPLETE**\n",encoding="utf-8")
+            staged=repo/"agent"/"staged"; staged.mkdir(parents=True,exist_ok=True)
+            (staged/"roadmap.json").write_text(json.dumps({"schema_version":1,"tasks":[{"task_id":"P1","successor":"P2","successor_spec_path":"agent/staged/P2.md"}]}),encoding="utf-8")
+            (staged/"P2.md").write_bytes(b"# P2 Bounded Task\n\nStatus: **PENDING DESIGN**\n\nGoal: test.\n")
+            subprocess.run(["git","-C",str(repo),"add","agent/"],check=True); subprocess.run(["git","-C",str(repo),"commit","-m","fixture"],check=True,stdout=subprocess.DEVNULL)
+            head=subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip(); config=base/"projects.json"; write_config(config,repo,bootstrap=False); write_decision(runtime,head=head)
+            summary=ready_summary(repo,"P1"); summary["projects"][0]["state"]="IDLE"; summary["projects"][0]["next_status"]="**COMPLETE**"
+            executor=TransitionExecutor(runtime,backend_overrides={"agy":FakeBackend("agy")}); executor._record_settled("worker_done:p1:r1","p1","reviewed task is COMPLETE and no next executable task is advertised",task_id="P1")
+            self.assertEqual(executor.advance(summary,config),[]); record=executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual((record["state"],record["outcome"],record["next_task_id"]),("handoff","planning_required","P2")); self.assertEqual(record["legacy_reconciled_from"]["state"],"settled")
+
+    def test_other_terminal_settle_is_not_replayed_for_staged_roadmap(self):
+        with tempfile.TemporaryDirectory() as td:
+            base=Path(td); repo=base/"repo"; runtime=base/"runtime"; make_repo(repo,"P1")
+            (repo/"agent"/"next.md").write_text("# P1 bounded task\nStatus: **COMPLETE**\n",encoding="utf-8")
+            staged=repo/"agent"/"staged"; staged.mkdir(parents=True,exist_ok=True)
+            (staged/"roadmap.json").write_text(json.dumps({"schema_version":1,"tasks":[{"task_id":"P1","successor":"P2","successor_spec_path":"agent/staged/P2.md"}]}),encoding="utf-8")
+            (staged/"P2.md").write_bytes(b"# P2 Bounded Task\n\nStatus: **PENDING DESIGN**\n")
+            subprocess.run(["git","-C",str(repo),"add","agent/"],check=True); subprocess.run(["git","-C",str(repo),"commit","-m","fixture"],check=True,stdout=subprocess.DEVNULL)
+            head=subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip(); config=base/"projects.json"; write_config(config,repo,bootstrap=False); write_decision(runtime,head=head)
+            summary=ready_summary(repo,"P1"); summary["projects"][0]["state"]="IDLE"; summary["projects"][0]["next_status"]="**COMPLETE**"
+            executor=TransitionExecutor(runtime,backend_overrides={"agy":FakeBackend("agy")}); executor._record_settled("worker_done:p1:r1","p1","terminal by explicit policy",task_id="P1")
+            self.assertEqual(executor.advance(summary,config),[]); record=executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual(record["state"],"settled"); self.assertEqual(record["reason"],"terminal by explicit policy")
+
     def test_reviewed_complete_task_with_invalid_roadmap_blocks(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"

@@ -151,6 +151,17 @@ def _legacy_not_ready_block(record: Any) -> bool:
     )
 
 
+def _legacy_no_next_settle(record: Any) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("state") == "settled"
+        and record.get("source_kind") == "decision"
+        and record.get("outcome") == "task_complete"
+        and record.get("reason") == "reviewed task is COMPLETE and no next executable task is advertised"
+        and not record.get("next_task_id")
+    )
+
+
 def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]], str]:
     raw = project.get("execution")
     if not isinstance(raw, dict):
@@ -537,7 +548,9 @@ class TransitionExecutor:
         with self._lock:
             ledger = self._load_ledger()
             existing = ledger["executions"].get(source_request_id)
-            if existing is not None and not _legacy_not_ready_block(existing):
+            if existing is not None and not (
+                _legacy_not_ready_block(existing) or _legacy_no_next_settle(existing)
+            ):
                 return
             row: dict[str, Any] = {
                 "project_id": project_id, "source_request_id": source_request_id,
@@ -1081,7 +1094,9 @@ class TransitionExecutor:
         for request_id, record in ordered:
             with self._lock:
                 existing = self._load_ledger()["executions"].get(request_id)
-                if existing is not None and not _legacy_not_ready_block(existing):
+                if existing is not None and not (
+                    _legacy_not_ready_block(existing) or _legacy_no_next_settle(existing)
+                ):
                     continue
             if record.get("disposition") != "apply":
                 continue
