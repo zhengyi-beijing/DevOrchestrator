@@ -31,12 +31,12 @@ class AdjudicationPort:
         if request.role != "adjudicator":
             raise AssertionError("unexpected role: " + request.role)
         if self.decision == "owner_gate":
-            payload = {"decision": "owner_gate", "reason": "owner choice required", "resolved_plan": None}
+            payload = {"decision": "owner_gate", "reason": "owner choice required", "contract_patch": None}
         else:
             payload = {
                 "decision": self.decision,
                 "reason": "remaining contract ambiguity is resolved",
-                "resolved_plan": plan_payload(request.task_run_id),
+                "contract_patch": {"interfaces": ["Keep the existing task interfaces stable."]},
             }
         return AIRoleResult(
             request_id=request.request_id,
@@ -153,14 +153,14 @@ def test_adjudication_accepts_json_markdown_fence_only():
     payload = {
         "decision": "contract_patch",
         "reason": "resolved",
-        "resolved_plan": plan_payload("P14"),
+        "contract_patch": {"validation": ["Run focused and full regression tests."]},
     }
-    decision, reason, plan = _parse_adjudication(
+    decision, reason, patch = _parse_adjudication(
         "```json\n" + json.dumps(payload) + "\n```", "P14"
     )
     assert decision == "contract_patch"
     assert reason == "resolved"
-    assert plan["task_id"] == "P14"
+    assert patch["validation"] == ["Run focused and full regression tests."]
 
 
 class InterruptedAdjudicationPort(AdjudicationPort):

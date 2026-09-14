@@ -59,8 +59,8 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
         return None, "planner adjudication_timeout_seconds must be positive"
     if isinstance(adjudication_min_rejections, bool) or not isinstance(adjudication_min_rejections, int) or not 1 <= adjudication_min_rejections <= 5:
         return None, "planner adjudication_min_rejections must be an integer from 1 to 5"
-    if isinstance(adjudication_max_attempts, bool) or not isinstance(adjudication_max_attempts, int) or not 1 <= adjudication_max_attempts <= 5:
-        return None, "planner adjudication_max_attempts must be an integer from 1 to 5"
+    if isinstance(adjudication_max_attempts, bool) or not isinstance(adjudication_max_attempts, int) or not 1 <= adjudication_max_attempts <= 6:
+        return None, "planner adjudication_max_attempts must be an integer from 1 to 6"
     if quality not in {"economy", "balanced", "high"}:
         return None, "planner quality invalid"
     if review_quality not in {"economy", "balanced", "high"}:
@@ -117,51 +117,50 @@ def _parse_plan(text: str | None, task_id: str) -> dict[str, Any]:
     return payload
 
 
-def _parse_adjudication(text: str | None, task_id: str) -> tuple[str, str, dict[str, Any] | None]:
+def _parse_adjudication(text: str | None, task_id: str):
     if not isinstance(text, str) or not text.strip():
         raise ValueError("adjudicator output is empty")
     body = text.strip()
     if body.startswith("```"):
-        lines = body.splitlines()
-        if len(lines) < 3 or lines[0].strip().casefold() not in {"```", "```json"} or lines[-1].strip() != "```":
-            raise ValueError("adjudicator output must be one JSON object")
-        body = "\n".join(lines[1:-1]).strip()
+        parts = body.splitlines()
+        body = "\n".join(parts[1:-1]).strip()
+    required = {"decision", "reason", "contract_patch"}
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
-        decoder = json.JSONDecoder()
-        candidates = []
-        pos = 0
-        required = {"decision", "reason", "resolved_plan"}
+        decoder = json.JSONDecoder(); found = []; pos = 0
         while True:
             start = body.find("{", pos)
-            if start < 0:
-                break
-            try:
-                candidate, end = decoder.raw_decode(body[start:])
-            except json.JSONDecodeError:
-                pos = start + 1
-                continue
-            if isinstance(candidate, dict) and set(candidate) == required:
-                candidates.append(candidate)
+            if start < 0: break
+            try: candidate, end = decoder.raw_decode(body[start:])
+            except json.JSONDecodeError: pos = start + 1; continue
+            if isinstance(candidate, dict) and set(candidate) == required: found.append(candidate)
             pos = start + max(end, 1)
-        if len(candidates) != 1:
-            raise ValueError("adjudicator output must contain exactly one adjudication JSON object") from exc
-        payload = candidates[0]
-    if not isinstance(payload, dict) or set(payload) != {"decision", "reason", "resolved_plan"}:
+        if len(found) != 1: raise ValueError("adjudicator output must contain exactly one adjudication JSON object") from exc
+        payload = found[0]
+    if not isinstance(payload, dict) or set(payload) != required:
         raise ValueError("adjudicator JSON schema mismatch")
-    decision = _nonblank(payload.get("decision"))
-    reason = _nonblank(payload.get("reason"))
+    decision = _nonblank(payload.get("decision")); reason = _nonblank(payload.get("reason"))
+    patch = payload.get("contract_patch")
     if decision not in {"approve_with_notes", "contract_patch", "owner_gate"} or reason is None:
         raise ValueError("invalid adjudicator decision")
-    resolved = payload.get("resolved_plan")
     if decision == "owner_gate":
-        if resolved is not None:
-            raise ValueError("owner_gate adjudication must not include resolved_plan")
+        if patch is not None: raise ValueError("owner_gate adjudication must not include contract_patch")
         return decision, reason, None
-    if not isinstance(resolved, dict):
-        raise ValueError("adjudication resolved_plan must be an object")
-    return decision, reason, _parse_plan(json.dumps(resolved), task_id)
+    if decision == "approve_with_notes":
+        if patch not in (None, {}): raise ValueError("approve_with_notes contract_patch must be null or empty")
+        return decision, reason, {}
+    if not isinstance(patch, dict) or not patch:
+        raise ValueError("contract_patch adjudication requires a non-empty object")
+    allowed = {"summary", "implementation_steps", "interfaces", "validation", "risks", "out_of_scope"}
+    if not set(patch).issubset(allowed): raise ValueError("adjudication contract_patch contains unsupported fields")
+    return decision, reason, patch
+
+def _merge_adjudication_patch(current_plan: dict[str, Any], patch: dict[str, Any] | None, task_id: str) -> dict[str, Any]:
+    if not isinstance(current_plan, dict): raise ValueError("current adjudication plan is unavailable")
+    merged = copy.deepcopy(current_plan)
+    if patch: merged.update(copy.deepcopy(patch))
+    return _parse_plan(json.dumps(merged, ensure_ascii=False), task_id)
 
 
 def _parse_plan_review(text: str | None) -> tuple[str, str]:
@@ -331,7 +330,8 @@ class AIPlannerCoordinator:
             result = self.port.execute(request) if self.port is not None else None
             if result is None or result.status != "succeeded":
                 raise RuntimeError((getattr(result, "error", None) if result is not None else None) or "adjudicator execution failed")
-            decision, reason, resolved_plan = _parse_adjudication(result.output, record["task_id"])
+            decision, reason, patch = _parse_adjudication(result.output, record["task_id"])
+            resolved_plan = None if decision == "owner_gate" else _merge_adjudication_patch(record.get("plan"), patch, record["task_id"])
         except Exception as exc:
             self._finish(plan_id, "failed", f"plan adjudication failed: {exc}")
             return
@@ -348,21 +348,21 @@ class AIPlannerCoordinator:
         self._apply_plan(plan_id, record, resolved_plan, f"adjudicated {decision}: {reason}", project=project)
 
     def _adjudication_prompt(self, record: dict[str, Any]) -> str:
-        source_heading, source_text = self._task_source(record)
         chain = record.get("rejection_chain") or []
-        compact_chain = [
-            {"round": item.get("round"), "reason": item.get("reason")}
-            for item in chain if isinstance(item, dict)
-        ]
+        compact_chain = [{"round": item.get("round"), "reason": item.get("reason")} for item in chain if isinstance(item, dict)]
         payload = {
+            "task_id": record.get("task_id"),
             "current_plan": record.get("plan"),
             "rejection_reasons": compact_chain,
-            "last_failure": record.get("reason"),
             "last_review_reason": record.get("review_reason"),
         }
         return (
-            "You are the final bounded adjudicator after repeated Planner/Reviewer disagreement. Do not reopen issues already resolved and do not broaden scope. Resolve only remaining contract ambiguities. Return exactly one JSON object with keys decision, reason, resolved_plan. decision is approve_with_notes, contract_patch, or owner_gate. For approve_with_notes or contract_patch, resolved_plan must be a complete planner-schema object for the same task and should minimally change the current plan. For owner_gate, resolved_plan must be null.\n\n"
-            + source_heading + ":\n" + source_text + "\n\nAdjudication evidence:\n"
+            "You are the final bounded adjudicator. Do not redesign the task, reopen resolved issues, or restate the full plan. "
+            "Resolve only the remaining contract ambiguity from the rejection reasons. Return exactly one JSON object with keys "
+            "decision, reason, contract_patch. decision is approve_with_notes, contract_patch, or owner_gate. "
+            "For approve_with_notes use null or {} contract_patch. For owner_gate use null. For contract_patch return only the planner fields "
+            "that must be replaced (summary, implementation_steps, interfaces, validation, risks, out_of_scope), with complete replacement values "
+            "for those fields only. Keep the patch minimal and concise; do not include task_id or unchanged fields. No markdown or explanation outside JSON.\n\n"
             + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         )
 
