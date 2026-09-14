@@ -49,6 +49,7 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     adjudication_quality = raw.get("adjudication_quality", "high")
     adjudication_timeout = raw.get("adjudication_timeout_seconds", 1800)
     adjudication_min_rejections = raw.get("adjudication_min_rejections", 3)
+    adjudication_max_attempts = raw.get("adjudication_max_attempts", 2)
     if not isinstance(adjudication_enabled, bool):
         return None, "planner adjudication_enabled must be a boolean"
     if adjudication_quality not in {"economy", "balanced", "high"}:
@@ -57,6 +58,8 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
         return None, "planner adjudication_timeout_seconds must be positive"
     if isinstance(adjudication_min_rejections, bool) or not isinstance(adjudication_min_rejections, int) or not 1 <= adjudication_min_rejections <= 5:
         return None, "planner adjudication_min_rejections must be an integer from 1 to 5"
+    if isinstance(adjudication_max_attempts, bool) or not isinstance(adjudication_max_attempts, int) or not 1 <= adjudication_max_attempts <= 5:
+        return None, "planner adjudication_max_attempts must be an integer from 1 to 5"
     if quality not in {"economy", "balanced", "high"}:
         return None, "planner quality invalid"
     if review_quality not in {"economy", "balanced", "high"}:
@@ -86,6 +89,7 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
         "adjudication_quality": adjudication_quality,
         "adjudication_timeout_seconds": float(adjudication_timeout),
         "adjudication_min_rejections": adjudication_min_rejections,
+        "adjudication_max_attempts": adjudication_max_attempts,
     }, ""
 
 
@@ -214,7 +218,7 @@ class AIPlannerCoordinator:
             if policy is None or not policy.get("adjudication_enabled"):
                 continue
             attempts = int(record.get("adjudication_attempt_count") or (1 if record.get("adjudication_attempted_at") else 0))
-            if record.get("state") != "failed" or record.get("adjudication_decision") or attempts >= 2:
+            if record.get("state") != "failed" or record.get("adjudication_decision") or attempts >= policy["adjudication_max_attempts"]:
                 continue
             chain = record.get("rejection_chain")
             if not isinstance(chain, list) or len(chain) < policy["adjudication_min_rejections"]:
@@ -232,7 +236,7 @@ class AIPlannerCoordinator:
             if not isinstance(record, dict) or record.get("state") != "failed" or record.get("adjudication_decision"):
                 return False
             attempts = int(record.get("adjudication_attempt_count") or (1 if record.get("adjudication_attempted_at") else 0))
-            if attempts >= 2:
+            if attempts >= policy["adjudication_max_attempts"]:
                 return False
             record["state"] = "adjudicating"
             record["adjudication_attempt_count"] = attempts + 1
