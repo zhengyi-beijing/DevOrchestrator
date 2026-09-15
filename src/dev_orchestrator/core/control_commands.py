@@ -334,6 +334,29 @@ class ControlCommandCoordinator:
             )
             return {**record, "state": "accepted", "processed_at": now, "effect": "resume_future_launches", "owner_control": state}
         if action == "stop":
+            lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "")
+            planner = snapshot.get("planner")
+            planner_active = isinstance(planner, dict) and planner.get("state") in {"planning", "reviewing", "applying", "remediating"}
+            reviewer = snapshot.get("reviewer")
+            reviewer_active = isinstance(reviewer, dict) and reviewer.get("state") in {"launching", "running"}
+            coordinator_planner_active = False
+            if self.planner is not None and hasattr(self.planner, "state"):
+                p_state = self.planner.state().get("plans", {})
+                coordinator_planner_active = any(
+                    isinstance(row, dict) and row.get("project_id") == project_id and row.get("state") in {"planning", "reviewing", "applying", "remediating"}
+                    for row in p_state.values()
+                )
+            if (
+                lifecycle in {"PLANNING", "REVIEWING_PLAN", "REMEDIATING_PLAN", "APPLYING_PLAN", "REVIEWING"}
+                or planner_active
+                or reviewer_active
+                or coordinator_planner_active
+            ):
+                return self._blocked(
+                    command_id, project_id, action,
+                    "active AI role does not support managed interruption; use pause",
+                    now, record,
+                )
             return self._stop(record, project_id, command_id, now, executor)
         if action in {"bind_conversation", "unbind_conversation", "rebind_conversation"}:
             return self._conversation_action(record, snapshot, project_id, command_id, action, target, now)
@@ -347,6 +370,11 @@ class ControlCommandCoordinator:
             return self._blocked(command_id, project_id, action, "project is paused", now, record)
         next_status = str(snapshot.get("next_status") or "").upper()
         if "PENDING DESIGN" in next_status:
+            lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "")
+            if lifecycle != "IDLE":
+                return self._blocked(
+                    command_id, project_id, action, "PENDING DESIGN continue requires IDLE lifecycle", now, record
+                )
             if self.planner is None:
                 return self._blocked(command_id, project_id, action, "planner coordinator unavailable", now, record)
             handled, approved_plan_id, approved_reason = self.planner.continue_owner_approved(

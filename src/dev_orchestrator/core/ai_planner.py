@@ -12,6 +12,7 @@ from typing import Any
 from dev_orchestrator.ai.contracts import AIRoleRequest, ResourceContext
 from dev_orchestrator.ai.execution_port import AIExecutionPort
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
+from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_raw, read_successor, sha256_bytes
 from dev_orchestrator.core.workflow_policy import workflow_policy_prompt
@@ -131,6 +132,7 @@ class AIPlannerCoordinator:
         self.accounting = accounting
         self.failure_memory = failure_memory
         self.failure_memory_max_chars = failure_memory_max_chars
+        self.owner_store = OwnerControlStore(self.runtime_root)
         self.state_path = self.runtime_root / PLANNER_STATE_FILE
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}
@@ -167,6 +169,24 @@ class AIPlannerCoordinator:
         with self._lock:
             return copy.deepcopy(self._load_state())
 
+    def _wait_for_launch_barrier(self, plan_id: str, project_id: str) -> bool:
+        while True:
+            with self._lock:
+                state = self._load_state()
+                plan = state["plans"].get(plan_id)
+                if isinstance(plan, dict) and plan.get("state") not in _ACTIVE_STATES:
+                    return False
+            owner = self.owner_store.project_state(project_id)
+            if not owner.get("paused"):
+                return True
+            if owner.get("last_action") == "stop":
+                self._finish(
+                    plan_id, "failed",
+                    "planner lifecycle stopped by owner before the next AI dispatch",
+                )
+                return False
+            time.sleep(0.1)
+
     def _begin_lifecycle(
         self,
         project: dict[str, Any],
@@ -194,6 +214,14 @@ class AIPlannerCoordinator:
             state = self._load_state()
             if plan_id in state["plans"]:
                 return plan_id, "planner lifecycle already exists"
+            active = next((
+                row for row in state["plans"].values()
+                if isinstance(row, dict)
+                and row.get("project_id") == project_id
+                and row.get("state") in _ACTIVE_STATES
+            ), None)
+            if active is not None:
+                return None, "planner lifecycle already active for project"
             record: dict[str, Any] = {
                 "plan_id": plan_id,
                 "command_id": command_id,
@@ -499,6 +527,8 @@ class AIPlannerCoordinator:
         base_req_id = plan_id + ":planner" if round_no == 0 else f"{plan_id}:planner:remediate-{round_no}"
 
         for attempt in range(1, max_attempts + 1):
+            if not self._wait_for_launch_barrier(plan_id, record["project_id"]):
+                return None
             retry_suffix = "" if attempt == 1 else f":retry-{attempt - 1}"
             metadata: dict[str, Any] = {
                 "control_command_id": record["command_id"],
@@ -648,6 +678,8 @@ class AIPlannerCoordinator:
         previous: ResourceContext | None,
         round_no: int,
     ) -> tuple[str, str, Any] | None:
+        if not self._wait_for_launch_barrier(plan_id, record["project_id"]):
+            return None
         request_id = plan_id + ":reviewer" if round_no == 0 else f"{plan_id}:reviewer:remediate-{round_no}"
         metadata: dict[str, Any] = {"control_command_id": record["command_id"], "review_kind": "plan"}
         if round_no > 0:

@@ -124,11 +124,18 @@ def project_control_view(
     if isinstance(planner, dict) and planner.get("state") in {"planning", "reviewing", "applying", "remediating"}:
         role = {"planning": "planner", "reviewing": "reviewer", "applying": "planner", "remediating": "remediator"}[str(planner.get("state"))]
         active_roles.append({"role": role, "state": planner.get("state"), "request_id": planner.get("plan_id")})
-    stoppable_active = (
+    lifecycle = str(identity.get("lifecycle_state") or projected.get("lifecycle_state") or projected.get("state") or "")
+    unsupported_stop_role_active = (
+        lifecycle in {"PLANNING", "REVIEWING_PLAN", "REMEDIATING_PLAN", "APPLYING_PLAN", "REVIEWING"}
+        or any(
+            row.get("role") in {"planner", "reviewer", "remediator"}
+            for row in active_roles
+        )
+    )
+    stoppable_active = not unsupported_stop_role_active and (
         active is None
         or (active.get("engine") == "aibroker" and bool(active.get("broker_request_id")))
     )
-    lifecycle = str(identity.get("lifecycle_state") or "")
     next_status = str(projected.get("next_status") or "")
     paused = bool(owner.get("paused"))
     execution_ready = False
@@ -139,9 +146,10 @@ def project_control_view(
         roles = project_config.get("ai_roles")
         planner_config = roles.get("planner") if isinstance(roles, dict) else None
         planning_ready = isinstance(planner_config, dict) and planner_config.get("enabled") is True
+    planning_start_ready = lifecycle == "IDLE" and "PENDING DESIGN" in next_status.upper() and planning_ready
     eligible_continue = not paused and gate is None and (
         (lifecycle == "READY_TO_RUN" and execution_ready)
-        or ("PENDING DESIGN" in next_status.upper() and planning_ready)
+        or planning_start_ready
     )
     # Recovery ledgers expose evidence today, but no exact owner retry adapter
     # exists yet. Keep the action visible and explicitly unavailable.
@@ -195,11 +203,19 @@ def project_control_view(
         approve_reason = "repository is dirty"
     else:
         approve_reason = "exact pending planner gate can be approved"
+    if unsupported_stop_role_active:
+        stop_reason = "active AI role does not support managed interruption; use pause"
+    elif active and stoppable_active:
+        stop_reason = "pause and interrupt exact supported execution"
+    elif not active:
+        stop_reason = "pause future launches"
+    else:
+        stop_reason = "active execution does not support managed interruption"
     controls = [
         {"action": "continue", "available": eligible_continue, "reason": "current state can continue" if eligible_continue else "project is paused or not continuable"},
         {"action": "pause", "available": not paused, "reason": "prevent future launches" if not paused else "project is already paused"},
         {"action": "resume", "available": paused, "reason": "clear launch barrier" if paused else "project is not paused"},
-        {"action": "stop", "available": not paused and stoppable_active, "reason": "pause and interrupt exact supported execution" if active and stoppable_active else ("pause future launches" if not active else "active execution does not support managed interruption")},
+        {"action": "stop", "available": not paused and stoppable_active, "reason": stop_reason},
         {"action": "retry", "available": safe_retry, "reason": "recovery-required state" if safe_retry else "no safe exact retry target"},
         {"action": "reconcile", "available": False, "reason": "no explicit safe reconcile target is projected"},
         {"action": "approve_owner_gate", "available": approve_available, "reason": approve_reason},
