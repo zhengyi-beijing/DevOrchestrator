@@ -180,6 +180,7 @@ class AIBrokerTransitionTests(unittest.TestCase):
             self.assertEqual(record["resource_context"]["provider"], "deepseek")
             self.assertEqual(port.requests[0].role, "worker")
             self.assertEqual(port.requests[0].timeout_seconds, 14400.0)
+            self.assertTrue(port.requests[0].metadata["managed_worktree"])
 
     def test_project_context_injected_into_aibroker_worker_prompt(self):
         with tempfile.TemporaryDirectory() as td:

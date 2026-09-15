@@ -1,0 +1,3 @@
+agent/next.md text eol=lf
+agent/staged/*.md text eol=lf
+agent/staged/*.json text eol=lf

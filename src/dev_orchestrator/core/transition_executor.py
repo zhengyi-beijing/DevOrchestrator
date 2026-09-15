@@ -877,6 +877,7 @@ class TransitionExecutor:
                 "source_request_id": source_request_id,
                 "source_kind": source_kind,
                 "failure_environment": environment_for_project(project),
+                "managed_worktree": True,
             },
         )
         with self._lock:
