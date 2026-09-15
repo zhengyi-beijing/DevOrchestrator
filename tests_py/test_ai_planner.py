@@ -6,7 +6,20 @@ import unittest
 from pathlib import Path
 
 from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
-from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
+from dev_orchestrator.core.ai_planner import AIPlannerCoordinator, _parse_plan_review
+
+
+class PlanReviewParserTests(unittest.TestCase):
+    def test_accepts_exact_json_fence(self):
+        self.assertEqual(_parse_plan_review('```json\n{"decision":"approve","reason":"ok"}\n```'), ('approve', 'ok'))
+
+    def test_rejects_prose_outside_json_fence(self):
+        with self.assertRaisesRegex(ValueError, "one JSON object"):
+            _parse_plan_review('Result:\n```json\n{"decision":"approve","reason":"ok"}\n```')
+
+    def test_rejects_nested_or_multiple_fences(self):
+        with self.assertRaisesRegex(ValueError, "one JSON object"):
+            _parse_plan_review('```json\n{"decision":"approve","reason":"ok"}\n```\n```')
 
 
 class FakePort:

@@ -116,8 +116,16 @@ def _parse_plan(text: str | None, task_id: str) -> dict[str, Any]:
 def _parse_plan_review(text: str | None) -> tuple[str, str]:
     if not isinstance(text, str) or not text.strip():
         raise ValueError("plan reviewer output is empty")
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        lines = candidate.splitlines()
+        if len(lines) < 3 or lines[0].strip().casefold() not in {"```", "```json"} or lines[-1].strip() != "```":
+            raise ValueError("plan reviewer output must be one JSON object")
+        candidate = "\n".join(lines[1:-1]).strip()
+        if "```" in candidate:
+            raise ValueError("plan reviewer output must be one JSON object")
     try:
-        payload = json.loads(text.strip())
+        payload = json.loads(candidate)
     except json.JSONDecodeError as exc:
         raise ValueError("plan reviewer output must be one JSON object") from exc
     if not isinstance(payload, dict) or set(payload) != {"decision", "reason"}:
