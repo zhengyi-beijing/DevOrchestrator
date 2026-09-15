@@ -1,13 +1,13 @@
 # DevOrchestrator Self-Hosted Development State
 
-- Stable controller: `C:\work\github\DevOrchestrator`.
-- Development worktree: `C:\work\github\DevOrchestrator-dev`.
-- Development branch: `feature/self-hosted-dev`.
-- Stable branch: `feature/browser-bridge-multiproject`.
+- Canonical worktree: C:\work\github\DevOrchestrator-dev.
+- Canonical branch: main.
+- Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
+- Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12 Unified AI Control Surface** — **COMPLETE**.
+Current task: **P12OPS Self-Host Operational Acceptance** — **PENDING DESIGN**.
 
-Staged roadmap: `P11d -> P12 -> null`. P12 was owner-authorized and completed on 2026-09-15; no successor is staged.
+Staged roadmap history remains P11d -> P12 -> null; P12OPS is an owner-authorized operational acceptance task used to validate the converged canonical main deployment before attaching other projects.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
