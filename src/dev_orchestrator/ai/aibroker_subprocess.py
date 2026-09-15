@@ -282,6 +282,7 @@ class AIBrokerExecutionPort:
             "excluded_resource_ids": list(request.excluded_resource_ids), "working_directory": str(request.working_directory),
             "timeout_seconds": request.timeout_seconds, "task_id": request.task_run_id,
             "managed_worktree": bool(request.metadata.get("managed_worktree", False)),
+            "probe": self.config.probe_before_dispatch,
             **({"previous_resource_context": {"resource_id": previous.resource_id, "provider": previous.provider, "account": previous.account, "model": previous.model}} if previous else {}),
         }
 

@@ -258,6 +258,7 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         self.assertEqual(call.call_args.args[0], "/api/dispatch")
         self.assertEqual(call.call_args.args[1]["project_id"], "devorchestrator")
         self.assertTrue(call.call_args.args[1]["managed_worktree"])
+        self.assertTrue(call.call_args.args[1]["probe"])
         run.assert_not_called()
 
 
