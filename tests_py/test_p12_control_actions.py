@@ -104,6 +104,41 @@ class P12ActionTests(unittest.TestCase):
             self.assertEqual(blocked["state"], "blocked")
             self.assertFalse(OwnerControlStore(runtime).is_paused("p1"))
 
+    def test_stop_is_isolated_from_other_project_execution_and_owner_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo, config, runtime, snapshot = self.fixture(base)
+            config.write_text(json.dumps({"projects": [
+                {
+                    "project_id": project_id, "repo_path": str(repo), "adapter": "agent_files",
+                    "execution": {
+                        "enabled": True, "owner_authorized": True,
+                        "allowed_next_actions": ["next_task"],
+                        "preferred_backends": ["agy"], "backends": {"agy": {"project": project_id}},
+                    },
+                }
+                for project_id in ("p1", "p2")
+            ]}), encoding="utf-8")
+            other = {**snapshot, "project_id": "p2"}
+            port = FakeInterruptPort(); executor = FakeExecutor(); executor._ai_execution_port = port
+            executor.records = {
+                "run-p1": {
+                    "source_request_id": "run-p1", "project_id": "p1", "state": "running",
+                    "engine": "aibroker", "broker_request_id": "broker-p1", "started_at": "2026-01-01T00:00:00Z",
+                },
+                "run-p2": {
+                    "source_request_id": "run-p2", "project_id": "p2", "state": "running",
+                    "engine": "aibroker", "broker_request_id": "broker-p2", "started_at": "2026-01-02T00:00:00Z",
+                },
+            }
+            submit_control_command(runtime, "p1", "stop")
+            outcome = ControlCommandCoordinator(runtime).advance(
+                config, {"projects": [snapshot, other]}, executor
+            )[0]
+            self.assertEqual(outcome["execution_id"], "run-p1")
+            self.assertEqual(port.calls, [("broker-p1", "explicit P12 owner stop")])
+            self.assertTrue(OwnerControlStore(runtime).is_paused("p1"))
+            self.assertFalse(OwnerControlStore(runtime).is_paused("p2"))
+
     def test_binding_actions_preserve_uniqueness_and_claim_guard(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); _, config, runtime, snapshot = self.fixture(base)
@@ -127,6 +162,13 @@ class P12ActionTests(unittest.TestCase):
             ).advance(config, {"projects": [bound_snapshot]}, FakeExecutor())[0]
             self.assertEqual(guarded["state"], "blocked")
             self.assertEqual(conversations.binding_for_project("p1")["binding_id"], "one")
+            guarded_view = project_control_view(
+                bound_snapshot, runtime, bridge_store=FakeBridgeStore(True)
+            )
+            guarded_capabilities = {item["action"]: item for item in guarded_view["controls"]}
+            self.assertFalse(guarded_capabilities["unbind_conversation"]["available"])
+            self.assertFalse(guarded_capabilities["rebind_conversation"]["available"])
+            self.assertTrue(guarded_view["conversation"]["active_claim"])
 
             submit_control_command(runtime, "p1", "rebind_conversation", target={"adapter": "chatgpt", "binding_id": "two"})
             rebound = coordinator.advance(config, {"projects": [bound_snapshot]}, FakeExecutor())[0]
@@ -148,6 +190,35 @@ class P12ActionTests(unittest.TestCase):
                 submit_control_command(runtime, "p1", action)
                 outcome = ControlCommandCoordinator(runtime).advance(config, {"projects": [snapshot]}, FakeExecutor())[0]
                 self.assertEqual(outcome["state"], "blocked")
+
+    def test_project_identity_is_project_scoped_and_every_action_revalidates_revision(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); _, config, runtime, snapshot = self.fixture(base)
+            other = {**snapshot, "project_id": "p2"}
+            self.assertNotEqual(project_identity(snapshot, runtime)["revision"], project_identity(other, runtime)["revision"])
+            stale = project_identity(snapshot, runtime); stale["revision"] = "sha256:stale"
+            targets = {
+                "bind_conversation": {"adapter": "chatgpt_web", "binding_id": "one"},
+                "rebind_conversation": {"adapter": "chatgpt_web", "binding_id": "two"},
+                "approve_owner_gate": {"gate_id": "gate"},
+                "retry": {"target_id": "retry"}, "reconcile": {"target_id": "reconcile"},
+            }
+            executor = FakeExecutor()
+            for action in (
+                "continue", "pause", "resume", "stop", "retry", "reconcile",
+                "approve_owner_gate", "bind_conversation", "unbind_conversation", "rebind_conversation",
+            ):
+                submit_control_command(
+                    runtime, "p1", action, expected=stale, target=targets.get(action, {}),
+                    source="control_api",
+                )
+                outcome = ControlCommandCoordinator(runtime).advance(
+                    config, {"projects": [snapshot]}, executor
+                )[0]
+                self.assertEqual(outcome["state"], "blocked", action)
+                self.assertIn("stale project identity", outcome["reason"], action)
+            self.assertEqual(executor.calls, [])
+            self.assertFalse(OwnerControlStore(runtime).is_paused("p1"))
 
 
 if __name__ == "__main__":

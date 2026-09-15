@@ -66,7 +66,11 @@ class ControlSecurity:
     def valid_origin(origin: str | None, host: str | None, port: int) -> bool:
         if not origin or not host:
             return False
-        parsed = urlsplit(origin)
+        try:
+            parsed = urlsplit(origin)
+            parsed_port = parsed.port
+        except ValueError:
+            return False
         if (
             parsed.scheme != "http" or parsed.path not in ("", "/")
             or parsed.query or parsed.fragment or parsed.username or parsed.password
@@ -83,7 +87,7 @@ class ControlSecurity:
             and is_loopback(advertised.hostname or "")
             and advertised_port == port
             and is_loopback(parsed.hostname or "")
-            and parsed.port == port
+            and parsed_port == port
             and _host_identity(advertised.hostname or "") == _host_identity(parsed.hostname or "")
         )
 
@@ -175,10 +179,14 @@ class ControlSecurity:
     def revoke_pairing(self, pairing_id: str) -> dict[str, Any]:
         with InterProcessFileLock(self.lock_path):
             data = self._pairings()
-            row = data["capabilities"].get(pairing_id)
-            if not isinstance(row, dict):
-                raise ValueError("pairing capability not found")
-            row["revoked"] = True
-            row["revoked_at"] = utc_now_iso()
+            pairing = data["pairings"].get(pairing_id)
+            capability = data["capabilities"].get(pairing_id)
+            if not isinstance(pairing, dict) and not isinstance(capability, dict):
+                raise ValueError("pairing not found")
+            now = utc_now_iso()
+            if isinstance(pairing, dict):
+                pairing.update({"used": True, "revoked": True, "revoked_at": now})
+            if isinstance(capability, dict):
+                capability.update({"revoked": True, "revoked_at": now})
             write_json(self.pairings_path, data, indent=2)
             return {"pairing_id": pairing_id, "revoked": True}

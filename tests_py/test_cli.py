@@ -5,10 +5,13 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+from dev_orchestrator.web.server import make_server
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,16 +67,21 @@ class CliLifecycleTests(unittest.TestCase):
                 "project_id": "p1", "state": "READY_TO_RUN", "conversation_binding": None,
             }), encoding="utf-8")
             (runtime / "daemon.pid").write_text(str(os.getpid()), encoding="utf-8")
-            status = run_cli("project-status", "p1", "--runtime-root", str(runtime))
-            self.assertEqual(status.returncode, 0, status.stderr)
-            self.assertEqual(json.loads(status.stdout)["project_id"], "p1")
-            queued = run_cli("project-continue", "p1", "--runtime-root", str(runtime))
-            self.assertEqual(queued.returncode, 0, queued.stderr)
-            payload = json.loads(queued.stdout)
-            self.assertEqual((payload["project_id"], payload["action"], payload["state"]), ("p1", "continue", "pending"))
-            inbox = list((runtime / "control" / "inbox").glob("*.json"))
-            self.assertEqual(len(inbox), 1)
-            self.assertNotIn("conversation", inbox[0].read_text(encoding="utf-8"))
+            server = make_server("127.0.0.1", 0, runtime, ROOT / "web", enable_control=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            try:
+                status = run_cli("project-status", "p1", "--runtime-root", str(runtime))
+                self.assertEqual(status.returncode, 0, status.stderr)
+                self.assertEqual(json.loads(status.stdout)["project_id"], "p1")
+                queued = run_cli("project-continue", "p1", "--runtime-root", str(runtime))
+                self.assertEqual(queued.returncode, 0, queued.stderr)
+                payload = json.loads(queued.stdout)
+                self.assertEqual((payload["project_id"], payload["action"], payload["state"]), ("p1", "continue", "pending"))
+                inbox = list((runtime / "control" / "inbox").glob("*.json"))
+                self.assertEqual(len(inbox), 1)
+                self.assertNotIn("conversation", inbox[0].read_text(encoding="utf-8"))
+            finally:
+                server.shutdown(); server.server_close(); thread.join(timeout=2)
 
     def test_project_status_cli_projects_active_broker_execution(self):
         with tempfile.TemporaryDirectory() as td:

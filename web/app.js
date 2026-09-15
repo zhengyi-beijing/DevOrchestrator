@@ -215,6 +215,7 @@ function renderBrokerUsage(payload) {
 }
 
 let controlCsrf = null;
+let activePairingId = null;
 
 async function ensureControlSession() {
   if (controlCsrf) return controlCsrf;
@@ -259,6 +260,35 @@ async function sendControl(project, action, target = {}) {
     : payload.data;
 }
 
+async function createAdapterPairing() {
+  const csrf = await ensureControlSession();
+  const response = await fetch('/api/v1/control/adapter-pairings', {
+    method: 'POST', credentials: 'same-origin',
+    headers: {'X-DevOrch-CSRF': csrf, 'Sec-Fetch-Site': 'same-origin'},
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.message || `adapter pairing: HTTP ${response.status}`);
+  activePairingId = payload.data.pairing_id;
+  $('pairingCode').textContent = `${payload.data.pairing_id}:${payload.data.code}`;
+  $('revokeAdapter').disabled = false;
+  return payload.data;
+}
+
+async function revokeAdapterPairing() {
+  if (!activePairingId) return null;
+  const csrf = await ensureControlSession();
+  const response = await fetch(`/api/v1/control/adapter-pairings/${encodeURIComponent(activePairingId)}/revoke`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: {'X-DevOrch-CSRF': csrf, 'Sec-Fetch-Site': 'same-origin'},
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.message || `pairing revoke: HTTP ${response.status}`);
+  activePairingId = null;
+  $('pairingCode').textContent = 'Pairing revoked.';
+  $('revokeAdapter').disabled = true;
+  return payload.data;
+}
+
 function renderControlSurface(payload) {
   const data = payload && payload.data || {};
   const projectsHost = $('controlProjects'); projectsHost.replaceChildren();
@@ -275,7 +305,9 @@ function renderControlSurface(payload) {
     kv(grid, 'Task', project.control_identity && project.control_identity.task_id, true);
     kv(grid, 'Branch / HEAD', project.control_identity ? `${text(project.control_identity.branch)} @ ${shortHead(project.control_identity.head)}` : UNKNOWN, true);
     kv(grid, 'Owner gate', project.control_identity && project.control_identity.gate_id, true);
-    kv(grid, 'Active role', project.active_execution && (project.active_execution.role || project.active_execution.engine));
+    kv(grid, 'Next action', project.next_title || project.next_status);
+    kv(grid, 'Active roles', (project.active_roles || []).map(item => `${text(item.role)} / ${text(item.state)}`).join(', ') || UNKNOWN);
+    kv(grid, 'Watchdog', project.watchdog && (project.watchdog.state || project.watchdog.diagnostic_code));
     kv(grid, 'Binding', project.conversation && project.conversation.binding ? `${text(project.conversation.binding.adapter)} / ${text(project.conversation.binding.binding_id)}` : 'unbound');
     card.appendChild(grid);
     const controls = document.createElement('div'); controls.className = 'control-actions';
@@ -455,9 +487,11 @@ async function refresh() {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { renderAccounting, renderControlSurface, sendControl };
+  module.exports = { renderAccounting, renderControlSurface, sendControl, createAdapterPairing, revokeAdapterPairing };
 }
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  $('pairAdapter').addEventListener('click', () => createAdapterPairing().catch(error => { $('pairingCode').textContent = String(error.message || error); }));
+  $('revokeAdapter').addEventListener('click', () => revokeAdapterPairing().catch(error => { $('pairingCode').textContent = String(error.message || error); }));
   refresh();
   setInterval(refresh, 10000);
 }

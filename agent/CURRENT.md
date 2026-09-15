@@ -57,8 +57,9 @@ P12 design result:
 P12 implementation result:
 - Port 8770 now exposes stable `/api/v1/control/*` read envelopes and a one-call operator overview while preserving every legacy GET route; standalone web remains read-only.
 - Unified-daemon POST uses loopback plus bearer or same-origin browser-session authorization, exact Host/Origin/CSRF checks, strict bounded JSON schemas, narrow ChatGPT CORS preflight, short-lived single-use pairing and revocable hash-only heartbeat capabilities.
-- Command submission is cross-process atomic and replay-safe, with canonical request hashes, conflict detection, persist-before-ack semantics, result-before-inbox-removal recovery and redacted append-only audit evidence.
+- CLI lifecycle commands now use the same authenticated 8770 ingress, and the ChatGPT userscript redeems dashboard pairing codes into a heartbeat-only private capability; neither client bypasses daemon authority.
+- Command submission is cross-process atomic and replay-safe, with canonical request hashes, conflict detection, persist-before-ack semantics, result-before-inbox-removal recovery and redacted append-only audit evidence. Corrupt/torn queue or audit records are preserved in quarantine and surfaced as degraded control health.
 - Daemon-owned control implements safe continue, pause/resume, exact supported AIBroker stop, and guarded runtime conversation bind/unbind/rebind; retry, reconcile and universal owner-gate approval remain explicitly unavailable because no exact safe adapter exists.
 - Durable owner pause is enforced at final Worker launch gates and suppresses later legacy static starts. Runtime conversation bindings override static migration fallback without disabling direct AIBroker projects.
 - The dashboard renders server-advertised capabilities, active roles, resources/executions, bindings, P11 evidence and pending/settled command results, including confirmation for stop/owner-gate actions.
-- Verification: 501 tests and 16 subtests passed; Python compilation, dashboard and browser-adapter JavaScript syntax, `git diff --check`, and Graphify refresh passed (2702 nodes, 7223 edges, 140 communities).
+- Verification: 509 tests and 16 subtests passed; Python compilation, dashboard and browser-adapter JavaScript syntax, `git diff --check`, and Graphify refresh passed (2744 nodes, 7357 edges, 141 communities).

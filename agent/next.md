@@ -10,10 +10,13 @@ Completion: **P12.1-P12.4 ACCEPTED / 2026-09-15**
 
 Completion evidence: the daemon-only 8770 Control API, atomic command/audit
 store, loopback authentication, guarded owner actions, conversation
-session/binding registry, capability-driven dashboard and representative
-software-only scenario are implemented. Full regression passed with 501 tests
+session/binding registry, paired ChatGPT heartbeat client, authenticated CLI,
+capability-driven dashboard and representative software-only scenario are
+implemented. Corrupt queue/audit evidence is quarantined and surfaced as
+degraded health. Full regression passed with 509 tests
 and 16 subtests; Python compilation, both JavaScript syntax checks,
-`git diff --check`, and Graphify AST refresh also passed.
+`git diff --check`, and Graphify AST refresh also passed (2744 nodes, 7357
+edges, 141 communities).
 
 Goal: make port 8770 the primary day-to-day project and AI-resource control surface while keeping AIBroker port 8875 as the broker-specialist configuration and diagnostic surface.
 

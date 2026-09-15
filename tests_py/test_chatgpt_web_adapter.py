@@ -1,3 +1,4 @@
+import json
 import subprocess
 import unittest
 from pathlib import Path
@@ -122,6 +123,50 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "[WORKER_STARTED] Started task P1|1")
+
+    def test_userscript_pairs_and_sends_capability_scoped_8770_heartbeat(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('CONTROL_BASE = "http://127.0.0.1:8770"', source)
+        self.assertIn('/api/v1/control/adapter-pairings/redeem', source)
+        self.assertIn('/api/v1/control/session-heartbeats', source)
+        self.assertIn('GM_registerMenuCommand("Pair DevOrchestrator 8770 heartbeat"', source)
+        self.assertIn('headers.Authorization = "Bearer " + capability', source)
+        self.assertNotIn('/v1/owner-action', source)
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const ok=a.pairingFields('pair-id:single-use-code');"
+            "console.log(ok.pairing_id+'|'+ok.code+'|'+String(a.pairingFields('invalid')===null));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "pair-id|single-use-code|true")
+
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "let saved='',requests=[];globalThis.GM_setValue=(k,v)=>{saved=v};"
+            "globalThis.GM_getValue=()=>saved;globalThis.GM_deleteValue=()=>{saved=''};"
+            "globalThis.GM_xmlhttpRequest=(o)=>{requests.push({url:o.url,headers:o.headers,data:JSON.parse(o.data)});"
+            "const body=o.url.includes('redeem')?{data:{capability:'scoped-cap'}}:{data:{state:'live'}};"
+            "o.onload({status:200,responseText:JSON.stringify(body)})};"
+            "globalThis.window={location:{href:'https://chatgpt.com/c/conv'}};"
+            "globalThis.document={title:'Conversation'};globalThis.sessionStorage={getItem:()=>null,setItem:()=>{}};"
+            "require(" + json.dumps(script) + ");const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "(async()=>{const paired=await a.redeemControlPairing('pair:code');const live=await a.sendControlHeartbeat();"
+            "console.log(JSON.stringify({paired,live,saved,requests}));process.exit(0)})()"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["paired"])
+        self.assertTrue(payload["live"])
+        self.assertEqual(payload["saved"], "scoped-cap")
+        self.assertEqual(payload["requests"][0]["headers"]["Origin"], "https://chatgpt.com")
+        self.assertNotIn("Authorization", payload["requests"][0]["headers"])
+        self.assertEqual(payload["requests"][1]["headers"]["Authorization"], "Bearer scoped-cap")
+        self.assertEqual(payload["requests"][1]["data"]["binding_id"], "conv")
 
 
 if __name__ == "__main__":

@@ -496,6 +496,20 @@ class BrowserBridgeStore:
                     return self._record_to_claim(record, claim_token)
             return None
 
+    def has_active_claim(
+        self, adapter: str, binding_id: str, *, now: Optional[datetime] = None
+    ) -> bool:
+        """Report whether the exact binding owns a currently valid claim lease."""
+        _require_route(adapter, binding_id)
+        moment = _as_utc(now)
+        with self._lock:
+            return any(
+                record.get("state") == STATE_CLAIMED
+                and (expires_at := _parse_iso(record.get("lease_expires_at"))) is not None
+                and moment < expires_at
+                for record in self._load_queue(adapter, binding_id).values()
+            )
+
     def respond(
         self,
         adapter: str,

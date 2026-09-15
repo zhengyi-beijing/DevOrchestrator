@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from dev_orchestrator.accounting.events import InterProcessFileLock
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
@@ -60,7 +61,7 @@ def canonical_request(value: dict[str, Any]) -> dict[str, Any]:
     if action not in CONTROL_ACTIONS:
         raise ValueError("unsupported control action")
     expected_allowed = {
-        "revision", "branch", "head", "task_id", "lifecycle_state", "gate_id",
+        "revision", "project_id", "repo_path", "branch", "head", "task_id", "lifecycle_state", "gate_id",
         "paused", "binding_state", "binding_id", "binding_adapter",
     }
     expected_unknown = sorted(set(expected) - expected_allowed)
@@ -102,6 +103,8 @@ class ControlCommandStore:
         self.inbox = self.root / "inbox"
         self.history = self.root / "history"
         self.audit_path = self.root / "audit.jsonl"
+        self.health_path = self.root / "health.json"
+        self.quarantine_dir = self.root / "quarantine"
         self.lock_path = self.root / "commands.lock"
 
     def _read_existing(self, command_id: str) -> dict[str, Any] | None:
@@ -194,8 +197,98 @@ class ControlCommandStore:
         with InterProcessFileLock(self.lock_path):
             self._append_audit_unlocked(event, value)
 
+    def quarantine(self, path: Path, reason: str) -> dict[str, Any]:
+        """Preserve an unreadable queue record and publish degraded health."""
+        with InterProcessFileLock(self.lock_path):
+            return self._quarantine_unlocked(path, reason)
+
+    def repair_corruption(self) -> list[dict[str, Any]]:
+        """Quarantine unreadable inbox/history records and repair a torn audit."""
+        outcomes: list[dict[str, Any]] = []
+        with InterProcessFileLock(self.lock_path):
+            self._repair_audit_unlocked()
+            for directory in (self.inbox, self.history):
+                if not directory.is_dir():
+                    continue
+                for path in sorted(directory.glob("*.json")):
+                    if not isinstance(read_json(path, None), dict):
+                        outcomes.append(self._quarantine_unlocked(
+                            path, f"unreadable control record in {directory.name}"
+                        ))
+        return outcomes
+
+    def health(self) -> dict[str, Any]:
+        persisted = read_json(self.health_path, {})
+        result = dict(persisted) if isinstance(persisted, dict) else {}
+        corrupt: list[str] = []
+        for directory in (self.inbox, self.history):
+            if directory.is_dir():
+                for path in directory.glob("*.json"):
+                    if not isinstance(read_json(path, None), dict):
+                        corrupt.append(str(path.relative_to(self.root)))
+        if self.audit_path.is_file() and not self._audit_is_valid():
+            corrupt.append(self.audit_path.name)
+        result.setdefault("schema_version", 1)
+        result["degraded"] = bool(result.get("degraded") or corrupt)
+        result["detected_corruption"] = corrupt
+        result["quarantined"] = sorted(path.name for path in self.quarantine_dir.glob("*") if path.is_file()) if self.quarantine_dir.is_dir() else []
+        return result
+
+    def _audit_is_valid(self) -> bool:
+        try:
+            raw = self.audit_path.read_bytes()
+        except OSError:
+            return False
+        if raw and not raw.endswith(b"\n"):
+            return False
+        try:
+            return all(isinstance(json.loads(line), dict) for line in raw.decode("utf-8").splitlines())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+
+    def _mark_degraded_unlocked(self, reason: str, quarantined_file: str) -> None:
+        current = read_json(self.health_path, {})
+        value = dict(current) if isinstance(current, dict) else {}
+        entries = list(value.get("events") or [])[-49:]
+        entries.append({"occurred_at": utc_now_iso(), "reason": reason, "quarantined_file": quarantined_file})
+        write_json(self.health_path, {"schema_version": 1, "degraded": True, "events": entries}, indent=2)
+
+    def _quarantine_unlocked(self, path: Path, reason: str) -> dict[str, Any]:
+        self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+        destination = self.quarantine_dir / f"{path.name}.corrupt-{uuid4().hex}"
+        try:
+            path.replace(destination)
+        except OSError as exc:
+            reason = f"{reason}; quarantine failed: {exc}"
+            destination = path
+        self._mark_degraded_unlocked(reason, destination.name)
+        outcome = {
+            "version": 1, "command_id": "corrupt-" + uuid4().hex,
+            "project_id": None, "action": None, "state": "failed",
+            "reason": reason, "processed_at": utc_now_iso(),
+            "quarantined_file": destination.name,
+        }
+        self._append_audit_unlocked("corruption_quarantined", outcome)
+        return outcome
+
+    def _repair_audit_unlocked(self) -> None:
+        if not self.audit_path.exists() or self._audit_is_valid():
+            return
+        self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+        destination = self.quarantine_dir / f"audit.jsonl.corrupt-{uuid4().hex}"
+        try:
+            self.audit_path.replace(destination)
+        except OSError as exc:
+            self._mark_degraded_unlocked(
+                f"corrupt or torn control audit; quarantine failed: {exc}",
+                self.audit_path.name,
+            )
+            return
+        self._mark_degraded_unlocked("corrupt or torn control audit", destination.name)
+
     def _append_audit_unlocked(self, event: str, value: dict[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        self._repair_audit_unlocked()
         row = {
             "schema_version": 1,
             "event": event,

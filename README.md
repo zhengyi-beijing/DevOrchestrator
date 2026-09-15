@@ -77,6 +77,24 @@ Default surfaces:
 - dashboard: `http://127.0.0.1:8770/`
 - Browser Bridge: `http://127.0.0.1:8765/`
 
+The daemon-hosted dashboard is the normal observation and control surface.
+Its buttons come from server-advertised capabilities and every mutation is
+revalidated by the daemon. To publish ChatGPT conversation presence, click
+**Pair ChatGPT heartbeat** on the dashboard, copy the displayed
+`pairing-id:code`, then choose **Pair DevOrchestrator 8770 heartbeat** from the
+installed userscript menu and paste the value. The single-use capability can
+send heartbeat/liveness only; lifecycle actions remain on authenticated 8770.
+
+The CLI uses that same loopback authenticated API. For example:
+
+```powershell
+python -m dev_orchestrator control-overview `
+  --config .\config\projects.json `
+  --runtime-root .\runtime
+python -m dev_orchestrator project-control <project_id> pause `
+  --runtime-root .\runtime
+```
+
 Status / stop:
 
 ```powershell

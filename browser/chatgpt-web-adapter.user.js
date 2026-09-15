@@ -1,11 +1,15 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.10
-// @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge. Derives the binding id from the current /c/<conversation-id> URL, claims only that binding, submits the rendered prompt, waits for a stable matching response marker, and posts the raw assistant text back.
+// @version      0.1.11
+// @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge plus paired 8770 conversation-presence heartbeat.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_registerMenuCommand
 // @connect      127.0.0.1
 // @run-at       document-idle
 // ==/UserScript==
@@ -22,6 +26,7 @@
   "use strict";
 
   var BRIDGE_BASE = "http://127.0.0.1:8765";
+  var CONTROL_BASE = "http://127.0.0.1:8770";
   var ADAPTER_ID = "chatgpt_web";
   var CONVERSATION_PATH_RE = /\/c\/([A-Za-z0-9_-]+)/;
   var REQUEST_HEAD = "[DEVORCH_WEB_SOL_REQUEST ";
@@ -30,6 +35,12 @@
   var RENEW_PATH = "/v1/renew";
   var RESPONSE_PATH = "/v1/response";
   var PROGRESS_PATH = "/v1/progress";
+  var PAIRING_REDEEM_PATH = "/api/v1/control/adapter-pairings/redeem";
+  var SESSION_HEARTBEAT_PATH = "/api/v1/control/session-heartbeats";
+  var CAPABILITY_STORAGE_KEY = "devorch:control:heartbeat-capability";
+  var TAB_INSTANCE_STORAGE_KEY = "devorch:control:tab-instance";
+  var CONTROL_HEARTBEAT_MS = 15000;
+  var controlHeartbeatTimer = null;
   var POLL_MS = 1500;
   var RENEW_INTERVAL_MS = 20000;
   var WAIT_DEADLINE_MS = 15 * 60 * 1000;
@@ -117,6 +128,44 @@
       return "";
     }
     return conversationIdFromUrl(String(window.location.href));
+  }
+
+  function pairingFields(raw) {
+    if (typeof raw !== "string") { return null; }
+    var separator = raw.indexOf(":");
+    if (separator <= 0 || separator >= raw.length - 1) { return null; }
+    return { pairing_id: raw.slice(0, separator).trim(), code: raw.slice(separator + 1).trim() };
+  }
+
+  function newTabInstanceId() {
+    if (root.crypto && typeof root.crypto.randomUUID === "function") { return root.crypto.randomUUID(); }
+    return "tab-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  }
+
+  function tabInstanceId() {
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        var existing = sessionStorage.getItem(TAB_INSTANCE_STORAGE_KEY);
+        if (existing) { return existing; }
+        var created = newTabInstanceId();
+        sessionStorage.setItem(TAB_INSTANCE_STORAGE_KEY, created);
+        return created;
+      }
+    } catch (err) {}
+    return newTabInstanceId();
+  }
+
+  function storedCapability() {
+    try { return typeof GM_getValue === "function" ? String(GM_getValue(CAPABILITY_STORAGE_KEY, "") || "") : ""; }
+    catch (err) { return ""; }
+  }
+
+  function saveCapability(value) {
+    if (typeof GM_setValue === "function") { GM_setValue(CAPABILITY_STORAGE_KEY, value); }
+  }
+
+  function clearCapability() {
+    if (typeof GM_deleteValue === "function") { GM_deleteValue(CAPABILITY_STORAGE_KEY); }
   }
 
   function responseMatches(text, requestId) {
@@ -253,7 +302,11 @@
     isStopComposerButton: isStopComposerButton,
     findSendButton: findSendButton,
     showProgressToast: showProgressToast,
-    pollProgress: pollProgress
+    pollProgress: pollProgress,
+    pairingFields: pairingFields,
+    tabInstanceId: tabInstanceId,
+    sendControlHeartbeat: sendControlHeartbeat,
+    redeemControlPairing: redeemControlPairing
   };
 
   // Exposed for the automated adapter test (Node `require`); harmless in a
@@ -299,6 +352,81 @@
       }
       finish(0, "");
     });
+  }
+
+  function controlPost(path, payload, capability) {
+    var url = CONTROL_BASE + path;
+    var body = JSON.stringify(payload);
+    return new Promise(function (resolve) {
+      var settled = false;
+      function finish(status, text) {
+        if (settled) { return; }
+        settled = true; resolve({ status: status, text: text });
+      }
+      var headers = { "Content-Type": "application/json", "Origin": "https://chatgpt.com" };
+      if (capability) { headers.Authorization = "Bearer " + capability; }
+      if (typeof GM_xmlhttpRequest === "function") {
+        GM_xmlhttpRequest({
+          method: "POST", url: url, data: body, headers: headers, timeout: 8000,
+          onload: function (response) { finish(response.status, response.responseText); },
+          onerror: function () { finish(0, ""); }, ontimeout: function () { finish(0, ""); }
+        });
+        return;
+      }
+      if (typeof fetch === "function") {
+        delete headers.Origin;
+        fetch(url, { method: "POST", headers: headers, body: body }).then(function (response) {
+          response.text().then(function (text) { finish(response.status, text); });
+        }).catch(function () { finish(0, ""); });
+        return;
+      }
+      finish(0, "");
+    });
+  }
+
+  function redeemControlPairing(raw) {
+    var fields = pairingFields(raw);
+    if (!fields) { return Promise.resolve(false); }
+    return controlPost(PAIRING_REDEEM_PATH, fields, "").then(function (result) {
+      var body = parsedJsonText(result);
+      var capability = body && body.data && body.data.capability;
+      if (result.status !== 200 || typeof capability !== "string" || !capability) { return false; }
+      saveCapability(capability);
+      scheduleControlHeartbeat(0);
+      return true;
+    });
+  }
+
+  function sendControlHeartbeat() {
+    var capability = storedCapability();
+    var bindingId = currentBindingId();
+    if (!capability || !bindingId || typeof window === "undefined") { return Promise.resolve(false); }
+    return controlPost(SESSION_HEARTBEAT_PATH, {
+      adapter: ADAPTER_ID, binding_id: bindingId,
+      title: (typeof document.title === "string" && document.title.trim()) || ("ChatGPT conversation " + bindingId),
+      url: String(window.location.href), tab_instance_id: tabInstanceId()
+    }, capability).then(function (result) {
+      if (result.status === 401) { clearCapability(); }
+      return result.status === 200;
+    });
+  }
+
+  function scheduleControlHeartbeat(delayMs) {
+    if (controlHeartbeatTimer !== null && typeof clearTimeout === "function") { clearTimeout(controlHeartbeatTimer); }
+    controlHeartbeatTimer = setTimeout(function () {
+      sendControlHeartbeat().then(function () { scheduleControlHeartbeat(CONTROL_HEARTBEAT_MS); });
+    }, delayMs);
+  }
+
+  function registerControlPairingMenu() {
+    if (typeof GM_registerMenuCommand !== "function") { return; }
+    GM_registerMenuCommand("Pair DevOrchestrator 8770 heartbeat", function () {
+      var raw = typeof root.prompt === "function" ? root.prompt("Paste pairing-id:code from the 8770 dashboard") : "";
+      redeemControlPairing(raw || "").then(function (ok) {
+        if (typeof root.alert === "function") { root.alert(ok ? "DevOrchestrator heartbeat paired" : "Pairing failed"); }
+      });
+    });
+    GM_registerMenuCommand("Forget DevOrchestrator heartbeat capability", clearCapability);
   }
 
   function claimOnce(bindingId) {
@@ -647,6 +775,8 @@
 
   if (typeof document !== "undefined" && !root.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__) {
     setAdapterStatus("IDLE", "Adapter starting");
+    registerControlPairingMenu();
+    scheduleControlHeartbeat(250);
     schedule(runAdapter, 1000);
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -8,6 +8,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
+from urllib.error import URLError
 
 from dev_orchestrator.control.binding_resolver import resolve_effective_project
 from dev_orchestrator.control.command_store import (
@@ -17,7 +19,7 @@ from dev_orchestrator.control.command_store import (
 from dev_orchestrator.control.security import ControlSecurity
 from dev_orchestrator.control.store import ConversationConflictError, ConversationControlStore
 from dev_orchestrator.core.control_commands import ControlCommandCoordinator
-from dev_orchestrator.web.server import make_server
+from dev_orchestrator.web.server import broker_proxy_payload, make_server
 from tests_py.test_control_commands import FakeExecutor, write_config
 
 
@@ -79,6 +81,24 @@ class P12StoreTests(unittest.TestCase):
             self.assertEqual(len({stdout.strip() for stdout, _ in results}), 1)
             self.assertEqual(len(list((Path(td) / "control" / "inbox").glob("*.json"))), 1)
 
+    def test_corrupt_queue_and_torn_audit_are_preserved_and_degraded(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td); store = ControlCommandStore(runtime)
+            store.submit(command("good"), source="test")
+            store.audit_path.write_text('{"torn":', encoding="utf-8")
+            store.audit("recovery", {"command_id": "good", "state": "pending"})
+            self.assertTrue(any(store.quarantine_dir.glob("audit.jsonl.corrupt-*")))
+            bad = store.inbox / "bad.json"; bad.write_text("{", encoding="utf-8")
+            store.history.mkdir(parents=True, exist_ok=True)
+            bad_history = store.history / "bad-result.json"; bad_history.write_text("[]", encoding="utf-8")
+            outcomes = store.repair_corruption()
+            self.assertEqual([outcome["state"] for outcome in outcomes], ["failed", "failed"])
+            health = store.health()
+            self.assertTrue(health["degraded"])
+            self.assertGreaterEqual(len(health["quarantined"]), 3)
+            self.assertFalse(bad.exists())
+            self.assertFalse(bad_history.exists())
+
     def test_conversation_liveness_uniqueness_tombstone_and_direct_ai(self):
         with tempfile.TemporaryDirectory() as td:
             store = ConversationControlStore(td, session_presence_seconds=60)
@@ -122,6 +142,44 @@ class P12StoreTests(unittest.TestCase):
                 security.redeem_pairing(pairing["pairing_id"], pairing["code"])
             security.revoke_pairing(pairing["pairing_id"])
             self.assertFalse(security.adapter_authorized("Bearer " + redeemed["capability"]))
+            unused = security.create_pairing()
+            self.assertTrue(security.revoke_pairing(unused["pairing_id"])["revoked"])
+            with self.assertRaisesRegex(ValueError, "used"):
+                security.redeem_pairing(unused["pairing_id"], unused["code"])
+            expired = security.create_pairing()
+            data = json.loads(security.pairings_path.read_text(encoding="utf-8"))
+            data["pairings"][expired["pairing_id"]]["expires_at_epoch"] = 0
+            security.pairings_path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "expired"):
+                security.redeem_pairing(expired["pairing_id"], expired["code"])
+
+    def test_broker_failure_is_isolated_and_unknown_fields_are_preserved(self):
+        class Response:
+            def __init__(self, body): self.body = body
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self): return self.body
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            (runtime / "aibroker.json").write_text(json.dumps({"base_url": "http://127.0.0.1:8875"}), encoding="utf-8")
+            with patch("dev_orchestrator.web.server.urlopen", side_effect=URLError("timed out")):
+                unavailable = broker_proxy_payload(runtime, "/api/resources")
+                self.assertFalse(unavailable["available"])
+                self.assertEqual(unavailable["availability"], "unavailable")
+            with patch("dev_orchestrator.web.server.urlopen", return_value=Response(b"[]")):
+                self.assertEqual(broker_proxy_payload(runtime, "/api/resources")["error"], "invalid AIBroker response")
+            with patch("dev_orchestrator.web.server.urlopen", return_value=Response(b'{"resources":[],"future_field":"preserved"}')):
+                result = broker_proxy_payload(runtime, "/api/resources")
+                self.assertTrue(result["available"])
+                self.assertEqual(result["availability"], "available")
+                self.assertEqual(result["future_field"], "preserved")
+                self.assertEqual(result["unknown_fields"], [])
+            with patch("dev_orchestrator.web.server.urlopen", return_value=Response(b'{"resources":[],"availability":"stale","observed_at":"2026-01-01T00:00:00Z","unknown_fields":["quota"]}')):
+                stale = broker_proxy_payload(runtime, "/api/resources")
+                self.assertTrue(stale["available"])
+                self.assertEqual(stale["availability"], "stale")
+                self.assertEqual(stale["unknown_fields"], ["quota"])
 
 
 class P12HTTPTests(unittest.TestCase):
@@ -140,7 +198,12 @@ class P12HTTPTests(unittest.TestCase):
             encoding="utf-8",
         )
         (self.runtime / "projects" / "p1.json").write_text(json.dumps(project), encoding="utf-8")
-        self.server = make_server("127.0.0.1", 0, self.runtime, ROOT / "web", enable_control=True)
+        self.config = self.runtime / "projects.json"
+        write_config(self.config, ROOT)
+        self.server = make_server(
+            "127.0.0.1", 0, self.runtime, ROOT / "web",
+            enable_control=True, config_path=self.config,
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.port = self.server.server_address[1]
@@ -172,6 +235,11 @@ class P12HTTPTests(unittest.TestCase):
         self.assertEqual(overview["schema_version"], 1)
         self.assertTrue(overview["data"]["control_enabled"])
         self.assertTrue(any("broker_resources unavailable" in item for item in overview["warnings"]))
+        continue_capability = next(
+            item for item in overview["data"]["projects"][0]["controls"]
+            if item["action"] == "continue"
+        )
+        self.assertTrue(continue_capability["available"])
         identity = overview["data"]["projects"][0]["control_identity"]
 
         payload = command("http-command")
@@ -190,6 +258,14 @@ class P12HTTPTests(unittest.TestCase):
         conflict = dict(payload); conflict["action"] = "pause"
         self.assertEqual(self.request("POST", "/api/v1/control/commands", body=json.dumps(conflict), headers=headers)[0], 409)
         self.assertEqual(self.request("GET", "/api/v1/control/commands/http-command")[0], 200)
+
+        bearer_value = dict(payload); bearer_value["command_id"] = "http-bearer"
+        token = (self.runtime / "control" / "api-token").read_text(encoding="utf-8").strip()
+        bearer = self.request(
+            "POST", "/api/v1/control/commands", body=json.dumps(bearer_value),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
+        )
+        self.assertEqual(bearer[0], 202)
 
         bad_headers = dict(headers); bad_headers["Origin"] = "http://evil.invalid"
         self.assertEqual(self.request("POST", "/api/v1/control/commands", body=encoded, headers=bad_headers)[0], 401)
@@ -241,17 +317,24 @@ class P12HTTPTests(unittest.TestCase):
         }
         value = command("representative-continue"); value["expected"] = identity
         self.assertEqual(self.request("POST", "/api/v1/control/commands", body=json.dumps(value), headers=headers)[0], 202)
-        config = self.runtime / "projects.json"
-        write_config(config, ROOT)
         summary = json.loads((self.runtime / "summary.json").read_text(encoding="utf-8"))
         executor = FakeExecutor()
-        outcomes = ControlCommandCoordinator(self.runtime).advance(config, summary, executor)
+        outcomes = ControlCommandCoordinator(self.runtime).advance(self.config, summary, executor)
         self.assertEqual(outcomes[0]["state"], "accepted")
         status, _, body = self.request("GET", "/api/v1/control/commands/representative-continue")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["data"]["state"], "accepted")
         audit_events = [json.loads(line)["event"] for line in (self.runtime / "control" / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(audit_events, ["request_accepted", "command_settled"])
+
+    def test_non_loopback_listener_never_enables_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            server = make_server("0.0.0.0", 0, td, ROOT / "web", enable_control=True)
+            try:
+                self.assertFalse(server.control_enabled)
+                self.assertIsNone(server.control_security)
+            finally:
+                server.server_close()
 
 
 if __name__ == "__main__":

@@ -1,10 +1,9 @@
 """Stdlib dashboard server with legacy reads and opt-in P12 Control API.
 
-Contract: methods ``GET``/``HEAD`` only; static allowlist ``/``, ``/app.js``,
-``/style.css``; API allowlist ``/api/monitor``, ``/api/summary``,
-``/api/projects/<id>``, ``/api/events?limit=N``, ``/api/runs?limit=N``,
-``/api/orchestration``, ``/api/watchdog``, ``/api/accounting``; history limits clamp to 1..100; unknown routes 404;
-write methods 405 with ``Allow: GET, HEAD``; traversal/malformed paths 400.
+The standalone web process remains GET/HEAD-only. The unified daemon opts into
+the bounded authenticated ``/api/v1/control/*`` POST surface; all other write
+routes remain disabled. Static paths are allowlisted, history limits clamp to
+1..100, and unknown/traversal/malformed routes fail closed.
 ``Cache-Control: no-store`` and ``X-Content-Type-Options: nosniff`` are always
 present.
 
@@ -33,6 +32,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import urlopen
 
 from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE
+from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.accounting import ROLES, build_p11_report, reporting_event_store
 from dev_orchestrator.accounting.events import EventWriteError
 from dev_orchestrator.control.command_store import (
@@ -108,17 +108,37 @@ def _default_summary() -> dict[str, Any]:
 
 
 def broker_proxy_payload(runtime_root: Path | str, endpoint: str) -> dict[str, Any]:
+    observed_at = utc_now_iso()
+
+    def unavailable(reason: str) -> dict[str, Any]:
+        return {
+            "available": False, "availability": "unavailable", "error": reason,
+            "observed_at": observed_at, "unknown_fields": [],
+        }
+
     runtime = Path(runtime_root)
     config = read_json(runtime / "aibroker.json", {})
     base_url = config.get("base_url") if isinstance(config, dict) else None
     if not isinstance(base_url, str) or not base_url.startswith(("http://127.0.0.1:", "http://localhost:")):
-        return {"available": False, "error": "AIBroker endpoint not configured"}
+        return unavailable("AIBroker endpoint not configured")
     try:
         with urlopen(base_url.rstrip("/") + endpoint, timeout=2) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
-        return {"available": False, "error": str(exc)}
-    return {**payload, "available": True} if isinstance(payload, dict) else {"available": False, "error": "invalid AIBroker response"}
+        return unavailable(str(exc))
+    if not isinstance(payload, dict):
+        return unavailable("invalid AIBroker response")
+    availability = payload.get("availability")
+    if availability not in {"available", "stale", "unavailable"}:
+        availability = "available"
+    result = dict(payload)
+    result.update({
+        "available": availability != "unavailable",
+        "availability": availability,
+        "observed_at": payload.get("observed_at") or observed_at,
+    })
+    result.setdefault("unknown_fields", [])
+    return result
 
 
 def orchestration_payload(runtime_root: Path | str) -> dict[str, Any]:
@@ -294,29 +314,70 @@ def _control_envelope(data: Any, *, warnings: list[str] | None = None, sources: 
     }
 
 
-def control_overview_payload(runtime_root: Path | str) -> dict[str, Any]:
+def _control_project_configs(config_path: Path | str | None) -> dict[str, dict[str, Any]]:
+    if config_path is None:
+        return {}
+    try:
+        config = load_projects_config(config_path)
+    except (OSError, ValueError):
+        return {}
+    return {
+        str(row.get("project_id")): row for row in config.get("projects") or []
+        if isinstance(row, dict) and row.get("project_id")
+    }
+
+
+def _source_availability(value: Any) -> str:
+    if isinstance(value, dict) and value.get("availability") in {"available", "stale", "unavailable"}:
+        return str(value["availability"])
+    return "available" if not isinstance(value, dict) or value.get("available", True) else "unavailable"
+
+
+def control_overview_payload(
+    runtime_root: Path | str, config_path: Path | str | None = None,
+    bridge_store: Any | None = None,
+) -> dict[str, Any]:
     """Build the one-call P12 operator view from existing durable projections."""
     runtime = Path(runtime_root)
     raw_summary = read_json(runtime / "summary.json", _default_summary())
     snapshots = raw_summary.get("projects") if isinstance(raw_summary, dict) else None
-    projects = [project_control_view(row, runtime) for row in (snapshots or []) if isinstance(row, dict)]
+    configs = _control_project_configs(config_path)
+    projects = [
+        project_control_view(
+            row, runtime, configs.get(str(row.get("project_id") or row.get("id") or "")),
+            bridge_store,
+        )
+        for row in (snapshots or []) if isinstance(row, dict)
+    ]
     resources = broker_proxy_payload(runtime, "/api/resources")
     executions = broker_proxy_payload(runtime, "/api/executions")
     accounting = accounting_payload(runtime)
     monitor = monitor_payload(runtime)
     watchdog = watchdog_payload(runtime)
+    watchdog_projects = watchdog.get("projects") if isinstance(watchdog, dict) else {}
+    for project in projects:
+        project["watchdog"] = (
+            watchdog_projects.get(str(project.get("project_id") or project.get("id") or ""))
+            if isinstance(watchdog_projects, dict) else None
+        )
     conversations = ConversationControlStore(runtime)
+    command_store = ControlCommandStore(runtime)
+    control_health = command_store.health()
     warnings: list[str] = []
     sources: list[dict[str, Any]] = []
     for name, value in (
         ("monitor", monitor), ("watchdog", watchdog), ("accounting", accounting),
         ("broker_resources", resources), ("broker_executions", executions),
     ):
-        available = value.get("available") if isinstance(value, dict) and "available" in value else True
-        status = "available" if available else "unavailable"
+        status = _source_availability(value)
         sources.append({"name": name, "availability": status})
-        if not available:
+        if status == "unavailable":
             warnings.append(f"{name} unavailable: {value.get('error') or 'unknown error'}")
+        elif status == "stale":
+            warnings.append(f"{name} stale")
+    sources.append({"name": "control", "availability": "degraded" if control_health.get("degraded") else "available"})
+    if control_health.get("degraded"):
+        warnings.append("control store degraded; inspect quarantined corruption evidence")
     return _control_envelope({
         "monitor": monitor,
         "projects": projects,
@@ -324,7 +385,8 @@ def control_overview_payload(runtime_root: Path | str) -> dict[str, Any]:
         "executions": executions,
         "watchdog": watchdog,
         "accounting": accounting,
-        "commands": ControlCommandStore(runtime).recent(20),
+        "commands": command_store.recent(20),
+        "control_health": control_health,
         "sessions": conversations.list_sessions(),
         "bindings": conversations.list_bindings(),
     }, warnings=warnings, sources=sources)
@@ -344,14 +406,17 @@ class DevOrchestratorHTTPServer(ThreadingHTTPServer):
         listen_label: str,
         started_at: str,
         enable_control: bool = False,
+        config_path: Path | str | None = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.web_root = Path(web_root)
         self.listen_label = listen_label
         self.started_at = started_at
         self.control_enabled = bool(enable_control and is_loopback(listen_label))
+        self.config_path = Path(config_path) if config_path is not None else None
         self.command_store = ControlCommandStore(self.runtime_root)
         self.conversation_store = ConversationControlStore(self.runtime_root)
+        self.bridge_store: Any | None = None
         self.control_security = ControlSecurity(self.runtime_root) if self.control_enabled else None
         self._heartbeat_lock = threading.Lock()
         super().__init__(server_address, _DashboardHandler)
@@ -533,14 +598,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
         runtime = self.server.runtime_root
         if path == "/api/v1/control/overview":
-            payload = control_overview_payload(runtime)
+            payload = control_overview_payload(runtime, self.server.config_path, self.server.bridge_store)
             payload["data"]["control_enabled"] = self.server.control_enabled
             for project in payload["data"]["projects"]:
                 project["latest_control"] = self.server.command_store.latest_for_project(
                     str(project.get("project_id") or project.get("id") or "")
                 )
         elif path == "/api/v1/control/projects":
-            overview = control_overview_payload(runtime)
+            overview = control_overview_payload(runtime, self.server.config_path, self.server.bridge_store)
             payload = _control_envelope(overview["data"]["projects"], warnings=overview["warnings"], sources=overview["sources"])
         elif path.startswith("/api/v1/control/projects/"):
             match = _CONTROL_PROJECT_PATH_RE.fullmatch(path)
@@ -549,13 +614,21 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             project = read_json(runtime / "projects" / f"{match.group(1)}.json", None)
             if not isinstance(project, dict):
                 self._error(404, "Not Found", "project snapshot not found", head_only); return
-            payload = _control_envelope(project_control_view(project, runtime), sources=[{"name": "project_runtime", "availability": "available"}])
+            configs = _control_project_configs(self.server.config_path)
+            payload = _control_envelope(
+                project_control_view(project, runtime, configs.get(match.group(1)), self.server.bridge_store),
+                sources=[{"name": "project_runtime", "availability": "available"}],
+            )
         elif path == "/api/v1/control/resources":
             data = broker_proxy_payload(runtime, "/api/resources")
-            payload = _control_envelope(data, warnings=[] if data.get("available") else [str(data.get("error"))], sources=[{"name": "aibroker", "availability": "available" if data.get("available") else "unavailable"}])
+            availability = _source_availability(data)
+            warning = str(data.get("error")) if availability == "unavailable" else ("AIBroker data is stale" if availability == "stale" else None)
+            payload = _control_envelope(data, warnings=[warning] if warning else [], sources=[{"name": "aibroker", "availability": availability}])
         elif path == "/api/v1/control/executions":
             data = broker_proxy_payload(runtime, "/api/executions")
-            payload = _control_envelope(data, warnings=[] if data.get("available") else [str(data.get("error"))], sources=[{"name": "aibroker", "availability": "available" if data.get("available") else "unavailable"}])
+            availability = _source_availability(data)
+            warning = str(data.get("error")) if availability == "unavailable" else ("AIBroker data is stale" if availability == "stale" else None)
+            payload = _control_envelope(data, warnings=[warning] if warning else [], sources=[{"name": "aibroker", "availability": availability}])
         elif path == "/api/v1/control/sessions":
             payload = _control_envelope(self.server.conversation_store.list_sessions(), sources=[{"name": "conversation_sessions", "availability": "available"}])
         elif path == "/api/v1/control/bindings":
@@ -753,7 +826,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
 def make_server(
     host: str, port: int, runtime_root: Path | str, web_root: Path | str,
-    *, enable_control: bool = False,
+    *, enable_control: bool = False, config_path: Path | str | None = None,
 ) -> DevOrchestratorHTTPServer:
     """Create (and bind) the dashboard server; runtime heartbeat is written now."""
     runtime = Path(runtime_root)
@@ -761,7 +834,7 @@ def make_server(
     started_at = utc_now_iso()
     return DevOrchestratorHTTPServer(
         (host, port), runtime, Path(web_root), host, started_at,
-        enable_control=enable_control,
+        enable_control=enable_control, config_path=config_path,
     )
 
 

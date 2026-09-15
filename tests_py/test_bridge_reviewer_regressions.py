@@ -36,6 +36,17 @@ class BridgeReviewerRegressions(unittest.TestCase):
             self.assertEqual(reclaimed.request_id, claim.request_id)
             self.assertNotEqual(reclaimed.claim_token, claim.claim_token)
 
+    def test_active_claim_query_tracks_the_exact_unexpired_lease(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = datetime(2026, 9, 3, tzinfo=timezone.utc)
+            store = BrowserBridgeStore(Path(td), lease_seconds=30)
+            store.submit("chatgpt_web", "conv-A", make_request(), "prompt", now=base)
+            self.assertFalse(store.has_active_claim("chatgpt_web", "conv-A", now=base))
+            store.claim("chatgpt_web", "conv-A", now=base)
+            self.assertTrue(store.has_active_claim("chatgpt_web", "conv-A", now=base + timedelta(seconds=29)))
+            self.assertFalse(store.has_active_claim("chatgpt_web", "conv-A", now=base + timedelta(seconds=30)))
+            self.assertFalse(store.has_active_claim("chatgpt_web", "conv-B", now=base))
+
     def test_prompt_requires_the_full_structured_response_schema(self):
         text = render_websol_prompt(make_request(), "Review evidence")
         for field in ("project_id", "request_id", "task_id", "stage_id", "branch", "head",

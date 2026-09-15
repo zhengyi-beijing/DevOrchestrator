@@ -18,12 +18,14 @@ Implements the accepted CLI contract:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
 import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
+from uuid import uuid4
 
 from dev_orchestrator.config import (
     REPO_ROOT,
@@ -39,7 +41,8 @@ from dev_orchestrator.accounting.evidence import import_rdc_evidence
 from dev_orchestrator.accounting.events import ROLES, EventWriteError, ExecutionEventStore
 from dev_orchestrator.accounting.reporting import build_p11_report, reporting_event_store
 from dev_orchestrator.accounting.runtime import load_accounting_runtime, load_accounting_settings
-from dev_orchestrator.core.control_commands import latest_control_result, submit_control_command
+from dev_orchestrator.core.control_commands import latest_control_result
+from dev_orchestrator.control.security import is_loopback
 from dev_orchestrator.core.project_status import project_runtime_status
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.platform.process import (
@@ -366,6 +369,50 @@ def _validated_project_id(value: str) -> str:
     return text
 
 
+def _submit_control_api(
+    runtime: Path, project_id: str, action: str, expected: dict[str, Any],
+    *, target: dict[str, Any] | None = None, command_id: str | None = None,
+) -> dict[str, Any]:
+    """Use the authenticated 8770 contract; never bypass the daemon HTTP ingress."""
+    heartbeat = read_json(runtime / "web.json", {})
+    host = heartbeat.get("listen_address") if isinstance(heartbeat, dict) else None
+    port = heartbeat.get("port") if isinstance(heartbeat, dict) else None
+    if not isinstance(host, str) or not is_loopback(host):
+        _fail("loopback 8770 Control API is unavailable")
+    try:
+        port = int(port)
+        token = (runtime / "control" / "api-token").read_text(encoding="utf-8").strip()
+    except (OSError, TypeError, ValueError):
+        _fail("8770 Control API credentials are unavailable")
+    if not token:
+        _fail("8770 Control API credentials are unavailable")
+    body = json.dumps({
+        "schema_version": 1, "command_id": command_id or str(uuid4()),
+        "project_id": project_id, "action": action,
+        "expected": expected, "target": dict(target or {}),
+    }, ensure_ascii=False).encode("utf-8")
+    connection = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        connection.request(
+            "POST", "/api/v1/control/commands", body=body,
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
+        )
+        response = connection.getresponse()
+        raw = response.read()
+    except OSError as exc:
+        _fail(f"8770 Control API request failed: {exc}")
+    finally:
+        connection.close()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        _fail("8770 Control API returned an invalid response")
+    if response.status not in {200, 202} or not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+        message = payload.get("message") if isinstance(payload, dict) else None
+        _fail(str(message or f"8770 Control API returned HTTP {response.status}"))
+    return payload["data"]
+
+
 def cmd_project_status(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
     project_id = _validated_project_id(args.project_id)
@@ -374,7 +421,14 @@ def cmd_project_status(args: argparse.Namespace) -> int:
         _print_json({"project_id": project_id, "state": "not_found"})
         return 1
     from dev_orchestrator.control.surface import project_control_view
-    projected = project_control_view(snapshot, runtime)
+    project_config = None
+    if getattr(args, "config", None) is not None:
+        config = load_projects_config(resolve_config_path(args.config))
+        project_config = next(
+            (row for row in config.get("projects") or [] if row.get("project_id") == project_id),
+            None,
+        )
+    projected = project_control_view(snapshot, runtime, project_config)
     payload = dict(projected)
     payload["latest_control"] = latest_control_result(runtime, project_id)
     _print_json(payload)
@@ -390,16 +444,10 @@ def cmd_project_continue(args: argparse.Namespace) -> int:
     if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
         _fail("project is not present in the current runtime")
     from dev_orchestrator.control.surface import project_identity
-    _print_json(
-        submit_control_command(
-            runtime,
-            project_id,
-            "continue",
-            gate_id=getattr(args, "gate_id", None),
-            expected=project_identity(snapshot, runtime),
-            source="local_cli",
-        )
-    )
+    target = {"gate_id": args.gate_id} if getattr(args, "gate_id", None) else {}
+    _print_json(_submit_control_api(
+        runtime, project_id, "continue", project_identity(snapshot, runtime), target=target
+    ))
     return 0
 
 
@@ -420,17 +468,18 @@ def cmd_project_control(args: argparse.Namespace) -> int:
         target["target_id"] = args.target_id
     if args.target_id and args.action == "approve_owner_gate":
         target["gate_id"] = args.target_id
-    _print_json(submit_control_command(
-        runtime, project_id, args.action, command_id=args.command_id,
-        expected=project_identity(snapshot, runtime), target=target,
-        source="local_cli",
+    _print_json(_submit_control_api(
+        runtime, project_id, args.action, project_identity(snapshot, runtime),
+        command_id=args.command_id, target=target,
     ))
     return 0
 
 
 def cmd_control_overview(args: argparse.Namespace) -> int:
     from dev_orchestrator.web.server import control_overview_payload
-    _print_json(control_overview_payload(resolve_runtime_root(args.runtime_root)))
+    _print_json(control_overview_payload(
+        resolve_runtime_root(args.runtime_root), resolve_config_path(args.config)
+    ))
     return 0
 
 
@@ -946,6 +995,7 @@ def build_parser() -> argparse.ArgumentParser:
     project_status = sub.add_parser("project-status", help="read one project status by project_id")
     project_status.add_argument("project_id")
     project_status.add_argument("--runtime-root", default=None)
+    project_status.add_argument("--config", default=None, help="path to projects.json for exact capabilities")
 
     watchdog_status = sub.add_parser("watchdog-status", help="report progress watchdog status")
     watchdog_status.add_argument("--config", default=None, help="path to projects.json")
@@ -981,6 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     control_overview = sub.add_parser("control-overview", help="print the versioned P12 overview envelope")
     control_overview.add_argument("--runtime-root", default=None)
+    control_overview.add_argument("--config", default=None, help="path to projects.json")
 
     import_rdc = sub.add_parser(
         "import-rdc-evidence",

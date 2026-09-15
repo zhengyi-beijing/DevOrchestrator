@@ -186,11 +186,15 @@ def run_daemon(
     owner_store = OwnerControlStore(runtime)
     conversation_store = ConversationControlStore(runtime)
     try:
-        server = make_server(listen, port, runtime, web_root, enable_control=True)
+        server = make_server(
+            listen, port, runtime, web_root,
+            enable_control=True, config_path=config,
+        )
         # HTTP heartbeats and daemon-owned binding commands must serialize
         # through the same in-process store instance.
         server.conversation_store = conversation_store
         bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=True)
+        server.bridge_store = bridge_store
         bridge_server = make_bridge_server(bridge_listen, bridge_port, bridge_store)
     except Exception:
         # Never leave a live-looking pid file behind when a bind fails.

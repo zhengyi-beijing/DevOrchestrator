@@ -129,12 +129,15 @@ class ControlCommandCoordinator:
         config = load_projects_config(config_path)
         projects = self._project_map(config)
         snapshots = self._snapshot_map(summary)
-        outcomes: list[dict[str, Any]] = []
+        outcomes = self.command_store.repair_corruption()
         outcomes.extend(self._sync_planner_terminals())
         outcomes.extend(self._resume_ready_plans(projects, snapshots, executor))
         outcomes.extend(self._resume_decision_handoffs(projects, snapshots, executor))
         for path in self.command_store.pending_paths():
             record = read_json(path, None)
+            if not isinstance(record, dict):
+                outcomes.append(self.command_store.quarantine(path, "unreadable control command record"))
+                continue
             raw_id = _safe_command_id(record.get("command_id")) if isinstance(record, dict) else None
             existing = read_json(self.history / (raw_id + ".json"), None) if raw_id else None
             if isinstance(existing, dict):

@@ -6,8 +6,9 @@ P12 Unified AI Control Surface (complete 2026-09-15):
 - Replaced the loose inbox with a cross-thread/process atomic command store, canonical exact replay/conflict behavior, persist-before-ack/result-before-remove crash recovery and an fsynced redacted audit trail.
 - Added daemon-owned pause/resume, exact supported AIBroker stop and conversation bind/unbind/rebind adapters. Owner pause now gates every final Worker launch and suppresses stale static starts; unsafe retry/reconcile/universal approval paths remain explicitly unavailable.
 - Added capability-driven dashboard actions, confirmations, pending-result polling and command/binding views, plus CLI project control and overview commands.
-- Added focused concurrency, security, pairing, stale-identity, action isolation, binding/liveness/claim guard, DOM and representative 8770 acceptance tests.
-- Verification: 501 tests and 16 subtests passed; Python compilation, dashboard/userscript syntax, whitespace validation and Graphify AST refresh passed (2702 nodes, 7223 edges, 140 communities).
+- Closed the client and recovery contracts: CLI mutations use authenticated 8770, the ChatGPT userscript performs pairing plus heartbeat-only capability storage, broker sections preserve stale/unavailable/unknown provenance, and corrupt command/audit evidence is quarantined with degraded health.
+- Added focused concurrency, security, pairing/expiry/revocation, stale-identity for every action, cross-project execution isolation, binding/liveness/claim guard, DOM pairing/confirmation/polling and representative 8770 acceptance tests.
+- Verification: 509 tests and 16 subtests passed; Python compilation, dashboard/userscript syntax, whitespace validation and Graphify AST refresh passed (2744 nodes, 7357 edges, 141 communities).
 
 Self-hosting baseline established:
 - stable controller remains in the original worktree;

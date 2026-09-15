@@ -135,3 +135,40 @@ const {{sendControl}}=require({json.dumps(app)});
         "/api/v1/control/commands",
         "/api/v1/control/commands/c1",
     ]
+
+
+def test_control_dashboard_creates_displays_and_revokes_adapter_pairing() -> None:
+    app = str(ROOT / "web" / "app.js")
+    script = f"""
+class Element {{ constructor() {{ this.textContent=''; this.disabled=true; }} }}
+const elements=new Map(); global.document={{
+  getElementById:id=>{{if(!elements.has(id))elements.set(id,new Element());return elements.get(id);}},
+}};
+let calls=[]; let step=0;
+global.fetch=async(url,options)=>{{calls.push([url,options.method,options.headers]);step+=1;
+  if(step===1)return {{ok:true,json:async()=>({{data:{{csrf_token:'csrf'}}}})}};
+  if(step===2)return {{ok:true,json:async()=>({{data:{{pairing_id:'pair-1',code:'123456'}}}})}};
+  return {{ok:true,json:async()=>({{data:{{revoked:true}}}})}};
+}};
+const {{createAdapterPairing,revokeAdapterPairing}}=require({json.dumps(app)});
+(async()=>{{
+  await createAdapterPairing();
+  const shown={{text:elements.get('pairingCode').textContent,disabled:elements.get('revokeAdapter').disabled}};
+  await revokeAdapterPairing();
+  console.log(JSON.stringify({{shown,revoked:{{text:elements.get('pairingCode').textContent,disabled:elements.get('revokeAdapter').disabled}},calls}}));
+}})().catch(error=>{{console.error(error);process.exit(1)}});
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], capture_output=True, text=True, encoding="utf-8",
+        timeout=5, check=True,
+    )
+    rendered = json.loads(completed.stdout)
+    assert rendered["shown"] == {"text": "pair-1:123456", "disabled": False}
+    assert rendered["revoked"] == {"text": "Pairing revoked.", "disabled": True}
+    assert [call[:2] for call in rendered["calls"]] == [
+        ["/api/v1/control/browser-sessions", "POST"],
+        ["/api/v1/control/adapter-pairings", "POST"],
+        ["/api/v1/control/adapter-pairings/pair-1/revoke", "POST"],
+    ]
+    assert rendered["calls"][1][2]["X-DevOrch-CSRF"] == "csrf"
+    assert rendered["calls"][2][2]["X-DevOrch-CSRF"] == "csrf"
