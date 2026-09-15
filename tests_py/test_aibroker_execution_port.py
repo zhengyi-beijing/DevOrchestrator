@@ -253,10 +253,11 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         ))
         with patch.object(port, "_service_call", return_value=self.payload(session_id="persistent-1")) as call, \
              patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run") as run:
-            result = port.execute(self.request())
+            result = port.execute(self.request(metadata={"managed_worktree": True}))
         self.assertEqual(result.session_id, "persistent-1")
         self.assertEqual(call.call_args.args[0], "/api/dispatch")
         self.assertEqual(call.call_args.args[1]["project_id"], "devorchestrator")
+        self.assertTrue(call.call_args.args[1]["managed_worktree"])
         run.assert_not_called()
 
 

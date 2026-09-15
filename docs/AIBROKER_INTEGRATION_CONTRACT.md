@@ -23,6 +23,11 @@ to interrupt an active harness unless the returned AIBroker capability proves
 an exact managed interrupt. RDC is bootstrap, inspection and recovery only;
 it is not in the normal coding inner loop.
 
+For a writable isolated checkout, DevOrchestrator includes the task run id and
+an explicit `managed_worktree` request metadata flag. AIBroker then owns the
+Git worktree lease and cleanup evidence; it will not automatically claim an
+observed canonical/live worktree.
+
 A single Broker dispatch decides once and executes at most one resource. It never interprets NEXT, REMEDIATE, OWNER_GATE, STOP, task advancement, or project stages, and it performs no automatic provider fallback or task remediation.
 
 ## Opt-in migration

@@ -280,7 +280,8 @@ class AIBrokerExecutionPort:
             "project_id": request.project_id, "role": request.role, "prompt": request.prompt,
             "request_id": request.request_id, "quality": request.quality, "independence": request.independence,
             "excluded_resource_ids": list(request.excluded_resource_ids), "working_directory": str(request.working_directory),
-            "timeout_seconds": request.timeout_seconds,
+            "timeout_seconds": request.timeout_seconds, "task_id": request.task_run_id,
+            "managed_worktree": bool(request.metadata.get("managed_worktree", False)),
             **({"previous_resource_context": {"resource_id": previous.resource_id, "provider": previous.provider, "account": previous.account, "model": previous.model}} if previous else {}),
         }
 
