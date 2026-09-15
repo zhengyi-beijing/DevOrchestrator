@@ -245,6 +245,25 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.request(request_id=" ")
 
+    def test_persistent_service_dispatch_timeout_covers_role_timeout(self):
+        port = AIBrokerExecutionPort(AIBrokerClientConfig(
+            python_executable=Path(sys.executable), broker_repo=self.root / "broker",
+            config_path=self.root / "resources.yaml", service_url="http://127.0.0.1:8876",
+            service_token="local-token", process_timeout_seconds=600,
+        ))
+        self.assertEqual(port._service_timeout_seconds(
+            "/api/dispatch", {"timeout_seconds": 1800}
+        ), 1860.0)
+        self.assertEqual(port._service_timeout_seconds(
+            "/api/dispatch", {"timeout_seconds": 14400}
+        ), 14460.0)
+        self.assertEqual(port._service_timeout_seconds(
+            "/api/dispatch", {"timeout_seconds": None}
+        ), 600.0)
+        self.assertEqual(port._service_timeout_seconds(
+            "/api/dispatches/req-1", None
+        ), 60.0)
+
     def test_persistent_service_transport_avoids_cli_spawn(self):
         port = AIBrokerExecutionPort(AIBrokerClientConfig(
             python_executable=Path(sys.executable), broker_repo=self.root / "broker",

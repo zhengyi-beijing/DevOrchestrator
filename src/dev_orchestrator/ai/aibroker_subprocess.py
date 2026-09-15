@@ -286,6 +286,15 @@ class AIBrokerExecutionPort:
             **({"previous_resource_context": {"resource_id": previous.resource_id, "provider": previous.provider, "account": previous.account, "model": previous.model}} if previous else {}),
         }
 
+    def _service_timeout_seconds(self, path: str, payload: Mapping[str, Any] | None) -> float:
+        if path != "/api/dispatch":
+            return min(self.config.process_timeout_seconds, 60.0)
+        timeout = self.config.process_timeout_seconds
+        requested = payload.get("timeout_seconds") if payload is not None else None
+        if isinstance(requested, (int, float)) and not isinstance(requested, bool) and requested > 0:
+            timeout = max(timeout, float(requested) + 60.0)
+        return timeout
+
     def _service_call(self, path: str, payload: Mapping[str, Any] | None) -> dict[str, Any]:
         base = (self.config.service_url or "").rstrip("/")
         if not base.startswith("http://127.0.0.1") and not base.startswith("http://localhost"):
@@ -295,7 +304,7 @@ class AIBrokerExecutionPort:
         if data is not None: headers["Content-Type"] = "application/json"
         if self.config.service_token: headers["X-AIResourceBroker-Token"] = self.config.service_token
         try:
-            with urllib.request.urlopen(urllib.request.Request(base + path, data=data, headers=headers, method="POST" if data is not None else "GET"), timeout=min(self.config.process_timeout_seconds, 60.0)) as response:
+            with urllib.request.urlopen(urllib.request.Request(base + path, data=data, headers=headers, method="POST" if data is not None else "GET"), timeout=self._service_timeout_seconds(path, payload)) as response:
                 body = response.read().decode("utf-8")
         except (OSError, urllib.error.URLError) as exc:
             raise AIBrokerInvocationError(f"broker service invocation failed: {exc}") from exc
