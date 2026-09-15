@@ -11,6 +11,7 @@ from typing import Any
 from dev_orchestrator.core.project_status import project_runtime_status
 from dev_orchestrator.storage.json_store import read_json
 
+from .command_store import EXPECTED_IDENTITY_FIELDS
 from .owner_store import OwnerControlStore
 from .store import ConversationControlStore
 
@@ -21,11 +22,17 @@ def _latest_owner_gate(runtime: Path, project_id: str) -> dict[str, Any] | None:
     row = projects.get(project_id) if isinstance(projects, dict) else None
     gate = row.get("owner_gate") if isinstance(row, dict) else None
     if isinstance(gate, dict):
-        return copy.deepcopy(gate)
+        result = copy.deepcopy(gate)
+        result["gate_source"] = "watchdog"
+        return result
     planner = read_json(runtime / "ai-planner.json", {})
     plans = planner.get("plans") if isinstance(planner, dict) else None
     matches = [value for value in (plans or {}).values() if isinstance(value, dict) and value.get("project_id") == project_id and value.get("state") == "owner_gate"]
-    return copy.deepcopy(max(matches, key=lambda value: str(value.get("completed_at") or value.get("started_at") or ""))) if matches else None
+    if not matches:
+        return None
+    result = copy.deepcopy(max(matches, key=lambda value: str(value.get("completed_at") or value.get("started_at") or "")))
+    result["gate_source"] = "planner"
+    return result
 
 
 def project_identity(snapshot: dict[str, Any], runtime_root: Path | str) -> dict[str, Any]:
@@ -49,6 +56,8 @@ def project_identity(snapshot: dict[str, Any], runtime_root: Path | str) -> dict
         "repo_path": projected.get("repo_path"),
         "branch": git.get("branch"),
         "head": git.get("head"),
+        "dirty": bool(git.get("dirty")),
+        "status_hash": git.get("status_hash"),
         "task_id": telemetry.get("task_id"),
         "lifecycle_state": projected.get("lifecycle_state") or projected.get("state"),
         "gate_id": (gate.get("gate_id") or gate.get("request_id") or gate.get("plan_id")) if gate else None,
@@ -63,10 +72,13 @@ def project_identity(snapshot: dict[str, Any], runtime_root: Path | str) -> dict
 
 def validate_expected(expected: Any, snapshot: dict[str, Any], runtime_root: Path | str) -> tuple[bool, str, dict[str, Any]]:
     observed = project_identity(snapshot, runtime_root)
-    if not isinstance(expected, dict) or not isinstance(expected.get("revision"), str):
-        return False, "control API command requires expected project revision", observed
-    for key in ("revision", "project_id", "repo_path", "branch", "head", "task_id", "lifecycle_state", "gate_id"):
-        if key in expected and expected.get(key) != observed.get(key):
+    if not isinstance(expected, dict):
+        return False, "control command requires complete expected project identity", observed
+    missing = [key for key in EXPECTED_IDENTITY_FIELDS if key not in expected]
+    if missing:
+        return False, "control command expected identity missing fields: " + ", ".join(missing), observed
+    for key in EXPECTED_IDENTITY_FIELDS:
+        if expected.get(key) != observed.get(key):
             return False, f"stale project identity: {key} changed", observed
     return True, "", observed
 
@@ -87,6 +99,7 @@ def project_control_view(
     projected = project_runtime_status(snapshot, runtime)
     project_id = str(projected.get("project_id") or projected.get("id") or "")
     identity = project_identity(projected, runtime)
+    gate = _latest_owner_gate(runtime, project_id)
     owner = OwnerControlStore(runtime).project_state(project_id)
     conversations = ConversationControlStore(runtime)
     runtime_binding = conversations.runtime_record_for_project(project_id)
@@ -126,7 +139,7 @@ def project_control_view(
         roles = project_config.get("ai_roles")
         planner_config = roles.get("planner") if isinstance(roles, dict) else None
         planning_ready = isinstance(planner_config, dict) and planner_config.get("enabled") is True
-    eligible_continue = not paused and (
+    eligible_continue = not paused and gate is None and (
         (lifecycle == "READY_TO_RUN" and execution_ready)
         or ("PENDING DESIGN" in next_status.upper() and planning_ready)
     )
@@ -154,6 +167,34 @@ def project_control_view(
         binding_change_reason = "project has no runtime binding"
     else:
         binding_change_reason = "runtime binding exists"
+    gate_id = identity.get("gate_id")
+    planner_gate = gate is not None and gate.get("gate_source") == "planner" and bool(gate_id)
+    bound_live = bound and str(binding.get("binding_id")) in live_ids
+    gate_binding = gate.get("conversation_binding") if planner_gate else None
+    gate_binding_matches = (
+        isinstance(gate_binding, dict) and bound
+        and gate_binding.get("adapter") == binding.get("adapter")
+        and gate_binding.get("binding_id") == binding.get("binding_id")
+    )
+    approve_available = (
+        planner_gate and gate_binding_matches and bound_live
+        and claim_guard_known and not active_claim
+        and not bool(identity.get("dirty"))
+    )
+    if not planner_gate:
+        approve_reason = "no pending planner owner gate"
+    elif not gate_binding_matches:
+        approve_reason = "owner gate does not match the exact bound conversation"
+    elif not bound_live:
+        approve_reason = "bound conversation is not live"
+    elif not claim_guard_known:
+        approve_reason = "bridge claim state is unavailable"
+    elif active_claim:
+        approve_reason = "active claimed request blocks owner-gate approval"
+    elif identity.get("dirty"):
+        approve_reason = "repository is dirty"
+    else:
+        approve_reason = "exact pending planner gate can be approved"
     controls = [
         {"action": "continue", "available": eligible_continue, "reason": "current state can continue" if eligible_continue else "project is paused or not continuable"},
         {"action": "pause", "available": not paused, "reason": "prevent future launches" if not paused else "project is already paused"},
@@ -161,13 +202,13 @@ def project_control_view(
         {"action": "stop", "available": not paused and stoppable_active, "reason": "pause and interrupt exact supported execution" if active and stoppable_active else ("pause future launches" if not active else "active execution does not support managed interruption")},
         {"action": "retry", "available": safe_retry, "reason": "recovery-required state" if safe_retry else "no safe exact retry target"},
         {"action": "reconcile", "available": False, "reason": "no explicit safe reconcile target is projected"},
-        {"action": "approve_owner_gate", "available": False, "reason": "no universal owner-gate adapter is available"},
+        {"action": "approve_owner_gate", "available": approve_available, "reason": approve_reason},
         {"action": "bind_conversation", "available": not bound and bool(live_ids), "reason": "live sessions are available" if live_ids else "no live session is available"},
         {"action": "unbind_conversation", "available": binding_change_available, "reason": binding_change_reason},
         {"action": "rebind_conversation", "available": binding_change_available and other_live_binding, "reason": "another live session is available" if binding_change_available and other_live_binding else ("no other live session is available" if binding_change_available else binding_change_reason)},
     ]
     for item in controls:
-        item["required_expected_fields"] = ["revision", "project_id", "repo_path", "branch", "head", "task_id", "lifecycle_state"]
+        item["required_expected_fields"] = list(EXPECTED_IDENTITY_FIELDS)
     result = copy.deepcopy(projected)
     result.update({
         "control_identity": identity,

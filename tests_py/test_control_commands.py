@@ -12,6 +12,7 @@ from dev_orchestrator.core.control_commands import (
     latest_control_result,
     submit_control_command,
 )
+from dev_orchestrator.control.surface import project_identity
 from dev_orchestrator.core.transition_executor import TransitionExecutor
 from tests_py.test_transition_executor import FakeBackend, make_repo
 
@@ -62,6 +63,8 @@ class FakePlanner:
         self.ready.append({"plan_id":plan_id,"command_id":command_id,"project_id":project["project_id"],
                            "task_id":telemetry.get("task_id"),"ready_head":"planned-head","state":"ready"})
         return plan_id, "planning started"
+    def continue_owner_approved(self, project, snapshot, command_id):
+        return False, None, "no owner-approved plan is pending"
     def start_deferred(self, project, snapshot, command_id, handoff):
         self.calls.append(("deferred", project["project_id"], command_id, handoff.get("staged_successor")))
         plan_id = "ai_plan:" + command_id
@@ -83,9 +86,12 @@ class ControlCommandTests(unittest.TestCase):
             base = Path(td); repo = base / "repo"; repo.mkdir()
             config = base / "projects.json"; write_config(config, repo)
             runtime = base / "runtime"
-            command = submit_control_command(runtime, "p1", "continue")
+            snapshot = {"project_id": "p1", "state": "READY_TO_RUN"}
+            command = submit_control_command(
+                runtime, "p1", "continue", expected=project_identity(snapshot, runtime)
+            )
             executor = FakeExecutor(launch=True)
-            summary = {"projects": [{"project_id": "p1", "state": "READY_TO_RUN"}]}
+            summary = {"projects": [snapshot]}
             coordinator = ControlCommandCoordinator(runtime)
             outcomes = coordinator.advance(config, summary, executor)
             self.assertEqual(len(outcomes), 1)
@@ -100,16 +106,23 @@ class ControlCommandTests(unittest.TestCase):
             base = Path(td); repo = base / "repo"; repo.mkdir()
             config = base / "projects.json"; write_config(config, repo)
             runtime = base / "runtime"
-            missing = submit_control_command(runtime, "missing", "continue")
+            missing_snapshot = {"project_id": "missing", "state": "READY_TO_RUN"}
+            missing = submit_control_command(
+                runtime, "missing", "continue",
+                expected=project_identity(missing_snapshot, runtime),
+            )
             coordinator = ControlCommandCoordinator(runtime)
             outcomes = coordinator.advance(config, {"projects": []}, FakeExecutor())
             self.assertEqual(outcomes[0]["command_id"], missing["command_id"])
             self.assertEqual(outcomes[0]["state"], "blocked")
             self.assertIn("not configured", outcomes[0]["reason"])
 
-            command = submit_control_command(runtime, "p1", "continue")
-            executor = FakeExecutor(launch=False)
             summary = {"projects": [{"project_id": "p1", "state": "IDLE"}]}
+            command = submit_control_command(
+                runtime, "p1", "continue",
+                expected=project_identity(summary["projects"][0], runtime),
+            )
+            executor = FakeExecutor(launch=False)
             outcomes = coordinator.advance(config, summary, executor)
             self.assertEqual(outcomes[0]["command_id"], command["command_id"])
             self.assertEqual(outcomes[0]["state"], "blocked")
@@ -119,10 +132,13 @@ class ControlCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             base=Path(td); repo=base/"repo"; repo.mkdir(); runtime=base/"runtime"
             config=base/"projects.json"; write_config(config, repo)
-            command=submit_control_command(runtime,"p1","continue")
             planner=FakePlanner(); executor=FakeExecutor(launch=True)
             coordinator=ControlCommandCoordinator(runtime, planner)
             pending={"projects":[{"project_id":"p1","state":"IDLE","next_status":"**PENDING DESIGN**","telemetry":{"task_id":"P1"}}]}
+            command=submit_control_command(
+                runtime,"p1","continue",
+                expected=project_identity(pending["projects"][0], runtime),
+            )
             first=coordinator.advance(config,pending,executor)
             self.assertEqual(first[0]["lifecycle_action"],"plan")
             self.assertEqual(executor.calls,[])
@@ -332,9 +348,12 @@ class ControlCommandTests(unittest.TestCase):
             base = Path(td); repo = base / "repo"; repo.mkdir()
             config = base / "projects.json"; write_config(config, repo)
             runtime = base / "runtime"; coordinator = ControlCommandCoordinator(runtime)
-            command = submit_control_command(runtime, "p1", "continue")
             executor = FakeExecutor(launch=True)
             summary = {"projects": [{"project_id": "p1", "state": "READY_TO_RUN"}]}
+            command = submit_control_command(
+                runtime, "p1", "continue",
+                expected=project_identity(summary["projects"][0], runtime),
+            )
             first = coordinator.advance(config, summary, executor)[0]
             self.assertEqual(first["state"], "accepted")
             inbox = runtime / "control" / "inbox"; inbox.mkdir(parents=True, exist_ok=True)

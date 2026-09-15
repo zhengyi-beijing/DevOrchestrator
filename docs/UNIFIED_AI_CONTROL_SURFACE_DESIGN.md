@@ -136,7 +136,11 @@ closed action list with:
   "action": "continue",
   "available": true,
   "reason": "project has a pending staged design",
-  "required_expected_fields": ["revision", "branch", "head", "task_id"]
+  "required_expected_fields": [
+    "revision", "project_id", "repo_path", "branch", "head", "dirty",
+    "status_hash", "task_id", "lifecycle_state", "gate_id", "paused",
+    "binding_state", "binding_id", "binding_adapter"
+  ]
 }
 ```
 
@@ -156,21 +160,30 @@ route and accepts only this bounded shape:
   "action": "continue",
   "expected": {
     "revision": "sha256:...",
+    "project_id": "dev-orchestrator",
+    "repo_path": "C:/work/github/DevOrchestrator-dev",
     "branch": "feature/self-hosted-dev",
     "head": "...",
+    "dirty": false,
+    "status_hash": null,
     "task_id": "P12",
     "lifecycle_state": "PENDING_DESIGN",
-    "gate_id": null
+    "gate_id": null,
+    "paused": false,
+    "binding_state": "bound",
+    "binding_id": "conversation-id",
+    "binding_adapter": "chatgpt"
   },
   "target": {}
 }
 ```
 
-`command_id` is mandatory for API clients. `expected.revision` is a hash of the
-canonical, action-relevant project identity returned by the read model. The
-human-readable expected fields are also retained in the audit record and are
-checked where the action requires them. `target` has an action-specific closed
-schema; extra keys and arbitrary text are rejected.
+`command_id` is mandatory for every client. `expected` must contain every field
+advertised by the read model; HTTP, CLI, watchdog recovery and direct local
+submission all fail closed when any field is omitted. `expected.revision` is a
+hash of that canonical project identity. Every human-readable expected field is
+also compared at daemon dequeue. `target` has an action-specific closed schema;
+extra keys and arbitrary text are rejected.
 
 The HTTP layer validates size, content type, JSON shape, authentication and
 project/action names, then durably enqueues the request. A new command returns
@@ -223,9 +236,10 @@ remain stateless and complete in each durable command envelope.
   and history, compares a canonical request hash, and creates at most one record.
 - The immutable command request is stored before the API acknowledges it. The
   daemon derives deterministic downstream request IDs from `command_id`.
-- The inbox item is removed only after a durable terminal command result exists.
-  Restart repeats the same deterministic effect or observes its existing
-  lifecycle ledger record; it never launches a duplicate Worker.
+- The inbox item is removed only after both a durable terminal command result
+  and its fsynced `command_settled` audit row exist. If restart observes history
+  with a missing terminal audit, it repairs that audit before removing inbox.
+  Repeated recovery is idempotent and never launches a duplicate Worker.
 - Command history stores the canonical request hash, timestamps, disposition,
   reason, expected/observed identity and effect references. Secrets and raw
   provider credentials are excluded.
@@ -249,7 +263,7 @@ All actions are capability-advertised and stale-state guarded:
 | `stop` | Persist the pause barrier, then request interruption of the exact active broker execution only when that backend advertises interruption. No PID kill or guessed execution is allowed. |
 | `retry` | Retry one exact terminal/recovery target through its existing guarded recovery path. |
 | `reconcile` | Reconcile one exact recovery-required ledger item; it is not a generic daemon tick or bypass. |
-| `approve_owner_gate` | Approve one exact, current gate after branch/HEAD/task/gate revalidation; approval does not imply arbitrary next-stage authority. |
+| `approve_owner_gate` | Approve one exact, current Planner gate only after complete identity, live bound conversation, inactive claim, clean repository and fresh branch/HEAD/task/gate revalidation. Approval records `owner_approved` only and never starts or applies a Worker; a later explicit `continue` applies the stored bounded plan through the Planner coordinator and normal daemon launch path. |
 | `bind_conversation` | Bind one exact live session to one exact unbound project after uniqueness and claimed-request checks. |
 | `unbind_conversation` | Write an explicit unbound tombstone for the exact current binding after claimed-request checks. |
 | `rebind_conversation` | Atomically move one exact project binding to one exact live session after current/target identity, uniqueness and claimed-request checks. |
@@ -275,6 +289,23 @@ Those capabilities move under 8770 `/api/v1/control/*`; P12 does not restore a
 second 8766 lifecycle-control authority. Any P12-relevant correctness fix that
 exists only on `feature/browser-bridge-multiproject` is forward-ported as a
 reviewed patch with a regression test, not by merging unrelated branch history.
+
+### Branch-convergence disposition (2026-09-15)
+
+| Old branch feature | Current P12 equivalent | Disposition | Rationale |
+| --- | --- | --- | --- |
+| Session registry, heartbeat and liveness | 8770 session APIs and `ConversationControlStore` | Replaced | Current runtime-first registry is already project-scoped. |
+| Bind/unbind/rebind and claimed-request guard | P12 command store plus daemon coordinator | Replaced | Same safety properties exist under the single authority. |
+| Pause/resume/stop and owner UI | P12 owner store, coordinator and capability-driven dashboard | Replaced | No second lifecycle service is needed. |
+| CCP `approve_next_stage` | P12 `approve_owner_gate` adapter | Selectively forward-ported | The strict approval semantics were missing; they now use the 8770 durable command contract and existing Planner authority. |
+| CCP `start_current_task` | P12 `continue` | Dropped | `continue` already owns this transition and preserves daemon launch guards. |
+| CCP 8766 server and `/v1/owner-action` | 8770 `/api/v1/control/commands` | Dropped | Restoring it would create a second owner-control authority. |
+| Old bounded adjudicator commits | Bounded Planner remediation followed by `OWNER_GATE` | Intentionally replaced | Current review loop has a finite configured bound and fails closed to owner judgment. The old read-only adjudicator prevents no reproducible data-loss, unsafe-execution or unrecoverable-lifecycle case that the current owner gate does not already prevent. |
+
+The adjudicator was therefore not restored. The current loop executes exactly
+`max_plan_remediation_rounds + 1` reviews and opens a durable owner gate on
+exhaustion; transport/parser failures also terminate fail closed rather than
+opening another review loop.
 
 ## Delivery sequence
 

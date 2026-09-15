@@ -1690,8 +1690,12 @@ class WatchdogCoordinator:
 
         # 2. ENQUEUE
         try:
+            from dev_orchestrator.control.surface import project_identity
             from dev_orchestrator.core.control_commands import submit_control_command
-            submit_control_command(self.runtime_root, pid, "continue", command_id=cid)
+            submit_control_command(
+                self.runtime_root, pid, "continue", command_id=cid,
+                expected=project_identity(snapshot, self.runtime_root),
+            )
             attempt_record["recovery"]["state"] = "requested"
             attempt_record["recovery"]["requested_at"] = utc_now_iso()
             self._emit_milestone(

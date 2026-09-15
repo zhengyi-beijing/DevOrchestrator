@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.accounting import ExecutionRecorder
+from dev_orchestrator.control.binding_resolver import resolve_effective_projects
 from dev_orchestrator.control.command_store import (
     CONTROL_ACTIONS,
     ControlCommandStore,
@@ -117,12 +118,17 @@ class ControlCommandCoordinator:
             if isinstance(row, dict) and row.get("project_id")
         }
 
-    @staticmethod
-    def _project_map(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    def _project_map(self, config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        projects = resolve_effective_projects(
+            (
+                row for row in config.get("projects") or []
+                if isinstance(row, dict) and row.get("project_id")
+            ),
+            self.conversation_store,
+        )
         return {
             str(row.get("project_id")): row
-            for row in config.get("projects") or []
-            if isinstance(row, dict) and row.get("project_id")
+            for row in projects
         }
 
     def advance(self, config_path: Path | str, summary: Any, executor: Any) -> list[dict[str, Any]]:
@@ -141,8 +147,7 @@ class ControlCommandCoordinator:
             raw_id = _safe_command_id(record.get("command_id")) if isinstance(record, dict) else None
             existing = read_json(self.history / (raw_id + ".json"), None) if raw_id else None
             if isinstance(existing, dict):
-                path.unlink(missing_ok=True)
-                outcomes.append(existing)
+                outcomes.append(self.command_store.settle(path, existing))
                 continue
             outcome = self._consume_one(record, projects, snapshots, executor)
             outcome = self.command_store.settle(path, outcome)
@@ -296,13 +301,18 @@ class ControlCommandCoordinator:
         snapshot = snapshots.get(project_id)
         if snapshot is None:
             return self._blocked(command_id, project_id, action, "project snapshot is unavailable", now, record)
-        if record.get("source") == "control_api" or (isinstance(record.get("expected"), dict) and record["expected"].get("revision")):
-            valid, reason, observed = validate_expected(record.get("expected"), snapshot, self.runtime_root)
-            if not valid:
-                return self._blocked(command_id, project_id, action, reason, now, {**record, "observed": observed})
+        valid, reason, observed = validate_expected(record.get("expected"), snapshot, self.runtime_root)
+        if not valid:
+            return self._blocked(command_id, project_id, action, reason, now, {**record, "observed": observed})
         target = record.get("target") if isinstance(record.get("target"), dict) else {}
         gate_id = _nonblank(target.get("gate_id"))
-        if gate_id is not None and self.accounting is not None:
+        if action == "approve_owner_gate" and gate_id != _nonblank(observed.get("gate_id")):
+            return self._blocked(
+                command_id, project_id, action,
+                "target gate_id does not match the currently projected owner gate",
+                now, record,
+            )
+        if gate_id is not None and action != "approve_owner_gate" and self.accounting is not None:
             telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
             self.accounting.close_owner_gate(
                 gate_id,
@@ -327,7 +337,11 @@ class ControlCommandCoordinator:
             return self._stop(record, project_id, command_id, now, executor)
         if action in {"bind_conversation", "unbind_conversation", "rebind_conversation"}:
             return self._conversation_action(record, snapshot, project_id, command_id, action, target, now)
-        if action in {"retry", "reconcile", "approve_owner_gate"}:
+        if action == "approve_owner_gate":
+            return self._approve_owner_gate(
+                record, projects[project_id], snapshot, project_id, command_id, gate_id, now
+            )
+        if action in {"retry", "reconcile"}:
             return self._blocked(command_id, project_id, action, "action is not available for the current projected target", now, record)
         if self.owner_store.is_paused(project_id):
             return self._blocked(command_id, project_id, action, "project is paused", now, record)
@@ -335,6 +349,17 @@ class ControlCommandCoordinator:
         if "PENDING DESIGN" in next_status:
             if self.planner is None:
                 return self._blocked(command_id, project_id, action, "planner coordinator unavailable", now, record)
+            handled, approved_plan_id, approved_reason = self.planner.continue_owner_approved(
+                projects[project_id], snapshot, command_id
+            )
+            if handled:
+                if approved_plan_id is None:
+                    return self._blocked(command_id, project_id, action, approved_reason, now, record)
+                return {
+                    **record, "state": "accepted", "processed_at": now,
+                    "lifecycle_action": "plan", "plan_id": approved_plan_id,
+                    "reason": approved_reason,
+                }
             plan_id, reason = self.planner.start(projects[project_id], snapshot, command_id)
             if plan_id is None:
                 return self._blocked(command_id, project_id, action, reason, now, record)
@@ -351,6 +376,56 @@ class ControlCommandCoordinator:
         state = executor.state().get("executions", {}).get(command_id, {})
         reason = state.get("reason") if isinstance(state, dict) else None
         return self._blocked(command_id, project_id, action, str(reason or "control command was not launched"), now, record)
+
+    def _approve_owner_gate(
+        self,
+        record: dict[str, Any],
+        project: dict[str, Any],
+        snapshot: dict[str, Any],
+        project_id: str,
+        command_id: str,
+        gate_id: str | None,
+        now: str,
+    ) -> dict[str, Any]:
+        if gate_id is None:
+            return self._blocked(command_id, project_id, "approve_owner_gate", "gate_id is required", now, record)
+        if self.planner is None:
+            return self._blocked(command_id, project_id, "approve_owner_gate", "planner coordinator unavailable", now, record)
+        binding = self.conversation_store.binding_for_project(project_id)
+        if binding is None:
+            route = snapshot.get("conversation_binding")
+            binding = route if isinstance(route, dict) else None
+        adapter = _nonblank(binding.get("adapter")) if isinstance(binding, dict) else None
+        binding_id = _nonblank(binding.get("binding_id")) if isinstance(binding, dict) else None
+        if adapter is None or binding_id is None:
+            return self._blocked(command_id, project_id, "approve_owner_gate", "project has no exact bound conversation", now, record)
+        if self.conversation_store.session_status(adapter, binding_id).get("state") != "live":
+            return self._blocked(command_id, project_id, "approve_owner_gate", "bound conversation is not currently live", now, record)
+        active = getattr(self.bridge_store, "has_active_claim", None)
+        if not callable(active):
+            return self._blocked(command_id, project_id, "approve_owner_gate", "bridge claim state is unavailable", now, record)
+        if active(adapter, binding_id):
+            return self._blocked(command_id, project_id, "approve_owner_gate", "active claimed Web Sol request blocks owner-gate approval", now, record)
+        approved, reason = self.planner.approve_owner_gate(
+            project, snapshot, gate_id, command_id, adapter, binding_id
+        )
+        if not approved:
+            return self._blocked(command_id, project_id, "approve_owner_gate", reason, now, record)
+        if self.accounting is not None:
+            telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+            self.accounting.close_owner_gate(
+                gate_id,
+                occurred_at=str(record.get("requested_at") or now),
+                project_id=project_id,
+                task_id=_nonblank(telemetry.get("task_id")),
+                role="owner",
+                request_id=command_id,
+            )
+        return {
+            **record, "state": "accepted", "processed_at": now,
+            "effect": "approve_exact_owner_gate_no_worker_started",
+            "gate_id": gate_id, "reason": reason,
+        }
 
     def _stop(
         self, record: dict[str, Any], project_id: str, command_id: str,

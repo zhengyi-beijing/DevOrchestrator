@@ -6,6 +6,7 @@ from pathlib import Path
 from dev_orchestrator.accounting import ExecutionEventStore, ExecutionRecorder
 from dev_orchestrator.ai.contracts import AIRoleRequest, AIRoleResult, ResourceContext
 from dev_orchestrator.bridge.store import BrowserBridgeStore
+from dev_orchestrator.control.surface import project_identity
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.control_commands import ControlCommandCoordinator, submit_control_command
 from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
@@ -132,6 +133,13 @@ def test_control_command_closes_only_an_explicitly_correlated_owner_gate(tmp_pat
         "continue",
         command_id="continue-1",
         gate_id="gate-1",
+        expected=project_identity(
+            {
+                "project_id": "project", "next_status": "READY_TO_RUN",
+                "telemetry": {"task_id": "P11b"},
+            },
+            tmp_path,
+        ),
     )
     coordinator = ControlCommandCoordinator(tmp_path, accounting=recorder)
     outcome = coordinator._consume_one(

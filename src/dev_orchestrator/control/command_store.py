@@ -18,6 +18,11 @@ CONTROL_ACTIONS = frozenset({
     "approve_owner_gate", "bind_conversation", "unbind_conversation",
     "rebind_conversation",
 })
+EXPECTED_IDENTITY_FIELDS = (
+    "revision", "project_id", "repo_path", "branch", "head", "dirty",
+    "status_hash", "task_id", "lifecycle_state", "gate_id", "paused",
+    "binding_state", "binding_id", "binding_adapter",
+)
 
 
 class ControlCommandConflictError(RuntimeError):
@@ -60,13 +65,13 @@ def canonical_request(value: dict[str, Any]) -> dict[str, Any]:
     action = _nonblank(value.get("action"), "action")
     if action not in CONTROL_ACTIONS:
         raise ValueError("unsupported control action")
-    expected_allowed = {
-        "revision", "project_id", "repo_path", "branch", "head", "task_id", "lifecycle_state", "gate_id",
-        "paused", "binding_state", "binding_id", "binding_adapter",
-    }
+    expected_allowed = set(EXPECTED_IDENTITY_FIELDS)
     expected_unknown = sorted(set(expected) - expected_allowed)
     if expected_unknown:
         raise ValueError("unknown expected fields: " + ", ".join(expected_unknown))
+    expected_missing = [key for key in EXPECTED_IDENTITY_FIELDS if key not in expected]
+    if expected_missing:
+        raise ValueError("expected identity missing fields: " + ", ".join(expected_missing))
     target_allowed = {
         "continue": {"gate_id"},
         "pause": set(), "resume": set(), "stop": set(),
@@ -167,14 +172,15 @@ class ControlCommandStore:
         if command_id is None:
             raise ValueError("cannot settle invalid command_id")
         with InterProcessFileLock(self.lock_path):
+            self._repair_audit_unlocked()
             existing = read_json(self.history / f"{command_id}.json", None)
-            if isinstance(existing, dict):
-                inbox_path.unlink(missing_ok=True)
-                return existing
-            write_json(self.history / f"{command_id}.json", outcome, indent=2)
-            self._append_audit_unlocked("command_settled", outcome)
+            terminal = existing if isinstance(existing, dict) else outcome
+            if not isinstance(existing, dict):
+                write_json(self.history / f"{command_id}.json", terminal, indent=2)
+            if not self._audit_has_unlocked("command_settled", terminal):
+                self._append_audit_unlocked("command_settled", terminal)
             inbox_path.unlink(missing_ok=True)
-            return outcome
+            return terminal
 
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         safe_limit = max(1, min(100, int(limit)))
@@ -285,6 +291,25 @@ class ControlCommandStore:
             )
             return
         self._mark_degraded_unlocked("corrupt or torn control audit", destination.name)
+
+    def _audit_has_unlocked(self, event: str, value: dict[str, Any]) -> bool:
+        if not self.audit_path.is_file() or not self._audit_is_valid():
+            return False
+        command_id = value.get("command_id")
+        request_digest = value.get("request_hash")
+        try:
+            with self.audit_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    row = json.loads(line)
+                    if (
+                        row.get("event") == event
+                        and row.get("command_id") == command_id
+                        and row.get("request_hash") == request_digest
+                    ):
+                        return True
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        return False
 
     def _append_audit_unlocked(self, event: str, value: dict[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)

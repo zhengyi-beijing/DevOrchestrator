@@ -337,6 +337,117 @@ class AIPlannerCoordinator:
         with self._lock:
             return [copy.deepcopy(row) for row in self._load_state()["plans"].values() if row.get("state") == "ready"]
 
+    def approve_owner_gate(
+        self,
+        project: dict[str, Any],
+        snapshot: dict[str, Any],
+        gate_id: str,
+        command_id: str,
+        binding_adapter: str,
+        binding_id: str,
+    ) -> tuple[bool, str]:
+        """Approve one exact pending planner gate without applying or launching it."""
+        project_id = _nonblank(project.get("project_id"))
+        repo_path = _nonblank(project.get("repo_path"))
+        telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+        task_id = _nonblank(telemetry.get("task_id"))
+        if project_id is None or repo_path is None or task_id is None:
+            return False, "owner-gate project identity incomplete"
+        with self._lock:
+            state = self._load_state()
+            record = state["plans"].get(gate_id)
+            if not isinstance(record, dict) or record.get("state") != "owner_gate":
+                return False, "owner gate is not pending"
+            if record.get("project_id") != project_id:
+                return False, "owner gate belongs to a different project"
+            if record.get("task_id") != task_id:
+                return False, "owner gate task does not match current task"
+            if record.get("repo_path") != repo_path:
+                return False, "owner gate repository does not match current project"
+            gate_binding = record.get("conversation_binding")
+            if (
+                not isinstance(gate_binding, dict)
+                or gate_binding.get("adapter") != binding_adapter
+                or gate_binding.get("binding_id") != binding_id
+            ):
+                return False, "owner gate does not belong to the exact bound conversation"
+            plan = record.get("plan")
+            if not isinstance(plan, dict):
+                return False, "owner gate has no bounded plan to approve"
+
+        truth = read_repository_truth(repo_path)
+        if not truth.valid or truth.dirty:
+            return False, "owner-gate approval requires a clean repository"
+        if (
+            truth.branch != record.get("branch")
+            or truth.head != record.get("head")
+            or truth.status_hash != record.get("status_hash")
+        ):
+            return False, "repository changed since owner gate was opened"
+
+        with self._lock:
+            state = self._load_state()
+            current = state["plans"].get(gate_id)
+            if not isinstance(current, dict) or current.get("state") != "owner_gate":
+                return False, "owner gate is not pending"
+            current.update({
+                "state": "owner_approved",
+                "approval_command_id": command_id,
+                "approved_at": utc_now_iso(),
+            })
+            self._save_state(state)
+        return True, "exact pending owner gate approved; explicit continue is required"
+
+    def continue_owner_approved(
+        self,
+        project: dict[str, Any],
+        snapshot: dict[str, Any],
+        command_id: str,
+    ) -> tuple[bool, str | None, str]:
+        """Apply an owner-approved plan only in response to an explicit continue."""
+        project_id = _nonblank(project.get("project_id"))
+        telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+        task_id = _nonblank(telemetry.get("task_id"))
+        with self._lock:
+            matches = [
+                copy.deepcopy(row) for row in self._load_state()["plans"].values()
+                if row.get("state") == "owner_approved" and row.get("project_id") == project_id
+            ]
+        if not matches:
+            return False, None, "no owner-approved plan is pending"
+        if len(matches) != 1:
+            return True, None, "multiple owner-approved plans require reconciliation"
+        record = matches[0]
+        plan_id = str(record.get("plan_id") or "")
+        if record.get("task_id") != task_id:
+            return True, None, "owner-approved plan task does not match current task"
+        plan = record.get("plan")
+        if not plan_id or not isinstance(plan, dict):
+            return True, None, "owner-approved plan is incomplete"
+        try:
+            _parse_plan(json.dumps(plan), str(task_id))
+        except ValueError as exc:
+            return True, None, f"owner-approved plan is invalid: {exc}"
+        with self._lock:
+            state = self._load_state()
+            current = state["plans"].get(plan_id)
+            if not isinstance(current, dict) or current.get("state") != "owner_approved":
+                return True, None, "owner-approved plan is no longer pending"
+            current["continuation_command_id"] = command_id
+            current["continuation_requested_at"] = utc_now_iso()
+            self._save_state(state)
+        self._apply_plan(
+            plan_id,
+            record,
+            plan,
+            "explicit owner approval after bounded plan review",
+            project=project,
+        )
+        final = self.state()["plans"].get(plan_id, {})
+        if final.get("state") != "ready":
+            return True, None, str(final.get("reason") or "owner-approved plan apply failed")
+        return True, plan_id, "owner-approved plan applied; Worker launch remains daemon-owned"
+
     def mark_worker_launched(self, plan_id: str, source_request_id: str) -> None:
         with self._lock:
             state = self._load_state()

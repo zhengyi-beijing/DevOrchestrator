@@ -16,6 +16,7 @@ from dev_orchestrator.control.command_store import (
     ControlCommandConflictError,
     ControlCommandStore,
 )
+from dev_orchestrator.storage.json_store import write_json
 from dev_orchestrator.control.security import ControlSecurity
 from dev_orchestrator.control.store import ConversationConflictError, ConversationControlStore
 from dev_orchestrator.core.control_commands import ControlCommandCoordinator
@@ -32,12 +33,26 @@ def command(command_id: str = "same-id", action: str = "continue") -> dict:
         "command_id": command_id,
         "project_id": "p1",
         "action": action,
-        "expected": {"revision": "r1"},
+        "expected": {
+            "revision": "r1", "project_id": "p1", "repo_path": "repo",
+            "branch": "main", "head": "head", "dirty": False,
+            "status_hash": None, "task_id": "P1", "lifecycle_state": "READY_TO_RUN",
+            "gate_id": None, "paused": False, "binding_state": None,
+            "binding_id": None, "binding_adapter": None,
+        },
         "target": {},
     }
 
 
 class P12StoreTests(unittest.TestCase):
+    def test_direct_submission_requires_complete_expected_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = ControlCommandStore(td)
+            incomplete = command("incomplete")
+            incomplete["expected"] = {"revision": "r1"}
+            with self.assertRaisesRegex(ValueError, "expected identity missing fields"):
+                store.submit(incomplete, source="local_client")
+
     def test_atomic_thread_replay_and_conflict(self):
         with tempfile.TemporaryDirectory() as td:
             store = ControlCommandStore(td)
@@ -98,6 +113,74 @@ class P12StoreTests(unittest.TestCase):
             self.assertGreaterEqual(len(health["quarantined"]), 3)
             self.assertFalse(bad.exists())
             self.assertFalse(bad_history.exists())
+
+    def test_settlement_crash_boundaries_recover_terminal_audit_before_unlink(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+
+            # Before history: an ordinary retry completes all three durable steps.
+            before = ControlCommandStore(runtime)
+            pending = before.submit(command("before-history"), source="test")
+            inbox = before.inbox / "before-history.json"
+            outcome = {**pending, "state": "accepted", "processed_at": "now"}
+            before.settle(inbox, outcome)
+            self.assertFalse(inbox.exists())
+
+            # After history, before audit: a recreated store repairs the audit,
+            # then removes the still-durable inbox record.
+            missing_audit = ControlCommandStore(runtime)
+            pending = missing_audit.submit(command("missing-audit"), source="test")
+            inbox = missing_audit.inbox / "missing-audit.json"
+            outcome = {**pending, "state": "blocked", "processed_at": "now"}
+            write_json(missing_audit.history / "missing-audit.json", outcome, indent=2)
+            recovered = ControlCommandStore(runtime).settle(inbox, outcome)
+            self.assertEqual(recovered, outcome)
+            self.assertFalse(inbox.exists())
+
+            # After audit, before unlink: restart/replay does not duplicate the
+            # terminal audit and does remove the leftover inbox record.
+            after_audit = ControlCommandStore(runtime)
+            pending = after_audit.submit(command("after-audit"), source="test")
+            inbox = after_audit.inbox / "after-audit.json"
+            outcome = {**pending, "state": "accepted", "processed_at": "now"}
+            write_json(after_audit.history / "after-audit.json", outcome, indent=2)
+            after_audit.audit("command_settled", outcome)
+            replayed = ControlCommandStore(runtime).settle(inbox, outcome)
+            self.assertEqual(replayed, outcome)
+            self.assertFalse(inbox.exists())
+
+            rows = [
+                json.loads(line)
+                for line in (runtime / "control" / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            terminal_ids = [row["command_id"] for row in rows if row["event"] == "command_settled"]
+            self.assertEqual(
+                terminal_ids,
+                ["before-history", "missing-audit", "after-audit"],
+            )
+
+            # The daemon restart path delegates the same history/inbox state to
+            # settle instead of deleting inbox directly.
+            restarted_runtime = runtime / "restart-runtime"
+            restarted = ControlCommandStore(restarted_runtime)
+            pending = restarted.submit(command("restart-replay"), source="test")
+            outcome = {**pending, "state": "accepted", "processed_at": "now"}
+            write_json(restarted.history / "restart-replay.json", outcome, indent=2)
+            repo = runtime / "restart-repo"; repo.mkdir()
+            config = runtime / "restart-projects.json"; write_config(config, repo)
+            replay = ControlCommandCoordinator(restarted_runtime).advance(
+                config, {"projects": []}, FakeExecutor()
+            )
+            self.assertEqual(replay, [outcome])
+            self.assertFalse((restarted.inbox / "restart-replay.json").exists())
+            restart_rows = [
+                json.loads(line)
+                for line in restarted.audit_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [row["event"] for row in restart_rows],
+                ["request_accepted", "command_settled"],
+            )
 
     def test_conversation_liveness_uniqueness_tombstone_and_direct_ai(self):
         with tempfile.TemporaryDirectory() as td:
@@ -273,6 +356,15 @@ class P12HTTPTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/v1/control/commands", body=encoded, headers=no_csrf)[0], 401)
         self.assertEqual(self.request("POST", "/api/v1/control/commands", body=encoded, headers={**headers, "Content-Type": "text/plain"})[0], 415)
         self.assertEqual(self.request("POST", "/api/v1/control/commands", body="{", headers=headers)[0], 400)
+        incomplete = dict(payload); incomplete["command_id"] = "incomplete-identity"
+        incomplete["expected"] = {"revision": identity["revision"]}
+        self.assertEqual(
+            self.request(
+                "POST", "/api/v1/control/commands",
+                body=json.dumps(incomplete), headers=headers,
+            )[0],
+            400,
+        )
         oversized = {**headers, "Content-Length": str(64 * 1024 + 1)}
         self.assertEqual(self.request("POST", "/api/v1/control/commands", body="{}", headers=oversized)[0], 413)
         self.assertEqual(self.request("PUT", "/api/v1/control/commands", body=encoded, headers=headers)[0], 405)

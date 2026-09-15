@@ -10,6 +10,14 @@ P12 Unified AI Control Surface (complete 2026-09-15):
 - Added focused concurrency, security, pairing/expiry/revocation, stale-identity for every action, cross-project execution isolation, binding/liveness/claim guard, DOM pairing/confirmation/polling and representative 8770 acceptance tests.
 - Verification: 509 tests and 16 subtests passed; Python compilation, dashboard/userscript syntax, whitespace validation and Graphify AST refresh passed (2744 nodes, 7357 edges, 141 communities).
 
+P12 selective branch convergence / hardening (2026-09-15):
+- Reviewed `feature/conversation-control-plane` and `feature/browser-bridge-multiproject` as reference implementations only; performed no merge or cherry-pick and restored neither 8766 nor a second lifecycle authority.
+- Reimplemented CCP owner-gate approval semantics as P12 `approve_owner_gate`: complete expected identity, exact current Planner gate/task/project, live exact binding, inactive Web Sol claim, and fresh clean branch/HEAD are all required. Approval records `owner_approved` without repository mutation or Worker launch; explicit `continue` is required to apply the stored plan through the existing Planner/daemon path.
+- Closed the all-client stale-state gap by requiring and comparing every projected identity field for HTTP, CLI, watchdog recovery and direct local commands.
+- Closed the settlement crash gap: history-without-terminal-audit recovery now fsyncs exactly one `command_settled` row before inbox deletion, including restart/replay boundaries.
+- Intentionally did not restore the old adjudicator. Current Planner review is finitely bounded and reliably opens `OWNER_GATE` on exhaustion; code review found no architecture-level data-loss, unsafe-execution or unrecoverable-lifecycle case requiring another arbitration layer.
+- Added deterministic approval, rejection, cross-project, idempotency/conflict, no-implicit-Worker and crash-boundary coverage. Verification: 514 tests and 22 subtests passed; Python compilation, dashboard/userscript syntax, whitespace validation and Graphify AST refresh passed (2759 nodes, 7461 edges, 143 communities).
+
 Self-hosting baseline established:
 - stable controller remains in the original worktree;
 - isolated development worktree created on `feature/self-hosted-dev`;
