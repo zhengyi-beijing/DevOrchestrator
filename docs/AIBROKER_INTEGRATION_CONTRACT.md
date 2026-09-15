@@ -8,6 +8,21 @@ DevOrchestrator sends an `AIRoleRequest` containing orchestration correlation ID
 
 AIBroker returns an `AIRoleResult` containing dispatch/decision/execution/session IDs and exact resource facts. Those facts are audit evidence and input to future semantic independence constraints, not routing policy owned by DevOrchestrator.
 
+## P12.6 persistent harness transport
+
+When ignored `runtime/aibroker-execution.json` supplies loopback `service_url`
+and `service_token`, `AIBrokerExecutionPort` sends normal role execution,
+status and exact-interrupt requests to AIBroker's persistent service rather
+than spawning `python -m ai_resource_broker.cli dispatch`. Existing
+configuration without `service_url` retains the CLI compatibility path.
+
+AIBroker owns session allocation/reuse, provider/account/model selection,
+native harness processes and worktree writer leases. DevOrchestrator retains
+its pause barrier: pause prevents a new port `execute` call, but does not claim
+to interrupt an active harness unless the returned AIBroker capability proves
+an exact managed interrupt. RDC is bootstrap, inspection and recovery only;
+it is not in the normal coding inner loop.
+
 A single Broker dispatch decides once and executes at most one resource. It never interprets NEXT, REMEDIATE, OWNER_GATE, STOP, task advancement, or project stages, and it performs no automatic provider fallback or task remediation.
 
 ## Opt-in migration

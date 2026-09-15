@@ -245,6 +245,20 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.request(request_id=" ")
 
+    def test_persistent_service_transport_avoids_cli_spawn(self):
+        port = AIBrokerExecutionPort(AIBrokerClientConfig(
+            python_executable=Path(sys.executable), broker_repo=self.root / "broker",
+            config_path=self.root / "resources.yaml", service_url="http://127.0.0.1:8876",
+            service_token="local-token",
+        ))
+        with patch.object(port, "_service_call", return_value=self.payload(session_id="persistent-1")) as call, \
+             patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run") as run:
+            result = port.execute(self.request())
+        self.assertEqual(result.session_id, "persistent-1")
+        self.assertEqual(call.call_args.args[0], "/api/dispatch")
+        self.assertEqual(call.call_args.args[1]["project_id"], "devorchestrator")
+        run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

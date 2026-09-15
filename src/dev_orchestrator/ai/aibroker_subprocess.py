@@ -5,6 +5,9 @@ import json
 import os
 import subprocess
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
@@ -93,6 +96,8 @@ class AIBrokerClientConfig:
     database_path: Path | None = None
     process_timeout_seconds: float = 600.0
     probe_before_dispatch: bool = True
+    service_url: str | None = None
+    service_token: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("python_executable", "broker_repo", "config_path"):
@@ -123,6 +128,13 @@ class AIBrokerExecutionPort:
         return env
 
     def execute(self, request: AIRoleRequest) -> AIRoleResult:
+        if self.config.service_url:
+            result = self._service_call("/api/dispatch", self._request_payload(request))
+            if not isinstance(result, dict):
+                raise AIBrokerInvocationError("broker service result must be an object")
+            parsed = self._result_from_payload(request, result)
+            self._record_provider_evidence(request, parsed)
+            return parsed
         env = self._build_env()
         transport_timeout = self.config.process_timeout_seconds
         if request.timeout_seconds is not None:
@@ -222,10 +234,16 @@ class AIBrokerExecutionPort:
         )
 
     def status(self, request_id: str) -> dict[str, Any] | None:
+        if self.config.service_url:
+            payload = self._service_call("/api/dispatches/" + urllib.parse.quote(request_id), None)
+            return None if payload.get("status") == "not_found" else payload
         payload = self._reconcile_call(["dispatch-status", request_id])
         return None if payload.get("status") == "not_found" else payload
 
     def interrupt(self, request_id: str, reason: str) -> dict[str, Any] | None:
+        if self.config.service_url:
+            payload = self._service_call("/api/dispatches/" + urllib.parse.quote(request_id) + "/interrupt", {"reason": reason})
+            return None if payload.get("status") == "not_found" else payload
         payload = self._reconcile_call(["interrupt-dispatch", request_id, "--reason", reason])
         return None if payload.get("status") == "not_found" else payload
 
@@ -255,6 +273,34 @@ class AIBrokerExecutionPort:
         if not isinstance(payload, dict):
             raise AIBrokerInvocationError("broker reconciliation result must be an object")
         return payload
+
+    def _request_payload(self, request: AIRoleRequest) -> dict[str, Any]:
+        previous = request.previous_resource_context
+        return {
+            "project_id": request.project_id, "role": request.role, "prompt": request.prompt,
+            "request_id": request.request_id, "quality": request.quality, "independence": request.independence,
+            "excluded_resource_ids": list(request.excluded_resource_ids), "working_directory": str(request.working_directory),
+            "timeout_seconds": request.timeout_seconds,
+            **({"previous_resource_context": {"resource_id": previous.resource_id, "provider": previous.provider, "account": previous.account, "model": previous.model}} if previous else {}),
+        }
+
+    def _service_call(self, path: str, payload: Mapping[str, Any] | None) -> dict[str, Any]:
+        base = (self.config.service_url or "").rstrip("/")
+        if not base.startswith("http://127.0.0.1") and not base.startswith("http://localhost"):
+            raise AIBrokerInvocationError("broker service_url must be loopback HTTP")
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Accept": "application/json"}
+        if data is not None: headers["Content-Type"] = "application/json"
+        if self.config.service_token: headers["X-AIResourceBroker-Token"] = self.config.service_token
+        try:
+            with urllib.request.urlopen(urllib.request.Request(base + path, data=data, headers=headers, method="POST" if data is not None else "GET"), timeout=min(self.config.process_timeout_seconds, 60.0)) as response:
+                body = response.read().decode("utf-8")
+        except (OSError, urllib.error.URLError) as exc:
+            raise AIBrokerInvocationError(f"broker service invocation failed: {exc}") from exc
+        try: result = json.loads(body)
+        except json.JSONDecodeError as exc: raise AIBrokerInvocationError("broker service returned invalid JSON") from exc
+        if not isinstance(result, dict): raise AIBrokerInvocationError("broker service result must be an object")
+        return result
 
     def _build_argv(self, request: AIRoleRequest, prompt_file: Path) -> list[str]:
         argv = [

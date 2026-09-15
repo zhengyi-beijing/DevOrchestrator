@@ -38,6 +38,12 @@ def load_aibroker_execution_port(
     probe = raw.get("probe_before_dispatch", True)
     if not isinstance(probe, bool):
         raise ValueError("probe_before_dispatch must be boolean")
+    service_url = raw.get("service_url")
+    service_token = raw.get("service_token")
+    if service_url is not None and (not isinstance(service_url, str) or not service_url.strip()):
+        raise ValueError("service_url must be a nonblank string when present")
+    if service_token is not None and (not isinstance(service_token, str) or not service_token.strip()):
+        raise ValueError("service_token must be a nonblank string when present")
     return AIBrokerExecutionPort(
         AIBrokerClientConfig(
             python_executable=Path(raw["python_executable"]),
@@ -46,6 +52,8 @@ def load_aibroker_execution_port(
             database_path=Path(database) if database else None,
             process_timeout_seconds=float(timeout),
             probe_before_dispatch=probe,
+            service_url=service_url,
+            service_token=service_token,
         ),
         accounting=accounting,
     )
