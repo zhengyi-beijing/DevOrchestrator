@@ -19,6 +19,72 @@ class AIBrokerInvocationError(RuntimeError):
     """The broker transport/contract failed before a valid dispatch result."""
 
 
+_RESOURCE_FAILURE_CODES = {
+    "quota_exhausted": "quota_exhausted",
+    "usage_limit_reached": "quota_exhausted",
+    "rate_limited": "rate_limited",
+    "too_many_requests": "rate_limited",
+    "provider_temporarily_unavailable": "provider_temporarily_unavailable",
+    "service_unavailable": "provider_temporarily_unavailable",
+    "temporarily_unavailable": "provider_temporarily_unavailable",
+    "resource_unavailable": "resource_unavailable",
+    "account_unavailable": "resource_unavailable",
+    "model_unavailable": "resource_unavailable",
+}
+_RESOURCE_FAILURE_TEXT = (
+    ("usage limit", "quota_exhausted"),
+    ("quota exhausted", "quota_exhausted"),
+    ("quota reached", "quota_exhausted"),
+    ("rate limited", "rate_limited"),
+    ("too many requests", "rate_limited"),
+    ("temporarily unavailable", "provider_temporarily_unavailable"),
+    ("service unavailable", "provider_temporarily_unavailable"),
+    ("resource unavailable", "resource_unavailable"),
+    ("account unavailable", "resource_unavailable"),
+    ("model unavailable", "resource_unavailable"),
+)
+
+
+def _failure_classification(payload: Mapping[str, Any]) -> str | None:
+    """Normalize only explicit resource-availability evidence from Broker results."""
+    if payload.get("status") != "failed":
+        return None
+    error = payload.get("error")
+    structured_codes = [payload.get("failure_classification"), payload.get("error_code")]
+    if isinstance(error, Mapping):
+        structured_codes.extend((error.get("classification"), error.get("code")))
+    for value in structured_codes:
+        if isinstance(value, str):
+            normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+            classification = _RESOURCE_FAILURE_CODES.get(normalized)
+            if classification is not None:
+                return classification
+    if isinstance(payload.get("quota_observation"), Mapping) and payload["quota_observation"]:
+        return "quota_exhausted"
+    rate_limit = payload.get("rate_limit_observation", payload.get("rate_limit"))
+    if isinstance(rate_limit, Mapping) and rate_limit:
+        return "rate_limited"
+    if not isinstance(error, str):
+        return None
+    message = " ".join(error.casefold().split())
+    for marker, classification in _RESOURCE_FAILURE_TEXT:
+        if marker in message:
+            return classification
+    return None
+
+
+def _error_message(payload: Mapping[str, Any]) -> str | None:
+    error = payload.get("error")
+    if isinstance(error, str):
+        return error
+    if isinstance(error, Mapping):
+        for key in ("message", "detail", "code"):
+            value = error.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class AIBrokerClientConfig:
     python_executable: Path
@@ -149,6 +215,8 @@ class AIBrokerExecutionPort:
             model=resource.model if resource else None,
             metadata={
                 "correlation_group": correlation_group,
+                "failure_classification": result.failure_classification,
+                "excluded_resource_ids": list(request.excluded_resource_ids),
                 **({"previous_resource_context": previous_payload} if previous_payload else {}),
             },
         )
@@ -205,6 +273,8 @@ class AIBrokerExecutionPort:
             argv += ["--timeout", str(request.timeout_seconds)]
         if self.config.probe_before_dispatch:
             argv.append("--probe")
+        for resource_id in request.excluded_resource_ids:
+            argv += ["--excluded-resource-id", resource_id]
 
         previous = request.previous_resource_context
         if previous is not None:
@@ -236,7 +306,7 @@ class AIBrokerExecutionPort:
                 request_id=request.request_id,
                 role_run_id=request.role_run_id,
                 status=payload["status"], output=payload.get("output"),
-                error=payload.get("error"), dispatch_id=payload.get("dispatch_id"),
+                error=_error_message(payload), dispatch_id=payload.get("dispatch_id"),
                 decision_id=payload.get("decision_id"), execution_id=payload.get("execution_id"),
                 session_id=payload.get("session_id"), resource_context=context,
                 usage=payload.get("usage"), usage_source=payload.get("usage_source", "unknown"),
@@ -248,6 +318,7 @@ class AIBrokerExecutionPort:
                     if payload.get("rate_limit_observation") is not None
                     else payload.get("rate_limit")
                 ),
+                failure_classification=_failure_classification(payload),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise AIBrokerInvocationError(f"invalid broker result: {exc}") from exc

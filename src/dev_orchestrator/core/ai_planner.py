@@ -22,6 +22,12 @@ from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_js
 PLANNER_STATE_FILE = "ai-planner.json"
 _STATE_VERSION = 1
 _ACTIVE_STATES = frozenset({"planning", "reviewing", "remediating", "applying"})
+_REVIEWER_RESOURCE_FAILURES = frozenset({
+    "quota_exhausted",
+    "rate_limited",
+    "provider_temporarily_unavailable",
+    "resource_unavailable",
+})
 
 
 def _nonblank(value: Any) -> str | None:
@@ -48,6 +54,7 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     review_timeout = raw.get("review_timeout_seconds", 600)
     max_attempts = raw.get("max_attempts", 3)
     max_plan_remediation_rounds = raw.get("max_plan_remediation_rounds", 2)
+    max_reviewer_resource_failovers = raw.get("max_reviewer_resource_failovers", 2)
     if quality not in {"economy", "balanced", "high"}:
         return None, "planner quality invalid"
     if review_quality not in {"economy", "balanced", "high"}:
@@ -65,6 +72,12 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
         or not 1 <= max_plan_remediation_rounds <= 5
     ):
         return None, "planner max_plan_remediation_rounds must be an integer from 1 to 5"
+    if (
+        isinstance(max_reviewer_resource_failovers, bool)
+        or not isinstance(max_reviewer_resource_failovers, int)
+        or not 0 <= max_reviewer_resource_failovers <= 2
+    ):
+        return None, "planner max_reviewer_resource_failovers must be an integer from 0 to 2"
     return {
         "quality": quality,
         "review_quality": review_quality,
@@ -73,6 +86,7 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
         "review_timeout_seconds": float(review_timeout),
         "max_attempts": max_attempts,
         "max_plan_remediation_rounds": max_plan_remediation_rounds,
+        "max_reviewer_resource_failovers": max_reviewer_resource_failovers,
     }, ""
 
 
@@ -678,104 +692,125 @@ class AIPlannerCoordinator:
         previous: ResourceContext | None,
         round_no: int,
     ) -> tuple[str, str, Any] | None:
-        if not self._wait_for_launch_barrier(plan_id, record["project_id"]):
-            return None
-        request_id = plan_id + ":reviewer" if round_no == 0 else f"{plan_id}:reviewer:remediate-{round_no}"
-        metadata: dict[str, Any] = {"control_command_id": record["command_id"], "review_kind": "plan"}
-        if round_no > 0:
-            metadata["remediation_round"] = round_no
+        base_request_id = plan_id + ":reviewer" if round_no == 0 else f"{plan_id}:reviewer:remediate-{round_no}"
+        failed_resource_ids: set[str] = set()
+        max_attempts = 1 + policy["max_reviewer_resource_failovers"]
 
-        review_request = AIRoleRequest(
-            project_id=record["project_id"],
-            task_run_id=record["task_id"],
-            stage_run_id="plan_review",
-            role_run_id="plan-reviewer-" + record["command_id"],
-            request_id=request_id,
-            role="reviewer",
-            prompt=self._review_prompt(record, plan),
-            working_directory=Path(record["repo_path"]),
-            quality=policy["review_quality"],
-            independence=policy["review_independence"],
-            previous_resource_context=previous,
-            timeout_seconds=policy["review_timeout_seconds"],
-            metadata=metadata,
-        )
-        review_result = None
-        review_outcome = "failed"
-        review_failure = None
-        review_started = time.monotonic()
-        if self.accounting is not None:
-            self.accounting.start_interval(
-                "plan_review",
-                review_request.request_id,
+        for attempt in range(1, max_attempts + 1):
+            if not self._wait_for_launch_barrier(plan_id, record["project_id"]):
+                return None
+            request_id = base_request_id if attempt == 1 else f"{base_request_id}:failover-{attempt - 1}"
+            metadata: dict[str, Any] = {
+                "control_command_id": record["command_id"],
+                "review_kind": "plan",
+                "reviewer_attempt": attempt,
+                "reviewer_max_attempts": max_attempts,
+            }
+            if failed_resource_ids:
+                metadata["reviewer_failover_from_resource_ids"] = sorted(failed_resource_ids)
+            if round_no > 0:
+                metadata["remediation_round"] = round_no
+            review_request = AIRoleRequest(
                 project_id=record["project_id"],
-                task_id=record["task_id"],
-                role="plan_reviewer",
-                request_id=review_request.request_id,
-                stage_run_id=review_request.stage_run_id,
-                role_run_id=review_request.role_run_id,
-                source_request_id=record["command_id"],
-                attempt_id=f"{plan_id}:plan-round-{round_no}",
+                task_run_id=record["task_id"],
+                stage_run_id="plan_review",
+                role_run_id="plan-reviewer-" + record["command_id"],
+                request_id=request_id,
+                role="reviewer",
+                prompt=self._review_prompt(record, plan),
+                working_directory=Path(record["repo_path"]),
+                quality=policy["review_quality"],
+                independence=policy["review_independence"],
+                previous_resource_context=previous,
+                excluded_resource_ids=tuple(sorted(failed_resource_ids)),
+                timeout_seconds=policy["review_timeout_seconds"],
+                metadata=metadata,
             )
-        try:
-            review_result = self.port.execute(review_request) if self.port is not None else None
-            if review_result is None:
-                raise RuntimeError("plan reviewer execution port unavailable")
-            if review_result.status != "succeeded":
-                raise RuntimeError(review_result.error or f"plan_reviewer_{review_result.status}")
-            decision, reason = _parse_plan_review(review_result.output)
-            review_outcome = "accepted"
-        except Exception as exc:
-            review_failure = str(exc)
-            self._finish(plan_id, "failed", f"plan review failed: {exc}")
-            return None
-        finally:
+            review_result = None
+            review_outcome = "failed"
+            review_failure = None
+            review_started = time.monotonic()
+            attempt_id = f"{plan_id}:plan-round-{round_no}:reviewer-attempt-{attempt}"
             if self.accounting is not None:
-                self.accounting.end_interval(
-                    "plan_review",
-                    review_request.request_id,
-                    outcome=review_outcome,
-                    project_id=record["project_id"],
-                    task_id=record["task_id"],
-                    role="plan_reviewer",
-                    request_id=review_request.request_id,
-                    stage_run_id=review_request.stage_run_id,
-                    role_run_id=review_request.role_run_id,
-                    source_request_id=record["command_id"],
-                    attempt_id=f"{plan_id}:plan-round-{round_no}",
-                    dispatch_id=getattr(review_result, "dispatch_id", None),
-                    decision_id=getattr(review_result, "decision_id", None),
-                    execution_id=getattr(review_result, "execution_id", None),
-                    session_id=getattr(review_result, "session_id", None),
-                    resource_id=(
-                        review_result.resource_context.resource_id
-                        if review_result is not None and review_result.resource_context else None
-                    ),
-                    provider=(
-                        review_result.resource_context.provider
-                        if review_result is not None and review_result.resource_context else None
-                    ),
-                    account=(
-                        review_result.resource_context.account
-                        if review_result is not None and review_result.resource_context else None
-                    ),
-                    model=(
-                        review_result.resource_context.model
-                        if review_result is not None and review_result.resource_context else None
-                    ),
+                self.accounting.start_interval(
+                    "plan_review", review_request.request_id,
+                    project_id=record["project_id"], task_id=record["task_id"],
+                    role="plan_reviewer", request_id=review_request.request_id,
+                    stage_run_id=review_request.stage_run_id, role_run_id=review_request.role_run_id,
+                    source_request_id=record["command_id"], attempt_id=attempt_id,
                 )
-            if self.failure_memory is not None and review_failure:
-                self.failure_memory.record_matching_recurrences(
-                    record.get("failure_environment", {}),
-                    review_failure,
-                    time.monotonic() - review_started,
-                    project_id=record["project_id"],
-                    task_id=record["task_id"],
-                    role="plan_reviewer",
-                    request_id=review_request.request_id,
-                    source_request_id=record["command_id"],
+            try:
+                review_result = self.port.execute(review_request) if self.port is not None else None
+                if review_result is None:
+                    raise RuntimeError("plan reviewer execution port unavailable")
+                if review_result.status != "succeeded":
+                    review_failure = review_result.error or f"plan_reviewer_{review_result.status}"
+                    classification = getattr(review_result, "failure_classification", None)
+                    resource = review_result.resource_context
+                    can_failover = (
+                        review_result.status == "failed"
+                        and classification in _REVIEWER_RESOURCE_FAILURES
+                        and resource is not None
+                        and resource.resource_id is not None
+                    )
+                    self._record_reviewer_attempt(
+                        plan_id, attempt, review_request, review_result, review_failure,
+                        classification=classification, round_no=round_no,
+                    )
+                    if can_failover and attempt < max_attempts:
+                        failed_resource_ids.add(resource.resource_id)
+                        continue
+                    if can_failover:
+                        self._finish(
+                            plan_id, "failed",
+                            "plan review failed: all eligible reviewer resources exhausted/unavailable: " + review_failure,
+                        )
+                    else:
+                        self._finish(plan_id, "failed", f"plan review failed: {review_failure}")
+                    return None
+                decision, reason = _parse_plan_review(review_result.output)
+                review_outcome = "accepted"
+                self._record_reviewer_attempt(
+                    plan_id, attempt, review_request, review_result, None,
+                    classification=None, round_no=round_no,
                 )
-        return decision, reason, review_result
+                return decision, reason, review_result
+            except Exception as exc:
+                review_failure = str(exc)
+                self._record_reviewer_attempt(
+                    plan_id, attempt, review_request, review_result, review_failure,
+                    classification=getattr(review_result, "failure_classification", None), round_no=round_no,
+                )
+                self._finish(plan_id, "failed", f"plan review failed: {exc}")
+                return None
+            finally:
+                if self.accounting is not None:
+                    resource = getattr(review_result, "resource_context", None)
+                    self.accounting.end_interval(
+                        "plan_review", review_request.request_id, outcome=review_outcome,
+                        project_id=record["project_id"], task_id=record["task_id"],
+                        role="plan_reviewer", request_id=review_request.request_id,
+                        stage_run_id=review_request.stage_run_id, role_run_id=review_request.role_run_id,
+                        source_request_id=record["command_id"], attempt_id=attempt_id,
+                        dispatch_id=getattr(review_result, "dispatch_id", None),
+                        decision_id=getattr(review_result, "decision_id", None),
+                        execution_id=getattr(review_result, "execution_id", None),
+                        session_id=getattr(review_result, "session_id", None),
+                        resource_id=resource.resource_id if resource else None,
+                        provider=resource.provider if resource else None,
+                        account=resource.account if resource else None,
+                        model=resource.model if resource else None,
+                    )
+                if self.failure_memory is not None and review_failure:
+                    self.failure_memory.record_matching_recurrences(
+                        record.get("failure_environment", {}), review_failure,
+                        time.monotonic() - review_started,
+                        project_id=record["project_id"], task_id=record["task_id"],
+                        role="plan_reviewer", request_id=review_request.request_id,
+                        source_request_id=record["command_id"],
+                    )
+        self._finish(plan_id, "failed", "plan review failed: reviewer retry loop ended unexpectedly")
+        return None
 
     def _run_cycle(self, plan_id: str, project: dict[str, Any], policy: dict[str, Any]) -> None:
         with self._lock:
@@ -1209,6 +1244,47 @@ class AIPlannerCoordinator:
             if reason is not None:
                 record["planner_last_failure"] = reason
                 record["planner_last_failure_at"] = utc_now_iso()
+            self._save_state(state)
+
+    def _record_reviewer_attempt(
+        self, plan_id: str, attempt: int, request: AIRoleRequest, result: Any,
+        reason: str | None, *, classification: str | None, round_no: int,
+    ) -> None:
+        """Keep every reviewer dispatch visible even when a later resource succeeds."""
+        with self._lock:
+            state = self._load_state()
+            record = state["plans"].get(plan_id)
+            if not isinstance(record, dict):
+                return
+            attempts = record.setdefault("reviewer_attempts", [])
+            if not isinstance(attempts, list):
+                attempts = []
+                record["reviewer_attempts"] = attempts
+            entry: dict[str, Any] = {
+                "attempt": attempt,
+                "round": round_no,
+                "request_id": request.request_id,
+                "started_at": getattr(result, "started_at", None),
+                "completed_at": getattr(result, "finished_at", None) or utc_now_iso(),
+                "status": getattr(result, "status", None),
+                "failure_classification": classification,
+                "error": reason,
+                "dispatch_id": getattr(result, "dispatch_id", None),
+                "decision_id": getattr(result, "decision_id", None),
+                "execution_id": getattr(result, "execution_id", None),
+                "session_id": getattr(result, "session_id", None),
+                "resource": self._resource_payload(getattr(result, "resource_context", None)),
+                "excluded_resource_ids": list(request.excluded_resource_ids),
+                "failover_from_resource_ids": list(
+                    request.metadata.get("reviewer_failover_from_resource_ids", [])
+                ),
+            }
+            attempts.append(entry)
+            record["reviewer_attempt_count"] = attempt
+            record["reviewer_failover_count"] = max(0, attempt - 1)
+            if reason is not None:
+                record["reviewer_last_failure"] = reason
+                record["reviewer_last_failure_at"] = utc_now_iso()
             self._save_state(state)
 
     @staticmethod

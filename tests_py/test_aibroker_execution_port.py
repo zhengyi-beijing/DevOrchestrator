@@ -202,6 +202,20 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         self.assertIn("old-r", argv)
         self.assertNotIn("--excluded-resource-id", argv)
 
+    @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
+    def test_reviewer_failover_exclusions_and_resource_failure_are_normalized(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=json.dumps(self.payload(
+                status="failed", output=None, error="You've hit your usage limit; try again later.",
+                quota_observation={"remaining": 0},
+            )), stderr=""
+        )
+        result = self.port.execute(self.request(excluded_resource_ids=("reviewer-a",)))
+        argv = run.call_args.args[0]
+        self.assertEqual(result.failure_classification, "quota_exhausted")
+        self.assertIn("--excluded-resource-id", argv)
+        self.assertIn("reviewer-a", argv)
+
 
     @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
     def test_status_and_interrupt_use_broker_reconciliation_commands(self, run):

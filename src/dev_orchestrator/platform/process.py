@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
@@ -118,11 +119,19 @@ def terminate_process_tree(pid: Any) -> bool:
     if pid_int <= 0:
         return False
     if os.name == "nt":
-        completed = subprocess.run(
+        subprocess.run(
             ["taskkill", "/PID", str(pid_int), "/T", "/F"],
             capture_output=True, text=True, check=False, **hidden_subprocess_kwargs(),
         )
-        return completed.returncode == 0 or not is_pid_alive(pid_int)
+        if is_pid_alive(pid_int):
+            # Some Windows hosts acknowledge taskkill before the detached
+            # process receives the tree signal. Fall back to the same exact
+            # PID termination primitive used by the single-process lifecycle.
+            _windows_terminate(pid_int)
+        deadline = time.monotonic() + 2.0
+        while is_pid_alive(pid_int) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return not is_pid_alive(pid_int)
     try:
         os.killpg(os.getpgid(pid_int), signal.SIGTERM)
         return True

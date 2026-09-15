@@ -10,6 +10,12 @@ from uuid import uuid4
 _QUALITIES = {"economy", "balanced", "high"}
 _INDEPENDENCE = {"none", "resource", "account", "provider"}
 _STATUSES = {"succeeded", "failed", "cancelled", "no_candidate"}
+_RESOURCE_FAILURE_CLASSIFICATIONS = {
+    "quota_exhausted",
+    "rate_limited",
+    "provider_temporarily_unavailable",
+    "resource_unavailable",
+}
 
 
 def _nonblank(name: str, value: str) -> str:
@@ -62,6 +68,7 @@ class AIRoleRequest:
     quality: str = "balanced"
     independence: str = "none"
     previous_resource_context: ResourceContext | None = None
+    excluded_resource_ids: tuple[str, ...] = ()
     timeout_seconds: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -88,6 +95,14 @@ class AIRoleRequest:
         }[self.independence]
         if any(previous is None or not getattr(previous, name) for name in required):
             raise ValueError("independence requires prior resource evidence")
+        excluded = self.excluded_resource_ids
+        if not isinstance(excluded, (tuple, list)):
+            raise ValueError("excluded_resource_ids must be a sequence")
+        if any(not isinstance(resource_id, str) or not resource_id.strip() for resource_id in excluded):
+            raise ValueError("excluded_resource_ids must contain nonblank strings")
+        if len(set(excluded)) != len(excluded):
+            raise ValueError("excluded_resource_ids must not contain duplicates")
+        object.__setattr__(self, "excluded_resource_ids", tuple(excluded))
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +126,7 @@ class AIRoleResult:
     first_output_at: str | None = None
     quota_observation: Mapping[str, Any] | None = None
     rate_limit_observation: Mapping[str, Any] | None = None
+    failure_classification: str | None = None
 
     def __post_init__(self) -> None:
         _nonblank("request_id", self.request_id)
@@ -133,3 +149,7 @@ class AIRoleResult:
             value = getattr(self, name)
             if value is not None and not isinstance(value, Mapping):
                 raise ValueError(f"{name} must be an object when present")
+        if self.failure_classification is not None:
+            _nonblank("failure_classification", self.failure_classification)
+            if self.failure_classification not in _RESOURCE_FAILURE_CLASSIFICATIONS:
+                raise ValueError("invalid failure_classification")

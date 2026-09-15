@@ -250,6 +250,54 @@ class FailReviewOnRemediationPort:
         )
 
 
+class ReviewerResourceFailoverPort:
+    def __init__(self, failures: int = 1, classification: str | None = "quota_exhausted"):
+        self.requests = []
+        self.planner_calls = 0
+        self.review_calls = 0
+        self.failures = failures
+        self.classification = classification
+
+    def execute(self, request):
+        self.requests.append(request)
+        if request.role == "planner":
+            self.planner_calls += 1
+            return AIRoleResult(
+                request_id=request.request_id,
+                role_run_id=request.role_run_id,
+                status="succeeded",
+                output=json.dumps({
+                    "task_id": request.task_run_id, "summary": "Original bounded plan",
+                    "implementation_steps": ["Step 1"], "interfaces": ["Interface 1"],
+                    "validation": ["Validation 1"], "risks": ["Risk 1"],
+                    "out_of_scope": ["Scope 1"],
+                }),
+                dispatch_id="dispatch-plan", decision_id="decision-plan", execution_id="execution-plan",
+                resource_context=ResourceContext("planner-r", "planner-provider", "planner-account", "planner-model"),
+            )
+        self.review_calls += 1
+        resource = ResourceContext(
+            f"reviewer-r-{self.review_calls}", f"provider-{self.review_calls}",
+            f"account-{self.review_calls}", f"model-{self.review_calls}",
+        )
+        if self.review_calls <= self.failures:
+            return AIRoleResult(
+                request_id=request.request_id, role_run_id=request.role_run_id, status="failed",
+                error="You've hit your usage limit; try again later.",
+                dispatch_id=f"dispatch-review-{self.review_calls}",
+                decision_id=f"decision-review-{self.review_calls}",
+                execution_id=f"execution-review-{self.review_calls}", resource_context=resource,
+                failure_classification=self.classification,
+            )
+        return AIRoleResult(
+            request_id=request.request_id, role_run_id=request.role_run_id, status="succeeded",
+            output=json.dumps({"decision": "approve", "reason": "same plan reviewed"}),
+            dispatch_id=f"dispatch-review-{self.review_calls}",
+            decision_id=f"decision-review-{self.review_calls}",
+            execution_id=f"execution-review-{self.review_calls}", resource_context=resource,
+        )
+
+
 def make_repo(repo: Path) -> None:
     (repo / "agent").mkdir(parents=True)
     (repo / "agent" / "next.md").write_text(
@@ -261,6 +309,16 @@ def make_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "seed"], check=True)
+
+
+def wait_terminal(coordinator: AIPlannerCoordinator, plan_id: str) -> dict:
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        row = coordinator.state()["plans"].get(plan_id)
+        if row and row.get("state") not in {"planning", "reviewing", "remediating", "applying"}:
+            return row
+        time.sleep(0.02)
+    raise AssertionError("planner lifecycle did not become terminal")
 
 
 class AIPlannerTests(unittest.TestCase):
@@ -307,6 +365,87 @@ class AIPlannerTests(unittest.TestCase):
             self.assertEqual(status.stdout.strip(), "")
             log = subprocess.run(["git", "-C", str(repo), "log", "-1", "--pretty=%s"], capture_output=True, text=True, check=True)
             self.assertEqual(log.stdout.strip(), "plan(P14): freeze executable design")
+
+    def test_reviewer_resource_failure_fails_over_same_plan_with_audit_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = ReviewerResourceFailoverPort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {"enabled": True, "review_independence": "provider"}},
+            }
+            snapshot = {"project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P14"}}
+            plan_id, _ = coordinator.start(project, snapshot, "command-reviewer-failover")
+            row = wait_terminal(coordinator, plan_id)
+
+            self.assertEqual(row["state"], "ready", row)
+            self.assertEqual(port.planner_calls, 1)
+            reviews = [request for request in port.requests if request.role == "reviewer"]
+            self.assertEqual(len(reviews), 2)
+            self.assertEqual(reviews[0].prompt, reviews[1].prompt)
+            self.assertEqual(reviews[0].previous_resource_context.resource_id, "planner-r")
+            self.assertEqual(reviews[1].previous_resource_context.resource_id, "planner-r")
+            self.assertEqual(reviews[1].independence, "provider")
+            self.assertEqual(reviews[1].excluded_resource_ids, ("reviewer-r-1",))
+            self.assertTrue(reviews[1].request_id.endswith(":reviewer:failover-1"))
+            self.assertEqual(row["review_resource"]["resource_id"], "reviewer-r-2")
+            self.assertEqual(row["reviewer_attempt_count"], 2)
+            self.assertEqual(row["reviewer_failover_count"], 1)
+            self.assertEqual(len(row["reviewer_attempts"]), 2)
+            failed, accepted = row["reviewer_attempts"]
+            self.assertEqual(failed["resource"]["resource_id"], "reviewer-r-1")
+            self.assertEqual(failed["failure_classification"], "quota_exhausted")
+            self.assertEqual(failed["dispatch_id"], "dispatch-review-1")
+            self.assertEqual(accepted["resource"]["resource_id"], "reviewer-r-2")
+            self.assertEqual(accepted["excluded_resource_ids"], ["reviewer-r-1"])
+            self.assertEqual(accepted["failover_from_resource_ids"], ["reviewer-r-1"])
+
+    def test_reviewer_non_resource_failure_does_not_fail_over(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = ReviewerResourceFailoverPort(failures=1, classification=None)
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo), "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {"enabled": True}},
+            }
+            snapshot = {"project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P14"}}
+            plan_id, _ = coordinator.start(project, snapshot, "command-non-resource-review")
+            row = wait_terminal(coordinator, plan_id)
+
+            self.assertEqual(row["state"], "failed", row)
+            self.assertEqual(port.planner_calls, 1)
+            self.assertEqual(port.review_calls, 1)
+            self.assertIn("usage limit", row["reason"])
+
+    def test_reviewer_resource_failover_is_bounded_when_all_candidates_fail(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = ReviewerResourceFailoverPort(failures=3)
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo), "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {"enabled": True, "max_reviewer_resource_failovers": 2}},
+            }
+            snapshot = {"project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P14"}}
+            plan_id, _ = coordinator.start(project, snapshot, "command-reviewer-exhaust")
+            row = wait_terminal(coordinator, plan_id)
+
+            self.assertEqual(row["state"], "failed", row)
+            self.assertIn("all eligible reviewer resources exhausted/unavailable", row["reason"])
+            self.assertEqual(port.planner_calls, 1)
+            self.assertEqual(port.review_calls, 3)
+            self.assertEqual(row["reviewer_attempt_count"], 3)
+            self.assertEqual(row["reviewer_failover_count"], 2)
+            self.assertEqual(
+                [entry["resource"]["resource_id"] for entry in row["reviewer_attempts"]],
+                ["reviewer-r-1", "reviewer-r-2", "reviewer-r-3"],
+            )
 
     def test_planner_failure_retries_and_recovers_without_new_control(self):
         with tempfile.TemporaryDirectory() as td:

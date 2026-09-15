@@ -181,6 +181,7 @@ def test_plan_remediation_default_is_two_rounds() -> None:
     assert reason == ""
     assert policy is not None
     assert policy["max_plan_remediation_rounds"] == 2
+    assert policy["max_reviewer_resource_failovers"] == 2
 
 
 def test_provider_native_entries_are_thin_and_reference_canonical_policy() -> None:
