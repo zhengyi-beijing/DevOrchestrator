@@ -214,6 +214,105 @@ function renderBrokerUsage(payload) {
   if (!(payload.usage || []).length) { const e=document.createElement('div'); e.className='empty'; e.textContent='No usage records yet.'; host.appendChild(e); }
 }
 
+let controlCsrf = null;
+
+async function ensureControlSession() {
+  if (controlCsrf) return controlCsrf;
+  const response = await fetch('/api/v1/control/browser-sessions', {
+    method: 'POST', credentials: 'same-origin', headers: {'Sec-Fetch-Site': 'same-origin'}
+  });
+  if (!response.ok) throw new Error(`control session: HTTP ${response.status}`);
+  const payload = await response.json();
+  controlCsrf = payload.data.csrf_token;
+  return controlCsrf;
+}
+
+async function pollControlCommand(commandId, attempts = 20) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const payload = await getJson(`/api/v1/control/commands/${encodeURIComponent(commandId)}`);
+    if (payload.data && payload.data.state !== 'pending') return payload.data;
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  return {command_id: commandId, state: 'pending', reason: 'daemon result is still pending'};
+}
+
+async function sendControl(project, action, target = {}) {
+  if ((action === 'stop' || action === 'approve_owner_gate') &&
+      !window.confirm(`Confirm ${action} for ${text(project.project_id || project.id)}?`)) return null;
+  const csrf = await ensureControlSession();
+  const response = await fetch('/api/v1/control/commands', {
+    method: 'POST', credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json', 'X-DevOrch-CSRF': csrf, 'Sec-Fetch-Site': 'same-origin'},
+    body: JSON.stringify({
+      schema_version: 1,
+      command_id: `ui-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      project_id: project.project_id || project.id,
+      action,
+      expected: project.control_identity,
+      target,
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.message || `control command: HTTP ${response.status}`);
+  return payload.data && payload.data.state === 'pending'
+    ? pollControlCommand(payload.data.command_id)
+    : payload.data;
+}
+
+function renderControlSurface(payload) {
+  const data = payload && payload.data || {};
+  const projectsHost = $('controlProjects'); projectsHost.replaceChildren();
+  $('controlStatus').textContent = data.control_enabled ? 'guarded actions enabled' : 'observation only';
+  for (const project of (data.projects || [])) {
+    const card = document.createElement('article'); card.className = `project-card ${stateTone(projectState(project))}`;
+    const head = document.createElement('div'); head.className = 'project-head';
+    const title = document.createElement('div'); title.className = 'project-name'; title.textContent = text(project.name || project.project_id || project.id);
+    const badge = document.createElement('div'); badge.className = `badge ${project.owner_control && project.owner_control.paused ? 'warn' : 'ok'}`;
+    badge.textContent = project.owner_control && project.owner_control.paused ? 'PAUSED' : text(projectState(project));
+    head.append(title, badge); card.appendChild(head);
+    const grid = document.createElement('div'); grid.className = 'kv-grid';
+    kv(grid, 'Repository', project.repo_path, true);
+    kv(grid, 'Task', project.control_identity && project.control_identity.task_id, true);
+    kv(grid, 'Branch / HEAD', project.control_identity ? `${text(project.control_identity.branch)} @ ${shortHead(project.control_identity.head)}` : UNKNOWN, true);
+    kv(grid, 'Owner gate', project.control_identity && project.control_identity.gate_id, true);
+    kv(grid, 'Active role', project.active_execution && (project.active_execution.role || project.active_execution.engine));
+    kv(grid, 'Binding', project.conversation && project.conversation.binding ? `${text(project.conversation.binding.adapter)} / ${text(project.conversation.binding.binding_id)}` : 'unbound');
+    card.appendChild(grid);
+    const controls = document.createElement('div'); controls.className = 'control-actions';
+    const targetSelect = document.createElement('select'); targetSelect.className = 'control-target';
+    const currentBindingId = project.conversation && project.conversation.binding && project.conversation.binding.binding_id;
+    for (const session of (data.sessions || []).filter(item => item.state === 'live' && item.binding_id !== currentBindingId)) {
+      const option = document.createElement('option');
+      option.value = JSON.stringify({adapter: session.adapter, binding_id: session.binding_id});
+      option.textContent = `${text(session.title)} · ${text(session.adapter)} / ${text(session.binding_id)}`;
+      targetSelect.appendChild(option);
+    }
+    if (targetSelect.children.length) controls.appendChild(targetSelect);
+    for (const capability of (project.controls || [])) {
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = capability.action;
+      button.disabled = !data.control_enabled || !capability.available;
+      button.title = capability.reason || '';
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        try {
+          const needsTarget = capability.action === 'bind_conversation' || capability.action === 'rebind_conversation';
+          const target = needsTarget && targetSelect.value ? JSON.parse(targetSelect.value) : {};
+          const result = await sendControl(project, capability.action, target);
+          if (result) { button.textContent = `${capability.action}: ${result.state}`; await refresh(); }
+        } catch (error) { button.textContent = `${capability.action}: failed`; $('controlStatus').textContent = String(error.message || error); }
+        finally { button.disabled = !data.control_enabled || !capability.available; }
+      });
+      controls.appendChild(button);
+    }
+    card.appendChild(controls); projectsHost.appendChild(card);
+  }
+  if (!(data.projects || []).length) { const e=document.createElement('div'); e.className='empty'; e.textContent='No project control projections.'; projectsHost.appendChild(e); }
+  const bindings = $('controlBindings'); bindings.replaceChildren();
+  for (const item of (data.bindings || [])) { const row=document.createElement('div'); row.className='timeline-item'; row.textContent=`${text(item.project_id)} · ${text(item.state)} · ${text(item.adapter)} / ${text(item.binding_id)}`; bindings.appendChild(row); }
+  if (!(data.bindings || []).length) { const e=document.createElement('div'); e.className='empty'; e.textContent='No runtime bindings.'; bindings.appendChild(e); }
+  renderTimeline('controlCommands', data.commands || [], item => `${text(item.action)} · ${text(item.state)}${item.reason ? ` · ${item.reason}` : ''}`);
+}
+
 function renderAccounting(payload) {
   const summary = $('accountingSummary'); summary.replaceChildren();
   const bottleneck = $('accountingBottleneck'); bottleneck.replaceChildren();
@@ -329,9 +428,9 @@ function renderAccounting(payload) {
 
 async function refresh() {
   try {
-    const [monitor, summary, eventsPayload, runsPayload, orchestration, brokerResources, brokerExecutions, brokerUsage, accounting] = await Promise.all([
+    const [monitor, summary, eventsPayload, runsPayload, orchestration, brokerResources, brokerExecutions, brokerUsage, accounting, control] = await Promise.all([
       getJson('/api/monitor'), getJson('/api/summary'), getJson('/api/events?limit=30'), getJson('/api/runs?limit=20'), getJson('/api/orchestration'),
-      getJson('/api/broker/resources'), getJson('/api/broker/executions'), getJson('/api/broker/usage'), getJson('/api/accounting')
+      getJson('/api/broker/resources'), getJson('/api/broker/executions'), getJson('/api/broker/usage'), getJson('/api/accounting'), getJson('/api/v1/control/overview')
     ]);
     const events = Array.isArray(eventsPayload.items) ? eventsPayload.items : [];
     const runs = Array.isArray(runsPayload.items) ? runsPayload.items : [];
@@ -342,6 +441,7 @@ async function refresh() {
     renderBrokerExecutions(brokerExecutions);
     renderBrokerUsage(brokerUsage);
     renderAccounting(accounting);
+    renderControlSurface(control);
     renderOrchestration(orchestration);
     renderTimeline('events', events, e => `${text(e.from_state)} → ${text(e.to_state)} · ${text(e.task_id)}`);
     renderTimeline('runs', runs, r => `${text(r.task_id)} · ${text(r.result)} · ${seconds(r.duration_seconds)}`);
@@ -355,7 +455,7 @@ async function refresh() {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { renderAccounting };
+  module.exports = { renderAccounting, renderControlSurface, sendControl };
 }
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   refresh();

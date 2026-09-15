@@ -1,4 +1,4 @@
-"""One-process DevOrchestrator daemon (monitor loop + read-only Web + Bridge).
+"""One-process DevOrchestrator daemon (monitor + Control API + Bridge).
 
 The preferred runtime entrypoint is a single OS process per computer:
 
@@ -37,6 +37,8 @@ from dev_orchestrator.core.progress import ProgressChannel
 from dev_orchestrator.core.transition_executor import TransitionExecutor
 from dev_orchestrator.core.watchdog import WatchdogCoordinator
 from dev_orchestrator.core.project_status import write_project_statuses
+from dev_orchestrator.control.owner_store import OwnerControlStore
+from dev_orchestrator.control.store import ConversationControlStore
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.storage.json_store import utc_now_iso, write_json, write_text
 from dev_orchestrator.web.server import make_server
@@ -181,8 +183,13 @@ def run_daemon(
     bridge_server = None
     web_thread: Optional[threading.Thread] = None
     bridge_thread: Optional[threading.Thread] = None
+    owner_store = OwnerControlStore(runtime)
+    conversation_store = ConversationControlStore(runtime)
     try:
-        server = make_server(listen, port, runtime, web_root)
+        server = make_server(listen, port, runtime, web_root, enable_control=True)
+        # HTTP heartbeats and daemon-owned binding commands must serialize
+        # through the same in-process store instance.
+        server.conversation_store = conversation_store
         bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=True)
         bridge_server = make_bridge_server(bridge_listen, bridge_port, bridge_store)
     except Exception:
@@ -227,6 +234,7 @@ def run_daemon(
         accounting=accounting,
         failure_memory=failure_memory,
         failure_memory_max_chars=failure_memory_max_chars,
+        owner_store=owner_store,
     )
     reviewer_coordinator = AIReviewerCoordinator(
         runtime,
@@ -245,7 +253,9 @@ def run_daemon(
         failure_memory_max_chars=failure_memory_max_chars,
     )
     control_coordinator = ControlCommandCoordinator(
-        runtime, planner_coordinator, accounting=accounting
+        runtime, planner_coordinator, accounting=accounting,
+        owner_store=owner_store, conversation_store=conversation_store,
+        bridge_store=bridge_store,
     )
     watchdog_coordinator = WatchdogCoordinator(
         runtime, ai_execution_port=ai_execution_port, progress_channel=progress_channel

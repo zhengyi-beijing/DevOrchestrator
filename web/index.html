@@ -31,6 +31,15 @@
       <div class="section-heading"><h2>Projects</h2><span id="lastRefresh">—</span></div>
       <div id="projects" class="project-grid"></div>
     </section>
+
+    <section>
+      <div class="section-heading"><h2>Unified Control</h2><span id="controlStatus">loading</span></div>
+      <div id="controlProjects" class="project-grid"></div>
+      <div class="split-grid">
+        <article class="panel"><div class="section-heading"><h2>Conversation bindings</h2></div><div id="controlBindings" class="timeline"></div></article>
+        <article class="panel"><div class="section-heading"><h2>Command outcomes</h2></div><div id="controlCommands" class="timeline"></div></article>
+      </div>
+    </section>
     <section>
       <div class="section-heading"><h2>Execution Evidence</h2><span>measured · derived · unavailable</span></div>
       <div class="hero-grid">
@@ -76,7 +85,7 @@
   </main>
 
   <footer>
-    Read-only dashboard · GET/HEAD only · no Worker or hardware controls
+    Loopback unified observation and guarded owner control · no arbitrary prompts, shell, file, or hardware controls
   </footer>
   <script src="/app.js"></script>
 </body>

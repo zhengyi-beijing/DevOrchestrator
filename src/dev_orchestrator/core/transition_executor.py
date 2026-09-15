@@ -27,13 +27,14 @@ from dev_orchestrator.agents.models import AgentRequest, AgentResult, AgentRole,
 from dev_orchestrator.agents.registry import BackendRegistry
 from dev_orchestrator.agents.router import AgentRouter
 from dev_orchestrator.config import load_projects_config
+from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_successor
 from dev_orchestrator.core.workflow_policy import inject_workflow_policy
 from dev_orchestrator.core.project_status import write_execution_status
 from dev_orchestrator.core.websol import NextAction, WebSolEvent, WebSolRole
 from dev_orchestrator.monitor.telemetry import extract_task_id
-from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
+from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
 ACTUATION_FILE = "transition-executor.json"
 _LEDGER_VERSION = 1
@@ -291,6 +292,7 @@ class TransitionExecutor:
         accounting: ExecutionRecorder | None = None,
         failure_memory: FailureMemory | None = None,
         failure_memory_max_chars: int = 2000,
+        owner_store: OwnerControlStore | None = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
@@ -302,6 +304,7 @@ class TransitionExecutor:
         self.accounting = accounting
         self.failure_memory = failure_memory
         self.failure_memory_max_chars = failure_memory_max_chars
+        self.owner_store = owner_store or OwnerControlStore(self.runtime_root)
         self._backend_overrides: dict[str, AgentBackend] = {}
         for backend_id, backend in (backend_overrides or {}).items():
             if backend_id not in _SUPPORTED_BACKENDS:
@@ -312,6 +315,24 @@ class TransitionExecutor:
                 raise ValueError("backend override id mismatch for {0}".format(backend_id))
             self._backend_overrides[backend_id] = backend
         self._recover_interrupted_runs()
+
+    def set_owner_paused(
+        self, project_id: str, paused: bool, *, command_id: str,
+        action: str, reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Serialize pause changes with final Worker launch checks."""
+        with self._lock:
+            return self.owner_store.set_paused(
+                project_id, paused, command_id=command_id, action=action, reason=reason
+            )
+
+    def _launch_barrier_reason(self, project_id: str, source_kind: str) -> str | None:
+        state = self.owner_store.project_state(project_id)
+        if state.get("paused"):
+            return "owner pause blocked Worker launch"
+        if source_kind in {"owner_start", "bootstrap"} and state.get("suppress_static_starts"):
+            return "runtime owner control suppresses legacy static launch"
+        return None
 
     def _backend_for_policy(self, backend_id: str, config: dict[str, Any]) -> AgentBackend:
         override = self._backend_overrides.get(backend_id)
@@ -750,6 +771,15 @@ class TransitionExecutor:
             if source_request_id in ledger["executions"]:
                 return None
             project_id = str(project["project_id"])
+            barrier = self._launch_barrier_reason(project_id, source_kind)
+            if barrier:
+                ledger["executions"][source_request_id] = {
+                    "project_id": project_id, "source_request_id": source_request_id,
+                    "source_kind": source_kind, "task_id": task_id, "state": "blocked",
+                    "reason": barrier, "recorded_at": utc_now_iso(),
+                }
+                self._save_ledger(ledger)
+                return None
             if self._active_project(ledger, project_id):
                 ledger["executions"][source_request_id] = {
                     "project_id": project_id,
@@ -852,6 +882,15 @@ class TransitionExecutor:
         with self._lock:
             ledger = self._load_ledger()
             if source_request_id in ledger["executions"]:
+                return None
+            barrier = self._launch_barrier_reason(project_id, source_kind)
+            if barrier:
+                ledger["executions"][source_request_id] = {
+                    "project_id": project_id, "source_request_id": source_request_id,
+                    "source_kind": source_kind, "task_id": task_id, "state": "blocked",
+                    "reason": barrier, "recorded_at": utc_now_iso(),
+                }
+                self._save_ledger(ledger)
                 return None
             if self._active_project(ledger, project_id):
                 ledger["executions"][source_request_id] = {
@@ -1302,6 +1341,8 @@ class TransitionExecutor:
             project_id = _non_blank_config(record.get("project_id"))
             if project_id is None:
                 continue
+            if not self._automatic_decision_allowed(project_id, record.get("consumed_at")):
+                continue
             task_id = _non_blank_config(record.get("task_id"))
             branch = _non_blank_config(record.get("branch"))
             head = _non_blank_config(record.get("head"))
@@ -1457,6 +1498,16 @@ class TransitionExecutor:
                 launches.append(launch)
         return launches
 
+    def _automatic_decision_allowed(self, project_id: str, consumed_at: Any) -> bool:
+        state = self.owner_store.project_state(project_id)
+        if state.get("paused"):
+            return False
+        paused_at = parse_utc(state.get("paused_at"))
+        if paused_at is None:
+            return True
+        consumed = parse_utc(consumed_at)
+        return consumed is not None and consumed > paused_at
+
     def start_control(
         self, project: dict[str, Any], snapshot: dict[str, Any], source_request_id: str
     ) -> Optional[ActuationLaunch]:
@@ -1526,6 +1577,8 @@ class TransitionExecutor:
     ) -> list[ActuationLaunch]:
         launches: list[ActuationLaunch] = []
         for project_id, project in projects.items():
+            if self.owner_store.is_paused(project_id) or self.owner_store.suppress_static_starts(project_id):
+                continue
             policy, _ = _execution_policy(project)
             if policy is None or policy.get("owner_start") is None: continue
             token = policy["owner_start"]; request_id = str(token["request_id"]); task_id = str(token["task_id"])
@@ -1548,6 +1601,8 @@ class TransitionExecutor:
     ) -> list[ActuationLaunch]:
         launches: list[ActuationLaunch] = []
         for project_id, project in projects.items():
+            if self.owner_store.is_paused(project_id) or self.owner_store.suppress_static_starts(project_id):
+                continue
             policy, _ = _execution_policy(project)
             if policy is None or policy.get("bootstrap") is None:
                 continue

@@ -1,4 +1,4 @@
-"""Read-only stdlib HTTP server implementing the accepted P2 surface.
+"""Stdlib dashboard server with legacy reads and opt-in P12 Control API.
 
 Contract: methods ``GET``/``HEAD`` only; static allowlist ``/``, ``/app.js``,
 ``/style.css``; API allowlist ``/api/monitor``, ``/api/summary``,
@@ -13,8 +13,9 @@ surfaces projects whose prepared Web Sol request cannot be delivered yet
 (``delivery_state=unbound``) so the dashboard can ask the owner to bind/rebind
 the ChatGPT conversation. The server never mutates the ledger.
 
-The server reads DevOrchestrator runtime projections only; it never shells
-into observed projects.
+Standalone ``run_web`` remains read-only. Only the unified daemon opts into
+authenticated command enqueueing; HTTP never executes lifecycle actions and
+never shells into observed projects.
 """
 
 from __future__ import annotations
@@ -34,6 +35,14 @@ from urllib.request import urlopen
 from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE
 from dev_orchestrator.accounting import ROLES, build_p11_report, reporting_event_store
 from dev_orchestrator.accounting.events import EventWriteError
+from dev_orchestrator.control.command_store import (
+    ControlCommandConflictError,
+    ControlCommandStore,
+)
+from dev_orchestrator.control.security import ControlSecurity, is_loopback
+from dev_orchestrator.control.store import ConversationControlStore
+from dev_orchestrator.control.surface import project_control_view
+from dev_orchestrator.core.control_commands import submit_control_command
 from dev_orchestrator.platform.process import is_pid_alive
 from dev_orchestrator.storage.json_store import (
     parse_utc,
@@ -50,7 +59,12 @@ _STATIC = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
 _PROJECT_PATH_RE = re.compile(r"^/api/projects/([A-Za-z0-9_-]+)$")
+_CONTROL_PROJECT_PATH_RE = re.compile(r"^/api/v1/control/projects/([A-Za-z0-9_-]+)$")
+_CONTROL_COMMAND_PATH_RE = re.compile(r"^/api/v1/control/commands/([A-Za-z0-9_-]+)$")
+_PAIRING_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/adapter-pairings/([A-Za-z0-9_-]+)/revoke$")
 _ALLOW_HEADER = "GET, HEAD"
+_CONTROL_ALLOW_HEADER = "GET, HEAD, POST, OPTIONS"
+_MAX_CONTROL_BODY = 64 * 1024
 
 
 def monitor_payload(runtime_root: Path | str) -> dict[str, Any]:
@@ -270,6 +284,52 @@ def accounting_payload(runtime_root: Path | str, query: str = "") -> dict[str, A
     return {"available": True, **report}
 
 
+def _control_envelope(data: Any, *, warnings: list[str] | None = None, sources: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now_iso(),
+        "data": data,
+        "warnings": list(warnings or []),
+        "sources": list(sources or []),
+    }
+
+
+def control_overview_payload(runtime_root: Path | str) -> dict[str, Any]:
+    """Build the one-call P12 operator view from existing durable projections."""
+    runtime = Path(runtime_root)
+    raw_summary = read_json(runtime / "summary.json", _default_summary())
+    snapshots = raw_summary.get("projects") if isinstance(raw_summary, dict) else None
+    projects = [project_control_view(row, runtime) for row in (snapshots or []) if isinstance(row, dict)]
+    resources = broker_proxy_payload(runtime, "/api/resources")
+    executions = broker_proxy_payload(runtime, "/api/executions")
+    accounting = accounting_payload(runtime)
+    monitor = monitor_payload(runtime)
+    watchdog = watchdog_payload(runtime)
+    conversations = ConversationControlStore(runtime)
+    warnings: list[str] = []
+    sources: list[dict[str, Any]] = []
+    for name, value in (
+        ("monitor", monitor), ("watchdog", watchdog), ("accounting", accounting),
+        ("broker_resources", resources), ("broker_executions", executions),
+    ):
+        available = value.get("available") if isinstance(value, dict) and "available" in value else True
+        status = "available" if available else "unavailable"
+        sources.append({"name": name, "availability": status})
+        if not available:
+            warnings.append(f"{name} unavailable: {value.get('error') or 'unknown error'}")
+    return _control_envelope({
+        "monitor": monitor,
+        "projects": projects,
+        "resources": resources,
+        "executions": executions,
+        "watchdog": watchdog,
+        "accounting": accounting,
+        "commands": ControlCommandStore(runtime).recent(20),
+        "sessions": conversations.list_sessions(),
+        "bindings": conversations.list_bindings(),
+    }, warnings=warnings, sources=sources)
+
+
 class DevOrchestratorHTTPServer(ThreadingHTTPServer):
     """Threading HTTP server that owns the DevOrchestrator web heartbeat."""
 
@@ -283,11 +343,16 @@ class DevOrchestratorHTTPServer(ThreadingHTTPServer):
         web_root: Path | str,
         listen_label: str,
         started_at: str,
+        enable_control: bool = False,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.web_root = Path(web_root)
         self.listen_label = listen_label
         self.started_at = started_at
+        self.control_enabled = bool(enable_control and is_loopback(listen_label))
+        self.command_store = ControlCommandStore(self.runtime_root)
+        self.conversation_store = ConversationControlStore(self.runtime_root)
+        self.control_security = ControlSecurity(self.runtime_root) if self.control_enabled else None
         self._heartbeat_lock = threading.Lock()
         super().__init__(server_address, _DashboardHandler)
         self.touch_heartbeat(None)
@@ -316,7 +381,7 @@ def _json_bytes(value: Any) -> bytes:
 
 
 class _DashboardHandler(BaseHTTPRequestHandler):
-    """GET/HEAD-only handler; every response carries no-store/nosniff."""
+    """Read dashboard plus daemon-only authenticated Control API mutations."""
 
     protocol_version = "HTTP/1.1"
     server_version = "DevOrchestrator/1.0"
@@ -331,14 +396,43 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self._dispatch(head_only=True)
 
+    def do_POST(self) -> None:
+        if not self.server.control_enabled:
+            self._dispatch_method_not_allowed()
+            return
+        self._dispatch_post()
+
     def _unsupported(self) -> None:
         self._dispatch_method_not_allowed()
 
-    do_POST = _unsupported
     do_PUT = _unsupported
     do_DELETE = _unsupported
     do_PATCH = _unsupported
-    do_OPTIONS = _unsupported
+    def do_OPTIONS(self) -> None:
+        if not self.server.control_enabled or not self._client_is_loopback():
+            self._dispatch_method_not_allowed()
+            return
+        path = urlsplit(self.path).path
+        if (
+            path not in {
+                "/api/v1/control/adapter-pairings/redeem",
+                "/api/v1/control/session-heartbeats",
+            }
+            or self.headers.get("Origin") != "https://chatgpt.com"
+        ):
+            self._dispatch_method_not_allowed()
+            return
+        self._send(
+            204, "No Content", "application/json; charset=utf-8", b"", False,
+            {
+                "Access-Control-Allow-Origin": "https://chatgpt.com",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                "Access-Control-Max-Age": "300",
+                "Vary": "Origin",
+            },
+        )
+        self._touch_after_request()
     do_TRACE = _unsupported
     do_CONNECT = _unsupported
 
@@ -357,6 +451,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'")
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -385,9 +481,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self._error(
             405,
             "Method Not Allowed",
-            "read-only dashboard supports GET and HEAD only",
+            "route does not support this method",
             self.command == "HEAD",
-            {"Allow": _ALLOW_HEADER},
+            {"Allow": _CONTROL_ALLOW_HEADER if self.server.control_enabled else _ALLOW_HEADER},
         )
 
     def _touch_after_request(self) -> None:
@@ -436,7 +532,43 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
 
         runtime = self.server.runtime_root
-        if path == "/api/monitor":
+        if path == "/api/v1/control/overview":
+            payload = control_overview_payload(runtime)
+            payload["data"]["control_enabled"] = self.server.control_enabled
+            for project in payload["data"]["projects"]:
+                project["latest_control"] = self.server.command_store.latest_for_project(
+                    str(project.get("project_id") or project.get("id") or "")
+                )
+        elif path == "/api/v1/control/projects":
+            overview = control_overview_payload(runtime)
+            payload = _control_envelope(overview["data"]["projects"], warnings=overview["warnings"], sources=overview["sources"])
+        elif path.startswith("/api/v1/control/projects/"):
+            match = _CONTROL_PROJECT_PATH_RE.fullmatch(path)
+            if not match:
+                self._error(404, "Not Found", "route not found", head_only); return
+            project = read_json(runtime / "projects" / f"{match.group(1)}.json", None)
+            if not isinstance(project, dict):
+                self._error(404, "Not Found", "project snapshot not found", head_only); return
+            payload = _control_envelope(project_control_view(project, runtime), sources=[{"name": "project_runtime", "availability": "available"}])
+        elif path == "/api/v1/control/resources":
+            data = broker_proxy_payload(runtime, "/api/resources")
+            payload = _control_envelope(data, warnings=[] if data.get("available") else [str(data.get("error"))], sources=[{"name": "aibroker", "availability": "available" if data.get("available") else "unavailable"}])
+        elif path == "/api/v1/control/executions":
+            data = broker_proxy_payload(runtime, "/api/executions")
+            payload = _control_envelope(data, warnings=[] if data.get("available") else [str(data.get("error"))], sources=[{"name": "aibroker", "availability": "available" if data.get("available") else "unavailable"}])
+        elif path == "/api/v1/control/sessions":
+            payload = _control_envelope(self.server.conversation_store.list_sessions(), sources=[{"name": "conversation_sessions", "availability": "available"}])
+        elif path == "/api/v1/control/bindings":
+            payload = _control_envelope(self.server.conversation_store.list_bindings(), sources=[{"name": "conversation_bindings", "availability": "available"}])
+        elif path.startswith("/api/v1/control/commands/"):
+            match = _CONTROL_COMMAND_PATH_RE.fullmatch(path)
+            if not match:
+                self._error(404, "Not Found", "route not found", head_only); return
+            command = self.server.command_store.get(match.group(1))
+            if command is None:
+                self._error(404, "Not Found", "command not found", head_only); return
+            payload = _control_envelope(command, sources=[{"name": "control_command_store", "availability": "available"}])
+        elif path == "/api/monitor":
             payload = monitor_payload(runtime)
         elif path == "/api/summary":
             payload = read_json(runtime / "summary.json", _default_summary())
@@ -481,6 +613,133 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             head_only,
         )
 
+    def _client_is_loopback(self) -> bool:
+        return is_loopback(str(self.client_address[0]))
+
+    def _same_origin(self) -> bool:
+        security = self.server.control_security
+        return bool(security and security.valid_origin(
+            self.headers.get("Origin"), self.headers.get("Host"), int(self.server.server_address[1])
+        ))
+
+    def _fetch_metadata_ok(self) -> bool:
+        value = self.headers.get("Sec-Fetch-Site")
+        return value is None or value in {"same-origin", "none"}
+
+    def _owner_authorized(self) -> bool:
+        security = self.server.control_security
+        if security is None or not self._client_is_loopback():
+            return False
+        bearer = security.bearer_authorized(self.headers.get("Authorization"))
+        if bearer:
+            return self.headers.get("Origin") is None or self._same_origin()
+        return self._same_origin() and self._fetch_metadata_ok() and security.browser_authorized(
+            self.headers.get("Cookie"), self.headers.get("X-DevOrch-CSRF")
+        )
+
+    def _read_control_json(self) -> dict[str, Any] | None:
+        content_type = str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self._error(415, "Unsupported Media Type", "control request must be application/json", False)
+            return None
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = 0
+        if length <= 0 or length > _MAX_CONTROL_BODY:
+            self._error(413 if length > _MAX_CONTROL_BODY else 400, "Payload Too Large" if length > _MAX_CONTROL_BODY else "Bad Request", "invalid control request size", False)
+            return None
+        try:
+            value = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            self._error(400, "Bad Request", "request body must be valid JSON", False)
+            return None
+        if not isinstance(value, dict):
+            self._error(400, "Bad Request", "request body must be a JSON object", False)
+            return None
+        return value
+
+    def _dispatch_post(self) -> None:
+        try:
+            self._route_post()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception:  # noqa: BLE001
+            self._error(500, "Internal Server Error", "request failed", False)
+        finally:
+            self._touch_after_request()
+
+    def _route_post(self) -> None:
+        if not self._client_is_loopback():
+            self._error(403, "Forbidden", "control mutations require a loopback peer", False); return
+        path = urlsplit(self.path).path
+        security = self.server.control_security
+        if security is None:
+            self._dispatch_method_not_allowed(); return
+        if path == "/api/v1/control/browser-sessions":
+            if not self._same_origin() or not self._fetch_metadata_ok():
+                self._error(403, "Forbidden", "browser session requires same-origin request", False); return
+            session_id, csrf = security.create_browser_session()
+            self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope({"csrf_token": csrf, "expires_in_seconds": security.SESSION_TTL_SECONDS})), False,
+                       {"Set-Cookie": f"devorch_control={session_id}; HttpOnly; SameSite=Strict; Path=/api/v1/control"})
+            return
+        if path == "/api/v1/control/adapter-pairings/redeem":
+            if self.headers.get("Origin") != "https://chatgpt.com":
+                self._error(403, "Forbidden", "pairing redemption requires the ChatGPT origin", False); return
+            value = self._read_control_json()
+            if value is None: return
+            try:
+                result = security.redeem_pairing(value.get("pairing_id"), value.get("code"))
+            except ValueError as exc:
+                self._error(400, "Bad Request", str(exc), False); return
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(result)), False,
+                       {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"})
+            return
+        if path == "/api/v1/control/session-heartbeats":
+            origin = self.headers.get("Origin")
+            if origin not in (None, "https://chatgpt.com") or not (security.adapter_authorized(self.headers.get("Authorization")) or security.bearer_authorized(self.headers.get("Authorization"))):
+                self._error(401, "Unauthorized", "valid heartbeat capability required", False); return
+            value = self._read_control_json()
+            if value is None: return
+            try:
+                session = self.server.conversation_store.heartbeat(
+                    value.get("adapter"), value.get("binding_id"), title=value.get("title"),
+                    url=value.get("url"), tab_instance_id=value.get("tab_instance_id"),
+                )
+            except ValueError as exc:
+                self._error(400, "Bad Request", str(exc), False); return
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(session)), False,
+                       {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"} if origin else None)
+            return
+        if not self._owner_authorized():
+            self._error(401, "Unauthorized", "valid control authorization required", False); return
+        if path == "/api/v1/control/adapter-pairings":
+            self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(security.create_pairing())), False); return
+        revoke = _PAIRING_REVOKE_PATH_RE.fullmatch(path)
+        if revoke:
+            try:
+                result = security.revoke_pairing(revoke.group(1))
+            except ValueError as exc:
+                self._error(404, "Not Found", str(exc), False); return
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(result)), False); return
+        if path != "/api/v1/control/commands":
+            self._error(404, "Not Found", "route not found", False); return
+        value = self._read_control_json()
+        if value is None: return
+        command_id = value.get("command_id")
+        try:
+            existing = self.server.command_store.get(command_id) if isinstance(command_id, str) else None
+            record = submit_control_command(
+                self.server.runtime_root, value.get("project_id"), value.get("action"),
+                command_id=command_id, expected=value.get("expected"), target=value.get("target"),
+                source="control_api",
+            )
+        except ControlCommandConflictError as exc:
+            self._error(409, "Conflict", str(exc), False); return
+        except (ValueError, TypeError) as exc:
+            self._error(400, "Bad Request", str(exc), False); return
+        self._send(200 if existing else 202, "OK" if existing else "Accepted", "application/json; charset=utf-8", _json_bytes(_control_envelope(record)), False)
+
     @staticmethod
     def _query_limit(query: str) -> int:
         values = parse_qs(query).get("limit")
@@ -493,14 +752,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
 
 def make_server(
-    host: str, port: int, runtime_root: Path | str, web_root: Path | str
+    host: str, port: int, runtime_root: Path | str, web_root: Path | str,
+    *, enable_control: bool = False,
 ) -> DevOrchestratorHTTPServer:
     """Create (and bind) the dashboard server; runtime heartbeat is written now."""
     runtime = Path(runtime_root)
     runtime.mkdir(parents=True, exist_ok=True)
     started_at = utc_now_iso()
     return DevOrchestratorHTTPServer(
-        (host, port), runtime, Path(web_root), host, started_at
+        (host, port), runtime, Path(web_root), host, started_at,
+        enable_control=enable_control,
     )
 
 

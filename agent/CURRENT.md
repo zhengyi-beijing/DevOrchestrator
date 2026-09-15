@@ -5,9 +5,9 @@
 - Development branch: `feature/self-hosted-dev`.
 - Stable branch: `feature/browser-bridge-multiproject`.
 
-Current task: **P12 Unified AI Control Surface** — **DESIGN COMPLETE / OWNER START REQUIRED**.
+Current task: **P12 Unified AI Control Surface** — **COMPLETE**.
 
-Staged roadmap: `P11d -> P12 -> null`. P12 implementation has not been authorized or started.
+Staged roadmap: `P11d -> P12 -> null`. P12 was owner-authorized and completed on 2026-09-15; no successor is staged.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
@@ -52,4 +52,13 @@ P12 design result:
 - Defined loopback-plus-secret/session security, CSRF/origin guards, exact state revisions, atomic replay/conflict behavior, crash recovery and always-on redacted audit evidence.
 - Defined selective forward-porting from `feature/conversation-control-plane`; no wholesale branch merge and no second 8766 lifecycle-control authority.
 - Design verification passed: staged-roadmap suite 22/22; full Python suite 487 tests plus 16 subtests; Python/JavaScript syntax, whitespace, and Graphify AST refresh passed.
-- P12 remains owner-gated for implementation. `xray-hw-platform` remains paused and unchanged.
+- Owner authorized implementation on 2026-09-15. `xray-hw-platform` remains paused and unchanged.
+
+P12 implementation result:
+- Port 8770 now exposes stable `/api/v1/control/*` read envelopes and a one-call operator overview while preserving every legacy GET route; standalone web remains read-only.
+- Unified-daemon POST uses loopback plus bearer or same-origin browser-session authorization, exact Host/Origin/CSRF checks, strict bounded JSON schemas, narrow ChatGPT CORS preflight, short-lived single-use pairing and revocable hash-only heartbeat capabilities.
+- Command submission is cross-process atomic and replay-safe, with canonical request hashes, conflict detection, persist-before-ack semantics, result-before-inbox-removal recovery and redacted append-only audit evidence.
+- Daemon-owned control implements safe continue, pause/resume, exact supported AIBroker stop, and guarded runtime conversation bind/unbind/rebind; retry, reconcile and universal owner-gate approval remain explicitly unavailable because no exact safe adapter exists.
+- Durable owner pause is enforced at final Worker launch gates and suppresses later legacy static starts. Runtime conversation bindings override static migration fallback without disabling direct AIBroker projects.
+- The dashboard renders server-advertised capabilities, active roles, resources/executions, bindings, P11 evidence and pending/settled command results, including confirmation for stop/owner-gate actions.
+- Verification: 501 tests and 16 subtests passed; Python compilation, dashboard and browser-adapter JavaScript syntax, `git diff --check`, and Graphify refresh passed (2702 nodes, 7223 edges, 140 communities).

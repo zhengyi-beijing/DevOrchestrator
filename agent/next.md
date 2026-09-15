@@ -1,10 +1,19 @@
 # P12 Unified AI Control Surface
 
-Status: **DESIGN COMPLETE / OWNER START REQUIRED**
+Status: **COMPLETE**
 
 Design authorization: **DESIGN P12 / 2026-09-15**
 
-Implementation authorization: **not yet granted**
+Implementation authorization: **START P12 / 2026-09-15**
+
+Completion: **P12.1-P12.4 ACCEPTED / 2026-09-15**
+
+Completion evidence: the daemon-only 8770 Control API, atomic command/audit
+store, loopback authentication, guarded owner actions, conversation
+session/binding registry, capability-driven dashboard and representative
+software-only scenario are implemented. Full regression passed with 501 tests
+and 16 subtests; Python compilation, both JavaScript syntax checks,
+`git diff --check`, and Graphify AST refresh also passed.
 
 Goal: make port 8770 the primary day-to-day project and AI-resource control surface while keeping AIBroker port 8875 as the broker-specialist configuration and diagnostic surface.
 

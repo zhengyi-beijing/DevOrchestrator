@@ -9,12 +9,20 @@ from uuid import uuid4
 
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.accounting import ExecutionRecorder
+from dev_orchestrator.control.command_store import (
+    CONTROL_ACTIONS,
+    ControlCommandStore,
+    safe_command_id,
+)
+from dev_orchestrator.control.owner_store import OwnerControlStore
+from dev_orchestrator.control.store import ConversationConflictError, ConversationControlStore
+from dev_orchestrator.control.surface import validate_expected
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 CONTROL_DIR = "control"
 CONTROL_VERSION = 1
-_SUPPORTED_ACTIONS = frozenset({"continue"})
+_SUPPORTED_ACTIONS = CONTROL_ACTIONS
 
 
 def _nonblank(value: Any) -> str | None:
@@ -25,10 +33,7 @@ def _nonblank(value: Any) -> str | None:
 
 
 def _safe_command_id(value: Any) -> str | None:
-    text = _nonblank(value)
-    if text is None or len(text) > 128 or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in text):
-        return None
-    return text
+    return safe_command_id(value)
 
 
 def _continuation_id(source_request_id: str) -> str:
@@ -48,13 +53,15 @@ def submit_control_command(
     *,
     command_id: Optional[str] = None,
     gate_id: Optional[str] = None,
+    expected: Optional[dict[str, Any]] = None,
+    target: Optional[dict[str, Any]] = None,
+    source: str = "local_client",
 ) -> dict[str, Any]:
     project = _nonblank(project_id)
     if project is None:
         raise ValueError("project_id must be nonblank")
     if action not in _SUPPORTED_ACTIONS:
         raise ValueError("unsupported control action")
-    inbox, _ = _paths(runtime_root)
     if command_id is not None:
         cid = _safe_command_id(command_id)
         if cid is None:
@@ -64,31 +71,22 @@ def submit_control_command(
     gate = _nonblank(gate_id)
     if gate_id is not None and gate is None:
         raise ValueError("gate_id must be nonblank when present")
-    record = {
-        "version": CONTROL_VERSION,
+    target_value = dict(target or {})
+    if gate is not None:
+        target_value["gate_id"] = gate
+    value = {
+        "schema_version": 1,
         "command_id": cid,
         "project_id": project,
         "action": action,
-        "state": "pending",
-        "requested_at": utc_now_iso(),
+        "expected": dict(expected or {}),
+        "target": target_value,
     }
-    if gate is not None:
-        record["gate_id"] = gate
-    write_json(inbox / (cid + ".json"), record, indent=2)
-    return record
+    return ControlCommandStore(runtime_root).submit(value, source=source)
 
 
 def latest_control_result(runtime_root: Path | str, project_id: str) -> dict[str, Any] | None:
-    _, history = _paths(runtime_root)
-    rows: list[dict[str, Any]] = []
-    if history.is_dir():
-        for path in history.glob("*.json"):
-            row = read_json(path, None)
-            if isinstance(row, dict) and row.get("project_id") == project_id:
-                rows.append(row)
-    if not rows:
-        return None
-    return max(rows, key=lambda row: str(row.get("processed_at") or row.get("requested_at") or ""))
+    return ControlCommandStore(runtime_root).latest_for_project(project_id)
 
 
 class ControlCommandCoordinator:
@@ -97,11 +95,18 @@ class ControlCommandCoordinator:
     def __init__(
         self, runtime_root: Path | str, planner: AIPlannerCoordinator | None = None,
         accounting: ExecutionRecorder | None = None,
+        *, owner_store: OwnerControlStore | None = None,
+        conversation_store: ConversationControlStore | None = None,
+        bridge_store: Any = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.inbox, self.history = _paths(runtime_root)
+        self.command_store = ControlCommandStore(runtime_root)
         self.planner = planner
         self.accounting = accounting
+        self.owner_store = owner_store or OwnerControlStore(runtime_root)
+        self.conversation_store = conversation_store or ConversationControlStore(runtime_root)
+        self.bridge_store = bridge_store
     @staticmethod
     def _snapshot_map(summary: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(summary, dict) or not isinstance(summary.get("projects"), list):
@@ -128,9 +133,7 @@ class ControlCommandCoordinator:
         outcomes.extend(self._sync_planner_terminals())
         outcomes.extend(self._resume_ready_plans(projects, snapshots, executor))
         outcomes.extend(self._resume_decision_handoffs(projects, snapshots, executor))
-        if not self.inbox.is_dir():
-            return outcomes
-        for path in sorted(self.inbox.glob("*.json"), key=lambda item: item.name):
+        for path in self.command_store.pending_paths():
             record = read_json(path, None)
             raw_id = _safe_command_id(record.get("command_id")) if isinstance(record, dict) else None
             existing = read_json(self.history / (raw_id + ".json"), None) if raw_id else None
@@ -139,8 +142,7 @@ class ControlCommandCoordinator:
                 outcomes.append(existing)
                 continue
             outcome = self._consume_one(record, projects, snapshots, executor)
-            write_json(self.history / (outcome["command_id"] + ".json"), outcome, indent=2)
-            path.unlink(missing_ok=True)
+            outcome = self.command_store.settle(path, outcome)
             outcomes.append(outcome)
         return outcomes
     def _resume_decision_handoffs(
@@ -158,6 +160,8 @@ class ControlCommandCoordinator:
             project_id = _nonblank(row.get("project_id")); next_task_id = _nonblank(row.get("next_task_id"))
             project = projects.get(project_id or ""); snapshot = snapshots.get(project_id or "")
             if project is None or snapshot is None or next_task_id is None:
+                continue
+            if self.owner_store.is_paused(project_id or ""):
                 continue
             telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
             staged_successor = _nonblank(row.get("staged_successor"))
@@ -189,9 +193,11 @@ class ControlCommandCoordinator:
             else:
                 outcome = {"version":CONTROL_VERSION,"command_id":continuation_id,"project_id":project_id,"action":"continue","state":"accepted","source":"automatic_review_handoff","parent_request_id":source_id,"lifecycle_action":"plan","plan_id":plan_id,"reason":reason,"processed_at":now}
                 write_json(history_path, outcome, indent=2)
+                self.command_store.audit("command_updated", outcome)
                 executor.mark_handoff_consumed(source_id, continuation_id, plan_id)
             if plan_id is None:
                 write_json(history_path, outcome, indent=2)
+                self.command_store.audit("command_updated", outcome)
             outcomes.append(outcome)
         return outcomes
 
@@ -210,6 +216,7 @@ class ControlCommandCoordinator:
                             "lifecycle_action":"plan", "reason":str(plan.get("reason") or plan_state),
                             "processed_at":utc_now_iso(), "plan_state":plan_state})
             write_json(self.history / (command_id + ".json"), history, indent=2)
+            self.command_store.audit("command_updated", history)
             self.planner.mark_control_synced(plan_id)
             outcomes.append(history)
         return outcomes
@@ -225,6 +232,8 @@ class ControlCommandCoordinator:
             command_id = _safe_command_id(plan.get("command_id"))
             plan_id = _nonblank(plan.get("plan_id"))
             if project_id is None or command_id is None or plan_id is None:
+                continue
+            if self.owner_store.is_paused(project_id):
                 continue
             project = projects.get(project_id); snapshot = snapshots.get(project_id)
             if project is None or snapshot is None:
@@ -256,6 +265,7 @@ class ControlCommandCoordinator:
             if not isinstance(history, dict): history = {}
             history.update({"state":"accepted","lifecycle_action":"execute","task_id":launch.task_id,"backend_id":launch.backend_id,"resumed_at":utc_now_iso()})
             write_json(self.history / (command_id + ".json"), history, indent=2)
+            self.command_store.audit("command_updated", history)
             outcomes.append(history)
         return outcomes
 
@@ -283,7 +293,12 @@ class ControlCommandCoordinator:
         snapshot = snapshots.get(project_id)
         if snapshot is None:
             return self._blocked(command_id, project_id, action, "project snapshot is unavailable", now, record)
-        gate_id = _nonblank(record.get("gate_id"))
+        if record.get("source") == "control_api" or (isinstance(record.get("expected"), dict) and record["expected"].get("revision")):
+            valid, reason, observed = validate_expected(record.get("expected"), snapshot, self.runtime_root)
+            if not valid:
+                return self._blocked(command_id, project_id, action, reason, now, {**record, "observed": observed})
+        target = record.get("target") if isinstance(record.get("target"), dict) else {}
+        gate_id = _nonblank(target.get("gate_id"))
         if gate_id is not None and self.accounting is not None:
             telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
             self.accounting.close_owner_gate(
@@ -294,6 +309,25 @@ class ControlCommandCoordinator:
                 role="owner",
                 request_id=command_id,
             )
+        if action == "pause":
+            state = self.owner_store.set_paused(
+                project_id, True, command_id=command_id, action=action,
+                reason="explicit owner pause",
+            )
+            return {**record, "state": "accepted", "processed_at": now, "effect": "pause_future_launches", "owner_control": state}
+        if action == "resume":
+            state = self.owner_store.set_paused(
+                project_id, False, command_id=command_id, action=action
+            )
+            return {**record, "state": "accepted", "processed_at": now, "effect": "resume_future_launches", "owner_control": state}
+        if action == "stop":
+            return self._stop(record, project_id, command_id, now, executor)
+        if action in {"bind_conversation", "unbind_conversation", "rebind_conversation"}:
+            return self._conversation_action(record, snapshot, project_id, command_id, action, target, now)
+        if action in {"retry", "reconcile", "approve_owner_gate"}:
+            return self._blocked(command_id, project_id, action, "action is not available for the current projected target", now, record)
+        if self.owner_store.is_paused(project_id):
+            return self._blocked(command_id, project_id, action, "project is paused", now, record)
         next_status = str(snapshot.get("next_status") or "").upper()
         if "PENDING DESIGN" in next_status:
             if self.planner is None:
@@ -314,6 +348,64 @@ class ControlCommandCoordinator:
         state = executor.state().get("executions", {}).get(command_id, {})
         reason = state.get("reason") if isinstance(state, dict) else None
         return self._blocked(command_id, project_id, action, str(reason or "control command was not launched"), now, record)
+
+    def _stop(
+        self, record: dict[str, Any], project_id: str, command_id: str,
+        now: str, executor: Any,
+    ) -> dict[str, Any]:
+        state = executor.state()
+        executions = state.get("executions") if isinstance(state, dict) else None
+        active = [row for row in (executions or {}).values() if isinstance(row, dict) and row.get("project_id") == project_id and row.get("state") in {"launching", "running"}]
+        latest = max(active, key=lambda row: str(row.get("started_at") or ""), default=None)
+        if latest is not None and (latest.get("engine") != "aibroker" or not latest.get("broker_request_id")):
+            return self._blocked(command_id, project_id, "stop", "active execution does not support managed interruption", now, record)
+        owner = self.owner_store.set_paused(
+            project_id, True, command_id=command_id, action="stop",
+            reason="explicit owner stop",
+        )
+        result: dict[str, Any] = {**record, "state": "accepted", "processed_at": now, "effect": "pause_future_launches", "owner_control": owner}
+        if latest is None:
+            return result
+        port = getattr(executor, "_ai_execution_port", None)
+        interrupt = getattr(port, "interrupt", None)
+        if not callable(interrupt):
+            return {**result, "state": "failed", "reason": "pause retained; AIBroker interruption is unavailable"}
+        try:
+            fact = interrupt(str(latest["broker_request_id"]), "explicit P12 owner stop")
+        except Exception as exc:  # noqa: BLE001 - pause remains the safe effect
+            return {**result, "state": "failed", "reason": f"pause retained; interruption failed: {exc}"}
+        return {**result, "effect": "pause_and_interrupt", "interruption": fact, "execution_id": latest.get("source_request_id")}
+
+    def _conversation_action(
+        self, record: dict[str, Any], snapshot: dict[str, Any], project_id: str,
+        command_id: str, action: str, target: dict[str, Any], now: str,
+    ) -> dict[str, Any]:
+        current = self.conversation_store.binding_for_project(project_id)
+        route = current if isinstance(current, dict) else (
+            snapshot.get("conversation_binding")
+            if self.conversation_store.runtime_record_for_project(project_id) is None
+            and isinstance(snapshot.get("conversation_binding"), dict)
+            else None
+        )
+        if action in {"unbind_conversation", "rebind_conversation"} and route is not None and self.bridge_store is not None:
+            active = getattr(self.bridge_store, "has_active_claim", None)
+            if callable(active) and active(str(route.get("adapter") or ""), str(route.get("binding_id") or "")):
+                return self._blocked(command_id, project_id, action, "active claimed Web Sol request blocks binding change", now, record)
+        try:
+            if action == "unbind_conversation":
+                binding = self.conversation_store.unbind(project_id)
+            else:
+                adapter = _nonblank(target.get("adapter"))
+                binding_id = _nonblank(target.get("binding_id"))
+                if adapter is None or binding_id is None:
+                    return self._blocked(command_id, project_id, action, "binding target requires adapter and binding_id", now, record)
+                if action == "bind_conversation":
+                    binding = self.conversation_store.bind(project_id, adapter, binding_id)
+                else:
+                    binding = self.conversation_store.rebind(project_id, adapter, binding_id)
+        except (ConversationConflictError, ValueError) as exc:
+            return self._blocked(command_id, project_id, action, str(exc), now, record)
+        return {**record, "state": "accepted", "processed_at": now, "effect": action, "binding": binding}
     @staticmethod
     def _blocked(
         command_id: str,

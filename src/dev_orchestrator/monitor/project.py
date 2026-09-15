@@ -187,6 +187,11 @@ def run_monitor_once(
 
     config = load_projects_config(config_path)
     runtime = Path(runtime_root)
+    from dev_orchestrator.control.binding_resolver import resolve_effective_projects
+    from dev_orchestrator.control.store import ConversationControlStore
+    projects = resolve_effective_projects(
+        config.get("projects") or [], ConversationControlStore(runtime)
+    )
     projects_dir = runtime / "projects"
     history_dir = runtime / "history"
     projects_dir.mkdir(parents=True, exist_ok=True)
@@ -196,7 +201,7 @@ def run_monitor_once(
     tick_now = now or utc_now()
 
     snapshots: list[dict[str, Any]] = []
-    for project in config.get("projects") or []:
+    for project in projects:
         project_id = str(project.get("project_id") or "")
         snapshot_path = projects_dir / (project_id + ".json")
         previous: Optional[dict] = None

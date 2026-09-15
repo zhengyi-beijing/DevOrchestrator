@@ -373,7 +373,8 @@ def cmd_project_status(args: argparse.Namespace) -> int:
     if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
         _print_json({"project_id": project_id, "state": "not_found"})
         return 1
-    projected = project_runtime_status(snapshot, runtime)
+    from dev_orchestrator.control.surface import project_control_view
+    projected = project_control_view(snapshot, runtime)
     payload = dict(projected)
     payload["latest_control"] = latest_control_result(runtime, project_id)
     _print_json(payload)
@@ -388,14 +389,48 @@ def cmd_project_continue(args: argparse.Namespace) -> int:
     snapshot = read_json(runtime / "projects" / (project_id + ".json"), None)
     if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
         _fail("project is not present in the current runtime")
+    from dev_orchestrator.control.surface import project_identity
     _print_json(
         submit_control_command(
             runtime,
             project_id,
             "continue",
             gate_id=getattr(args, "gate_id", None),
+            expected=project_identity(snapshot, runtime),
+            source="local_cli",
         )
     )
+    return 0
+
+
+def cmd_project_control(args: argparse.Namespace) -> int:
+    """Queue any closed P12 action using the same command envelope as 8770."""
+    runtime = resolve_runtime_root(args.runtime_root)
+    project_id = _validated_project_id(args.project_id)
+    if _recorded_pid(runtime, "daemon") is None:
+        _fail("DevOrchestrator daemon is not running")
+    snapshot = read_json(runtime / "projects" / (project_id + ".json"), None)
+    if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
+        _fail("project is not present in the current runtime")
+    from dev_orchestrator.control.surface import project_identity
+    target = {}
+    if args.binding_id and args.action in {"bind_conversation", "rebind_conversation"}:
+        target.update({"adapter": args.adapter, "binding_id": args.binding_id})
+    if args.target_id and args.action in {"retry", "reconcile"}:
+        target["target_id"] = args.target_id
+    if args.target_id and args.action == "approve_owner_gate":
+        target["gate_id"] = args.target_id
+    _print_json(submit_control_command(
+        runtime, project_id, args.action, command_id=args.command_id,
+        expected=project_identity(snapshot, runtime), target=target,
+        source="local_cli",
+    ))
+    return 0
+
+
+def cmd_control_overview(args: argparse.Namespace) -> int:
+    from dev_orchestrator.web.server import control_overview_payload
+    _print_json(control_overview_payload(resolve_runtime_root(args.runtime_root)))
     return 0
 
 
@@ -932,6 +967,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicit owner-gate correlation id for wait-time accounting",
     )
 
+    project_control = sub.add_parser("project-control", help="queue a closed P12 control action")
+    project_control.add_argument("project_id")
+    project_control.add_argument("action", choices=(
+        "continue", "pause", "resume", "stop", "retry", "reconcile",
+        "approve_owner_gate", "bind_conversation", "unbind_conversation", "rebind_conversation",
+    ))
+    project_control.add_argument("--command-id", default=None)
+    project_control.add_argument("--target-id", default=None)
+    project_control.add_argument("--adapter", default="chatgpt_web")
+    project_control.add_argument("--binding-id", default=None)
+    project_control.add_argument("--runtime-root", default=None)
+
+    control_overview = sub.add_parser("control-overview", help="print the versioned P12 overview envelope")
+    control_overview.add_argument("--runtime-root", default=None)
+
     import_rdc = sub.add_parser(
         "import-rdc-evidence",
         help="import normalized RDC invocation evidence into the accounting ledger",
@@ -1027,6 +1077,8 @@ _COMMANDS = {
     "watchdog-status": cmd_watchdog_status,
     "watchdog-clear-degraded": cmd_watchdog_clear_degraded,
     "project-continue": cmd_project_continue,
+    "project-control": cmd_project_control,
+    "control-overview": cmd_control_overview,
     "import-rdc-evidence": cmd_import_rdc_evidence,
     "execution-report": cmd_execution_report,
     "monitor": cmd_monitor,

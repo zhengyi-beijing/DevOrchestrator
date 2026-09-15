@@ -1,10 +1,12 @@
 # P12 Unified AI Control Surface
 
-Status: **DESIGN FROZEN / OWNER START REQUIRED**
+Status: **COMPLETE / ACCEPTED 2026-09-15**
 
 Design authorization: **DESIGN P12 / 2026-09-15**
 
-Implementation authorization: **not yet granted**
+Implementation authorization: **START P12 / 2026-09-15**
+
+Implementation acceptance: **P12.1-P12.4 PASS / 2026-09-15**
 
 ## Outcome
 

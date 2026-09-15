@@ -1,0 +1,214 @@
+"""Atomic, idempotent command inbox and always-on control audit."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+from dev_orchestrator.accounting.events import InterProcessFileLock
+from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
+
+CONTROL_SCHEMA_VERSION = 1
+CONTROL_ACTIONS = frozenset({
+    "continue", "pause", "resume", "stop", "retry", "reconcile",
+    "approve_owner_gate", "bind_conversation", "unbind_conversation",
+    "rebind_conversation",
+})
+
+
+class ControlCommandConflictError(RuntimeError):
+    """A command id was reused with different canonical input."""
+
+
+class ControlCommandCorruptionError(RuntimeError):
+    """A durable command record exists but cannot be read safely."""
+
+
+def safe_command_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 128:
+        return None
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    return text if all(ch in allowed for ch in text) else None
+
+
+def _nonblank(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be nonblank")
+    return value.strip()
+
+
+def canonical_request(value: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"schema_version", "command_id", "project_id", "action", "expected", "target"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError("unknown control request fields: " + ", ".join(unknown))
+    if value.get("schema_version") != CONTROL_SCHEMA_VERSION:
+        raise ValueError("unsupported control schema_version")
+    expected = value.get("expected", {})
+    target = value.get("target", {})
+    if not isinstance(expected, dict):
+        raise ValueError("expected must be an object")
+    if not isinstance(target, dict):
+        raise ValueError("target must be an object")
+    action = _nonblank(value.get("action"), "action")
+    if action not in CONTROL_ACTIONS:
+        raise ValueError("unsupported control action")
+    expected_allowed = {
+        "revision", "branch", "head", "task_id", "lifecycle_state", "gate_id",
+        "paused", "binding_state", "binding_id", "binding_adapter",
+    }
+    expected_unknown = sorted(set(expected) - expected_allowed)
+    if expected_unknown:
+        raise ValueError("unknown expected fields: " + ", ".join(expected_unknown))
+    target_allowed = {
+        "continue": {"gate_id"},
+        "pause": set(), "resume": set(), "stop": set(),
+        "retry": {"target_id"}, "reconcile": {"target_id"},
+        "approve_owner_gate": {"gate_id"},
+        "bind_conversation": {"adapter", "binding_id"},
+        "unbind_conversation": set(),
+        "rebind_conversation": {"adapter", "binding_id"},
+    }[action]
+    target_unknown = sorted(set(target) - target_allowed)
+    if target_unknown:
+        raise ValueError("unknown target fields for action: " + ", ".join(target_unknown))
+    return {
+        "schema_version": CONTROL_SCHEMA_VERSION,
+        "command_id": _nonblank(value.get("command_id"), "command_id"),
+        "project_id": _nonblank(value.get("project_id"), "project_id"),
+        "action": action,
+        "expected": expected,
+        "target": target,
+    }
+
+
+def request_hash(value: dict[str, Any]) -> str:
+    raw = json.dumps(canonical_request(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class ControlCommandStore:
+    """Serialize command submission across local threads and processes."""
+
+    def __init__(self, runtime_root: Path | str) -> None:
+        self.runtime_root = Path(runtime_root)
+        self.root = self.runtime_root / "control"
+        self.inbox = self.root / "inbox"
+        self.history = self.root / "history"
+        self.audit_path = self.root / "audit.jsonl"
+        self.lock_path = self.root / "commands.lock"
+
+    def _read_existing(self, command_id: str) -> dict[str, Any] | None:
+        for path in (self.history / f"{command_id}.json", self.inbox / f"{command_id}.json"):
+            if not path.exists():
+                continue
+            value = read_json(path, None)
+            if not isinstance(value, dict):
+                raise ControlCommandCorruptionError(f"unreadable control record: {path.name}")
+            return value
+        return None
+
+    @staticmethod
+    def _existing_hash(value: dict[str, Any]) -> str | None:
+        stored = value.get("request_hash")
+        if isinstance(stored, str) and stored:
+            return stored
+        try:
+            return request_hash(value)
+        except ValueError:
+            return None
+
+    def submit(self, value: dict[str, Any], *, source: str) -> dict[str, Any]:
+        canonical = canonical_request(value)
+        command_id = safe_command_id(canonical["command_id"])
+        if command_id is None:
+            raise ValueError("invalid command_id")
+        digest = request_hash(canonical)
+        with InterProcessFileLock(self.lock_path):
+            existing = self._read_existing(command_id)
+            if existing is not None:
+                if self._existing_hash(existing) != digest:
+                    raise ControlCommandConflictError("command_id already belongs to different input")
+                return existing
+            record = {
+                "version": 1,
+                **canonical,
+                "request_hash": digest,
+                "source": _nonblank(source, "source"),
+                "state": "pending",
+                "requested_at": utc_now_iso(),
+            }
+            write_json(self.inbox / f"{command_id}.json", record, indent=2)
+            self._append_audit_unlocked("request_accepted", record)
+            return record
+
+    def get(self, command_id: str) -> dict[str, Any] | None:
+        safe = safe_command_id(command_id)
+        if safe is None:
+            raise ValueError("invalid command_id")
+        return self._read_existing(safe)
+
+    def pending_paths(self) -> list[Path]:
+        if not self.inbox.is_dir():
+            return []
+        return sorted(self.inbox.glob("*.json"), key=lambda item: item.name)
+
+    def settle(self, inbox_path: Path, outcome: dict[str, Any]) -> dict[str, Any]:
+        command_id = safe_command_id(outcome.get("command_id"))
+        if command_id is None:
+            raise ValueError("cannot settle invalid command_id")
+        with InterProcessFileLock(self.lock_path):
+            existing = read_json(self.history / f"{command_id}.json", None)
+            if isinstance(existing, dict):
+                inbox_path.unlink(missing_ok=True)
+                return existing
+            write_json(self.history / f"{command_id}.json", outcome, indent=2)
+            self._append_audit_unlocked("command_settled", outcome)
+            inbox_path.unlink(missing_ok=True)
+            return outcome
+
+    def recent(self, limit: int = 20) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(100, int(limit)))
+        rows: list[dict[str, Any]] = []
+        for directory in (self.history, self.inbox):
+            if not directory.is_dir():
+                continue
+            for path in directory.glob("*.json"):
+                value = read_json(path, None)
+                if isinstance(value, dict):
+                    rows.append(value)
+        rows.sort(key=lambda row: str(row.get("processed_at") or row.get("requested_at") or ""))
+        return rows[-safe_limit:]
+
+    def latest_for_project(self, project_id: str) -> dict[str, Any] | None:
+        rows = [row for row in self.recent(100) if row.get("project_id") == project_id]
+        return rows[-1] if rows else None
+
+    def audit(self, event: str, value: dict[str, Any]) -> None:
+        with InterProcessFileLock(self.lock_path):
+            self._append_audit_unlocked(event, value)
+
+    def _append_audit_unlocked(self, event: str, value: dict[str, Any]) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        row = {
+            "schema_version": 1,
+            "event": event,
+            "occurred_at": utc_now_iso(),
+            "command_id": value.get("command_id"),
+            "project_id": value.get("project_id"),
+            "action": value.get("action"),
+            "state": value.get("state"),
+            "request_hash": value.get("request_hash"),
+            "reason": value.get("reason"),
+            "effect": value.get("effect"),
+        }
+        with self.audit_path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
