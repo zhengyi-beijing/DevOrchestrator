@@ -217,6 +217,12 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         self.assertIn("reviewer-a", argv)
 
 
+    def test_execution_timeout_is_normalized_as_temporary_provider_failure(self):
+        payload = self.payload(status="failed", output=None, error="execution timed out after 1800.0 seconds")
+        result = self.port._result_from_payload(self.request(role="reviewer"), payload)
+        self.assertEqual(result.failure_classification, "provider_temporarily_unavailable")
+
+
     @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
     def test_status_and_interrupt_use_broker_reconciliation_commands(self, run):
         running = {"request_id": "req-1", "status": "running", "resource_id": "r1"}

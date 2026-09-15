@@ -42,6 +42,7 @@ _RESOURCE_FAILURE_TEXT = (
     ("too many requests", "rate_limited"),
     ("temporarily unavailable", "provider_temporarily_unavailable"),
     ("service unavailable", "provider_temporarily_unavailable"),
+    ("execution timed out after", "provider_temporarily_unavailable"),
     ("resource unavailable", "resource_unavailable"),
     ("account unavailable", "resource_unavailable"),
     ("model unavailable", "resource_unavailable"),
