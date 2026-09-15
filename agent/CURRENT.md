@@ -5,9 +5,9 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12OPS Self-Host Operational Acceptance** — **PENDING DESIGN**.
+Current task: **P12.5 Self-Host Operational Acceptance** — **PENDING DESIGN**.
 
-Staged roadmap history remains P11d -> P12 -> null; P12OPS is an owner-authorized operational acceptance task used to validate the converged canonical main deployment before attaching other projects.
+Staged roadmap history remains P11d -> P12 -> null; P12.5 is an owner-authorized operational acceptance task used to validate the converged canonical main deployment before attaching other projects.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.

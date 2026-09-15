@@ -1,8 +1,8 @@
-# P12OPS Self-Host Operational Acceptance
+# P12.5 Self-Host Operational Acceptance
 
 Status: **PENDING DESIGN**
 
-Owner authorization: **START P12OPS / 2026-09-15**
+Owner authorization: **START P12.5 / 2026-09-15**
 
 Goal: prove the canonical `main` deployment can safely operate DevOrchestrator as its own managed project, with P11 accounting and the P12 unified control surface observable from the running daemon.
 
