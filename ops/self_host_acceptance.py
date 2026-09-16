@@ -28,10 +28,14 @@ def sanitize_url(url: str) -> str:
         parsed = urllib.parse.urlsplit(url)
         if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
             hostname = parsed.hostname or ""
+            try:
+                host_part = f"[{hostname}]" if ipaddress.ip_address(hostname).version == 6 else hostname
+            except ValueError:
+                host_part = hostname
             port_part = f":{parsed.port}" if parsed.port is not None else ""
             return urllib.parse.urlunsplit((
                 parsed.scheme,
-                f"{hostname}{port_part}",
+                f"{host_part}{port_part}",
                 parsed.path,
                 parsed.query,
                 parsed.fragment,
@@ -64,7 +68,8 @@ def validate_loopback_url(url: str, param_name: str) -> str:
     if parsed.query or parsed.fragment:
         raise ValueError(f"{param_name} must not contain query or fragment parameters")
     port_part = f":{parsed.port}" if parsed.port is not None else ""
-    return f"{parsed.scheme.lower()}://{hostname}{port_part}".rstrip("/")
+    host_part = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{parsed.scheme.lower()}://{host_part}{port_part}".rstrip("/")
 
 
 def canonical_path(p: str | Path | None) -> str:
@@ -193,11 +198,20 @@ def run_acceptance_checks(
         unified_res_diags.append(malformed_msg)
         unified_exec_diags.append(malformed_msg)
     else:
-        overview_warnings = [
-            str(w) for w in overview.get("warnings", [])
-            if isinstance(w, str) and w
-        ]
+        warnings_raw = overview.get("warnings", [])
+        if not isinstance(warnings_raw, list):
+            control_diags.append("control overview missing or invalid 'warnings' list")
+            warnings_raw = []
+        overview_warnings = [str(w) for w in warnings_raw if isinstance(w, str) and w]
+
         sources = overview.get("sources", [])
+        if not isinstance(sources, list):
+            sources_msg = "control overview missing or invalid 'sources' list"
+            control_diags.append(sources_msg)
+            accounting_diags.append(sources_msg)
+            unified_res_diags.append(sources_msg)
+            unified_exec_diags.append(sources_msg)
+            sources = []
         sources_dict = {
             s.get("name"): s.get("availability")
             for s in sources if isinstance(s, dict) and s.get("name")
@@ -274,9 +288,21 @@ def run_acceptance_checks(
                             f"expected {str(resolved_expected_repo)!r}, got {str(actual_repo_path)!r}"
                         )
 
+                    git_info = target_project.get("git")
+                    if git_info is None:
+                        git_info = {}
+                    elif not isinstance(git_info, dict):
+                        project_identity_diags.append(f"project {project_id!r} has invalid 'git' object")
+                        git_info = {}
+                    control_identity = target_project.get("control_identity")
+                    if control_identity is None:
+                        control_identity = {}
+                    elif not isinstance(control_identity, dict):
+                        project_identity_diags.append(f"project {project_id!r} has invalid 'control_identity' object")
+                        control_identity = {}
                     actual_branch = (
-                        (target_project.get("git") or {}).get("branch")
-                        or (target_project.get("control_identity") or {}).get("branch")
+                        git_info.get("branch")
+                        or control_identity.get("branch")
                         or target_project.get("branch")
                     )
                     if actual_branch != expected_branch:

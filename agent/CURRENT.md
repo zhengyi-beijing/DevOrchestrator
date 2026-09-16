@@ -124,3 +124,13 @@ P12.5 recovery consumption remediation result:
   evidence and fails recovery closed.
 - Verification: focused transition/control/remediation suites passed (39
   tests); full suite passed (566 tests and 22 subtests in 151.23s).
+
+P12.5 post-reanchor closure remediation result (2026-09-17):
+- Acceptance parsing now fails closed on malformed/null overview collections and incorrectly typed nested project identity objects; IPv6 loopback normalization preserves brackets.
+- Reconcile replay is restart-idempotent after a durably persisted reviewer launch, avoiding false blocked settlement after a crash boundary.
+- Exact current-HEAD re-anchored REMEDIATE work blocked only by transient lifecycle/active-worker state can be recovered by a new explicit owner `continue` without mutating historical evidence.
+- Recovery precedence preserves the established descendant-recovery barrier when no exact re-anchor candidate exists.
+- Focused regression: 54 tests and 9 subtests passed.
+- Full regression: 583 tests and 31 subtests passed; compileall and `git diff --check` passed.
+- Live self-host acceptance passed against daemon PID 29212 and AIBroker 8875.
+- Current implementation is ready for independent technical re-review before P12.5 closure.

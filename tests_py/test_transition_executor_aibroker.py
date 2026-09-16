@@ -249,6 +249,58 @@ class AIBrokerTransitionTests(unittest.TestCase):
             self.assertIsNone(launch)
             self.assertEqual(port.requests, [])
 
+    def test_owner_continue_recovers_exact_blocked_reanchored_remediation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"; runtime.mkdir()
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            truth = read_repository_truth(repo)
+            original_id = "stale-failed-remediation"
+            decision_id = "ai_review:reconcile:reanchor-one"
+            resource = {"resource_id": "agy/default/model", "provider": "agy", "account": "default", "model": "model"}
+            original = {
+                "project_id": "p1", "source_request_id": original_id,
+                "source_kind": "remediation", "task_id": "P1", "engine": "aibroker",
+                "state": "failed", "broker_status": "failed", "session_id": None,
+                "provider_output_observed": False, "first_output_at": None,
+                "reason": "WorktreeUnsafeError: dirty worktree requires deterministic recovery before writable reuse",
+                "dispatch_id": "d-old", "decision_id": "q-old", "execution_id": "e-old",
+                "resource_context": resource,
+            }
+            blocked = {
+                "project_id": "p1", "source_request_id": decision_id,
+                "source_kind": "remediation", "task_id": "P1", "state": "blocked",
+                "reason": "project state is not eligible for exact remediation", "recorded_at": "2026-09-16T08:34:00+00:00",
+            }
+            (runtime / "transition-executor.json").write_text(
+                json.dumps({"version": 1, "executions": {original_id: original, decision_id: blocked}}), encoding="utf-8"
+            )
+            (runtime / "ai-reviewer.json").write_text(json.dumps({"version": 1, "reviews": {
+                decision_id: {"review_id": decision_id, "project_id": "p1", "source_request_id": "worker-source",
+                              "task_id": "P1", "branch": truth.branch, "head": truth.head,
+                              "review_status_hash": truth.status_hash, "state": "completed", "reconcile_of": original_id}
+            }}), encoding="utf-8")
+            (runtime / "review-decisions.json").write_text(json.dumps({"version": 1, "decisions": {
+                decision_id: {"project_id": "p1", "request_id": decision_id, "disposition": "apply",
+                              "decision": "remediate", "next_action": "continue_current_stage",
+                              "reason": "current-head reviewer still requires bounded remediation",
+                              "review_status_hash": truth.status_hash, "task_id": "P1", "branch": truth.branch,
+                              "head": truth.head, "role": "reviewer", "event": "worker_done",
+                              "consumed_at": "2026-09-16T08:32:00+00:00"}
+            }}), encoding="utf-8")
+            port = FakePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            launch = executor.start_control(project, self._remediation_snapshot("P1"), "owner-continue-reanchor")
+            self.assertIsNotNone(launch)
+            executor._threads["owner-continue-reanchor"].join(timeout=2)
+            ledger = executor.state()["executions"]
+            self.assertEqual(ledger[original_id], original)
+            self.assertEqual(ledger[decision_id], blocked)
+            self.assertEqual(ledger["owner-continue-reanchor"]["state"], "completed")
+            self.assertEqual(ledger["owner-continue-reanchor"]["recovery_of"], original_id)
+            self.assertEqual(ledger["owner-continue-reanchor"]["review_decision_id"], decision_id)
+            self.assertEqual(len(port.requests), 1)
+            self.assertIn("current-head reviewer still requires bounded remediation", port.requests[0].prompt)
+
     def test_owner_continue_retries_only_exact_pre_execution_remediation_with_review_evidence(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"

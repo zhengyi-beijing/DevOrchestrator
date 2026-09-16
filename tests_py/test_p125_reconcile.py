@@ -108,6 +108,32 @@ class P125ReconcileTests(unittest.TestCase):
             self.assertEqual(ControlCommandCoordinator(runtime, reviewer=reviewer).advance(config, {"projects": [snapshot]}, executor), [])
             self.assertEqual(len(port.requests), 1)
 
+    def test_reconcile_command_restart_recovers_persisted_review_launch(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, runtime, config, project, snapshot, old_review = self.fixture(Path(td))
+            port = ReviewerPort()
+            reviewer = AIReviewerCoordinator(runtime, port)
+            candidate, reason = resolve_reconcile_candidate(snapshot, runtime, project)
+            self.assertEqual(reason, "")
+            review_id, launch_reason = reviewer.reconcile(project, snapshot, candidate, "crash-replay")
+            self.assertIsNotNone(review_id, launch_reason)
+            reviewer._threads[review_id].join(timeout=2)
+            self.assertEqual(len(port.requests), 1)
+            self.assertIsNone(resolve_reconcile_candidate(snapshot, runtime, project)[0])
+
+            expected = project_identity(snapshot, runtime)
+            submit_control_command(
+                runtime, "p1", "reconcile", command_id="crash-replay",
+                expected=expected, target={"target_id": old_review},
+            )
+            result = ControlCommandCoordinator(runtime, reviewer=reviewer).advance(
+                config, {"projects": [snapshot]}, FakeExecutor()
+            )[0]
+            self.assertEqual(result["state"], "accepted")
+            self.assertEqual(result["review_id"], review_id)
+            self.assertIn("already launched", result["reason"])
+            self.assertEqual(len(port.requests), 1)
+
     def test_stale_expected_identity_rejected_before_reconcile(self):
         with tempfile.TemporaryDirectory() as td:
             _, runtime, config, project, snapshot, old_review = self.fixture(Path(td))

@@ -680,5 +680,51 @@ class SelfHostAcceptanceTests(unittest.TestCase):
         self.assertEqual(res2["broker_executions"]["status"], "FAIL")
 
 
+    def test_ipv6_loopback_url_preserves_brackets(self):
+        self.assertEqual(validate_loopback_url("http://[::1]:8770", "control_url"), "http://[::1]:8770")
+        with self.assertRaises(ValueError):
+            validate_loopback_url("http://[2001:db8::1]:8770", "control_url")
+
+    def test_malformed_overview_collections_fail_closed_without_traceback(self):
+        self.broker_server.set_route("/api/resources", 200, make_healthy_resources())
+        self.broker_server.set_route("/api/executions", 200, make_healthy_executions())
+        for field in ("sources", "warnings"):
+            with self.subTest(field=field):
+                overview = make_healthy_overview(self.repo_dir)
+                overview[field] = None
+                self.control_server.set_route("/api/v1/control/overview", 200, overview)
+                res = run_acceptance_checks(
+                    control_url=self.control_server.url,
+                    broker_url=self.broker_server.url,
+                    expected_repo_path=self.repo_dir,
+                )
+                self.assertEqual(res["overall_status"], "FAIL")
+                self.assertTrue(any(field in d for d in res["diagnostics"]))
+                proc = subprocess.run(
+                    [sys.executable, str(self.script_path), "--control-url", self.control_server.url,
+                     "--broker-url", self.broker_server.url, "--expected-repo-path", self.repo_dir],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertEqual(json.loads(proc.stdout)["overall_status"], "FAIL")
+
+    def test_invalid_nested_project_identity_objects_fail_closed(self):
+        self.broker_server.set_route("/api/resources", 200, make_healthy_resources())
+        self.broker_server.set_route("/api/executions", 200, make_healthy_executions())
+        for field in ("git", "control_identity"):
+            with self.subTest(field=field):
+                overview = make_healthy_overview(self.repo_dir)
+                overview["data"]["projects"][0][field] = "invalid"
+                self.control_server.set_route("/api/v1/control/overview", 200, overview)
+                res = run_acceptance_checks(
+                    control_url=self.control_server.url,
+                    broker_url=self.broker_server.url,
+                    expected_repo_path=self.repo_dir,
+                )
+                self.assertEqual(res["overall_status"], "FAIL")
+                self.assertTrue(any(field in d for d in res["diagnostics"]))
+
+
 if __name__ == "__main__":
     unittest.main()

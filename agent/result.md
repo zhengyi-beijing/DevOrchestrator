@@ -382,3 +382,15 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   session evidence cannot be overridden by stale negative fields.
 - Verification: focused transition/control/remediation suites passed (39
   tests); full suite passed (566 tests and 22 subtests in 151.23s).
+
+## P12.5 Post-Reanchor Closure Remediation (2026-09-17)
+
+- Hardened `ops/self_host_acceptance.py` so malformed overview shapes fail closed instead of raising: invalid/null `warnings` and `sources`, plus incorrectly typed project `git` / `control_identity` objects, now produce deterministic diagnostics.
+- Preserved IPv6 loopback brackets during URL sanitization/normalization while retaining loopback-only, credential-free HTTP enforcement.
+- Made stale-review reconcile restart-idempotent when the reviewer launch was durably persisted before command settlement: replay of the exact command recovers the already-launched review instead of incorrectly settling blocked.
+- Added bounded owner-driven recovery for a current-HEAD re-anchored `REMEDIATE` that was blocked only by a transient lifecycle/active-worker condition. Historical blocked/reviewer evidence remains immutable and the new remediation uses a new execution identity with explicit recovery lineage.
+- Corrected recovery precedence so the new re-anchor helper checks active-worker state only when it has an exact matching re-anchor candidate; otherwise the established descendant recovery barrier remains authoritative.
+- Focused P12.5 recovery/reconcile/acceptance regression passed: 54 tests and 9 subtests.
+- Full `python -m pytest tests_py -q` passed: 583 tests and 31 subtests in 184.09s.
+- `python -m compileall -q src ops tests_py` and `git diff --check` passed.
+- Live `python ops/self_host_acceptance.py` passed against daemon PID 29212 and AIBroker 8875 with all required checks PASS.

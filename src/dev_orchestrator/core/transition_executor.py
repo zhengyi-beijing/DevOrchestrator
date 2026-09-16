@@ -1546,6 +1546,86 @@ class TransitionExecutor:
             "[/ORIGINAL_TECHNICAL_REVIEW_EVIDENCE]"
         ).format(reason, findings_text)
 
+    def _blocked_reconcile_remediation_retry(
+        self,
+        ledger: dict[str, Any],
+        decisions: dict[str, dict[str, Any]],
+        *,
+        project_id: str,
+        task_id: str | None,
+        branch: str,
+        head: str,
+        current_truth: Any,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, str]:
+        """Resolve one exact re-anchored REMEDIATE blocked only by transient state.
+
+        Recovery is owner-driven through a new continue command.  Historical
+        blocked decision rows remain immutable; the new launch consumes the
+        original pre-provider WorktreeUnsafeError via recovery_of lineage.
+        """
+        if task_id is None or current_truth.dirty:
+            return None, None, None, ""
+        reviews_raw = read_json(self.runtime_root / "ai-reviewer.json", {})
+        reviews = reviews_raw.get("reviews") if isinstance(reviews_raw, dict) else None
+        reviews = reviews if isinstance(reviews, dict) else {}
+        consumed_sources = {
+            _non_blank_config(row.get("recovery_of"))
+            for row in ledger["executions"].values()
+            if isinstance(row, dict)
+        }
+        transient_reasons = {
+            "project state is not eligible for exact remediation",
+            "an external task Worker is already active",
+            "another managed Worker is already active",
+        }
+        matches: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+        for decision_id, decision in decisions.items():
+            blocked = ledger["executions"].get(decision_id)
+            review = reviews.get(decision_id)
+            if not (
+                isinstance(blocked, dict)
+                and blocked.get("state") == "blocked"
+                and blocked.get("source_kind") == "remediation"
+                and blocked.get("reason") in transient_reasons
+                and isinstance(review, dict)
+                and review.get("state") == "completed"
+                and review.get("project_id") == project_id
+                and review.get("task_id") == task_id
+                and review.get("branch") == branch
+                and review.get("head") == head
+                and decision.get("project_id") == project_id
+                and decision.get("task_id") == task_id
+                and decision.get("branch") == branch
+                and decision.get("head") == head
+                and decision.get("disposition") == "apply"
+                and decision.get("decision") == "remediate"
+                and decision.get("next_action") == NextAction.CONTINUE_CURRENT_STAGE.value
+                and decision.get("role") == WebSolRole.REVIEWER.value
+                and decision.get("event") == WebSolEvent.WORKER_DONE.value
+            ):
+                continue
+            original_id = _non_blank_config(review.get("reconcile_of"))
+            original = ledger["executions"].get(original_id or "")
+            review_hash = _non_blank_config(decision.get("review_status_hash"))
+            if (
+                original_id is None
+                or original_id in consumed_sources
+                or not isinstance(original, dict)
+                or not self._failed_before_provider_work(original)
+                or review_hash is None
+                or review.get("review_status_hash") != review_hash
+                or current_truth.status_hash != review_hash
+            ):
+                continue
+            matches.append((original, decision, review))
+        if matches and self._active_project(ledger, project_id):
+            return None, None, None, "another managed Worker is already active"
+        if len(matches) == 1:
+            return (*matches[0], "")
+        if len(matches) > 1:
+            return None, None, None, "multiple blocked re-anchored remediations match recovery evidence"
+        return None, None, None, ""
+
     def _pre_execution_remediation_retry(
         self,
         ledger: dict[str, Any],
@@ -1871,6 +1951,11 @@ class TransitionExecutor:
         decisions = self._load_decisions()
         with self._lock:
             ledger = self._load_ledger()
+            reanchor_original, reanchor_decision, reanchor_review, reanchor_error = self._blocked_reconcile_remediation_retry(
+                ledger, decisions,
+                project_id=project_id, task_id=task_id, branch=truth.branch, head=truth.head,
+                current_truth=truth,
+            )
             failed_remediation, review_decision, fingerprint_evidence, recovery_error = self._pre_execution_remediation_retry(
                 ledger, decisions,
                 project_id=project_id, branch=truth.branch, head=truth.head,
@@ -1879,6 +1964,49 @@ class TransitionExecutor:
             recovery_descendant_barrier = self._recovery_descendant_barrier(
                 ledger, project_id,
             )
+        if reanchor_error:
+            self._record_blocked(
+                source_request_id, project_id, reanchor_error,
+                task_id=task_id, source_kind="remediation",
+            )
+            return None
+        if reanchor_original is not None and reanchor_decision is not None and reanchor_review is not None:
+            if NextAction.CONTINUE_CURRENT_STAGE.value not in policy["allowed_next_actions"]:
+                self._record_blocked(
+                    source_request_id, project_id,
+                    "review-driven remediation is not owner-authorized by project execution policy",
+                    task_id=task_id, source_kind="remediation",
+                )
+                return None
+            guard_error = self._recovery_fresh_guard(
+                project, snapshot, expected_branch=truth.branch, expected_head=truth.head,
+            )
+            if guard_error:
+                self._record_blocked(
+                    source_request_id, project_id, guard_error,
+                    task_id=task_id, source_kind="remediation",
+                )
+                return None
+            decision_id = _non_blank_config(reanchor_decision.get("request_id"))
+            original_id = _non_blank_config(reanchor_review.get("reconcile_of"))
+            prompt = (
+                str(policy["remediation_prompt"])
+                + "\nReviewed task identity: {0}. Remediate only this reviewed task.\n\n"
+                + self._review_evidence(reanchor_decision)
+            ).format(task_id)
+            return self._launch(
+                project, source_request_id=source_request_id, source_kind="remediation",
+                task_id=task_id, source_task_id=task_id,
+                branch=truth.branch, head=truth.head, worker_prompt=prompt, policy=policy,
+                lineage={
+                    "recovery_of": original_id,
+                    "review_decision_id": decision_id,
+                    "reconcile_review_id": decision_id,
+                    "recovery_reason": "owner continue after transient blocked re-anchored remediation",
+                    "review_status_hash": reanchor_decision.get("review_status_hash"),
+                },
+            )
+
         recovery_task_id = _non_blank_config(
             failed_remediation.get("task_id") if failed_remediation else None
         )
