@@ -113,3 +113,14 @@ P12.5 recovery review remediation result:
   starts. Verification: 58 focused tests and 563 tests plus 22 subtests in the
   full suite passed; compileall, both JavaScript syntax checks and diff check
   passed.
+
+P12.5 recovery consumption remediation result:
+- A failed remediation is durably consumed by a retry row's `recovery_of`
+  lineage without mutating historical rows. Continue/resume cannot replay it
+  while that retry is active or awaiting its normal technical-review
+  transition; after the reviewed transition, ordinary P2 control is unblocked.
+- Contradictory positive provider evidence (raw output, provider-work flag,
+  output flag, first-output timestamp or session) overrides stale negative
+  evidence and fails recovery closed.
+- Verification: focused transition/control/remediation suites passed (39
+  tests); full suite passed (566 tests and 22 subtests in 151.23s).

@@ -368,3 +368,17 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
 - Verification: focused suites passed (58 tests); full suite passed (563
   tests and 22 subtests in 145.16s). Compileall, both JavaScript syntax checks
   and `git diff --check` passed.
+
+## P12.5 Recovery Consumption Remediation (2026-09-16)
+
+- A retry's immutable `recovery_of` lineage now consumes the original failed
+  remediation without altering historical evidence. It blocks repeated
+  continue/resume during an active or completed-but-unreviewed retry, then
+  releases ordinary P2 control only after the retry's normal reviewed terminal
+  transition.
+- Contradictory positive provider-work evidence always fails recovery closed:
+  nonempty raw output, `provider_work_observed=True`,
+  `provider_output_observed=True`, non-null `first_output_at`, or non-null
+  session evidence cannot be overridden by stale negative fields.
+- Verification: focused transition/control/remediation suites passed (39
+  tests); full suite passed (566 tests and 22 subtests in 151.23s).

@@ -1373,6 +1373,16 @@ class TransitionExecutor:
             return False
         if "session_id" not in record or record.get("session_id") is not None:
             return False
+        # A positive provider-work fact always wins over a conflicting negative
+        # field.  Do not let a malformed or stale `provider_output_observed=False`
+        # reclassify an execution that durably recorded usable provider work.
+        if (
+            _non_blank_config(record.get("output")) is not None
+            or record.get("provider_work_observed") is True
+            or record.get("provider_output_observed") is True
+            or record.get("first_output_at") is not None
+        ):
+            return False
         has_modern_negative_evidence = all(
             name in record for name in _NEGATIVE_PROVIDER_EVIDENCE_FIELDS
         )
@@ -1390,6 +1400,60 @@ class TransitionExecutor:
                 "dispatch_id", "decision_id", "execution_id", "resource_context",
             ))
         )
+
+    def _recovery_descendant_barrier(
+        self, ledger: dict[str, Any], project_id: str,
+    ) -> str:
+        """Keep a consumed remediation in its own review lifecycle.
+
+        ``recovery_of`` is immutable lineage on the new execution, so its mere
+        presence consumes the older failed row without rewriting history.  A
+        completed retry remains a barrier until its usual AI review has reached
+        a durable terminal lifecycle transition; only then can a later task use
+        the ordinary control path.
+        """
+        executions = ledger["executions"]
+        failed_sources = {
+            _non_blank_config(record.get("source_request_id"))
+            for record in executions.values()
+            if isinstance(record, dict)
+            and record.get("project_id") == project_id
+            and record.get("engine") == "aibroker"
+            and record.get("source_kind") == "remediation"
+            and record.get("state") == "failed"
+        }
+        failed_sources.discard(None)
+        if not failed_sources:
+            return ""
+        descendants = [
+            record for record in executions.values()
+            if isinstance(record, dict)
+            and record.get("project_id") == project_id
+            and _non_blank_config(record.get("recovery_of")) in failed_sources
+        ]
+        if not descendants:
+            return ""
+        reviews_raw = read_json(self.runtime_root / "ai-reviewer.json", {})
+        reviews = reviews_raw.get("reviews") if isinstance(reviews_raw, dict) else None
+        reviews = reviews if isinstance(reviews, dict) else {}
+        for descendant in descendants:
+            state = descendant.get("state")
+            if state in _ACTIVE_STATES:
+                return "a prior remediation recovery is still active"
+            source_id = _non_blank_config(descendant.get("source_request_id"))
+            review_id = "ai_review:" + source_id if source_id else ""
+            review = reviews.get(review_id)
+            transition = executions.get(review_id)
+            if (
+                state == "completed"
+                and isinstance(review, dict)
+                and review.get("state") == "completed"
+                and isinstance(transition, dict)
+                and transition.get("state") in {"settled", "handoff"}
+            ):
+                continue
+            return "a prior remediation recovery is awaiting its normal review transition"
+        return ""
 
     @staticmethod
     def _status_hash(entries: tuple[str, ...]) -> str:
@@ -1461,6 +1525,11 @@ class TransitionExecutor:
         shape is a failed AIBroker remediation whose exception proves that the
         provider was not reached because its managed worktree was unsafe.
         """
+        consumed_sources = {
+            _non_blank_config(row.get("recovery_of"))
+            for row in ledger["executions"].values()
+            if isinstance(row, dict)
+        }
         failed_remediations = [
             row for row in ledger["executions"].values()
             if isinstance(row, dict)
@@ -1468,6 +1537,7 @@ class TransitionExecutor:
             and row.get("engine") == "aibroker"
             and row.get("source_kind") == "remediation"
             and row.get("state") == "failed"
+            and _non_blank_config(row.get("source_request_id")) not in consumed_sources
         ]
         if not failed_remediations:
             return None, None, None, ""
@@ -1769,9 +1839,18 @@ class TransitionExecutor:
                 project_id=project_id, branch=truth.branch, head=truth.head,
                 current_truth=truth,
             )
+            recovery_descendant_barrier = self._recovery_descendant_barrier(
+                ledger, project_id,
+            )
         recovery_task_id = _non_blank_config(
             failed_remediation.get("task_id") if failed_remediation else None
         )
+        if recovery_descendant_barrier:
+            self._record_blocked(
+                source_request_id, project_id, recovery_descendant_barrier,
+                task_id=recovery_task_id or task_id, source_kind="remediation",
+            )
+            return None
         if recovery_error:
             self._record_blocked(
                 source_request_id, project_id, recovery_error,

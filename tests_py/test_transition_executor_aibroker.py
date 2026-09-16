@@ -269,6 +269,91 @@ class AIBrokerTransitionTests(unittest.TestCase):
             self.assertIsNone(executor.start_control(project, self._remediation_snapshot("P2"), "owner-continue-2"))
             self.assertEqual(len(port.requests), 2)
 
+    def test_completed_recovery_cannot_replay_before_its_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            port = PreExecutionWorktreePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            truth = read_repository_truth(repo); decision_id = self._write_remediation_decision(runtime, truth)
+            policy, error = _execution_policy(project); self.assertFalse(error)
+            initial = executor._launch(project, source_request_id=decision_id, source_kind="remediation",
+                task_id="P1", source_task_id="P1", branch=truth.branch, head=truth.head,
+                worker_prompt="INITIAL", policy=policy)
+            self.assertIsNotNone(initial); executor._threads[decision_id].join(timeout=2)
+            retry_id = "recovery-before-review"
+            self.assertIsNotNone(executor.start_control(project, self._remediation_snapshot("P2"), retry_id))
+            executor._threads[retry_id].join(timeout=2)
+            self.assertEqual(executor.state()["executions"][retry_id]["state"], "completed")
+
+            self.assertIsNone(executor.resume_exact_remediation(
+                project, self._remediation_snapshot("P2"), "later-resume",
+            ))
+            self.assertIsNone(executor.start_control(project, self._remediation_snapshot("P2"), "later-continue"))
+            blocked = executor.state()["executions"]["later-continue"]
+            self.assertIn("awaiting its normal review transition", blocked["reason"])
+            self.assertEqual(len(port.requests), 2)
+
+    def test_running_recovery_prevents_duplicate_remediation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            port = BlockingRetryPort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            truth = read_repository_truth(repo); decision_id = self._write_remediation_decision(runtime, truth)
+            policy, error = _execution_policy(project); self.assertFalse(error)
+            initial = executor._launch(project, source_request_id=decision_id, source_kind="remediation",
+                task_id="P1", source_task_id="P1", branch=truth.branch, head=truth.head,
+                worker_prompt="INITIAL", policy=policy)
+            self.assertIsNotNone(initial); executor._threads[decision_id].join(timeout=2)
+            retry_id = "running-recovery"
+            self.assertIsNotNone(executor.start_control(project, self._remediation_snapshot("P2"), retry_id))
+            self.assertTrue(port.retry_started.wait(timeout=2))
+
+            self.assertIsNone(executor.start_control(project, self._remediation_snapshot("P2"), "duplicate-continue"))
+            blocked = executor.state()["executions"]["duplicate-continue"]
+            self.assertIn("prior remediation recovery is still active", blocked["reason"])
+            self.assertEqual(len(port.requests), 1)
+            port.allow_retry.set()
+            executor._threads[retry_id].join(timeout=2)
+            self.assertEqual(len(port.requests), 2)
+
+    def test_reviewed_recovery_head_advance_allows_normal_p2_control(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            port = PreExecutionWorktreePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            truth = read_repository_truth(repo); decision_id = self._write_remediation_decision(runtime, truth)
+            policy, error = _execution_policy(project); self.assertFalse(error)
+            initial = executor._launch(project, source_request_id=decision_id, source_kind="remediation",
+                task_id="P1", source_task_id="P1", branch=truth.branch, head=truth.head,
+                worker_prompt="INITIAL", policy=policy)
+            self.assertIsNotNone(initial); executor._threads[decision_id].join(timeout=2)
+            retry_id = "reviewed-recovery"
+            self.assertIsNotNone(executor.start_control(project, self._remediation_snapshot("P2"), retry_id))
+            executor._threads[retry_id].join(timeout=2)
+
+            (repo / "README.md").write_text("P1 remediation committed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "complete P1 remediation"], cwd=repo, check=True, capture_output=True)
+            review_id = "ai_review:" + retry_id
+            (runtime / "ai-reviewer.json").write_text(json.dumps({"version": 1, "reviews": {
+                review_id: {"state": "completed"},
+            }}), encoding="utf-8")
+            ledger = executor.state()
+            ledger["executions"][review_id] = {
+                "project_id": "p1", "source_request_id": review_id,
+                "state": "handoff", "recorded_at": "2026-09-16T01:00:00+00:00",
+            }
+            (runtime / "transition-executor.json").write_text(json.dumps(ledger), encoding="utf-8")
+
+            launch = executor.start_control(project, self._remediation_snapshot("P2"), "p2-continue")
+            self.assertIsNotNone(launch)
+            executor._threads["p2-continue"].join(timeout=2)
+            self.assertEqual(port.requests[-1].task_run_id, "P2")
+            self.assertEqual(executor.state()["executions"]["p2-continue"]["source_kind"], "control")
+
     def test_remediation_recovery_refuses_dirty_mismatched_or_usable_provider_work(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
@@ -300,6 +385,8 @@ class AIBrokerTransitionTests(unittest.TestCase):
             for command_id, field, value in (
                 ("session-continue", "session_id", "provider-session"),
                 ("output-continue", "provider_output_observed", True),
+                ("raw-output-continue", "output", "usable provider output"),
+                ("provider-work-continue", "provider_work_observed", True),
                 ("provider-failure-continue", "reason", "provider timeout"),
             ):
                 bad = json.loads(json.dumps(baseline)); bad["executions"][decision_id][field] = value
