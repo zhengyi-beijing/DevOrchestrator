@@ -180,6 +180,10 @@ Never infer progress from UI activity alone. Never allow automatic recovery to c
 
 Port 8770 remains the stable operator/control surface. Web, ChatGPT integration, CLI, Android and optional messaging clients are stateless clients of the same authority. Add an SSE/WebSocket event stream only as a projection of durable DevO events; reconnecting clients reconcile from authoritative state.
 
+P13 starts with a conversation-session binding UX before the larger Android client. The user-facing concept is project_session_binding: which DevO project the current ChatGPT conversation is operating on. It is distinct from AIBroker resource_binding, which selects or locates an AI/provider session such as chatgpt/default/sol. A project-session binding must never decide which model/provider executes a role.
+
+The preferred ChatGPT UX is an explicit visible command such as /project DevO. The Web client resolves the current browser conversation binding locally and calls the existing 8770 bind/rebind authority. New-conversation migration should therefore be a safe rebind operation rather than a shell/UUID workflow. Persistent page state should expose BOUND/UNBOUND/STALE/conflict explicitly. Project/task/review/handoff state remains durable in DevO/Harness, so changing a ChatGPT conversation changes only the transport/control session, not project authority or execution context.
+
 P13 Android should consume this API rather than duplicate lifecycle logic. Before building a large native application, validate whether the stable API plus lightweight notification/Telegram integration covers most remote observation and OWNER_GATE needs.
 
 ## 14. Migration phases

@@ -70,6 +70,19 @@ Follow-up from CCP7 live acceptance:
 
 Goal: provide an Android-native, failure-independent observation and bounded-control client for DevOrchestrator so project execution remains visible and controllable even when a ChatGPT conversation, browser session, or RDC interaction is stalled or unavailable.
 
+### P13.0 - ChatGPT Conversation Project Binding UX
+
+- Treat project-to-ChatGPT-conversation binding as a required first-class control capability, but keep it separate from AIBroker resource-to-provider-session routing.
+- The operator must not need to know or copy a binding_id, UUID, PowerShell command, runtime JSON path, or browser-bridge implementation detail.
+- Provide explicit visible in-conversation commands, with /project <project-id-or-alias> as the primary UX. /project DevO binds the current ChatGPT conversation when unbound and safely rebinds the project when it is still attached to an older or stale conversation.
+- Also expose /binding to show current project/binding state and /unbind to explicitly detach. Lower-level /bind and /rebind forms may exist for diagnostics but are not the normal operator workflow.
+- The Tampermonkey/Web client obtains the current conversation binding_id locally and submits the existing authenticated/idempotent 8770 bind_conversation or rebind_conversation control action. ChatGPT text itself must not be trusted as the routing identity.
+- Binding/rebinding must retain current P12 safety rules: one effective conversation route per project, cross-project binding conflicts fail closed, stale expected identity fails closed, and an active claimed Web Sol request blocks rebind/unbind until safe.
+- Starting a new ChatGPT conversation after context exhaustion must require only /project <project>; the system should detect the old binding and perform the safe rebind without asking the user for UUIDs or shell commands.
+- Show a persistent visible status in the page, for example Project: DevO - BOUND, plus explicit UNBOUND, STALE, and conflict/error states.
+- Binding is routing/control metadata only. Authoritative task state, review lineage, recovery evidence, handoff/context summaries and lifecycle authority remain in DevO/Harness, never in the ChatGPT conversation.
+- Acceptance: from a newly opened ChatGPT conversation, the operator can type /project DevO, observe a confirmed bound state, issue project-scoped control/status interactions without naming the project repeatedly, then open another conversation and repeat /project DevO to rebind safely with no shell access or manual UUID handling.
+
 - Build the Android client on the stable P12 Control API; do not create a second lifecycle/control authority in the mobile application.
 - Connect Android directly to DevOrchestrator over the private Tailscale path; do not require RDC or a ChatGPT conversation in the normal mobile data/control path.
 - Show all configured projects with lifecycle/task/stage state, current role/worker, AI provider/model, current and next action, last-progress age, watchdog/diagnostic state and OWNER_GATE conditions.
