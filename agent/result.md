@@ -350,3 +350,21 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   full `python -m pytest tests_py -q` passed (560 tests and 22 subtests in
   141.04s); Python compilation, both JavaScript syntax checks and
   `git diff --check` passed.
+
+## P12.5 Recovery Review Remediation (2026-09-16)
+
+- Anchored retry selection to the durable failed remediation and applied
+  reviewer decision rather than the currently advertised task. A reviewed P1
+  retry remains `source_kind=remediation` for P1 when `agent/next.md` now
+  advertises P2.
+- Preserved reviewed-fingerprint safety: clean-up is allowed only when the
+  reviewed dirty fingerprint proves exactly generated `?? graphify-out/`
+  output. The known legacy hash is accepted through that closed rule; tracked
+  source cleanup/revert and any unproven fingerprint change are blocked.
+- New Broker launch rows persist explicit session/output-negative facts and
+  recovery lineage before the worker thread starts. Missing historical fields
+  are rejected unless the exact legacy Broker `WorktreeUnsafeError` contract
+  supplies the narrow compatibility proof.
+- Verification: focused suites passed (58 tests); full suite passed (563
+  tests and 22 subtests in 145.16s). Compileall, both JavaScript syntax checks
+  and `git diff --check` passed.

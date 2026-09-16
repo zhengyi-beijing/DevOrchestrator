@@ -1,6 +1,7 @@
 import json
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -70,6 +71,20 @@ class PreExecutionWorktreePort(FakePort):
         )
 
 
+class BlockingRetryPort(PreExecutionWorktreePort):
+    def __init__(self):
+        super().__init__()
+        self.retry_started = threading.Event()
+        self.allow_retry = threading.Event()
+
+    def execute(self, request):
+        if not self.fail_first:
+            self.retry_started.set()
+            if not self.allow_retry.wait(timeout=2):
+                raise RuntimeError("test retry release timed out")
+        return super().execute(request)
+
+
 def broker_project(repo: Path):
     return {
         "project_id": "p1",
@@ -110,9 +125,9 @@ class AIBrokerTransitionTests(unittest.TestCase):
         return decision_id
 
     @staticmethod
-    def _remediation_snapshot():
+    def _remediation_snapshot(task_id="P1"):
         return {
-            "state": "READY_TO_RUN", "telemetry": {"task_id": "P1"},
+            "project_id": "p1", "state": "READY_TO_RUN", "telemetry": {"task_id": task_id},
             "worker": {"state": "not_started", "process_alive": False},
         }
 
@@ -200,15 +215,19 @@ class AIBrokerTransitionTests(unittest.TestCase):
             project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
             policy, error = _execution_policy(project); self.assertFalse(error)
             port = PreExecutionWorktreePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
-            (repo / "graphify-out.txt").write_text("generated\n", encoding="utf-8")
+            (repo / "agent").mkdir()
+            (repo / "agent" / "next.md").write_text("# P2 next task\nStatus: READY_TO_RUN\n", encoding="utf-8")
+            subprocess.run(["git", "add", "agent/next.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "advance to P2"], cwd=repo, check=True, capture_output=True)
+            (repo / "graphify-out").mkdir()
+            (repo / "graphify-out" / "generated.json").write_text("{}\n", encoding="utf-8")
             reviewed_truth = read_repository_truth(repo)
+            self.assertEqual(reviewed_truth.status_hash, "c955036d0817f8f2dbb4e79ccf010d1206eee1694ffa4f2d951b1a9e3ffe3d20")
             decision_id = self._write_remediation_decision(runtime, reviewed_truth)
-            initial = executor._launch(
-                project, source_request_id=decision_id, source_kind="remediation",
-                task_id="P1", source_task_id="P1", branch=reviewed_truth.branch,
-                head=reviewed_truth.head, worker_prompt="INITIAL REMEDIATION", policy=policy,
-            )
-            self.assertIsNotNone(initial)
+            config = root / "projects.json"
+            config.write_text(json.dumps({"projects": [project]}), encoding="utf-8")
+            launches = executor.advance({"projects": [self._remediation_snapshot("P2")]}, config)
+            self.assertEqual(len(launches), 1)
             executor._threads[decision_id].join(timeout=2)
             original = executor.state()["executions"][decision_id]
             self.assertEqual(original["state"], "failed")
@@ -220,10 +239,20 @@ class AIBrokerTransitionTests(unittest.TestCase):
             self.assertEqual(original["resource_context"]["resource_id"], "agy/agy-1/gemini-3.8-flash-high")
             self.assertIsNone(original["session_id"])
             self.assertFalse(original["provider_output_observed"])
-            original_before_retry = json.loads(json.dumps(original))
+            self.assertEqual(original["review_dirty_entries"], ["?? graphify-out/"])
+            self.assertEqual(original["review_status_hash"], reviewed_truth.status_hash)
+            # Model the historical incident before explicit no-output fields
+            # were added: the exact Broker worktree-safety contract is the
+            # only accepted compatibility proof.
+            legacy = executor.state()
+            legacy["executions"][decision_id].pop("provider_output_observed")
+            legacy["executions"][decision_id].pop("first_output_at")
+            (runtime / "transition-executor.json").write_text(json.dumps(legacy), encoding="utf-8")
+            original_before_retry = legacy["executions"][decision_id]
 
-            (repo / "graphify-out.txt").unlink()
-            retry = executor.start_control(project, self._remediation_snapshot(), "owner-continue-2")
+            (repo / "graphify-out" / "generated.json").unlink()
+            (repo / "graphify-out").rmdir()
+            retry = executor.start_control(project, self._remediation_snapshot("P2"), "owner-continue-2")
             self.assertIsNotNone(retry)
             executor._threads["owner-continue-2"].join(timeout=2)
             ledger = executor.state()["executions"]
@@ -234,9 +263,10 @@ class AIBrokerTransitionTests(unittest.TestCase):
             self.assertEqual(ledger["owner-continue-2"]["review_decision_id"], decision_id)
             self.assertEqual(len(port.requests), 2)
             self.assertEqual(port.requests[1].stage_run_id, "remediation")
+            self.assertEqual(port.requests[1].task_run_id, "P1")
             self.assertIn("Remediate the current bounded task", port.requests[1].prompt)
             self.assertIn("Reviewer reason: Fix the stale broker evidence", port.requests[1].prompt)
-            self.assertIsNone(executor.start_control(project, self._remediation_snapshot(), "owner-continue-2"))
+            self.assertIsNone(executor.start_control(project, self._remediation_snapshot("P2"), "owner-continue-2"))
             self.assertEqual(len(port.requests), 2)
 
     def test_remediation_recovery_refuses_dirty_mismatched_or_usable_provider_work(self):
@@ -254,7 +284,7 @@ class AIBrokerTransitionTests(unittest.TestCase):
 
             (repo / "generated.txt").write_text("dirty\n", encoding="utf-8")
             self.assertIsNone(executor.start_control(project, self._remediation_snapshot(), "dirty-continue"))
-            self.assertIn("repository is dirty", executor.state()["executions"]["dirty-continue"]["reason"])
+            self.assertIn("requires a clean current worktree", executor.state()["executions"]["dirty-continue"]["reason"])
             (repo / "generated.txt").unlink()
 
             decision_path = runtime / "review-decisions.json"
@@ -277,6 +307,83 @@ class AIBrokerTransitionTests(unittest.TestCase):
                 self.assertIsNone(executor.start_control(project, self._remediation_snapshot(), command_id))
                 self.assertIn("not an exact no-usable-provider-work WorktreeUnsafeError", executor.state()["executions"][command_id]["reason"])
             self.assertEqual(len(port.requests), 1)
+
+    def test_reviewed_source_cleanup_cannot_use_generated_only_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            policy, error = _execution_policy(project); self.assertFalse(error)
+            port = PreExecutionWorktreePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            (repo / "README.md").write_text("reviewed source change\n", encoding="utf-8")
+            reviewed_truth = read_repository_truth(repo)
+            decision_id = self._write_remediation_decision(runtime, reviewed_truth)
+            initial = executor._launch(project, source_request_id=decision_id, source_kind="remediation",
+                task_id="P1", source_task_id="P1", branch=reviewed_truth.branch, head=reviewed_truth.head,
+                worker_prompt="INITIAL", policy=policy)
+            self.assertIsNotNone(initial); executor._threads[decision_id].join(timeout=2)
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            self.assertIsNone(executor.start_control(project, self._remediation_snapshot(), "source-revert-continue"))
+            record = executor.state()["executions"]["source-revert-continue"]
+            self.assertIn("generated-only proof", record["reason"])
+            self.assertEqual(len(port.requests), 1)
+
+    def test_missing_negative_provider_evidence_is_ambiguous_without_exact_legacy_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            policy, error = _execution_policy(project); self.assertFalse(error)
+            port = PreExecutionWorktreePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            (repo / "graphify-out").mkdir()
+            (repo / "graphify-out" / "generated.json").write_text("{}\n", encoding="utf-8")
+            reviewed_truth = read_repository_truth(repo)
+            decision_id = self._write_remediation_decision(runtime, reviewed_truth)
+            initial = executor._launch(project, source_request_id=decision_id, source_kind="remediation",
+                task_id="P1", source_task_id="P1", branch=reviewed_truth.branch, head=reviewed_truth.head,
+                worker_prompt="INITIAL", policy=policy)
+            self.assertIsNotNone(initial); executor._threads[decision_id].join(timeout=2)
+            (repo / "graphify-out" / "generated.json").unlink()
+            (repo / "graphify-out").rmdir()
+            ambiguous = executor.state()
+            row = ambiguous["executions"][decision_id]
+            row.pop("provider_output_observed")
+            row.pop("first_output_at")
+            row["reason"] = "WorktreeUnsafeError: non-contract legacy worktree message"
+            (runtime / "transition-executor.json").write_text(json.dumps(ambiguous), encoding="utf-8")
+            self.assertIsNone(executor.start_control(project, self._remediation_snapshot(), "missing-evidence-continue"))
+            self.assertIn("not an exact no-usable-provider-work", executor.state()["executions"]["missing-evidence-continue"]["reason"])
+            self.assertEqual(len(port.requests), 1)
+
+    def test_recovery_lineage_is_persisted_before_the_retry_executes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            policy, error = _execution_policy(project); self.assertFalse(error)
+            port = BlockingRetryPort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            (repo / "graphify-out").mkdir()
+            (repo / "graphify-out" / "generated.json").write_text("{}\n", encoding="utf-8")
+            reviewed_truth = read_repository_truth(repo)
+            decision_id = self._write_remediation_decision(runtime, reviewed_truth)
+            initial = executor._launch(project, source_request_id=decision_id, source_kind="remediation",
+                task_id="P1", source_task_id="P1", branch=reviewed_truth.branch, head=reviewed_truth.head,
+                worker_prompt="INITIAL", policy=policy)
+            self.assertIsNotNone(initial); executor._threads[decision_id].join(timeout=2)
+            (repo / "graphify-out" / "generated.json").unlink()
+            (repo / "graphify-out").rmdir()
+            retry_id = "crash-safe-retry"
+            self.assertIsNotNone(executor.start_control(project, self._remediation_snapshot(), retry_id))
+            self.assertTrue(port.retry_started.wait(timeout=2))
+            launching = executor.state()["executions"][retry_id]
+            self.assertEqual(launching["source_kind"], "remediation")
+            self.assertEqual(launching["recovery_of"], decision_id)
+            self.assertEqual(launching["review_decision_id"], decision_id)
+            self.assertEqual(launching["review_status_hash"], reviewed_truth.status_hash)
+            self.assertEqual(launching["reviewed_fingerprint_evidence"]["kind"], "legacy_generated_only_fingerprint")
+            port.allow_retry.set()
+            executor._threads[retry_id].join(timeout=2)
+            self.assertEqual(executor.state()["executions"][retry_id]["state"], "completed")
 
     def test_policy_accepts_aibroker_without_legacy_backends(self):
         with tempfile.TemporaryDirectory() as td:

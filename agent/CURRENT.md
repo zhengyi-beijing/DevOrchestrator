@@ -99,3 +99,17 @@ P12.5 self-host recovery hotfix result:
 - Verification: focused remediation/control/staged suites passed (55 tests);
   full `python -m pytest tests_py -q` passed (560 tests and 22 subtests), as
   did `python -m compileall -q src ops tests_py` and `git diff --check`.
+
+P12.5 recovery review remediation result:
+- Recovery selection is now anchored to the failed remediation and its durable
+  applied reviewer decision, so a reviewed P1 remediation remains P1 even
+  after `agent/next.md` advertises P2.
+- A differing clean fingerprint is accepted only for a closed generated-only
+  proof (`?? graphify-out/`), including the independently verified legacy
+  fingerprint; tracked-source cleanup/revert and ambiguous historical rows
+  fail closed.
+- Recovery lineage, reviewed fingerprint evidence and explicit no-output
+  fields are persisted in the new launch ledger row before the Broker thread
+  starts. Verification: 58 focused tests and 563 tests plus 22 subtests in the
+  full suite passed; compileall, both JavaScript syntax checks and diff check
+  passed.

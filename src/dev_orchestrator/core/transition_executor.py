@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import re
 import threading
@@ -133,9 +134,12 @@ _RETRYABLE_PROVIDER_FAILURE_MARKERS = (
 )
 
 _PRE_EXECUTION_WORKTREE_SAFETY_MARKER = "worktreeunsafeerror"
-_USABLE_PROVIDER_WORK_EVIDENCE_FIELDS = (
-    "provider_output_observed", "provider_work_observed", "first_output_at",
-    "output",
+_NEGATIVE_PROVIDER_EVIDENCE_FIELDS = (
+    "session_id", "provider_output_observed", "first_output_at",
+)
+_GENERATED_ONLY_PORCELAIN_ENTRIES = frozenset({"?? graphify-out/"})
+_LEGACY_WORKTREE_UNSAFE_REASON = (
+    "worktreeunsafeerror: dirty worktree requires deterministic recovery before writable reuse"
 )
 
 
@@ -676,6 +680,24 @@ class TransitionExecutor:
             return None, "repository is dirty"
         return current_task, ""
 
+    def _recovery_fresh_guard(
+        self, project: dict[str, Any], snapshot: dict[str, Any], *,
+        expected_branch: str, expected_head: str,
+    ) -> str:
+        """Check recovery truth without relabelling a reviewed task as next.md."""
+        if snapshot.get("state") not in ("READY_TO_RUN", "WAITING_REVIEW", "IDLE"):
+            return "project state is not eligible for exact remediation"
+        if _external_worker_active(snapshot):
+            return "an external task Worker is already active"
+        truth = read_repository_truth(project.get("repo_path") or "")
+        if not truth.valid:
+            return "repository truth unavailable"
+        if truth.branch != expected_branch or truth.head != expected_head:
+            return "repository changed after reviewed remediation truth"
+        if truth.dirty:
+            return "remediation recovery requires a clean current worktree"
+        return ""
+
     @staticmethod
     def _project_context_for_worker(project: dict[str, Any]) -> tuple[str, Any]:
         from dev_orchestrator.core.project_context import context_prompt_block
@@ -693,6 +715,7 @@ class TransitionExecutor:
         head: str,
         worker_prompt: str,
         policy: dict[str, Any],
+        lineage: Optional[dict[str, Any]] = None,
     ) -> Optional[ActuationLaunch]:
         context_block, resolution = self._project_context_for_worker(project)
         ctx_decl = project.get("project_context") or {}
@@ -721,6 +744,7 @@ class TransitionExecutor:
                 project, source_request_id=source_request_id, source_kind=source_kind,
                 task_id=task_id, source_task_id=source_task_id, branch=branch, head=head,
                 worker_prompt=effective_worker_prompt, policy=policy, resolution=resolution,
+                lineage=lineage,
             )
         request = AgentRequest(
             project_id=str(project["project_id"]),
@@ -816,6 +840,7 @@ class TransitionExecutor:
                 "launch_status_hash": launch_truth.status_hash,
                 "context_state": resolution.state,
                 "context_digest": resolution.document.digest if resolution.document else None,
+                **(copy.deepcopy(lineage) if lineage else {}),
             }
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])
@@ -852,6 +877,7 @@ class TransitionExecutor:
         worker_prompt: str,
         policy: dict[str, Any],
         resolution: Optional[Any] = None,
+        lineage: Optional[dict[str, Any]] = None,
     ) -> Optional[ActuationLaunch]:
         project_id = str(project["project_id"])
         if self._ai_execution_port is None:
@@ -925,8 +951,12 @@ class TransitionExecutor:
                 "started_at": utc_now_iso(),
                 "review_state": "pending",
                 "launch_status_hash": launch_truth.status_hash,
+                "session_id": None,
+                "provider_output_observed": False,
+                "first_output_at": None,
                 "context_state": resolution.state if resolution else None,
                 "context_digest": resolution.document.digest if resolution and resolution.document else None,
+                **(copy.deepcopy(lineage) if lineage else {}),
             }
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])
@@ -1001,6 +1031,10 @@ class TransitionExecutor:
                 reason="AIBroker worker lifecycle error [{0}]: {1}".format(
                     type(exc).__name__, exc,
                 ),
+                broker_status="launch_error",
+                session_id=None,
+                provider_output_observed=False,
+                first_output_at=None,
                 completed_at=utc_now_iso(),
             )
             if self._progress_channel is not None:
@@ -1339,7 +1373,58 @@ class TransitionExecutor:
             return False
         if "session_id" not in record or record.get("session_id") is not None:
             return False
-        return not any(record.get(name) for name in _USABLE_PROVIDER_WORK_EVIDENCE_FIELDS)
+        has_modern_negative_evidence = all(
+            name in record for name in _NEGATIVE_PROVIDER_EVIDENCE_FIELDS
+        )
+        if has_modern_negative_evidence:
+            return (
+                record.get("provider_output_observed") is False
+                and record.get("first_output_at") is None
+            )
+        # The known legacy Broker contract persisted allocation facts but not
+        # the later explicit output fields.  Its exact terminal worktree-safety
+        # refusal plus null session is the narrow historical compatibility case.
+        return (
+            str(record.get("reason") or "").casefold() == _LEGACY_WORKTREE_UNSAFE_REASON
+            and all(record.get(name) for name in (
+                "dispatch_id", "decision_id", "execution_id", "resource_context",
+            ))
+        )
+
+    @staticmethod
+    def _status_hash(entries: tuple[str, ...]) -> str:
+        digest = hashlib.sha256()
+        for entry in sorted(entries):
+            digest.update(entry.encode("utf-8", errors="replace"))
+        return digest.hexdigest()
+
+    @classmethod
+    def _generated_only_fingerprint_evidence(
+        cls, candidate: dict[str, Any], decision: dict[str, Any], review_hash: str,
+    ) -> dict[str, Any] | None:
+        raw_entries = candidate.get("review_dirty_entries", decision.get("review_dirty_entries"))
+        if isinstance(raw_entries, (list, tuple)) and all(isinstance(entry, str) for entry in raw_entries):
+            entries = tuple(raw_entries)
+            if (
+                entries
+                and set(entries).issubset(_GENERATED_ONLY_PORCELAIN_ENTRIES)
+                and cls._status_hash(entries) == review_hash
+            ):
+                return {
+                    "kind": "generated_only_entries",
+                    "review_status_hash": review_hash,
+                    "entries": list(entries),
+                }
+            return None
+        # This is the one independently verified legacy incident fingerprint.
+        legacy_entries = ("?? graphify-out/",)
+        if review_hash == cls._status_hash(legacy_entries):
+            return {
+                "kind": "legacy_generated_only_fingerprint",
+                "review_status_hash": review_hash,
+                "entries": list(legacy_entries),
+            }
+        return None
 
     @staticmethod
     def _review_evidence(decision: dict[str, Any]) -> str:
@@ -1366,10 +1451,10 @@ class TransitionExecutor:
         decisions: dict[str, dict[str, Any]],
         *,
         project_id: str,
-        task_id: str,
         branch: str,
         head: str,
-    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+        current_truth: Any,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, str]:
         """Find one exact, owner-resumable review remediation or fail closed.
 
         A plain failed Worker is deliberately invisible here.  The sole recovery
@@ -1380,39 +1465,67 @@ class TransitionExecutor:
             row for row in ledger["executions"].values()
             if isinstance(row, dict)
             and row.get("project_id") == project_id
-            and row.get("task_id") == task_id
             and row.get("engine") == "aibroker"
             and row.get("source_kind") == "remediation"
             and row.get("state") == "failed"
         ]
         if not failed_remediations:
-            return None, None, ""
-        if any(not self._failed_before_provider_work(row) for row in failed_remediations):
-            return None, None, "failed remediation is not an exact no-usable-provider-work WorktreeUnsafeError recovery"
-        candidates = failed_remediations
-        candidates.sort(key=lambda row: str(row.get("completed_at") or row.get("started_at") or ""), reverse=True)
-        candidate = candidates[0]
-        if candidate.get("branch") != branch or candidate.get("head") != head:
-            return None, None, "remediation recovery repository branch/HEAD anchor changed"
-        decision_id = _non_blank_config(candidate.get("review_decision_id")) or _non_blank_config(candidate.get("source_request_id"))
-        decision = decisions.get(decision_id or "")
-        if not isinstance(decision, dict):
-            return None, None, "remediation recovery lacks its durable reviewer decision"
-        if (
-            decision.get("disposition") != "apply"
-            or decision.get("decision") != "remediate"
-            or decision.get("next_action") != NextAction.CONTINUE_CURRENT_STAGE.value
-            or decision.get("project_id") != project_id
-            or decision.get("task_id") != task_id
-            or decision.get("branch") != branch
-            or decision.get("head") != head
-            or decision.get("role") != WebSolRole.REVIEWER.value
-            or decision.get("event") != WebSolEvent.WORKER_DONE.value
-        ):
-            return None, None, "remediation recovery reviewer decision no longer matches project/task/branch/HEAD"
+            return None, None, None, ""
+        candidates: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+        errors: list[str] = []
+        for candidate in failed_remediations:
+            if not self._failed_before_provider_work(candidate):
+                errors.append("failed remediation is not an exact no-usable-provider-work WorktreeUnsafeError recovery")
+                continue
+            if candidate.get("branch") != branch or candidate.get("head") != head:
+                errors.append("remediation recovery repository branch/HEAD anchor changed")
+                continue
+            decision_id = _non_blank_config(candidate.get("review_decision_id")) or _non_blank_config(candidate.get("source_request_id"))
+            decision = decisions.get(decision_id or "")
+            task_id = _non_blank_config(candidate.get("task_id"))
+            if not isinstance(decision, dict) or task_id is None:
+                errors.append("remediation recovery lacks its durable reviewer decision")
+                continue
+            if (
+                decision.get("disposition") != "apply"
+                or decision.get("decision") != "remediate"
+                or decision.get("next_action") != NextAction.CONTINUE_CURRENT_STAGE.value
+                or decision.get("project_id") != project_id
+                or decision.get("task_id") != task_id
+                or decision.get("branch") != branch
+                or decision.get("head") != head
+                or decision.get("role") != WebSolRole.REVIEWER.value
+                or decision.get("event") != WebSolEvent.WORKER_DONE.value
+            ):
+                errors.append("remediation recovery reviewer decision no longer matches project/task/branch/HEAD")
+                continue
+            review_hash = _non_blank_config(decision.get("review_status_hash"))
+            if review_hash is None:
+                errors.append("remediation recovery decision lacks reviewed dirty fingerprint")
+                continue
+            if current_truth.dirty:
+                errors.append("remediation recovery requires a clean current worktree")
+                continue
+            if current_truth.status_hash == review_hash:
+                fingerprint_evidence = {
+                    "kind": "exact_reviewed_fingerprint",
+                    "review_status_hash": review_hash,
+                }
+            else:
+                fingerprint_evidence = self._generated_only_fingerprint_evidence(
+                    candidate, decision, review_hash,
+                )
+                if fingerprint_evidence is None:
+                    errors.append("reviewed dirty fingerprint changed without generated-only proof")
+                    continue
+            candidates.append((candidate, decision, fingerprint_evidence))
         if self._active_project(ledger, project_id):
-            return None, None, "another managed Worker is already active"
-        return candidate, decision, ""
+            return None, None, None, "another managed Worker is already active"
+        if len(candidates) == 1:
+            return (*candidates[0], "")
+        if len(candidates) > 1:
+            return None, None, None, "multiple failed remediations match recovery evidence"
+        return None, None, None, (errors[0] if errors else "failed remediation recovery is unsafe")
 
     @staticmethod
     def _project_has_execution_history(ledger: dict[str, Any], project_id: str) -> bool:
@@ -1487,6 +1600,7 @@ class TransitionExecutor:
                     task_id=task_id,
                 )
                 continue
+            lineage: dict[str, Any] | None = None
             if decision == "remediate":
                 reviewed_hash = _non_blank_config(record.get("review_status_hash"))
                 if reviewed_hash is None:
@@ -1508,6 +1622,17 @@ class TransitionExecutor:
                 )
                 launch_task = task_id if _guard_task is not None else None
                 source_kind = "remediation"
+                reviewed_truth = read_repository_truth(project.get("repo_path") or "")
+                if (
+                    launch_task is not None
+                    and reviewed_truth.valid
+                    and reviewed_truth.status_hash == reviewed_hash
+                ):
+                    lineage = {
+                        "review_decision_id": request_id,
+                        "review_status_hash": reviewed_hash,
+                        "review_dirty_entries": list(reviewed_truth.dirty_entries),
+                    }
                 prompt = (
                     str(policy["remediation_prompt"])
                     + "\nReviewed task identity: {0}. Remediate only this reviewed task. "
@@ -1605,6 +1730,7 @@ class TransitionExecutor:
                 head=head,
                 worker_prompt=prompt,
                 policy=policy,
+                lineage=lineage,
             )
             if launch is not None:
                 launches.append(launch)
@@ -1635,10 +1761,74 @@ class TransitionExecutor:
             self._record_blocked(source_request_id, project_id, "repository truth unavailable", source_kind="control")
             return None
         task_id = _current_task_id(snapshot)
+        decisions = self._load_decisions()
+        with self._lock:
+            ledger = self._load_ledger()
+            failed_remediation, review_decision, fingerprint_evidence, recovery_error = self._pre_execution_remediation_retry(
+                ledger, decisions,
+                project_id=project_id, branch=truth.branch, head=truth.head,
+                current_truth=truth,
+            )
+        recovery_task_id = _non_blank_config(
+            failed_remediation.get("task_id") if failed_remediation else None
+        )
+        if recovery_error:
+            self._record_blocked(
+                source_request_id, project_id, recovery_error,
+                task_id=recovery_task_id or task_id, source_kind="remediation",
+            )
+            return None
+        if (
+            failed_remediation is not None
+            and review_decision is not None
+            and fingerprint_evidence is not None
+            and recovery_task_id is not None
+        ):
+            if NextAction.CONTINUE_CURRENT_STAGE.value not in policy["allowed_next_actions"]:
+                self._record_blocked(
+                    source_request_id, project_id,
+                    "review-driven remediation is not owner-authorized by project execution policy",
+                    task_id=recovery_task_id, source_kind="remediation",
+                )
+                return None
+            guard_error = self._recovery_fresh_guard(
+                project, snapshot, expected_branch=truth.branch, expected_head=truth.head,
+            )
+            if guard_error:
+                self._record_blocked(
+                    source_request_id, project_id, guard_error,
+                    task_id=recovery_task_id, source_kind="remediation",
+                )
+                return None
+            prompt = (
+                str(policy["remediation_prompt"])
+                + "\nReviewed task identity: {0}. Remediate only this reviewed task.\n\n"
+                + self._review_evidence(review_decision)
+            ).format(recovery_task_id)
+            review_decision_id = (
+                _non_blank_config(review_decision.get("request_id"))
+                or _non_blank_config(failed_remediation.get("review_decision_id"))
+                or _non_blank_config(failed_remediation.get("source_request_id"))
+            )
+            lineage = {
+                "recovery_of": failed_remediation.get("source_request_id"),
+                "review_decision_id": review_decision_id,
+                "recovery_reason": "owner continue after pre-execution worktree-safety refusal",
+                "review_status_hash": review_decision.get("review_status_hash"),
+                "reviewed_fingerprint_evidence": fingerprint_evidence,
+            }
+            launch = self._launch(
+                project, source_request_id=source_request_id, source_kind="remediation",
+                task_id=recovery_task_id, source_task_id=recovery_task_id,
+                branch=truth.branch, head=truth.head, worker_prompt=prompt, policy=policy,
+                lineage=lineage,
+            )
+            return launch
+        if exact_remediation_only:
+            return None
         if task_id is None:
             self._record_blocked(source_request_id, project_id, "current task id is unavailable", source_kind="control")
             return None
-        decisions = self._load_decisions()
         with self._lock:
             ledger = self._load_ledger()
             broker_rows = [
@@ -1673,51 +1863,6 @@ class TransitionExecutor:
                 if review_id not in ledger["executions"]:
                     self._record_blocked(source_request_id, project_id, "latest AIBroker Worker review transition is not yet applied", source_kind="control")
                     return None
-            failed_remediation, review_decision, recovery_error = self._pre_execution_remediation_retry(
-                ledger, decisions,
-                project_id=project_id, task_id=task_id, branch=truth.branch, head=truth.head,
-            )
-        if recovery_error:
-            self._record_blocked(source_request_id, project_id, recovery_error, task_id=task_id, source_kind="remediation")
-            return None
-        if failed_remediation is not None and review_decision is not None:
-            if NextAction.CONTINUE_CURRENT_STAGE.value not in policy["allowed_next_actions"]:
-                self._record_blocked(
-                    source_request_id, project_id,
-                    "review-driven remediation is not owner-authorized by project execution policy",
-                    task_id=task_id, source_kind="remediation",
-                )
-                return None
-            launch_task, guard_error = self._fresh_guard(
-                project, snapshot, expected_branch=truth.branch, expected_head=truth.head,
-                expected_task_id=task_id,
-            )
-            if launch_task is None:
-                self._record_blocked(
-                    source_request_id, project_id, guard_error,
-                    task_id=task_id, source_kind="remediation",
-                )
-                return None
-            prompt = (
-                str(policy["remediation_prompt"])
-                + "\nReviewed task identity: {0}. Remediate only this reviewed task.\n\n"
-                + self._review_evidence(review_decision)
-            ).format(task_id)
-            launch = self._launch(
-                project, source_request_id=source_request_id, source_kind="remediation",
-                task_id=launch_task, source_task_id=task_id,
-                branch=truth.branch, head=truth.head, worker_prompt=prompt, policy=policy,
-            )
-            if launch is not None:
-                self._update_record(
-                    source_request_id,
-                    recovery_of=failed_remediation.get("source_request_id"),
-                    review_decision_id=review_decision.get("request_id"),
-                    recovery_reason="owner continue after pre-execution worktree-safety refusal",
-                )
-            return launch
-        if exact_remediation_only:
-            return None
         launch_task, guard_error = self._fresh_guard(
             project, snapshot, expected_branch=truth.branch, expected_head=truth.head,
             expected_task_id=task_id,
@@ -1742,16 +1887,16 @@ class TransitionExecutor:
         project_id = str(project.get("project_id") or "")
         policy, _error = _execution_policy(project)
         truth = read_repository_truth(project.get("repo_path") or "")
-        task_id = _current_task_id(snapshot)
-        if policy is None or not truth.valid or task_id is None:
+        if policy is None or not truth.valid:
             return None
         decisions = self._load_decisions()
         with self._lock:
-            failed, decision, error = self._pre_execution_remediation_retry(
+            failed, decision, fingerprint_evidence, error = self._pre_execution_remediation_retry(
                 self._load_ledger(), decisions,
-                project_id=project_id, task_id=task_id, branch=truth.branch, head=truth.head,
+                project_id=project_id, branch=truth.branch, head=truth.head,
+                current_truth=truth,
             )
-        if failed is None or decision is None or error:
+        if failed is None or decision is None or fingerprint_evidence is None or error:
             return None
         return self.start_control(
             project, snapshot, source_request_id, exact_remediation_only=True,
