@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+from typing import Any
 import unittest
 
 from ops.self_host_acceptance import (
@@ -15,7 +16,7 @@ from ops.self_host_acceptance import (
 
 
 class EphemeralMockServer:
-    def __init__(self, routes: dict[str, tuple[int, bytes, str]] | None = None):
+    def __init__(self, routes: dict[str, Any] | None = None):
         self.routes = dict(routes or {})
         self.recorded_requests: list[tuple[str, str]] = []
         outer = self
@@ -27,10 +28,17 @@ class EphemeralMockServer:
             def do_GET(self):
                 outer.recorded_requests.append(("GET", self.path))
                 if self.path in outer.routes:
-                    status, body, content_type = outer.routes[self.path]
+                    entry = outer.routes[self.path]
+                    if len(entry) == 4:
+                        status, body, content_type, headers = entry
+                    else:
+                        status, body, content_type = entry
+                        headers = {}
                     self.send_response(status)
                     self.send_header("Content-Type", content_type)
                     self.send_header("Content-Length", str(len(body)))
+                    for h_name, h_val in (headers or {}).items():
+                        self.send_header(h_name, h_val)
                     self.end_headers()
                     self.wfile.write(body)
                 else:
@@ -48,14 +56,21 @@ class EphemeralMockServer:
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self._thread.start()
 
-    def set_route(self, path: str, status: int, data: bytes | str | dict, content_type: str = "application/json"):
+    def set_route(
+        self,
+        path: str,
+        status: int,
+        data: bytes | str | dict,
+        content_type: str = "application/json",
+        headers: dict[str, str] | None = None,
+    ):
         if isinstance(data, dict):
             body = json.dumps(data).encode("utf-8")
         elif isinstance(data, str):
             body = data.encode("utf-8")
         else:
             body = data
-        self.routes[path] = (status, body, content_type)
+        self.routes[path] = (status, body, content_type, headers or {})
 
     def close(self):
         self.server.shutdown()
@@ -457,6 +472,212 @@ class SelfHostAcceptanceTests(unittest.TestCase):
         path1 = canonical_path("C:/work/github/DevOrchestrator-dev")
         path2 = canonical_path("c:\\work\\github\\devorchestrator-dev")
         self.assertEqual(path1, path2)
+
+    def test_userinfo_credentials_rejection_and_no_leak_in_diagnostics(self):
+        with self.assertRaises(ValueError) as ctx:
+            validate_loopback_url("http://user:secret123@127.0.0.1:8770", "control_url")
+        self.assertIn("must not contain credentials", str(ctx.exception))
+        self.assertNotIn("secret123", str(ctx.exception))
+
+        with self.assertRaises(ValueError):
+            validate_loopback_url("http://user@127.0.0.1:8770", "control_url")
+        with self.assertRaises(ValueError):
+            validate_loopback_url("http://:secret123@localhost:8770", "control_url")
+
+        # Subprocess execution must reject credentials without leaking them
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(self.script_path),
+                "--control-url", "http://admin:super_secret_token@127.0.0.1:8770",
+                "--broker-url", self.broker_server.url,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("super_secret_token", proc.stdout)
+        self.assertNotIn("super_secret_token", proc.stderr)
+        parsed = json.loads(proc.stdout)
+        self.assertEqual(parsed["status"], "FAIL")
+        self.assertTrue(any("must not contain credentials" in d for d in parsed["diagnostics"]))
+
+    def test_http_redirects_rejected_without_following(self):
+        # Point overview to a 302 redirect targeting a secondary path
+        self._setup_healthy_endpoints()
+        self.control_server.set_route(
+            "/api/v1/control/overview",
+            302,
+            b"Redirecting",
+            "text/plain",
+            headers={"Location": f"{self.control_server.url}/evil_redirect_target"},
+        )
+        self.control_server.set_route(
+            "/evil_redirect_target",
+            200,
+            make_healthy_overview(self.repo_dir),
+        )
+
+        res = run_acceptance_checks(
+            control_url=self.control_server.url,
+            broker_url=self.broker_server.url,
+            expected_repo_path=self.repo_dir,
+        )
+        self.assertEqual(res["status"], "FAIL")
+        self.assertEqual(res["checks"]["daemon_health"]["status"], "FAIL")
+        self.assertTrue(any("redirect" in d.lower() for d in res["diagnostics"]))
+
+        # Confirm the redirect target was NEVER fetched
+        control_paths = [path for _, path in self.control_server.recorded_requests]
+        self.assertNotIn("/evil_redirect_target", control_paths)
+
+    def test_stale_unified_broker_resources_fails_acceptance(self):
+        # 1. Stale availability in data.resources
+        overview = make_healthy_overview(self.repo_dir)
+        overview["data"]["resources"]["availability"] = "stale"
+        overview["sources"] = [
+            {"name": "monitor", "availability": "available"},
+            {"name": "control", "availability": "available"},
+            {"name": "accounting", "availability": "available"},
+            {"name": "broker_resources", "availability": "stale"},
+            {"name": "broker_executions", "availability": "available"},
+        ]
+        self.control_server.set_route("/api/v1/control/overview", 200, overview)
+        self.broker_server.set_route("/api/resources", 200, make_healthy_resources())
+        self.broker_server.set_route("/api/executions", 200, make_healthy_executions())
+
+        res = run_acceptance_checks(
+            control_url=self.control_server.url,
+            broker_url=self.broker_server.url,
+            expected_repo_path=self.repo_dir,
+        )
+        self.assertEqual(res["status"], "FAIL")
+        self.assertEqual(res["overall_status"], "FAIL")
+        self.assertEqual(res["checks"]["broker_resources"]["status"], "FAIL")
+        self.assertEqual(res["broker_resources"]["status"], "FAIL")
+        self.assertFalse(res["broker_resources"]["unified_visible"])
+        self.assertTrue(any("stale" in d.lower() for d in res["diagnostics"]))
+
+        # Subprocess must return non-zero
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(self.script_path),
+                "--control-url", self.control_server.url,
+                "--broker-url", self.broker_server.url,
+                "--expected-repo-path", self.repo_dir,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        parsed = json.loads(proc.stdout)
+        self.assertEqual(parsed["status"], "FAIL")
+        self.assertEqual(parsed["checks"]["broker_resources"]["status"], "FAIL")
+
+        # 2. stale=True flag in data.resources
+        overview2 = make_healthy_overview(self.repo_dir)
+        overview2["data"]["resources"]["stale"] = True
+        self.control_server.set_route("/api/v1/control/overview", 200, overview2)
+        res2 = run_acceptance_checks(
+            control_url=self.control_server.url,
+            broker_url=self.broker_server.url,
+            expected_repo_path=self.repo_dir,
+        )
+        self.assertEqual(res2["status"], "FAIL")
+        self.assertEqual(res2["checks"]["broker_resources"]["status"], "FAIL")
+
+    def test_stale_unified_broker_executions_fails_acceptance(self):
+        # 1. Stale availability in data.executions
+        overview = make_healthy_overview(self.repo_dir)
+        overview["data"]["executions"]["availability"] = "stale"
+        overview["sources"] = [
+            {"name": "monitor", "availability": "available"},
+            {"name": "control", "availability": "available"},
+            {"name": "accounting", "availability": "available"},
+            {"name": "broker_resources", "availability": "available"},
+            {"name": "broker_executions", "availability": "stale"},
+        ]
+        self.control_server.set_route("/api/v1/control/overview", 200, overview)
+        self.broker_server.set_route("/api/resources", 200, make_healthy_resources())
+        self.broker_server.set_route("/api/executions", 200, make_healthy_executions())
+
+        res = run_acceptance_checks(
+            control_url=self.control_server.url,
+            broker_url=self.broker_server.url,
+            expected_repo_path=self.repo_dir,
+        )
+        self.assertEqual(res["status"], "FAIL")
+        self.assertEqual(res["overall_status"], "FAIL")
+        self.assertEqual(res["checks"]["broker_executions"]["status"], "FAIL")
+        self.assertEqual(res["broker_executions"]["status"], "FAIL")
+        self.assertFalse(res["broker_executions"]["unified_visible"])
+        self.assertTrue(any("stale" in d.lower() for d in res["diagnostics"]))
+
+        # Subprocess must return non-zero
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(self.script_path),
+                "--control-url", self.control_server.url,
+                "--broker-url", self.broker_server.url,
+                "--expected-repo-path", self.repo_dir,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        parsed = json.loads(proc.stdout)
+        self.assertEqual(parsed["status"], "FAIL")
+        self.assertEqual(parsed["checks"]["broker_executions"]["status"], "FAIL")
+
+        # 2. stale=True flag in data.executions
+        overview2 = make_healthy_overview(self.repo_dir)
+        overview2["data"]["executions"]["stale"] = True
+        self.control_server.set_route("/api/v1/control/overview", 200, overview2)
+        res2 = run_acceptance_checks(
+            control_url=self.control_server.url,
+            broker_url=self.broker_server.url,
+            expected_repo_path=self.repo_dir,
+        )
+        self.assertEqual(res2["status"], "FAIL")
+        self.assertEqual(res2["checks"]["broker_executions"]["status"], "FAIL")
+
+    def test_stale_direct_broker_endpoints_fail_acceptance(self):
+        # Direct resources reports stale
+        overview = make_healthy_overview(self.repo_dir)
+        self.control_server.set_route("/api/v1/control/overview", 200, overview)
+        stale_res = make_healthy_resources()
+        stale_res["availability"] = "stale"
+        self.broker_server.set_route("/api/resources", 200, stale_res)
+        self.broker_server.set_route("/api/executions", 200, make_healthy_executions())
+
+        res = run_acceptance_checks(
+            control_url=self.control_server.url,
+            broker_url=self.broker_server.url,
+            expected_repo_path=self.repo_dir,
+        )
+        self.assertEqual(res["status"], "FAIL")
+        self.assertEqual(res["checks"]["broker_resources"]["status"], "FAIL")
+        self.assertEqual(res["broker_resources"]["status"], "FAIL")
+
+        # Direct executions reports stale
+        self.broker_server.set_route("/api/resources", 200, make_healthy_resources())
+        stale_exec = make_healthy_executions()
+        stale_exec["availability"] = "stale"
+        self.broker_server.set_route("/api/executions", 200, stale_exec)
+
+        res2 = run_acceptance_checks(
+            control_url=self.control_server.url,
+            broker_url=self.broker_server.url,
+            expected_repo_path=self.repo_dir,
+        )
+        self.assertEqual(res2["status"], "FAIL")
+        self.assertEqual(res2["checks"]["broker_executions"]["status"], "FAIL")
+        self.assertEqual(res2["broker_executions"]["status"], "FAIL")
 
 
 if __name__ == "__main__":

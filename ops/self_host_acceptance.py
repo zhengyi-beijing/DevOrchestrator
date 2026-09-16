@@ -20,16 +20,39 @@ import urllib.request
 from typing import Any
 
 
+def sanitize_url(url: str) -> str:
+    """Remove userinfo / credentials from URL for safe diagnostics."""
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            hostname = parsed.hostname or ""
+            port_part = f":{parsed.port}" if parsed.port is not None else ""
+            return urllib.parse.urlunsplit((
+                parsed.scheme,
+                f"{hostname}{port_part}",
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            ))
+    except Exception:
+        pass
+    return url
+
+
 def validate_loopback_url(url: str, param_name: str) -> str:
-    """Validate that url is an HTTP loopback endpoint and return normalized base URL."""
+    """Validate that url is an HTTP loopback endpoint without credentials and return normalized base URL."""
     if not url or not isinstance(url, str):
         raise ValueError(f"{param_name} must be a non-empty string")
     stripped = url.strip()
     parsed = urllib.parse.urlsplit(stripped)
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise ValueError(f"{param_name} must not contain credentials")
     if parsed.scheme.lower() != "http":
-        raise ValueError(f"{param_name} must use 'http' scheme: {url!r}")
+        raise ValueError(f"{param_name} must use 'http' scheme: {sanitize_url(url)!r}")
     if not parsed.hostname:
-        raise ValueError(f"{param_name} missing hostname: {url!r}")
+        raise ValueError(f"{param_name} missing hostname: {sanitize_url(url)!r}")
     hostname = parsed.hostname.lower()
     is_loop = False
     try:
@@ -37,10 +60,11 @@ def validate_loopback_url(url: str, param_name: str) -> str:
     except ValueError:
         is_loop = (hostname == "localhost")
     if not is_loop:
-        raise ValueError(f"{param_name} must target loopback address (127.0.0.1 or localhost): {url!r}")
+        raise ValueError(f"{param_name} must target loopback address (127.0.0.1 or localhost): {sanitize_url(url)!r}")
     if parsed.query or parsed.fragment:
         raise ValueError(f"{param_name} must not contain query or fragment parameters")
-    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    port_part = f":{parsed.port}" if parsed.port is not None else ""
+    return f"{parsed.scheme.lower()}://{hostname}{port_part}".rstrip("/")
 
 
 def canonical_path(p: str | Path | None) -> str:
@@ -54,28 +78,59 @@ def canonical_path(p: str | Path | None) -> str:
         return os.path.normcase(str(p))
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP redirects to prevent navigating outside allowlisted loopback endpoints."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+    def http_error_301(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"HTTP redirect {code} not permitted", headers, fp
+        )
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+
+_OPENER = urllib.request.build_opener(NoRedirectHandler)
+
+
 def fetch_json(url: str, timeout: float) -> tuple[int | None, Any, str | None]:
-    """Issue a GET request to a loopback URL.
+    """Issue a GET request to a loopback URL without following redirects.
 
     Returns (status_code, parsed_json, error_diagnostic).
     Response bodies and secrets are excluded from diagnostics.
     """
+    safe_url = sanitize_url(url)
     req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             status = resp.status
             raw_data = resp.read()
             try:
                 data = json.loads(raw_data.decode("utf-8"))
                 return status, data, None
             except (UnicodeDecodeError, json.JSONDecodeError):
-                return status, None, f"endpoint {url!r} returned malformed JSON"
+                return status, None, f"endpoint {safe_url!r} returned malformed JSON"
     except urllib.error.HTTPError as exc:
-        return exc.code, None, f"endpoint {url!r} returned HTTP {exc.code}: {exc.reason}"
+        if 300 <= exc.code < 400:
+            return exc.code, None, f"endpoint {safe_url!r} returned HTTP redirect {exc.code} (redirects not permitted)"
+        return exc.code, None, f"endpoint {safe_url!r} returned HTTP {exc.code}: {exc.reason}"
     except urllib.error.URLError as exc:
-        return None, None, f"endpoint {url!r} connection failed: {exc.reason}"
+        return None, None, f"endpoint {safe_url!r} connection failed: {exc.reason}"
     except (TimeoutError, OSError) as exc:
-        return None, None, f"endpoint {url!r} request failed: {type(exc).__name__}"
+        return None, None, f"endpoint {safe_url!r} request failed: {type(exc).__name__}"
 
 
 def run_acceptance_checks(
@@ -235,36 +290,87 @@ def run_acceptance_checks(
             if not isinstance(acct, dict):
                 accounting_diags.append("overview missing or invalid 'accounting' section")
             else:
-                if acct.get("available") is not True or acct.get("data_status") == "unavailable":
+                acct_stale = acct.get("stale") is True or acct.get("availability") == "stale" or acct.get("data_status") == "stale"
+                if acct_stale:
+                    accounting_diags.append("P11 accounting reported stale")
+                elif acct.get("available") is not True or acct.get("data_status") == "unavailable" or acct.get("availability") == "unavailable":
                     err_msg = acct.get("error") or "accounting data unavailable"
                     accounting_diags.append(f"P11 accounting unavailable: {err_msg}")
                 else:
                     accounting_available = True
-            if sources_dict.get("accounting") == "unavailable" and not accounting_diags:
+            if sources_dict.get("accounting") == "stale" and "stale" not in " ".join(accounting_diags):
+                accounting_available = False
+                accounting_diags.append("accounting source reported stale")
+            elif sources_dict.get("accounting") == "unavailable" and not accounting_diags:
+                accounting_available = False
                 accounting_diags.append("accounting source reported unavailable")
 
             # 5. Unified broker resources & executions
             res = data.get("resources")
             if not isinstance(res, dict):
                 unified_res_diags.append("overview missing or invalid 'resources' section")
-            elif res.get("available") is not True or res.get("availability") == "unavailable":
-                err_res = res.get("error") or "resources unavailable"
-                unified_res_diags.append(f"broker resources unavailable through unified surface: {err_res}")
             else:
-                unified_res_visible = True
-            if sources_dict.get("broker_resources") == "unavailable" and not unified_res_diags:
-                unified_res_diags.append("broker_resources source reported unavailable")
+                res_avail = res.get("availability")
+                res_stale = res.get("stale") is True or res_avail == "stale"
+                res_unavail = res.get("available") is False or res_avail == "unavailable"
+                if res_stale:
+                    err_res = res.get("error") or "broker resources reported stale"
+                    unified_res_diags.append(f"broker resources reported stale through unified surface: {err_res}")
+                elif res_unavail or res.get("available") is not True:
+                    err_res = res.get("error") or "resources unavailable"
+                    unified_res_diags.append(f"broker resources unavailable through unified surface: {err_res}")
+                else:
+                    unified_res_visible = True
+
+            src_res_avail = sources_dict.get("broker_resources")
+            if src_res_avail == "stale":
+                unified_res_visible = False
+                msg = "broker_resources source reported stale"
+                if msg not in unified_res_diags:
+                    unified_res_diags.append(msg)
+            elif src_res_avail == "unavailable":
+                unified_res_visible = False
+                msg = "broker_resources source reported unavailable"
+                if msg not in unified_res_diags:
+                    unified_res_diags.append(msg)
+            elif src_res_avail is not None and src_res_avail != "available":
+                unified_res_visible = False
+                msg = f"broker_resources source reported unexpected availability: {src_res_avail!r}"
+                if msg not in unified_res_diags:
+                    unified_res_diags.append(msg)
 
             ex = data.get("executions")
             if not isinstance(ex, dict):
                 unified_exec_diags.append("overview missing or invalid 'executions' section")
-            elif ex.get("available") is not True or ex.get("availability") == "unavailable":
-                err_ex = ex.get("error") or "executions unavailable"
-                unified_exec_diags.append(f"broker executions unavailable through unified surface: {err_ex}")
             else:
-                unified_exec_visible = True
-            if sources_dict.get("broker_executions") == "unavailable" and not unified_exec_diags:
-                unified_exec_diags.append("broker_executions source reported unavailable")
+                ex_avail = ex.get("availability")
+                ex_stale = ex.get("stale") is True or ex_avail == "stale"
+                ex_unavail = ex.get("available") is False or ex_avail == "unavailable"
+                if ex_stale:
+                    err_ex = ex.get("error") or "broker executions reported stale"
+                    unified_exec_diags.append(f"broker executions reported stale through unified surface: {err_ex}")
+                elif ex_unavail or ex.get("available") is not True:
+                    err_ex = ex.get("error") or "executions unavailable"
+                    unified_exec_diags.append(f"broker executions unavailable through unified surface: {err_ex}")
+                else:
+                    unified_exec_visible = True
+
+            src_exec_avail = sources_dict.get("broker_executions")
+            if src_exec_avail == "stale":
+                unified_exec_visible = False
+                msg = "broker_executions source reported stale"
+                if msg not in unified_exec_diags:
+                    unified_exec_diags.append(msg)
+            elif src_exec_avail == "unavailable":
+                unified_exec_visible = False
+                msg = "broker_executions source reported unavailable"
+                if msg not in unified_exec_diags:
+                    unified_exec_diags.append(msg)
+            elif src_exec_avail is not None and src_exec_avail != "available":
+                unified_exec_visible = False
+                msg = f"broker_executions source reported unexpected availability: {src_exec_avail!r}"
+                if msg not in unified_exec_diags:
+                    unified_exec_diags.append(msg)
 
     # Direct broker checks
     direct_res_diags: list[str] = []
@@ -277,6 +383,10 @@ def run_acceptance_checks(
         direct_res_diags.append("direct broker /api/resources response is not a JSON object")
     elif not isinstance(broker_res.get("resources"), list):
         direct_res_diags.append("direct broker /api/resources response missing 'resources' list")
+    elif broker_res.get("stale") is True or broker_res.get("availability") == "stale":
+        direct_res_diags.append("direct broker /api/resources reported stale")
+    elif broker_res.get("available") is False or broker_res.get("availability") == "unavailable":
+        direct_res_diags.append("direct broker /api/resources reported unavailable")
     else:
         direct_res_visible = True
         direct_res_count = len(broker_res["resources"])
@@ -291,6 +401,10 @@ def run_acceptance_checks(
         direct_exec_diags.append("direct broker /api/executions response is not a JSON object")
     elif not isinstance(broker_exec.get("executions"), list):
         direct_exec_diags.append("direct broker /api/executions response missing 'executions' list")
+    elif broker_exec.get("stale") is True or broker_exec.get("availability") == "stale":
+        direct_exec_diags.append("direct broker /api/executions reported stale")
+    elif broker_exec.get("available") is False or broker_exec.get("availability") == "unavailable":
+        direct_exec_diags.append("direct broker /api/executions reported unavailable")
     else:
         direct_exec_visible = True
         direct_exec_count = len(broker_exec["executions"])
@@ -330,16 +444,16 @@ def run_acceptance_checks(
 
     broker_resources_section = {
         "status": "PASS" if not broker_resources_diags else "FAIL",
-        "unified_visible": unified_res_visible,
-        "direct_visible": direct_res_visible,
+        "unified_visible": unified_res_visible and not unified_res_diags,
+        "direct_visible": direct_res_visible and not direct_res_diags,
         "resource_count": direct_res_count,
         "diagnostics": broker_resources_diags,
     }
 
     broker_executions_section = {
         "status": "PASS" if not broker_executions_diags else "FAIL",
-        "unified_visible": unified_exec_visible,
-        "direct_visible": direct_exec_visible,
+        "unified_visible": unified_exec_visible and not unified_exec_diags,
+        "direct_visible": direct_exec_visible and not direct_exec_diags,
         "execution_count": direct_exec_count,
         "diagnostics": broker_executions_diags,
     }
@@ -445,17 +559,18 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
         )
     except ValueError as exc:
+        diag = sanitize_url(str(exc))
         result = {
             "status": "FAIL",
             "overall_status": "FAIL",
             "checks": {},
-            "daemon_control": {"status": "FAIL", "diagnostics": [str(exc)]},
+            "daemon_control": {"status": "FAIL", "diagnostics": [diag]},
             "project_identity": {"status": "FAIL", "diagnostics": []},
             "accounting": {"status": "FAIL", "diagnostics": []},
             "broker_resources": {"status": "FAIL", "diagnostics": []},
             "broker_executions": {"status": "FAIL", "diagnostics": []},
             "warnings": [],
-            "diagnostics": [str(exc)],
+            "diagnostics": [diag],
         }
         print(json.dumps(result, indent=2))
         return 2

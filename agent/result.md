@@ -304,3 +304,22 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Full test suite passed: 550 passed, 22 subtests passed in 141.98s.
   - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax (`browser/chatgpt-web-adapter.user.js` and `web/app.js`), and `git diff --check` passed cleanly.
   - Knowledge graph refreshed via `graphify update .`: 2865 nodes, 7785 edges, 140 communities.
+
+## P12.5 Review Remediation (2026-09-16)
+
+- Remediation of Technical Review findings for P12.5:
+  - Fixed stale broker evidence handling in `ops/self_host_acceptance.py`: unified broker resources and executions now fail closed when `availability="stale"` or `stale=True` in payload data or when `broker_resources`/`broker_executions` sources report `stale`, setting the check to `FAIL` and exiting non-zero. Direct broker `/api/resources` and `/api/executions` checks also verify non-stale availability.
+  - Blocked HTTP redirects in `ops/self_host_acceptance.py`: configured `urllib.request` with `NoRedirectHandler` subclassing `HTTPRedirectHandler` that rejects 301, 302, 303, 307, 308 redirects with explicit HTTP errors instead of following them to non-allowlisted or remote destinations.
+  - Rejected credentials and sanitized diagnostics: `validate_loopback_url` explicitly rejects userinfo/credentials (raising `ValueError("must not contain credentials")`) before formatting URLs. Added `sanitize_url` stripping userinfo from URLs across all diagnostic formatting, preventing secrets from leaking into CLI output.
+- Added 5 regression tests in `tests_py/test_self_host_acceptance.py`:
+  - `test_userinfo_credentials_rejection_and_no_leak_in_diagnostics`: verifies credential rejection and proves userinfo/passwords are not leaked in stdout/stderr/diagnostics across both direct calls and subprocess invocation.
+  - `test_http_redirects_rejected_without_following`: verifies 302 redirects are blocked, error diagnostics are recorded, and redirect targets are never requested.
+  - `test_stale_unified_broker_resources_fails_acceptance`: verifies stale availability and stale flag in overview data and sources fail closed with non-zero exit code.
+  - `test_stale_unified_broker_executions_fails_acceptance`: verifies stale availability and stale flag in overview data and sources fail closed with non-zero exit code.
+  - `test_stale_direct_broker_endpoints_fail_acceptance`: verifies direct 8875 endpoints reporting stale availability fail closed.
+- Verification:
+  - Focused test suite passed: 21 passed in 25.81s (`python -m pytest tests_py/test_self_host_acceptance.py -q`).
+  - Full test suite passed: 555 passed, 22 subtests passed in 148.26s (`python -m pytest tests_py -q`).
+  - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax (`browser/chatgpt-web-adapter.user.js` and `web/app.js`), and `git diff --check` passed cleanly.
+  - Live deployment acceptance test (`python ops/self_host_acceptance.py`) against running daemon (PID 5712) and AIBroker (8875) passed cleanly with status `PASS`.
+  - Knowledge graph refreshed via `graphify update .`: 2879 nodes, 7820 edges, 145 communities.

@@ -73,3 +73,11 @@ P12.5 result:
 - Documented canonical self-host deployment commands, expected exit behavior, and endpoint overrides in README.md.
 - Added 16 focused tests in `tests_py/test_self_host_acceptance.py`.
 - Full regression passed: 550 tests and 22 subtests. Python compilation, JavaScript syntax, and git diff check passed. Knowledge graph updated to 2865 nodes, 7785 edges, 140 communities.
+
+P12.5 review remediation result:
+- Closed stale broker evidence gap: unified broker resources and executions now fail closed on `availability="stale"` or `stale=True` (and corresponding sources availability), as well as direct broker endpoints.
+- Closed HTTP redirect gap: requests now use `NoRedirectHandler` preventing redirection to non-allowlisted or remote targets, returning explicit HTTP redirect errors without following.
+- Closed credentials/userinfo gap: `validate_loopback_url` explicitly rejects userinfo/credentials, URLs are sanitized for safe diagnostics, and credentials are never leaked in error messages or subprocess outputs.
+- Added 5 new regression tests in `tests_py/test_self_host_acceptance.py` (21 focused tests total passing).
+- Full regression passed: 555 passed, 22 subtests passed. Python compilation, JavaScript syntax, and `git diff --check` passed cleanly. Knowledge graph updated to 2879 nodes, 7820 edges, 145 communities.
+- Live deployment check against running daemon (PID 5712) and AIBroker (8875) verified PASS.
