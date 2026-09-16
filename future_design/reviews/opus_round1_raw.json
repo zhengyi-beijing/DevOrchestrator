@@ -1,0 +1,21 @@
+{
+  "success": false,
+  "exit_code": null,
+  "stdout": "",
+  "stderr": "",
+  "final_response": null,
+  "session_id": null,
+  "started_at": "2026-09-16T07:26:41.663871+00:00",
+  "finished_at": "2026-09-16T07:29:41.986320+00:00",
+  "duration_seconds": 180.3279999999795,
+  "resource_id": "agy/agy-1/claude-opus-4-6-thinking",
+  "model": "claude-opus-4-6-thinking",
+  "usage": null,
+  "quota_before": null,
+  "quota_after": null,
+  "error": "execution timed out after 180.0 seconds",
+  "rate_limit": null,
+  "metadata": {
+    "execution_id": "c46c4447-911d-4de6-ab5e-f702de07709f"
+  }
+}

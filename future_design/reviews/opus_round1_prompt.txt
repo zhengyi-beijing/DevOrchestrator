@@ -1,0 +1,17 @@
+READ-ONLY independent architecture review.
+
+Read these files in the current repository:
+- future_design/DEVORCH_AIBROKER_ARCHITECTURE_EVOLUTION.md
+- docs/AIBROKER_INTEGRATION_CONTRACT.md
+- docs/DURABLE_PROJECT_CONTEXT_DESIGN.md
+- docs/PROGRESS_WATCHDOG_DIAGNOSTICS_DESIGN.md
+- docs/backlog.md
+- agent/CURRENT.md
+- agent/staged/P12.6.md
+
+Do not edit any file. Review the future design against the accepted current contracts.
+Focus on: DevO/AIBroker authority boundary, nested-orchestrator risk, incremental feasibility, ProjectActor/event journal design, resource leases/dynamic cost, context/evidence efficiency, SoL-Pi/AI Toolbox/OMA/Repowire/A2A integration boundaries, restart/recovery, auditability, Windows/WSL operational risk, and migration compatibility.
+
+Identify contradictions, hidden failure modes, over-engineering, missing schemas/invariants, and migration hazards.
+Classify findings as BLOCKING, IMPORTANT, or OPTIONAL. For each finding give evidence/reason and a concrete revision.
+End with a concise recommended revision list and an overall verdict: ACCEPTABLE_AFTER_REVISION or FUNDAMENTAL_RETHINK.

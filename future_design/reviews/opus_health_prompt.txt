@@ -1,0 +1,1 @@
+Return exactly OPUS_HEALTH_OK and nothing else.
