@@ -39,6 +39,37 @@ class RecoveryPort(FakePort):
         self.status_requests.append(request_id); return dict(self.fact) if self.fact else None
 
 
+class WorktreeUnsafeError(Exception):
+    pass
+
+
+class PreExecutionWorktreePort(FakePort):
+    def __init__(self):
+        super().__init__()
+        self.fail_first = True
+
+    def execute(self, request):
+        self.requests.append(request)
+        if self.fail_first:
+            self.fail_first = False
+            return AIRoleResult(
+                request_id=request.request_id, role_run_id=request.role_run_id,
+                status="failed",
+                error="WorktreeUnsafeError: dirty worktree requires deterministic recovery before writable reuse",
+                dispatch_id="fa9af4c6-incident", decision_id="17fd00d7-incident",
+                execution_id="c44f65e9-2da2-41d3-9eab-cc1a03241114",
+                resource_context=ResourceContext(
+                    "agy/agy-1/gemini-3.8-flash-high", "agy", "agy-1", "gemini-3.8-flash-high",
+                ),
+            )
+        return AIRoleResult(
+            request_id=request.request_id, role_run_id=request.role_run_id,
+            status="succeeded", output="REMEDIATED",
+            dispatch_id="dispatch-retry", decision_id="decision-retry",
+            execution_id="execution-retry",
+        )
+
+
 def broker_project(repo: Path):
     return {
         "project_id": "p1",
@@ -62,6 +93,28 @@ class AIBrokerTransitionTests(unittest.TestCase):
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
         return repo
+
+    def _write_remediation_decision(self, runtime: Path, truth, *, head=None, reason="Fix the stale broker evidence"):
+        runtime.mkdir(parents=True, exist_ok=True)
+        decision_id = "review-remediate-1"
+        (runtime / "review-decisions.json").write_text(json.dumps({"version": 1, "decisions": {
+            decision_id: {
+                "project_id": "p1", "request_id": decision_id,
+                "disposition": "apply", "decision": "remediate",
+                "next_action": "continue_current_stage", "task_id": "P1",
+                "branch": truth.branch, "head": head or truth.head,
+                "role": "reviewer", "event": "worker_done", "reason": reason,
+                "review_status_hash": truth.status_hash, "consumed_at": "2026-09-16T00:00:00+00:00",
+            },
+        }}), encoding="utf-8")
+        return decision_id
+
+    @staticmethod
+    def _remediation_snapshot():
+        return {
+            "state": "READY_TO_RUN", "telemetry": {"task_id": "P1"},
+            "worker": {"state": "not_started", "process_alive": False},
+        }
 
 
     def _write_active_broker_record(self, runtime: Path, repo: Path, truth, *, request_id="worker-1"):
@@ -139,6 +192,91 @@ class AIBrokerTransitionTests(unittest.TestCase):
             launch = executor.start_control(broker_project(repo), snapshot, "new-control")
             self.assertIsNone(launch)
             self.assertEqual(port.requests, [])
+
+    def test_owner_continue_retries_only_exact_pre_execution_remediation_with_review_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            policy, error = _execution_policy(project); self.assertFalse(error)
+            port = PreExecutionWorktreePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            (repo / "graphify-out.txt").write_text("generated\n", encoding="utf-8")
+            reviewed_truth = read_repository_truth(repo)
+            decision_id = self._write_remediation_decision(runtime, reviewed_truth)
+            initial = executor._launch(
+                project, source_request_id=decision_id, source_kind="remediation",
+                task_id="P1", source_task_id="P1", branch=reviewed_truth.branch,
+                head=reviewed_truth.head, worker_prompt="INITIAL REMEDIATION", policy=policy,
+            )
+            self.assertIsNotNone(initial)
+            executor._threads[decision_id].join(timeout=2)
+            original = executor.state()["executions"][decision_id]
+            self.assertEqual(original["state"], "failed")
+            self.assertIn("WorktreeUnsafeError", original["reason"])
+            self.assertEqual(original["broker_status"], "failed")
+            self.assertEqual(original["dispatch_id"], "fa9af4c6-incident")
+            self.assertEqual(original["decision_id"], "17fd00d7-incident")
+            self.assertEqual(original["execution_id"], "c44f65e9-2da2-41d3-9eab-cc1a03241114")
+            self.assertEqual(original["resource_context"]["resource_id"], "agy/agy-1/gemini-3.8-flash-high")
+            self.assertIsNone(original["session_id"])
+            self.assertFalse(original["provider_output_observed"])
+            original_before_retry = json.loads(json.dumps(original))
+
+            (repo / "graphify-out.txt").unlink()
+            retry = executor.start_control(project, self._remediation_snapshot(), "owner-continue-2")
+            self.assertIsNotNone(retry)
+            executor._threads["owner-continue-2"].join(timeout=2)
+            ledger = executor.state()["executions"]
+            self.assertEqual(ledger[decision_id], original_before_retry)
+            self.assertEqual(ledger["owner-continue-2"]["state"], "completed")
+            self.assertEqual(ledger["owner-continue-2"]["source_kind"], "remediation")
+            self.assertEqual(ledger["owner-continue-2"]["recovery_of"], decision_id)
+            self.assertEqual(ledger["owner-continue-2"]["review_decision_id"], decision_id)
+            self.assertEqual(len(port.requests), 2)
+            self.assertEqual(port.requests[1].stage_run_id, "remediation")
+            self.assertIn("Remediate the current bounded task", port.requests[1].prompt)
+            self.assertIn("Reviewer reason: Fix the stale broker evidence", port.requests[1].prompt)
+            self.assertIsNone(executor.start_control(project, self._remediation_snapshot(), "owner-continue-2"))
+            self.assertEqual(len(port.requests), 2)
+
+    def test_remediation_recovery_refuses_dirty_mismatched_or_usable_provider_work(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            policy, error = _execution_policy(project); self.assertFalse(error)
+            port = PreExecutionWorktreePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            truth = read_repository_truth(repo); decision_id = self._write_remediation_decision(runtime, truth)
+            initial = executor._launch(project, source_request_id=decision_id, source_kind="remediation",
+                task_id="P1", source_task_id="P1", branch=truth.branch, head=truth.head,
+                worker_prompt="INITIAL", policy=policy)
+            self.assertIsNotNone(initial); executor._threads[decision_id].join(timeout=2)
+
+            (repo / "generated.txt").write_text("dirty\n", encoding="utf-8")
+            self.assertIsNone(executor.start_control(project, self._remediation_snapshot(), "dirty-continue"))
+            self.assertIn("repository is dirty", executor.state()["executions"]["dirty-continue"]["reason"])
+            (repo / "generated.txt").unlink()
+
+            decision_path = runtime / "review-decisions.json"
+            decisions = json.loads(decision_path.read_text(encoding="utf-8"))
+            decisions["decisions"][decision_id]["head"] = "mismatched-head"
+            decision_path.write_text(json.dumps(decisions), encoding="utf-8")
+            self.assertIsNone(executor.start_control(project, self._remediation_snapshot(), "mismatched-continue"))
+            self.assertIn("decision no longer matches", executor.state()["executions"]["mismatched-continue"]["reason"])
+            decisions["decisions"][decision_id]["head"] = truth.head
+            decision_path.write_text(json.dumps(decisions), encoding="utf-8")
+
+            baseline = executor.state()
+            for command_id, field, value in (
+                ("session-continue", "session_id", "provider-session"),
+                ("output-continue", "provider_output_observed", True),
+                ("provider-failure-continue", "reason", "provider timeout"),
+            ):
+                bad = json.loads(json.dumps(baseline)); bad["executions"][decision_id][field] = value
+                (runtime / "transition-executor.json").write_text(json.dumps(bad), encoding="utf-8")
+                self.assertIsNone(executor.start_control(project, self._remediation_snapshot(), command_id))
+                self.assertIn("not an exact no-usable-provider-work WorktreeUnsafeError", executor.state()["executions"][command_id]["reason"])
+            self.assertEqual(len(port.requests), 1)
 
     def test_policy_accepts_aibroker_without_legacy_backends(self):
         with tempfile.TemporaryDirectory() as td:

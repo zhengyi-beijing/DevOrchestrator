@@ -42,6 +42,19 @@ class FakeExecutor:
         self.records[source_request_id].update({"state": "blocked", "reason": reason})
 
 
+class ExactResumeExecutor(FakeExecutor):
+    def __init__(self, owner_store):
+        super().__init__(launch=True)
+        self.resume_calls = []
+        self.owner_store = owner_store
+
+    def resume_exact_remediation(self, project, snapshot, source_request_id):
+        if self.owner_store.is_paused(project["project_id"]):
+            raise AssertionError("resume exact remediation ran before owner pause was cleared")
+        self.resume_calls.append((project["project_id"], source_request_id))
+        return SimpleNamespace(task_id="P1", backend_id="aibroker")
+
+
 def write_config(path: Path, repo: Path) -> None:
     path.write_text(json.dumps({"projects": [{
         "project_id": "p1", "repo_path": str(repo), "adapter": "agent_files",
@@ -100,6 +113,23 @@ class ControlCommandTests(unittest.TestCase):
             self.assertEqual(coordinator.advance(config, summary, executor), [])
             self.assertEqual(len(executor.calls), 1)
             self.assertEqual(latest_control_result(runtime, "p1")["state"], "accepted")
+
+    def test_resume_uses_only_the_exact_remediation_adapter(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; repo.mkdir(); runtime = base / "runtime"
+            config = base / "projects.json"; write_config(config, repo)
+            snapshot = {"project_id": "p1", "state": "READY_TO_RUN", "telemetry": {"task_id": "P1"}}
+            coordinator = ControlCommandCoordinator(runtime)
+            coordinator.owner_store.set_paused("p1", True, command_id="pause-1", action="pause")
+            command = submit_control_command(
+                runtime, "p1", "resume", expected=project_identity(snapshot, runtime),
+            )
+            executor = ExactResumeExecutor(coordinator.owner_store)
+            outcome = coordinator.advance(config, {"projects": [snapshot]}, executor)[0]
+            self.assertEqual(outcome["command_id"], command["command_id"])
+            self.assertEqual(outcome["effect"], "resume_exact_remediation")
+            self.assertEqual(executor.resume_calls, [("p1", command["command_id"] + ":resume")])
+            self.assertEqual(executor.calls, [])
 
     def test_missing_project_and_executor_refusal_fail_closed(self):
         with tempfile.TemporaryDirectory() as td:

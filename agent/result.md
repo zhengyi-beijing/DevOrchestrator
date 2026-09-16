@@ -323,3 +323,30 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax (`browser/chatgpt-web-adapter.user.js` and `web/app.js`), and `git diff --check` passed cleanly.
   - Live deployment acceptance test (`python ops/self_host_acceptance.py`) against running daemon (PID 5712) and AIBroker (8875) passed cleanly with status `PASS`.
   - Knowledge graph refreshed via `graphify update .`: 2879 nodes, 7820 edges, 145 communities.
+
+## P12.5 Self-Host Recovery Hotfix (2026-09-16)
+
+- Fixed owner `continue`/`resume` recovery for an exact Technical Review
+  `REMEDIATE` whose AIBroker harness rejected writable reuse with recorded
+  `WorktreeUnsafeError`. The accepted production shape has
+  `broker_status=failed`, dispatch/decision/execution/resource allocation
+  evidence, a null provider session and no usable output/work evidence.
+- The retry creates a new remediation execution identity and preserves the
+  original failed execution. Its prompt uses `remediation_prompt` and injects
+  durable original reviewer reason/findings evidence.
+- Retry fails closed unless the applied reviewer decision, task, branch/HEAD,
+  clean current worktree, no-active-execution state and absence of provider
+  usable-session/output/work evidence all match. Broker allocation IDs and
+  resource context alone do not prove useful provider work. Failed generic
+  Workers, mismatched decisions and provider-evidenced/ambiguous failures
+  cannot become remediation retries.
+- Formalized single-authorization unattended continuation in
+  `docs/AIBROKER_INTEGRATION_CONTRACT.md` without creating a second lifecycle
+  authority.
+- Added staged `P12.6` acceptance/closure specification and roadmap handoff
+  from P12.5. P12.6 verifies the existing persistent harness and CLI fallback;
+  it is not a harness rewrite.
+- Verification: focused remediation/control/staged tests passed (55 tests);
+  full `python -m pytest tests_py -q` passed (560 tests and 22 subtests in
+  141.04s); Python compilation, both JavaScript syntax checks and
+  `git diff --check` passed.

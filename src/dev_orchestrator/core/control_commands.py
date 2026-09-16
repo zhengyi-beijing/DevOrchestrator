@@ -332,6 +332,17 @@ class ControlCommandCoordinator:
             state = self.owner_store.set_paused(
                 project_id, False, command_id=command_id, action=action
             )
+            resume_exact = getattr(executor, "resume_exact_remediation", None)
+            launch = (
+                resume_exact(projects[project_id], snapshot, command_id + ":resume")
+                if callable(resume_exact) else None
+            )
+            if launch is not None:
+                return {
+                    **record, "state": "accepted", "processed_at": now,
+                    "effect": "resume_exact_remediation", "owner_control": state,
+                    "task_id": launch.task_id, "backend_id": launch.backend_id,
+                }
             return {**record, "state": "accepted", "processed_at": now, "effect": "resume_future_launches", "owner_control": state}
         if action == "stop":
             lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "")

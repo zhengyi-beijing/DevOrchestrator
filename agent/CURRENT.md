@@ -81,3 +81,21 @@ P12.5 review remediation result:
 - Added 5 new regression tests in `tests_py/test_self_host_acceptance.py` (21 focused tests total passing).
 - Full regression passed: 555 passed, 22 subtests passed. Python compilation, JavaScript syntax, and `git diff --check` passed cleanly. Knowledge graph updated to 2879 nodes, 7820 edges, 145 communities.
 - Live deployment check against running daemon (PID 5712) and AIBroker (8875) verified PASS.
+
+P12.5 self-host recovery hotfix result:
+- Owner `continue` and `resume` preserve exact review-driven remediation after a
+  `WorktreeUnsafeError` broker failure with explicit `broker_status=failed`,
+  allocation IDs/resource context, null provider session and no usable output:
+  a new remediation identity uses the configured remediation prompt plus durable
+  original reviewer evidence; the failed execution remains immutable history.
+- Recovery is fail-closed unless the applied REMEDIATE decision, task,
+  branch/HEAD, clean current worktree, no-active-run state and absence of all
+  usable provider session/output/work evidence match exactly. Broker allocation
+  IDs and resource context alone do not imply useful provider work. Generic
+  failed Workers and ambiguous attempts remain non-retryable.
+- Documented unattended continuation authority without adding a second
+  lifecycle authority. P12.5 now hands off to the bounded P12.6 persistent
+  harness acceptance/closure spec, which verifies existing capability only.
+- Verification: focused remediation/control/staged suites passed (55 tests);
+  full `python -m pytest tests_py -q` passed (560 tests and 22 subtests), as
+  did `python -m compileall -q src ops tests_py` and `git diff --check`.

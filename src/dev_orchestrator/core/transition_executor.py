@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import re
 import threading
 import time
@@ -129,6 +130,12 @@ _RETRYABLE_PROVIDER_FAILURE_MARKERS = (
     "individual quota reached",
     "quota exhausted",
     "quota reached",
+)
+
+_PRE_EXECUTION_WORKTREE_SAFETY_MARKER = "worktreeunsafeerror"
+_USABLE_PROVIDER_WORK_EVIDENCE_FIELDS = (
+    "provider_output_observed", "provider_work_observed", "first_output_at",
+    "output",
 )
 
 
@@ -991,7 +998,9 @@ class TransitionExecutor:
                 )
             self._update_record(
                 source_request_id, state="failed",
-                reason="AIBroker worker lifecycle error: {0}".format(exc),
+                reason="AIBroker worker lifecycle error [{0}]: {1}".format(
+                    type(exc).__name__, exc,
+                ),
                 completed_at=utc_now_iso(),
             )
             if self._progress_channel is not None:
@@ -1049,6 +1058,9 @@ class TransitionExecutor:
                 request_id=request.request_id,
                 source_request_id=source_request_id,
             )
+        provider_output_observed = bool(
+            _non_blank_config(result.output) is not None or result.first_output_at is not None
+        )
         self._update_record(
             source_request_id,
             state=state,
@@ -1061,6 +1073,8 @@ class TransitionExecutor:
             backend_run_id=result.execution_id or result.dispatch_id,
             resource_context=resource_payload,
             usage_source=result.usage_source,
+            provider_output_observed=provider_output_observed,
+            first_output_at=result.first_output_at,
             reason=result.error,
         )
         if self._progress_channel is not None:
@@ -1304,6 +1318,103 @@ class TransitionExecutor:
         return merged
 
     @staticmethod
+    def _failed_before_provider_work(record: dict[str, Any]) -> bool:
+        """Recognize Broker allocation that failed at worktree safety pre-provider.
+
+        Broker dispatch/decision/execution/resource identities establish allocation,
+        not useful provider work. The recovery evidence is the explicit safety
+        refusal, a terminal Broker failure, no usable provider session, and no
+        positive output/work evidence.
+        """
+        if (
+            record.get("engine") != "aibroker"
+            or record.get("source_kind") != "remediation"
+            or record.get("state") != "failed"
+        ):
+            return False
+        reason = str(record.get("reason") or "").casefold()
+        if _PRE_EXECUTION_WORKTREE_SAFETY_MARKER not in reason:
+            return False
+        if record.get("broker_status") != "failed":
+            return False
+        if "session_id" not in record or record.get("session_id") is not None:
+            return False
+        return not any(record.get(name) for name in _USABLE_PROVIDER_WORK_EVIDENCE_FIELDS)
+
+    @staticmethod
+    def _review_evidence(decision: dict[str, Any]) -> str:
+        """Render only durable reviewer evidence; never reconstruct findings."""
+        reason = _non_blank_config(decision.get("reason")) or "(no reviewer reason recorded)"
+        findings = decision.get("findings", decision.get("review_findings"))
+        if findings is None:
+            findings_text = "(no separate findings recorded)"
+        elif isinstance(findings, str):
+            findings_text = findings.strip() or "(no separate findings recorded)"
+        else:
+            findings_text = json.dumps(findings, sort_keys=True, ensure_ascii=False)
+        return (
+            "[ORIGINAL_TECHNICAL_REVIEW_EVIDENCE]\n"
+            "Reviewer decision: REMEDIATE\n"
+            "Reviewer reason: {0}\n"
+            "Reviewer findings: {1}\n"
+            "[/ORIGINAL_TECHNICAL_REVIEW_EVIDENCE]"
+        ).format(reason, findings_text)
+
+    def _pre_execution_remediation_retry(
+        self,
+        ledger: dict[str, Any],
+        decisions: dict[str, dict[str, Any]],
+        *,
+        project_id: str,
+        task_id: str,
+        branch: str,
+        head: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+        """Find one exact, owner-resumable review remediation or fail closed.
+
+        A plain failed Worker is deliberately invisible here.  The sole recovery
+        shape is a failed AIBroker remediation whose exception proves that the
+        provider was not reached because its managed worktree was unsafe.
+        """
+        failed_remediations = [
+            row for row in ledger["executions"].values()
+            if isinstance(row, dict)
+            and row.get("project_id") == project_id
+            and row.get("task_id") == task_id
+            and row.get("engine") == "aibroker"
+            and row.get("source_kind") == "remediation"
+            and row.get("state") == "failed"
+        ]
+        if not failed_remediations:
+            return None, None, ""
+        if any(not self._failed_before_provider_work(row) for row in failed_remediations):
+            return None, None, "failed remediation is not an exact no-usable-provider-work WorktreeUnsafeError recovery"
+        candidates = failed_remediations
+        candidates.sort(key=lambda row: str(row.get("completed_at") or row.get("started_at") or ""), reverse=True)
+        candidate = candidates[0]
+        if candidate.get("branch") != branch or candidate.get("head") != head:
+            return None, None, "remediation recovery repository branch/HEAD anchor changed"
+        decision_id = _non_blank_config(candidate.get("review_decision_id")) or _non_blank_config(candidate.get("source_request_id"))
+        decision = decisions.get(decision_id or "")
+        if not isinstance(decision, dict):
+            return None, None, "remediation recovery lacks its durable reviewer decision"
+        if (
+            decision.get("disposition") != "apply"
+            or decision.get("decision") != "remediate"
+            or decision.get("next_action") != NextAction.CONTINUE_CURRENT_STAGE.value
+            or decision.get("project_id") != project_id
+            or decision.get("task_id") != task_id
+            or decision.get("branch") != branch
+            or decision.get("head") != head
+            or decision.get("role") != WebSolRole.REVIEWER.value
+            or decision.get("event") != WebSolEvent.WORKER_DONE.value
+        ):
+            return None, None, "remediation recovery reviewer decision no longer matches project/task/branch/HEAD"
+        if self._active_project(ledger, project_id):
+            return None, None, "another managed Worker is already active"
+        return candidate, decision, ""
+
+    @staticmethod
     def _project_has_execution_history(ledger: dict[str, Any], project_id: str) -> bool:
         return any(
             record.get("project_id") == project_id and record.get("state") != "blocked"
@@ -1510,7 +1621,8 @@ class TransitionExecutor:
         return consumed is not None and consumed > paused_at
 
     def start_control(
-        self, project: dict[str, Any], snapshot: dict[str, Any], source_request_id: str
+        self, project: dict[str, Any], snapshot: dict[str, Any], source_request_id: str,
+        *, exact_remediation_only: bool = False,
     ) -> Optional[ActuationLaunch]:
         """Start the current executable task for one stateless owner continue command."""
         project_id = str(project.get("project_id") or "")
@@ -1526,6 +1638,7 @@ class TransitionExecutor:
         if task_id is None:
             self._record_blocked(source_request_id, project_id, "current task id is unavailable", source_kind="control")
             return None
+        decisions = self._load_decisions()
         with self._lock:
             ledger = self._load_ledger()
             broker_rows = [
@@ -1560,6 +1673,51 @@ class TransitionExecutor:
                 if review_id not in ledger["executions"]:
                     self._record_blocked(source_request_id, project_id, "latest AIBroker Worker review transition is not yet applied", source_kind="control")
                     return None
+            failed_remediation, review_decision, recovery_error = self._pre_execution_remediation_retry(
+                ledger, decisions,
+                project_id=project_id, task_id=task_id, branch=truth.branch, head=truth.head,
+            )
+        if recovery_error:
+            self._record_blocked(source_request_id, project_id, recovery_error, task_id=task_id, source_kind="remediation")
+            return None
+        if failed_remediation is not None and review_decision is not None:
+            if NextAction.CONTINUE_CURRENT_STAGE.value not in policy["allowed_next_actions"]:
+                self._record_blocked(
+                    source_request_id, project_id,
+                    "review-driven remediation is not owner-authorized by project execution policy",
+                    task_id=task_id, source_kind="remediation",
+                )
+                return None
+            launch_task, guard_error = self._fresh_guard(
+                project, snapshot, expected_branch=truth.branch, expected_head=truth.head,
+                expected_task_id=task_id,
+            )
+            if launch_task is None:
+                self._record_blocked(
+                    source_request_id, project_id, guard_error,
+                    task_id=task_id, source_kind="remediation",
+                )
+                return None
+            prompt = (
+                str(policy["remediation_prompt"])
+                + "\nReviewed task identity: {0}. Remediate only this reviewed task.\n\n"
+                + self._review_evidence(review_decision)
+            ).format(task_id)
+            launch = self._launch(
+                project, source_request_id=source_request_id, source_kind="remediation",
+                task_id=launch_task, source_task_id=task_id,
+                branch=truth.branch, head=truth.head, worker_prompt=prompt, policy=policy,
+            )
+            if launch is not None:
+                self._update_record(
+                    source_request_id,
+                    recovery_of=failed_remediation.get("source_request_id"),
+                    review_decision_id=review_decision.get("request_id"),
+                    recovery_reason="owner continue after pre-execution worktree-safety refusal",
+                )
+            return launch
+        if exact_remediation_only:
+            return None
         launch_task, guard_error = self._fresh_guard(
             project, snapshot, expected_branch=truth.branch, expected_head=truth.head,
             expected_task_id=task_id,
@@ -1571,6 +1729,32 @@ class TransitionExecutor:
             project, source_request_id=source_request_id, source_kind="control",
             task_id=launch_task, source_task_id=None, branch=truth.branch, head=truth.head,
             worker_prompt=str(policy["worker_prompt"]), policy=policy,
+        )
+
+    def resume_exact_remediation(
+        self, project: dict[str, Any], snapshot: dict[str, Any], source_request_id: str,
+    ) -> Optional[ActuationLaunch]:
+        """Let owner resume recover only the exact safe remediation shape.
+
+        Normal resume remains an unpause operation.  This narrow adapter never
+        turns resume into a generic Worker start when no proven recovery exists.
+        """
+        project_id = str(project.get("project_id") or "")
+        policy, _error = _execution_policy(project)
+        truth = read_repository_truth(project.get("repo_path") or "")
+        task_id = _current_task_id(snapshot)
+        if policy is None or not truth.valid or task_id is None:
+            return None
+        decisions = self._load_decisions()
+        with self._lock:
+            failed, decision, error = self._pre_execution_remediation_retry(
+                self._load_ledger(), decisions,
+                project_id=project_id, task_id=task_id, branch=truth.branch, head=truth.head,
+            )
+        if failed is None or decision is None or error:
+            return None
+        return self.start_control(
+            project, snapshot, source_request_id, exact_remediation_only=True,
         )
 
     def _advance_owner_start(

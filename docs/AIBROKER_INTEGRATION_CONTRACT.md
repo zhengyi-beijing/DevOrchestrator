@@ -81,3 +81,29 @@ Stopping the daemon terminates the recorded daemon process tree before marking a
 The provider-neutral control/execution path has passed a synthetic multi-task lifecycle acceptance covering Worker → Review → next-task Planner → Plan Review → Worker → Review → terminal settle from a single continue intent. Restart/self-heal and historical-worker overlay barriers are included in the accepted behavior.
 
 See `CONTINUOUS_EXECUTION_ACCEPTANCE_2026-09-10.md` for the frozen evidence and current legacy-migration boundary.
+
+## Unattended-execution acceptance
+
+One meaningful owner authorization (an authorized bootstrap, approved plan, or
+accepted `continue`) authorizes the ordinary bounded lifecycle to proceed
+without another owner command through plan, plan review, Worker, validation,
+technical review, exact remediation and eligible provider failover. It
+continues until `TASK_COMPLETE`, `OWNER_GATE`, an explicit owner pause/stop,
+an authentication or OS-permission requirement, all eligible providers being
+unavailable, or genuinely unsafe/ambiguous recovery evidence.
+
+This is continuation authority, not a second lifecycle authority: every
+transition remains owned and durably applied by DevOrchestrator's existing
+control/transition coordinators. AIBroker continues to execute one requested
+role on one selected resource and never advances tasks, interprets review
+decisions, or creates fallback lifecycle transitions.
+
+An owner `continue` after a failed exact review remediation may create a new
+remediation execution only when durable decision evidence, failure provenance,
+repository identity and current clean worktree truth prove that no provider
+work occurred and the original reviewed remediation remains exact. Broker
+dispatch, decision, execution and resource identifiers are allocation evidence,
+not by themselves provider-work evidence; the recovery shape also requires no
+usable provider session or output/work evidence. All other failed or ambiguous
+executions remain stopped or owner-gated; they do not silently become generic
+Worker retries.

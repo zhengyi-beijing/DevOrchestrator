@@ -5,6 +5,7 @@
     {"task_id": "P11b", "successor": "P11c", "successor_spec_path": "agent/staged/P11c.md"},
     {"task_id": "P11c", "successor": "P11d", "successor_spec_path": "agent/staged/P11d.md"},
     {"task_id": "P11d", "successor": "P12", "successor_spec_path": "agent/staged/P12.md"},
-    {"task_id": "P12", "successor": null, "successor_spec_path": null}
+    {"task_id": "P12", "successor": null, "successor_spec_path": null},
+    {"task_id": "P12.5", "successor": "P12.6", "successor_spec_path": "agent/staged/P12.6.md"}
   ]
 }
