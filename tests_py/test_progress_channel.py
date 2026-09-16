@@ -12,10 +12,13 @@ if str(SRC) not in sys.path:
 from dev_orchestrator.bridge.server import make_bridge_server
 from dev_orchestrator.bridge.store import BrowserBridgeStore
 from dev_orchestrator.core.progress import (
+    ATTENTION_MILESTONES,
     NORMAL_MILESTONES,
     PROGRESS_LEVEL_NORMAL,
     PROGRESS_LEVEL_QUIET,
     PROGRESS_LEVEL_VERBOSE,
+    PROGRESS_ATTENTION_NORMAL,
+    PROGRESS_ATTENTION_URGENT,
     QUIET_MILESTONES,
     VERBOSE_MILESTONES,
     ProgressChannel,
@@ -69,6 +72,18 @@ class ProgressChannelTests(unittest.TestCase):
             # WORKER_FAILED is not in NORMAL_MILESTONES
             notif_failed = channel.emit(project, "WORKER_FAILED", task_id="T1")
             self.assertIsNone(notif_failed)
+
+    def test_attention_classification_is_server_side_and_explicit(self):
+        with tempfile.TemporaryDirectory() as td:
+            channel = ProgressChannel(Path(td))
+            normal = channel.emit({"project_id": "p-attn"}, "WORKER_STARTED", task_id="T1")
+            urgent = channel.emit({"project_id": "p-attn"}, "OWNER_GATE", task_id="T1", occurrence_key="gate-1")
+            blocked = channel.emit({"project_id": "p-attn"}, "BLOCKED", task_id="T1", occurrence_key="blocked-1")
+            self.assertEqual(normal.attention, PROGRESS_ATTENTION_NORMAL)
+            self.assertEqual(urgent.attention, PROGRESS_ATTENTION_URGENT)
+            self.assertEqual(blocked.attention, PROGRESS_ATTENTION_URGENT)
+            self.assertIn("OWNER_GATE", ATTENTION_MILESTONES)
+            self.assertIn("BLOCKED", ATTENTION_MILESTONES)
 
     def test_emit_tolerates_none_telemetry(self):
         with tempfile.TemporaryDirectory() as td:

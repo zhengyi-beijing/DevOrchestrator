@@ -124,6 +124,28 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "[WORKER_STARTED] Started task P1|1")
 
+    def test_userscript_raises_transport_alert_from_server_attention_metadata(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('// @version      0.1.12', source)
+        self.assertIn('// @grant        GM_notification', source)
+        self.assertIn('notification.attention !== "urgent"', source)
+        self.assertIn('GM_notification({', source)
+        self.assertIn('Test DevOrchestrator attention alert', source)
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "const notices=[];"
+            "globalThis.GM_notification=(x)=>notices.push(x);"
+            "globalThis.GM_getValue=()=>'';globalThis.GM_setValue=()=>{};"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const ok=a.showUrgentProgressAlert({notification_id:'n1',project_id:'p1',task_id:'T1',message:'Owner action required',attention:'urgent'});"
+            "console.log(String(ok)+'|'+notices.length+'|'+notices[0].title);process.exit(0);"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "true|1|DevOrchestrator requires attention")
+
     def test_userscript_pairs_and_sends_capability_scoped_8770_heartbeat(self):
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('CONTROL_BASE = "http://127.0.0.1:8770"', source)

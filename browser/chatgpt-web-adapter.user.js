@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.11
+// @version      0.1.12
 // @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge plus paired 8770 conversation-presence heartbeat.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
@@ -10,6 +10,7 @@
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_notification
 // @connect      127.0.0.1
 // @run-at       document-idle
 // ==/UserScript==
@@ -39,6 +40,7 @@
   var SESSION_HEARTBEAT_PATH = "/api/v1/control/session-heartbeats";
   var CAPABILITY_STORAGE_KEY = "devorch:control:heartbeat-capability";
   var TAB_INSTANCE_STORAGE_KEY = "devorch:control:tab-instance";
+  var LAST_URGENT_NOTIFICATION_KEY = "devorch:progress:last-urgent";
   var CONTROL_HEARTBEAT_MS = 15000;
   var controlHeartbeatTimer = null;
   var POLL_MS = 1500;
@@ -86,28 +88,89 @@
   function setAdapterStatus(state, detail) {
     var badge = ensureStatusBadge();
     if (!badge) { return; }
-    var colors = { LIVE: "#237a3b", IDLE: "#555", CLAIMED: "#8a5a00", WAITING: "#2457a6", OFFLINE: "#a32929" };
+    var colors = { LIVE: "#237a3b", IDLE: "#555", CLAIMED: "#8a5a00", WAITING: "#2457a6", OFFLINE: "#a32929", ATTENTION: "#b42318" };
     badge.textContent = "DevOrch · " + state;
     badge.style.background = colors[state] || "#555";
     badge.setAttribute("data-state", state);
     badge.title = detail || state;
   }
 
+  function progressAlertText(notification) {
+    if (!notification) { return "DevOrchestrator requires attention"; }
+    var project = notification.project_id || "project";
+    var task = notification.task_id ? (" / " + notification.task_id) : "";
+    var msg = notification.message || notification.summary || "Attention required";
+    return project + task + ": " + msg;
+  }
+
+  function playUrgentTone() {
+    try {
+      var AudioContextCtor = root.AudioContext || root.webkitAudioContext;
+      if (typeof AudioContextCtor !== "function") { return false; }
+      var ctx = new AudioContextCtor();
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = 880;
+      gain.gain.value = 0.08;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.35);
+      osc.onended = function () { try { ctx.close(); } catch (err) {} };
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function showUrgentProgressAlert(notification) {
+    if (!notification || notification.attention !== "urgent") { return false; }
+    var notificationId = notification.notification_id || "";
+    if (notificationId && typeof GM_getValue === "function" && GM_getValue(LAST_URGENT_NOTIFICATION_KEY, "") === notificationId) {
+      return false;
+    }
+    if (notificationId && typeof GM_setValue === "function") {
+      GM_setValue(LAST_URGENT_NOTIFICATION_KEY, notificationId);
+    }
+    var text = progressAlertText(notification);
+    setAdapterStatus("ATTENTION", text);
+    playUrgentTone();
+    if (typeof GM_notification === "function") {
+      try {
+        GM_notification({
+          title: "DevOrchestrator requires attention",
+          text: text,
+          timeout: 0,
+          tag: notificationId || "devorch-attention"
+        });
+      } catch (err) {}
+    }
+    return true;
+  }
+
   function showProgressToast(notification) {
     if (typeof document === "undefined" || !document.body || !notification) { return null; }
+    var urgent = notification.attention === "urgent";
     var toast = document.createElement("div");
     toast.className = "devorch-progress-toast";
-    toast.style.cssText = "position:fixed;right:12px;bottom:42px;z-index:2147483646;padding:6px 10px;border-radius:6px;font:11px/1.3 system-ui,sans-serif;color:#fff;background:#1a5276;box-shadow:0 1px 4px rgba(0,0,0,.3);pointer-events:none;opacity:.95;transition:opacity 0.5s ease";
+    toast.style.cssText = "position:fixed;right:12px;bottom:42px;z-index:2147483646;padding:8px 12px;border-radius:7px;font:12px/1.35 system-ui,sans-serif;color:#fff;background:" + (urgent ? "#b42318" : "#1a5276") + ";box-shadow:0 2px 8px rgba(0,0,0,.35);pointer-events:none;opacity:.97;transition:opacity 0.5s ease;max-width:420px";
     var milestone = notification.milestone || "PROGRESS";
     var msg = notification.message || notification.summary || notification.task_id || "";
-    toast.textContent = "[" + milestone + "] " + msg;
+    toast.textContent = (urgent ? "ATTENTION 路 " : "") + "[" + milestone + "] " + msg;
     document.body.appendChild(toast);
     setTimeout(function () {
       toast.style.opacity = "0";
       setTimeout(function () {
         if (toast.parentNode) { toast.parentNode.removeChild(toast); }
       }, 600);
-    }, 5000);
+    }, urgent ? 30000 : 5000);
+    return toast;
+  }
+
+  function handleProgressNotification(notification) {
+    var toast = showProgressToast(notification);
+    showUrgentProgressAlert(notification);
     return toast;
   }
 
@@ -302,6 +365,8 @@
     isStopComposerButton: isStopComposerButton,
     findSendButton: findSendButton,
     showProgressToast: showProgressToast,
+    showUrgentProgressAlert: showUrgentProgressAlert,
+    handleProgressNotification: handleProgressNotification,
     pollProgress: pollProgress,
     pairingFields: pairingFields,
     tabInstanceId: tabInstanceId,
@@ -427,6 +492,16 @@
       });
     });
     GM_registerMenuCommand("Forget DevOrchestrator heartbeat capability", clearCapability);
+    GM_registerMenuCommand("Test DevOrchestrator attention alert", function () {
+      handleProgressNotification({
+        notification_id: "manual-test-" + Date.now(),
+        project_id: "devorchestrator",
+        task_id: "manual-test",
+        milestone: "ATTENTION_TEST",
+        message: "Manual browser alert test",
+        attention: "urgent"
+      });
+    });
   }
 
   function claimOnce(bindingId) {
@@ -467,7 +542,7 @@
           var items = data ? (data.claimed || data.notifications) : null;
           if (Array.isArray(items)) {
             for (var i = 0; i < items.length; i++) {
-              showProgressToast(items[i]);
+              handleProgressNotification(items[i]);
             }
           }
         } catch (err) {}

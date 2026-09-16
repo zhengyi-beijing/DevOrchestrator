@@ -21,7 +21,16 @@ from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_js
 PROGRESS_LEVEL_QUIET = "quiet"
 PROGRESS_LEVEL_NORMAL = "normal"
 PROGRESS_LEVEL_VERBOSE = "verbose"
+PROGRESS_ATTENTION_NORMAL = "normal"
+PROGRESS_ATTENTION_URGENT = "urgent"
 _ALL_LEVELS = frozenset({PROGRESS_LEVEL_QUIET, PROGRESS_LEVEL_NORMAL, PROGRESS_LEVEL_VERBOSE})
+
+ATTENTION_MILESTONES = frozenset({
+    "OWNER_GATE",
+    "BLOCKED",
+    "STALL_DETECTED",
+    "RECOVERY_REQUIRED",
+})
 
 QUIET_MILESTONES = frozenset({
     "OWNER_GATE",
@@ -88,6 +97,7 @@ class ProgressNotification:
     message: str
     timestamp: str
     level: str = PROGRESS_LEVEL_NORMAL
+    attention: str = PROGRESS_ATTENTION_NORMAL
     binding_id: Optional[str] = None
     adapter: Optional[str] = None
     details: Mapping[str, Any] = field(default_factory=dict)
@@ -406,6 +416,7 @@ class ProgressChannel:
                 message=msg,
                 timestamp=now_iso,
                 level=effective_level,
+                attention=(PROGRESS_ATTENTION_URGENT if milestone in ATTENTION_MILESTONES else PROGRESS_ATTENTION_NORMAL),
                 binding_id=binding.get("binding_id") if isinstance(binding, dict) else None,
                 adapter=binding.get("adapter") if isinstance(binding, dict) else None,
                 details=dict(details or {}),
