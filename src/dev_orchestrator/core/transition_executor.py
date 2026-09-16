@@ -1408,9 +1408,9 @@ class TransitionExecutor:
 
         ``recovery_of`` is immutable lineage on the new execution, so its mere
         presence consumes the older failed row without rewriting history.  A
-        completed retry remains a barrier until its usual AI review has reached
-        a durable terminal lifecycle transition; only then can a later task use
-        the ordinary control path.
+        completed retry remains a barrier until its AI-review descendant chain
+        has reached a durable terminal lifecycle transition; only then can a
+        later task use the ordinary control path.
         """
         executions = ledger["executions"]
         failed_sources = {
@@ -1437,22 +1437,55 @@ class TransitionExecutor:
         reviews = reviews_raw.get("reviews") if isinstance(reviews_raw, dict) else None
         reviews = reviews if isinstance(reviews, dict) else {}
         for descendant in descendants:
-            state = descendant.get("state")
-            if state in _ACTIVE_STATES:
-                return "a prior remediation recovery is still active"
-            source_id = _non_blank_config(descendant.get("source_request_id"))
-            review_id = "ai_review:" + source_id if source_id else ""
-            review = reviews.get(review_id)
-            transition = executions.get(review_id)
-            if (
-                state == "completed"
-                and isinstance(review, dict)
-                and review.get("state") == "completed"
-                and isinstance(transition, dict)
-                and transition.get("state") in {"settled", "handoff"}
-            ):
-                continue
-            return "a prior remediation recovery is awaiting its normal review transition"
+            current = descendant
+            seen_sources: set[str] = set()
+            while True:
+                state = current.get("state")
+                if state in _ACTIVE_STATES:
+                    return "a prior remediation recovery is still active"
+                if state == "failed" and self._failed_before_provider_work(current):
+                    # A review-launched remediation can fail before its provider
+                    # starts just like the original remediation. Leave that exact
+                    # child visible to _pre_execution_remediation_retry instead of
+                    # making its consumed ancestor a permanent barrier.
+                    break
+                if state != "completed":
+                    return "a prior remediation recovery is awaiting its normal review transition"
+
+                source_id = _non_blank_config(current.get("source_request_id"))
+                if source_id is None or source_id in seen_sources:
+                    return "a prior remediation recovery is awaiting its normal review transition"
+                seen_sources.add(source_id)
+                review_id = "ai_review:" + source_id
+                review = reviews.get(review_id)
+                transition = executions.get(review_id)
+                if (
+                    not isinstance(review, dict)
+                    or review.get("state") != "completed"
+                    or not isinstance(transition, dict)
+                    or transition.get("project_id") != project_id
+                    or transition.get("source_request_id") != review_id
+                ):
+                    return "a prior remediation recovery is awaiting its normal review transition"
+                transition_state = transition.get("state")
+                if transition_state in {"settled", "handoff"}:
+                    break
+                if transition_state in _ACTIVE_STATES:
+                    return "a prior remediation recovery is still active"
+                if (
+                    transition_state == "failed"
+                    and self._failed_before_provider_work(transition)
+                ):
+                    # See the equivalent current-row case above. This is the
+                    # review REMEDIATE descendant that owner recovery may retry.
+                    break
+                if (
+                    transition_state != "completed"
+                    or transition.get("engine") != "aibroker"
+                    or transition.get("source_kind") not in {"decision", "remediation"}
+                ):
+                    return "a prior remediation recovery is awaiting its normal review transition"
+                current = transition
         return ""
 
     @staticmethod

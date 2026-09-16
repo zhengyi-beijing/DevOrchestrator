@@ -142,6 +142,47 @@ class AIBrokerTransitionTests(unittest.TestCase):
                          "review_state": "pending"}
         }}), encoding="utf-8")
 
+    def _write_recovery_next_chain(self, runtime: Path, truth, *, descendant_state="completed", terminal_state="settled"):
+        """Persist recovery -> review NEXT -> Worker -> review terminal lineage."""
+        recovery_id = "recovery-1"
+        first_review_id = "ai_review:" + recovery_id
+        worker_review_id = "ai_review:" + first_review_id
+        executions = {
+            "failed-remediation": {
+                "project_id": "p1", "source_request_id": "failed-remediation",
+                "engine": "aibroker", "source_kind": "remediation", "state": "failed",
+            },
+            recovery_id: {
+                "project_id": "p1", "source_request_id": recovery_id,
+                "engine": "aibroker", "source_kind": "remediation", "state": "completed",
+                "recovery_of": "failed-remediation", "task_id": "P1",
+                "branch": truth.branch, "head": truth.head,
+                "started_at": "2026-09-16T01:00:00+00:00", "completed_at": "2026-09-16T01:01:00+00:00",
+            },
+            first_review_id: {
+                "project_id": "p1", "source_request_id": first_review_id,
+                "engine": "aibroker", "source_kind": "decision", "state": descendant_state,
+                "task_id": "P2", "branch": truth.branch, "head": truth.head,
+                "started_at": "2026-09-16T01:02:00+00:00", "completed_at": "2026-09-16T01:03:00+00:00",
+            },
+        }
+        reviews = {first_review_id: {"state": "completed"}}
+        if descendant_state == "completed":
+            executions[worker_review_id] = {
+                "project_id": "p1", "source_request_id": worker_review_id,
+                "source_kind": "decision", "state": terminal_state,
+                "task_id": "P2", "recorded_at": "2026-09-16T01:04:00+00:00",
+            }
+            reviews[worker_review_id] = {"state": "completed"}
+        runtime.mkdir(parents=True, exist_ok=True)
+        (runtime / "transition-executor.json").write_text(
+            json.dumps({"version": 1, "executions": executions}), encoding="utf-8",
+        )
+        (runtime / "ai-reviewer.json").write_text(
+            json.dumps({"version": 1, "reviews": reviews}), encoding="utf-8",
+        )
+        return recovery_id, first_review_id
+
     def test_restart_recovers_succeeded_broker_as_completed_with_resource_facts(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); repo=self.make_repo(root); runtime=root/"runtime"; truth=read_repository_truth(repo)
@@ -353,6 +394,82 @@ class AIBrokerTransitionTests(unittest.TestCase):
             executor._threads["p2-continue"].join(timeout=2)
             self.assertEqual(port.requests[-1].task_run_id, "P2")
             self.assertEqual(executor.state()["executions"]["p2-continue"]["source_kind"], "control")
+
+    def test_recovery_barrier_follows_review_next_worker_to_its_terminal_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            truth = read_repository_truth(repo)
+            self._write_recovery_next_chain(runtime, truth)
+            port = FakePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+
+            launch = executor.start_control(
+                broker_project(repo), self._remediation_snapshot("P2"), "later-owner-control",
+            )
+            self.assertIsNotNone(launch)
+            executor._threads["later-owner-control"].join(timeout=2)
+            self.assertEqual(port.requests[-1].task_run_id, "P2")
+            self.assertEqual(executor.state()["executions"]["later-owner-control"]["source_kind"], "control")
+
+    def test_recovery_barrier_keeps_review_next_active_worker_blocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            truth = read_repository_truth(repo)
+            port = FakePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+            # Create the durable active descendant after startup reconciliation;
+            # an unverified synthetic running row is otherwise correctly made
+            # recovery_required by that separate restart-safety contract.
+            self._write_recovery_next_chain(runtime, truth, descendant_state="running")
+
+            self.assertIsNone(executor.start_control(
+                broker_project(repo), self._remediation_snapshot("P2"), "blocked-owner-control",
+            ))
+            blocked = executor.state()["executions"]["blocked-owner-control"]
+            self.assertIn("prior remediation recovery is still active", blocked["reason"])
+            self.assertEqual(port.requests, [])
+
+    def test_recovery_barrier_allows_exact_failed_review_remediation_to_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+            truth = read_repository_truth(repo)
+            _recovery_id, review_id = self._write_recovery_next_chain(
+                runtime, truth, descendant_state="failed",
+            )
+            ledger = json.loads((runtime / "transition-executor.json").read_text(encoding="utf-8"))
+            ledger["executions"][review_id] = {
+                "project_id": "p1", "source_request_id": review_id,
+                "engine": "aibroker", "source_kind": "remediation", "state": "failed",
+                "task_id": "P1", "branch": truth.branch, "head": truth.head,
+                "review_decision_id": review_id,
+                "reason": "WorktreeUnsafeError: dirty worktree requires deterministic recovery before writable reuse",
+                "broker_status": "failed", "session_id": None,
+                "provider_output_observed": False, "first_output_at": None,
+                "dispatch_id": "nested-dispatch", "decision_id": "nested-decision",
+                "execution_id": "nested-execution", "resource_context": {"resource_id": "nested-resource"},
+            }
+            (runtime / "transition-executor.json").write_text(json.dumps(ledger), encoding="utf-8")
+            (runtime / "review-decisions.json").write_text(json.dumps({"version": 1, "decisions": {
+                review_id: {
+                    "project_id": "p1", "request_id": review_id,
+                    "disposition": "apply", "decision": "remediate",
+                    "next_action": "continue_current_stage", "task_id": "P1",
+                    "branch": truth.branch, "head": truth.head,
+                    "role": "reviewer", "event": "worker_done",
+                    "review_status_hash": truth.status_hash,
+                    "consumed_at": "2026-09-16T01:03:00+00:00",
+                },
+            }}), encoding="utf-8")
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            port = FakePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+
+            launch = executor.start_control(project, self._remediation_snapshot("P1"), "nested-owner-retry")
+            self.assertIsNotNone(launch)
+            executor._threads["nested-owner-retry"].join(timeout=2)
+            retry = executor.state()["executions"]["nested-owner-retry"]
+            self.assertEqual(retry["state"], "completed")
+            self.assertEqual(retry["source_kind"], "remediation")
+            self.assertEqual(retry["recovery_of"], review_id)
+            self.assertEqual(port.requests[-1].stage_run_id, "remediation")
 
     def test_remediation_recovery_refuses_dirty_mismatched_or_usable_provider_work(self):
         with tempfile.TemporaryDirectory() as td:
