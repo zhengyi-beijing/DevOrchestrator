@@ -106,6 +106,57 @@ python -m dev_orchestrator stop-daemon --runtime-root .\runtime
 Legacy independent monitor/Web lifecycle commands remain compatibility paths,
 but one daemon per computer is the target architecture.
 
+## Canonical self-host operational acceptance
+
+The canonical `main` worktree for DevOrchestrator self-hosting is
+`C:\work\github\DevOrchestrator-dev`.
+
+To validate configuration, inspect or start the unified daemon, and run the
+read-only operational acceptance utility:
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python -m dev_orchestrator validate-config --config .\config\projects.json
+python -m dev_orchestrator status-daemon --runtime-root .\runtime
+# Start daemon if not running:
+# python -m dev_orchestrator start-daemon --config .\config\projects.json --runtime-root .\runtime
+python ops/self_host_acceptance.py
+```
+
+Under Windows PowerShell 5.1, run each command as a separate statement; do not
+use `&&` or `||` operators.
+
+### Acceptance behavior and overrides
+
+`ops/self_host_acceptance.py` verifies:
+- daemon health, running state, and fresh monitor heartbeat;
+- enabled, non-degraded 8770 Control API authority;
+- exact project identity (`devorchestrator` on branch `main` at the repository root);
+- P11 execution accounting availability;
+- AIBroker resource and execution visibility both through the unified surface and directly on 8875.
+
+The utility is strictly read-only: it issues GET requests only and cannot mutate
+lifecycle state.
+
+- **Exit code 0 (`"status": "PASS"`)**: all required checks pass. Any reported
+  overview warnings are preserved in the result without causing failure.
+- **Non-zero exit code (`"status": "FAIL"`)**: returned when any required check
+  is unavailable, degraded, stale, malformed, or has an identity mismatch.
+  Categorized diagnostics describe the issue without exposing secrets or
+  response bodies.
+
+To override target endpoints or project identity:
+
+```powershell
+python ops/self_host_acceptance.py `
+  --control-url http://127.0.0.1:8770 `
+  --broker-url http://127.0.0.1:8875 `
+  --project-id devorchestrator `
+  --expected-repo-path C:\work\github\DevOrchestrator-dev `
+  --expected-branch main `
+  --timeout 10.0
+```
+
 ## Tests
 
 Python regression suite:

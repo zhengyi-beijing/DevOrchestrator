@@ -5,7 +5,7 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12.5 Self-Host Operational Acceptance** — **PENDING DESIGN**.
+Current task: **P12.5 Self-Host Operational Acceptance** — **READY_FOR_REVIEW**.
 
 Staged roadmap history remains P11d -> P12 -> null; P12.5 is an owner-authorized operational acceptance task used to validate the converged canonical main deployment before attaching other projects.
 
@@ -64,3 +64,12 @@ P12 implementation result:
 - Durable owner pause is enforced at final Worker launch gates and suppresses later legacy static starts. Runtime conversation bindings override static migration fallback without disabling direct AIBroker projects.
 - The dashboard renders server-advertised capabilities, active roles, resources/executions, bindings, P11 evidence and pending/settled command results, including confirmation for stop/owner-gate actions.
 - Verification: 509 tests and 16 subtests passed; Python compilation, dashboard and browser-adapter JavaScript syntax, `git diff --check`, and Graphify refresh passed (2744 nodes, 7357 edges, 141 communities).
+
+P12.5 result:
+- Added `ops/self_host_acceptance.py` standard-library operational acceptance utility enforcing loopback-only HTTP endpoints and issuing GET requests only against `/api/v1/control/overview`, `/api/resources`, and `/api/executions`.
+- Verifies daemon health/freshness, enabled/non-degraded control authority, exact project identity (`devorchestrator` on branch `main`), P11 execution accounting availability, and AIBroker resources/executions visibility through both the unified overview and direct 8875 endpoints.
+- Preserves overview warnings as non-fatal diagnostics and returns deterministic JSON with categorized diagnostics excluding response bodies and secrets.
+- Verified live deployment reports overall PASS against running daemon (PID 5712) and AIBroker on 8875.
+- Documented canonical self-host deployment commands, expected exit behavior, and endpoint overrides in README.md.
+- Added 16 focused tests in `tests_py/test_self_host_acceptance.py`.
+- Full regression passed: 550 tests and 22 subtests. Python compilation, JavaScript syntax, and git diff check passed. Knowledge graph updated to 2865 nodes, 7785 edges, 140 communities.

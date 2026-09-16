@@ -279,3 +279,28 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
 - Defined selective consolidation of prior conversation-control work under 8770 without a second 8766 authority or wholesale branch merge.
 - Verification passed: staged-roadmap suite 22/22; full Python suite 487 tests plus 16 subtests; Python compilation, both JavaScript syntax checks, `git diff --check`, and Graphify AST refresh (2542 nodes, 6703 edges, 129 communities).
 - Implementation was not started because the owner authorized P12 design only. `xray-hw-platform` remains paused and unchanged.
+
+## P12.5 Self-Host Operational Acceptance (2026-09-16)
+
+- Implemented the read-only self-host operational acceptance utility in `ops/self_host_acceptance.py`:
+  - Restricts targets strictly to loopback HTTP addresses (127.0.0.1 or localhost), rejecting remote endpoints, non-HTTP schemes, and query/fragment parameters.
+  - Interacts exclusively through GET requests on allowlisted endpoints: `/api/v1/control/overview` on 8770, `/api/resources` and `/api/executions` on 8875. No mutations, commands, pairings, heartbeats, or lifecycle calls are ever issued.
+  - Verifies daemon health (running, process alive, pid, no error) and monitor heartbeat freshness (`stale == False`).
+  - Verifies enabled and non-degraded 8770 Control API authority.
+  - Verifies exact project identity (`devorchestrator` on branch `main` at the canonical repository root) using cross-platform path normalization.
+  - Verifies P11 execution accounting availability without corruptions.
+  - Verifies AIBroker resource and execution visibility through both the unified overview proxy and direct 8875 queries without requiring active executions or inferring provider health/costs.
+  - Preserves overview warnings as a distinct non-fatal diagnostic category.
+  - Outputs deterministic structured JSON with discrete sections, named check outcomes, and overall `PASS`/`FAIL` status.
+  - Excludes response bodies and secrets from failure diagnostics.
+- Added comprehensive focused test suite in `tests_py/test_self_host_acceptance.py`:
+  - 16 unit tests using ephemeral loopback mock HTTP servers and subprocess execution.
+  - Covers fully healthy fixtures, exact GET-only allowlisted paths, warning preservation, unreachable Control/Broker endpoints, malformed JSON, missing list fields, stale monitor, degraded control store, disabled control authority, accounting unavailability, project ID/path/branch mismatches, non-loopback URL rejection, and Windows path normalization.
+- Verified live deployment:
+  - Running `python ops/self_host_acceptance.py` against the active daemon on 8770 (PID 5712) and AIBroker on 8875 reported `PASS` across all required checks.
+- Documented canonical self-host deployment commands, expected exit behavior, and endpoint overrides in `README.md`.
+- Verification:
+  - Focused test suite passed: 16 passed in 23.88s.
+  - Full test suite passed: 550 passed, 22 subtests passed in 141.98s.
+  - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax (`browser/chatgpt-web-adapter.user.js` and `web/app.js`), and `git diff --check` passed cleanly.
+  - Knowledge graph refreshed via `graphify update .`: 2865 nodes, 7785 edges, 140 communities.
