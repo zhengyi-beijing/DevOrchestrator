@@ -157,6 +157,49 @@ def _non_blank_config(value: Any) -> Optional[str]:
     return text or None
 
 
+def is_pre_provider_worktree_unsafe_failure(record: dict[str, Any]) -> bool:
+    """Recognize the one durable, no-provider-work remediation failure shape.
+
+    This shared predicate is the recovery contract for both Worker retry and
+    stale-review re-anchoring.  Allocation identifiers alone never establish
+    provider work; any session, output, or work evidence fails closed.
+    """
+    if (
+        record.get("engine") != "aibroker"
+        or record.get("source_kind") != "remediation"
+        or record.get("state") != "failed"
+    ):
+        return False
+    reason = str(record.get("reason") or "").casefold()
+    if _PRE_EXECUTION_WORKTREE_SAFETY_MARKER not in reason:
+        return False
+    if record.get("broker_status") != "failed":
+        return False
+    if "session_id" not in record or record.get("session_id") is not None:
+        return False
+    if (
+        _non_blank_config(record.get("output")) is not None
+        or record.get("provider_work_observed") is True
+        or record.get("provider_output_observed") is True
+        or record.get("first_output_at") is not None
+    ):
+        return False
+    has_modern_negative_evidence = all(
+        name in record for name in _NEGATIVE_PROVIDER_EVIDENCE_FIELDS
+    )
+    if has_modern_negative_evidence:
+        return (
+            record.get("provider_output_observed") is False
+            and record.get("first_output_at") is None
+        )
+    return (
+        str(record.get("reason") or "").casefold() == _LEGACY_WORKTREE_UNSAFE_REASON
+        and all(record.get(name) for name in (
+            "dispatch_id", "decision_id", "execution_id", "resource_context",
+        ))
+    )
+
+
 def _legacy_not_ready_block(record: Any) -> bool:
     return (
         isinstance(record, dict)
@@ -1360,46 +1403,7 @@ class TransitionExecutor:
         refusal, a terminal Broker failure, no usable provider session, and no
         positive output/work evidence.
         """
-        if (
-            record.get("engine") != "aibroker"
-            or record.get("source_kind") != "remediation"
-            or record.get("state") != "failed"
-        ):
-            return False
-        reason = str(record.get("reason") or "").casefold()
-        if _PRE_EXECUTION_WORKTREE_SAFETY_MARKER not in reason:
-            return False
-        if record.get("broker_status") != "failed":
-            return False
-        if "session_id" not in record or record.get("session_id") is not None:
-            return False
-        # A positive provider-work fact always wins over a conflicting negative
-        # field.  Do not let a malformed or stale `provider_output_observed=False`
-        # reclassify an execution that durably recorded usable provider work.
-        if (
-            _non_blank_config(record.get("output")) is not None
-            or record.get("provider_work_observed") is True
-            or record.get("provider_output_observed") is True
-            or record.get("first_output_at") is not None
-        ):
-            return False
-        has_modern_negative_evidence = all(
-            name in record for name in _NEGATIVE_PROVIDER_EVIDENCE_FIELDS
-        )
-        if has_modern_negative_evidence:
-            return (
-                record.get("provider_output_observed") is False
-                and record.get("first_output_at") is None
-            )
-        # The known legacy Broker contract persisted allocation facts but not
-        # the later explicit output fields.  Its exact terminal worktree-safety
-        # refusal plus null session is the narrow historical compatibility case.
-        return (
-            str(record.get("reason") or "").casefold() == _LEGACY_WORKTREE_UNSAFE_REASON
-            and all(record.get(name) for name in (
-                "dispatch_id", "decision_id", "execution_id", "resource_context",
-            ))
-        )
+        return is_pre_provider_worktree_unsafe_failure(record)
 
     def _recovery_descendant_barrier(
         self, ledger: dict[str, Any], project_id: str,

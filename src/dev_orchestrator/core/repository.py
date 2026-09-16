@@ -100,3 +100,19 @@ def read_repository_truth(root: Path | str, *, timeout: float = 15.0) -> Reposit
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return _invalid_truth(root, str(exc))
+
+
+def is_git_ancestor(root: Path | str, ancestor: str, descendant: str, *, timeout: float = 15.0) -> bool:
+    """Return whether ``ancestor`` is a Git ancestor of ``descendant``.
+
+    This is deliberately a strict, read-only predicate for recovery guards.
+    Unknown or malformed repository state is false rather than an invitation to
+    reconstruct lineage heuristically.
+    """
+    if not isinstance(ancestor, str) or not ancestor.strip() or not isinstance(descendant, str) or not descendant.strip():
+        return False
+    try:
+        result = _run_git(Path(root), timeout, "merge-base", "--is-ancestor", ancestor, descendant)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False

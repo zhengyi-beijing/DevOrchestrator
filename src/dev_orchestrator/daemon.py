@@ -257,7 +257,7 @@ def run_daemon(
         failure_memory_max_chars=failure_memory_max_chars,
     )
     control_coordinator = ControlCommandCoordinator(
-        runtime, planner_coordinator, accounting=accounting,
+        runtime, planner_coordinator, accounting=accounting, reviewer=reviewer_coordinator,
         owner_store=owner_store, conversation_store=conversation_store,
         bridge_store=bridge_store,
     )

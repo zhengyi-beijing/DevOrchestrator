@@ -16,9 +16,11 @@ from dev_orchestrator.control.command_store import (
     safe_command_id,
 )
 from dev_orchestrator.control.owner_store import OwnerControlStore
+from dev_orchestrator.control.reconcile import resolve_reconcile_candidate
 from dev_orchestrator.control.store import ConversationConflictError, ConversationControlStore
 from dev_orchestrator.control.surface import validate_expected
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
+from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 CONTROL_DIR = "control"
@@ -96,7 +98,8 @@ class ControlCommandCoordinator:
     def __init__(
         self, runtime_root: Path | str, planner: AIPlannerCoordinator | None = None,
         accounting: ExecutionRecorder | None = None,
-        *, owner_store: OwnerControlStore | None = None,
+        *, reviewer: AIReviewerCoordinator | None = None,
+        owner_store: OwnerControlStore | None = None,
         conversation_store: ConversationControlStore | None = None,
         bridge_store: Any = None,
     ) -> None:
@@ -104,6 +107,7 @@ class ControlCommandCoordinator:
         self.inbox, self.history = _paths(runtime_root)
         self.command_store = ControlCommandStore(runtime_root)
         self.planner = planner
+        self.reviewer = reviewer
         self.accounting = accounting
         self.owner_store = owner_store or OwnerControlStore(runtime_root)
         self.conversation_store = conversation_store or ConversationControlStore(runtime_root)
@@ -375,7 +379,26 @@ class ControlCommandCoordinator:
             return self._approve_owner_gate(
                 record, projects[project_id], snapshot, project_id, command_id, gate_id, now
             )
-        if action in {"retry", "reconcile"}:
+        if action == "reconcile":
+            target_id = _nonblank(target.get("target_id"))
+            candidate, candidate_reason = resolve_reconcile_candidate(snapshot, self.runtime_root, projects[project_id])
+            if candidate is None:
+                return self._blocked(command_id, project_id, action, candidate_reason, now, record)
+            if target_id != candidate["target_id"]:
+                return self._blocked(command_id, project_id, action, "target_id does not match the currently projected reconcile target", now, record)
+            if self.reviewer is None:
+                return self._blocked(command_id, project_id, action, "reviewer coordinator unavailable", now, record)
+            review_id, launch_reason = self.reviewer.reconcile(
+                projects[project_id], snapshot, candidate, command_id,
+            )
+            if review_id is None:
+                return self._blocked(command_id, project_id, action, launch_reason, now, record)
+            return {
+                **record, "state": "accepted", "processed_at": now,
+                "effect": "reconcile_stale_technical_review_no_worker_started",
+                "target_id": target_id, "review_id": review_id, "reason": launch_reason,
+            }
+        if action == "retry":
             return self._blocked(command_id, project_id, action, "action is not available for the current projected target", now, record)
         if self.owner_store.is_paused(project_id):
             return self._blocked(command_id, project_id, action, "project is paused", now, record)

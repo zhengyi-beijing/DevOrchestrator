@@ -13,6 +13,7 @@ from dev_orchestrator.storage.json_store import read_json
 
 from .command_store import EXPECTED_IDENTITY_FIELDS
 from .owner_store import OwnerControlStore
+from .reconcile import resolve_reconcile_candidate
 from .store import ConversationControlStore
 
 
@@ -203,6 +204,7 @@ def project_control_view(
         approve_reason = "repository is dirty"
     else:
         approve_reason = "exact pending planner gate can be approved"
+    reconcile_target, reconcile_reason = resolve_reconcile_candidate(projected, runtime, project_config)
     if unsupported_stop_role_active:
         stop_reason = "active AI role does not support managed interruption; use pause"
     elif active and stoppable_active:
@@ -217,7 +219,11 @@ def project_control_view(
         {"action": "resume", "available": paused, "reason": "clear launch barrier" if paused else "project is not paused"},
         {"action": "stop", "available": not paused and stoppable_active, "reason": stop_reason},
         {"action": "retry", "available": safe_retry, "reason": "recovery-required state" if safe_retry else "no safe exact retry target"},
-        {"action": "reconcile", "available": False, "reason": "no explicit safe reconcile target is projected"},
+        {
+            "action": "reconcile", "available": reconcile_target is not None,
+            "reason": "exact stale technical review can be re-anchored" if reconcile_target is not None else reconcile_reason,
+            **({"target_id": reconcile_target["target_id"]} if reconcile_target is not None else {}),
+        },
         {"action": "approve_owner_gate", "available": approve_available, "reason": approve_reason},
         {"action": "bind_conversation", "available": not bound and bool(live_ids), "reason": "live sessions are available" if live_ids else "no live session is available"},
         {"action": "unbind_conversation", "available": binding_change_available, "reason": binding_change_reason},
