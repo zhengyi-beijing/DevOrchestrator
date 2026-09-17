@@ -228,6 +228,15 @@ def resolve_reconcile_candidate(
     return None, errors[0] if errors else "no exact stale technical-review reconcile target"
 
 
+
+def _git_distance(repo_path: str, ancestor: str, descendant: str) -> int | None:
+    import subprocess
+    try:
+        out = subprocess.run(["git", "rev-list", "--count", f"{ancestor}..{descendant}"], cwd=repo_path, capture_output=True, text=True, timeout=5)
+        return int(out.stdout.strip()) if out.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
 def resolve_rereview_candidate(
     snapshot: dict[str, Any], runtime_root: Path | str, project_config: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, str]:
@@ -275,10 +284,15 @@ def resolve_rereview_candidate(
                         "branch": truth.branch, "reviewed_head": old_head, "current_head": truth.head,
                         "prior_reason": _text(review.get("reason")) or "review infrastructure failure",
                         "resource_context": copy.deepcopy(resource)})
-    if len(matches) == 1:
+    if matches:
+        # Failed attempts are immutable audit history.  For descendant re-review,
+        # select the nearest failed ancestor deterministically; older failures
+        # remain preserved but must not globally block the current task anchor.
+        matches.sort(key=lambda row: (
+            int(_git_distance(repo_path or "", row["reviewed_head"], truth.head) or 10**9),
+            row["target_id"],
+        ))
         return matches[0], ""
-    if len(matches) > 1:
-        return None, "multiple failed descendant technical-review candidates"
     return None, "no safe failed-review descendant re-review target"
 
 
