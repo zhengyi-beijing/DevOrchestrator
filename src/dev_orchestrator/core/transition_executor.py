@@ -1406,7 +1406,7 @@ class TransitionExecutor:
         return is_pre_provider_worktree_unsafe_failure(record)
 
     def _recovery_descendant_barrier(
-        self, ledger: dict[str, Any], project_id: str,
+        self, ledger: dict[str, Any], project_id: str, *, branch: str, head: str,
     ) -> str:
         """Keep a consumed remediation in its own review lifecycle.
 
@@ -1425,6 +1425,8 @@ class TransitionExecutor:
             and record.get("engine") == "aibroker"
             and record.get("source_kind") == "remediation"
             and record.get("state") == "failed"
+            and record.get("branch") == branch
+            and record.get("head") == head
         }
         failed_sources.discard(None)
         if not failed_sources:
@@ -1647,6 +1649,12 @@ class TransitionExecutor:
             for row in ledger["executions"].values()
             if isinstance(row, dict)
         }
+        # Recovery authority is anchored to the repository truth at which the
+        # remediation failed.  Older task/HEAD failures remain immutable audit
+        # evidence but must not globally block a later task after the repository
+        # has advanced to a new anchor.  Same-anchor unresolved review recovery
+        # remains eligible even when agent/next.md already advertises a later
+        # task, preserving the exact reviewed-task remediation contract.
         failed_remediations = [
             row for row in ledger["executions"].values()
             if isinstance(row, dict)
@@ -1654,6 +1662,8 @@ class TransitionExecutor:
             and row.get("engine") == "aibroker"
             and row.get("source_kind") == "remediation"
             and row.get("state") == "failed"
+            and row.get("branch") == branch
+            and row.get("head") == head
             and _non_blank_config(row.get("source_request_id")) not in consumed_sources
         ]
         if not failed_remediations:
@@ -1663,9 +1673,6 @@ class TransitionExecutor:
         for candidate in failed_remediations:
             if not self._failed_before_provider_work(candidate):
                 errors.append("failed remediation is not an exact no-usable-provider-work WorktreeUnsafeError recovery")
-                continue
-            if candidate.get("branch") != branch or candidate.get("head") != head:
-                errors.append("remediation recovery repository branch/HEAD anchor changed")
                 continue
             decision_id = _non_blank_config(candidate.get("review_decision_id")) or _non_blank_config(candidate.get("source_request_id"))
             decision = decisions.get(decision_id or "")
@@ -1962,7 +1969,7 @@ class TransitionExecutor:
                 current_truth=truth,
             )
             recovery_descendant_barrier = self._recovery_descendant_barrier(
-                ledger, project_id,
+                ledger, project_id, branch=truth.branch, head=truth.head,
             )
         if reanchor_error:
             self._record_blocked(

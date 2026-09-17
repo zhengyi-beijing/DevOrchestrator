@@ -151,6 +151,7 @@ class AIBrokerTransitionTests(unittest.TestCase):
             "failed-remediation": {
                 "project_id": "p1", "source_request_id": "failed-remediation",
                 "engine": "aibroker", "source_kind": "remediation", "state": "failed",
+                "task_id": "P1", "branch": truth.branch, "head": truth.head,
             },
             recovery_id: {
                 "project_id": "p1", "source_request_id": recovery_id,
@@ -300,6 +301,48 @@ class AIBrokerTransitionTests(unittest.TestCase):
             self.assertEqual(ledger["owner-continue-reanchor"]["review_decision_id"], decision_id)
             self.assertEqual(len(port.requests), 1)
             self.assertIn("current-head reviewer still requires bounded remediation", port.requests[0].prompt)
+
+    def test_prior_anchor_remediation_history_does_not_block_later_task(self):
+        for with_descendant in (False, True):
+            with self.subTest(with_descendant=with_descendant), tempfile.TemporaryDirectory() as td:
+                root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"; runtime.mkdir()
+                truth = read_repository_truth(repo)
+                old_id = "p125-old-remediation"
+                historical = {
+                    "project_id": "p1", "source_request_id": old_id,
+                    "engine": "aibroker", "source_kind": "remediation", "state": "failed",
+                    "task_id": "P12.5", "branch": truth.branch, "head": "superseded-head",
+                    "reason": "WorktreeUnsafeError: dirty worktree requires deterministic recovery before writable reuse",
+                    "broker_status": "failed", "session_id": None,
+                    "provider_output_observed": False, "first_output_at": None,
+                    "dispatch_id": "old-dispatch", "decision_id": "old-decision",
+                    "execution_id": "old-execution", "resource_context": {"resource_id": "old-resource"},
+                }
+                executions = {old_id: historical}
+                if with_descendant:
+                    executions["p125-old-recovery"] = {
+                        "project_id": "p1", "source_request_id": "p125-old-recovery",
+                        "engine": "aibroker", "source_kind": "remediation", "state": "completed",
+                        "task_id": "P12.5", "branch": truth.branch, "head": "superseded-head",
+                        "recovery_of": old_id,
+                    }
+                (runtime / "transition-executor.json").write_text(
+                    json.dumps({"version": 1, "executions": executions}), encoding="utf-8"
+                )
+                before = json.loads((runtime / "transition-executor.json").read_text(encoding="utf-8"))
+                port = FakePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+                launch = executor.start_control(
+                    broker_project(repo), self._remediation_snapshot("P12.6"), "p126-owner-continue",
+                )
+                self.assertIsNotNone(launch)
+                executor._threads["p126-owner-continue"].join(timeout=2)
+                after = executor.state()["executions"]
+                self.assertEqual(after[old_id], before["executions"][old_id])
+                if with_descendant:
+                    self.assertEqual(after["p125-old-recovery"], before["executions"]["p125-old-recovery"])
+                self.assertEqual(after["p126-owner-continue"]["task_id"], "P12.6")
+                self.assertEqual(after["p126-owner-continue"]["source_kind"], "control")
+                self.assertEqual(len(port.requests), 1)
 
     def test_owner_continue_retries_only_exact_pre_execution_remediation_with_review_evidence(self):
         with tempfile.TemporaryDirectory() as td:
