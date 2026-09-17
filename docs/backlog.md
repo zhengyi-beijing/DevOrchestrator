@@ -99,3 +99,27 @@ Goal: provide an Android-native, failure-independent observation and bounded-con
 - Acceptance: with the ChatGPT/browser path intentionally unavailable, an operator on Android over Tailscale can determine whether a selected project is actively progressing or stalled, inspect recent authoritative events, execute supported bounded controls without RDC or direct shell access, and receive a vibration/audible notification when an active development project enters a confirmed no-progress condition.
 
 Sequence: P13 follows P12. P12 owns and stabilizes the machine-readable Control/Event API; P13 is a client of that contract and must not duplicate DevOrchestrator lifecycle logic.
+
+
+## P14 staged roadmap
+
+### P14 - Remote Execution Resilience & Recoverable Jobs
+
+Goal: make long-running RDC/remote-shell work recoverable when the ChatGPT message/tool-result path times out, reconnects, or loses a synchronous response, without duplicating side effects or losing authoritative execution state.
+
+- Treat `Message delivery timed out` as an ambiguous transport/orchestration outcome, not proof that the remote command failed. DevO must distinguish remote process state, RDC transport state, and ChatGPT/tool-result delivery state.
+- Replace long synchronous remote-shell calls with durable asynchronous jobs where execution can exceed the bounded interactive-call window. `START` must return a durable `job_id`; later `STATUS`, `TAIL`, and `RESULT` operations recover state without re-running the command.
+- Persist job identity, command/request identity, project/task/stage correlation, PID/process handle where available, start/end timestamps, exit code, bounded stdout/stderr references, heartbeat/progress evidence, and terminal result before acknowledging completion.
+- Make mutating remote actions idempotent. Retrying a ChatGPT turn, RDC request, or DevO command with the same semantic `command_id`/`job_id` must reconcile to the existing execution rather than launching a duplicate side effect.
+- Separate remote execution from message delivery: a ChatGPT/RDC delivery timeout must not terminate a healthy background job, and reconnect must permit status recovery from durable DevO state.
+- Add bounded-output behavior: long stdout/stderr is written to durable log/evidence storage; interactive responses return a capped tail/summary instead of transporting unbounded build/test output through one tool call.
+- Add long-operation classification/heartbeat so builds, tests, package operations, and provider runs can report `running` with evidence rather than being mislabeled as stalled merely because no terminal output has arrived.
+- Prefer short single-purpose shell steps over large chained commands. Build/configure/test/git/diagnostic phases should be separately attributable and recoverable; Windows PowerShell 5.1 `&&`/`||` remains prohibited by verified failure memory.
+- Define explicit states at minimum: `queued`, `running`, `completed`, `failed`, `cancel_requested`, `cancelled`, `unknown/recovery_required`, plus transport connectivity/freshness evidence independent of job lifecycle.
+- Integrate with watchdog/accounting: distinguish expected long-running work, remote-process hang, RDC disconnect/reconnect, lost tool-result delivery, and true no-progress stalls; expose the classification on the 8770 control surface and future P13 mobile client.
+- `Retry` after an ambiguous timeout must be fail-safe: first reconcile the prior command/job and only create new work when durable evidence proves no equivalent execution exists.
+- Preserve DevOrchestrator as lifecycle authority. RDC/remote agent owns process execution evidence only and must not independently advance project task/review/remediation state.
+
+Acceptance: intentionally interrupt or time out the ChatGPT/RDC response path during a long-running test/build, verify the remote job continues, reconnect from a later turn, recover the same `job_id` and bounded logs/result, and prove repeated retry/reconcile operations create no duplicate side effects. Also verify deterministic classification for remote process still running, process completed but result delivery lost, RDC disconnected, command genuinely failed, and state genuinely unknown.
+
+Sequence: P14 follows the P13 mobile-control track in the roadmap, but its durable job/idempotency contract should be designed so P13 can consume the same authoritative execution state rather than introducing a second monitoring model.
