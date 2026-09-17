@@ -470,3 +470,27 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Full suite passed: 619 passed, 40 subtests passed in 214.13s (`python -m pytest tests_py -q`).
   - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax checks (`node --check web/app.js` and `node --check browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Canonical worktree is clean and ready for final independent technical re-review.
+
+## P12.7 Web Control Surface Visual Refresh (2026-09-17)
+
+- Refactored `web/index.html`, `web/style.css`, and `web/app.js` into a dense, restrained, single-page operations dashboard referencing OpenCode Data visual and information-architecture hierarchy without copying any branding, assets, or product metrics.
+- Preserved all 26 legacy DOM IDs and compatibility strings (`"UNBOUND / BLOCKED"`, `"Rebind the ChatGPT conversation to resume the pending request."`, `"/api/orchestration"`), retaining full backward compatibility for existing monitors, tests, and endpoints.
+- Maintained existing GET/control HTTP API contracts, loopback enforcement, CSRF/origin/Host headers, static allowlist, CSP (`default-src 'self'`), and daemon-only mutation authority via `ControlCommandCoordinator`.
+- Implemented pure exported helper functions in `web/app.js`:
+  - `buildControlTarget(project, capability, selectedSession)`: produces exact target payloads adhering strictly to the `command_store.py` `target_allowed` map for all 11 control actions (e.g. `{}` for pause/resume/stop/continue/unbind, `{target_id: capability.target_id}` for retry/rereview/reconcile, `{gate_id: project.control_identity.gate_id}` for approve_owner_gate, `{adapter, binding_id}` for bind/rebind); returns `null` when required fields are missing.
+  - `describeGuardedAction(project, capability, target)`: returns structured, labeled identity lines (`project_id`, `task_id`, `lifecycle_state`, `branch@head`, `dirty`, `revision`, plus `target_id` or `gate_id`) and explicit state-consequence sentences.
+  - `computeFreshnessState(monitor, overview)`: evaluates freshness into four explicit states: `'Live'`, `'Stale'`, `'Disconnected'`, or `'Unknown'`.
+  - `computeIncidentCount(overview, watchdog)`: counts active incidents, reviewers failed, degraded components, and watchdog alerts; returns `'unavailable'` when data sources are missing.
+  - `computeKPIs(overview, watchdog, accounting)`: computes flat KPI cell metrics, failing closed to `'unavailable'` rather than displaying `0` or healthy when data is missing.
+  - `severityRank(code)` & `compareSeverityThenIdThenTime(a, b)`: provides deterministic multi-column sorting across projects, executions, resources, and watchdog tables.
+- Added native confirmation dialog via `window.confirm` for the five lifecycle-changing guarded actions (`stop`, `retry`, `rereview`, `reconcile`, `approve_owner_gate`) displaying identity lines and consequence details before any network request; user cancellation issues zero fetches.
+- Connected all control buttons through `buildControlTarget`, disabling buttons when targets are missing or capabilities are unavailable.
+- Replaced `Promise.all` in `refresh()` with per-source `Promise.allSettled` handling to isolate partial network/endpoint failures cleanly without masking errors as healthy.
+- Added comprehensive unit and integration test suite `tests_py/test_web_ui_refresh.py` (8 tests) validating target construction, prompt contents, button disabled states, helper functions, fake-DOM fixture rendering, required DOM IDs, security guards (no inline scripts/styles, `:focus-visible`, reduced-motion), and read-only GET-only verification.
+- Verification:
+  - Focused web and control suites passed: 55 passed, 6 subtests passed (`test_web.py`, `test_accounting_dashboard.py`, `test_unbound_web_ui.py`, `test_web_ui_refresh.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_control_commands.py`).
+  - `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/web-selftest.ps1` passed cleanly (`web-selftest: PASS`).
+  - Full regression suite passed: 629 passed, 40 subtests passed in 206.09s (`python -m pytest tests_py -q`).
+  - `python -m compileall -q src ops tests_py`, node syntax checks (`web/app.js` and `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated via `graphify update .`: 3110 nodes, 8624 edges, 148 communities.
+  - Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.

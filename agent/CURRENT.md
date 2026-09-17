@@ -5,17 +5,22 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12.6 Persistent Harness Acceptance and Closure** — **REMEDIATION IMPLEMENTED / FINAL INDEPENDENT RE-REVIEW PENDING**.
+Current task: **P12.7 Web Control Surface Visual Refresh** — **IMPLEMENTATION COMPLETE / TECHNICAL REVIEW PENDING**.
 
 Latest continuation state (2026-09-17):
-- Canonical `main` HEAD is `48b3152` (`fix_p127_staged_status_contract`), ahead of `origin/main` by 12 commits.
-- Evidence-correlation fixes implemented in `40e7d24` (review_status_hash exact verification and Broker restart request_id identity guard).
-- P12.6-to-P12.7 successor linkage staged in `36eb632` and `agent/staged/P12.7.md` status contract corrected to `Status: **PENDING DESIGN**` in `48b3152`.
-- Technical review finding from `ai_review:closure:p126:final2:36eb632d1b7f` remediated: added comprehensive regression tests for the P12.6-to-P12.7 handoff contract and lifecycle in `tests_py/test_staged_roadmap.py` and `tests_py/test_staged_handoff.py`.
-- Focused regression passed (85 tests, 9 subtests); full regression passed (619 tests, 40 subtests in 214.13s); compileall, JavaScript syntax, and `git diff --check` passed cleanly.
-- Canonical worktree is clean; runtime ready for final independent technical re-review on clean HEAD to emit `NEXT` with no blockers, settle P12.6, and hand off to P12.7.
+- Canonical `main` HEAD is `8059d04` (`plan(P12.7): freeze executable design`), ahead of `origin/main` by 21 commits.
+- Executed P12.7 Web Control Surface Visual Refresh per approved executable design in `agent/next.md` and `docs/P12_7_WEB_UI_DESIGN.md`.
+- Refactored `web/index.html` and `web/style.css` into a dense, single-page operations dashboard with header health/freshness/refresh strip, flat KPI cards, section navigation, and distinct labelled `#controls` region.
+- Preserved all 26 legacy DOM IDs, static allowlist, CSP (`default-src 'self'`), CSRF/origin/Host headers, and backward-compatible strings (`UNBOUND / BLOCKED`, `Rebind the ChatGPT conversation to resume the pending request.`, `/api/orchestration`).
+- Implemented pure exported helper functions in `web/app.js`: `buildControlTarget`, `describeGuardedAction`, `computeFreshnessState`, `computeIncidentCount`, `computeKPIs`, `severityRank`, and `compareSeverityThenIdThenTime`.
+- Added native confirmation prompts (`window.confirm`) for the five lifecycle-changing guarded actions (`stop`, `retry`, `rereview`, `reconcile`, `approve_owner_gate`) displaying identity lines and state consequences before sending any fetch; cancelling issues 0 fetches.
+- Connected control buttons to `buildControlTarget`, disabling buttons when targets are missing or capabilities are unavailable.
+- Upgraded `refresh()` to use `Promise.allSettled` to isolate per-source network failures cleanly without masking errors as healthy or zero.
+- Added comprehensive unit and integration test suite `tests_py/test_web_ui_refresh.py` (8 tests) validating helper behavior, confirmation prompts, button disabling, fake-DOM fixture rendering, required DOM IDs, security guards (no inline scripts/styles, `:focus-visible`, reduced-motion), and read-only GET-only verification.
+- Verification: focused web/control suites passed (55 passed, 6 subtests), `tests/web-selftest.ps1` passed, full test suite passed (629 passed, 40 subtests in 206.09s), Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly.
+- Knowledge graph updated with `graphify update .` (3110 nodes, 8624 edges, 148 communities). Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
 
-Immediate continuation rule: require independent reviewer verdict `NEXT` on the clean P12.6 HEAD with no blocking findings, settle P12.6 cleanly, and proceed to P12.7 staged planner handoff. Do not advance to P12.7 early.
+Immediate continuation rule: perform independent technical review of P12.7 changes on clean worktree.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
@@ -182,3 +187,16 @@ P12.6 closure review remediation result (2026-09-17):
   - Full suite passed: 619 passed, 40 subtests passed in 214.13s (`python -m pytest tests_py -q`).
   - `python -m compileall -q src ops tests_py`, node syntax checks on `web/app.js` and `browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
   - Canonical worktree is clean and ready for final independent technical re-review.
+
+P12.7 web control surface visual refresh result (2026-09-17):
+- Refactored `web/index.html`, `web/style.css`, and `web/app.js` into a dense single-page dashboard referencing OpenCode Data visual/information-architecture principles without copying branding, assets, or product metrics.
+- Preserved all 26 legacy DOM IDs, GET API contracts, daemon mutation authority, CSRF/origin/Host headers, and CSP (`default-src 'self'`).
+- Implemented pure exported helpers (`buildControlTarget`, `describeGuardedAction`, `computeFreshnessState`, `computeIncidentCount`, `computeKPIs`, `severityRank`, `compareSeverityThenIdThenTime`).
+- Wired control buttons through `buildControlTarget` with target validation and disabled state handling.
+- Added native confirmation dialogs for the five lifecycle-changing guarded actions (`stop`, `retry`, `rereview`, `reconcile`, `approve_owner_gate`).
+- Replaced `Promise.all` with `Promise.allSettled` in `refresh()` to prevent partial fetch failures from masking errors as healthy.
+- Added dedicated test suite `tests_py/test_web_ui_refresh.py` (8 tests) covering target building, confirmation prompts, disabled states, helpers, fake-DOM rendering fixtures, required IDs, security checks, and read-only GET behavior.
+- Focused web & control regression passed: 55 passed, 6 subtests passed; `tests/web-selftest.ps1` passed; full regression passed: 629 passed, 40 subtests passed in 206.09s.
+- `python -m compileall -q src ops tests_py`, node syntax checks on `web/app.js` and `browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly.
+- Knowledge graph updated via `graphify update .`: 3110 nodes, 8624 edges, 148 communities.
+- Canonical worktree clean and ready for independent technical review.
