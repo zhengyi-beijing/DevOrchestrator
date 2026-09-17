@@ -14,7 +14,7 @@ from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_js
 
 CONTROL_SCHEMA_VERSION = 1
 CONTROL_ACTIONS = frozenset({
-    "continue", "pause", "resume", "stop", "retry", "reconcile",
+    "continue", "pause", "resume", "stop", "retry", "rereview", "reconcile",
     "approve_owner_gate", "bind_conversation", "unbind_conversation",
     "rebind_conversation",
 })
@@ -75,7 +75,7 @@ def canonical_request(value: dict[str, Any]) -> dict[str, Any]:
     target_allowed = {
         "continue": {"gate_id"},
         "pause": set(), "resume": set(), "stop": set(),
-        "retry": {"target_id"}, "reconcile": {"target_id"},
+        "retry": {"target_id"}, "rereview": {"target_id"}, "reconcile": {"target_id"},
         "approve_owner_gate": {"gate_id"},
         "bind_conversation": {"adapter", "binding_id"},
         "unbind_conversation": set(),

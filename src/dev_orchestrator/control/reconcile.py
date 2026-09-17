@@ -228,6 +228,60 @@ def resolve_reconcile_candidate(
     return None, errors[0] if errors else "no exact stale technical-review reconcile target"
 
 
+def resolve_rereview_candidate(
+    snapshot: dict[str, Any], runtime_root: Path | str, project_config: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Resolve one failed reviewer lineage that may be re-reviewed at a clean descendant HEAD."""
+    if not isinstance(snapshot, dict):
+        return None, "project snapshot is unavailable"
+    project_id = _text(snapshot.get("project_id") or snapshot.get("id"))
+    telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+    task_id = _text(telemetry.get("task_id"))
+    if project_id is None or task_id is None or not _reviewer_ready(project_config):
+        return None, "current project/task/reviewer identity is incomplete"
+    repo_path = _text(project_config.get("repo_path")) or _text(snapshot.get("repo_path"))
+    truth = read_repository_truth(repo_path or "")
+    if not truth.valid or truth.dirty:
+        return None, "current repository is unavailable or dirty"
+    git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
+    if git.get("branch") != truth.branch or git.get("head") != truth.head or bool(git.get("dirty")):
+        return None, "current monitor repository identity is stale"
+    runtime = Path(runtime_root)
+    executions = _rows(runtime, "transition-executor.json", "executions")
+    reviews = _rows(runtime, "ai-reviewer.json", "reviews")
+    decisions = _rows(runtime, "review-decisions.json", "decisions")
+    plans = _rows(runtime, "ai-planner.json", "plans")
+    active = _active_reason(snapshot, project_id, executions, reviews, plans)
+    if active:
+        return None, active
+    consumed = {target for row in reviews.values() if row.get("project_id") == project_id for target in [_text(row.get("rereview_of"))] if target}
+    matches = []
+    for review_id, review in sorted(reviews.items()):
+        old_head = _text(review.get("head"))
+        if review_id in consumed or review_id in decisions or not (
+            review.get("project_id") == project_id and review.get("task_id") == task_id
+            and review.get("state") == "failed" and review.get("branch") == truth.branch
+            and old_head and old_head != truth.head and review.get("review_dirty") is False
+            and is_git_ancestor(repo_path or "", old_head, truth.head)
+        ):
+            continue
+        source_id = _text(review.get("source_request_id")); source = executions.get(source_id or "")
+        resource = source.get("resource_context") if isinstance(source, dict) else None
+        if not (isinstance(source, dict) and source.get("state") == "completed" and source.get("engine") == "aibroker"
+                and source.get("project_id") == project_id and source.get("task_id") == task_id
+                and isinstance(resource, dict)):
+            continue
+        matches.append({"target_id": review_id, "source_request_id": source_id, "task_id": task_id,
+                        "branch": truth.branch, "reviewed_head": old_head, "current_head": truth.head,
+                        "prior_reason": _text(review.get("reason")) or "review infrastructure failure",
+                        "resource_context": copy.deepcopy(resource)})
+    if len(matches) == 1:
+        return matches[0], ""
+    if len(matches) > 1:
+        return None, "multiple failed descendant technical-review candidates"
+    return None, "no safe failed-review descendant re-review target"
+
+
 def resolve_retry_candidate(
     snapshot: dict[str, Any], runtime_root: Path | str, project_config: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, str]:

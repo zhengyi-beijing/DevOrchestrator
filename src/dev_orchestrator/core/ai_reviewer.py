@@ -353,6 +353,41 @@ class AIReviewerCoordinator:
         )
         return review_id, "stale technical review re-anchored at current clean HEAD"
 
+
+    def rereview_failed_descendant(self, project, snapshot, candidate, command_id):
+        """Re-review current clean descendant HEAD while preserving the failed review lineage."""
+        from dev_orchestrator.control.reconcile import resolve_rereview_candidate
+        target, reason = resolve_rereview_candidate(snapshot, self.runtime_root, project)
+        if target is None or target.get("target_id") != candidate.get("target_id"):
+            return None, reason or "re-review target changed before launch"
+        policy, policy_reason = _review_policy(project)
+        if policy is None or self.port is None:
+            return None, policy_reason or "AIBroker reviewer port unavailable"
+        review_id = "ai_review:rereview:" + command_id
+        with self._lock:
+            existing = self._load_state()["reviews"].get(review_id)
+            if isinstance(existing, dict):
+                return (review_id, "descendant re-review already launched for command_id") if existing.get("rereview_of") == target["target_id"] else (None, "conflicting descendant re-review replay")
+        repo_path = _nonblank(project.get("repo_path")); source_id = _nonblank(target.get("source_request_id")); task_id = _nonblank(target.get("task_id"))
+        resource = target.get("resource_context"); truth = read_repository_truth(repo_path or "")
+        if not repo_path or not source_id or not task_id or not isinstance(resource, dict) or not truth.valid or truth.dirty or truth.head != target.get("current_head"):
+            return None, "current repository or source identity changed before descendant re-review"
+        previous = ResourceContext(resource.get("resource_id"), resource.get("provider"), resource.get("account"), resource.get("model"))
+        from dev_orchestrator.core.project_context import context_prompt_block
+        context_block, resolution = context_prompt_block(project, "reviewer")
+        binding = project.get("conversation_binding") or self._project_bindings.get(str(project["project_id"]))
+        reanchor = ("[FAILED_REVIEW_DESCENDANT_REREVIEW]\nPrior reviewer infrastructure failed at HEAD {0}: {1}\n"
+                    "The current clean HEAD is a descendant containing bounded recovery fixes. Independently review CURRENT HEAD; do not inherit a verdict.\n"
+                    "[/FAILED_REVIEW_DESCENDANT_REREVIEW]").format(target.get("reviewed_head"), target.get("prior_reason"))
+        request = AIRoleRequest(project_id=str(project["project_id"]), task_run_id=task_id, stage_run_id="review",
+            role_run_id="reviewer-rereview-" + command_id, request_id=review_id, role="reviewer",
+            prompt=self._review_prompt(str(project["project_id"]), task_id, source_id, truth, context_block=context_block, reanchor_context=reanchor),
+            working_directory=Path(repo_path), quality=policy["quality"], independence=policy["independence"], previous_resource_context=previous,
+            timeout_seconds=policy["timeout_seconds"], metadata={"worker_source_request_id": source_id, "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
+            "failure_environment": environment_for_project(project), "rereview_of": target["target_id"]})
+        self._launch_review(review_id, source_id, request, truth, conversation_binding=binding, resolution=resolution)
+        return review_id, "failed reviewer lineage re-anchored at current clean descendant HEAD"
+
     def retry_failed(
         self, project: dict[str, Any], snapshot: dict[str, Any],
         candidate: dict[str, Any], command_id: str,
@@ -498,6 +533,7 @@ class AIReviewerCoordinator:
                 "context_digest": resolution.document.digest if resolution and resolution.document else None,
                 "reconcile_of": request.metadata.get("reconcile_of") if isinstance(request.metadata, dict) else None,
                 "retry_of": request.metadata.get("retry_of") if isinstance(request.metadata, dict) else None,
+                "rereview_of": request.metadata.get("rereview_of") if isinstance(request.metadata, dict) else None,
             }
             if conversation_binding and isinstance(conversation_binding, dict):
                 self._project_bindings[request.project_id] = copy.deepcopy(conversation_binding)

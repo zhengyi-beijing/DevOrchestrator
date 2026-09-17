@@ -312,7 +312,7 @@ class ControlCommandCoordinator:
         # Project only that reviewer lifecycle for retry identity validation; all
         # other controls retain their established snapshot semantics.
         validation_snapshot = snapshot
-        if action == "retry" and self.reviewer is not None:
+        if action in {"retry", "rereview"} and self.reviewer is not None:
             reviewer_state_fn = getattr(self.reviewer, "state", None)
             validation_snapshot = project_runtime_status(snapshot, self.runtime_root)
             validation_snapshot = overlay_orchestration_lifecycle(
@@ -434,6 +434,20 @@ class ControlCommandCoordinator:
                 "effect": "reconcile_stale_technical_review_no_worker_started",
                 "target_id": target_id, "review_id": review_id, "reason": launch_reason,
             }
+        if action == "rereview":
+            target_id = _nonblank(target.get("target_id"))
+            if self.reviewer is None:
+                return self._blocked(command_id, project_id, action, "reviewer coordinator unavailable", now, record)
+            from dev_orchestrator.control.reconcile import resolve_rereview_candidate
+            candidate, candidate_reason = resolve_rereview_candidate(snapshot, self.runtime_root, projects[project_id])
+            if candidate is None:
+                return self._blocked(command_id, project_id, action, candidate_reason, now, record)
+            if target_id != candidate["target_id"]:
+                return self._blocked(command_id, project_id, action, "target_id does not match the currently projected re-review target", now, record)
+            review_id, launch_reason = self.reviewer.rereview_failed_descendant(projects[project_id], snapshot, candidate, command_id)
+            if review_id is None:
+                return self._blocked(command_id, project_id, action, launch_reason, now, record)
+            return {**record, "state": "accepted", "processed_at": now, "effect": "rereview_failed_technical_review_no_worker_started", "target_id": target_id, "review_id": review_id, "reason": launch_reason}
         if action == "retry":
             target_id = _nonblank(target.get("target_id"))
             if self.reviewer is None:

@@ -13,7 +13,7 @@ from dev_orchestrator.storage.json_store import read_json
 
 from .command_store import EXPECTED_IDENTITY_FIELDS
 from .owner_store import OwnerControlStore
-from .reconcile import resolve_reconcile_candidate, resolve_retry_candidate
+from .reconcile import resolve_reconcile_candidate, resolve_retry_candidate, resolve_rereview_candidate
 from .store import ConversationControlStore
 
 
@@ -154,6 +154,7 @@ def project_control_view(
     )
     retry_target, retry_reason = resolve_retry_candidate(projected, runtime, project_config)
     safe_retry = retry_target is not None
+    rereview_target, rereview_reason = resolve_rereview_candidate(projected, runtime, project_config)
     bound = isinstance(binding, dict) and binding.get("state") == "bound"
     claim_guard_known = not bound or bridge_store is not None
     active_claim = False
@@ -221,6 +222,11 @@ def project_control_view(
             "action": "retry", "available": safe_retry,
             "reason": "exact failed technical review can be retried" if safe_retry else retry_reason,
             **({"target_id": retry_target["target_id"]} if retry_target is not None else {}),
+        },
+        {
+            "action": "rereview", "available": rereview_target is not None,
+            "reason": "failed reviewer lineage can be re-reviewed at current descendant HEAD" if rereview_target is not None else rereview_reason,
+            **({"target_id": rereview_target["target_id"]} if rereview_target is not None else {}),
         },
         {
             "action": "reconcile", "available": reconcile_target is not None,

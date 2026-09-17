@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dev_orchestrator.control.reconcile import resolve_retry_candidate
+from dev_orchestrator.control.reconcile import resolve_retry_candidate, resolve_rereview_candidate
 from dev_orchestrator.control.surface import project_control_view
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.control_commands import ControlCommandCoordinator, submit_control_command
@@ -180,6 +180,36 @@ class P126ReviewRetryTests(unittest.TestCase):
             self.assertEqual(command["action"], "retry")
             self.assertEqual(command["target"], {"target_id": failed_id})
 
+
+    def test_failed_review_can_rereview_clean_descendant_without_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, runtime, config, project, snapshot, failed_id = self.fixture(Path(td))
+            (repo / "bounded-fix.txt").write_text("fix", encoding="utf-8")
+            import subprocess
+            subprocess.run(["git", "add", "bounded-fix.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "bounded recovery fix"], cwd=repo, check=True, capture_output=True)
+            from dev_orchestrator.core.repository import read_repository_truth
+            truth = read_repository_truth(repo)
+            snapshot["git"].update({"head": truth.head, "status_hash": truth.status_hash, "dirty": False})
+            candidate, reason = resolve_rereview_candidate(snapshot, runtime, project)
+            self.assertEqual(reason, "")
+            self.assertEqual(candidate["target_id"], failed_id)
+            view = project_control_view(snapshot, runtime, project)
+            control = next(row for row in view["controls"] if row["action"] == "rereview")
+            self.assertTrue(control["available"], control)
+            submit_control_command(runtime, "p1", "rereview", command_id="rereview-one",
+                                   expected=view["control_identity"], target={"target_id": failed_id})
+            port = ReviewerPort(); reviewer = AIReviewerCoordinator(runtime, port); executor = FakeExecutor()
+            result = ControlCommandCoordinator(runtime, reviewer=reviewer).advance(config, {"projects": [snapshot]}, executor)[0]
+            self.assertEqual(result["state"], "accepted", result)
+            self.assertEqual(result["effect"], "rereview_failed_technical_review_no_worker_started")
+            self.assertEqual(executor.calls, [])
+            review_id = "ai_review:rereview:rereview-one"
+            reviewer._threads[review_id].join(timeout=2)
+            state = reviewer.state()["reviews"][review_id]
+            self.assertEqual(state["rereview_of"], failed_id)
+            self.assertEqual(state["head"], truth.head)
+            self.assertIn("[FAILED_REVIEW_DESCENDANT_REREVIEW]", port.requests[0].prompt)
 
 
 if __name__ == "__main__":
