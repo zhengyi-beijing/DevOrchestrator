@@ -5,17 +5,17 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12.6 Persistent Harness Acceptance and Closure** — **RECOVERY FIX IMPLEMENTED / FINAL INDEPENDENT RE-REVIEW STILL PENDING**.
+Current task: **P12.6 Persistent Harness Acceptance and Closure** — **REMEDIATION IMPLEMENTED / FINAL INDEPENDENT RE-REVIEW PENDING**.
 
 Latest continuation state (2026-09-17):
-- Canonical `main` HEAD is `1d31f42` (`docs(p12.7): freeze OpenCode-inspired web UI direction`), ahead of `origin/main` by 6 commits.
-- P12.6 exact failed-review recovery is implemented in `6f14df8` and watchdog `REVIEW_FAILED` support/config validation in `3937777`. Historical failed review evidence is preserved; retries create a new `ai_review:retry:<command-id>` lineage and never rerun Worker.
-- Root cause of the earlier no-recovery behavior: `src/monitor.ps1` is observation-only; watchdog originally did not monitor `REVIEW_FAILED`, project `auto_recovery` was false, and diagnostics classified reviewer failure as `unknown`. These gaps are now bounded to reviewer-failure exact retry rather than generic `continue`.
-- Latest focused recovery/watchdog regression passed (82 tests). Latest full unittest-style regression completed with 546 tests OK.
-- Live runtime currently projects `REVIEW_FAILED`, no active execution/role, watchdog diagnosis `reviewer_failed`; exact retry is currently unavailable because the canonical worktree is dirty only from an uncommitted `docs/backlog.md` change. Do not discard or overwrite that file implicitly.
-- P12.7 visual/IA direction is frozen in `1d31f42`: use `https://opencode.ai/data` as reference for dense, restrained, freshness-explicit operations UI; preserve DevO lifecycle/control semantics. `docs/P12_7_WEB_UI_DESIGN.md` is the frozen design, and P12.7 starts only after P12.6 closure.
+- Canonical `main` HEAD is `48b3152` (`fix_p127_staged_status_contract`), ahead of `origin/main` by 12 commits.
+- Evidence-correlation fixes implemented in `40e7d24` (review_status_hash exact verification and Broker restart request_id identity guard).
+- P12.6-to-P12.7 successor linkage staged in `36eb632` and `agent/staged/P12.7.md` status contract corrected to `Status: **PENDING DESIGN**` in `48b3152`.
+- Technical review finding from `ai_review:closure:p126:final2:36eb632d1b7f` remediated: added comprehensive regression tests for the P12.6-to-P12.7 handoff contract and lifecycle in `tests_py/test_staged_roadmap.py` and `tests_py/test_staged_handoff.py`.
+- Focused regression passed (85 tests, 9 subtests); full regression passed (619 tests, 40 subtests in 214.13s); compileall, JavaScript syntax, and `git diff --check` passed cleanly.
+- Canonical worktree is clean; runtime ready for final independent technical re-review on clean HEAD to emit `NEXT` with no blockers, settle P12.6, and hand off to P12.7.
 
-Immediate continuation rule: preserve `docs/backlog.md`, restore a clean canonical worktree through an explicit safe handling of that pending change, let watchdog/exact retry launch a fresh independent reviewer on the same current task/HEAD, require `NEXT` with no blockers, then close P12.6 before starting P12.7.
+Immediate continuation rule: require independent reviewer verdict `NEXT` on the clean P12.6 HEAD with no blocking findings, settle P12.6 cleanly, and proceed to P12.7 staged planner handoff. Do not advance to P12.7 early.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
@@ -171,3 +171,14 @@ P12.6 review remediation result (2026-09-17):
 - `python -m compileall -q src ops tests_py`, node syntax checks on `web/app.js` and `browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly.
 - Updated `docs/P12_6_PERSISTENT_HARNESS_ACCEPTANCE.md` focused test results (65 passed, 8 subtests passed) and added full regression evidence (602 passed, 33 subtests passed).
 - Verified canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
+
+P12.6 closure review remediation result (2026-09-17):
+- Remediated Technical Review finding from `ai_review:closure:p126:final2:36eb632d1b7f`:
+  - Successor status contract: `agent/staged/P12.7.md` status corrected to `Status: **PENDING DESIGN**` (from `READY_TO_RUN`), satisfying `read_successor` contract and preventing terminal handoff blocks.
+  - Successor roadmap link regression: `tests_py/test_staged_roadmap.py` now asserts `read_successor(checkout_root, "P12.6")` returns successor `P12.7`, spec path `agent/staged/P12.7.md`, and `Status: **PENDING DESIGN**`; `test_real_repo_p126_to_p127_staged_contract` verifies `READY_TO_RUN` and approved design markers are absent.
+  - End-to-end handoff lifecycle regression: `tests_py/test_staged_handoff.py` added `test_p126_to_p127_staged_handoff_contract_and_lifecycle` reproducing both the defect (`READY_TO_RUN` causing `state="blocked"` with missing pending design reason) and the fix (`PENDING DESIGN` advancing to `state="handoff"` with `next_task_id="P12.7"` and unblocking deferred planning).
+- Verification:
+  - Focused suites passed: 85 passed, 9 subtests passed (`test_p126_review_retry.py`, `test_transition_executor_aibroker.py`, `test_p12_6_persistent_harness_acceptance.py`, `test_staged_roadmap.py`, `test_staged_handoff.py`).
+  - Full suite passed: 619 passed, 40 subtests passed in 214.13s (`python -m pytest tests_py -q`).
+  - `python -m compileall -q src ops tests_py`, node syntax checks on `web/app.js` and `browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
+  - Canonical worktree is clean and ready for final independent technical re-review.

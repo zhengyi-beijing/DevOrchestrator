@@ -783,6 +783,129 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
             )
             self.assertEqual((repo / spec_path).read_bytes(), spec_bytes)
 
+    def test_p126_to_p127_staged_handoff_contract_and_lifecycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "repo"
+            head = make_git_repo(repo, "P12.6")
+            spec_path = "agent/staged/P12.7.md"
+            # 1. First test the defect: READY_TO_RUN causes roadmap invalid and blocks handoff
+            invalid_spec_bytes = (
+                "# P12.7 Web Control Surface Visual Refresh\n\n"
+                "Status: **READY_TO_RUN**\n\n"
+                "Goal: implement visual refresh.\n"
+            ).encode("utf-8")
+            (repo / spec_path).write_bytes(invalid_spec_bytes)
+            setup_roadmap(repo, "P12.6", "P12.7", spec_path)
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "setup staged p127 ready"], check=True, capture_output=True)
+            head_invalid = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+            runtime = base / "runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            port = FakeHandoffPort("P12.7")
+            planner = AIPlannerCoordinator(runtime, port)
+            config_path = base / "projects.json"
+            config_data = {
+                "projects": [{
+                    "project_id": "p1",
+                    "repo_path": str(repo),
+                    "adapter": "agent_files",
+                    "execution": {
+                        "enabled": True,
+                        "engine": "aibroker",
+                        "owner_authorized": True,
+                        "allowed_next_actions": ["next_task"],
+                    },
+                    "ai_roles": {"planner": {"enabled": True}},
+                }]
+            }
+            config_path.write_text(json.dumps(config_data), encoding="utf-8")
+
+            # Write review decision NEXT for P12.6
+            repo_truth = read_repository_truth(repo)
+            record_invalid = {
+                "project_id": "p1", "request_id": "review:p1:p126",
+                "disposition": "apply", "decision": "next", "next_action": "next_task",
+                "task_id": "P12.6", "stage_id": None,
+                "branch": repo_truth.branch, "head": head_invalid,
+                "role": "reviewer", "event": "worker_done",
+                "consumed_at": "2026-09-17T00:00:00+00:00",
+            }
+            (runtime / "websol-decisions.json").write_text(
+                json.dumps({"version": 1, "decisions": {"review:p1:p126": record_invalid}}), encoding="utf-8"
+            )
+
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": FakeBackend("agy")})
+            summary_invalid = {
+                "projects": [{
+                    "project_id": "p1",
+                    "state": "IDLE",
+                    "next_status": "**COMPLETE**",
+                    "telemetry": {"task_id": "P12.6"},
+                    "git": {"head": head_invalid},
+                }]
+            }
+            executor.advance(summary_invalid, config_path)
+            exec_row = executor.state()["executions"]["review:p1:p126"]
+            self.assertEqual(exec_row["state"], "blocked")
+            self.assertIn("staged roadmap invalid: successor spec missing Status: **PENDING DESIGN**", exec_row["reason"])
+
+            # 2. Now test the fix: PENDING DESIGN allows handoff and starts deferred planner
+            valid_spec_bytes = (
+                "# P12.7 Web Control Surface Visual Refresh\n\n"
+                "Status: **PENDING DESIGN**\n\n"
+                "Goal: implement visual refresh.\n"
+            ).encode("utf-8")
+            (repo / spec_path).write_bytes(valid_spec_bytes)
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "fix p127 staged status"], check=True, capture_output=True)
+            head_valid = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+            repo_truth2 = read_repository_truth(repo)
+            record_valid = {
+                "project_id": "p1", "request_id": "review:p1:p126-valid",
+                "disposition": "apply", "decision": "next", "next_action": "next_task",
+                "task_id": "P12.6", "stage_id": None,
+                "branch": repo_truth2.branch, "head": head_valid,
+                "role": "reviewer", "event": "worker_done",
+                "consumed_at": "2026-09-17T00:01:00+00:00",
+            }
+            (runtime / "websol-decisions.json").write_text(
+                json.dumps({"version": 1, "decisions": {"review:p1:p126-valid": record_valid}}), encoding="utf-8"
+            )
+
+            summary_valid = {
+                "projects": [{
+                    "project_id": "p1",
+                    "state": "IDLE",
+                    "next_status": "**COMPLETE**",
+                    "telemetry": {"task_id": "P12.6"},
+                    "git": {"head": head_valid},
+                }]
+            }
+            control = ControlCommandCoordinator(runtime, planner)
+            executor.advance(summary_valid, config_path)
+            exec_row2 = executor.state()["executions"]["review:p1:p126-valid"]
+            self.assertEqual(exec_row2["state"], "handoff")
+            self.assertEqual(exec_row2["next_task_id"], "P12.7")
+            self.assertEqual(exec_row2["staged_successor"], "P12.7")
+
+            outcomes = control.advance(config_path, summary_valid, executor)
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["lifecycle_action"], "plan")
+            self.assertTrue(executor.state()["executions"]["review:p1:p126-valid"]["handoff_consumed"])
+
+            plan_id = outcomes[0]["plan_id"]
+            for _ in range(50):
+                plan_state = planner.state()["plans"].get(plan_id, {})
+                if plan_state.get("state") == "ready":
+                    break
+                time.sleep(0.1)
+
+            self.assertEqual(plan_state.get("state"), "ready")
+            self.assertEqual(plan_state.get("task_id"), "P12.7")
+
 
 if __name__ == "__main__":
     unittest.main()

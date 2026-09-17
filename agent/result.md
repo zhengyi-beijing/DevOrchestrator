@@ -458,3 +458,15 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
 - Commit `1d31f42` freezes P12.7 UI direction: reference `https://opencode.ai/data` for dense, restrained, freshness-explicit information architecture; keep DevO project/role/resource/execution/watchdog semantics and all P12 lifecycle authority unchanged.
 - Live runtime after these commits: lifecycle `REVIEW_FAILED`, no active execution/role, watchdog diagnosis `reviewer_failed`. Exact retry is currently blocked because `docs/backlog.md` is modified in the canonical worktree. Preserve that pending change; do not reset it implicitly.
 - Continuation order: safely resolve the pending `docs/backlog.md` worktree change -> clean canonical tree -> allow exact reviewer retry/watchdog recovery -> require independent `NEXT` with no blockers -> mark P12.6 closed -> only then start P12.7.
+
+## P12.6 Closure Review Remediation / Staged Handoff Regression (2026-09-17)
+
+- Remediated Technical Review finding from `ai_review:closure:p126:final2:36eb632d1b7f`:
+  - Staged successor contract: `agent/staged/P12.7.md` status was declared as `Status: **READY_TO_RUN**` in commit `36eb632`, causing `read_successor('.', 'P12.6')` to fail with `kind="invalid"` ("successor spec missing Status: **PENDING DESIGN**"). Corrected to `Status: **PENDING DESIGN**` in commit `48b3152`, adhering to the staged-roadmap contract and ensuring terminal handoff will not block.
+  - Successor roadmap link regression: `tests_py/test_staged_roadmap.py` updated to verify `read_successor(checkout_root, "P12.6")` returns `kind="successor"`, `successor_task_id="P12.7"`, `spec_path="agent/staged/P12.7.md"`, and `Status: **PENDING DESIGN**`. Added `test_real_repo_p126_to_p127_staged_contract` ensuring `READY_TO_RUN` and approved design markers are absent.
+  - End-to-end handoff lifecycle regression: `tests_py/test_staged_handoff.py` added `test_p126_to_p127_staged_handoff_contract_and_lifecycle` testing both defect reproduction (`READY_TO_RUN` causing `state="blocked"` with missing pending design reason on NEXT) and the fix (`PENDING DESIGN` transitioning to `state="handoff"` with `next_task_id="P12.7"` and unblocking deferred planning in `ControlCommandCoordinator`).
+- Verification:
+  - Focused suites passed: 85 passed, 9 subtests passed (`test_p126_review_retry.py`, `test_transition_executor_aibroker.py`, `test_p12_6_persistent_harness_acceptance.py`, `test_staged_roadmap.py`, `test_staged_handoff.py`).
+  - Full suite passed: 619 passed, 40 subtests passed in 214.13s (`python -m pytest tests_py -q`).
+  - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax checks (`node --check web/app.js` and `node --check browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Canonical worktree is clean and ready for final independent technical re-review.

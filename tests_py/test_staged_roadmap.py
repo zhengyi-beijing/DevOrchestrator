@@ -319,6 +319,23 @@ class TestStagedRoadmap(unittest.TestCase):
         self.assertEqual(res_125.successor_task_id, "P12.6")
         self.assertEqual(res_125.spec_path, "agent/staged/P12.6.md")
 
+        res_126 = read_successor(checkout_root, "P12.6")
+        self.assertEqual(res_126.kind, "successor")
+        self.assertEqual(res_126.successor_task_id, "P12.7")
+        self.assertEqual(res_126.spec_path, "agent/staged/P12.7.md")
+        self.assertIn("Status: **PENDING DESIGN**", res_126.spec_text or "")
+
+    def test_real_repo_p126_to_p127_staged_contract(self):
+        checkout_root = Path(__file__).resolve().parent.parent
+        res = read_successor(checkout_root, "P12.6")
+        self.assertEqual(res.kind, "successor")
+        self.assertEqual(res.successor_task_id, "P12.7")
+        self.assertEqual(res.spec_path, "agent/staged/P12.7.md")
+        self.assertIsNotNone(res.spec_sha256)
+        self.assertIn("Status: **PENDING DESIGN**", res.spec_text or "")
+        self.assertNotIn("Status: **READY_TO_RUN**", res.spec_text or "")
+        self.assertNotIn("## Approved executable design", res.spec_text or "")
+
 
 if __name__ == "__main__":
     unittest.main()
