@@ -188,7 +188,7 @@ class AIBrokerTransitionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); repo=self.make_repo(root); runtime=root/"runtime"; truth=read_repository_truth(repo)
             self._write_active_broker_record(runtime, repo, truth)
-            port=RecoveryPort({"status":"succeeded", "dispatch_id":"d1", "decision_id":"q1",
+            port=RecoveryPort({"request_id":"ai-worker:worker-1", "status":"succeeded", "dispatch_id":"d1", "decision_id":"q1",
                                "execution_id":"e1", "resource_id":"r1", "provider":"deepseek",
                                "account":"a", "model":"m", "finished_at":"2026-09-10T01:02:00+00:00"})
             record=TransitionExecutor(runtime, ai_execution_port=port).state()["executions"]["worker-1"]
@@ -200,7 +200,7 @@ class AIBrokerTransitionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); repo=self.make_repo(root); runtime=root/"runtime"; truth=read_repository_truth(repo)
             self._write_active_broker_record(runtime, repo, truth)
-            fact={"status":"failed", "execution_error":MANAGED_INTERRUPT_REASON, "resource_id":"r1"}
+            fact={"request_id":"ai-worker:worker-1", "status":"failed", "execution_error":MANAGED_INTERRUPT_REASON, "resource_id":"r1"}
             record=TransitionExecutor(runtime, ai_execution_port=RecoveryPort(fact)).state()["executions"]["worker-1"]
             self.assertEqual(record["state"], "recovery_required")
             self.assertTrue(record["recovery_safe_retry"])
@@ -210,14 +210,32 @@ class AIBrokerTransitionTests(unittest.TestCase):
             root=Path(td); repo=self.make_repo(root); runtime=root/"runtime"; truth=read_repository_truth(repo)
             self._write_active_broker_record(runtime, repo, truth)
             (repo/"README.md").write_text("changed\n", encoding="utf-8")
-            fact={"status":"failed", "execution_error":MANAGED_INTERRUPT_REASON, "resource_id":"r1"}
+            fact={"request_id":"ai-worker:worker-1", "status":"failed", "execution_error":MANAGED_INTERRUPT_REASON, "resource_id":"r1"}
             record=TransitionExecutor(runtime, ai_execution_port=RecoveryPort(fact)).state()["executions"]["worker-1"]
             self.assertFalse(record["recovery_safe_retry"])
             runtime2=root/"runtime2"; truth2=read_repository_truth(repo)
             self._write_active_broker_record(runtime2, repo, truth2, request_id="worker-2")
-            running=TransitionExecutor(runtime2, ai_execution_port=RecoveryPort({"status":"running", "resource_id":"r1"})).state()["executions"]["worker-2"]
+            running=TransitionExecutor(runtime2, ai_execution_port=RecoveryPort({"request_id":"ai-worker:worker-2", "status":"running", "resource_id":"r1"})).state()["executions"]["worker-2"]
             self.assertEqual(running["state"], "recovery_required")
             self.assertFalse(running["recovery_safe_retry"])
+
+    def test_restart_rejects_missing_or_mismatched_broker_request_id(self):
+        facts = (
+            {"status": "succeeded", "execution_id": "untrusted"},
+            {"request_id": "ai-worker:other", "status": "failed", "execution_error": MANAGED_INTERRUPT_REASON},
+        )
+        for fact in facts:
+            with self.subTest(fact=fact), tempfile.TemporaryDirectory() as td:
+                root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"
+                truth = read_repository_truth(repo)
+                self._write_active_broker_record(runtime, repo, truth)
+                port = RecoveryPort(fact)
+                record = TransitionExecutor(runtime, ai_execution_port=port).state()["executions"]["worker-1"]
+                self.assertEqual(port.status_requests, ["ai-worker:worker-1"])
+                self.assertEqual(record["state"], "recovery_required")
+                self.assertFalse(record["recovery_safe_retry"])
+                self.assertIn("request_id", record["broker_recovery_error"])
+                self.assertNotEqual(record.get("execution_id"), "untrusted")
 
     def test_start_control_ignores_unsafe_recovery_from_stale_head(self):
         with tempfile.TemporaryDirectory() as td:

@@ -301,6 +301,13 @@ def resolve_retry_candidate(
             and review.get("review_dirty") is False
         ):
             continue
+        review_status_hash = _text(review.get("review_status_hash"))
+        if review_status_hash is None:
+            errors.append("failed technical review lacks repository status hash evidence")
+            continue
+        if review_status_hash != truth.status_hash:
+            errors.append("failed technical review repository status hash does not match current truth")
+            continue
         source_id = _text(review.get("source_request_id"))
         source = executions.get(source_id or "")
         resource = source.get("resource_context") if isinstance(source, dict) else None

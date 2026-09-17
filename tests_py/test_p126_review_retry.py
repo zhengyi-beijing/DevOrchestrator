@@ -99,6 +99,23 @@ class P126ReviewRetryTests(unittest.TestCase):
             self.assertIn("target_id does not match", result["reason"])
 
 
+    def test_retry_requires_exact_review_status_hash_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, runtime, _, project, snapshot, failed_id = self.fixture(Path(td))
+            reviews_path = runtime / "ai-reviewer.json"
+            reviews = json.loads(reviews_path.read_text(encoding="utf-8"))
+            reviews["reviews"][failed_id]["review_status_hash"] = "0" * 64
+            reviews_path.write_text(json.dumps(reviews), encoding="utf-8")
+            candidate, reason = resolve_retry_candidate(snapshot, runtime, project)
+            self.assertIsNone(candidate)
+            self.assertIn("status hash", reason)
+
+            reviews["reviews"][failed_id].pop("review_status_hash")
+            reviews_path.write_text(json.dumps(reviews), encoding="utf-8")
+            candidate, reason = resolve_retry_candidate(snapshot, runtime, project)
+            self.assertIsNone(candidate)
+            self.assertIn("status hash", reason)
+
     def test_watchdog_enqueues_exact_reviewer_retry_not_worker_continue(self):
         with tempfile.TemporaryDirectory() as td:
             _, runtime, _, project, snapshot, failed_id = self.fixture(Path(td))

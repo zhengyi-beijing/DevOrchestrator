@@ -451,6 +451,17 @@ class TransitionExecutor:
                         except Exception as exc:
                             record["broker_recovery_error"] = str(exc)
                 if isinstance(fact, dict):
+                    fact_request_id = fact.get("request_id")
+                    if (
+                        not isinstance(fact_request_id, str)
+                        or not fact_request_id.strip()
+                        or fact_request_id.strip() != str(broker_request_id)
+                    ):
+                        record["broker_recovery_error"] = (
+                            "Broker recovery status request_id is missing or does not match the durable broker_request_id"
+                        )
+                        fact = None
+                if isinstance(fact, dict):
                     record["dispatch_id"] = fact.get("dispatch_id") or record.get("dispatch_id")
                     record["decision_id"] = fact.get("decision_id") or record.get("decision_id")
                     record["execution_id"] = fact.get("execution_id") or record.get("execution_id")
