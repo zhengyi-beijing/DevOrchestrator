@@ -1,8 +1,8 @@
 # DevOrchestrator + AIBroker Architecture Evolution
 
 Status: **FUTURE DESIGN / NON-BINDING**  
-Version: **V1 draft for independent Opus review**  
-Date: 2026-09-16
+Version: **V1.1 draft - V2 resource/gateway update**
+Date: 2026-09-17
 
 ## 1. Purpose
 
@@ -100,11 +100,17 @@ Allow safe local fusion of predictable action pairs such as `edit -> targeted va
 
 ## 6. AIBroker resource-model evolution
 
-Split resources into `SubscriptionResource` and `MeteredResource` while keeping a common capability surface.
+Split resources into `SubscriptionResource`, `MeteredResource` and `FreeQuotaResource` while keeping a common capability surface. Resource class describes the charging/quota semantics of an exact execution route; it is not the same thing as a provider or harness.
 
 `SubscriptionResource` examples: Claude CLI subscription, Codex CLI via ChatGPT login, Gemini/AGY account, Copilot subscription. Track login/health, model availability, reset windows, remaining quota when observable, cooldown, concurrency and session affinity.
 
-`MeteredResource` examples: DeepSeek API and future pay-per-token providers. Track current tariff, currency, input/output/cache rates, provider timezone, effective date, rate limits and balance when observable.
+`MeteredResource` examples: DeepSeek API, paid OpenRouter routes and future pay-per-token providers. Track current tariff, currency, input/output/cache rates, provider timezone, effective date, rate limits and balance when observable.
+
+`FreeQuotaResource` examples: OpenRouter models/routes currently exposed at zero input/output price, including explicit `:free` endpoints where available. Zero monetary price does **not** imply unlimited capacity or equivalent privacy. Track model/route identity, request/token/rate limits when observable, reset windows, availability volatility, context/tool capabilities, provider data policy, and whether the underlying provider/model is auditable after routing. Mutable limits must come from provider telemetry/configuration rather than being hard-coded into DevO.
+
+OpenRouter is modeled as a **model gateway/provider adapter**, not as an agent harness. OpenCode is modeled as an optional **execution/harness adapter** that may consume OpenRouter or other model providers. AIBroker remains the resource-policy authority above both.
+
+For low-risk implementation work, AIBroker may expose a `free_preferred` / CheapWorker execution profile that prefers eligible `FreeQuotaResource` routes after capability, privacy, safety and deadline filters pass. Architecture, planning and independent review must not be downgraded merely because a free route exists.
 
 ### 6.1 Dynamic effective-cost policy
 
@@ -122,11 +128,21 @@ Support provider-defined tariff timezones and effective date/version rather than
 
 AIBroker grants bounded resource/session leases to executions. Timeout or provider failure releases/fences the lease. Repeated provider failures trip a resource-level circuit breaker/cooldown instead of letting DevO wait indefinitely. AIBroker may select a different eligible resource only under an explicit DevO retry/failover request; it must not create lifecycle transitions itself.
 
+### 6.4 OpenRouter gateway and free-route policy
+
+Add an `OpenRouterAdapter` behind the AIBroker provider boundary. It must support exact-model routes and discovery of currently eligible zero-price routes without encoding a permanent free-model list in source. Provider/model availability, limits and price are mutable facts and must be timestamped telemetry or configuration inputs.
+
+Automatic routers such as `openrouter/free` may be used only for explicitly low-risk, disposable CheapWorker work where model identity variance is acceptable. For frozen-plan implementation, architecture, planning, independent review, security-sensitive work or any task requiring reproducibility, AIBroker should prefer an exact model/route and persist the returned model/provider identity. If the actual underlying route cannot be audited, the execution is ineligible for those roles.
+
+Private-source eligibility is a hard filter. A free route is eligible for proprietary repositories only when its effective provider/data-retention policy satisfies the configured project policy; otherwise it is restricted to synthetic/public/disposable tasks. Cost score is evaluated only after this privacy filter.
+
+Registration, API-key presence and account entitlement are operator-owned setup facts. AIBroker may report `UNCONFIGURED`, `AUTH_FAILED`, `RATE_LIMITED`, `EXHAUSTED` and `AVAILABLE`, but must not infer entitlement merely because OpenRouter is installed or an account exists.
+
 ## 7. Execution and infrastructure adapters
 
 Define a narrow execution contract such as `submit(TaskSpec)`, `status(handle)`, `cancel(handle)`, `collect(handle)` and `health()`. DevO never branches on provider-specific transport details.
 
-Preferred adapters include native Claude CLI, Codex CLI, AGY/Gemini CLI, local-model and API adapters. ChatGPT Web and RDC remain compatibility/bootstrap/recovery adapters rather than the normal coding inner loop.
+Preferred adapters include native Claude CLI, Codex CLI, AGY/Gemini CLI, OpenCode CLI/harness, local-model adapters and direct API/gateway adapters such as OpenRouter. ChatGPT Web and RDC remain compatibility/bootstrap/recovery adapters rather than the normal coding inner loop. OpenCode may execute a task, but it may not silently become the AIBroker routing authority; OpenRouter may route model API traffic, but it may not become the DevO lifecycle authority.
 
 ### 7.1 AI Toolbox boundary
 
@@ -194,7 +210,7 @@ P13 Android should consume this API rather than duplicate lifecycle logic. Befor
 
 **Phase C - Runtime boundary (P1):** complete execution-adapter normalization, payload-by-reference and explicit transport capabilities; keep current AIBroker persistent harness compatible.
 
-**Phase D - Resource scheduler (P1):** resource lease, subscription scarcity, metered dynamic tariff, deadline/deferrable policy, circuit breaker and context affinity.
+**Phase D - Resource scheduler (P1):** resource lease, subscription scarcity, metered dynamic tariff, `FreeQuotaResource`, OpenRouter gateway adapter, `free_preferred` CheapWorker policy, privacy/data-policy eligibility, deadline/deferrable policy, circuit breaker and context affinity.
 
 **Phase E - Multi-project isolation (P1):** ProjectActor single-writer queues and cross-project non-blocking acceptance.
 
@@ -204,9 +220,11 @@ P13 Android should consume this API rather than duplicate lifecycle logic. Befor
 
 **Phase H - Interoperability experiments (P2/P3):** bounded OMA, Repowire, AI Toolbox, Pi/SoL-Pi and A2A adapters. Promote only measured winners; no framework is a mandatory dependency by default.
 
+**V2 inclusion decision:** OpenRouter free-route support is a planned V2 Phase-D feature, not merely a future experiment. Minimum V2 scope is: configure/authenticate an OpenRouter account/API key; discover/refresh free-route eligibility; represent free quota/limits/health separately from paid routes; apply project privacy filters; route eligible low-risk worker tasks with an auditable decision record; and fall back only through an explicit DevO retry/failover decision. OpenCode support remains an execution-adapter choice and is not required to obtain OpenRouter support.
+
 ## 15. Required measurements before implementation promotion
 
-Future changes should be promoted only with baseline and paired evidence where practical. At minimum measure: end-to-end task completion rate; owner interventions per task; plan-review rounds; provider/model switches; context bytes/tokens replayed; cache/session continuity; model turns; AI monetary cost; subscription scarcity consumption; stall/recovery count; duplicate execution count; and cross-project blocking time.
+Future changes should be promoted only with baseline and paired evidence where practical. At minimum measure: end-to-end task completion rate; owner interventions per task; plan-review rounds; provider/model switches; context bytes/tokens replayed; cache/session continuity; model turns; AI monetary cost; subscription scarcity consumption; free-route requests/token throughput and exhaustion events; free-vs-paid worker completion/verification quality; stall/recovery count; duplicate execution count; and cross-project blocking time.
 
 Efficiency changes require a capability floor. Token/cost reductions do not count as improvements if completion, verification coverage or evidence quality falls below the predeclared tolerance. This follows the central validation discipline demonstrated by SoL-Pi rather than adopting its benchmark numbers as DevO expectations.
 
@@ -220,6 +238,8 @@ Efficiency changes require a capability floor. Token/cost reductions do not coun
 6. **Recovery duplication:** session loss plus ambiguous provider work can create duplicate edits; exact execution/repository evidence and fencing remain mandatory.
 7. **Windows/WSL complexity:** Repowire/Pi/Unix-oriented runtimes may add more operational failure surface than they remove on ZXZ-PC.
 8. **Security/log retention:** gateways and observation archives may persist prompts, source and credentials; retention, redaction and filesystem permissions require explicit policy.
+9. **Free-route volatility:** zero-price models can change availability, rate limits, capabilities or upstream provider without notice. Free resources are opportunistic capacity, never a correctness dependency.
+10. **Free-route data policy:** zero monetary cost can trade against retention/training/privacy terms. Proprietary source must be blocked unless the effective route policy satisfies the project's configured data policy.
 
 ## 17. Immediate low-cost validation spikes
 
@@ -228,6 +248,7 @@ Efficiency changes require a capability floor. Token/cost reductions do not coun
 - `EXP-OMA-01`: disposable repo; execute a predeclared task DAG with checkpoint/resume while disabling independent goal replanning.
 - `EXP-REPOWIRE-01`: Mac first; two real coding sessions, ask/ack, reconnect and delivery trace; measure whether it materially improves session addressing.
 - `EXP-A2A-01`: define only a small interoperability contract; no AG2 runtime dependency.
+- `EXP-OPENROUTER-01`: isolated disposable repo; connect one OpenRouter account, enumerate current free routes, run fixed read/edit/test/remediate tasks against one exact free model and the automatic free router, record actual model/provider metadata, rate-limit/exhaustion behavior, tool-call compatibility, and verify that privacy-policy filtering can make an otherwise free route ineligible. Compare against one paid/known worker baseline before enabling `free_preferred`.
 
 No spike may mutate the production DevO scheduler or become a required dependency until its evidence is reviewed.
 
@@ -236,5 +257,8 @@ No spike may mutate the production DevO scheduler or become a required dependenc
 - NVIDIA NVLabs SoL-Pi: https://github.com/NVlabs/SoL-Pi
 - SoL-Pi research page: https://nvlabs.github.io/SoL-Pi/
 - AI Toolbox: https://github.com/coulsontl/ai-toolbox
+- OpenRouter documentation/model routing: https://openrouter.ai/docs
+- OpenRouter free-model collection: https://openrouter.ai/collections/free-models
+- OpenCode provider/runtime documentation: https://opencode.ai/docs/
 
 The target architecture intentionally remains framework-neutral. External projects are evidence and implementation options, not ownership authorities.
