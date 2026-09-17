@@ -105,13 +105,22 @@ function computeFreshnessState(monitor, overview, fetchFailed = false) {
 }
 
 function computeIncidentCount(summary, controlOverview, watchdogData) {
-  if (!summary && !controlOverview && !watchdogData) return 'unavailable';
-  const projects = Array.isArray(summary && summary.projects)
-    ? summary.projects
-    : (controlOverview && controlOverview.data && Array.isArray(controlOverview.data.projects)
-        ? controlOverview.data.projects
+  const sum = summary && summary.available !== false ? summary : null;
+  const ctrl = controlOverview && controlOverview.available !== false ? controlOverview : null;
+  const wd = (watchdogData && watchdogData.available !== false)
+    ? (watchdogData.data || watchdogData)
+    : (ctrl && ctrl.data && ctrl.data.watchdog ? ctrl.data.watchdog : null);
+
+  if (!sum && !ctrl && !wd) return 'unavailable';
+
+  const projects = Array.isArray(sum && sum.projects)
+    ? sum.projects
+    : (ctrl && ctrl.data && Array.isArray(ctrl.data.projects)
+        ? ctrl.data.projects
         : null);
-  if (!projects && !watchdogData) return 'unavailable';
+
+  if (!projects && !wd) return 'unavailable';
+
   let count = 0;
   if (projects) {
     for (const p of projects) {
@@ -124,7 +133,7 @@ function computeIncidentCount(summary, controlOverview, watchdogData) {
       if (isIncident) count += 1;
     }
   }
-  const wd = (watchdogData && watchdogData.data) || watchdogData || (controlOverview && controlOverview.data && controlOverview.data.watchdog);
+
   if (wd && wd.degraded) {
     count += 1;
   }
@@ -141,16 +150,22 @@ function computeIncidentCount(summary, controlOverview, watchdogData) {
 }
 
 function computeKPIs({ summary, control, brokerResources, brokerExecutions, watchdog, monitor } = {}) {
-  const summaryProjects = summary && Array.isArray(summary.projects) ? summary.projects : null;
-  const controlProjects = control && control.data && Array.isArray(control.data.projects) ? control.data.projects : null;
+  const sum = summary && summary.available !== false ? summary : null;
+  const ctrl = control && control.available !== false ? control : null;
+  const summaryProjects = sum && Array.isArray(sum.projects) ? sum.projects : null;
+  const controlProjects = ctrl && ctrl.data && Array.isArray(ctrl.data.projects) ? ctrl.data.projects : null;
   const projects = summaryProjects || controlProjects;
+
+  const wd = (watchdog && watchdog.available !== false)
+    ? (watchdog.data || watchdog)
+    : (ctrl && ctrl.data && ctrl.data.watchdog ? ctrl.data.watchdog : null);
 
   let projectsKpi = 'unavailable';
   let rolesKpi = 'unavailable';
   let incidentsKpi = 'unavailable';
 
   if (projects !== null) {
-    const total = summary && summary.project_count !== undefined ? summary.project_count : projects.length;
+    const total = sum && sum.project_count !== undefined ? sum.project_count : projects.length;
     const active = projects.filter(p => {
       const s = String(p.lifecycle_state || p.state || '').toUpperCase();
       return /EXECUTING|WORKER_RUNNING|RUNNING|PLANNING|REVIEWING|REMEDIATING/.test(s);
@@ -169,9 +184,9 @@ function computeKPIs({ summary, control, brokerResources, brokerExecutions, watc
       }
     }
     rolesKpi = String(activeRolesCount);
-    incidentsKpi = String(computeIncidentCount(summary, control, watchdog));
-  } else if (watchdog) {
-    incidentsKpi = String(computeIncidentCount(summary, control, watchdog));
+    incidentsKpi = String(computeIncidentCount(sum, ctrl, wd));
+  } else if (wd) {
+    incidentsKpi = String(computeIncidentCount(sum, ctrl, wd));
   }
 
   let executionsKpi = 'unavailable';
@@ -360,6 +375,11 @@ function renderWatchdogBadge(watchdog) {
   if (hasAlert) {
     badge.className = 'badge warn';
     badge.textContent = 'Watchdog alert';
+    return;
+  }
+  if (!projects.length) {
+    badge.className = 'badge ok';
+    badge.textContent = 'No watchdog projects';
     return;
   }
   badge.className = 'badge ok';

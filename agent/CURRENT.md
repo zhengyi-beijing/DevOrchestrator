@@ -8,24 +8,18 @@
 Current task: **P12.7 Web Control Surface Visual Refresh** — **REVIEW REMEDIATION COMPLETE / TECHNICAL RE-REVIEW PENDING**.
 
 Latest continuation state (2026-09-17):
-- Canonical `main` HEAD is `406d057` (`feat(web): P12.7 web control surface visual refresh`), ahead of `origin/main` by 22 commits.
-- Remediated all 6 Technical Review findings from `ai_review:auto-cf45dc90052f1a5988604625:execute`:
-  1. Acceptance 3: Added first-viewport `#daemonBadge` and `#watchdogBadge` in header status strip alongside `#monitorBadge`, `#freshnessBadge`, and `#lastRefresh` in `web/index.html` and `web/app.js`, ensuring daemon and watchdog health are immediately visible.
-  2. Acceptance 4 (fail-closed freshness): Hardened `computeFreshnessState` in `web/app.js` to fail closed to `'Disconnected'` whenever monitor fetch fails (`fetchFailed=true`), `!monitor`, `monitor.available===false`, or `monitor.process_alive===false`, preventing false `Live` display when overview has `observed_at`.
-  3. Acceptance 4 (fail-closed incident count): Hardened `computeIncidentCount` in `web/app.js` to detect top-level `watchdog.degraded === true` and increment the incident count by 1, correctly reporting incidents when watchdog is degraded with 0 projects.
-  4. Acceptance 4 / UI integrity: Fixed `renderWatchdogDiagnostics` in `web/app.js` to omit fabricated/unknown placeholders (`—`), displays `State` only when returned by API, renders `Degraded: yes/no`, renders `Auto recovery: unavailable` when undefined instead of fabricating `disabled`, and omits placeholder `Observed: —`.
-  5. Acceptance verification: Recorded explicit manual 1366x768 viewport verification:
-     - Header topbar (daemon, monitor, watchdog, freshness badges, last refresh, refresh button) and 5 KPI cells fit in the first viewport (155px height vs 768px).
-     - Contrast ratios: bright text `#f0f6fc` on `#0d1117` (15.8:1), body `#c9d1d9` on `#161b22` (10.4:1), muted `#8b949e` (5.1:1), status colors (OK `#3fb950` 6.7:1, Warn `#d29922` 6.9:1, Bad `#f85149` 5.4:1, Info `#58a6ff` 6.8:1) exceeding WCAG AA/AAA standards.
-     - Visible keyboard focus via `*:focus-visible` (2px solid `#58a6ff` with 2px offset).
-     - Guarded action confirm dialogs with labeled identity lines and consequence descriptions; 0 fetches on cancel.
-  6. Test regression: Added comprehensive regression test `test_partial_failure_states_in_kpis_header_and_diagnostics` in `tests_py/test_web_ui_refresh.py` (9 tests total now) covering monitor failure, degraded watchdog with no projects, broker/accounting unavailable, and daemon/watchdog health badges. Also updated `test_freshness_kpi_and_incident_helpers` and `test_dom_ids_security_and_opencode_exclusion`.
+- Canonical `main` HEAD is ahead of `origin/main` by 23 commits.
+- Remediated Technical Re-Review findings from `ai_review:ai_review:auto-cf45dc90052f1a5988604625:execute`:
+  1. Acceptance 4 (fail-closed watchdog handling): Hardened `computeIncidentCount` and `computeKPIs` in `web/app.js` to treat any watchdog payload with `available === false` as missing rather than present-and-empty. When all sources (summary, control overview, watchdog) fail or are unavailable, `computeIncidentCount` and `computeKPIs` return `'unavailable'` rather than displaying `0`.
+  2. Acceptance 4 (summary OK with watchdog unavailable): When summary succeeds but watchdog fails (`{available: false}` as built by `refresh()`), `computeIncidentCount` correctly evaluates project incidents without treating missing watchdog data as present-and-empty.
+  3. Non-blocking UI integrity: Hardened `renderWatchdogBadge` in `web/app.js` to display `'No watchdog projects'` when watchdog reports empty projects (`projects: {}`), distinguishing an empty/unrun watchdog from `'Watchdog healthy'`.
+  4. Test regression: Expanded `test_partial_failure_states_in_kpis_header_and_diagnostics` in `tests_py/test_web_ui_refresh.py` with cases 6 and 7 covering all three sources failed and summary OK with watchdog unavailable using the `{available: false}` objects that `refresh()` actually builds. Updated `test_freshness_kpi_and_incident_helpers` to verify both `'Watchdog healthy'` and `'No watchdog projects'`.
 - Verification:
   - Focused web/control suites passed: 56 passed, 6 subtests passed (`test_web.py`, `test_accounting_dashboard.py`, `test_unbound_web_ui.py`, `test_web_ui_refresh.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_control_commands.py`).
   - `tests/web-selftest.ps1`: PASS.
-  - Full test suite passed: 630 passed, 40 subtests passed in 205.12s (`python -m pytest tests_py -q`).
+  - Full test suite passed: 630 passed, 40 subtests passed in 205.73s (`python -m pytest tests_py -q`).
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
-  - Knowledge graph updated with `graphify update .` (3114 nodes, 8631 edges, 157 communities). Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
+  - Knowledge graph updated with `graphify update .` (3115 nodes, 8632 edges, 161 communities). Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
 - Immediate continuation rule: perform independent technical re-review of P12.7 changes on clean worktree.
 
 Implementation summary:
@@ -225,4 +219,18 @@ P12.7 review remediation result (2026-09-17):
   - Full test suite passed: 630 passed, 40 subtests passed in 205.12s (`python -m pytest tests_py -q`).
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (3114 nodes, 8631 edges, 157 communities).
+  - Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
+
+P12.7 second review remediation result (2026-09-18):
+- Remediated findings from `ai_review:ai_review:auto-cf45dc90052f1a5988604625:execute`:
+  - Hardened `computeIncidentCount` and `computeKPIs` in `web/app.js` to treat watchdog payloads with `available === false` as missing rather than present-and-empty. When all sources (summary, control overview, watchdog) are unavailable or missing, `computeIncidentCount` and `computeKPIs` return `'unavailable'` rather than displaying `0`.
+  - When summary succeeds but watchdog fails (`{available: false}` as built by `refresh()`), `computeIncidentCount` correctly evaluates project incidents without treating missing watchdog data as present-and-empty.
+  - Hardened `renderWatchdogBadge` in `web/app.js` to display `'No watchdog projects'` when watchdog reports empty projects (`projects: {}`), distinguishing an empty/unrun watchdog from `'Watchdog healthy'`.
+  - Expanded `test_partial_failure_states_in_kpis_header_and_diagnostics` in `tests_py/test_web_ui_refresh.py` with cases 6 and 7 covering all three sources failed and summary OK with watchdog unavailable using the `{available: false}` objects that `refresh()` actually builds. Updated `test_freshness_kpi_and_incident_helpers` to verify both `'Watchdog healthy'` and `'No watchdog projects'`.
+- Verification:
+  - Focused web/control suites passed: 56 passed, 6 subtests passed (`test_web.py`, `test_accounting_dashboard.py`, `test_unbound_web_ui.py`, `test_web_ui_refresh.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_control_commands.py`).
+  - `tests/web-selftest.ps1`: PASS.
+  - Full test suite passed: 630 passed, 40 subtests passed in 205.73s (`python -m pytest tests_py -q`).
+  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3115 nodes, 8632 edges, 161 communities).
   - Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.

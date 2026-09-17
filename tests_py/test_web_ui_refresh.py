@@ -411,8 +411,11 @@ const daemonDegraded = {{ text: elements.get('daemonBadge').textContent, cls: el
 renderDaemonBadge({{ available: false, error: 'fail' }}, {{ available: false, error: 'fail' }});
 const daemonUnavail = {{ text: elements.get('daemonBadge').textContent, cls: elements.get('daemonBadge').className }};
 
-renderWatchdogBadge({{ available: true, data: {{ degraded: false, projects: {{}} }} }});
+renderWatchdogBadge({{ available: true, data: {{ degraded: false, projects: {{ p1: {{ state: 'ok' }} }} }} }});
 const wdHealthy = {{ text: elements.get('watchdogBadge').textContent, cls: elements.get('watchdogBadge').className }};
+
+renderWatchdogBadge({{ available: true, data: {{ degraded: false, projects: {{}} }} }});
+const wdNoProjects = {{ text: elements.get('watchdogBadge').textContent, cls: elements.get('watchdogBadge').className }};
 
 renderWatchdogBadge({{ available: true, data: {{ degraded: true, projects: {{}} }} }});
 const wdDegraded = {{ text: elements.get('watchdogBadge').textContent, cls: elements.get('watchdogBadge').className }};
@@ -436,7 +439,7 @@ items.sort(compareSeverityThenIdThenTime);
 console.log(JSON.stringify({{
   freshness: {{ fLive, fStale, fDead, fDisconnected, fUnknown, fMonitorNull }},
   incidents: {{ incMissing, incHealthy, incFail, incDegraded }},
-  badges: {{ daemonHealthy, daemonDegraded, daemonUnavail, wdHealthy, wdDegraded, wdUnavail }},
+  badges: {{ daemonHealthy, daemonDegraded, daemonUnavail, wdHealthy, wdNoProjects, wdDegraded, wdUnavail }},
   kpisEmpty,
   sortedIds: items.map(x => x.id),
 }}));
@@ -466,6 +469,8 @@ console.log(JSON.stringify({{
 
         self.assertEqual(data["badges"]["wdHealthy"]["text"], "Watchdog healthy")
         self.assertIn("ok", data["badges"]["wdHealthy"]["cls"])
+        self.assertEqual(data["badges"]["wdNoProjects"]["text"], "No watchdog projects")
+        self.assertIn("ok", data["badges"]["wdNoProjects"]["cls"])
         self.assertEqual(data["badges"]["wdDegraded"]["text"], "Watchdog degraded")
         self.assertIn("warn", data["badges"]["wdDegraded"]["cls"])
         self.assertEqual(data["badges"]["wdUnavail"]["text"], "Watchdog unavailable")
@@ -756,6 +761,47 @@ const daemonStopped = {{ text: elements.get('daemonBadge').textContent, cls: ele
 renderDaemonBadge({{ available: false, error: 'down' }}, {{ available: false, error: 'down' }});
 const daemonUnavail = {{ text: elements.get('daemonBadge').textContent, cls: elements.get('daemonBadge').className }};
 
+// 6. All three sources failed (summary, control overview, watchdog all {{available:false}})
+const summaryFailedObj = {{ available: false, error: 'summary service down' }};
+const controlFailedObj = {{ available: false, error: 'control overview down' }};
+const watchdogFailedObj = {{ available: false, error: 'watchdog down' }};
+
+const incAllThreeFailed = computeIncidentCount(summaryFailedObj, controlFailedObj, watchdogFailedObj);
+const incDirectNullSources = computeIncidentCount(null, null, watchdogFailedObj);
+const kpisAllThreeFailed = computeKPIs({{
+  summary: summaryFailedObj,
+  control: controlFailedObj,
+  brokerResources: {{ available: false, error: 'broker down' }},
+  brokerExecutions: {{ available: false, error: 'broker down' }},
+  watchdog: watchdogFailedObj,
+  monitor: {{ available: false, error: 'monitor down' }},
+}});
+
+// 7. Summary OK with watchdog unavailable ({{available:false}} as built by refresh)
+const summaryOkObj = {{
+  observed_at: '2026-09-17T00:00:00Z',
+  project_count: 1,
+  projects: [
+    {{ id: 'p1', lifecycle_state: 'ACCEPTED', telemetry: {{ health: 'OK' }} }},
+  ],
+}};
+const incSummaryOkWatchdogFailed = computeIncidentCount(summaryOkObj, controlFailedObj, watchdogFailedObj);
+const kpisSummaryOkWatchdogFailed = computeKPIs({{
+  summary: summaryOkObj,
+  control: controlFailedObj,
+  watchdog: watchdogFailedObj,
+  monitor: {{ available: true, process_alive: true, state: 'running' }},
+}});
+
+const summaryWithIncidentObj = {{
+  observed_at: '2026-09-17T00:00:00Z',
+  project_count: 1,
+  projects: [
+    {{ id: 'p1', lifecycle_state: 'REVIEW_FAILED', telemetry: {{ health: 'OK' }} }},
+  ],
+}};
+const incSummaryWithIncidentWatchdogFailed = computeIncidentCount(summaryWithIncidentObj, controlFailedObj, watchdogFailedObj);
+
 console.log(JSON.stringify({{
   fDirect,
   fWithFetchFailed,
@@ -771,6 +817,12 @@ console.log(JSON.stringify({{
   daemonDegraded,
   daemonStopped,
   daemonUnavail,
+  incAllThreeFailed,
+  incDirectNullSources,
+  kpisAllThreeFailed,
+  incSummaryOkWatchdogFailed,
+  kpisSummaryOkWatchdogFailed,
+  incSummaryWithIncidentWatchdogFailed,
 }}));
 """
         res = run_node(script)
@@ -808,6 +860,19 @@ console.log(JSON.stringify({{
         self.assertIn("bad", res["daemonStopped"]["cls"])
         self.assertEqual(res["daemonUnavail"]["text"], "Daemon unavailable")
         self.assertIn("bad", res["daemonUnavail"]["cls"])
+
+        # 6. All three sources failed must report unavailable incidents and unavailable KPIs
+        self.assertEqual(res["incAllThreeFailed"], "unavailable")
+        self.assertEqual(res["incDirectNullSources"], "unavailable")
+        self.assertEqual(res["kpisAllThreeFailed"]["incidents"], "unavailable")
+        self.assertEqual(res["kpisAllThreeFailed"]["projects"], "unavailable")
+        self.assertEqual(res["kpisAllThreeFailed"]["roles"], "unavailable")
+
+        # 7. Summary OK with watchdog unavailable ({available:false})
+        self.assertEqual(res["incSummaryOkWatchdogFailed"], 0)
+        self.assertEqual(res["kpisSummaryOkWatchdogFailed"]["incidents"], "0")
+        self.assertEqual(res["kpisSummaryOkWatchdogFailed"]["projects"], "0 / 1")
+        self.assertEqual(res["incSummaryWithIncidentWatchdogFailed"], 1)
 
 
 if __name__ == "__main__":

@@ -515,3 +515,18 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (3114 nodes, 8631 edges, 157 communities).
   - Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
+
+## P12.7 Second Review Remediation (2026-09-18)
+
+- Remediated findings from `ai_review:ai_review:auto-cf45dc90052f1a5988604625:execute`:
+  - Hardened `computeIncidentCount` and `computeKPIs` in `web/app.js` to treat watchdog payloads with `available === false` as missing rather than present-and-empty. When all sources (summary, control overview, watchdog) are unavailable or missing, `computeIncidentCount` and `computeKPIs` return `'unavailable'` rather than displaying `0`.
+  - When summary succeeds but watchdog fails (`{available: false}` as built by `refresh()`), `computeIncidentCount` correctly evaluates project incidents without treating missing watchdog data as present-and-empty.
+  - Hardened `renderWatchdogBadge` in `web/app.js` to display `'No watchdog projects'` when watchdog reports empty projects (`projects: {}`), distinguishing an empty/unrun watchdog from `'Watchdog healthy'`.
+  - Expanded `test_partial_failure_states_in_kpis_header_and_diagnostics` in `tests_py/test_web_ui_refresh.py` with cases 6 and 7 covering all three sources failed and summary OK with watchdog unavailable using the `{available: false}` objects that `refresh()` actually builds. Updated `test_freshness_kpi_and_incident_helpers` to verify both `'Watchdog healthy'` and `'No watchdog projects'`.
+- Verification:
+  - Focused web/control suites passed: 56 passed, 6 subtests passed (`test_web.py`, `test_accounting_dashboard.py`, `test_unbound_web_ui.py`, `test_web_ui_refresh.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_control_commands.py`).
+  - `tests/web-selftest.ps1`: PASS.
+  - Full test suite passed: 630 passed, 40 subtests passed in 205.73s (`python -m pytest tests_py -q`).
+  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3115 nodes, 8632 edges, 161 communities).
+  - Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
