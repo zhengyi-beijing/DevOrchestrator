@@ -64,6 +64,18 @@ Follow-up from CCP7 live acceptance:
 - Acceptance passed with atomic/replay, corruption quarantine, security, paired ChatGPT heartbeat, authenticated CLI, stale broker provenance, every-action revision, cross-project isolation, conversation, UI and representative 8770 fixtures plus the full 509-test/16-subtest regression. Actions without an exact safe existing authority adapter remain capability-advertised as unavailable rather than gaining a weaker fallback.
 - Post-acceptance selective branch convergence added the P12-native exact Planner `approve_owner_gate` adapter without restoring CCP 8766 or `start_current_task`. All mutation paths now require the complete projected identity, and settlement recovery repairs a missing terminal audit before inbox removal. The old adjudicator remains intentionally retired because bounded plan remediation already exhausts to a durable fail-closed owner gate.
 
+## P12.7 Web Control Surface Visual Refresh
+
+Status: **FUTURE / design constraint frozen 2026-09-17**
+
+- Refresh the port 8770 Operations Console using https://opencode.ai/data as a visual/information-architecture reference, not a branding or component-copy target.
+- Direction: high information density, restrained surfaces/dividers, strong numeric/status hierarchy, explicit freshness, useful trends plus compact ranked tables, and substantially less decorative card elevation.
+- Preserve P12 lifecycle authority and all guarded control semantics; P12.7 is a client-side information-architecture/visual refresh, not a control-plane redesign.
+- Adapt reference concepts to DevO: execution trends, project health, provider/model utilization, bottleneck/recovery ranking, watchdog incidents and accounting evidence. Do not reproduce irrelevant OpenCode metrics.
+- Begin with a fixture-backed low-cost prototype; validate hierarchy before production styling changes.
+- Frozen design: docs/P12_7_WEB_UI_DESIGN.md.
+- P12.7 starts only after P12.6 closure and does not replace P13; P13 remains the Android/mobile client track.
+
 ## P13 staged roadmap
 
 ### P13 - Mobile Control & Observability
