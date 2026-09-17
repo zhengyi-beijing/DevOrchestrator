@@ -460,16 +460,19 @@ def cmd_project_control(args: argparse.Namespace) -> int:
     snapshot = read_json(runtime / "projects" / (project_id + ".json"), None)
     if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
         _fail("project is not present in the current runtime")
-    from dev_orchestrator.control.surface import project_identity
+    from dev_orchestrator.control.surface import project_control_view
+    config = load_projects_config(resolve_config_path(getattr(args, "config", None)))
+    project_config = next((row for row in config.get("projects") or [] if row.get("project_id") == project_id), None)
+    projected = project_control_view(snapshot, runtime, project_config)
     target = {}
     if args.binding_id and args.action in {"bind_conversation", "rebind_conversation"}:
         target.update({"adapter": args.adapter, "binding_id": args.binding_id})
-    if args.target_id and args.action in {"retry", "reconcile"}:
+    if args.target_id and args.action in {"retry", "rereview", "reconcile"}:
         target["target_id"] = args.target_id
     if args.target_id and args.action == "approve_owner_gate":
         target["gate_id"] = args.target_id
     _print_json(_submit_control_api(
-        runtime, project_id, args.action, project_identity(snapshot, runtime),
+        runtime, project_id, args.action, projected["control_identity"],
         command_id=args.command_id, target=target,
     ))
     return 0
@@ -1028,6 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
     project_control.add_argument("--adapter", default="chatgpt_web")
     project_control.add_argument("--binding-id", default=None)
     project_control.add_argument("--runtime-root", default=None)
+    project_control.add_argument("--config", default=None, help="path to projects.json")
 
     control_overview = sub.add_parser("control-overview", help="print the versioned P12 overview envelope")
     control_overview.add_argument("--runtime-root", default=None)
