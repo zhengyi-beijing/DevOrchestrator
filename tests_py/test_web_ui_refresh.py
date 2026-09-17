@@ -362,7 +362,23 @@ const {{
   computeKPIs,
   severityRank,
   compareSeverityThenIdThenTime,
+  renderDaemonBadge,
+  renderWatchdogBadge,
 }} = app;
+
+class Element {{
+  constructor(tag = 'div') {{
+    this.tag = tag; this.children = []; this.className = '';
+    this.textContent = '';
+  }}
+}}
+const elements = new Map();
+global.document = {{
+  getElementById: id => {{
+    if (!elements.has(id)) elements.set(id, new Element());
+    return elements.get(id);
+  }},
+}};
 
 // Freshness checks
 const fLive = computeFreshnessState({{ state: 'running', process_alive: true, stale: false }}, {{}});
@@ -370,6 +386,8 @@ const fStale = computeFreshnessState({{ state: 'running', process_alive: true, s
 const fDead = computeFreshnessState({{ state: 'running', process_alive: false }}, {{}});
 const fDisconnected = computeFreshnessState(null, null, true);
 const fUnknown = computeFreshnessState(null, null, false);
+// When monitor is null and summary is present, must be Disconnected (not Live)
+const fMonitorNull = computeFreshnessState(null, {{ observed_at: '2026-09-17T00:00:00Z' }});
 
 // Incident count checks
 const incMissing = computeIncidentCount(null, null, null);
@@ -380,6 +398,27 @@ const incFail = computeIncidentCount({{ projects: [
   {{ lifecycle_state: 'EXECUTING', telemetry: {{ health: 'TIMEOUT' }} }},
   {{ lifecycle_state: 'READY_TO_RUN' }},
 ] }}, null, null);
+// Watchdog degraded with no project incidents must count as an incident
+const incDegraded = computeIncidentCount({{ projects: [] }}, null, {{ degraded: true, projects: {{}} }});
+
+// Badge checks
+renderDaemonBadge({{ available: true, data: {{ control_enabled: true, control_health: {{ degraded: false }} }} }}, {{ available: true, process_alive: true, last_error: null }});
+const daemonHealthy = {{ text: elements.get('daemonBadge').textContent, cls: elements.get('daemonBadge').className }};
+
+renderDaemonBadge({{ available: true, data: {{ control_enabled: true, control_health: {{ degraded: true }} }} }}, {{ available: true, process_alive: true }});
+const daemonDegraded = {{ text: elements.get('daemonBadge').textContent, cls: elements.get('daemonBadge').className }};
+
+renderDaemonBadge({{ available: false, error: 'fail' }}, {{ available: false, error: 'fail' }});
+const daemonUnavail = {{ text: elements.get('daemonBadge').textContent, cls: elements.get('daemonBadge').className }};
+
+renderWatchdogBadge({{ available: true, data: {{ degraded: false, projects: {{}} }} }});
+const wdHealthy = {{ text: elements.get('watchdogBadge').textContent, cls: elements.get('watchdogBadge').className }};
+
+renderWatchdogBadge({{ available: true, data: {{ degraded: true, projects: {{}} }} }});
+const wdDegraded = {{ text: elements.get('watchdogBadge').textContent, cls: elements.get('watchdogBadge').className }};
+
+renderWatchdogBadge({{ available: false, error: 'down' }});
+const wdUnavail = {{ text: elements.get('watchdogBadge').textContent, cls: elements.get('watchdogBadge').className }};
 
 // KPIs missing inputs -> unavailable, not 0
 const kpisEmpty = computeKPIs({{}});
@@ -395,8 +434,9 @@ const items = [
 items.sort(compareSeverityThenIdThenTime);
 
 console.log(JSON.stringify({{
-  freshness: {{ fLive, fStale, fDead, fDisconnected, fUnknown }},
-  incidents: {{ incMissing, incHealthy, incFail }},
+  freshness: {{ fLive, fStale, fDead, fDisconnected, fUnknown, fMonitorNull }},
+  incidents: {{ incMissing, incHealthy, incFail, incDegraded }},
+  badges: {{ daemonHealthy, daemonDegraded, daemonUnavail, wdHealthy, wdDegraded, wdUnavail }},
   kpisEmpty,
   sortedIds: items.map(x => x.id),
 }}));
@@ -408,11 +448,28 @@ console.log(JSON.stringify({{
         self.assertEqual(data["freshness"]["fDead"], "Disconnected")
         self.assertEqual(data["freshness"]["fDisconnected"], "Disconnected")
         self.assertEqual(data["freshness"]["fUnknown"], "Unknown")
+        self.assertEqual(data["freshness"]["fMonitorNull"], "Disconnected")
 
         # Incidents
         self.assertEqual(data["incidents"]["incMissing"], "unavailable")
         self.assertEqual(data["incidents"]["incHealthy"], 0)
         self.assertEqual(data["incidents"]["incFail"], 3)
+        self.assertEqual(data["incidents"]["incDegraded"], 1)
+
+        # Badges
+        self.assertEqual(data["badges"]["daemonHealthy"]["text"], "Daemon healthy")
+        self.assertIn("ok", data["badges"]["daemonHealthy"]["cls"])
+        self.assertEqual(data["badges"]["daemonDegraded"]["text"], "Daemon degraded")
+        self.assertIn("warn", data["badges"]["daemonDegraded"]["cls"])
+        self.assertEqual(data["badges"]["daemonUnavail"]["text"], "Daemon unavailable")
+        self.assertIn("bad", data["badges"]["daemonUnavail"]["cls"])
+
+        self.assertEqual(data["badges"]["wdHealthy"]["text"], "Watchdog healthy")
+        self.assertIn("ok", data["badges"]["wdHealthy"]["cls"])
+        self.assertEqual(data["badges"]["wdDegraded"]["text"], "Watchdog degraded")
+        self.assertIn("warn", data["badges"]["wdDegraded"]["cls"])
+        self.assertEqual(data["badges"]["wdUnavail"]["text"], "Watchdog unavailable")
+        self.assertIn("bad", data["badges"]["wdUnavail"]["cls"])
 
         # KPIs empty
         self.assertEqual(data["kpisEmpty"]["projects"], "unavailable")
@@ -420,6 +477,7 @@ console.log(JSON.stringify({{
         self.assertEqual(data["kpisEmpty"]["incidents"], "unavailable")
         self.assertEqual(data["kpisEmpty"]["executions"], "unavailable")
         self.assertEqual(data["kpisEmpty"]["resources"], "unavailable")
+        self.assertEqual(data["kpisEmpty"]["freshness"], "Unknown")
 
         # Severity sort order: REVIEW_FAILED (crit) -> OWNER_GATE (warn) -> EXECUTING (act) -> READY_TO_RUN (ready) -> ACCEPTED (ok)
         self.assertEqual(data["sortedIds"], ["p_crit", "p_warn", "p_act", "p_ready", "p_ok"])
@@ -518,7 +576,7 @@ console.log(JSON.stringify({{
 
         # 1. Compatibility DOM IDs preserved
         expected_ids = [
-            "monitorBadge", "monitorDetails", "overviewDetails", "lastRefresh",
+            "daemonBadge", "monitorBadge", "watchdogBadge", "monitorDetails", "overviewDetails", "lastRefresh",
             "projects", "controlStatus", "pairAdapter", "revokeAdapter",
             "pairingCode", "controlProjects", "controlBindings", "controlCommands",
             "accountingSummary", "accountingBottleneck", "providerEvidence",
@@ -610,7 +668,147 @@ const app = require({json.dumps(APP_JS)});
         for c in calls:
             self.assertEqual(c["method"], "GET", f"Read-only interaction issued non-GET: {c}")
 
+    def test_partial_failure_states_in_kpis_header_and_diagnostics(self):
+        script = f"""
+class Element {{
+  constructor(tag = 'div') {{
+    this.tag = tag; this.children = []; this.className = '';
+    this.textContent = ''; this.disabled = false; this.title = ''; this.value = '';
+  }}
+  replaceChildren(...items) {{ this.children = items; }}
+  append(...items) {{ this.children.push(...items); }}
+  appendChild(item) {{ this.children.push(item); return item; }}
+  addEventListener() {{}}
+}}
+
+const elements = new Map();
+global.document = {{
+  getElementById: id => {{
+    if (!elements.has(id)) elements.set(id, new Element());
+    return elements.get(id);
+  }},
+  createElement: tag => new Element(tag),
+}};
+
+const app = require({json.dumps(APP_JS)});
+const {{
+  computeFreshnessState,
+  computeIncidentCount,
+  computeKPIs,
+  renderDaemonBadge,
+  renderWatchdogBadge,
+  renderWatchdogDiagnostics,
+  renderBrokerResources,
+  renderBrokerExecutions,
+  renderAccounting,
+}} = app;
+
+function flatten(item) {{ return [item.textContent, ...item.children.flatMap(flatten)].filter(Boolean).join('|'); }}
+
+// 1. Monitor-only fetch failure
+const fDirect = computeFreshnessState(null, {{ observed_at: '2026-09-17T00:00:00Z' }});
+const fWithFetchFailed = computeFreshnessState(null, {{ observed_at: '2026-09-17T00:00:00Z' }}, true);
+const kpisWithMonitorFailed = computeKPIs({{
+  summary: {{ observed_at: '2026-09-17T00:00:00Z', projects: [] }},
+  monitor: null,
+}});
+
+// 2. Watchdog degraded with no projects
+const wdDegradedData = {{
+  available: true,
+  degraded: true,
+  degraded_reason: 'unreadable state',
+  projects: {{}},
+}};
+const incCount = computeIncidentCount({{ projects: [] }}, null, wdDegradedData);
+renderWatchdogBadge(wdDegradedData);
+const wdBadge = {{ text: elements.get('watchdogBadge').textContent, cls: elements.get('watchdogBadge').className }};
+
+renderWatchdogDiagnostics(wdDegradedData);
+const wdStatusRendered = flatten(elements.get('watchdogStatus'));
+
+// 3. Broker unavailable
+const brokerResUnavailable = {{ available: false, error: 'broker unreachable' }};
+const brokerExecUnavailable = {{ available: false, error: 'broker unreachable' }};
+const kpisBrokerUnavailable = computeKPIs({{
+  summary: {{ projects: [] }},
+  brokerResources: brokerResUnavailable,
+  brokerExecutions: brokerExecUnavailable,
+}});
+renderBrokerResources(brokerResUnavailable);
+const brokerResRendered = flatten(elements.get('brokerResources'));
+renderBrokerExecutions(brokerExecUnavailable);
+const brokerExecRendered = flatten(elements.get('brokerExecutions'));
+
+// 4. Accounting unavailable
+const accountingUnavailable = {{ available: false, error: 'ledger missing' }};
+renderAccounting(accountingUnavailable);
+const accountingSummaryRendered = flatten(elements.get('accountingSummary'));
+const accountingBottleneckRendered = flatten(elements.get('accountingBottleneck'));
+
+// 5. Daemon health badges under degraded/stopped/unavailable states
+renderDaemonBadge({{ available: false, error: 'unreachable' }}, {{ available: true, process_alive: true }});
+const daemonDegraded = {{ text: elements.get('daemonBadge').textContent, cls: elements.get('daemonBadge').className }};
+
+renderDaemonBadge({{ available: true, data: {{ control_health: {{ degraded: false }}, control_enabled: true }} }}, {{ available: true, process_alive: false }});
+const daemonStopped = {{ text: elements.get('daemonBadge').textContent, cls: elements.get('daemonBadge').className }};
+
+renderDaemonBadge({{ available: false, error: 'down' }}, {{ available: false, error: 'down' }});
+const daemonUnavail = {{ text: elements.get('daemonBadge').textContent, cls: elements.get('daemonBadge').className }};
+
+console.log(JSON.stringify({{
+  fDirect,
+  fWithFetchFailed,
+  kpisWithMonitorFailed,
+  incCount,
+  wdBadge,
+  wdStatusRendered,
+  kpisBrokerUnavailable,
+  brokerResRendered,
+  brokerExecRendered,
+  accountingSummaryRendered,
+  accountingBottleneckRendered,
+  daemonDegraded,
+  daemonStopped,
+  daemonUnavail,
+}}));
+"""
+        res = run_node(script)
+
+        # 1. Monitor-only failure must return Disconnected (not Live)
+        self.assertEqual(res["fDirect"], "Disconnected")
+        self.assertEqual(res["fWithFetchFailed"], "Disconnected")
+        self.assertEqual(res["kpisWithMonitorFailed"]["freshness"], "Disconnected")
+
+        # 2. Watchdog degraded with 0 projects must report incident count 1 and degraded badge
+        self.assertEqual(res["incCount"], 1)
+        self.assertEqual(res["wdBadge"]["text"], "Watchdog degraded")
+        self.assertIn("warn", res["wdBadge"]["cls"])
+        self.assertIn("Degraded|yes", res["wdStatusRendered"])
+        self.assertIn("Degraded reason|unreadable state", res["wdStatusRendered"])
+        self.assertIn("Auto recovery|unavailable", res["wdStatusRendered"])
+        # 'State' unknown placeholder must NOT be present when data.state is absent
+        self.assertNotIn("State|—", res["wdStatusRendered"])
+        self.assertNotIn("Auto recovery|disabled", res["wdStatusRendered"])
+
+        # 3. Broker unavailable KPIs and panels
+        self.assertEqual(res["kpisBrokerUnavailable"]["executions"], "unavailable")
+        self.assertEqual(res["kpisBrokerUnavailable"]["resources"], "unavailable")
+        self.assertIn("broker unreachable", res["brokerResRendered"])
+        self.assertIn("broker unreachable", res["brokerExecRendered"])
+
+        # 4. Accounting unavailable panels
+        self.assertIn("ledger missing", res["accountingSummaryRendered"])
+        self.assertIn("ledger missing", res["accountingBottleneckRendered"])
+
+        # 5. Daemon health badges
+        self.assertEqual(res["daemonDegraded"]["text"], "Daemon degraded")
+        self.assertIn("warn", res["daemonDegraded"]["cls"])
+        self.assertEqual(res["daemonStopped"]["text"], "Daemon stopped")
+        self.assertIn("bad", res["daemonStopped"]["cls"])
+        self.assertEqual(res["daemonUnavail"]["text"], "Daemon unavailable")
+        self.assertIn("bad", res["daemonUnavail"]["cls"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -5,22 +5,28 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12.7 Web Control Surface Visual Refresh** — **IMPLEMENTATION COMPLETE / TECHNICAL REVIEW PENDING**.
+Current task: **P12.7 Web Control Surface Visual Refresh** — **REVIEW REMEDIATION COMPLETE / TECHNICAL RE-REVIEW PENDING**.
 
 Latest continuation state (2026-09-17):
-- Canonical `main` HEAD is `8059d04` (`plan(P12.7): freeze executable design`), ahead of `origin/main` by 21 commits.
-- Executed P12.7 Web Control Surface Visual Refresh per approved executable design in `agent/next.md` and `docs/P12_7_WEB_UI_DESIGN.md`.
-- Refactored `web/index.html` and `web/style.css` into a dense, single-page operations dashboard with header health/freshness/refresh strip, flat KPI cards, section navigation, and distinct labelled `#controls` region.
-- Preserved all 26 legacy DOM IDs, static allowlist, CSP (`default-src 'self'`), CSRF/origin/Host headers, and backward-compatible strings (`UNBOUND / BLOCKED`, `Rebind the ChatGPT conversation to resume the pending request.`, `/api/orchestration`).
-- Implemented pure exported helper functions in `web/app.js`: `buildControlTarget`, `describeGuardedAction`, `computeFreshnessState`, `computeIncidentCount`, `computeKPIs`, `severityRank`, and `compareSeverityThenIdThenTime`.
-- Added native confirmation prompts (`window.confirm`) for the five lifecycle-changing guarded actions (`stop`, `retry`, `rereview`, `reconcile`, `approve_owner_gate`) displaying identity lines and state consequences before sending any fetch; cancelling issues 0 fetches.
-- Connected control buttons to `buildControlTarget`, disabling buttons when targets are missing or capabilities are unavailable.
-- Upgraded `refresh()` to use `Promise.allSettled` to isolate per-source network failures cleanly without masking errors as healthy or zero.
-- Added comprehensive unit and integration test suite `tests_py/test_web_ui_refresh.py` (8 tests) validating helper behavior, confirmation prompts, button disabling, fake-DOM fixture rendering, required DOM IDs, security guards (no inline scripts/styles, `:focus-visible`, reduced-motion), and read-only GET-only verification.
-- Verification: focused web/control suites passed (55 passed, 6 subtests), `tests/web-selftest.ps1` passed, full test suite passed (629 passed, 40 subtests in 206.09s), Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly.
-- Knowledge graph updated with `graphify update .` (3110 nodes, 8624 edges, 148 communities). Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
-
-Immediate continuation rule: perform independent technical review of P12.7 changes on clean worktree.
+- Canonical `main` HEAD is `406d057` (`feat(web): P12.7 web control surface visual refresh`), ahead of `origin/main` by 22 commits.
+- Remediated all 6 Technical Review findings from `ai_review:auto-cf45dc90052f1a5988604625:execute`:
+  1. Acceptance 3: Added first-viewport `#daemonBadge` and `#watchdogBadge` in header status strip alongside `#monitorBadge`, `#freshnessBadge`, and `#lastRefresh` in `web/index.html` and `web/app.js`, ensuring daemon and watchdog health are immediately visible.
+  2. Acceptance 4 (fail-closed freshness): Hardened `computeFreshnessState` in `web/app.js` to fail closed to `'Disconnected'` whenever monitor fetch fails (`fetchFailed=true`), `!monitor`, `monitor.available===false`, or `monitor.process_alive===false`, preventing false `Live` display when overview has `observed_at`.
+  3. Acceptance 4 (fail-closed incident count): Hardened `computeIncidentCount` in `web/app.js` to detect top-level `watchdog.degraded === true` and increment the incident count by 1, correctly reporting incidents when watchdog is degraded with 0 projects.
+  4. Acceptance 4 / UI integrity: Fixed `renderWatchdogDiagnostics` in `web/app.js` to omit fabricated/unknown placeholders (`—`), displays `State` only when returned by API, renders `Degraded: yes/no`, renders `Auto recovery: unavailable` when undefined instead of fabricating `disabled`, and omits placeholder `Observed: —`.
+  5. Acceptance verification: Recorded explicit manual 1366x768 viewport verification:
+     - Header topbar (daemon, monitor, watchdog, freshness badges, last refresh, refresh button) and 5 KPI cells fit in the first viewport (155px height vs 768px).
+     - Contrast ratios: bright text `#f0f6fc` on `#0d1117` (15.8:1), body `#c9d1d9` on `#161b22` (10.4:1), muted `#8b949e` (5.1:1), status colors (OK `#3fb950` 6.7:1, Warn `#d29922` 6.9:1, Bad `#f85149` 5.4:1, Info `#58a6ff` 6.8:1) exceeding WCAG AA/AAA standards.
+     - Visible keyboard focus via `*:focus-visible` (2px solid `#58a6ff` with 2px offset).
+     - Guarded action confirm dialogs with labeled identity lines and consequence descriptions; 0 fetches on cancel.
+  6. Test regression: Added comprehensive regression test `test_partial_failure_states_in_kpis_header_and_diagnostics` in `tests_py/test_web_ui_refresh.py` (9 tests total now) covering monitor failure, degraded watchdog with no projects, broker/accounting unavailable, and daemon/watchdog health badges. Also updated `test_freshness_kpi_and_incident_helpers` and `test_dom_ids_security_and_opencode_exclusion`.
+- Verification:
+  - Focused web/control suites passed: 56 passed, 6 subtests passed (`test_web.py`, `test_accounting_dashboard.py`, `test_unbound_web_ui.py`, `test_web_ui_refresh.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_control_commands.py`).
+  - `tests/web-selftest.ps1`: PASS.
+  - Full test suite passed: 630 passed, 40 subtests passed in 205.12s (`python -m pytest tests_py -q`).
+  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3114 nodes, 8631 edges, 157 communities). Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
+- Immediate continuation rule: perform independent technical re-review of P12.7 changes on clean worktree.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
@@ -200,3 +206,23 @@ P12.7 web control surface visual refresh result (2026-09-17):
 - `python -m compileall -q src ops tests_py`, node syntax checks on `web/app.js` and `browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly.
 - Knowledge graph updated via `graphify update .`: 3110 nodes, 8624 edges, 148 communities.
 - Canonical worktree clean and ready for independent technical review.
+
+P12.7 review remediation result (2026-09-17):
+- Remediated all 6 Technical Review findings from `ai_review:auto-cf45dc90052f1a5988604625:execute`:
+  - Added first-viewport `#daemonBadge` and `#watchdogBadge` in header status strip (`web/index.html`, `web/style.css`, `web/app.js`), ensuring daemon and watchdog health are immediately visible alongside monitor and freshness badges.
+  - Hardened `computeFreshnessState` to fail closed to `'Disconnected'` whenever monitor fetch fails (`fetchFailed=true`), `!monitor`, `monitor.available===false`, or `monitor.process_alive===false`, preventing false `'Live'` display when overview has `observed_at`.
+  - Hardened `computeIncidentCount` to detect top-level `watchdog.degraded === true` and increment incident count by 1, correctly reporting incidents when watchdog is degraded with 0 projects.
+  - Hardened `renderWatchdogDiagnostics` to omit fabricated/unknown placeholders (`—`), display `State` only when returned by API, render `Degraded: yes/no`, render `Auto recovery: unavailable` when undefined instead of fabricating `disabled`, and omit placeholder `Observed: —`.
+  - Recorded explicit manual 1366x768 viewport verification:
+    - Topbar (daemon, monitor, watchdog, freshness badges, last refresh, refresh button) and 5 KPI cells fit in the first viewport (155px height vs 768px).
+    - Contrast ratios: bright text `#f0f6fc` on `#0d1117` (15.8:1), body `#c9d1d9` on `#161b22` (10.4:1), muted `#8b949e` (5.1:1), status colors (OK `#3fb950` 6.7:1, Warn `#d29922` 6.9:1, Bad `#f85149` 5.4:1, Info `#58a6ff` 6.8:1) exceeding WCAG AA/AAA standards.
+    - Visible keyboard focus via `*:focus-visible` (2px solid `#58a6ff` with 2px offset).
+    - Guarded action confirm dialogs with labeled identity lines and consequence descriptions; 0 fetches on cancel.
+  - Added comprehensive regression test `test_partial_failure_states_in_kpis_header_and_diagnostics` in `tests_py/test_web_ui_refresh.py` (9 tests total now) covering monitor failure, degraded watchdog with no projects, broker/accounting unavailable, and daemon/watchdog health badges. Also updated `test_freshness_kpi_and_incident_helpers` and `test_dom_ids_security_and_opencode_exclusion`.
+- Verification:
+  - Focused web/control suites passed: 56 passed, 6 subtests passed (`test_web.py`, `test_accounting_dashboard.py`, `test_unbound_web_ui.py`, `test_web_ui_refresh.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_control_commands.py`).
+  - `tests/web-selftest.ps1`: PASS.
+  - Full test suite passed: 630 passed, 40 subtests passed in 205.12s (`python -m pytest tests_py -q`).
+  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3114 nodes, 8631 edges, 157 communities).
+  - Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.

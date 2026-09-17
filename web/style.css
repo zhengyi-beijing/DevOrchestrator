@@ -90,7 +90,8 @@ body {
 .header-status {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .meta-time {

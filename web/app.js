@@ -95,10 +95,11 @@ function compareSeverityThenIdThenTime(a, b) {
 function computeFreshnessState(monitor, overview, fetchFailed = false) {
   if (fetchFailed) return 'Disconnected';
   if (!monitor && !overview) return 'Unknown';
-  if (monitor && monitor.process_alive === false) return 'Disconnected';
-  if (monitor && monitor.stale) return 'Stale';
+  if (!monitor || monitor.available === false || monitor.process_alive === false) return 'Disconnected';
+  if (overview && overview.available === false) return 'Disconnected';
+  if (monitor.stale) return 'Stale';
   if (overview && overview.stale) return 'Stale';
-  if (monitor && monitor.state === 'running') return 'Live';
+  if (monitor.state === 'running') return 'Live';
   if (overview && overview.observed_at) return 'Live';
   return 'Unknown';
 }
@@ -123,8 +124,12 @@ function computeIncidentCount(summary, controlOverview, watchdogData) {
       if (isIncident) count += 1;
     }
   }
-  if (watchdogData && watchdogData.projects && typeof watchdogData.projects === 'object') {
-    for (const [pid, entry] of Object.entries(watchdogData.projects)) {
+  const wd = (watchdogData && watchdogData.data) || watchdogData || (controlOverview && controlOverview.data && controlOverview.data.watchdog);
+  if (wd && wd.degraded) {
+    count += 1;
+  }
+  if (wd && wd.projects && typeof wd.projects === 'object') {
+    for (const [pid, entry] of Object.entries(wd.projects)) {
       if (entry && entry.state && entry.state !== 'ok' && entry.state !== 'healthy_slow') {
         if (!projects || !projects.some(p => (p.id || p.project_id) === pid)) {
           count += 1;
@@ -192,7 +197,11 @@ function computeKPIs({ summary, control, brokerResources, brokerExecutions, watc
     incidents: incidentsKpi,
     executions: executionsKpi,
     resources: resourcesKpi,
-    freshness: computeFreshnessState(monitor, summary),
+    freshness: computeFreshnessState(
+      monitor,
+      summary,
+      Boolean((monitor && monitor.available === false) || (summary && !monitor))
+    ),
   };
 }
 
@@ -291,12 +300,79 @@ function describeGuardedAction(project, capability, target) {
   return lines.join('\n');
 }
 
+function renderDaemonBadge(control, monitor) {
+  const badge = $('daemonBadge');
+  if (!badge) return;
+  const controlAvail = control && control.available !== false;
+  const monitorAvail = monitor && monitor.available !== false;
+
+  if (!controlAvail && !monitorAvail) {
+    badge.className = 'badge bad';
+    badge.textContent = 'Daemon unavailable';
+    return;
+  }
+  if (monitorAvail && monitor.process_alive === false) {
+    badge.className = 'badge bad';
+    badge.textContent = 'Daemon stopped';
+    return;
+  }
+  if (monitorAvail && monitor.last_error) {
+    badge.className = 'badge bad';
+    badge.textContent = 'Daemon error';
+    return;
+  }
+  const ctrlData = control && control.data;
+  if (ctrlData && ctrlData.control_health && ctrlData.control_health.degraded) {
+    badge.className = 'badge warn';
+    badge.textContent = 'Daemon degraded';
+    return;
+  }
+  if (ctrlData && ctrlData.control_enabled === false) {
+    badge.className = 'badge warn';
+    badge.textContent = 'Daemon observation-only';
+    return;
+  }
+  if (!controlAvail) {
+    badge.className = 'badge warn';
+    badge.textContent = 'Daemon degraded';
+    return;
+  }
+  badge.className = 'badge ok';
+  badge.textContent = 'Daemon healthy';
+}
+
+function renderWatchdogBadge(watchdog) {
+  const badge = $('watchdogBadge');
+  if (!badge) return;
+  if (!watchdog || watchdog.available === false) {
+    badge.className = 'badge bad';
+    badge.textContent = 'Watchdog unavailable';
+    return;
+  }
+  const wd = watchdog.data || watchdog;
+  if (wd.degraded) {
+    badge.className = 'badge warn';
+    badge.textContent = 'Watchdog degraded';
+    return;
+  }
+  const projects = Object.values(wd.projects || {});
+  const hasAlert = projects.some(p => p && p.state && p.state !== 'ok' && p.state !== 'healthy_slow');
+  if (hasAlert) {
+    badge.className = 'badge warn';
+    badge.textContent = 'Watchdog alert';
+    return;
+  }
+  badge.className = 'badge ok';
+  badge.textContent = 'Watchdog healthy';
+}
+
 function renderMonitor(monitor) {
   const badge = $('monitorBadge');
   if (badge) {
     const stale = Boolean(monitor.stale);
-    badge.className = `badge ${stale ? 'bad' : monitor.state === 'degraded' ? 'warn' : 'ok'}`;
-    badge.textContent = stale ? 'Monitor STALE' : monitor.state === 'degraded' ? 'Monitor degraded' : 'Monitor healthy';
+    const stopped = monitor.process_alive === false;
+    badge.className = `badge ${stale || stopped ? 'bad' : monitor.state === 'degraded' ? 'warn' : 'ok'}`;
+    badge.textContent = stopped ? 'Monitor stopped' : (stale ? 'Monitor STALE' : (monitor.state === 'degraded' ? 'Monitor degraded' : 'Monitor healthy'));
   }
   const box = $('monitorDetails');
   if (box) {
@@ -461,7 +537,17 @@ function renderBrokerResources(payload) {
 }
 
 function renderBrokerExecutions(payload) {
-  const items = payload && payload.available ? (payload.executions || []).slice().sort(compareSeverityThenIdThenTime) : [];
+  const host = $('brokerExecutions');
+  if (!payload || !payload.available) {
+    if (host) {
+      host.replaceChildren();
+      const e = document.createElement('div'); e.className = 'empty';
+      e.textContent = `AI executions unavailable: ${text(payload && payload.error)}`;
+      host.appendChild(e);
+    }
+    return;
+  }
+  const items = (payload.executions || []).slice().sort(compareSeverityThenIdThenTime);
   renderTimeline('brokerExecutions', items, e => `${text(e.role)} · ${text(e.resource_id)} · ${text(e.status)} · ${seconds(e.duration_seconds)}`);
 }
 
@@ -504,13 +590,20 @@ function renderWatchdogDiagnostics(payload) {
 
   const data = payload.data || payload;
   if (statusBox) {
-    kv(statusBox, 'State', data.state);
-    kv(statusBox, 'Degraded', data.degraded ? 'yes' : 'no');
+    if (data.state !== undefined && data.state !== null) {
+      kv(statusBox, 'State', data.state);
+    }
+    kv(statusBox, 'Degraded', data.degraded !== undefined ? (data.degraded ? 'yes' : 'no') : 'unavailable');
     if (data.degraded_reason) {
       kv(statusBox, 'Degraded reason', data.degraded_reason);
     }
-    kv(statusBox, 'Auto recovery', data.auto_recovery ? 'enabled' : 'disabled');
-    kv(statusBox, 'Observed', ago(data.updated_at || data.observed_at));
+    const autoRec = data.auto_recovery !== undefined && data.auto_recovery !== null
+      ? (data.auto_recovery ? 'enabled' : 'disabled')
+      : 'unavailable';
+    kv(statusBox, 'Auto recovery', autoRec);
+    if (data.updated_at || data.observed_at) {
+      kv(statusBox, 'Observed', ago(data.updated_at || data.observed_at));
+    }
   }
 
   if (projectsBox) {
@@ -873,6 +966,8 @@ async function refresh() {
     }
   });
 
+  renderDaemonBadge(data.control, data.monitor);
+
   if (data.monitor && data.monitor.available !== false) {
     renderMonitor(data.monitor);
   } else {
@@ -887,6 +982,13 @@ async function refresh() {
     }
   }
 
+  const watchdogData = data.watchdog && data.watchdog.available !== false
+    ? data.watchdog
+    : (data.control && data.control.data && data.control.data.watchdog
+        ? { available: true, data: data.control.data.watchdog }
+        : data.watchdog);
+  renderWatchdogBadge(watchdogData);
+
   if (data.summary && data.summary.available !== false) {
     renderOverview(data.summary);
   } else {
@@ -899,11 +1001,12 @@ async function refresh() {
     }
   }
 
+  const monitorFailed = !data.monitor || data.monitor.available === false;
   const freshnessBadge = $('freshnessBadge');
   const freshnessState = computeFreshnessState(
     data.monitor && data.monitor.available !== false ? data.monitor : null,
     data.summary && data.summary.available !== false ? data.summary : null,
-    Boolean((!data.monitor || data.monitor.available === false) && (!data.summary || data.summary.available === false))
+    monitorFailed
   );
   if (freshnessBadge) {
     freshnessBadge.className = `badge ${freshnessState === 'Live' ? 'ok' : freshnessState === 'Stale' ? 'warn' : 'bad'}`;
@@ -915,7 +1018,7 @@ async function refresh() {
     control: data.control && data.control.available !== false ? data.control : null,
     brokerResources: data.brokerResources,
     brokerExecutions: data.brokerExecutions,
-    watchdog: data.watchdog && data.watchdog.available !== false ? data.watchdog : null,
+    watchdog: watchdogData,
     monitor: data.monitor && data.monitor.available !== false ? data.monitor : null,
   });
   if ($('kpiProjects')) $('kpiProjects').textContent = kpis.projects;
@@ -941,11 +1044,6 @@ async function refresh() {
   renderBrokerExecutions(data.brokerExecutions);
   renderBrokerUsage(data.brokerUsage);
 
-  const watchdogData = data.watchdog && data.watchdog.available !== false
-    ? data.watchdog
-    : (data.control && data.control.data && data.control.data.watchdog
-        ? { available: true, data: data.control.data.watchdog }
-        : data.watchdog);
   renderWatchdogDiagnostics(watchdogData);
 
   renderAccounting(data.accounting);
@@ -1000,9 +1098,12 @@ if (typeof module !== 'undefined' && module.exports) {
     compareSeverityThenIdThenTime,
     renderWatchdogDiagnostics,
     renderBrokerResources,
+    renderBrokerExecutions,
     renderProjects,
     renderOverview,
     renderMonitor,
+    renderDaemonBadge,
+    renderWatchdogBadge,
   };
 }
 
