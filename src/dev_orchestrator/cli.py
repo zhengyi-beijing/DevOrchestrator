@@ -464,6 +464,13 @@ def cmd_project_control(args: argparse.Namespace) -> int:
     config = load_projects_config(resolve_config_path(getattr(args, "config", None)))
     project_config = next((row for row in config.get("projects") or [] if row.get("project_id") == project_id), None)
     projected = project_control_view(snapshot, runtime, project_config)
+    # Match the daemon/web control surface: raw per-project snapshots may have
+    # monitor-local IDLE while summary.json carries the orchestration overlay.
+    summary = read_json(runtime / "summary.json", {})
+    if isinstance(summary, dict) and isinstance(summary.get("projects"), list):
+        summary_project = next((row for row in summary["projects"] if isinstance(row, dict) and row.get("project_id") == project_id), None)
+        if isinstance(summary_project, dict):
+            projected = project_control_view(summary_project, runtime, project_config)
     target = {}
     if args.binding_id and args.action in {"bind_conversation", "rebind_conversation"}:
         target.update({"adapter": args.adapter, "binding_id": args.binding_id})
