@@ -5,9 +5,9 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12.5 Self-Host Operational Acceptance** — **READY_FOR_REVIEW**.
+Current task: **P12.6 Persistent Harness Acceptance and Closure** ? **PENDING DESIGN / OWNER START REQUIRED**.
 
-Staged roadmap history remains P11d -> P12 -> null; P12.5 is an owner-authorized operational acceptance task used to validate the converged canonical main deployment before attaching other projects.
+Staged roadmap handoff is now P12.5 -> P12.6. P12.5 is closed after independent technical review; P12.6 is the active staged task and requires explicit owner start before implementation.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
@@ -134,3 +134,9 @@ P12.5 post-reanchor closure remediation result (2026-09-17):
 - Full regression: 583 tests and 31 subtests passed; compileall and `git diff --check` passed.
 - Live self-host acceptance passed against daemon PID 29212 and AIBroker 8875.
 - Current implementation is ready for independent technical re-review before P12.5 closure.
+
+P12.5 independent closure review (2026-09-17):
+- Independent reviewer: `copilot/default/claude-sonnet-4.6`; exact-run execution `4c8f55f2-bfd6-470e-bf81-bdeb537a2c68`; Copilot session `6f61368b-f089-43e3-8986-6fc2167da180`. The reviewer execution completed with exit code 0 and no file modifications.
+- Verdict: `NEXT`; blocking findings: none. The reviewer accepted all five post-reanchor closure criteria, recovery lineage/consumption, fail-closed guards, command idempotency, and barrier precedence at HEAD `05129fc8c5ae90d19e3b3e20c2ffe1b757a83fce`.
+- Non-blocking notes only: cosmetic blocked-reason precedence when two barriers coincide; harmless `None` member in `consumed_sources`; theoretical reconcile replay equality if both task IDs are absent, constrained away by valid reconcile target requirements.
+- P12.5 is CLOSED. Active handoff is P12.6, which remains `PENDING DESIGN` and `OWNER START REQUIRED`.

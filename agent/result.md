@@ -394,3 +394,12 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
 - Full `python -m pytest tests_py -q` passed: 583 tests and 31 subtests in 184.09s.
 - `python -m compileall -q src ops tests_py` and `git diff --check` passed.
 - Live `python ops/self_host_acceptance.py` passed against daemon PID 29212 and AIBroker 8875 with all required checks PASS.
+
+## P12.5 Independent Closure Review (2026-09-17)
+
+- Review HEAD: `05129fc8c5ae90d19e3b3e20c2ffe1b757a83fce` on clean `main`, pushed to `origin/main`.
+- Independent reviewer resource: `copilot/default/claude-sonnet-4.6`; exact-run execution `4c8f55f2-bfd6-470e-bf81-bdeb537a2c68`; Copilot session `6f61368b-f089-43e3-8986-6fc2167da180`.
+- Reviewer execution succeeded with `exit_code=0`, `filesModified=[]`, and returned `decision=NEXT`, `blocking_findings=[]`.
+- Reviewer accepted fail-closed malformed overview handling, IPv6 loopback bracket preservation, reconcile crash/restart idempotency, exact re-anchored REMEDIATE owner-continue recovery with immutable history, and descendant recovery-barrier precedence.
+- Non-blocking findings: cosmetic diagnostic reason precedence; harmless `None` in the consumed-source set; theoretical both-task-ids-missing equality in reconcile replay, constrained away by valid target requirements.
+- P12.5 closure is accepted. Handoff target is `agent/staged/P12.6.md`; P12.6 remains `PENDING DESIGN` with `OWNER START REQUIRED`.
