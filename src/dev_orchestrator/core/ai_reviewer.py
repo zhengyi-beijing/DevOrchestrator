@@ -353,6 +353,93 @@ class AIReviewerCoordinator:
         )
         return review_id, "stale technical review re-anchored at current clean HEAD"
 
+    def retry_failed(
+        self, project: dict[str, Any], snapshot: dict[str, Any],
+        candidate: dict[str, Any], command_id: str,
+    ) -> tuple[str | None, str]:
+        """Retry one exact failed technical review at the unchanged clean HEAD."""
+        from dev_orchestrator.control.reconcile import resolve_retry_candidate
+        target, reason = resolve_retry_candidate(snapshot, self.runtime_root, project)
+        if target is None:
+            return None, reason
+        if target.get("target_id") != candidate.get("target_id"):
+            return None, "retry target changed before reviewer launch"
+        policy, policy_reason = _review_policy(project)
+        if policy is None:
+            return None, policy_reason
+        if self.port is None:
+            return None, "AIBroker reviewer port unavailable"
+        review_id = "ai_review:retry:" + command_id
+        with self._lock:
+            existing = self._load_state()["reviews"].get(review_id)
+            if isinstance(existing, dict):
+                if (
+                    existing.get("retry_of") == target["target_id"]
+                    and existing.get("project_id") == project.get("project_id")
+                    and existing.get("source_request_id") == target.get("source_request_id")
+                    and existing.get("task_id") == target.get("task_id")
+                ):
+                    return review_id, "failed review retry already launched for command_id"
+                return None, "conflicting failed-review retry replay"
+        repo_path = _nonblank(project.get("repo_path"))
+        source_id = _nonblank(target.get("source_request_id"))
+        task_id = _nonblank(target.get("task_id"))
+        resource = target.get("resource_context")
+        if repo_path is None or source_id is None or task_id is None or not isinstance(resource, dict):
+            return None, "retry candidate source identity is incomplete"
+        truth = read_repository_truth(repo_path)
+        if not truth.valid or truth.dirty or truth.branch != target.get("branch") or truth.head != target.get("current_head"):
+            return None, "current repository changed before retry reviewer launch"
+        previous = ResourceContext(
+            resource.get("resource_id"), resource.get("provider"),
+            resource.get("account"), resource.get("model"),
+        )
+        from dev_orchestrator.core.project_context import context_prompt_block
+        context_block, resolution = context_prompt_block(project, "reviewer")
+        ctx_decl = project.get("project_context") or {}
+        if ctx_decl.get("enabled") and ctx_decl.get("require_valid", True) and resolution.state == "invalid":
+            self._record_terminal(
+                review_id, str(project["project_id"]), source_id, "failed",
+                "durable project context is invalid: {0}".format(resolution.reason),
+            )
+            return None, "durable project context is invalid: {0}".format(resolution.reason)
+        binding = project.get("conversation_binding") or self._project_bindings.get(str(project["project_id"]))
+        failure_memory_block = ""
+        if self.failure_memory is not None:
+            failure_memory_block = self.failure_memory.prompt_block(
+                environment_for_project(project), max_chars=self.failure_memory_max_chars
+            )
+        retry_context = (
+            "[FAILED_REVIEW_RETRY]\n"
+            "A prior technical review of this SAME clean HEAD failed before producing a durable decision: {0}\n"
+            "Independently review the current HEAD from repository evidence. Do not infer a verdict from the failed attempt.\n"
+            "[/FAILED_REVIEW_RETRY]"
+        ).format(str(target.get("prior_reason") or "review infrastructure failure")[:2000])
+        request = AIRoleRequest(
+            project_id=str(project["project_id"]), task_run_id=task_id, stage_run_id="review",
+            role_run_id="reviewer-retry-" + command_id,
+            request_id=review_id, role="reviewer",
+            prompt=self._review_prompt(
+                str(project["project_id"]), task_id, source_id, truth,
+                context_block=context_block, failure_memory_block=failure_memory_block,
+                reanchor_context=retry_context,
+            ),
+            working_directory=Path(repo_path), quality=policy["quality"],
+            independence=policy["independence"], previous_resource_context=previous,
+            timeout_seconds=policy["timeout_seconds"],
+            metadata={
+                "worker_source_request_id": source_id,
+                "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
+                "failure_environment": environment_for_project(project),
+                "retry_of": target["target_id"],
+            },
+        )
+        self._launch_review(
+            review_id, source_id, request, truth,
+            conversation_binding=binding, resolution=resolution,
+        )
+        return review_id, "failed technical review retried at the same clean HEAD"
+
     @staticmethod
     def _review_prompt(
         project_id: str, task_id: str, source_request_id: str, truth: Any,
@@ -410,6 +497,7 @@ class AIReviewerCoordinator:
                 "context_state": resolution.state if resolution else None,
                 "context_digest": resolution.document.digest if resolution and resolution.document else None,
                 "reconcile_of": request.metadata.get("reconcile_of") if isinstance(request.metadata, dict) else None,
+                "retry_of": request.metadata.get("retry_of") if isinstance(request.metadata, dict) else None,
             }
             if conversation_binding and isinstance(conversation_binding, dict):
                 self._project_bindings[request.project_id] = copy.deepcopy(conversation_binding)

@@ -24,6 +24,7 @@ DIAGNOSIS_CODES = (
     "healthy_slow",
     "agent_stalled",
     "process_dead",
+    "reviewer_failed",
     "provider_or_quota_blocked",
     "state_desync",
     "external_wait",
@@ -202,6 +203,10 @@ def collect_evidence(
                             "state": latest.get("state"),
                             "status": latest.get("status"),
                             "request_id": latest.get("request_id"),
+                            "review_id": latest.get("review_id"),
+                            "task_id": latest.get("task_id"),
+                            "head": latest.get("head"),
+                            "reason": _redact_secrets(str(latest.get("reason") or ""))[:1000],
                             "started_at": latest.get("started_at"),
                             "updated_at": latest.get("updated_at"),
                         }
@@ -256,6 +261,21 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
     # REVIEWING_PLAN / APPLYING_PLAN / REVIEWING.
     worker_active = lifecycle in WORKER_EXPECTED_LIFECYCLE_STATES
 
+    # A terminal technical-review infrastructure failure is recoverable only
+    # through the exact-review retry control path; never map it to Worker continue.
+    ledgers = evidence.get("ledgers") if isinstance(evidence.get("ledgers"), dict) else {}
+    review_ledger = ledgers.get("ai-reviewer.json") if isinstance(ledgers.get("ai-reviewer.json"), dict) else {}
+    if lifecycle == "REVIEW_FAILED" and review_ledger.get("state") == "failed":
+        return Diagnosis(
+            code="reviewer_failed",
+            confidence=1.0,
+            reason=str(review_ledger.get("reason") or "technical reviewer failed before durable decision"),
+            recommended_action="retry the exact failed technical review at the unchanged clean HEAD",
+            owner_gate_required=False,
+            evidence=evidence,
+            evidence_hash=ev_hash,
+        )
+
     # Check process_dead
     if pid is not None and is_alive is False and worker_active:
         return Diagnosis(
@@ -284,7 +304,6 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
         )
 
     # Check state desync
-    ledgers = evidence.get("ledgers") if isinstance(evidence.get("ledgers"), dict) else {}
     exec_ledger = ledgers.get("transition-executor.json") if isinstance(ledgers.get("transition-executor.json"), dict) else {}
     if exec_ledger.get("state") == "completed" and getattr(assessment, "lifecycle_state", None) in ("EXECUTING", "APPLYING_PLAN"):
         return Diagnosis(

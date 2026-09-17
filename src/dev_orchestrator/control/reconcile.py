@@ -226,3 +226,119 @@ def resolve_reconcile_candidate(
     if len(matches) > 1:
         return None, "multiple stale technical-review reconcile candidates"
     return None, errors[0] if errors else "no exact stale technical-review reconcile target"
+
+
+def resolve_retry_candidate(
+    snapshot: dict[str, Any], runtime_root: Path | str, project_config: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Resolve one exact failed technical review at the current clean HEAD.
+
+    Retry is intentionally narrower than reconcile: it only applies when the
+    reviewer failed before producing a durable decision, the repository/task
+    identity is unchanged, and the completed AIBroker Worker lineage is intact.
+    """
+    if not isinstance(snapshot, dict):
+        return None, "project snapshot is unavailable"
+    project_id = _text(snapshot.get("project_id") or snapshot.get("id"))
+    telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+    task_id = _text(telemetry.get("task_id"))
+    if project_id is None or task_id is None:
+        return None, "current project/task identity is incomplete"
+    if not _reviewer_ready(project_config):
+        return None, "technical reviewer is not configured for retry"
+    if project_config.get("project_id") != project_id:
+        return None, "project configuration identity changed"
+    repo_path = _text(project_config.get("repo_path")) or _text(snapshot.get("repo_path"))
+    if repo_path is None:
+        return None, "repository path is unavailable"
+    truth = read_repository_truth(repo_path)
+    if not truth.valid:
+        return None, "current repository truth is unavailable"
+    if truth.dirty:
+        return None, "current repository is dirty"
+    git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
+    monitor_status_hash = _text(git.get("status_hash"))
+    if (
+        git.get("branch") != truth.branch
+        or git.get("head") != truth.head
+        or bool(git.get("dirty"))
+        or (monitor_status_hash is not None and monitor_status_hash != truth.status_hash)
+    ):
+        return None, "current monitor repository identity is stale"
+
+    runtime = Path(runtime_root)
+    executions = _rows(runtime, "transition-executor.json", "executions")
+    reviews = _rows(runtime, "ai-reviewer.json", "reviews")
+    decisions = _rows(runtime, "review-decisions.json", "decisions")
+    plans = _rows(runtime, "ai-planner.json", "plans")
+    active = _active_reason(snapshot, project_id, executions, reviews, plans)
+    if active:
+        return None, active
+
+    consumed = {
+        target
+        for row in reviews.values()
+        if row.get("project_id") == project_id
+        for target in [_text(row.get("retry_of"))]
+        if target is not None
+    }
+    decided = {
+        _text(row.get("request_id")) or key
+        for key, row in decisions.items()
+        if row.get("project_id") == project_id
+    }
+    matches: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for review_id, review in sorted(reviews.items()):
+        if review_id in consumed or review_id in decided:
+            continue
+        if not (
+            review.get("project_id") == project_id
+            and review.get("task_id") == task_id
+            and review.get("state") == "failed"
+            and review.get("branch") == truth.branch
+            and _text(review.get("head")) == truth.head
+            and review.get("review_dirty") is False
+        ):
+            continue
+        source_id = _text(review.get("source_request_id"))
+        source = executions.get(source_id or "")
+        resource = source.get("resource_context") if isinstance(source, dict) else None
+        if not (
+            isinstance(source, dict)
+            and source.get("project_id") == project_id
+            and source.get("task_id") == task_id
+            and source.get("repo_path") == repo_path
+            and source.get("branch") == truth.branch
+            and source.get("engine") == "aibroker"
+            and source.get("state") == "completed"
+            and source.get("source_kind") in _SOURCE_KINDS
+            and all(_text(source.get(field)) is not None for field in _BROKER_FIELDS)
+            and isinstance(resource, dict)
+            and all(_text(resource.get(field)) is not None for field in _RESOURCE_FIELDS)
+        ):
+            errors.append("failed technical review lacks completed AIBroker source resource evidence")
+            continue
+        source_head = _text(source.get("head"))
+        if source_head is None or not is_git_ancestor(repo_path, source_head, truth.head):
+            errors.append("failed technical review source HEAD is not an ancestor of current HEAD")
+            continue
+        reason = _text(review.get("reason"))
+        if reason is None:
+            errors.append("failed technical review lacks terminal failure reason")
+            continue
+        matches.append({
+            "target_id": review_id,
+            "source_request_id": source_id,
+            "task_id": task_id,
+            "branch": truth.branch,
+            "current_head": truth.head,
+            "prior_reason": reason,
+            "resource_context": copy.deepcopy(resource),
+            "completed_at": review.get("completed_at"),
+        })
+    if len(matches) == 1:
+        return matches[0], ""
+    if len(matches) > 1:
+        return None, "multiple exact failed technical-review retry candidates"
+    return None, errors[0] if errors else "no safe exact retry target"

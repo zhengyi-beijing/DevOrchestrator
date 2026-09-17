@@ -16,7 +16,7 @@ from dev_orchestrator.control.command_store import (
     safe_command_id,
 )
 from dev_orchestrator.control.owner_store import OwnerControlStore
-from dev_orchestrator.control.reconcile import resolve_reconcile_candidate
+from dev_orchestrator.control.reconcile import resolve_reconcile_candidate, resolve_retry_candidate
 from dev_orchestrator.control.store import ConversationConflictError, ConversationControlStore
 from dev_orchestrator.control.surface import validate_expected
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
@@ -421,7 +421,42 @@ class ControlCommandCoordinator:
                 "target_id": target_id, "review_id": review_id, "reason": launch_reason,
             }
         if action == "retry":
-            return self._blocked(command_id, project_id, action, "action is not available for the current projected target", now, record)
+            target_id = _nonblank(target.get("target_id"))
+            if self.reviewer is None:
+                return self._blocked(command_id, project_id, action, "reviewer coordinator unavailable", now, record)
+            review_id = "ai_review:retry:" + command_id
+            reviews_state = self.reviewer.state().get("reviews", {})
+            existing_review = reviews_state.get(review_id) if isinstance(reviews_state, dict) else None
+            if isinstance(existing_review, dict):
+                telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+                current_task_id = _nonblank(telemetry.get("task_id"))
+                if (
+                    existing_review.get("retry_of") == target_id
+                    and existing_review.get("project_id") == project_id
+                    and _nonblank(existing_review.get("task_id")) == current_task_id
+                ):
+                    return {
+                        **record, "state": "accepted", "processed_at": now,
+                        "effect": "retry_failed_technical_review_no_worker_started",
+                        "target_id": target_id, "review_id": review_id,
+                        "reason": "failed review retry already launched for command_id",
+                    }
+                return self._blocked(command_id, project_id, action, "conflicting failed-review retry replay", now, record)
+            candidate, candidate_reason = resolve_retry_candidate(snapshot, self.runtime_root, projects[project_id])
+            if candidate is None:
+                return self._blocked(command_id, project_id, action, candidate_reason, now, record)
+            if target_id != candidate["target_id"]:
+                return self._blocked(command_id, project_id, action, "target_id does not match the currently projected retry target", now, record)
+            launched_id, launch_reason = self.reviewer.retry_failed(
+                projects[project_id], snapshot, candidate, command_id,
+            )
+            if launched_id is None:
+                return self._blocked(command_id, project_id, action, launch_reason, now, record)
+            return {
+                **record, "state": "accepted", "processed_at": now,
+                "effect": "retry_failed_technical_review_no_worker_started",
+                "target_id": target_id, "review_id": launched_id, "reason": launch_reason,
+            }
         if self.owner_store.is_paused(project_id):
             return self._blocked(command_id, project_id, action, "project is paused", now, record)
         next_status = str(snapshot.get("next_status") or "").upper()

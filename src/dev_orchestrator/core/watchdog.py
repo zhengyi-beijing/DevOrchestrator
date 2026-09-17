@@ -48,6 +48,7 @@ ACTIVE_LIFECYCLE_STATES = frozenset({
     "APPLYING_PLAN",
     "EXECUTING",
     "REVIEWING",
+    "REVIEW_FAILED",
     "REMEDIATING",
 })
 
@@ -58,6 +59,7 @@ LIFECYCLE_OVERRIDE_FAMILY = {
     "APPLYING_PLAN": "PLANNING",
     "EXECUTING": "EXECUTING",
     "REVIEWING": "REVIEWING",
+    "REVIEW_FAILED": "REVIEWING",
     "REMEDIATING": "REMEDIATING",
 }
 
@@ -1470,7 +1472,7 @@ class WatchdogCoordinator:
             return
 
         diag_code = attempt_record.get("diagnosis")
-        if diag_code not in ("agent_stalled", "process_dead"):
+        if diag_code not in ("agent_stalled", "process_dead", "reviewer_failed"):
             self._emit_owner_gate_once(pid, attempt_record, f"diagnosis_{diag_code}_requires_owner")
             return
 
@@ -1494,18 +1496,33 @@ class WatchdogCoordinator:
             return
         proc_liveness = evidence.get("process_liveness") if isinstance(evidence.get("process_liveness"), dict) else {}
         ev_pid = proc_liveness.get("pid")
-        if ev_pid is None:
-            self._emit_owner_gate_once(pid, attempt_record, "malformed_attempt_missing_pid")
-            return
-        if "process_alive" not in proc_liveness:
-            self._emit_owner_gate_once(pid, attempt_record, "malformed_attempt_missing_process_alive")
-            return
         process_alive = proc_liveness.get("process_alive")
+        if diag_code in ("agent_stalled", "process_dead"):
+            if ev_pid is None:
+                self._emit_owner_gate_once(pid, attempt_record, "malformed_attempt_missing_pid")
+                return
+            if "process_alive" not in proc_liveness:
+                self._emit_owner_gate_once(pid, attempt_record, "malformed_attempt_missing_process_alive")
+                return
 
         current_worker = snapshot.get("worker") if isinstance(snapshot.get("worker"), dict) else {}
         current_lifecycle = str(
             snapshot.get("lifecycle_state") or snapshot.get("status") or snapshot.get("state") or ""
         ).strip().upper()
+
+        recovery_action = "continue"
+        recovery_target: dict[str, Any] = {}
+        if diag_code == "reviewer_failed":
+            if current_lifecycle != "REVIEW_FAILED":
+                self._emit_owner_gate_once(pid, attempt_record, "reviewer_failed_lifecycle_changed")
+                return
+            from dev_orchestrator.control.reconcile import resolve_retry_candidate
+            retry_candidate, retry_reason = resolve_retry_candidate(snapshot, self.runtime_root, project_config)
+            if retry_candidate is None:
+                self._emit_owner_gate_once(pid, attempt_record, f"reviewer_retry_unavailable: {retry_reason}")
+                return
+            recovery_action = "retry"
+            recovery_target = {"target_id": retry_candidate["target_id"]}
 
         if diag_code == "agent_stalled":
             # R3-F1: agent_stalled recovery is only valid when the current snapshot lifecycle
@@ -1677,13 +1694,14 @@ class WatchdogCoordinator:
 
         # 1. RESERVE
         attempt_record["recovery"] = {
-            "action": "continue",
+            "action": recovery_action,
             "state": "reserved",
             "command_id": cid,
             "reserved_at": now_iso,
             "requested_at": None,
             "resolved_at": None,
-            "reason": f"automatic recovery for {diag_code}",
+            "reason": f"automatic {recovery_action} recovery for {diag_code}",
+            "target": copy.deepcopy(recovery_target),
         }
         recovery_slots[r_scope] = cid
         self._save_state(self._cached_state)
@@ -1693,8 +1711,9 @@ class WatchdogCoordinator:
             from dev_orchestrator.control.surface import project_identity
             from dev_orchestrator.core.control_commands import submit_control_command
             submit_control_command(
-                self.runtime_root, pid, "continue", command_id=cid,
+                self.runtime_root, pid, recovery_action, command_id=cid,
                 expected=project_identity(snapshot, self.runtime_root),
+                target=recovery_target,
             )
             attempt_record["recovery"]["state"] = "requested"
             attempt_record["recovery"]["requested_at"] = utc_now_iso()
@@ -1703,7 +1722,7 @@ class WatchdogCoordinator:
                 "RECOVERY_STARTED",
                 task_id=attempt_record.get("task_id"),
                 occurrence_key=f"{attempt_key}:recovery-start",
-                details={"source": "watchdog", "command_id": cid, "action": "continue"},
+                details={"source": "watchdog", "command_id": cid, "action": recovery_action},
             )
         except Exception as exc:
             attempt_record["recovery"]["state"] = "blocked"

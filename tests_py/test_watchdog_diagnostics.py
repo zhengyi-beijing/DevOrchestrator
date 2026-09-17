@@ -30,9 +30,9 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
     def tearDown(self):
         self.tmp_dir.cleanup()
 
-    def test_7_diagnostic_classifications(self):
-        """Verify all 7 diagnosis codes can be classified deterministically."""
-        self.assertEqual(len(DIAGNOSIS_CODES), 7)
+    def test_8_diagnostic_classifications(self):
+        """Verify all 8 diagnosis codes can be classified deterministically."""
+        self.assertEqual(len(DIAGNOSIS_CODES), 8)
         assessment = DummyAssessment()
 
         # 1. process_dead
@@ -45,7 +45,19 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag1.confidence, 1.0)
         self.assertFalse(diag1.owner_gate_required)
 
-        # 2. provider_or_quota_blocked
+        # 2. reviewer_failed
+        ev_review_failed = {
+            "process_liveness": {"process_alive": False, "pid": None},
+            "repository_truth": {"valid": True},
+            "ledgers": {"ai-reviewer.json": {"state": "failed", "reason": "broker timed out"}},
+        }
+        diag_review = classify_evidence(
+            ev_review_failed, DummyAssessment(lifecycle_state="REVIEW_FAILED")
+        )
+        self.assertEqual(diag_review.code, "reviewer_failed")
+        self.assertFalse(diag_review.owner_gate_required)
+
+        # 3. provider_or_quota_blocked
         ev_quota = {
             "process_liveness": {"process_alive": True, "pid": 1234},
             "broker": {"status": "rate_limit_exceeded (429)"},
@@ -55,7 +67,7 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag2.code, "provider_or_quota_blocked")
         self.assertTrue(diag2.owner_gate_required)
 
-        # 3. state_desync
+        # 4. state_desync
         ev_desync = {
             "process_liveness": {"process_alive": True, "pid": 1234},
             "ledgers": {"transition-executor.json": {"state": "completed"}},
@@ -65,7 +77,7 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag3.code, "state_desync")
         self.assertTrue(diag3.owner_gate_required)
 
-        # 4. external_wait
+        # 5. external_wait
         ev_wait = {
             "process_liveness": {"process_alive": True, "pid": 1234},
             "broker": {"status": "waiting_bridge"},
@@ -75,7 +87,7 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag4.code, "external_wait")
         self.assertTrue(diag4.owner_gate_required)
 
-        # 5. healthy_slow
+        # 6. healthy_slow
         ev_healthy = {
             "process_liveness": {"process_alive": True, "pid": 1234},
             "repository_truth": {"valid": True, "dirty": True, "uncommitted_files": ["f1.py"]},
@@ -85,7 +97,7 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag5.code, "healthy_slow")
         self.assertFalse(diag5.owner_gate_required)
 
-        # 6. agent_stalled
+        # 7. agent_stalled
         ev_stalled = {
             "process_liveness": {"process_alive": True, "pid": 1234},
             "repository_truth": {"valid": True, "dirty": False},
@@ -95,7 +107,7 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag6.code, "agent_stalled")
         self.assertFalse(diag6.owner_gate_required)
 
-        # 7. unknown (skipped deadline or ambiguous)
+        # 8. unknown (skipped deadline or ambiguous)
         ev_unknown = {
             "repository_truth": {"status": "skipped_deadline"},
         }

@@ -13,7 +13,7 @@ from dev_orchestrator.storage.json_store import read_json
 
 from .command_store import EXPECTED_IDENTITY_FIELDS
 from .owner_store import OwnerControlStore
-from .reconcile import resolve_reconcile_candidate
+from .reconcile import resolve_reconcile_candidate, resolve_retry_candidate
 from .store import ConversationControlStore
 
 
@@ -152,9 +152,8 @@ def project_control_view(
         (lifecycle == "READY_TO_RUN" and execution_ready)
         or planning_start_ready
     )
-    # Recovery ledgers expose evidence today, but no exact owner retry adapter
-    # exists yet. Keep the action visible and explicitly unavailable.
-    safe_retry = False
+    retry_target, retry_reason = resolve_retry_candidate(projected, runtime, project_config)
+    safe_retry = retry_target is not None
     bound = isinstance(binding, dict) and binding.get("state") == "bound"
     claim_guard_known = not bound or bridge_store is not None
     active_claim = False
@@ -218,7 +217,11 @@ def project_control_view(
         {"action": "pause", "available": not paused, "reason": "prevent future launches" if not paused else "project is already paused"},
         {"action": "resume", "available": paused, "reason": "clear launch barrier" if paused else "project is not paused"},
         {"action": "stop", "available": not paused and stoppable_active, "reason": stop_reason},
-        {"action": "retry", "available": safe_retry, "reason": "recovery-required state" if safe_retry else "no safe exact retry target"},
+        {
+            "action": "retry", "available": safe_retry,
+            "reason": "exact failed technical review can be retried" if safe_retry else retry_reason,
+            **({"target_id": retry_target["target_id"]} if retry_target is not None else {}),
+        },
         {
             "action": "reconcile", "available": reconcile_target is not None,
             "reason": "exact stale technical review can be re-anchored" if reconcile_target is not None else reconcile_reason,
