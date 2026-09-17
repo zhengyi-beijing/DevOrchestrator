@@ -74,36 +74,11 @@ Status: **FUTURE / design constraint frozen 2026-09-17**
 - Adapt reference concepts to DevO: execution trends, project health, provider/model utilization, bottleneck/recovery ranking, watchdog incidents and accounting evidence. Do not reproduce irrelevant OpenCode metrics.
 - Begin with a fixture-backed low-cost prototype; validate hierarchy before production styling changes.
 - Frozen design: docs/P12_7_WEB_UI_DESIGN.md.
-- P12.7 starts only after P12.6 closure and does not replace P13; P13 remains the Android/mobile client track.
+- P12.7 starts only after P12.6 closure and does not replace the P13/P14 roadmap; P13 is the remote-execution resilience foundation and P14 is the Android/mobile client track.
 
 ## P13 staged roadmap
 
-### P13 - Mobile Control & Observability
-
-Goal: provide an Android-native, failure-independent observation and bounded-control client for DevOrchestrator so project execution remains visible and controllable even when a ChatGPT conversation, browser session, or RDC interaction is stalled or unavailable.
-
-- Build the Android client on the stable P12 Control API; do not create a second lifecycle/control authority in the mobile application.
-- Connect Android directly to DevOrchestrator over the private Tailscale path; do not require RDC or a ChatGPT conversation in the normal mobile data/control path.
-- Show all configured projects with lifecycle/task/stage state, current role/worker, AI provider/model, current and next action, last-progress age, watchdog/diagnostic state and OWNER_GATE conditions.
-- Provide a project event timeline with execution/review/remediation/retry milestones and enough evidence to distinguish a genuinely running worker from stale orchestration state.
-- Use a push-style event channel (SSE or WebSocket, selected during P12 API design) for near-real-time updates; reconnect with bounded backoff and reconcile from authoritative DevO state after disconnects.
-- Provide guarded mobile controls for continue, pause/resume where supported, stop, retry/reconcile and OWNER_GATE actions; all mutations must use P12 DevO authority, idempotency and audit paths.
-- Treat ChatGPT, Android, Web Dashboard and CLI as stateless control/observation clients. No authoritative project state may live in the Android application or a ChatGPT conversation.
-- Preserve explicit `unknown`, disconnected and stale states instead of presenting cached data as live execution.
-- Initial POC should stay small: project list/detail, event stream, connection/reconnect handling, stall alerting, and the minimum bounded controls needed to validate the architecture before expanding UI scope.
-- Stall alerting is a P13 core requirement, not a later enhancement. Consume authoritative DevO/P11-P12 progress timestamps and stall/watchdog state rather than inferring progress only from Android-side timers.
-- When an actively executing development project exceeds its configured no-progress threshold, raise an Android notification with vibration and an optional audible alarm; the alert must identify project, task/stage, last-progress age and the best-known stall/diagnostic reason.
-- Support per-project/global alert policy including enable/disable, no-progress threshold, sound/vibration mode, quiet-hours behavior and acknowledgement/snooze. Deduplicate repeated alerts for the same stall episode and re-arm only after authoritative progress resumes or the stall state materially changes.
-- Do not alert merely because a legitimate long-running build/test/review has produced no UI event: DevO should expose heartbeat/expected-long-operation evidence so the client can distinguish expected waiting from loss of progress. Disconnected/unknown state is a separate connectivity alert class and must not be mislabeled as project stall.
-- Later P13 increments may add voice capture/control and Bluetooth-ring navigation/confirm/cancel, reusing the same Control API rather than introducing a separate command channel.
-- Acceptance: with the ChatGPT/browser path intentionally unavailable, an operator on Android over Tailscale can determine whether a selected project is actively progressing or stalled, inspect recent authoritative events, execute supported bounded controls without RDC or direct shell access, and receive a vibration/audible notification when an active development project enters a confirmed no-progress condition.
-
-Sequence: P13 follows P12. P12 owns and stabilizes the machine-readable Control/Event API; P13 is a client of that contract and must not duplicate DevOrchestrator lifecycle logic.
-
-
-## P14 staged roadmap
-
-### P14 - Remote Execution Resilience & Recoverable Jobs
+### P13 - Remote Execution Resilience & Recoverable Jobs
 
 Goal: make long-running RDC/remote-shell work recoverable when the ChatGPT message/tool-result path times out, reconnects, or loses a synchronous response, without duplicating side effects or losing authoritative execution state.
 
@@ -116,10 +91,34 @@ Goal: make long-running RDC/remote-shell work recoverable when the ChatGPT messa
 - Add long-operation classification/heartbeat so builds, tests, package operations, and provider runs can report `running` with evidence rather than being mislabeled as stalled merely because no terminal output has arrived.
 - Prefer short single-purpose shell steps over large chained commands. Build/configure/test/git/diagnostic phases should be separately attributable and recoverable; Windows PowerShell 5.1 `&&`/`||` remains prohibited by verified failure memory.
 - Define explicit states at minimum: `queued`, `running`, `completed`, `failed`, `cancel_requested`, `cancelled`, `unknown/recovery_required`, plus transport connectivity/freshness evidence independent of job lifecycle.
-- Integrate with watchdog/accounting: distinguish expected long-running work, remote-process hang, RDC disconnect/reconnect, lost tool-result delivery, and true no-progress stalls; expose the classification on the 8770 control surface and future P13 mobile client.
+- Integrate with watchdog/accounting: distinguish expected long-running work, remote-process hang, RDC disconnect/reconnect, lost tool-result delivery, and true no-progress stalls; expose the classification on the 8770 control surface and future P14 mobile client.
 - `Retry` after an ambiguous timeout must be fail-safe: first reconcile the prior command/job and only create new work when durable evidence proves no equivalent execution exists.
 - Preserve DevOrchestrator as lifecycle authority. RDC/remote agent owns process execution evidence only and must not independently advance project task/review/remediation state.
 
 Acceptance: intentionally interrupt or time out the ChatGPT/RDC response path during a long-running test/build, verify the remote job continues, reconnect from a later turn, recover the same `job_id` and bounded logs/result, and prove repeated retry/reconcile operations create no duplicate side effects. Also verify deterministic classification for remote process still running, process completed but result delivery lost, RDC disconnected, command genuinely failed, and state genuinely unknown.
 
-Sequence: P14 follows the P13 mobile-control track in the roadmap, but its durable job/idempotency contract should be designed so P13 can consume the same authoritative execution state rather than introducing a second monitoring model.
+Sequence: P13 follows P12.7 in the staged roadmap and establishes the durable job/idempotency contract before mobile work. P14 must consume this authoritative execution state rather than introducing a second monitoring model.
+
+## P14 staged roadmap
+
+### P14 - Mobile Control & Observability
+
+Goal: provide an Android-native, failure-independent observation and bounded-control client for DevOrchestrator so project execution remains visible and controllable even when a ChatGPT conversation, browser session, or RDC interaction is stalled or unavailable.
+
+- Build the Android client on the stable P12 Control API; do not create a second lifecycle/control authority in the mobile application.
+- Connect Android directly to DevOrchestrator over the private Tailscale path; do not require RDC or a ChatGPT conversation in the normal mobile data/control path.
+- Show all configured projects with lifecycle/task/stage state, current role/worker, AI provider/model, current and next action, last-progress age, watchdog/diagnostic state and OWNER_GATE conditions.
+- Provide a project event timeline with execution/review/remediation/retry milestones and enough evidence to distinguish a genuinely running worker from stale orchestration state.
+- Use a push-style event channel (SSE or WebSocket, selected during P12 API design) for near-real-time updates; reconnect with bounded backoff and reconcile from authoritative DevO state after disconnects.
+- Provide guarded mobile controls for continue, pause/resume where supported, stop, retry/reconcile and OWNER_GATE actions; all mutations must use P12 DevO authority, idempotency and audit paths.
+- Treat ChatGPT, Android, Web Dashboard and CLI as stateless control/observation clients. No authoritative project state may live in the Android application or a ChatGPT conversation.
+- Preserve explicit `unknown`, disconnected and stale states instead of presenting cached data as live execution.
+- Initial POC should stay small: project list/detail, event stream, connection/reconnect handling, stall alerting, and the minimum bounded controls needed to validate the architecture before expanding UI scope.
+- Stall alerting is a P14 core requirement, not a later enhancement. Consume authoritative DevO/P11-P12 progress timestamps and stall/watchdog state rather than inferring progress only from Android-side timers.
+- When an actively executing development project exceeds its configured no-progress threshold, raise an Android notification with vibration and an optional audible alarm; the alert must identify project, task/stage, last-progress age and the best-known stall/diagnostic reason.
+- Support per-project/global alert policy including enable/disable, no-progress threshold, sound/vibration mode, quiet-hours behavior and acknowledgement/snooze. Deduplicate repeated alerts for the same stall episode and re-arm only after authoritative progress resumes or the stall state materially changes.
+- Do not alert merely because a legitimate long-running build/test/review has produced no UI event: DevO should expose heartbeat/expected-long-operation evidence so the client can distinguish expected waiting from loss of progress. Disconnected/unknown state is a separate connectivity alert class and must not be mislabeled as project stall.
+- Later P14 increments may add voice capture/control and Bluetooth-ring navigation/confirm/cancel, reusing the same Control API rather than introducing a separate command channel.
+- Acceptance: with the ChatGPT/browser path intentionally unavailable, an operator on Android over Tailscale can determine whether a selected project is actively progressing or stalled, inspect recent authoritative events, execute supported bounded controls without RDC or direct shell access, and receive a vibration/audible notification when an active development project enters a confirmed no-progress condition.
+
+Sequence: P14 follows P13. P12 owns the lifecycle/control contract; P13 adds durable recoverable remote-job state; P14 consumes both contracts and must not duplicate DevOrchestrator lifecycle or execution authority.
