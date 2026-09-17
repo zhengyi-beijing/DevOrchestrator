@@ -447,3 +447,14 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax checks (`node --check web/app.js` and `node --check browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Updated `docs/P12_6_PERSISTENT_HARNESS_ACCEPTANCE.md` focused test results (65 passed, 8 subtests passed) and added full regression evidence (602 passed, 33 subtests passed).
   - Verified canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
+
+## P12.6 Review-Failure Recovery / P12.7 Handoff Update (2026-09-17)
+
+- The final P12.6 independent technical reviewer on clean HEAD `f4526b9` failed only because the Broker invocation timed out after 1800 seconds; no review decision was produced and no Worker rerun is required.
+- Root cause of no unattended recovery: `src/monitor.ps1` observes only; watchdog did not monitor `REVIEW_FAILED`; project auto recovery was disabled; reviewer failure classified as `unknown`; and the P12 control surface hard-coded `safe_retry = False`.
+- Commit `6f14df8` adds exact failed technical-review retry, preserving the failed row and creating a new `ai_review:retry:<command-id>` lineage. Eligibility requires same project/task/branch/current clean HEAD, no active role, no existing decision, and infrastructure-style review failure.
+- Commit `3937777` adds `REVIEW_FAILED` watchdog monitoring/diagnosis and routes only that diagnosis to exact `retry`; Worker stall/dead recovery remains on its separate bounded `continue` path.
+- Focused reviewer/watchdog recovery regression passed (82 tests); latest full unittest-style regression completed with 546 tests OK.
+- Commit `1d31f42` freezes P12.7 UI direction: reference `https://opencode.ai/data` for dense, restrained, freshness-explicit information architecture; keep DevO project/role/resource/execution/watchdog semantics and all P12 lifecycle authority unchanged.
+- Live runtime after these commits: lifecycle `REVIEW_FAILED`, no active execution/role, watchdog diagnosis `reviewer_failed`. Exact retry is currently blocked because `docs/backlog.md` is modified in the canonical worktree. Preserve that pending change; do not reset it implicitly.
+- Continuation order: safely resolve the pending `docs/backlog.md` worktree change -> clean canonical tree -> allow exact reviewer retry/watchdog recovery -> require independent `NEXT` with no blockers -> mark P12.6 closed -> only then start P12.7.

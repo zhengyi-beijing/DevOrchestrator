@@ -5,9 +5,17 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12.6 Persistent Harness Acceptance and Closure** — **REMEDIATION COMPLETE / READY FOR TECHNICAL RE-REVIEW**.
+Current task: **P12.6 Persistent Harness Acceptance and Closure** — **RECOVERY FIX IMPLEMENTED / FINAL INDEPENDENT RE-REVIEW STILL PENDING**.
 
-Staged roadmap handoff is now P12.5 -> P12.6. P12.6 review remediation is complete with positive capability-qualified stop evidence enforcement (`interrupt_supported is True`), fail-closed CLI fallback stop semantics, acceptance doc whitespace corrections, and dedicated regression tests; ready for independent technical re-review.
+Latest continuation state (2026-09-17):
+- Canonical `main` HEAD is `1d31f42` (`docs(p12.7): freeze OpenCode-inspired web UI direction`), ahead of `origin/main` by 6 commits.
+- P12.6 exact failed-review recovery is implemented in `6f14df8` and watchdog `REVIEW_FAILED` support/config validation in `3937777`. Historical failed review evidence is preserved; retries create a new `ai_review:retry:<command-id>` lineage and never rerun Worker.
+- Root cause of the earlier no-recovery behavior: `src/monitor.ps1` is observation-only; watchdog originally did not monitor `REVIEW_FAILED`, project `auto_recovery` was false, and diagnostics classified reviewer failure as `unknown`. These gaps are now bounded to reviewer-failure exact retry rather than generic `continue`.
+- Latest focused recovery/watchdog regression passed (82 tests). Latest full unittest-style regression completed with 546 tests OK.
+- Live runtime currently projects `REVIEW_FAILED`, no active execution/role, watchdog diagnosis `reviewer_failed`; exact retry is currently unavailable because the canonical worktree is dirty only from an uncommitted `docs/backlog.md` change. Do not discard or overwrite that file implicitly.
+- P12.7 visual/IA direction is frozen in `1d31f42`: use `https://opencode.ai/data` as reference for dense, restrained, freshness-explicit operations UI; preserve DevO lifecycle/control semantics. `docs/P12_7_WEB_UI_DESIGN.md` is the frozen design, and P12.7 starts only after P12.6 closure.
+
+Immediate continuation rule: preserve `docs/backlog.md`, restore a clean canonical worktree through an explicit safe handling of that pending change, let watchdog/exact retry launch a fresh independent reviewer on the same current task/HEAD, require `NEXT` with no blockers, then close P12.6 before starting P12.7.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.

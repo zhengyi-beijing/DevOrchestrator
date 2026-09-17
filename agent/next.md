@@ -1,10 +1,12 @@
 # P12.6 Persistent Harness Acceptance and Closure
 
-Status: **READY_TO_RUN**
+Status: **IMPLEMENTATION COMPLETE / REVIEW-FAILURE RECOVERY FIXED / FINAL RE-REVIEW PENDING**
 
-Design authorization: **P12.5 completion handoff / 2026-09-16**
+Design authorization: **completed**
 
-Implementation authorization: **OWNER START REQUIRED**
+Implementation authorization: **owner-authorized and executed**
+
+Current continuation: exact reviewer retry + `REVIEW_FAILED` watchdog recovery are implemented. Do not rerun Worker. Preserve the failed reviewer audit row. Current runtime is blocked only because the canonical worktree has an uncommitted `docs/backlog.md` change; handle that pending change safely, regain a clean worktree, then allow a fresh independent technical review on the same P12.6 lineage. Close P12.6 only on `NEXT` with no blocking findings. P12.7 is staged after closure and must not start early.
 
 Goal: close the existing P12.6 AIBroker persistent-harness capability through
 bounded verification and operational evidence. This task verifies the
