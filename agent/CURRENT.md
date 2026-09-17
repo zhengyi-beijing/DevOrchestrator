@@ -5,9 +5,9 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12.6 Persistent Harness Acceptance and Closure** ? **PENDING DESIGN / OWNER START REQUIRED**.
+Current task: **P12.6 Persistent Harness Acceptance and Closure** — **IMPLEMENTATION COMPLETE / READY FOR TECHNICAL REVIEW**.
 
-Staged roadmap handoff is now P12.5 -> P12.6. P12.5 is closed after independent technical review; P12.6 is the active staged task and requires explicit owner start before implementation.
+Staged roadmap handoff is now P12.5 -> P12.6. P12.6 implementation is complete with dedicated loopback acceptance tests, transport hardening, and acceptance documentation; ready for independent technical review.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
@@ -140,3 +140,14 @@ P12.5 independent closure review (2026-09-17):
 - Verdict: `NEXT`; blocking findings: none. The reviewer accepted all five post-reanchor closure criteria, recovery lineage/consumption, fail-closed guards, command idempotency, and barrier precedence at HEAD `05129fc8c5ae90d19e3b3e20c2ffe1b757a83fce`.
 - Non-blocking notes only: cosmetic blocked-reason precedence when two barriers coincide; harmless `None` member in `consumed_sources`; theoretical reconcile replay equality if both task IDs are absent, constrained away by valid reconcile target requirements.
 - P12.5 is CLOSED. Active handoff is P12.6, which remains `PENDING DESIGN` and `OWNER START REQUIRED`.
+
+P12.6 persistent harness acceptance result (2026-09-17):
+- Implemented loopback-only HTTP URL validation in `AIBrokerExecutionPort._service_call`, rejecting non-HTTP schemes, non-loopback hosts, query/fragment parameters, and credentials.
+- Blocked HTTP redirects via `_NoRedirectHandler` and redacted service tokens from diagnostics and exception logs.
+- Quoted exact request identifiers safely in status and interrupt routes; 404 responses return `None`.
+- Hardened `ControlCommandCoordinator._stop` to require exact correlated Broker evidence (`status` in `interrupted`, `failed`, `cancelled` and `interrupt_supported is not False`); unsupported, unconfirmed, missing, or mismatched evidence fails closed with retained durable pause (`effect="pause_future_launches"`, `state="failed"`).
+- Added dedicated acceptance suite in `tests_py/test_p12_6_persistent_harness_acceptance.py` using an ephemeral loopback HTTP server fixture covering authenticated dispatch, correlation, lifecycle neutrality, pre-launch pause barrier, active-run pause, exact stop interrupt, fail-closed stop, cross-project isolation, restart reconciliation projections, and CLI fallback.
+- Updated `docs/AIBROKER_INTEGRATION_CONTRACT.md` and authored `docs/P12_6_PERSISTENT_HARNESS_ACCEPTANCE.md`.
+- Focused persistent harness regression: 64 passed, 8 subtests passed.
+- Full regression: 601 passed, 33 subtests passed in 198.18s. Python compilation, JavaScript syntax checks, and `git diff --check` passed cleanly.
+- Knowledge graph refreshed via `graphify update .`: 3046 nodes, 8390 edges, 152 communities.

@@ -1,6 +1,7 @@
 """Process-isolated AIResourceBroker execution port."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import subprocess
@@ -20,6 +21,80 @@ if TYPE_CHECKING:
 
 class AIBrokerInvocationError(RuntimeError):
     """The broker transport/contract failed before a valid dispatch result."""
+
+
+def sanitize_url(url: str) -> str:
+    """Remove userinfo / credentials from URL for safe diagnostics."""
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            hostname = parsed.hostname or ""
+            try:
+                host_part = f"[{hostname}]" if ipaddress.ip_address(hostname).version == 6 else hostname
+            except ValueError:
+                host_part = hostname
+            port_part = f":{parsed.port}" if parsed.port is not None else ""
+            return urllib.parse.urlunsplit((
+                parsed.scheme,
+                f"{host_part}{port_part}",
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            ))
+    except Exception:
+        pass
+    return url
+
+
+def validate_loopback_url(url: str, param_name: str = "broker service_url") -> str:
+    """Validate that url is an HTTP loopback endpoint without credentials and return normalized base URL."""
+    if not url or not isinstance(url, str):
+        raise AIBrokerInvocationError(f"{param_name} must be a non-empty string")
+    stripped = url.strip()
+    parsed = urllib.parse.urlsplit(stripped)
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise AIBrokerInvocationError(f"{param_name} must not contain credentials")
+    if parsed.scheme.lower() != "http":
+        raise AIBrokerInvocationError(f"{param_name} must be loopback HTTP: {sanitize_url(url)!r}")
+    if not parsed.hostname:
+        raise AIBrokerInvocationError(f"{param_name} missing hostname: {sanitize_url(url)!r}")
+    hostname = parsed.hostname.lower()
+    is_loop = False
+    try:
+        is_loop = ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        is_loop = (hostname == "localhost")
+    if not is_loop:
+        raise AIBrokerInvocationError(f"{param_name} must be loopback HTTP: {sanitize_url(url)!r}")
+    if parsed.query or parsed.fragment:
+        raise AIBrokerInvocationError(f"{param_name} must not contain query or fragment parameters")
+    port_part = f":{parsed.port}" if parsed.port is not None else ""
+    host_part = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{parsed.scheme.lower()}://{host_part}{port_part}".rstrip("/")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP redirects to prevent navigating outside validated loopback endpoints."""
+
+    def redirect_request(
+        self, req: urllib.request.Request, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> None:
+        return None
+
+    def http_error_301(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"HTTP redirect {code} not permitted", headers, fp
+        )
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+
+_SERVICE_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
 _RESOURCE_FAILURE_CODES = {
@@ -236,16 +311,16 @@ class AIBrokerExecutionPort:
 
     def status(self, request_id: str) -> dict[str, Any] | None:
         if self.config.service_url:
-            payload = self._service_call("/api/dispatches/" + urllib.parse.quote(request_id), None)
+            payload = self._service_call("/api/dispatches/" + urllib.parse.quote(str(request_id), safe=""), None)
             return None if payload.get("status") == "not_found" else payload
-        payload = self._reconcile_call(["dispatch-status", request_id])
+        payload = self._reconcile_call(["dispatch-status", str(request_id)])
         return None if payload.get("status") == "not_found" else payload
 
     def interrupt(self, request_id: str, reason: str) -> dict[str, Any] | None:
         if self.config.service_url:
-            payload = self._service_call("/api/dispatches/" + urllib.parse.quote(request_id) + "/interrupt", {"reason": reason})
+            payload = self._service_call("/api/dispatches/" + urllib.parse.quote(str(request_id), safe="") + "/interrupt", {"reason": reason})
             return None if payload.get("status") == "not_found" else payload
-        payload = self._reconcile_call(["interrupt-dispatch", request_id, "--reason", reason])
+        payload = self._reconcile_call(["interrupt-dispatch", str(request_id), "--reason", reason])
         return None if payload.get("status") == "not_found" else payload
 
     def _reconcile_call(self, args: list[str]) -> dict[str, Any]:
@@ -297,21 +372,51 @@ class AIBrokerExecutionPort:
         return timeout
 
     def _service_call(self, path: str, payload: Mapping[str, Any] | None) -> dict[str, Any]:
-        base = (self.config.service_url or "").rstrip("/")
-        if not base.startswith("http://127.0.0.1") and not base.startswith("http://localhost"):
-            raise AIBrokerInvocationError("broker service_url must be loopback HTTP")
+        base = validate_loopback_url(self.config.service_url or "")
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         headers = {"Accept": "application/json"}
-        if data is not None: headers["Content-Type"] = "application/json"
-        if self.config.service_token: headers["X-AIResourceBroker-Token"] = self.config.service_token
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        if self.config.service_token:
+            headers["X-AIResourceBroker-Token"] = self.config.service_token
+        req = urllib.request.Request(
+            base + path,
+            data=data,
+            headers=headers,
+            method="POST" if data is not None else "GET",
+        )
+        safe_target = sanitize_url(base + path)
         try:
-            with urllib.request.urlopen(urllib.request.Request(base + path, data=data, headers=headers, method="POST" if data is not None else "GET"), timeout=self._service_timeout_seconds(path, payload)) as response:
+            with _SERVICE_OPENER.open(
+                req,
+                timeout=self._service_timeout_seconds(path, payload),
+            ) as response:
                 body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                try:
+                    raw = exc.read().decode("utf-8")
+                    parsed_404 = json.loads(raw)
+                    if isinstance(parsed_404, dict) and parsed_404.get("status") == "not_found":
+                        return parsed_404
+                except Exception:
+                    pass
+                return {"status": "not_found"}
+            if 300 <= exc.code < 400:
+                raise AIBrokerInvocationError(f"broker service redirect not permitted ({exc.code})") from exc
+            err_detail = f"HTTP {exc.code} for {safe_target}"
+            raise AIBrokerInvocationError(f"broker service invocation failed: {err_detail}") from exc
         except (OSError, urllib.error.URLError) as exc:
-            raise AIBrokerInvocationError(f"broker service invocation failed: {exc}") from exc
-        try: result = json.loads(body)
-        except json.JSONDecodeError as exc: raise AIBrokerInvocationError("broker service returned invalid JSON") from exc
-        if not isinstance(result, dict): raise AIBrokerInvocationError("broker service result must be an object")
+            err_msg = str(exc)
+            if self.config.service_token and self.config.service_token in err_msg:
+                err_msg = err_msg.replace(self.config.service_token, "[REDACTED]")
+            raise AIBrokerInvocationError(f"broker service invocation failed for {safe_target}: {err_msg}") from exc
+        try:
+            result = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise AIBrokerInvocationError("broker service returned invalid JSON") from exc
+        if not isinstance(result, dict):
+            raise AIBrokerInvocationError("broker service result must be an object")
         return result
 
     def _build_argv(self, request: AIRoleRequest, prompt_file: Path) -> list[str]:

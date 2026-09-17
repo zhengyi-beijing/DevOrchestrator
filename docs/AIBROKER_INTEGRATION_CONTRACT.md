@@ -16,6 +16,14 @@ status and exact-interrupt requests to AIBroker's persistent service rather
 than spawning `python -m ai_resource_broker.cli dispatch`. Existing
 configuration without `service_url` retains the CLI compatibility path.
 
+Persistent service transport enforces:
+- Strict loopback HTTP URL validation (127.0.0.1, localhost, or [::1]);
+  credentials, remote hosts, non-HTTP schemes, queries, and fragments are rejected.
+- HTTP redirects (301, 302, 303, 307, 308) are rejected and never followed.
+- Service tokens are authenticated via `X-AIResourceBroker-Token` and redacted
+  from all diagnostics and error messages.
+- Request identifiers are exact-encoded with special character escaping.
+
 AIBroker owns session allocation/reuse, provider/account/model selection,
 native harness processes and worktree writer leases. DevOrchestrator retains
 its pause barrier: pause prevents a new port `execute` call, but does not claim
@@ -23,12 +31,29 @@ to interrupt an active harness unless the returned AIBroker capability proves
 an exact managed interrupt. RDC is bootstrap, inspection and recovery only;
 it is not in the normal coding inner loop.
 
+Stopping an active Broker execution requires exact correlated Broker confirmation:
+- Mismatched request ID, unsupported harness interruption (`interrupt_supported=False`),
+  missing/404 target, or unconfirmed status fails closed: the command outcome reports
+  `state="failed"`, durable pause is retained, and `pause_and_interrupt` is not claimed.
+- Unrelated projects and executions remain untouched.
+
 For a writable isolated checkout, DevOrchestrator includes the task run id and
 an explicit `managed_worktree` request metadata flag. AIBroker then owns the
 Git worktree lease and cleanup evidence; it will not automatically claim an
 observed canonical/live worktree.
 
-A single Broker dispatch decides once and executes at most one resource. It never interprets NEXT, REMEDIATE, OWNER_GATE, STOP, task advancement, or project stages, and it performs no automatic provider fallback or task remediation.
+A single Broker dispatch decides once and executes at most one resource. One
+DevOrchestrator execute call produces exactly one Broker dispatch and one
+execution-ledger record. TransitionExecutor records Broker output strictly as
+execution evidence: AIBroker never interprets NEXT, REMEDIATE, OWNER_GATE, STOP,
+task advancement, or project stages, and it performs no automatic provider
+fallback or task remediation.
+
+Restart reconciliation queries the persistent status endpoint: succeeded work
+projects to completed, explicit provider failure remains failed, and running or
+unresolved dispatches project to recovery_required without automatic replay.
+Only an exact managed-stop reason plus unchanged repository truth qualifies a
+safe owner retry.
 
 ## Opt-in migration
 

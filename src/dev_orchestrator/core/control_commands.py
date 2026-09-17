@@ -532,10 +532,29 @@ class ControlCommandCoordinator:
         interrupt = getattr(port, "interrupt", None)
         if not callable(interrupt):
             return {**result, "state": "failed", "reason": "pause retained; AIBroker interruption is unavailable"}
+        target_request_id = str(latest["broker_request_id"])
         try:
-            fact = interrupt(str(latest["broker_request_id"]), "explicit P12 owner stop")
+            fact = interrupt(target_request_id, "explicit P12 owner stop")
         except Exception as exc:  # noqa: BLE001 - pause remains the safe effect
             return {**result, "state": "failed", "reason": f"pause retained; interruption failed: {exc}"}
+        if fact is None:
+            return {**result, "state": "failed", "reason": "pause retained; AIBroker interruption target not found"}
+        if not isinstance(fact, dict):
+            return {**result, "state": "failed", "reason": "pause retained; AIBroker interruption returned invalid evidence"}
+        if str(fact.get("request_id") or "") != target_request_id:
+            return {
+                **result,
+                "state": "failed",
+                "reason": f"pause retained; AIBroker interruption request_id mismatch: expected {target_request_id!r}, got {fact.get('request_id')!r}",
+            }
+        if fact.get("interrupt_supported") is False:
+            return {**result, "state": "failed", "reason": "pause retained; AIBroker persistent harness interruption unsupported"}
+        if fact.get("status") not in {"interrupted", "failed", "cancelled"}:
+            return {
+                **result,
+                "state": "failed",
+                "reason": f"pause retained; AIBroker interruption was not confirmed (status={fact.get('status')!r})",
+            }
         return {**result, "effect": "pause_and_interrupt", "interruption": fact, "execution_id": latest.get("source_request_id")}
 
     def _conversation_action(

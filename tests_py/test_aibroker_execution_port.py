@@ -3,6 +3,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -285,6 +287,97 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         self.assertTrue(call.call_args.args[1]["managed_worktree"])
         self.assertTrue(call.call_args.args[1]["probe"])
         run.assert_not_called()
+
+    def test_service_url_validation_rejects_credentials_and_non_loopback(self):
+        invalid_urls = [
+            ("http://user:pass@127.0.0.1:8876", "must not contain credentials"),
+            ("http://example.com:8876", "must be loopback HTTP"),
+            ("http://192.168.1.10:8876", "must be loopback HTTP"),
+            ("https://127.0.0.1:8876", "must be loopback HTTP"),
+            ("http://127.0.0.1:8876/api?query=1", "must not contain query or fragment parameters"),
+            ("http://127.0.0.1:8876/api#frag", "must not contain query or fragment parameters"),
+        ]
+        for url, expected_error in invalid_urls:
+            port = AIBrokerExecutionPort(AIBrokerClientConfig(
+                python_executable=Path(sys.executable), broker_repo=self.root / "broker",
+                config_path=self.root / "resources.yaml", service_url=url,
+                service_token="test-token",
+            ))
+            with self.assertRaises(AIBrokerInvocationError) as ctx:
+                port.status("req-1")
+            self.assertIn(expected_error, str(ctx.exception))
+
+    def test_service_call_rejects_http_redirects(self):
+        port = AIBrokerExecutionPort(AIBrokerClientConfig(
+            python_executable=Path(sys.executable), broker_repo=self.root / "broker",
+            config_path=self.root / "resources.yaml", service_url="http://127.0.0.1:8876",
+            service_token="test-token",
+        ))
+        redirect_err = urllib.error.HTTPError("http://127.0.0.1:8876/api/dispatch", 302, "Found", {}, None)
+        with patch("dev_orchestrator.ai.aibroker_subprocess._SERVICE_OPENER.open", side_effect=redirect_err):
+            with self.assertRaises(AIBrokerInvocationError) as ctx:
+                port.execute(self.request())
+            self.assertIn("redirect not permitted", str(ctx.exception))
+
+    def test_service_call_redacts_token_in_diagnostics(self):
+        secret_token = "super-secret-service-token-12345"
+        port = AIBrokerExecutionPort(AIBrokerClientConfig(
+            python_executable=Path(sys.executable), broker_repo=self.root / "broker",
+            config_path=self.root / "resources.yaml", service_url="http://127.0.0.1:8876",
+            service_token=secret_token,
+        ))
+        conn_err = urllib.error.URLError(f"Connection refused with {secret_token}")
+        with patch("dev_orchestrator.ai.aibroker_subprocess._SERVICE_OPENER.open", side_effect=conn_err):
+            with self.assertRaises(AIBrokerInvocationError) as ctx:
+                port.status("req-1")
+            self.assertNotIn(secret_token, str(ctx.exception))
+            self.assertIn("[REDACTED]", str(ctx.exception))
+
+    def test_status_and_interrupt_quote_request_id_safely(self):
+        port = AIBrokerExecutionPort(AIBrokerClientConfig(
+            python_executable=Path(sys.executable), broker_repo=self.root / "broker",
+            config_path=self.root / "resources.yaml", service_url="http://127.0.0.1:8876",
+            service_token="token",
+        ))
+        calls = []
+        def fake_service_call(path, payload):
+            calls.append((path, payload))
+            return {"request_id": "req/with:slashes?and#symbols", "status": "running"}
+
+        with patch.object(port, "_service_call", side_effect=fake_service_call):
+            port.status("req/with:slashes?and#symbols")
+            port.interrupt("req/with:slashes?and#symbols", "test-reason")
+
+        self.assertEqual(calls[0][0], "/api/dispatches/req%2Fwith%3Aslashes%3Fand%23symbols")
+        self.assertEqual(calls[1][0], "/api/dispatches/req%2Fwith%3Aslashes%3Fand%23symbols/interrupt")
+
+    def test_status_and_interrupt_404_returns_none(self):
+        port = AIBrokerExecutionPort(AIBrokerClientConfig(
+            python_executable=Path(sys.executable), broker_repo=self.root / "broker",
+            config_path=self.root / "resources.yaml", service_url="http://127.0.0.1:8876",
+            service_token="token",
+        ))
+        err_404 = urllib.error.HTTPError(
+            "http://127.0.0.1:8876/api/dispatches/nonexistent", 404, "Not Found", {}, None
+        )
+        with patch("dev_orchestrator.ai.aibroker_subprocess._SERVICE_OPENER.open", side_effect=err_404):
+            self.assertIsNone(port.status("nonexistent"))
+            self.assertIsNone(port.interrupt("nonexistent", "test-reason"))
+
+    @patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run")
+    def test_cli_fallback_when_service_url_absent_preserves_subprocess(self, run):
+        # Even when service_token is provided, absence of service_url preserves CLI transport
+        port = AIBrokerExecutionPort(AIBrokerClientConfig(
+            python_executable=Path(sys.executable), broker_repo=self.root / "broker",
+            config_path=self.root / "resources.yaml", service_url=None,
+            service_token="token-without-url",
+        ))
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(self.payload()), stderr=""
+        )
+        result = port.execute(self.request())
+        self.assertEqual(result.status, "succeeded")
+        self.assertTrue(run.called)
 
 
 if __name__ == "__main__":

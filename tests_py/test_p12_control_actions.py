@@ -182,6 +182,38 @@ class P12ActionTests(unittest.TestCase):
             self.assertEqual(blocked["state"], "blocked")
             self.assertFalse(OwnerControlStore(runtime).is_paused("p1"))
 
+    def test_stop_fails_closed_when_interrupt_evidence_is_unconfirmed_or_mismatched(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); _, config, runtime, snapshot = self.fixture(base)
+
+            cases = [
+                # (return_value, expected_reason_substring)
+                ({"request_id": "mismatched-req", "status": "interrupted"}, "request_id mismatch"),
+                ({"request_id": "broker-1", "interrupt_supported": False, "status": "running"}, "interruption unsupported"),
+                ({"request_id": "broker-1", "status": "running"}, "interruption was not confirmed"),
+                (None, "interruption target not found"),
+                ("not-a-dict", "returned invalid evidence"),
+            ]
+
+            for i, (mock_return, expected_reason) in enumerate(cases):
+                cmd_id = f"stop-fail-{i}"
+                OwnerControlStore(runtime).set_paused("p1", False, command_id=f"resume-{i}", action="resume")
+                class CustomInterruptPort:
+                    def interrupt(self, req_id, reason):
+                        return mock_return
+
+                executor = FakeExecutor()
+                executor._ai_execution_port = CustomInterruptPort()
+                executor.records["run-1"] = {
+                    "source_request_id": "run-1", "project_id": "p1", "state": "running",
+                    "engine": "aibroker", "broker_request_id": "broker-1", "started_at": "2026-01-01T00:00:00Z",
+                }
+                _, outcome = self.consume(runtime, config, snapshot, "stop", executor=executor)
+                self.assertEqual(outcome["state"], "failed")
+                self.assertEqual(outcome["effect"], "pause_future_launches")
+                self.assertIn(expected_reason, outcome["reason"])
+                self.assertTrue(OwnerControlStore(runtime).is_paused("p1"))
+
     def test_stop_is_isolated_from_other_project_execution_and_owner_state(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo, config, runtime, snapshot = self.fixture(base)

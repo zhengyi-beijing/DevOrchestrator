@@ -403,3 +403,31 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
 - Reviewer accepted fail-closed malformed overview handling, IPv6 loopback bracket preservation, reconcile crash/restart idempotency, exact re-anchored REMEDIATE owner-continue recovery with immutable history, and descendant recovery-barrier precedence.
 - Non-blocking findings: cosmetic diagnostic reason precedence; harmless `None` in the consumed-source set; theoretical both-task-ids-missing equality in reconcile replay, constrained away by valid target requirements.
 - P12.5 closure is accepted. Handoff target is `agent/staged/P12.6.md`; P12.6 remains `PENDING DESIGN` with `OWNER START REQUIRED`.
+
+## P12.6 Persistent Harness Acceptance and Closure (2026-09-17)
+
+- Verified the documented `runtime/aibroker-execution.json` persistent-service path (`service_url` and `service_token`) using an ephemeral loopback HTTP Broker fixture without invoking live model providers.
+- Hardened persistent transport in `src/dev_orchestrator/ai/aibroker_subprocess.py`:
+  - Enforced strict loopback HTTP URLs (127.0.0.1, localhost, [::1]); rejected credentials, non-loopback hosts, non-HTTP schemes, and query/fragment parameters.
+  - Rejection of HTTP redirects (301, 302, 303, 307, 308) via `_NoRedirectHandler`.
+  - Service token redaction from all diagnostics and error messages.
+  - Exact URL-encoded request identifiers in status and interrupt routes (`safe=""`).
+  - Safe 404 handling returning `None` for missing dispatches.
+  - Preserved subprocess CLI fallback when `service_url` is absent.
+- Hardened `ControlCommandCoordinator._stop`:
+  - Requires exact correlated Broker confirmation (`request_id` match, `interrupt_supported is not False`, status in `interrupted`, `failed`, `cancelled`) before reporting `pause_and_interrupt`.
+  - Unconfirmed, unsupported, missing, or mismatched evidence retains the durable pause barrier while reporting `pause_future_launches` with `state="failed"`.
+  - Unrelated projects and executions remain untouched.
+- Verified ownership boundary:
+  - AIBroker owns session/resource allocation and managed-worktree lease evidence.
+  - DevOrchestrator alone owns task, stage, review, remediation, owner gates, pause, and stop transitions.
+  - One DevOrchestrator execute call produces exactly one Broker dispatch and one execution ledger record.
+  - Lifecycle neutrality: Broker output containing lifecycle commands (`NEXT`, `REMEDIATE`, `OWNER_GATE`) is recorded strictly as execution evidence and never mutates DevOrchestrator lifecycle state.
+- Verified restart reconciliation: succeeded -> completed, explicit failure -> failed, running/unknown/404 -> recovery_required (no auto replay), managed interrupt with unchanged repository -> recovery_safe_retry=True, changed repository -> recovery_safe_retry=False.
+- Created dedicated acceptance suite `tests_py/test_p12_6_persistent_harness_acceptance.py` (10 tests) and added port and action hardening unit tests.
+- Authored acceptance document `docs/P12_6_PERSISTENT_HARNESS_ACCEPTANCE.md` and updated `docs/AIBROKER_INTEGRATION_CONTRACT.md`.
+- Verification:
+  - Focused suites passed: 64 passed, 8 subtests passed (`test_aibroker_execution_port.py`, `test_transition_executor_aibroker.py`, `test_p12_control_actions.py`, `test_p12_6_persistent_harness_acceptance.py`).
+  - Full suite passed: 601 passed, 33 subtests passed in 198.18s (`python -m pytest tests_py -q`).
+  - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax (`web/app.js` and `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly.
+  - Knowledge graph refreshed via `graphify update .`: 3046 nodes, 8390 edges, 152 communities.
