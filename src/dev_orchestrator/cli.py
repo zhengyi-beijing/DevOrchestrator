@@ -1020,7 +1020,7 @@ def build_parser() -> argparse.ArgumentParser:
     project_control = sub.add_parser("project-control", help="queue a closed P12 control action")
     project_control.add_argument("project_id")
     project_control.add_argument("action", choices=(
-        "continue", "pause", "resume", "stop", "retry", "reconcile",
+        "continue", "pause", "resume", "stop", "retry", "rereview", "reconcile",
         "approve_owner_gate", "bind_conversation", "unbind_conversation", "rebind_conversation",
     ))
     project_control.add_argument("--command-id", default=None)
