@@ -21,6 +21,8 @@ from dev_orchestrator.control.store import ConversationConflictError, Conversati
 from dev_orchestrator.control.surface import validate_expected
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
+from dev_orchestrator.core.project_status import project_runtime_status
+from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lifecycle
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 CONTROL_DIR = "control"
@@ -305,7 +307,19 @@ class ControlCommandCoordinator:
         snapshot = snapshots.get(project_id)
         if snapshot is None:
             return self._blocked(command_id, project_id, action, "project snapshot is unavailable", now, record)
-        valid, reason, observed = validate_expected(record.get("expected"), snapshot, self.runtime_root)
+        # Retry is advertised from durable reviewer state, which can be newer than
+        # the raw monitor snapshot consumed at the start of the next daemon tick.
+        # Project only that reviewer lifecycle for retry identity validation; all
+        # other controls retain their established snapshot semantics.
+        validation_snapshot = snapshot
+        if action == "retry" and self.reviewer is not None:
+            reviewer_state_fn = getattr(self.reviewer, "state", None)
+            validation_snapshot = project_runtime_status(snapshot, self.runtime_root)
+            validation_snapshot = overlay_orchestration_lifecycle(
+                {"projects": [validation_snapshot]},
+                reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
+            )["projects"][0]
+        valid, reason, observed = validate_expected(record.get("expected"), validation_snapshot, self.runtime_root)
         if not valid:
             return self._blocked(command_id, project_id, action, reason, now, {**record, "observed": observed})
         target = record.get("target") if isinstance(record.get("target"), dict) else {}

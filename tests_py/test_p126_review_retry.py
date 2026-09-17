@@ -70,6 +70,33 @@ class P126ReviewRetryTests(unittest.TestCase):
             self.assertEqual(state["retry_of"], failed_id)
             self.assertIsNone(resolve_retry_candidate(snapshot, runtime, project)[0])
 
+    def test_retry_consumes_command_against_runtime_projected_review_failed_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, runtime, config, project, snapshot, failed_id = self.fixture(Path(td))
+            view = project_control_view(snapshot, runtime, project)
+            submit_control_command(
+                runtime, "p1", "retry", command_id="retry-runtime-projection",
+                expected=view["control_identity"], target={"target_id": failed_id},
+            )
+            # The monitor snapshot can still be IDLE/WAITING_REVIEW before durable reviewer
+            # state is projected. Control consumption must validate the same projected identity
+            # that the watchdog/control surface used when the command was created.
+            raw_snapshot = dict(snapshot)
+            raw_snapshot["state"] = "IDLE"
+            raw_snapshot["lifecycle_state"] = "IDLE"
+            port = ReviewerPort()
+            reviewer = AIReviewerCoordinator(runtime, port)
+            executor = FakeExecutor()
+            result = ControlCommandCoordinator(runtime, reviewer=reviewer).advance(
+                config, {"projects": [raw_snapshot]}, executor
+            )[0]
+            self.assertEqual(result["state"], "accepted", result)
+            self.assertEqual(result["effect"], "retry_failed_technical_review_no_worker_started")
+            self.assertEqual(executor.calls, [])
+            review_id = "ai_review:retry:retry-runtime-projection"
+            reviewer._threads[review_id].join(timeout=2)
+            self.assertEqual(len(port.requests), 1)
+
     def test_retry_fails_closed_on_decision_dirty_or_wrong_target(self):
         with tempfile.TemporaryDirectory() as td:
             repo, runtime, config, project, snapshot, failed_id = self.fixture(Path(td))
