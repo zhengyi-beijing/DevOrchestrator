@@ -1,102 +1,127 @@
-# P12.6 Persistent Harness Acceptance and Closure
+# P12.7 Web Control Surface Visual Refresh
 
-Status: **IMPLEMENTATION COMPLETE / REVIEW-FAILURE RECOVERY FIXED / FINAL RE-REVIEW PENDING**
+Status: **READY_TO_RUN**
 
-Design authorization: **completed**
+Design authorization: **FROZEN 2026-09-17**
 
-Implementation authorization: **owner-authorized and executed**
+Implementation authorization: **OWNER AUTHORIZED AFTER P12.6 CLOSURE**
 
-Current continuation: exact reviewer retry + `REVIEW_FAILED` watchdog recovery are implemented. Do not rerun Worker. Preserve the failed reviewer audit row. Current runtime is blocked only because the canonical worktree has an uncommitted `docs/backlog.md` change; handle that pending change safely, regain a clean worktree, then allow a fresh independent technical review on the same P12.6 lineage. Close P12.6 only on `NEXT` with no blocking findings. P12.7 is staged after closure and must not start early.
-
-Goal: close the existing P12.6 AIBroker persistent-harness capability through
-bounded verification and operational evidence. This task verifies the
-already-implemented persistent service transport; it does not redesign or
-rewrite the harness, provider routing, lifecycle authority, or worktree lease
-model.
+Goal: refresh the existing port 8770 Operations Console into a denser,
+calmer operational dashboard using OpenCode Data as a visual/information-
+architecture reference without copying branding, assets, or product metrics.
 
 Scope:
+- Preserve the daemon and `ControlCommandCoordinator` as the only mutation authority.
+- Keep the existing P12 Control/Event API contracts and guarded action semantics.
+- Reorganize the UI around Overview, Projects, Runs/Activity, AI Resources,
+  Watchdog/Diagnostics, and Accounting.
+- Make freshness, active roles, failures/stalls, owner gates, and unavailable
+  evidence first-class operational states.
+- Prefer neutral surfaces, thin dividers, compact tables, restrained KPI cells,
+  and low visual noise over elevated card stacks and decorative charts.
 
-- Verify the documented `runtime/aibroker-execution.json` persistent-service
-  path (`service_url` and `service_token`) for normal role execute, exact status
-  and exact managed interrupt transport, while preserving the CLI compatibility
-  path when that configuration is absent.
-- Verify the ownership boundary: AIBroker owns session/resource allocation and
-  managed-worktree lease evidence; DevOrchestrator alone owns task/stage/review/
-  remediation transitions, owner gates and stop intent.
-- Collect deterministic automated and loopback operational evidence for
-  persistent transport, pause barrier behavior, restart/recovery projection and
-  capability-qualified interruption. Do not require a live provider mutation
-  when synthetic or loopback evidence proves the contract.
-- Close documentation and acceptance evidence only for verified behavior and
-  record any unavailable external prerequisite as an OWNER_GATE or explicit
-  closure blocker.
-
-Non-goals:
-
-- No replacement of the existing persistent harness or AIBroker transport.
-- No new lifecycle controller, scheduler, provider/account/model selection,
-  automatic provider failover, or second control authority.
-- No expansion to non-loopback deployment, credentials changes, or unrelated
-  P12 control-surface implementation.
+Delivery:
+- Start with fixture-backed hierarchy/prototype validation before production styling.
+- Refactor `web/index.html` and `web/style.css` first; modify `web/app.js` only
+  where deterministic rendering/filtering requires it.
+- Keep read-only navigation/filter/chart interactions mutation-free.
 
 Acceptance:
+1. Existing 8770 GET/control API contracts remain compatible.
+2. Guarded actions retain exact identity, idempotency, CSRF/origin/Host, and audit semantics.
+3. The first viewport exposes daemon/monitor/watchdog health, active AI roles,
+   incident count, AI resource availability, freshness, and last refresh time.
+4. `REVIEW_FAILED`, stalls, owner gates, disconnected/unknown, and unavailable
+   evidence remain explicit and cannot be presented as healthy/zero.
+5. Project/resource/run tables support compact deterministic scanning.
+6. Keyboard/focus/contrast behavior remains acceptable and status never relies on color alone.
+7. Representative web/control fixtures, JavaScript syntax, Python regression,
+   and `git diff --check` pass.
 
-1. Existing persistent-service and CLI compatibility tests pass without
-   changing their ownership contracts.
-2. Evidence proves one Broker dispatch remains one resource execution and that
-   DevOrchestrator does not interpret Broker results as lifecycle transitions.
-3. Pause, restart and interrupt verification demonstrate the documented
-   capability limits and fail closed when exact evidence is unavailable.
-4. Full required regression/compile/syntax/diff checks pass, or a bounded
-   blocker states the exact unavailable prerequisite.
+Non-goals:
+- No lifecycle/control-plane redesign or second source of truth.
+- No OpenCode branding, wording, proprietary assets, or pixel-copying.
+- No P13 remote-job implementation or P14 Android-client implementation in this task.
+
+Frozen design: `docs/P12_7_WEB_UI_DESIGN.md`.
 
 ## Approved executable design
 
-Close the existing AIBroker persistent-harness integration through provider-free loopback verification, narrowly harden any fail-open transport or interruption evidence paths found by that verification, preserve the CLI fallback and sole DevOrchestrator lifecycle authority, and publish reproducible acceptance evidence without redesigning either system.
+Refresh the port 8770 Operations Console (web/index.html, web/style.css, and only the necessary parts of web/app.js) into a dense single-page dashboard. It has compact section navigation, a header strip for health and freshness, flat KPI cells and deterministic compact tables. Existing P12 GET/control API contracts, the static allowlist, CSP and guarded-action semantics stay unchanged. The daemon and ControlCommandCoordinator remain the only mutation authority. Every lifecycle-changing guarded action (stop, retry, rereview, reconcile, approve_owner_gate) gets a tested confirmation before submission, showing the exact identity and the state consequence. A pure buildControlTarget helper produces, for every action, exactly the target fields allowed by command_store.py; approve_owner_gate sends {gate_id: control_identity.gate_id}.
 
 ### Implementation steps
-- Add a dedicated P12.6 acceptance suite using an ephemeral loopback HTTP Broker fixture and the real runtime configuration loader and AIBrokerExecutionPort; exercise authenticated dispatch, status, and interrupt requests without invoking a live provider.
-- Tighten the existing persistent-service adapter as needed to enforce the documented boundary: parse and require loopback HTTP service URLs, reject credentials and unsafe redirects, keep service tokens out of diagnostics, encode exact request identifiers, and preserve the subprocess CLI path whenever service_url is absent.
-- Verify dispatch payload and result correlation end to end, including project, role, request/task identity, managed_worktree intent, timeout, prior-resource evidence, dispatch/decision/execution/session identifiers, and resource context; assert one DevOrchestrator execute call produces exactly one Broker dispatch and one execution-ledger record.
-- Exercise TransitionExecutor with lifecycle-looking Broker output and prove the result is recorded only as execution evidence: AIBroker must not advance tasks, apply review decisions, create remediation, open or approve owner gates, or otherwise mutate DevOrchestrator lifecycle state.
-- Add pause and stop acceptance coverage proving pause blocks every later launch before AIBrokerExecutionPort.execute, does not claim to cancel an already active harness, and leaves the durable pause barrier in place when interruption is unsupported, unavailable, malformed, or not correlated to the exact active request.
-- Require an accepted interrupt outcome to carry exact Broker evidence for the targeted request and interruption result; mismatched, missing, ambiguous, or failed evidence must not be reported as pause_and_interrupt, while unrelated projects and executions remain untouched.
-- Exercise restart reconciliation through the persistent status route: succeeded work projects to completed, explicit provider failure remains failed, running/unknown/unavailable evidence becomes recovery_required without replay, and only the documented managed-stop reason plus unchanged repository identity can qualify an explicit owner retry.
-- Update the AIBroker integration contract and a focused P12.6 acceptance record with the tested configuration, ownership boundary, capability limits, commands, results, and any external prerequisite that could not be established; materialize task closure files only after all required evidence passes, otherwise retain P12.6 as blocked behind an explicit OWNER_GATE.
-- Refresh the Graphify knowledge graph after implementation so the new acceptance, transport, lifecycle, and documentation relationships are indexed.
+- Record a baseline: web, accounting-dashboard, unbound-UI and P12 control pytest suites, node --check web/app.js, and tests/web-selftest.ps1.
+- Freeze the compatibility surface: existing DOM ids, module.exports, and the literal strings asserted by test_unbound_web_ui.py.
+- Add tests_py/test_web_ui_refresh.py using the Node fake-DOM harness, with fixtures for healthy, REVIEW_FAILED, stall, owner gate, paused, stale monitor, failed fetch, broker unavailable and accounting unavailable.
+- Restructure index.html into one SPA: a header with health, freshness and last-refresh plus a Refresh button, a KPI strip, and Overview, Projects, Runs/Activity, AI Resources, Watchdog/Diagnostics and Accounting sections.
+- Put guarded controls (control rows, pairing bar, command outcomes) in a separate labelled Controls region; add no inline scripts or styles because of the CSP.
+- Rewrite style.css with a neutral solid surface, 1px dividers, minimal shadow and radius, compact tables, monospace IDs, visible :focus-visible, reduced-motion support and a narrow-screen collapse.
+- In app.js, replace Promise.all in refresh() with per-source allSettled handling so a failed source shows as unavailable or disconnected, never healthy.
+- Add pure exported helpers for KPIs, the Live/Stale/Disconnected/Unknown freshness state and the incident count; missing inputs yield unavailable, never zero or healthy.
+- Render the Projects, AI Resources, Runs/Activity and Watchdog tables with a deterministic severity-then-id-then-time sort, using only createElement, textContent and className.
+- Render Watchdog/Diagnostics from control overview data.watchdog or GET /api/watchdog, with state, diagnostic code and degraded reason as text.
+- Add a pure exported buildControlTarget(project, capability, selectedSession) that returns the exact target for each action under the interfaces target contract, or null if a required value is missing.
+- Wire the control buttons through buildControlTarget; disable a button when data.control_enabled is false, capability.available is false, or buildControlTarget returns null.
+- Add a pure exported describeGuardedAction(project, capability, target) that returns labelled identity lines and a fixed consequence sentence for stop, retry, rereview, reconcile and approve_owner_gate.
+- The identity lines are project_id, task_id, lifecycle_state, branch@head, dirty and revision, plus target.target_id for retry/rereview/reconcile and target.gate_id for approve_owner_gate; missing values show as unavailable.
+- sendControl shows window.confirm with the describeGuardedAction text for those five actions before any fetch; if cancelled, it returns null and sends nothing.
+- Keep the command body {schema_version, command_id, project_id, action, expected: control_identity, target}, the CSRF/Sec-Fetch-Site headers, polling, session handling and pairing flows unchanged.
+- Add Node tests for buildControlTarget covering all 11 CONTROL_ACTIONS: exact target objects, no fields outside the command_store allowlist, and null when target_id, gate_id or the session is missing.
+- Add Node tests for the five confirmed actions: the confirm text includes identity, target_id or gate_id, and the consequence; cancel issues zero fetches; confirm posts expected equal to control_identity and the exact target.
+- Extend tests: helper outputs, deterministic ordering, GET-only refresh and navigation, required ids, no inline scripts or OpenCode strings, and the focus and reduced-motion CSS rules.
+- Run the full validation, then manually check the first viewport, keyboard focus and one confirm dialog against the fixture server, and record the evidence.
 
 ### Interfaces / contracts
-- Machine-local runtime/aibroker-execution.json retains python_executable, broker_repo, config_path, optional database_path and timeout/probe settings; service_url plus service_token selects persistent transport, while absence of service_url selects the existing CLI compatibility transport.
-- AIExecutionPort remains the provider-neutral boundary with execute(AIRoleRequest), status(request_id), and interrupt(request_id, reason); no provider, account, model, session-reuse, or worktree-lease policy moves into DevOrchestrator.
-- Persistent transport uses the existing AIBroker routes POST /api/dispatch, GET /api/dispatches/{exact_request_id}, and POST /api/dispatches/{exact_request_id}/interrupt with X-AIResourceBroker-Token authentication and bounded timeouts.
-- AIRoleResult and the transition-executor ledger retain one set of dispatch_id, decision_id, execution_id, session_id, resource_context, and status facts per semantic role request; these are evidence and never lifecycle commands.
-- OwnerControlStore and ControlCommandCoordinator remain the sole pause/stop-intent path, while TransitionExecutor and the existing planner/reviewer coordinators remain the sole owners of task, stage, review, remediation, recovery, and owner-gate transitions.
-- The acceptance deliverable is deterministic fixture-backed test output plus a checked-in closure record; it introduces no production scheduler, controller, provider mutation endpoint, or second source of lifecycle truth.
+- Unchanged HTTP contracts: GET /api/monitor, summary, events, runs, orchestration, watchdog, accounting, broker/*, v1/control/overview and v1/control/commands/{id}; POST browser-sessions, commands and adapter-pairings create/revoke. No server.py changes.
+- Guarded command body {schema_version:1, command_id, project_id, action, expected: control_identity, target} with X-DevOrch-CSRF and Sec-Fetch-Site: same-origin is unchanged.
+- Target contract, matching the command_store.py target_allowed map: pause, resume, stop, continue and unbind_conversation send {}.
+- Target contract: retry, rereview and reconcile send {target_id: capability.target_id}; when target_id is missing the helper returns null and the button is disabled.
+- Target contract: approve_owner_gate sends {gate_id: project.control_identity.gate_id}; when gate_id is missing or blank the helper returns null and the button is disabled. This mirrors the CLI --target-id handling and the daemon gate_id check.
+- Target contract: bind_conversation and rebind_conversation send {adapter, binding_id} from the selected live session; with no selection the helper returns null.
+- buildControlTarget(project, capability, selectedSession) and describeGuardedAction(project, capability, target) are pure exported helpers in app.js; the describeGuardedAction text is the only content of the confirm prompt.
+- The confirmation gate covers stop, retry, rereview, reconcile and approve_owner_gate; cancelling returns null before any fetch, and the daemon remains the final identity authority.
+- Static allowlist stays at /, /app.js and /style.css under CSP default-src 'self'; existing app.js exports are kept.
+- Freshness vocabulary is Live, Stale, Disconnected and Unknown as text; unavailable evidence is never shown as 0 or healthy.
 
 ### Validation plan
-- Run the focused persistent transport and integration suites, including tests_py/test_aibroker_execution_port.py, tests_py/test_transition_executor_aibroker.py, tests_py/test_p12_control_actions.py, and the new P12.6 loopback acceptance tests.
-- Verify the loopback fixture observed the exact HTTP methods, paths, token header, payload correlations, one-dispatch count, status lookup, interrupt target and reason, and that persistent requests never spawned the CLI subprocess.
-- Verify CLI compatibility separately with service_url absent, including dispatch, status, interrupt, timeout handling, correlation failures, malformed responses, and not-found behavior.
-- Verify pause-before-launch, pause-during-active-execution, exact stop, unsupported or ambiguous interruption, cross-project isolation, restart projection, unchanged-repository managed interruption, and no-automatic-replay cases.
-- Run python -m pytest tests_py -q and python -m compileall -q src ops tests_py.
-- Run node --check web/app.js and node --check browser/chatgpt-web-adapter.user.js, then run git diff --check and inspect the final diff for unintended lifecycle, provider-routing, credential, runtime-secret, or generated-output changes.
-- Run graphify update . and confirm it succeeds; if Graphify or an external AIBroker contract prerequisite is unavailable, record the exact unavailable prerequisite as the bounded closure blocker rather than claiming acceptance.
-- Execute validation commands as separate PowerShell statements with explicit exit-code checks; do not use && or || in Windows PowerShell 5.1, preserving VERIFIED_FAILURE_MEMORY provenance seed:p11b:rdc-powershell-5.1.
+- node --check web/app.js exits 0.
+- pytest passes for tests_py/test_web.py, test_accounting_dashboard.py, test_unbound_web_ui.py, test_web_ui_refresh.py, test_p12_control_actions.py, test_p12_control_foundation.py and test_control_commands.py.
+- The full pytest tests_py run shows no new failures compared with the baseline.
+- tests/web-selftest.ps1 passes; PowerShell 5.1 sequencing uses ';' and $LASTEXITCODE checks, never && or ||.
+- A Node test asserts buildControlTarget output for all 11 actions, including approve_owner_gate returning {gate_id: 'gate-1'} for control_identity.gate_id 'gate-1' and null when gate_id is null.
+- A test asserts every buildControlTarget result's keys are a subset of the command_store target_allowed set for that action.
+- A test posts approve_owner_gate through sendControl with confirm accepted and asserts the body target equals {gate_id: control_identity.gate_id} and expected equals control_identity.
+- For each of stop, retry, rereview, reconcile and approve_owner_gate, a Node test asserts the confirm text includes the identity lines, target_id or gate_id, and the consequence, and that cancel issues zero fetch calls.
+- A test asserts retry, rereview, reconcile and approve_owner_gate buttons are disabled when the capability is unavailable or the required target value is missing.
+- Optionally, a Python test passes the UI-shaped approve and retry bodies through the command_store request validation to show they are accepted as well-formed.
+- Fixture tests show failure, stall, gate, paused, stale, disconnected and unavailable states render explicitly, and table ordering is deterministic.
+- A non-mutation test shows refresh and navigation issue only GET requests; the existing stop-confirm/poll and pairing CSRF tests pass.
+- git diff --check is clean and the diff touches only web/, tests_py/ and optional evidence docs.
+- A manual 1366x768 check shows health, active roles, incidents, AI resources, freshness and last refresh in the first viewport, visible focus, and a correct confirm dialog.
 
 ### Risks / failure modes
-- A permissive URL or redirect implementation could leak the service token or escape the loopback boundary; parsed endpoint validation, redirect rejection, and redacted diagnostics must fail closed.
-- Synthetic fixtures can drift from the installed AIBroker response contract; fixture fields and capability assertions must be tied to documented Broker responses, and unverifiable external behavior must remain an OWNER_GATE rather than inferred evidence.
-- Asynchronous pause, stop, and restart tests can become timing-dependent; use synchronization barriers and persisted-state assertions instead of sleeps or provider timing.
-- Treating the presence of an AIBroker engine or interrupt method as proof of successful interruption could overstate safety; acceptance requires exact correlated Broker evidence and retains pause on failure.
-- Over-tightening persistent configuration could accidentally break the established CLI fallback; explicit configuration-loading and fallback regressions are required.
-- Implementation remains unauthorized until the owner supplies the required P12.6 start authorization; planning and read-only inspection do not satisfy that gate.
+- The current UI sends target {} for retry, rereview, reconcile and approve_owner_gate, which the daemon blocks. Filling target_id and gate_id aligns the web UI with the existing CLI and daemon contract without changing server semantics.
+- A client-side target copied from a stale projection is still rejected by the daemon's exact identity and gate checks; the UI must surface blocked results as text, not success.
+- window.confirm is plain text only; the identity must be on labelled lines to stay readable.
+- Renaming DOM ids or exports can break the existing Node tests; freeze them and rerun often.
+- allSettled handling could present a missing source as zero or healthy; unavailable fixtures guard against this.
+- The test fake DOM supports only a minimal API; rendering must avoid unsupported DOM methods.
+- CSP blocks inline scripts, inline styles and external assets.
+- Freshness thresholds could conflict with the server's stale flags; prefer monitor.stale and sources availability.
+- Contrast and focus need recorded manual evidence.
+- agent/next.md still shows P12.6; use the staged P12.7 spec.
 
 ### Out of scope
-- Replacing or redesigning the persistent AIBroker harness, its service API, native provider processes, session allocation, worktree lease ownership, or cleanup model.
-- Adding provider, account, model, quota, failover, scheduling, or automatic retry policy to DevOrchestrator.
-- Adding a second lifecycle controller or allowing Broker output to drive task, stage, review, remediation, owner-gate, pause, or stop transitions.
-- Non-loopback deployment, TLS or remote-access design, credential rotation, live provider mutation, or changes to machine-local provider configuration.
-- Unrelated P12 control-surface features, dashboard redesign, broader remediation changes, hardware-project actions, or resuming any paused external project.
+- Changes to server.py, control/surface.py, control/command_store.py, core/control_commands.py, routes, security headers or daemon lifecycle.
+- New APIs, capability or target schema changes, or any client-side source of truth.
+- Adding an optional gate_id to continue from the web UI.
+- A custom modal framework; the native confirm is enough for this task.
+- Routing frameworks, build tooling, third-party chart libraries or external fonts.
+- Decorative charts.
+- OpenCode branding, wording, assets or pixel-copying.
+- P13 remote jobs and P14 Android client.
+- Changes to idempotency, CSRF, origin/Host, audit or pairing semantics.
+- Lifecycle bookkeeping beyond recording P12.7 evidence.
 
 ### Independent plan review
-- Approved: APPROVE. The plan is execution-ready and matches the bounded P12.6 task: it verifies the already-existing persistent AIBroker transport rather than redesigning lifecycle authority, provider routing, session allocation, or worktree leasing. Repository inspection confirms the cited production interfaces exist as described: runtime/aibroker-execution.json selects persistent transport when service_url is present and retains CLI compatibility otherwise; AIBrokerExecutionPort implements POST /api/dispatch, GET /api/dispatches/{request_id}, POST /api/dispatches/{request_id}/interrupt, execute/status/interrupt, token authentication, managed_worktree metadata, timeout propagation, prior resource context and result correlation. The existing integration contract already defines AIBroker ownership of provider/session/worktree resources, DevOrchestrator ownership of lifecycle and pause/stop intent, one-dispatch/at-most-one-resource semantics, restart reconciliation, and exact managed-interrupt requirements. The proposed loopback fixture, correlation assertions, pause/stop/restart cases, CLI fallback coverage and full regression provide concrete verification paths for every acceptance criterion. The narrowly stated hardening is justified by current implementation evidence rather than scope inflation: service URL validation currently uses a permissive string-prefix check and urllib's default redirect behavior, and ControlCommandCoordinator._stop currently reports pause_and_interrupt for any non-exception interrupt return without validating exact correlated interruption evidence. Those are bounded fail-closed corrections within the documented machine-local persistent-harness contract if acceptance tests expose them. NON_BLOCKING: the implementation should derive the exact accepted interrupt response fields from the installed AIBroker contract/fixture rather than inventing a new response schema, and preserve the current behavior that service_url is the transport selector even if service_token validation remains optional unless the actual Broker service contract requires it. Graphify availability should not by itself create an OWNER_GATE unless it is genuinely required for closure evidence; record it as a tooling blocker according to the task's bounded-closure policy. The explicit OWNER START REQUIRED remains a separate implementation authorization gate and does not make this plan unexecutable or require plan-review rejection.
+- Approved: No BLOCKING findings. The plan now matches the repository’s guarded-target contracts, preserves mutation authority and HTTP/security semantics, covers every required operational state, sequences fixture validation before styling, and provides executable automated and manual verification for the frozen design.
