@@ -1847,10 +1847,20 @@ class TransitionExecutor:
                 ).format(task_id)
             else:
                 current_task = _advertised_task_id(snapshot)
-                if current_task == task_id and _task_marked_complete(snapshot):
+                reviewed_current_ready = (
+                    current_task == task_id and _next_task_ready(snapshot)
+                )
+                if current_task == task_id and (
+                    _task_marked_complete(snapshot) or reviewed_current_ready
+                ):
                     repo_dir = project.get("repo_path") or ""
                     rm_res = read_successor(repo_dir, task_id)
-                    if rm_res.kind == "invalid":
+                    unlisted_ready_task = (
+                        reviewed_current_ready
+                        and rm_res.kind == "invalid"
+                        and rm_res.reason == f"completed task {task_id} not found in roadmap"
+                    )
+                    if rm_res.kind == "invalid" and not unlisted_ready_task:
                         self._record_blocked(
                             request_id, project_id,
                             f"staged roadmap invalid: {rm_res.reason}",
@@ -1865,7 +1875,7 @@ class TransitionExecutor:
                     ):
                         self._record_blocked(
                             request_id, project_id,
-                            "reviewed COMPLETE task repository truth changed before terminal settle",
+                            "reviewed task repository truth changed before terminal settle",
                             task_id=task_id, source_kind="decision",
                         )
                     elif rm_res.kind == "successor":
@@ -1878,9 +1888,14 @@ class TransitionExecutor:
                             reviewed_head=truth.head,
                         )
                     else:
+                        reason = (
+                            "review accepted current READY_TO_RUN task and no next "
+                            "executable task is advertised"
+                            if reviewed_current_ready
+                            else "reviewed task is COMPLETE and no next executable task is advertised"
+                        )
                         self._record_settled(
-                            request_id, project_id,
-                            "reviewed task is COMPLETE and no next executable task is advertised",
+                            request_id, project_id, reason,
                             task_id=task_id, outcome="task_complete",
                         )
                     continue

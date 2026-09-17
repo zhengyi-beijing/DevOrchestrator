@@ -527,6 +527,116 @@ class TransitionExecutorActuationTests(unittest.TestCase):
             executor=TransitionExecutor(runtime,backend_overrides={"agy":FakeBackend("agy")}); self.assertEqual(executor.advance(summary,config),[])
             row=executor.state()["executions"]["worker_done:p1:r1"]; self.assertEqual(row["state"],"settled"); self.assertIn("legacy_reconciled_from",row)
 
+    def test_p127_next_at_same_ready_reviewed_head_terminal_settles_without_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P12.7")
+            (repo / "agent" / "next.md").write_text(
+                "# P12.7 Web Control Surface Visual Refresh\nStatus: **READY_TO_RUN**\n",
+                encoding="utf-8",
+            )
+            staged = repo / "agent" / "staged"; staged.mkdir(parents=True)
+            (staged / "roadmap.json").write_text(json.dumps({
+                "schema_version": 1,
+                "tasks": [{
+                    "task_id": "P12.6", "successor": "P12.7",
+                    "successor_spec_path": "agent/staged/P12.7.md",
+                }],
+            }), encoding="utf-8")
+            (staged / "P12.7.md").write_text(
+                "# P12.7 Web Control Surface Visual Refresh\n\n"
+                "Status: **PENDING DESIGN**\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "agent/"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-m", "reviewed P12.7"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+            head = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True,
+            ).strip()
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            request_id = "ai_review:ai_review:ai_review:p127:execute"
+            write_decision(runtime, head=head, task_id="P12.7", request_id=request_id)
+            (runtime / "transition-executor.json").write_text(json.dumps({
+                "version": 1,
+                "executions": {request_id: {
+                    "project_id": "p1", "source_request_id": request_id,
+                    "source_kind": "decision", "task_id": "P12.7",
+                    "state": "blocked", "reason": "project is not READY_TO_RUN",
+                }},
+            }), encoding="utf-8")
+            summary = ready_summary(repo, "P12.7")
+            summary["projects"][0].update({
+                "state": "WAITING_REVIEW",
+                "next_status": "**READY_TO_RUN**",
+                "next_title": "P12.7 Web Control Surface Visual Refresh",
+            })
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+
+            self.assertEqual(executor.advance(summary, config), [])
+            row = executor.state()["executions"][request_id]
+            self.assertEqual((row["state"], row["outcome"]), ("settled", "task_complete"))
+            self.assertEqual(row["legacy_reconciled_from"]["reason"], "project is not READY_TO_RUN")
+            self.assertEqual(len(backend.started), 0)
+            self.assertEqual(executor.advance(summary, config), [])
+            self.assertEqual(len(backend.started), 0)
+            self.assertEqual(
+                subprocess.check_output(
+                    ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True,
+                ).strip(),
+                head,
+            )
+            self.assertIn(
+                "Status: **READY_TO_RUN**",
+                (repo / "agent" / "next.md").read_text(encoding="utf-8"),
+            )
+
+    def test_reviewed_current_ready_task_with_staged_successor_hands_off(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P1")
+            (repo / "agent" / "next.md").write_text(
+                "# P1 bounded task\nStatus: **READY_TO_RUN**\n", encoding="utf-8",
+            )
+            staged = repo / "agent" / "staged"; staged.mkdir(parents=True)
+            (staged / "roadmap.json").write_text(json.dumps({
+                "schema_version": 1,
+                "tasks": [{
+                    "task_id": "P1", "successor": "P2",
+                    "successor_spec_path": "agent/staged/P2.md",
+                }],
+            }), encoding="utf-8")
+            (staged / "P2.md").write_bytes(
+                b"# P2 bounded task\n\nStatus: **PENDING DESIGN**\n"
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "agent/"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-m", "reviewed P1"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+            head = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True,
+            ).strip()
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            write_decision(runtime, head=head, task_id="P1")
+            summary = ready_summary(repo, "P1")
+            summary["projects"][0].update({
+                "state": "WAITING_REVIEW", "next_status": "**READY_TO_RUN**",
+            })
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+
+            self.assertEqual(executor.advance(summary, config), [])
+            row = executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual(
+                (row["state"], row["outcome"], row["next_task_id"]),
+                ("handoff", "planning_required", "P2"),
+            )
+            self.assertEqual(len(backend.started), 0)
+
     def test_owner_start_launches_current_task_once_after_prior_history(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"
