@@ -443,6 +443,7 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Added Case 4 to `test_stop_fails_closed_when_interrupt_evidence_is_unsupported_or_unconfirmed` and added dedicated regression test `test_stop_cli_fallback_retains_pause_and_fails_closed_without_persistent_capability` in `tests_py/test_p12_6_persistent_harness_acceptance.py`.
 - Verification:
   - Focused suites passed: 65 passed, 8 subtests passed (`test_aibroker_execution_port.py`, `test_transition_executor_aibroker.py`, `test_p12_control_actions.py`, `test_p12_6_persistent_harness_acceptance.py`).
-  - Full suite passed: 602 passed, 33 subtests passed in 195.81s (`python -m pytest tests_py -q`).
+  - Full suite passed: 602 passed, 33 subtests passed in 196.61s (`python -m pytest tests_py -q`).
   - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax checks (`node --check web/app.js` and `node --check browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
-  - Knowledge graph refreshed via `graphify update .`: 3049 nodes, 8400 edges, 141 communities.
+  - Updated `docs/P12_6_PERSISTENT_HARNESS_ACCEPTANCE.md` focused test results (65 passed, 8 subtests passed) and added full regression evidence (602 passed, 33 subtests passed).
+  - Verified canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.

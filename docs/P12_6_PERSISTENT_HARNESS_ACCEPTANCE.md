@@ -67,7 +67,13 @@ All acceptance checks run deterministically against an ephemeral loopback HTTP s
 ```powershell
 python -m pytest tests_py/test_aibroker_execution_port.py tests_py/test_transition_executor_aibroker.py tests_py/test_p12_control_actions.py tests_py/test_p12_6_persistent_harness_acceptance.py -q
 ```
-**Result**: `64 passed, 8 subtests passed in 33.02s` (100% PASS).
+**Result**: `65 passed, 8 subtests passed in 34.23s` (100% PASS).
+
+### Full regression suite:
+```powershell
+python -m pytest tests_py -q
+```
+**Result**: `602 passed, 33 subtests passed in 196.61s` (100% PASS).
 
 ### Syntax & compilation:
 ```powershell

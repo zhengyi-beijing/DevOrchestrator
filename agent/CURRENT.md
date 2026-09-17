@@ -159,6 +159,7 @@ P12.6 review remediation result (2026-09-17):
 - Updated `FakeInterruptPort` in `tests_py/test_p12_control_actions.py` to include `interrupt_supported: True`, and added regression test cases covering missing `interrupt_supported`, CLI fallback result shape, and `interrupt_supported: True` with unconfirmed status.
 - Added Case 4 to `test_stop_fails_closed_when_interrupt_evidence_is_unsupported_or_unconfirmed` and added dedicated `test_stop_cli_fallback_retains_pause_and_fails_closed_without_persistent_capability` in `tests_py/test_p12_6_persistent_harness_acceptance.py`.
 - Focused persistent harness regression: 65 passed, 8 subtests passed.
-- Full regression: 602 passed, 33 subtests passed in 195.81s.
+- Full regression: 602 passed, 33 subtests passed in 196.61s.
 - `python -m compileall -q src ops tests_py`, node syntax checks on `web/app.js` and `browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly.
-- Knowledge graph refreshed via `graphify update .`: 3049 nodes, 8400 edges, 141 communities.
+- Updated `docs/P12_6_PERSISTENT_HARNESS_ACCEPTANCE.md` focused test results (65 passed, 8 subtests passed) and added full regression evidence (602 passed, 33 subtests passed).
+- Verified canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
