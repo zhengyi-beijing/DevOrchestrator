@@ -614,6 +614,17 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             project = read_json(runtime / "projects" / f"{match.group(1)}.json", None)
             if not isinstance(project, dict):
                 self._error(404, "Not Found", "project snapshot not found", head_only); return
+            # The per-project mirror is intentionally monitor-local and may be
+            # overwritten with raw IDLE before orchestration lifecycle overlay.
+            # Control capability must use the daemon's projected summary truth.
+            summary = read_json(runtime / "summary.json", {})
+            if isinstance(summary, dict) and isinstance(summary.get("projects"), list):
+                projected = next((
+                    item for item in summary["projects"]
+                    if isinstance(item, dict) and str(item.get("project_id") or item.get("id") or "") == match.group(1)
+                ), None)
+                if isinstance(projected, dict):
+                    project = projected
             configs = _control_project_configs(self.server.config_path)
             payload = _control_envelope(
                 project_control_view(project, runtime, configs.get(match.group(1)), self.server.bridge_store),
