@@ -32,7 +32,7 @@ an exact managed interrupt. RDC is bootstrap, inspection and recovery only;
 it is not in the normal coding inner loop.
 
 Stopping an active Broker execution requires exact correlated Broker confirmation:
-- Mismatched request ID, unsupported harness interruption (`interrupt_supported=False`),
+- Mismatched request ID, unsupported harness interruption (`interrupt_supported=False` or missing capability evidence),
   missing/404 target, or unconfirmed status fails closed: the command outcome reports
   `state="failed"`, durable pause is retained, and `pause_and_interrupt` is not claimed.
 - Unrelated projects and executions remain untouched.

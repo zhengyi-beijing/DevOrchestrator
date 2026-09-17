@@ -595,6 +595,23 @@ class P12_6_PersistentHarnessAcceptanceTests(unittest.TestCase):
         self.assertIn("request_id mismatch", outcome3["reason"])
         self.assertTrue(OwnerControlStore(self.runtime).is_paused("devorchestrator"))
 
+        # Case 4: Missing interrupt_supported in response (ambiguous capability evidence fails closed)
+        self.server.interrupt_responses[broker_req_id] = {
+            "request_id": broker_req_id,
+            "status": "interrupted",
+        }
+        OwnerControlStore(self.runtime).set_paused("devorchestrator", False, command_id="res-4", action="resume")
+        submit_control_command(
+            self.runtime, "devorchestrator", "stop",
+            expected=project_identity(snapshot, self.runtime),
+        )
+        outcome4 = coordinator.advance(self.config_file, {"projects": [snapshot]}, executor)[0]
+
+        self.assertEqual(outcome4["state"], "failed")
+        self.assertEqual(outcome4["effect"], "pause_future_launches")
+        self.assertIn("interruption unsupported", outcome4["reason"])
+        self.assertTrue(OwnerControlStore(self.runtime).is_paused("devorchestrator"))
+
     def test_stop_cross_project_isolation(self):
         """Stopping project A interrupts only project A; project B's execution and unpaused state are untouched."""
         truth = read_repository_truth(self.repo)
@@ -826,6 +843,70 @@ class P12_6_PersistentHarnessAcceptanceTests(unittest.TestCase):
             self.assertTrue(mock_run.called)
             # Ephemeral server should have received NO requests
             self.assertEqual(len([r for r in self.server.recorded_requests if r.get("token")]), 0)
+
+    def test_stop_cli_fallback_retains_pause_and_fails_closed_without_persistent_capability(self):
+        """CLI fallback interrupt dispatch lacks persistent capability proof and fails closed with retained pause."""
+        runtime_cli = self.root / "runtime_stop_cli"
+        runtime_cli.mkdir()
+        (runtime_cli / "aibroker-execution.json").write_text(json.dumps({
+            "python_executable": sys.executable,
+            "broker_repo": str(self.root / "broker_dummy"),
+            "config_path": str(self.root / "resources_dummy.yaml"),
+            "process_timeout_seconds": 300.0,
+            "probe_before_dispatch": False,
+        }), encoding="utf-8")
+
+        port = load_aibroker_execution_port(runtime_cli)
+        self.assertIsNotNone(port)
+        self.assertIsNone(port.config.service_url)
+
+        truth = read_repository_truth(self.repo)
+        snapshot = {
+            "project_id": "devorchestrator",
+            "state": "READY_TO_RUN",
+            "lifecycle_state": "READY_TO_RUN",
+            "next_status": "**READY_TO_RUN**",
+            "git": {"branch": truth.branch, "head": truth.head},
+            "telemetry": {"task_id": "P12.6"},
+        }
+        executor = TransitionExecutor(runtime_cli, ai_execution_port=port)
+        broker_req_id = "ai-worker:run-cli-stop-1"
+
+        with executor._lock:
+            ledger = executor._load_ledger()
+            ledger["executions"]["run-cli-stop-1"] = {
+                "source_request_id": "run-cli-stop-1",
+                "project_id": "devorchestrator",
+                "state": "running",
+                "engine": "aibroker",
+                "broker_request_id": broker_req_id,
+                "started_at": "2026-09-17T01:00:00Z",
+            }
+            executor._save_ledger(ledger)
+
+        submit_control_command(
+            runtime_cli, "devorchestrator", "stop",
+            expected=project_identity(snapshot, runtime_cli),
+        )
+
+        with unittest.mock.patch("dev_orchestrator.ai.aibroker_subprocess.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout=json.dumps({
+                    "request_id": broker_req_id,
+                    "status": "failed",
+                    "resource_id": "r1",
+                    "execution_error": "stopped",
+                }),
+                stderr="",
+            )
+            coordinator = ControlCommandCoordinator(runtime_cli)
+            outcome = coordinator.advance(self.config_file, {"projects": [snapshot]}, executor)[0]
+
+        self.assertEqual(outcome["state"], "failed")
+        self.assertEqual(outcome["effect"], "pause_future_launches")
+        self.assertIn("interruption unsupported", outcome["reason"])
+        self.assertTrue(OwnerControlStore(runtime_cli).is_paused("devorchestrator"))
 
 
 if __name__ == "__main__":

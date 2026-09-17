@@ -431,3 +431,18 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Full suite passed: 601 passed, 33 subtests passed in 198.18s (`python -m pytest tests_py -q`).
   - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax (`web/app.js` and `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly.
   - Knowledge graph refreshed via `graphify update .`: 3046 nodes, 8390 edges, 152 communities.
+
+## P12.6 Review Remediation (2026-09-17)
+
+- Remediation of Technical Review findings for P12.6:
+  - Fixed stop capability qualification in `src/dev_orchestrator/core/control_commands.py`: `ControlCommandCoordinator._stop` now enforces positive capability-qualified confirmation (`interrupt_supported is True` in addition to exact request correlation and status in `{"interrupted", "failed", "cancelled"}`). Missing or False `interrupt_supported` fails closed, retaining durable pause with `effect="pause_future_launches"` and `state="failed"`.
+  - Fixed CLI fallback stop semantics: AIBroker CLI `interrupt-dispatch` updates persisted telemetry to failed without persistent harness interrupt invocation; DevOrchestrator now fails closed with retained pause rather than erroneously reporting `pause_and_interrupt`.
+  - Fixed trailing whitespace in `docs/P12_6_PERSISTENT_HARNESS_ACCEPTANCE.md` lines 3-6 so `git diff --check` and `git diff 14737b2..HEAD --check` pass with zero whitespace defects.
+  - Updated `FakeInterruptPort` in `tests_py/test_p12_control_actions.py` to return `interrupt_supported: True`.
+  - Added regression test cases in `tests_py/test_p12_control_actions.py` covering missing `interrupt_supported`, CLI fallback result payload, and `interrupt_supported: True` with unconfirmed status.
+  - Added Case 4 to `test_stop_fails_closed_when_interrupt_evidence_is_unsupported_or_unconfirmed` and added dedicated regression test `test_stop_cli_fallback_retains_pause_and_fails_closed_without_persistent_capability` in `tests_py/test_p12_6_persistent_harness_acceptance.py`.
+- Verification:
+  - Focused suites passed: 65 passed, 8 subtests passed (`test_aibroker_execution_port.py`, `test_transition_executor_aibroker.py`, `test_p12_control_actions.py`, `test_p12_6_persistent_harness_acceptance.py`).
+  - Full suite passed: 602 passed, 33 subtests passed in 195.81s (`python -m pytest tests_py -q`).
+  - Python compilation (`python -m compileall -q src ops tests_py`), JavaScript syntax checks (`node --check web/app.js` and `node --check browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph refreshed via `graphify update .`: 3049 nodes, 8400 edges, 141 communities.

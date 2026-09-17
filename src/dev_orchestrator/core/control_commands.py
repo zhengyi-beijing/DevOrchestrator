@@ -555,6 +555,8 @@ class ControlCommandCoordinator:
                 "state": "failed",
                 "reason": f"pause retained; AIBroker interruption was not confirmed (status={fact.get('status')!r})",
             }
+        if fact.get("interrupt_supported") is not True:
+            return {**result, "state": "failed", "reason": "pause retained; AIBroker persistent harness interruption unsupported"}
         return {**result, "effect": "pause_and_interrupt", "interruption": fact, "execution_id": latest.get("source_request_id")}
 
     def _conversation_action(

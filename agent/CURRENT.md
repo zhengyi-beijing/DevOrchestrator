@@ -5,9 +5,9 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12.6 Persistent Harness Acceptance and Closure** — **IMPLEMENTATION COMPLETE / READY FOR TECHNICAL REVIEW**.
+Current task: **P12.6 Persistent Harness Acceptance and Closure** — **REMEDIATION COMPLETE / READY FOR TECHNICAL RE-REVIEW**.
 
-Staged roadmap handoff is now P12.5 -> P12.6. P12.6 implementation is complete with dedicated loopback acceptance tests, transport hardening, and acceptance documentation; ready for independent technical review.
+Staged roadmap handoff is now P12.5 -> P12.6. P12.6 review remediation is complete with positive capability-qualified stop evidence enforcement (`interrupt_supported is True`), fail-closed CLI fallback stop semantics, acceptance doc whitespace corrections, and dedicated regression tests; ready for independent technical re-review.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
@@ -151,3 +151,14 @@ P12.6 persistent harness acceptance result (2026-09-17):
 - Focused persistent harness regression: 64 passed, 8 subtests passed.
 - Full regression: 601 passed, 33 subtests passed in 198.18s. Python compilation, JavaScript syntax checks, and `git diff --check` passed cleanly.
 - Knowledge graph refreshed via `graphify update .`: 3046 nodes, 8390 edges, 152 communities.
+
+P12.6 review remediation result (2026-09-17):
+- Hardened `ControlCommandCoordinator._stop` to require positive capability-qualified interrupt evidence (`interrupt_supported is True` along with exact request correlation and status in `{"interrupted", "failed", "cancelled"}`); missing or False `interrupt_supported` fails closed, retaining durable pause (`effect="pause_future_launches"`, `state="failed"`).
+- Sealed the CLI fallback stop gap: AIBroker CLI `interrupt-dispatch` reports `status="failed"` without persistent harness proof; it now fails closed with retained pause instead of incorrectly reporting `pause_and_interrupt`.
+- Corrected trailing whitespace in `docs/P12_6_PERSISTENT_HARNESS_ACCEPTANCE.md` lines 3-6 so `git diff --check` passes with zero whitespace defects.
+- Updated `FakeInterruptPort` in `tests_py/test_p12_control_actions.py` to include `interrupt_supported: True`, and added regression test cases covering missing `interrupt_supported`, CLI fallback result shape, and `interrupt_supported: True` with unconfirmed status.
+- Added Case 4 to `test_stop_fails_closed_when_interrupt_evidence_is_unsupported_or_unconfirmed` and added dedicated `test_stop_cli_fallback_retains_pause_and_fails_closed_without_persistent_capability` in `tests_py/test_p12_6_persistent_harness_acceptance.py`.
+- Focused persistent harness regression: 65 passed, 8 subtests passed.
+- Full regression: 602 passed, 33 subtests passed in 195.81s.
+- `python -m compileall -q src ops tests_py`, node syntax checks on `web/app.js` and `browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly.
+- Knowledge graph refreshed via `graphify update .`: 3049 nodes, 8400 edges, 141 communities.

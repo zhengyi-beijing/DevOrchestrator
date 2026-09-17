@@ -22,7 +22,7 @@ class FakeInterruptPort:
 
     def interrupt(self, request_id, reason):
         self.calls.append((request_id, reason))
-        return {"request_id": request_id, "status": "interrupted"}
+        return {"request_id": request_id, "status": "interrupted", "interrupt_supported": True}
 
 
 class FakeBridgeStore:
@@ -191,6 +191,9 @@ class P12ActionTests(unittest.TestCase):
                 ({"request_id": "mismatched-req", "status": "interrupted"}, "request_id mismatch"),
                 ({"request_id": "broker-1", "interrupt_supported": False, "status": "running"}, "interruption unsupported"),
                 ({"request_id": "broker-1", "status": "running"}, "interruption was not confirmed"),
+                ({"request_id": "broker-1", "status": "interrupted"}, "interruption unsupported"),
+                ({"request_id": "broker-1", "status": "failed", "resource_id": "r1", "execution_error": "stopped"}, "interruption unsupported"),
+                ({"request_id": "broker-1", "interrupt_supported": True, "status": "running"}, "interruption was not confirmed"),
                 (None, "interruption target not found"),
                 ("not-a-dict", "returned invalid evidence"),
             ]

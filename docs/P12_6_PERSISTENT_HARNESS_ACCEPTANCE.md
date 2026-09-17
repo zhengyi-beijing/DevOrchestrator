@@ -1,9 +1,9 @@
 # P12.6 Persistent Harness Acceptance Record
 
-**Date**: 2026-09-17  
-**Task**: P12.6 Persistent Harness Acceptance and Closure  
-**Status**: **ACCEPTED / READY FOR TECHNICAL REVIEW**  
-**Handoff**: P12.6 acceptance complete  
+**Date**: 2026-09-17
+**Task**: P12.6 Persistent Harness Acceptance and Closure
+**Status**: **ACCEPTED / READY FOR TECHNICAL REVIEW**
+**Handoff**: P12.6 acceptance complete
 
 ---
 
@@ -52,7 +52,7 @@ Persistent transport is activated when `runtime/aibroker-execution.json` contain
 | **Pause Barrier (Pre-launch)** | Pause in `OwnerControlStore` blocks subsequent launches before `port.execute`, recording `state="blocked"` in the ledger and producing zero Broker HTTP calls. | **PASS** |
 | **Pause Barrier (Active)** | Pausing during an active harness run does not cancel or interrupt the running harness; pause blocks future launches only. | **PASS** |
 | **Stop Interruption (Confirmed)** | Stop command with confirmed correlated interrupt evidence (`status` in `interrupted`, `failed`, `cancelled` and `interrupt_supported is True`) returns `state="accepted"`, `effect="pause_and_interrupt"`. | **PASS** |
-| **Stop Interruption (Fail-Closed)** | Stop with unsupported (`interrupt_supported=False`), unconfirmed (`status="running"`), mismatched request ID, 404 target not found, or server error returns `state="failed"`, retains durable pause (`effect="pause_future_launches"`), and does not claim `pause_and_interrupt`. | **PASS** |
+| **Stop Interruption (Fail-Closed)** | Stop with unsupported (`interrupt_supported=False`), unconfirmed (`status="running"`), missing capability evidence (CLI fallback or missing `interrupt_supported`), mismatched request ID, 404 target not found, or server error returns `state="failed"`, retains durable pause (`effect="pause_future_launches"`), and does not claim `pause_and_interrupt`. | **PASS** |
 | **Cross-Project Isolation** | Stopping project A interrupts only project A; project B's active executions and unpaused state remain completely untouched. | **PASS** |
 | **Restart Reconciliation** | Succeeded dispatches project to `completed`; failed dispatches project to `failed`; running/unknown/404 dispatches project to `recovery_required` (no automatic replay); managed interrupt with unchanged repo truth qualifies for safe owner retry (`recovery_safe_retry=True`); managed interrupt with changed repo truth remains `recovery_safe_retry=False`. | **PASS** |
 | **CLI Compatibility Fallback** | When `service_url` is absent, dispatch, status, and interrupt use subprocess execution without invoking the network service. | **PASS** |
