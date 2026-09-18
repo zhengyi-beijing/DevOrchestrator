@@ -78,47 +78,47 @@ Status: **FUTURE / design constraint frozen 2026-09-17**
 
 ## P13 staged roadmap
 
-### P13 - Remote Execution Resilience & Recoverable Jobs
+### P13 - Transport-Independent Control Bridge
 
-Goal: make long-running RDC/remote-shell work recoverable when the ChatGPT message/tool-result path times out, reconnects, or loses a synchronous response, without duplicating side effects or losing authoritative execution state.
+Goal: remove RDC as the normal ChatGPT-to-DevO control dependency while preserving DevOrchestrator as the sole lifecycle authority.
 
-- Treat `Message delivery timed out` as an ambiguous transport/orchestration outcome, not proof that the remote command failed. DevO must distinguish remote process state, RDC transport state, and ChatGPT/tool-result delivery state.
-- Replace long synchronous remote-shell calls with durable asynchronous jobs where execution can exceed the bounded interactive-call window. `START` must return a durable `job_id`; later `STATUS`, `TAIL`, and `RESULT` operations recover state without re-running the command.
-- Persist job identity, command/request identity, project/task/stage correlation, PID/process handle where available, start/end timestamps, exit code, bounded stdout/stderr references, heartbeat/progress evidence, and terminal result before acknowledging completion.
-- Make mutating remote actions idempotent. Retrying a ChatGPT turn, RDC request, or DevO command with the same semantic `command_id`/`job_id` must reconcile to the existing execution rather than launching a duplicate side effect.
-- Separate remote execution from message delivery: a ChatGPT/RDC delivery timeout must not terminate a healthy background job, and reconnect must permit status recovery from durable DevO state.
-- Add bounded-output behavior: long stdout/stderr is written to durable log/evidence storage; interactive responses return a capped tail/summary instead of transporting unbounded build/test output through one tool call.
-- Add long-operation classification/heartbeat so builds, tests, package operations, and provider runs can report `running` with evidence rather than being mislabeled as stalled merely because no terminal output has arrived.
-- Prefer short single-purpose shell steps over large chained commands. Build/configure/test/git/diagnostic phases should be separately attributable and recoverable; Windows PowerShell 5.1 `&&`/`||` remains prohibited by verified failure memory.
-- Define explicit states at minimum: `queued`, `running`, `completed`, `failed`, `cancel_requested`, `cancelled`, `unknown/recovery_required`, plus transport connectivity/freshness evidence independent of job lifecycle.
-- Integrate with watchdog/accounting: distinguish expected long-running work, remote-process hang, RDC disconnect/reconnect, lost tool-result delivery, and true no-progress stalls; expose the classification on the 8770 control surface and future P14 mobile client.
-- `Retry` after an ambiguous timeout must be fail-safe: first reconcile the prior command/job and only create new work when durable evidence proves no equivalent execution exists.
-- Preserve DevOrchestrator as lifecycle authority. RDC/remote agent owns process execution evidence only and must not independently advance project task/review/remediation state.
+- Add a Control Adapter boundary above the existing P12 Control API; adapters translate transport-specific requests only.
+- Provide an MCPAdapter MVP for bounded semantic status/log/control operations; do not expose unrestricted remote shell.
+- Stabilize WebBridgeAdapter as a secondary path with durable request identity, freshness, stale-binding detection and fail-closed response handling.
+- Separate ExecutionTransport from control transport: LocalTransport first, SSHTransport over Tailscale for remote hosts, RDCTransport only as fallback/emergency GUI/debug.
+- Preserve idempotency, expected-revision/repository-truth guards, authentication/origin protections, audit and explicit stale/unknown states.
+- Acceptance: with RDC unavailable, ChatGPT through a supported adapter can inspect authoritative DevO state, issue bounded lifecycle controls, and DevO can execute through Local/SSH without changing lifecycle authority.
 
-Acceptance: intentionally interrupt or time out the ChatGPT/RDC response path during a long-running test/build, verify the remote job continues, reconnect from a later turn, recover the same `job_id` and bounded logs/result, and prove repeated retry/reconcile operations create no duplicate side effects. Also verify deterministic classification for remote process still running, process completed but result delivery lost, RDC disconnected, command genuinely failed, and state genuinely unknown.
-
-Sequence: P13 follows P12.7 in the staged roadmap and establishes the durable job/idempotency contract before mobile work. P14 must consume this authoritative execution state rather than introducing a second monitoring model.
+Sequence: P13 follows P12.7 and removes the current RDC communication bottleneck before durable remote-job expansion.
 
 ## P14 staged roadmap
 
-### P14 - Mobile Control & Observability
+### P14 - Remote Execution Resilience & Recoverable Jobs
 
-Goal: provide an Android-native, failure-independent observation and bounded-control client for DevOrchestrator so project execution remains visible and controllable even when a ChatGPT conversation, browser session, or RDC interaction is stalled or unavailable.
+Goal: make long-running local/SSH/remote execution durable and recoverable across client, transport or tool-result interruption without duplicate side effects.
 
-- Build the Android client on the stable P12 Control API; do not create a second lifecycle/control authority in the mobile application.
-- Connect Android directly to DevOrchestrator over the private Tailscale path; do not require RDC or a ChatGPT conversation in the normal mobile data/control path.
-- Show all configured projects with lifecycle/task/stage state, current role/worker, AI provider/model, current and next action, last-progress age, watchdog/diagnostic state and OWNER_GATE conditions.
-- Provide a project event timeline with execution/review/remediation/retry milestones and enough evidence to distinguish a genuinely running worker from stale orchestration state.
-- Use a push-style event channel (SSE or WebSocket, selected during P12 API design) for near-real-time updates; reconnect with bounded backoff and reconcile from authoritative DevO state after disconnects.
-- Provide guarded mobile controls for continue, pause/resume where supported, stop, retry/reconcile and OWNER_GATE actions; all mutations must use P12 DevO authority, idempotency and audit paths.
-- Treat ChatGPT, Android, Web Dashboard and CLI as stateless control/observation clients. No authoritative project state may live in the Android application or a ChatGPT conversation.
-- Preserve explicit `unknown`, disconnected and stale states instead of presenting cached data as live execution.
-- Initial POC should stay small: project list/detail, event stream, connection/reconnect handling, stall alerting, and the minimum bounded controls needed to validate the architecture before expanding UI scope.
-- Stall alerting is a P14 core requirement, not a later enhancement. Consume authoritative DevO/P11-P12 progress timestamps and stall/watchdog state rather than inferring progress only from Android-side timers.
-- When an actively executing development project exceeds its configured no-progress threshold, raise an Android notification with vibration and an optional audible alarm; the alert must identify project, task/stage, last-progress age and the best-known stall/diagnostic reason.
-- Support per-project/global alert policy including enable/disable, no-progress threshold, sound/vibration mode, quiet-hours behavior and acknowledgement/snooze. Deduplicate repeated alerts for the same stall episode and re-arm only after authoritative progress resumes or the stall state materially changes.
-- Do not alert merely because a legitimate long-running build/test/review has produced no UI event: DevO should expose heartbeat/expected-long-operation evidence so the client can distinguish expected waiting from loss of progress. Disconnected/unknown state is a separate connectivity alert class and must not be mislabeled as project stall.
-- Later P14 increments may add voice capture/control and Bluetooth-ring navigation/confirm/cancel, reusing the same Control API rather than introducing a separate command channel.
-- Acceptance: with the ChatGPT/browser path intentionally unavailable, an operator on Android over Tailscale can determine whether a selected project is actively progressing or stalled, inspect recent authoritative events, execute supported bounded controls without RDC or direct shell access, and receive a vibration/audible notification when an active development project enters a confirmed no-progress condition.
+- Use durable asynchronous jobs with stable job_id/request_id and queued/running/completed/failed/cancelled/unknown-recovery states.
+- Persist execution identity, project/task/stage correlation, process evidence, timestamps, bounded logs, heartbeat/progress and terminal result.
+- Make retries idempotent and reconcile ambiguous timeouts before creating new work.
+- Separate execution from message delivery; disconnect must not terminate a healthy job.
+- Add bounded logs, long-operation classification, cancel/retry/reconcile, daemon-restart recovery and watchdog/accounting integration.
+- Preserve DevO lifecycle authority; ExecutionTransport owns execution evidence only.
+- Acceptance: interrupt a long build/test, recover the same job_id/log/result later, and prove retries create no duplicate side effects.
 
-Sequence: P14 follows P13. P12 owns the lifecycle/control contract; P13 adds durable recoverable remote-job state; P14 consumes both contracts and must not duplicate DevOrchestrator lifecycle or execution authority.
+Sequence: P14 follows P13 and builds recoverable jobs on the transport-independent boundary established by P13.
+
+## P15 staged roadmap
+
+### P15 - Mobile Observability & Guarded Control
+
+Goal: provide an Android-native, failure-independent observation and bounded-control client without creating a second lifecycle authority.
+
+- Connect Android directly to DevO over Tailscale and consume authoritative P12-P14 state.
+- Show project/task/stage, worker/reviewer/provider, current/next action, job progress, freshness, watchdog/diagnostics and OWNER_GATE.
+- Provide reconnectable event updates and guarded continue/pause/resume/stop/retry/reconcile/OWNER_GATE controls through DevO authority.
+- Raise deduplicated vibration/optional sound alerts for confirmed no-progress; disconnected/unknown remains a separate alert class.
+- Support per-project/global alert policy, thresholds, quiet hours, acknowledgement and snooze.
+- Initial scope: project list/detail, event stream, reconnect, stall alerts and minimum guarded controls; voice/Bluetooth-ring interaction is later scope.
+- Acceptance: with ChatGPT/browser/RDC unavailable, Android can observe authoritative execution, distinguish running/stalled/disconnected states, receive alerts and execute supported guarded controls.
+
+Sequence: P15 follows P14 and consumes existing lifecycle, transport and durable-job contracts.
