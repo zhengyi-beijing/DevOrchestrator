@@ -91,6 +91,22 @@ Goal: remove RDC as the normal ChatGPT-to-DevO control dependency while preservi
 
 Sequence: P13 follows P12.7 and removes the current RDC communication bottleneck before durable remote-job expansion.
 
+## P13.5 staged roadmap
+
+### P13.5 - Canonical Dashboard Sidebar Migration
+
+Goal: migrate the left-sidebar dashboard information architecture from `DevOrchestrator-dashboard-redesign` into the canonical web control surface without regressing P12.7 behavior.
+
+- Treat `C:\\work\\github\\DevOrchestrator-dashboard-redesign` as read-only UI reference; do not merge that branch wholesale.
+- Replace the canonical top-tab navigation with a persistent left sidebar.
+- Preserve all current canonical project, run, resource, watchdog, accounting and control capabilities.
+- Organize the sidebar around Overview, Projects, AI Resources, Usage/Accounting, Logs and System while keeping safety-critical controls discoverable.
+- Preserve authentication, CSRF/origin/Host protections, stale/unknown rendering and fail-closed control behavior.
+- Keep this phase bounded to UI/information architecture; lifecycle, AIBroker routing and P13 transport contracts remain unchanged.
+- Acceptance: all pre-migration capabilities remain reachable and functional, P12/P12.7 regression stays green, and new navigation/layout tests cover the sidebar behavior.
+
+Sequence: P13.5 follows P13 and precedes P14 so the canonical dashboard structure is settled before durable-job state expands the UI further.
+
 ## P14 staged roadmap
 
 ### P14 - Remote Execution Resilience & Recoverable Jobs
