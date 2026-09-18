@@ -89,18 +89,25 @@ class WebBridgeRequestStoreUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             store = WebBridgeRequestStore(td)
             client = MagicMock(spec=ControlAdapterClient)
-            client.status.return_value = {"project_id": "p1", "revision": "rev1"}
+            client.status.return_value = {
+                "project_id": "p1",
+                "revision": "rev1",
+                "service_token": "secret-service-token",
+            }
 
             req = make_valid_wb_request(adapter_request_id="req-same", operation="status")
 
-            # First execution
+            # First execution: returns redacted response
             res1 = store.handle_request(req, client)
             self.assertEqual(res1["revision"], "rev1")
+            self.assertEqual(res1["service_token"], "[REDACTED]")
             self.assertEqual(client.status.call_count, 1)
 
-            # Exact replay: must return cached response without calling client.status again
+            # Exact replay: must return identical cached response without calling client.status again
             res2 = store.handle_request(req, client)
             self.assertEqual(res2["revision"], "rev1")
+            self.assertEqual(res2["service_token"], "[REDACTED]")
+            self.assertEqual(res1, res2)
             self.assertEqual(client.status.call_count, 1)
 
             # Replay conflict: same request_id with altered operation

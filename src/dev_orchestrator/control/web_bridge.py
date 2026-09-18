@@ -225,6 +225,7 @@ class WebBridgeRequestStore:
                 raise ValueError(f"unsupported operation: {op!r}")
 
             # Persist durable record
+            redacted_result = redact_secrets(result)
             record = {
                 "schema_version": WEB_BRIDGE_SCHEMA_VERSION,
                 "adapter_request_id": safe_id,
@@ -233,8 +234,8 @@ class WebBridgeRequestStore:
                 "project_id": proj_id,
                 "issued_at": canonical["issued_at"],
                 "processed_at": utc_now_iso(),
-                "response": redact_secrets(result),
+                "response": redacted_result,
             }
             write_json(record_path, record, indent=2)
 
-            return result
+            return redacted_result

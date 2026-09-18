@@ -602,3 +602,17 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (3441 nodes, 9569 edges, 161 communities).
   - Canonical worktree clean and ready for independent technical re-review.
+
+## P13 Technical Review Remediation Round 2 (2026-09-18)
+
+- Remediated remaining Technical Review findings:
+  1. `SSHTransport.map_path`: Resolved remote subpath lowercasing bug on Windows hosts. Now derives relative subpath from non-normcased `os.path.abspath` values while performing prefix matching and boundary checks on normcased paths. Added mixed-case subpath regression test and case-insensitive prefix match test.
+  2. `redact_secrets` diagnostic code preservation: Removed bare `'code'` and bare `'csrf'` from `_SENSITIVE_KEYS` to ensure operational watchdog/diagnostics classifications (`agent_stalled`, `process_dead`, `provider_or_quota_blocked`) and broker CLI error codes (`UNAVAILABLE`) survive secret redaction in control logs and WebBridge responses. Secret-bearing pairing verification codes are now redacted selectively in pairing contexts (`is_pairing` context / `pairing_id`), along with `code_hash`, `csrf_token`, and session CSRF. Added dedicated regression test.
+  3. WebBridge response consistency: Updated `WebBridgeRequestStore.handle_request` to store and return the same `redacted_result` payload, preventing discrepancies between initial responses and idempotent replays.
+  4. SSH host identity validation: Tightened `_host_identities_match` so that two FQDNs with differing domains (e.g. `'host1.example.com'` vs `'host1.attacker.net'`) fail closed; short-name vs FQDN matches only when one side is an unqualified single DNS label and neither is an IP address. Added cross-domain rejection and short-name/FQDN tests.
+- Verification:
+  - Focused P13 suites passed: 63 P13 tests passed across 5 suites (10 control_logs, 23 execution_transport, 16 mcp_adapter, 2 software_acceptance, 12 web_bridge_adapter; 87 passed including test_aibroker_execution_port).
+  - Full test suite passed: 732 passed in 238.94s (`python -m pytest tests_py`).
+  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3444 nodes, 9574 edges, 171 communities).
+  - Canonical worktree clean and ready for independent technical re-review.

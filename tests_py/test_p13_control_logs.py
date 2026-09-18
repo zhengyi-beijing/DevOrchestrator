@@ -37,6 +37,62 @@ class P13ControlLogsUnitTests(unittest.TestCase):
         self.assertEqual(redacted["array"][0]["bearer_token"], "[REDACTED]")
         self.assertIn("[REDACTED]", redacted["array"][1])
 
+    def test_diagnostics_code_survives_redaction_and_secrets_redacted(self):
+        # Operational diagnostics / watchdog code must NOT be redacted
+        diagnostics_record = {
+            "code": "agent_stalled",
+            "message": "Agent did not report progress within timeout window",
+            "detail": "worker-1",
+        }
+        redacted_diag = redact_secrets(diagnostics_record)
+        self.assertEqual(redacted_diag["code"], "agent_stalled")
+        self.assertEqual(redacted_diag["message"], "Agent did not report progress within timeout window")
+
+        # Broker subprocess error code must NOT be redacted
+        broker_err = {
+            "code": "UNAVAILABLE",
+            "error": "broker CLI process terminated unexpectedly",
+        }
+        redacted_broker = redact_secrets(broker_err)
+        self.assertEqual(redacted_broker["code"], "UNAVAILABLE")
+
+        # Pairing verification code in pairing context MUST be redacted
+        pairing_record = {
+            "pairing_id": "pair-test-123",
+            "code": "sensitive-pairing-code-456",
+            "code_hash": "sha256-hash-of-code",
+            "expires_in_seconds": 300,
+        }
+        redacted_pairing = redact_secrets(pairing_record)
+        self.assertEqual(redacted_pairing["pairing_id"], "pair-test-123")
+        self.assertEqual(redacted_pairing["code"], "[REDACTED]")
+        self.assertEqual(redacted_pairing["code_hash"], "[REDACTED]")
+        self.assertEqual(redacted_pairing["expires_in_seconds"], 300)
+
+        # CSRF tokens MUST be redacted
+        csrf_record = {
+            "csrf_token": "csrf-secret-token-xyz",
+            "expires_in_seconds": 1800,
+        }
+        redacted_csrf = redact_secrets(csrf_record)
+        self.assertEqual(redacted_csrf["csrf_token"], "[REDACTED]")
+        self.assertEqual(redacted_csrf["expires_in_seconds"], 1800)
+
+        # Explicit pairing_code key MUST be redacted
+        explicit_pairing = {
+            "pairing_code": "my-secret-pairing-code",
+        }
+        self.assertEqual(redact_secrets(explicit_pairing)["pairing_code"], "[REDACTED]")
+
+        # Session CSRF in session context MUST be redacted
+        session_record = {
+            "session_id": "sess-xyz",
+            "csrf": "raw-session-csrf",
+        }
+        redacted_sess = redact_secrets(session_record)
+        self.assertEqual(redacted_sess["session_id"], "sess-xyz")
+        self.assertEqual(redacted_sess["csrf"], "[REDACTED]")
+
     def test_read_control_logs_empty_runtime(self):
         with tempfile.TemporaryDirectory() as td:
             res = read_control_logs(td)

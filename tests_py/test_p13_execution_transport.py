@@ -163,6 +163,24 @@ class P13SSHTransportTests(unittest.TestCase):
         # Subdirectory mapped
         sub = ROOT / "src" / "file.py"
         self.assertEqual(transport.map_path(sub), "/home/ubuntu/repo/src/file.py")
+        # Mixed-case subpath preserves case on remote mapping
+        sub_mixed = ROOT / "DevOrchestrator-dev" / "Src" / "WorkerHelper.py"
+        self.assertEqual(
+            transport.map_path(sub_mixed),
+            "/home/ubuntu/repo/DevOrchestrator-dev/Src/WorkerHelper.py",
+        )
+        # Mapping prefix case insensitivity match preserving target case
+        custom_cfg = SSHTransportConfig(
+            peer="100.64.0.10",
+            path_mapping={
+                "C:/Work/Github": "/home/ubuntu/github",
+            },
+        )
+        custom_transport = SSHTransport(custom_cfg)
+        self.assertEqual(
+            custom_transport.map_path("c:/work/github/DevOrchestrator-dev/src/ExecutionHelper.py"),
+            "/home/ubuntu/github/DevOrchestrator-dev/src/ExecutionHelper.py",
+        )
         # Unmapped path unchanged
         self.assertEqual(transport.map_path("/unmapped/path"), "/unmapped/path")
         # Sibling directory sharing name prefix does not match
@@ -336,6 +354,64 @@ class P13SSHTransportTests(unittest.TestCase):
         with patch("subprocess.run", return_value=mock_completed):
             res = transport_custom.dispatch(req, b_cfg, {}, 60.0)
             self.assertEqual(res.host_identity, "worker-box")
+
+        # 4. FQDN cross-domain mismatch fails closed ('host1.example.com' vs 'host1.attacker.net')
+        cfg_fqdn = SSHTransportConfig(peer="100.64.0.10", expected_host_identity="host1.example.com")
+        transport_fqdn = SSHTransport(cfg_fqdn)
+        resp_attacker = {
+            "status": "success",
+            "request_id": "req-host-1",
+            "host_identity": "host1.attacker.net",
+            "payload": {"success": True},
+        }
+        mock_attacker = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(resp_attacker).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=mock_attacker):
+            with self.assertRaises(ExecutionTransportError) as ctx:
+                transport_fqdn.dispatch(req, b_cfg, {}, 60.0)
+            self.assertIn("host identity mismatch", str(ctx.exception))
+
+        # 5. Short-name matches FQDN first DNS label
+        cfg_short = SSHTransportConfig(peer="100.64.0.10", expected_host_identity="host1")
+        transport_short = SSHTransport(cfg_short)
+        resp_fqdn = {
+            "status": "success",
+            "request_id": "req-host-1",
+            "host_identity": "host1.tailscale.net",
+            "payload": {"success": True},
+        }
+        mock_fqdn = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(resp_fqdn).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=mock_fqdn):
+            res_short = transport_short.dispatch(req, b_cfg, {}, 60.0)
+            self.assertEqual(res_short.host_identity, "host1.tailscale.net")
+
+        # 6. FQDN expected matches remote short-name
+        cfg_fqdn_expected = SSHTransportConfig(peer="100.64.0.10", expected_host_identity="host1.tailscale.net")
+        transport_fqdn_exp = SSHTransport(cfg_fqdn_expected)
+        resp_short_ret = {
+            "status": "success",
+            "request_id": "req-host-1",
+            "host_identity": "host1",
+            "payload": {"success": True},
+        }
+        mock_short_ret = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(resp_short_ret).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=mock_short_ret):
+            res_exp = transport_fqdn_exp.dispatch(req, b_cfg, {}, 60.0)
+            self.assertEqual(res_exp.host_identity, "host1")
 
     def test_host_key_rejection_fails_closed(self):
         cfg = SSHTransportConfig(peer="100.64.0.10")

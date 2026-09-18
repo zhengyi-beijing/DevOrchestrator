@@ -19,8 +19,9 @@ from dev_orchestrator.storage.json_store import parse_utc, utc_now_iso
 
 _SENSITIVE_KEYS = frozenset({
     "api_key", "secret", "password", "token", "access_token", "refresh_token",
-    "bearer", "authorization", "private_key", "cookie", "code", "csrf", "token_hash", "code_hash",
-    "csrf_token", "service_token",
+    "bearer", "authorization", "private_key", "cookie", "token_hash", "code_hash",
+    "csrf_token", "csrf-token", "x-csrf-token", "x_csrf_token", "service_token",
+    "pairing_code",
 })
 _BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/-]+", re.IGNORECASE)
 _PEM_RE = re.compile(r"-----BEGIN[A-Z\s]+PRIVATE KEY-----.*?-----END[A-Z\s]+PRIVATE KEY-----", re.DOTALL)
@@ -30,11 +31,21 @@ def redact_secrets(value: Any) -> Any:
     """Recursively redact secrets, tokens, passwords, and private keys."""
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
+        is_pairing = (
+            any("pairing" in str(k).lower() for k in value.keys())
+            or any("pairing" in str(v).lower() for v in value.values() if isinstance(v, str))
+        )
+        is_session = any("session" in str(k).lower() for k in value.keys())
         for key, val in value.items():
             key_lower = str(key).lower()
-            if key_lower in _SENSITIVE_KEYS or (
-                any(marker in key_lower for marker in ("secret", "password", "token", "api_key"))
-                and not key_lower.endswith(("_id", "_type", "_name", "_count", "_status", "_state"))
+            if (
+                key_lower in _SENSITIVE_KEYS
+                or (key_lower == "code" and is_pairing)
+                or (key_lower == "csrf" and is_session)
+                or (
+                    any(marker in key_lower for marker in ("secret", "password", "token", "api_key"))
+                    and not key_lower.endswith(("_id", "_type", "_name", "_count", "_status", "_state"))
+                )
             ):
                 result[key] = "[REDACTED]"
             else:

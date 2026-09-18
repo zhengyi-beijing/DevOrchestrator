@@ -9,6 +9,7 @@ Prohibits automatic RDC fallback and duplicate dispatch on ambiguous transport f
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import socket
@@ -339,17 +340,45 @@ class SSHTransport:
             reverse=True,
         )
         for local_prefix, remote_prefix in sorted_mappings:
-            norm_local = os.path.normcase(os.path.abspath(local_prefix))
-            norm_target = os.path.normcase(os.path.abspath(p_str))
+            abs_local = os.path.abspath(local_prefix)
+            abs_target = os.path.abspath(p_str)
+            norm_local = os.path.normcase(abs_local)
+            norm_target = os.path.normcase(abs_target)
             if norm_target == norm_local:
                 return remote_prefix
             if norm_target.startswith(norm_local + os.sep):
-                relative = os.path.relpath(norm_target, norm_local)
+                relative = os.path.relpath(abs_target, abs_local)
                 if relative.startswith(".."):
                     continue
                 # Join with POSIX forward slashes for remote
                 return remote_prefix.rstrip("/") + "/" + relative.replace("\\", "/")
         return p_str
+
+    @staticmethod
+    def _host_identities_match(expected: str, actual: str) -> bool:
+        if expected == actual:
+            return True
+        # If both contain dots (e.g. both are FQDNs or IP addresses), they must match exactly
+        if "." in expected and "." in actual:
+            return False
+        # If one is an unqualified short name (no dots), it can match the first DNS label of a FQDN
+        # provided neither is an IP address
+        try:
+            ipaddress.ip_address(expected)
+            return False
+        except ValueError:
+            pass
+        try:
+            ipaddress.ip_address(actual)
+            return False
+        except ValueError:
+            pass
+
+        if "." not in expected and actual.split(".")[0] == expected:
+            return True
+        if "." not in actual and expected.split(".")[0] == actual:
+            return True
+        return False
 
     def _build_ssh_argv(self) -> list[str]:
         cfg = self.ssh_config
@@ -422,11 +451,10 @@ class SSHTransport:
 
         expected_host = (self.ssh_config.expected_host_identity or self.ssh_config.peer).strip().lower()
         actual_host = returned_host_id.strip().lower()
-        if actual_host != expected_host:
-            if actual_host.split(".")[0] != expected_host.split(".")[0]:
-                raise ExecutionTransportError(
-                    f"SSH host identity mismatch: expected {expected_host!r}, received {actual_host!r}"
-                )
+        if not self._host_identities_match(expected_host, actual_host):
+            raise ExecutionTransportError(
+                f"SSH host identity mismatch: expected {expected_host!r}, received {actual_host!r}"
+            )
 
         if resp.get("status") != "success":
             err_msg = str(resp.get("error") or "remote helper execution failed")
