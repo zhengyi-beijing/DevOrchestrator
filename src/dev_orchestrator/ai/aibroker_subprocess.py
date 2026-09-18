@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from .contracts import AIRoleRequest, AIRoleResult, ResourceContext
+from .execution_transport import (
+    ExecutionTransport,
+    ExecutionTransportError,
+    LocalTransport,
+)
 
 if TYPE_CHECKING:
     from dev_orchestrator.accounting.events import ExecutionRecorder
@@ -21,6 +26,7 @@ if TYPE_CHECKING:
 
 class AIBrokerInvocationError(RuntimeError):
     """The broker transport/contract failed before a valid dispatch result."""
+
 
 
 def sanitize_url(url: str) -> str:
@@ -191,10 +197,12 @@ class AIBrokerExecutionPort:
         self,
         config: AIBrokerClientConfig,
         *,
+        transport: ExecutionTransport | None = None,
         accounting: "ExecutionRecorder | None" = None,
     ) -> None:
         self.config = config
         self.accounting = accounting
+        self.transport = transport if transport is not None else LocalTransport()
 
     def _build_env(self) -> dict[str, str]:
         env = dict(os.environ)
@@ -206,50 +214,27 @@ class AIBrokerExecutionPort:
         return env
 
     def execute(self, request: AIRoleRequest) -> AIRoleResult:
-        if self.config.service_url:
-            result = self._service_call("/api/dispatch", self._request_payload(request))
-            if not isinstance(result, dict):
-                raise AIBrokerInvocationError("broker service result must be an object")
-            parsed = self._result_from_payload(request, result)
-            self._record_provider_evidence(request, parsed)
-            return parsed
         env = self._build_env()
         transport_timeout = self.config.process_timeout_seconds
         if request.timeout_seconds is not None:
             transport_timeout = max(transport_timeout, float(request.timeout_seconds) + 60.0)
+
         try:
-            with tempfile.TemporaryDirectory(prefix="devorch-aibroker-") as temp_dir:
-                prompt_file = Path(temp_dir) / "prompt.txt"
-                prompt_file.write_text(request.prompt, encoding="utf-8")
-                argv = self._build_argv(request, prompt_file)
-                completed = subprocess.run(
-                    argv,
-                    cwd=str(self.config.broker_repo),
-                    env=env,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    capture_output=True,
-                    timeout=transport_timeout,
-                    check=False,
-                )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            transport_result = self.transport.dispatch(
+                request,
+                self.config,
+                env,
+                transport_timeout,
+                service_caller=self._service_call if self.config.service_url else None,
+            )
+        except ExecutionTransportError as exc:
             raise AIBrokerInvocationError(f"broker invocation failed: {exc}") from exc
 
-        if completed.returncode not in (0, 1):
-            detail = (completed.stderr or completed.stdout).strip()
-            raise AIBrokerInvocationError(
-                f"broker rejected request (exit {completed.returncode}): {detail}"
-            )
-        try:
-            payload = json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            raise AIBrokerInvocationError("broker returned invalid JSON") from exc
-        if not isinstance(payload, dict):
-            raise AIBrokerInvocationError("broker result must be a JSON object")
+        payload = transport_result.payload
         result = self._result_from_payload(request, payload)
         self._record_provider_evidence(request, result)
         return result
+
 
     def _record_provider_evidence(self, request: AIRoleRequest, result: AIRoleResult) -> None:
         """Record only fields returned by Broker or carried by the exact request."""
@@ -312,18 +297,30 @@ class AIBrokerExecutionPort:
         )
 
     def status(self, request_id: str) -> dict[str, Any] | None:
-        if self.config.service_url:
-            payload = self._service_call("/api/dispatches/" + urllib.parse.quote(str(request_id), safe=""), None)
-            return None if payload.get("status") == "not_found" else payload
-        payload = self._reconcile_call(["dispatch-status", str(request_id)])
-        return None if payload.get("status") == "not_found" else payload
+        env = self._build_env()
+        try:
+            return self.transport.status(
+                request_id,
+                self.config,
+                env,
+                service_caller=self._service_call if self.config.service_url else None,
+            )
+        except ExecutionTransportError as exc:
+            raise AIBrokerInvocationError(f"broker status failed: {exc}") from exc
 
     def interrupt(self, request_id: str, reason: str) -> dict[str, Any] | None:
-        if self.config.service_url:
-            payload = self._service_call("/api/dispatches/" + urllib.parse.quote(str(request_id), safe="") + "/interrupt", {"reason": reason})
-            return None if payload.get("status") == "not_found" else payload
-        payload = self._reconcile_call(["interrupt-dispatch", str(request_id), "--reason", reason])
-        return None if payload.get("status") == "not_found" else payload
+        env = self._build_env()
+        try:
+            return self.transport.interrupt(
+                request_id,
+                reason,
+                self.config,
+                env,
+                service_caller=self._service_call if self.config.service_url else None,
+            )
+        except ExecutionTransportError as exc:
+            raise AIBrokerInvocationError(f"broker interrupt failed: {exc}") from exc
+
 
     def _reconcile_call(self, args: list[str]) -> dict[str, Any]:
         argv = [str(self.config.python_executable), "-m", "ai_resource_broker.cli",

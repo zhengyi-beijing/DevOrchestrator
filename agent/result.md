@@ -543,3 +543,39 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Full test suite passed: 658 passed, 45 subtests passed in 228.65s (`python -m pytest tests_py -q`).
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (3146 nodes, 8781 edges, 159 communities). Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
+
+## P13 Transport-Independent Control Bridge (2026-09-18)
+
+- Authority and trust contract:
+  - Documented `docs/P13_CONTROL_BRIDGE_CONTRACT.md` establishing the authoritative P13 architecture, authority/trust boundaries, Control Adapter specifications, ExecutionTransport protocol, security models, and explicit manual-only RDC fallback exclusion.
+- Bounded paginated control logs:
+  - Implemented `src/dev_orchestrator/control/logs.py` (`build_control_logs`, `read_control_logs`, `redact_secrets`) with secret redaction, opaque base64 cursor pagination, source availability reporting across events, runs, audit, and accounting records, corrupt record skipping, and limit clamping. Exposed via authenticated `GET /api/v1/control/logs` on Port 8770.
+- Shared ControlAdapter client:
+  - Added `src/dev_orchestrator/control/adapter.py` above P12 HTTP routes for loopback authenticated `status`, `logs`, `submit_control` (with complete `EXPECTED_IDENTITY_FIELDS` and expected-revision CAS validation), and `command_status`.
+- Stdio MCP Adapter MVP:
+  - Implemented `src/dev_orchestrator/control/mcp_adapter.py` (`MCPAdapter`, `run_mcp_adapter`) exposing four closed semantic tools (`devorch_status`, `devorch_logs`, `devorch_control`, `devorch_command_status`) with JSON-RPC 2.0 stdio framing.
+- WebBridge Adapter & Store:
+  - Implemented `src/dev_orchestrator/control/web_bridge.py` (`WebBridgeRequestStore`) with canonical request hashing, deduplication/idempotent replay, 409 conflict detection, corruption quarantine to degraded health, and freshness window enforcement.
+- Scoped Capabilities:
+  - Extended `src/dev_orchestrator/control/security.py` with `create_web_bridge_capability`, `validate_web_bridge_capability`, and `revoke_capability` for project- and conversation-bound tokens.
+- HTTP Control Surface:
+  - Wired `server.py` for `/api/v1/control/logs`, `/api/v1/control/web-bridge/requests`, `/api/v1/control/bridge/requests`, `/api/v1/control/web-bridge-capabilities`, and revocation. Port 8765 remains transport-only; Port 8770 hosts control routes.
+- ExecutionTransport:
+  - Implemented `src/dev_orchestrator/ai/execution_transport.py` with `@runtime_checkable class ExecutionTransport(Protocol)`, `LocalTransport` (subprocess & service calls), and `SSHTransport` (OpenSSH over Tailscale, structured stdin/stdout, path mapping, result correlation, strict fail-closed on connection/timeout error with NO RDC fallback).
+- Remote Helper:
+  - Implemented `src/dev_orchestrator/ai/remote_helper.py` (`execute_request`, `handle_request`, `main`) for remote OpenSSH invocation.
+- Runtime Config & Integration:
+  - Extended `src/dev_orchestrator/ai/aibroker_subprocess.py` and `src/dev_orchestrator/ai/runtime_config.py` to support `transport` configuration (`local` or `ssh`).
+- CLI Commands:
+  - Added `mcp-adapter`, `create-web-bridge-capability`, `revoke-web-bridge-capability` in `src/dev_orchestrator/cli.py`.
+- Verification:
+  - 43 focused P13 tests across 5 test suites passed 100%:
+    - `tests_py/test_p13_control_logs.py` (6 passed)
+    - `tests_py/test_p13_mcp_adapter.py` (16 passed)
+    - `tests_py/test_p13_web_bridge_adapter.py` (6 passed)
+    - `tests_py/test_p13_execution_transport.py` (13 passed)
+    - `tests_py/test_p13_software_acceptance.py` (2 passed)
+  - Existing execution port suite verified: `test_aibroker_execution_port.py` (24 passed).
+  - Full test suite passed: 712 passed, 45 subtests passed in 238.73s (`python -m pytest tests_py -q`).
+  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3421 nodes, 9490 edges, 174 communities).

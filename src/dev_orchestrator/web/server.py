@@ -62,6 +62,8 @@ _PROJECT_PATH_RE = re.compile(r"^/api/projects/([A-Za-z0-9_-]+)$")
 _CONTROL_PROJECT_PATH_RE = re.compile(r"^/api/v1/control/projects/([A-Za-z0-9_-]+)$")
 _CONTROL_COMMAND_PATH_RE = re.compile(r"^/api/v1/control/commands/([A-Za-z0-9_-]+)$")
 _PAIRING_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/adapter-pairings/([A-Za-z0-9_-]+)/revoke$")
+_CAPABILITY_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/web-bridge-capabilities/([A-Za-z0-9_-]+)/revoke$")
+
 _ALLOW_HEADER = "GET, HEAD"
 _CONTROL_ALLOW_HEADER = "GET, HEAD, POST, OPTIONS"
 _MAX_CONTROL_BODY = 64 * 1024
@@ -482,6 +484,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             path not in {
                 "/api/v1/control/adapter-pairings/redeem",
                 "/api/v1/control/session-heartbeats",
+                "/api/v1/control/bridge/requests",
+                "/api/v1/control/web-bridge/requests",
             }
             or self.headers.get("Origin") != "https://chatgpt.com"
         ):
@@ -652,6 +656,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if command is None:
                 self._error(404, "Not Found", "command not found", head_only); return
             payload = _control_envelope(command, sources=[{"name": "control_command_store", "availability": "available"}])
+        elif path == "/api/v1/control/logs":
+            if not self._owner_authorized():
+                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            from dev_orchestrator.control.logs import build_control_logs
+            try:
+                payload = build_control_logs(runtime, parsed.query)
+            except ValueError as exc:
+                self._error(400, "Bad Request", str(exc), head_only); return
+
         elif path == "/api/monitor":
             payload = monitor_payload(runtime)
         elif path == "/api/summary":
@@ -757,6 +770,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         if not self._client_is_loopback():
             self._error(403, "Forbidden", "control mutations require a loopback peer", False); return
         path = urlsplit(self.path).path
+        runtime = self.server.runtime_root
         security = self.server.control_security
         if security is None:
             self._dispatch_method_not_allowed(); return
@@ -795,10 +809,97 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(session)), False,
                        {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"} if origin else None)
             return
+        if path in {"/api/v1/control/bridge/requests", "/api/v1/control/web-bridge/requests"}:
+            origin = self.headers.get("Origin")
+            if origin not in (None, "https://chatgpt.com") and not self._same_origin():
+                self._error(403, "Forbidden", "invalid origin for WebBridge request", False); return
+            value = self._read_control_json()
+            if value is None: return
+
+            auth_header = self.headers.get("Authorization")
+            is_master = security.bearer_authorized(auth_header)
+            binding = value.get("binding") if isinstance(value.get("binding"), dict) else {}
+            b_adapter = binding.get("adapter")
+            b_id = binding.get("binding_id")
+            project_id = value.get("project_id")
+
+            if not is_master:
+                if not isinstance(project_id, str) or not isinstance(b_id, str) or not isinstance(b_adapter, str):
+                    self._error(400, "Bad Request", "WebBridge request requires project_id and binding", False); return
+                ok, reason, cap_row = security.validate_web_bridge_capability(
+                    auth_header, project_id=project_id, binding_id=b_id, adapter=b_adapter
+                )
+                if not ok:
+                    self._error(401 if ("missing" in reason or "token" in reason) else 403, "Unauthorized" if ("missing" in reason or "token" in reason) else "Forbidden", reason, False); return
+
+                # Check live conversation session
+                session = self.server.conversation_store.session_status(b_adapter, b_id)
+                if session.get("state") != "live":
+                    self._error(403, "Forbidden", f"conversation session is {session.get('state')}", False); return
+
+                # Check project binding
+                bound = self.server.conversation_store.binding_for_project(project_id)
+                if bound is None or bound.get("binding_id") != b_id or bound.get("adapter") != b_adapter:
+                    self._error(403, "Forbidden", "project is not bound to the specified conversation", False); return
+
+            from dev_orchestrator.control.web_bridge import (
+                WebBridgeRequestStore,
+                WebBridgeConflictError,
+                WebBridgeFreshnessError,
+                WebBridgeCorruptionError,
+            )
+            from dev_orchestrator.control.adapter import (
+                ControlAdapterClient,
+                ControlAdapterRevisionMismatchError,
+                ControlAdapterError,
+            )
+            client = ControlAdapterClient(
+                base_url=f"http://127.0.0.1:{self.server.server_address[1]}",
+                token=security._master,
+                runtime_root=runtime,
+            )
+            store = WebBridgeRequestStore(runtime)
+            try:
+                result = store.handle_request(value, client)
+            except WebBridgeConflictError as exc:
+                self._error(409, "Conflict", str(exc), False); return
+            except ControlAdapterRevisionMismatchError as exc:
+                self._error(409, "Conflict", str(exc), False); return
+            except (WebBridgeFreshnessError, ValueError, TypeError) as exc:
+                self._error(400, "Bad Request", str(exc), False); return
+            except WebBridgeCorruptionError as exc:
+                self._error(500, "Internal Server Error", str(exc), False); return
+            except ControlAdapterError as exc:
+                self._error(400, "Bad Request", str(exc), False); return
+
+            cors_header = {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"} if origin == "https://chatgpt.com" else None
+            envelope = result if (isinstance(result, dict) and "data" in result and ("schema_version" in result or "version" in result)) else _control_envelope(result)
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(envelope), False, cors_header)
+            return
         if not self._owner_authorized():
             self._error(401, "Unauthorized", "valid control authorization required", False); return
         if path == "/api/v1/control/adapter-pairings":
             self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(security.create_pairing())), False); return
+        if path == "/api/v1/control/web-bridge-capabilities":
+            value = self._read_control_json()
+            if value is None: return
+            try:
+                cap = security.create_web_bridge_capability(
+                    value.get("project_id"),
+                    value.get("binding_id"),
+                    value.get("adapter", "chatgpt"),
+                    expires_in_seconds=value.get("expires_in_seconds", 3600),
+                )
+            except (ValueError, TypeError) as exc:
+                self._error(400, "Bad Request", str(exc), False); return
+            self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(cap)), False); return
+        revoke_wb = _CAPABILITY_REVOKE_PATH_RE.fullmatch(path)
+        if revoke_wb:
+            try:
+                res = security.revoke_capability(revoke_wb.group(1))
+            except ValueError as exc:
+                self._error(404, "Not Found", str(exc), False); return
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(res)), False); return
         revoke = _PAIRING_REVOKE_PATH_RE.fullmatch(path)
         if revoke:
             try:

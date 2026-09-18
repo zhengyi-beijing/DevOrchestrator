@@ -508,6 +508,43 @@ def cmd_control_overview(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mcp_adapter(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.control.mcp_adapter import run_mcp_adapter
+    return run_mcp_adapter(
+        base_url=getattr(args, "base_url", None),
+        token=getattr(args, "token", None),
+        runtime_root=str(runtime),
+    )
+
+
+def cmd_create_web_bridge_capability(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.control.security import ControlSecurity
+    security = ControlSecurity(runtime)
+    res = security.create_web_bridge_capability(
+        args.project_id,
+        args.binding_id,
+        adapter=args.adapter,
+        expires_in_seconds=args.ttl,
+    )
+    _print_json(res)
+    return 0
+
+
+def cmd_revoke_web_bridge_capability(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.control.security import ControlSecurity
+    security = ControlSecurity(runtime)
+    try:
+        res = security.revoke_capability(args.capability_id)
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+    _print_json(res)
+    return 0
+
+
+
 def cmd_watchdog_status(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
     payload = watchdog_payload(runtime)
@@ -1059,6 +1096,22 @@ def build_parser() -> argparse.ArgumentParser:
     control_overview.add_argument("--runtime-root", default=None)
     control_overview.add_argument("--config", default=None, help="path to projects.json")
 
+    mcp_adapter = sub.add_parser("mcp-adapter", help="run stdio JSON-RPC 2.0 MCP adapter for DevOrchestrator control")
+    mcp_adapter.add_argument("--base-url", default=None, help="DevOrchestrator control HTTP base URL")
+    mcp_adapter.add_argument("--token", default=None, help="control bearer token")
+    mcp_adapter.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    create_cap = sub.add_parser("create-web-bridge-capability", help="issue a scoped web bridge capability token")
+    create_cap.add_argument("project_id", help="target project ID")
+    create_cap.add_argument("binding_id", help="browser conversation binding ID")
+    create_cap.add_argument("--adapter", default="chatgpt_web", help="control adapter name")
+    create_cap.add_argument("--ttl", type=int, default=3600, help="time-to-live in seconds")
+    create_cap.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    revoke_cap = sub.add_parser("revoke-web-bridge-capability", help="revoke an active capability token")
+    revoke_cap.add_argument("capability_id", help="capability ID to revoke")
+    revoke_cap.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     import_rdc = sub.add_parser(
         "import-rdc-evidence",
         help="import normalized RDC invocation evidence into the accounting ledger",
@@ -1156,6 +1209,9 @@ _COMMANDS = {
     "project-continue": cmd_project_continue,
     "project-control": cmd_project_control,
     "control-overview": cmd_control_overview,
+    "mcp-adapter": cmd_mcp_adapter,
+    "create-web-bridge-capability": cmd_create_web_bridge_capability,
+    "revoke-web-bridge-capability": cmd_revoke_web_bridge_capability,
     "import-rdc-evidence": cmd_import_rdc_evidence,
     "execution-report": cmd_execution_report,
     "monitor": cmd_monitor,

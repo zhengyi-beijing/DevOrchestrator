@@ -5,21 +5,33 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P12.7 Web Control Surface Visual Refresh** — **REVIEW REMEDIATION COMPLETE / TECHNICAL RE-REVIEW PENDING**.
+Current task: **P13 Transport-Independent Control Bridge** — **IMPLEMENTATION COMPLETE / TECHNICAL REVIEW PENDING**.
 
 Latest continuation state (2026-09-18):
-- Canonical `main` HEAD is ahead of `origin/main` by 31 commits.
-- Remediated Technical Review findings from `ai_review:rereview:closure3`:
-  1. Acceptance 2 (guarded-action CAS projection): Hardened `cmd_project_control` in `src/dev_orchestrator/cli.py` to mirror the daemon coordinator's per-action validation projection. For `retry` and `rereview`, expected CAS identity is derived using the orchestration lifecycle overlay (`overlay_orchestration_lifecycle` with `ai-reviewer.json` and `summary.json`), matching what `ControlCommandCoordinator._advance_command` observes (e.g. `REVIEW_FAILED`). For all other controls (e.g. `pause`), raw per-project snapshots are retained so commands are not rejected as stale project identity.
-  2. Daemon reviewer fallback: Hardened `ControlCommandCoordinator._advance_command` in `src/dev_orchestrator/core/control_commands.py` to fall back to durable on-disk reviewer state (`ai-reviewer.json`) when `self.reviewer` is not injected.
-  3. CLI CAS regression tests: Added `test_project_control_retry_uses_orchestration_lifecycle_overlay` and `test_project_control_rereview_uses_orchestration_lifecycle_overlay` in `tests_py/test_cli.py` verifying that both actions derive `expected.lifecycle_state = "REVIEW_FAILED"`.
+- Implemented P13 Transport-Independent Control Bridge:
+  1. Contract: Added `docs/P13_CONTROL_BRIDGE_CONTRACT.md` establishing the authoritative P13 architecture, authority/trust boundaries, Control Adapter specifications, ExecutionTransport protocol, security models, and explicit manual-only RDC fallback exclusion.
+  2. Bounded Paginated Control Logs: Implemented `src/dev_orchestrator/control/logs.py` with secret redaction, opaque base64 cursor pagination, source availability reporting, and limit clamping. Exposed via authenticated `GET /api/v1/control/logs` on Port 8770.
+  3. Shared ControlAdapter Client: Added `src/dev_orchestrator/control/adapter.py` above P12 HTTP routes for loopback authenticated `status`, `logs`, `submit_control` (with complete `EXPECTED_IDENTITY_FIELDS` and expected-revision CAS validation), and `command_status`.
+  4. Stdio MCP Adapter MVP: Implemented `src/dev_orchestrator/control/mcp_adapter.py` (`MCPAdapter`, `run_mcp_adapter`) exposing four closed semantic tools (`devorch_status`, `devorch_logs`, `devorch_control`, `devorch_command_status`) with JSON-RPC 2.0 stdio framing.
+  5. WebBridge Adapter & Store: Implemented `src/dev_orchestrator/control/web_bridge.py` (`WebBridgeRequestStore`) with canonical request hashing, deduplication/idempotent replay, 409 conflict detection, corruption quarantine to degraded health, and freshness window enforcement.
+  6. Scoped Capabilities: Extended `src/dev_orchestrator/control/security.py` with `create_web_bridge_capability`, `validate_web_bridge_capability`, and `revoke_capability` for project- and conversation-bound tokens.
+  7. HTTP Control Surface: Wired `server.py` for `/api/v1/control/logs`, `/api/v1/control/web-bridge/requests`, `/api/v1/control/bridge/requests`, `/api/v1/control/web-bridge-capabilities`, and revocation. Port 8765 remains transport-only; Port 8770 hosts control routes.
+  8. ExecutionTransport: Implemented `src/dev_orchestrator/ai/execution_transport.py` with `@runtime_checkable class ExecutionTransport(Protocol)`, `LocalTransport` (subprocess & service calls), and `SSHTransport` (OpenSSH over Tailscale, structured stdin/stdout, path mapping, result correlation, strict fail-closed on connection/timeout error with NO RDC fallback).
+  9. Remote Helper: Implemented `src/dev_orchestrator/ai/remote_helper.py` (`execute_request`, `handle_request`, `main`) for remote OpenSSH invocation.
+  10. Runtime Config & Integration: Extended `src/dev_orchestrator/ai/aibroker_subprocess.py` and `src/dev_orchestrator/ai/runtime_config.py` to support `transport` configuration (`local` or `ssh`).
+  11. CLI Commands: Added `mcp-adapter`, `create-web-bridge-capability`, `revoke-web-bridge-capability` in `src/dev_orchestrator/cli.py`.
 - Verification:
-  - Focused web/control/cli suites passed: 101 passed, 16 subtests passed (`test_cli.py`, `test_web.py`, `test_accounting_dashboard.py`, `test_unbound_web_ui.py`, `test_web_ui_refresh.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_control_commands.py`, `test_p126_review_retry.py`, `test_p127_closure_rereview.py`).
-  - `tests/web-selftest.ps1`: PASS.
-  - Full test suite passed: 658 passed, 45 subtests passed in 228.65s (`python -m pytest tests_py -q`).
+  - 43 focused P13 tests across 5 test suites passed 100%:
+    - `tests_py/test_p13_control_logs.py` (6 passed)
+    - `tests_py/test_p13_mcp_adapter.py` (16 passed)
+    - `tests_py/test_p13_web_bridge_adapter.py` (6 passed)
+    - `tests_py/test_p13_execution_transport.py` (13 passed)
+    - `tests_py/test_p13_software_acceptance.py` (2 passed)
+  - Existing execution port suite verified: `test_aibroker_execution_port.py` (24 passed).
+  - Full test suite passed: 712 passed, 45 subtests passed in 238.73s (`python -m pytest tests_py -q`).
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
-  - Knowledge graph updated with `graphify update .` (3146 nodes, 8781 edges, 159 communities). Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
-- Immediate continuation rule: perform independent technical re-review of P12.7 changes on clean worktree.
+  - Knowledge graph updated with `graphify update .` (3421 nodes, 9490 edges, 174 communities).
+- Immediate continuation rule: perform independent technical review of P13 changes on clean worktree.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.

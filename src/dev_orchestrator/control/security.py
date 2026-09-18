@@ -62,6 +62,10 @@ class ControlSecurity:
                     pass
             return value
 
+    def token(self) -> str:
+        """Return the master control authorization token."""
+        return self._master
+
     @staticmethod
     def valid_origin(origin: str | None, host: str | None, port: int) -> bool:
         if not origin or not host:
@@ -177,16 +181,120 @@ class ControlSecurity:
         )
 
     def revoke_pairing(self, pairing_id: str) -> dict[str, Any]:
+        return self.revoke_capability(pairing_id)
+
+    def create_web_bridge_capability(
+        self,
+        project_id: str,
+        binding_id: str,
+        adapter: str = "chatgpt",
+        *,
+        expires_in_seconds: int = 3600,
+    ) -> dict[str, Any]:
+        """Create an owner-authorized, revocable WebBridge control capability bound to exact project and binding."""
+        if not project_id or not isinstance(project_id, str):
+            raise ValueError("project_id must be a nonblank string")
+        if not binding_id or not isinstance(binding_id, str):
+            raise ValueError("binding_id must be a nonblank string")
+        if not adapter or not isinstance(adapter, str):
+            raise ValueError("adapter must be a nonblank string")
+
+        cap_id = secrets.token_urlsafe(12)
+        token = secrets.token_urlsafe(32)
+        ttl = max(60, min(86400 * 30, int(expires_in_seconds)))
+
         with InterProcessFileLock(self.lock_path):
             data = self._pairings()
-            pairing = data["pairings"].get(pairing_id)
-            capability = data["capabilities"].get(pairing_id)
+            data["capabilities"][cap_id] = {
+                "capability_id": cap_id,
+                "token_hash": _digest(token),
+                "scope": "web_bridge_control",
+                "project_id": project_id.strip(),
+                "binding_id": binding_id.strip(),
+                "adapter": adapter.strip(),
+                "created_at": utc_now_iso(),
+                "expires_at_epoch": time.time() + ttl,
+                "revoked": False,
+            }
+            write_json(self.pairings_path, data, indent=2)
+
+        return {
+            "capability_id": cap_id,
+            "token": token,
+            "scope": "web_bridge_control",
+            "project_id": project_id.strip(),
+            "binding_id": binding_id.strip(),
+            "adapter": adapter.strip(),
+            "expires_in_seconds": ttl,
+        }
+
+    def validate_web_bridge_capability(
+        self,
+        header_or_token: str | None,
+        project_id: str,
+        binding_id: str,
+        adapter: str | None = None,
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """Validate a WebBridge control token against project and live binding."""
+        if not header_or_token or not isinstance(header_or_token, str):
+            return False, "missing capability token", None
+        token = header_or_token
+        if token.startswith("Bearer "):
+            token = token[7:].strip()
+        if not token:
+            return False, "empty capability token", None
+
+        digest = _digest(token)
+        data = self._pairings()
+        now = time.time()
+
+        for row in data["capabilities"].values():
+            if not isinstance(row, dict):
+                continue
+            if row.get("scope") != "web_bridge_control":
+                continue
+            if row.get("revoked"):
+                continue
+            if not hmac.compare_digest(str(row.get("token_hash") or ""), digest):
+                continue
+
+            # Check expiration
+            expires_at = float(row.get("expires_at_epoch") or 0)
+            if expires_at <= now:
+                return False, "capability token expired", None
+
+            # Check project match
+            if row.get("project_id") != project_id:
+                return False, f"capability project mismatch: bound to {row.get('project_id')!r}, requested {project_id!r}", None
+
+            # Check binding match
+            if row.get("binding_id") != binding_id:
+                return False, f"capability binding mismatch: bound to {row.get('binding_id')!r}, requested {binding_id!r}", None
+
+            # Check adapter match if provided
+            if adapter and row.get("adapter") and row.get("adapter") != adapter:
+                return False, f"capability adapter mismatch: bound to {row.get('adapter')!r}, requested {adapter!r}", None
+
+            return True, "", row
+
+        return False, "invalid or revoked capability token", None
+
+    def revoke_capability(self, capability_id: str) -> dict[str, Any]:
+        with InterProcessFileLock(self.lock_path):
+            data = self._pairings()
+            pairing = data["pairings"].get(capability_id)
+            capability = data["capabilities"].get(capability_id)
             if not isinstance(pairing, dict) and not isinstance(capability, dict):
-                raise ValueError("pairing not found")
+                # Try finding by capability_id in capabilities values
+                matched_key = next((k for k, v in data["capabilities"].items() if isinstance(v, dict) and v.get("capability_id") == capability_id), None)
+                if matched_key:
+                    capability = data["capabilities"][matched_key]
+                else:
+                    raise ValueError(f"capability or pairing not found: {capability_id!r}")
             now = utc_now_iso()
             if isinstance(pairing, dict):
                 pairing.update({"used": True, "revoked": True, "revoked_at": now})
             if isinstance(capability, dict):
                 capability.update({"revoked": True, "revoked_at": now})
             write_json(self.pairings_path, data, indent=2)
-            return {"pairing_id": pairing_id, "revoked": True}
+            return {"capability_id": capability_id, "revoked": True}

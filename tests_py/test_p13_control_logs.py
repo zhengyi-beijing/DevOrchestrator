@@ -1,0 +1,180 @@
+import http.client
+import json
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+from dev_orchestrator.control.logs import read_control_logs, redact_secrets
+from dev_orchestrator.control.security import ControlSecurity
+from dev_orchestrator.web.server import make_server
+from tests_py.test_control_commands import write_config
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class P13ControlLogsUnitTests(unittest.TestCase):
+    def test_secret_redaction(self):
+        sample = {
+            "token": "secret_token_123",
+            "api_key": "sk-1234567890abcdef",
+            "authorization": "Bearer super-secret",
+            "nested": {
+                "password": "my_password",
+                "normal": "safe_value",
+            },
+            "array": [
+                {"bearer_token": "token_abc"},
+                "just a string with Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 inside",
+            ],
+        }
+        redacted = redact_secrets(sample)
+        self.assertEqual(redacted["token"], "[REDACTED]")
+        self.assertEqual(redacted["api_key"], "[REDACTED]")
+        self.assertEqual(redacted["authorization"], "[REDACTED]")
+        self.assertEqual(redacted["nested"]["password"], "[REDACTED]")
+        self.assertEqual(redacted["nested"]["normal"], "safe_value")
+        self.assertEqual(redacted["array"][0]["bearer_token"], "[REDACTED]")
+        self.assertIn("[REDACTED]", redacted["array"][1])
+
+    def test_read_control_logs_empty_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = read_control_logs(td)
+            self.assertEqual(res["schema_version"], 1)
+            self.assertEqual(res["items"], [])
+            self.assertEqual(res["total_matched"], 0)
+            self.assertFalse(res["has_more"])
+            self.assertIsNone(res["next_cursor"])
+            self.assertIn("sources", res)
+            self.assertEqual(res["sources"]["events"]["status"], "not_found")
+
+    def test_read_control_logs_filtering_and_pagination(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            events_file = p / "events.jsonl"
+            # Write 25 events for p1, 10 events for p2
+            with events_file.open("w", encoding="utf-8") as f:
+                for i in range(25):
+                    rec = {
+                        "timestamp": f"2026-09-18T10:{i:02d}:00Z",
+                        "project_id": "proj-alpha",
+                        "run_id": f"run-{i}",
+                        "command_id": f"cmd-{i % 5}",
+                        "event": f"alpha_event_{i}",
+                        "token": f"sensitive_token_{i}",
+                    }
+                    f.write(json.dumps(rec) + "\n")
+                for j in range(10):
+                    rec = {
+                        "timestamp": f"2026-09-18T11:{j:02d}:00Z",
+                        "project_id": "proj-beta",
+                        "event": f"beta_event_{j}",
+                    }
+                    f.write(json.dumps(rec) + "\n")
+
+            # Filter by proj-alpha, limit 10
+            page1 = read_control_logs(td, project_id="proj-alpha", limit=10)
+            self.assertEqual(len(page1["items"]), 10)
+            self.assertEqual(page1["total_matched"], 25)
+            self.assertTrue(page1["has_more"])
+            self.assertIsNotNone(page1["next_cursor"])
+            # Ensure redaction worked
+            self.assertEqual(page1["items"][0]["data"]["token"], "[REDACTED]")
+
+            # Page 2
+            page2 = read_control_logs(td, project_id="proj-alpha", limit=10, cursor=page1["next_cursor"])
+            self.assertEqual(len(page2["items"]), 10)
+            self.assertTrue(page2["has_more"])
+
+            # Page 3
+            page3 = read_control_logs(td, project_id="proj-alpha", limit=10, cursor=page2["next_cursor"])
+            self.assertEqual(len(page3["items"]), 5)
+            self.assertFalse(page3["has_more"])
+            self.assertIsNone(page3["next_cursor"])
+
+            # Filter by command_id
+            cmd_filter = read_control_logs(td, command_id="cmd-1")
+            self.assertEqual(len(cmd_filter["items"]), 5)
+            for it in cmd_filter["items"]:
+                self.assertEqual(it["command_id"], "cmd-1")
+
+    def test_corrupt_lines_handled_gracefully(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            events_file = p / "events.jsonl"
+            with events_file.open("w", encoding="utf-8") as f:
+                f.write(json.dumps({"timestamp": "2026-09-18T10:00:00Z", "project_id": "p1", "msg": "valid1"}) + "\n")
+                f.write("{invalid json syntax here\n")
+                f.write(json.dumps({"timestamp": "2026-09-18T10:01:00Z", "project_id": "p1", "msg": "valid2"}) + "\n")
+
+            res = read_control_logs(td)
+            self.assertEqual(len(res["items"]), 2)
+            self.assertEqual(res["items"][0]["data"]["msg"], "valid2")
+            self.assertEqual(res["items"][1]["data"]["msg"], "valid1")
+            self.assertIn("corrupt_lines_skipped", res["sources"]["events"])
+            self.assertEqual(res["sources"]["events"]["corrupt_lines_skipped"], 1)
+
+
+class P13ControlLogsHTTPTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.runtime = Path(self.temp.name)
+        (self.runtime / "projects").mkdir()
+        self.config = self.runtime / "projects.json"
+        write_config(self.config, ROOT)
+
+        # Write sample event
+        events_file = self.runtime / "events.jsonl"
+        with events_file.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "timestamp": "2026-09-18T12:00:00Z",
+                "project_id": "test-p1",
+                "action": "pause",
+                "secret_key": "supersecret123",
+            }) + "\n")
+
+        self.security = ControlSecurity(self.runtime)
+        self.auth_token = self.security.token()
+
+        self.server = make_server(
+            "127.0.0.1", 0, self.runtime, ROOT / "web",
+            enable_control=True, config_path=self.config,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temp.cleanup()
+
+    def request(self, path, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        h = headers or {}
+        conn.request("GET", path, headers=h)
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp.status, resp.headers, data
+
+    def test_unauthorized_request_rejected(self):
+        status, _, _ = self.request("/api/v1/control/logs")
+        self.assertEqual(status, 401)
+
+        status, _, _ = self.request("/api/v1/control/logs", headers={"Authorization": "Bearer invalid-token"})
+        self.assertEqual(status, 401)
+
+    def test_authorized_get_logs_success(self):
+        status, _, body = self.request(
+            "/api/v1/control/logs?project_id=test-p1&limit=10",
+            headers={"Authorization": f"Bearer {self.auth_token}"},
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(len(payload["items"]), 1)
+        item = payload["items"][0]
+        self.assertEqual(item["project_id"], "test-p1")
+        self.assertEqual(item["data"]["secret_key"], "[REDACTED]")
