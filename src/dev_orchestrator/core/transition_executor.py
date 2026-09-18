@@ -220,6 +220,15 @@ def _legacy_no_next_settle(record: Any) -> bool:
     )
 
 
+def _legacy_not_advanced_block(record: Any) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get("state") == "blocked"
+        and record.get("source_kind") == "decision"
+        and record.get("reason") == "NEXT_TASK refused because agent/next.md has not advanced"
+    )
+
+
 def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]], str]:
     raw = project.get("execution")
     if not isinstance(raw, dict):
@@ -615,7 +624,9 @@ class TransitionExecutor:
         with self._lock:
             ledger = self._load_ledger()
             existing = ledger["executions"].get(source_request_id)
-            if existing is not None and not _legacy_not_ready_block(existing):
+            if existing is not None and not (
+                _legacy_not_ready_block(existing) or _legacy_not_advanced_block(existing)
+            ):
                 return
             ledger["executions"][source_request_id] = {
                 "project_id": project_id, "source_request_id": source_request_id,
@@ -639,12 +650,15 @@ class TransitionExecutor:
         staged: Any = None,
         reviewed_branch: str | None = None,
         reviewed_head: str | None = None,
+        reviewed_ready: bool = False,
     ) -> None:
         with self._lock:
             ledger = self._load_ledger()
             existing = ledger["executions"].get(source_request_id)
             if existing is not None and not (
-                _legacy_not_ready_block(existing) or _legacy_no_next_settle(existing)
+                _legacy_not_ready_block(existing)
+                or _legacy_no_next_settle(existing)
+                or _legacy_not_advanced_block(existing)
             ):
                 return
             row: dict[str, Any] = {
@@ -661,6 +675,7 @@ class TransitionExecutor:
                 row["staged_spec_sha256"] = staged.spec_sha256
                 row["reviewed_branch"] = reviewed_branch
                 row["reviewed_head"] = reviewed_head
+                row["reviewed_ready"] = bool(reviewed_ready)
             ledger["executions"][source_request_id] = row
             self._save_ledger(ledger)
         if self._progress_channel is not None:
@@ -1759,7 +1774,9 @@ class TransitionExecutor:
             with self._lock:
                 existing = self._load_ledger()["executions"].get(request_id)
                 if existing is not None and not (
-                    _legacy_not_ready_block(existing) or _legacy_no_next_settle(existing)
+                    _legacy_not_ready_block(existing)
+                    or _legacy_no_next_settle(existing)
+                    or _legacy_not_advanced_block(existing)
                 ):
                     continue
             if record.get("disposition") != "apply":
@@ -1855,12 +1872,7 @@ class TransitionExecutor:
                 ):
                     repo_dir = project.get("repo_path") or ""
                     rm_res = read_successor(repo_dir, task_id)
-                    unlisted_ready_task = (
-                        reviewed_current_ready
-                        and rm_res.kind == "invalid"
-                        and rm_res.reason == f"completed task {task_id} not found in roadmap"
-                    )
-                    if rm_res.kind == "invalid" and not unlisted_ready_task:
+                    if rm_res.kind == "invalid":
                         self._record_blocked(
                             request_id, project_id,
                             f"staged roadmap invalid: {rm_res.reason}",
@@ -1886,6 +1898,7 @@ class TransitionExecutor:
                             staged=rm_res,
                             reviewed_branch=truth.branch,
                             reviewed_head=truth.head,
+                            reviewed_ready=reviewed_current_ready,
                         )
                     else:
                         reason = (

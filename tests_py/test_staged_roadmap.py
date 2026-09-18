@@ -96,7 +96,7 @@ class TestStagedRoadmap(unittest.TestCase):
             self.assertEqual(result.kind, "invalid")
             self.assertIn("duplicate task_id", result.reason or "")
 
-    def test_missing_completed_task_returns_invalid(self):
+    def test_missing_completed_task_returns_unlisted(self):
         with tempfile.TemporaryDirectory() as td:
             repo = make_staged_repo(Path(td))
             data = {
@@ -105,7 +105,7 @@ class TestStagedRoadmap(unittest.TestCase):
             }
             (repo / "agent" / "staged" / "roadmap.json").write_text(json.dumps(data), encoding="utf-8")
             result = read_successor(repo, "P11x")
-            self.assertEqual(result.kind, "invalid")
+            self.assertEqual(result.kind, "unlisted")
             self.assertIn("completed task P11x not found", result.reason or "")
 
     def test_only_one_null_returns_invalid(self):

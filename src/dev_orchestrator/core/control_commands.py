@@ -184,9 +184,16 @@ class ControlCommandCoordinator:
                 if _nonblank(telemetry.get("task_id")) != next_task_id or "PENDING DESIGN" not in str(snapshot.get("next_status") or "").upper():
                     continue
             else:
+                status = str(snapshot.get("next_status") or "")
+                if row.get("reviewed_ready") is True:
+                    status_ok = re.search(
+                        r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE
+                    ) is not None
+                else:
+                    status_ok = re.search(r"\bCOMPLETED?\b", status, re.IGNORECASE) is not None
                 if (
                     _nonblank(telemetry.get("task_id")) != _nonblank(row.get("task_id"))
-                    or not re.search(r"\bCOMPLETED?\b", str(snapshot.get("next_status") or ""), re.IGNORECASE)
+                    or not status_ok
                     or staged_successor != next_task_id
                 ):
                     continue

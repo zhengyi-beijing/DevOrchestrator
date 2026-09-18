@@ -233,6 +233,50 @@ class ControlCommandTests(unittest.TestCase):
             third = coordinator2.advance(config, snapshot, executor)
             self.assertEqual(len(planner.calls), 1)
 
+    def test_staged_ready_decision_handoff_consumes_on_ready_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; repo.mkdir(); runtime = base / "runtime"
+            config = base / "projects.json"; write_config(config, repo)
+            planner = FakePlanner(); executor = FakeExecutor(launch=True)
+            executor.records["review-r1"] = {
+                "project_id": "p1", "state": "handoff", "outcome": "planning_required",
+                "task_id": "P1", "next_task_id": "P2", "staged_successor": "P2",
+                "staged_spec_path": "agent/staged/P2.md", "staged_spec_sha256": "abc",
+                "reviewed_branch": "main", "reviewed_head": "head1",
+                "reviewed_ready": True,
+            }
+            coordinator = ControlCommandCoordinator(runtime, planner)
+            snapshot = {"projects": [{"project_id": "p1", "state": "IDLE", "next_status": "**READY_TO_RUN**", "telemetry": {"task_id": "P1"}}]}
+            first = coordinator.advance(config, snapshot, executor)
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0]["lifecycle_action"], "plan")
+            self.assertEqual(first[0]["source"], "automatic_review_handoff")
+            self.assertTrue(executor.records["review-r1"]["handoff_consumed"])
+            self.assertEqual(planner.calls[0][0], "deferred")
+            self.assertEqual(planner.calls[0][3], "P2")
+
+    def test_staged_ready_decision_handoff_skips_on_non_ready_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; repo.mkdir(); runtime = base / "runtime"
+            config = base / "projects.json"; write_config(config, repo)
+            planner = FakePlanner(); executor = FakeExecutor(launch=True)
+            executor.records["review-r1"] = {
+                "project_id": "p1", "state": "handoff", "outcome": "planning_required",
+                "task_id": "P1", "next_task_id": "P2", "staged_successor": "P2",
+                "reviewed_ready": True,
+            }
+            coordinator = ControlCommandCoordinator(runtime, planner)
+            # A reviewed_ready handoff must not be consumed on a COMPLETE snapshot.
+            complete = {"projects": [{"project_id": "p1", "state": "IDLE", "next_status": "**COMPLETE**", "telemetry": {"task_id": "P1"}}]}
+            self.assertEqual(coordinator.advance(config, complete, executor), [])
+            self.assertNotIn("handoff_consumed", executor.records["review-r1"])
+
+            # Nor on a PENDING DESIGN snapshot.
+            pending = {"projects": [{"project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P1"}}]}
+            self.assertEqual(coordinator.advance(config, pending, executor), [])
+            self.assertNotIn("handoff_consumed", executor.records["review-r1"])
+            self.assertEqual(len(planner.calls), 0)
+
     def test_staged_decision_handoff_skips_when_snapshot_mismatches(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; repo.mkdir(); runtime = base / "runtime"

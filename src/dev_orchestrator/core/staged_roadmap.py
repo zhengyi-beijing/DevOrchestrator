@@ -11,7 +11,7 @@ from dev_orchestrator.monitor.telemetry import extract_task_id
 
 @dataclass(frozen=True)
 class RoadmapResult:
-    kind: Literal["absent", "invalid", "end_of_roadmap", "successor"]
+    kind: Literal["absent", "invalid", "end_of_roadmap", "unlisted", "successor"]
     reason: str | None = None
     successor_task_id: str | None = None
     spec_path: str | None = None
@@ -72,7 +72,7 @@ def read_successor(repo_path: str | Path, completed_task_id: str) -> RoadmapResu
             completed_entry = entry
 
     if completed_entry is None:
-        return RoadmapResult(kind="invalid", reason=f"completed task {completed_task_id} not found in roadmap")
+        return RoadmapResult(kind="unlisted", reason=f"completed task {completed_task_id} not found in roadmap")
 
     successor = completed_entry.get("successor")
     spec_path = completed_entry.get("successor_spec_path")
