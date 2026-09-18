@@ -227,6 +227,14 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         result = self.port._result_from_payload(self.request(role="planner"), payload)
         self.assertEqual(result.failure_classification, "quota_exhausted")
 
+    def test_no_quota_is_normalized_as_quota_exhausted(self):
+        payload = self.payload(
+            status="failed", output=None,
+            error="You have no quota (Request ID: example)",
+        )
+        result = self.port._result_from_payload(self.request(role="reviewer"), payload)
+        self.assertEqual(result.failure_classification, "quota_exhausted")
+
     def test_execution_timeout_is_normalized_as_temporary_provider_failure(self):
         payload = self.payload(status="failed", output=None, error="execution timed out after 1800.0 seconds")
         result = self.port._result_from_payload(self.request(role="reviewer"), payload)
