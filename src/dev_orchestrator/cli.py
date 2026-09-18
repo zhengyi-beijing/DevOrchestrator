@@ -463,14 +463,12 @@ def cmd_project_control(args: argparse.Namespace) -> int:
     from dev_orchestrator.control.surface import project_control_view
     config = load_projects_config(resolve_config_path(getattr(args, "config", None)))
     project_config = next((row for row in config.get("projects") or [] if row.get("project_id") == project_id), None)
+    # Command CAS identity must be derived from the same durable per-project
+    # snapshot that the daemon command coordinator will observe.  summary.json
+    # is a presentation overlay and can legitimately lag or carry a different
+    # lifecycle projection; using it here makes otherwise valid commands stale
+    # before the daemon can consume them.
     projected = project_control_view(snapshot, runtime, project_config)
-    # Match the daemon/web control surface: raw per-project snapshots may have
-    # monitor-local IDLE while summary.json carries the orchestration overlay.
-    summary = read_json(runtime / "summary.json", {})
-    if isinstance(summary, dict) and isinstance(summary.get("projects"), list):
-        summary_project = next((row for row in summary["projects"] if isinstance(row, dict) and row.get("project_id") == project_id), None)
-        if isinstance(summary_project, dict):
-            projected = project_control_view(summary_project, runtime, project_config)
     target = {}
     if args.binding_id and args.action in {"bind_conversation", "rebind_conversation"}:
         target.update({"adapter": args.adapter, "binding_id": args.binding_id})

@@ -112,6 +112,36 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn("broker_execution", data)
             self.assertEqual(data["broker_execution"]["broker_request_id"], "brk-99")
 
+    def test_project_control_uses_durable_project_snapshot_not_stale_summary_overlay(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            (runtime / "projects").mkdir()
+            (runtime / "projects" / "p1.json").write_text(json.dumps({
+                "project_id": "p1", "state": "READY_TO_RUN", "lifecycle_state": "READY_TO_RUN",
+            }), encoding="utf-8")
+            (runtime / "summary.json").write_text(json.dumps({"projects": [{
+                "project_id": "p1", "state": "WAITING_REVIEW", "lifecycle_state": "WAITING_REVIEW",
+            }]}), encoding="utf-8")
+            config = Path(td) / "projects.json"
+            config.write_text(json.dumps({"projects": [{
+                "project_id": "p1", "repo_path": str(ROOT), "adapter": "agent_files",
+            }]}), encoding="utf-8")
+            (runtime / "daemon.pid").write_text(str(os.getpid()), encoding="utf-8")
+            server = make_server("127.0.0.1", 0, runtime, ROOT / "web", enable_control=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            try:
+                queued = run_cli(
+                    "project-control", "p1", "pause", "--runtime-root", str(runtime),
+                    "--config", str(config), "--command-id", "projection-test",
+                )
+                self.assertEqual(queued.returncode, 0, queued.stderr)
+                inbox = list((runtime / "control" / "inbox").glob("*.json"))
+                self.assertEqual(len(inbox), 1)
+                envelope = json.loads(inbox[0].read_text(encoding="utf-8"))
+                self.assertEqual(envelope["expected"]["lifecycle_state"], "READY_TO_RUN")
+            finally:
+                server.shutdown(); server.server_close(); thread.join(timeout=2)
+
     def test_project_continue_fails_when_daemon_is_not_running(self):
         with tempfile.TemporaryDirectory() as td:
             runtime = Path(td); (runtime / "projects").mkdir()
