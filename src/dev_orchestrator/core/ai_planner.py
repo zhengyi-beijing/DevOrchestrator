@@ -22,7 +22,7 @@ from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_js
 PLANNER_STATE_FILE = "ai-planner.json"
 _STATE_VERSION = 1
 _ACTIVE_STATES = frozenset({"planning", "reviewing", "remediating", "applying"})
-_REVIEWER_RESOURCE_FAILURES = frozenset({
+_ROLE_RESOURCE_FAILURES = frozenset({
     "quota_exhausted",
     "rate_limited",
     "provider_temporarily_unavailable",
@@ -707,6 +707,7 @@ class AIPlannerCoordinator:
         prior_resource: ResourceContext | None = None,
     ) -> tuple[dict[str, Any], Any] | None:
         max_attempts = policy["max_attempts"]
+        failed_resource_ids: set[str] = set()
         planner_result = None
         plan = None
         previous_attempt_resource = prior_resource if round_no > 0 else None
@@ -730,6 +731,8 @@ class AIPlannerCoordinator:
                 "planner_attempt": attempt,
                 "planner_max_attempts": max_attempts,
             }
+            if failed_resource_ids:
+                metadata["planner_failover_from_resource_ids"] = sorted(failed_resource_ids)
             if round_no > 0:
                 metadata["remediation_round"] = round_no
 
@@ -750,6 +753,7 @@ class AIPlannerCoordinator:
                 quality=policy["quality"],
                 independence="none",
                 previous_resource_context=previous_attempt_resource,
+                excluded_resource_ids=tuple(sorted(failed_resource_ids)),
                 timeout_seconds=policy["timeout_seconds"],
                 metadata=metadata,
             )
@@ -780,7 +784,31 @@ class AIPlannerCoordinator:
                 if attempt_result.status == "cancelled":
                     raise InterruptedError(attempt_result.error or "planner_cancelled")
                 if attempt_result.status != "succeeded":
-                    raise RuntimeError(attempt_result.error or f"planner_{attempt_result.status}")
+                    attempt_reason = attempt_result.error or f"planner_{attempt_result.status}"
+                    classification = getattr(attempt_result, "failure_classification", None)
+                    resource = attempt_result.resource_context
+                    can_failover = (
+                        attempt_result.status == "failed"
+                        and classification in _ROLE_RESOURCE_FAILURES
+                        and resource is not None
+                        and resource.resource_id is not None
+                    )
+                    if can_failover:
+                        self._record_planner_attempt(
+                            plan_id, attempt, planner_request, attempt_result, attempt_reason,
+                            classification=classification, round_no=round_no,
+                        )
+                        failed_resource_ids.add(resource.resource_id)
+                        previous_attempt_resource = resource
+                        failure_reason = attempt_reason
+                        if attempt < max_attempts:
+                            continue
+                        self._finish(
+                            plan_id, "failed",
+                            "planner resource failover limit reached: " + attempt_reason,
+                        )
+                        return None
+                    raise RuntimeError(attempt_reason)
                 plan = _parse_plan(attempt_result.output, record["task_id"])
                 if attempt_result.resource_context is None:
                     raise RuntimeError("planner resource context missing")
@@ -792,7 +820,10 @@ class AIPlannerCoordinator:
                 return None
             except Exception as exc:
                 attempt_reason = str(exc)
-                self._record_planner_attempt(plan_id, attempt, planner_request, attempt_result, attempt_reason, round_no=round_no)
+                self._record_planner_attempt(
+                    plan_id, attempt, planner_request, attempt_result, attempt_reason,
+                    classification=getattr(attempt_result, "failure_classification", None), round_no=round_no,
+                )
                 if attempt_result is not None and attempt_result.resource_context is not None:
                     previous_attempt_resource = attempt_result.resource_context
                 failure_reason = attempt_reason
@@ -930,7 +961,7 @@ class AIPlannerCoordinator:
                     resource = review_result.resource_context
                     can_failover = (
                         review_result.status == "failed"
-                        and classification in _REVIEWER_RESOURCE_FAILURES
+                        and classification in _ROLE_RESOURCE_FAILURES
                         and resource is not None
                         and resource.resource_id is not None
                     )
@@ -1396,7 +1427,7 @@ class AIPlannerCoordinator:
         return {"resource_id": resource.resource_id, "provider": resource.provider, "account": resource.account, "model": resource.model}
     def _record_planner_attempt(
         self, plan_id: str, attempt: int, request: AIRoleRequest, result: Any, reason: str | None,
-        round_no: int = 0,
+        *, classification: str | None = None, round_no: int = 0,
     ) -> None:
         with self._lock:
             state = self._load_state()
@@ -1413,9 +1444,14 @@ class AIPlannerCoordinator:
                 "completed_at": utc_now_iso(),
                 "status": getattr(result, "status", None),
                 "reason": reason,
+                "failure_classification": classification,
                 "dispatch_id": getattr(result, "dispatch_id", None),
                 "execution_id": getattr(result, "execution_id", None),
                 "resource": self._resource_payload(getattr(result, "resource_context", None)),
+                "excluded_resource_ids": list(request.excluded_resource_ids),
+                "failover_from_resource_ids": list(
+                    request.metadata.get("planner_failover_from_resource_ids", [])
+                ),
             }
             if round_no > 0:
                 entry["round"] = round_no

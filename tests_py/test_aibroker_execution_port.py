@@ -219,6 +219,14 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         self.assertIn("reviewer-a", argv)
 
 
+    def test_session_limit_is_normalized_as_quota_exhausted(self):
+        payload = self.payload(
+            status="failed", output=None,
+            error="You've hit your session limit · resets 5:10pm (Asia/Shanghai)",
+        )
+        result = self.port._result_from_payload(self.request(role="planner"), payload)
+        self.assertEqual(result.failure_classification, "quota_exhausted")
+
     def test_execution_timeout_is_normalized_as_temporary_provider_failure(self):
         payload = self.payload(status="failed", output=None, error="execution timed out after 1800.0 seconds")
         result = self.port._result_from_payload(self.request(role="reviewer"), payload)
