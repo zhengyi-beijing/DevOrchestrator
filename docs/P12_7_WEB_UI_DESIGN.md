@@ -161,3 +161,11 @@ Navigation is strictly read-only and issues zero network requests or state mutat
 
 ### 9.4 Guarded Controls and Read-Only Separation
 P12.7 section 5 read-only/mutation separation is strictly preserved. Mutation controls are not a standalone view; they are distributed to their owning domain (per-project controls in Projects, adapter pairing/bindings in System) inside an explicitly demarcated `.controls-region` with prominent headings (`Guarded Project Controls`, `Guarded System Controls`), ensuring safety-critical actions remain discoverable within two clicks while preventing accidental interaction.
+
+### 9.5 Reference Provenance and Placement Reconciliation
+The left-sidebar information architecture reconciles the layout from the `dashboard-redesign` reference worktree (`C:\work\github\DevOrchestrator-dashboard-redesign`) with canonical DevOrchestrator requirements. In that reference worktree, projects, events, and runs were placed under Overview, while bindings and command outcomes were placed in Projects. In the canonical architecture, this distribution was deliberately reconciled:
+- **Overview** is kept focused on high-level daemon/monitor health and project counts/summary.
+- **Projects** hosts the primary project grid, orchestration queue, and guarded project controls.
+- **Logs** groups events and runs timelines together in a single chronological view.
+- **System** hosts watchdog diagnostics, pairing controls, conversation bindings, and command outcomes.
+This deliberate canonical reconciliation ensures P12.7 first-viewport health visibility, preserves P12 mutation/read-only separation, and maintains clean domain isolation without regressing canonical contracts.

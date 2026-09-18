@@ -5,28 +5,31 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P13.5 Canonical Dashboard Sidebar Migration** — **IMPLEMENTATION COMPLETE / READY FOR TECHNICAL REVIEW**.
+Current task: **P13.5 Canonical Dashboard Sidebar Migration** — **REMEDIATION COMPLETE / READY FOR TECHNICAL RE-REVIEW**.
 
-Latest continuation state (2026-09-18):
-- Implemented the approved left-sidebar dashboard information architecture from the `dashboard-redesign` reference worktree in the canonical `DevOrchestrator-dev` web UI without regressing P12.7 functionality:
-  1. Two-Column App Shell (`web/index.html`): Replaced the top-tab navigation (`<nav class="section-nav">`) with a persistent left sidebar (`<nav class="sidebar" aria-label="Primary">`) containing the brand block, six primary view links, and loopback metadata footer. Retained persistent health chrome (`daemonBadge`, `monitorBadge`, `watchdogBadge`, `freshnessBadge`, `lastRefresh`, `refreshBtn`) in a slim header strip and persistent KPI strip (`#kpis`) outside the switchable views. Added skip-to-content link for keyboard accessibility.
-  2. Authoritative Six-View Host Mapping: All six view sections (`overview`, `projects-section`, `resources-section`, `accounting-section`, `logs-section`, `system-section`) remain permanently in the DOM and toggle via the `hidden` attribute and `.is-active` class, ensuring `refresh()` populates all 35 compatibility DOM IDs unconditionally.
-     - Overview: `monitorDetails`, `overviewDetails`.
-     - Projects: `projects`, `orchestration` (`#orchestration-section` subregion), and guarded project controls (`controlStatus`, `controlProjects` in `#controls.controls-region`).
-     - AI Resources: `brokerResources`, `brokerExecutions`.
-     - Usage & Accounting: `brokerUsage`, `accountingSummary`, `accountingBottleneck`, `providerEvidence`, `rdcEvidence`, `hypothesisEvidence`, `acceptanceGates`, `scopeBreakdown`, `evidenceWarnings`.
-     - Logs: `events`, `runs` (`#runs-section` subregion).
-     - System: `watchdogStatus`, `watchdogProjects` (`#watchdog-section` subregion), guarded system controls (`pairAdapter`, `revokeAdapter`, `pairingCode`, `controlBindings`, `controlCommands` in `.controls-region`), and loopback safety statement footer.
-  3. Strict Read-Only Navigation (`web/app.js`): Added pure `resolveViewId(hash)` resolving the six canonical views and aliasing legacy anchors (`#controls` -> `#projects-section`, `#orchestration-section` -> `#projects-section`, `#runs-section` -> `#logs-section`, `#watchdog-section` -> `#system-section`) with fallback to `#overview`. Added `activateView(target)` toggling `hidden` and `aria-current="page"` and moving heading focus with zero fetch or state mutation. Exported both for unit testing.
-  4. Ergonomic Layout & Responsive Collapse (`web/style.css`): Added fixed left sidebar (232px width), neutral surface hierarchy, skip-to-content link, `aria-current` accent indicators not relying on color alone, and responsive collapse below 960px to a horizontal scrollable rail without hamburger menus, keeping health and failure signals accessible. Preserved all `:root` tokens, `*:focus-visible`, and `prefers-reduced-motion`.
-  5. Information Architecture Documentation: Documented the reconciled information architecture, host mappings, legacy aliases, and controls distribution in `docs/P12_7_WEB_UI_DESIGN.md` Section 9.
+Latest continuation state (2026-09-19):
+- Remediated Technical Review findings from `ai_review:retry:p135-review-retry-json-contract`:
+  1. Skip-Link Fragment View Preservation (`web/app.js`, `web/index.html`):
+     - Added pure `isKnownViewHash(rawHash)` returning true only for the 6 canonical view IDs and 4 legacy aliases; exported for unit testing.
+     - Updated `hashchange` listener in `initNavigation()` to ignore non-view fragments (e.g. `#mainContent`, in-page anchors, arbitrary hashes) instead of coercing them to `overview`, preserving the active view.
+     - Attached click listener to `.skip-link` calling `preventDefault()` and focusing `#mainContent` directly with `tabindex="-1"`. Added `tabindex="-1"` attribute to `<main id="mainContent">` in `web/index.html`.
+  2. Initial Activation Heading Focus (`web/app.js`):
+     - Updated `activateView(targetInput, options = {})` to make heading focus opt-in (`options.focusHeading` boolean). Defaults to false so initial/programmatic activation performs no focus move.
+     - In `initNavigation()`, initial activation passes `{ focusHeading: false }`, ensuring initial document focus is undisturbed and keyboard Tab order begins at `.skip-link` -> sidebar links -> header refresh button -> main content.
+     - User-initiated navigation (sidebar clicks and valid view `hashchange` events) passes `{ focusHeading: true }`, moving focus to target section heading for accessibility.
+  3. Reference Worktree Placement Reconciliation (`docs/P12_7_WEB_UI_DESIGN.md` Section 9.5):
+     - Documented the placement delta against reference worktree `C:\work\github\DevOrchestrator-dashboard-redesign`: the reference placed projects, events, and runs under Overview and bindings/command outcomes under Projects; the canonical architecture deliberately reconciled this into Overview (daemon/monitor health and project counts), Projects (project grid, orchestration queue, guarded project controls), Logs (events and runs timelines), and System (watchdog diagnostics, pairing, bindings, command outcomes) to maintain P12.7 first-viewport visibility and P12 mutation/read-only separation.
+  4. Regression Coverage (`tests_py/test_p135_sidebar_nav.py`):
+     - Updated `test_activator_toggles_sections_and_aria_current_with_zero_fetch` to assert initial activation without `focusHeading` does not focus heading, while user navigation with `focusHeading: true` does.
+     - Added `test_is_known_view_hash_identifies_views_aliases_and_rejects_non_view_fragments` testing canonical views, legacy aliases, and rejection of non-view fragments (`#mainContent`, `#kpis`, `#not-a-view`) and empty/falsy inputs.
+     - Added `test_navigation_initial_activation_no_focus_and_non_view_hash_preserves_view` verifying initial load performs no focus move, hash navigation focuses target heading, non-view fragment `#mainContent` preserves active view and steals no focus, arbitrary unknown fragments preserve active view, and skip-link click focuses `#mainContent` directly while preserving active view.
 - Verification:
-  - Focused web & control regression passed: 73 passed, 11 subtests passed across 8 suites (`test_web_ui_refresh.py`, `test_p135_sidebar_nav.py`, `test_web.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_unbound_web_ui.py`, `test_p127_closure_rereview.py`, `test_p13_web_bridge_adapter.py`).
+  - Focused web & control regression passed: 75 passed, 11 subtests passed across 8 suites (`test_web_ui_refresh.py`, `test_p135_sidebar_nav.py`, `test_web.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_unbound_web_ui.py`, `test_p127_closure_rereview.py`, `test_p13_web_bridge_adapter.py`).
   - Web selftest script passed: `tests/web-selftest.ps1`: PASS.
-  - Full test suite passed: 745 passed, 45 subtests passed in 245.31s (`python -m pytest tests_py -q`).
+  - Full test suite passed: 747 passed, 45 subtests passed in 237.70s (`python -m pytest tests_py -q`).
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
-  - Knowledge graph updated with `graphify update .` (3484 nodes, 9640 edges, 174 communities).
-- Immediate continuation rule: conduct independent technical review on clean worktree.
+  - Knowledge graph updated with `graphify update .` (3489 nodes, 9648 edges, 168 communities).
+- Immediate continuation rule: conduct independent technical re-review on clean worktree.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.

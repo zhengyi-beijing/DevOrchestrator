@@ -662,3 +662,29 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Full test suite passed: 745 passed, 45 subtests passed in 245.31s (`python -m pytest tests_py -q`).
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (3484 nodes, 9640 edges, 174 communities).
+
+## P13.5 Technical Review Remediation (2026-09-19)
+
+- Remediated all Technical Review findings from `ai_review:retry:p135-review-retry-json-contract`:
+  1. Skip-Link Fragment View Preservation (`web/app.js`, `web/index.html`):
+     - Added pure helper `isKnownViewHash(rawHash)` in `web/app.js` validating whether a hash resolves to one of the six canonical view IDs or four legacy aliases; exported for unit testing.
+     - Hardened `hashchange` listener in `initNavigation()` to check `cleaned && !isKnownViewHash(cleaned)` and return early, preventing non-view fragments (`#mainContent`, `#kpis`, arbitrary in-page anchors) from coercing the active view to `#overview`.
+     - Attached a click listener to `.skip-link` calling `preventDefault()` and moving focus directly to `#mainContent` with `tabindex="-1"`.
+     - Added `tabindex="-1"` attribute to `<main id="mainContent">` in `web/index.html` for standard accessible programmatic container focus.
+  2. Initial Activation Heading Focus (`web/app.js`):
+     - Updated `activateView(targetInput, options = {})` in `web/app.js` so that `heading.focus()` is opt-in via `options.focusHeading` (defaulting to `false`).
+     - `initNavigation()` performs initial load activation with `{ focusHeading: false }`, ensuring initial document focus is undisturbed and natural keyboard Tab navigation traverses skip-link -> sidebar links -> header refresh button -> main content.
+     - User-initiated navigation (sidebar link click and valid view `hashchange` events) explicitly passes `{ focusHeading: true }` to move focus to the target view heading.
+  3. Reference Worktree Placement Reconciliation (`docs/P12_7_WEB_UI_DESIGN.md` Section 9.5):
+     - Authored Section 9.5 documenting the reference provenance and deliberate placement reconciliation against `C:\work\github\DevOrchestrator-dashboard-redesign`: the reference placed projects, events, and runs under Overview and bindings/command outcomes under Projects; the canonical architecture deliberately reconciled this into Overview (daemon/monitor health and project summary), Projects (primary project grid, orchestration queue, guarded project controls), Logs (events and runs timelines), and System (watchdog diagnostics, pairing controls, conversation bindings, command outcomes) to maintain P12.7 first-viewport visibility and P12 mutation/read-only separation.
+  4. Regression Coverage (`tests_py/test_p135_sidebar_nav.py`):
+     - Updated `test_activator_toggles_sections_and_aria_current_with_zero_fetch` to assert initial activation without `focusHeading` performs no focus move (`heading.focused == False`), while user navigation with `focusHeading: true` moves focus to target heading (`heading.focused == True`).
+     - Added `test_is_known_view_hash_identifies_views_aliases_and_rejects_non_view_fragments` verifying exact recognition of the 6 canonical views, 4 legacy aliases, and rejection of non-view fragments (`#mainContent`, `#kpis`, `#not-a-view`) and empty/falsy inputs.
+     - Added `test_navigation_initial_activation_no_focus_and_non_view_hash_preserves_view` testing `initNavigation()` in a simulated DOM: proves initial load activates Overview without moving heading focus, proves hash navigation focuses target heading, proves non-view fragment `#mainContent` preserves active view without stealing focus, proves arbitrary fragments preserve active view, and proves skip-link click focuses `#mainContent` directly with `tabindex="-1"` while preserving active view.
+- Verification:
+  - Focused web & control regression passed: 75 passed, 11 subtests passed across 8 suites (`test_web_ui_refresh.py`, `test_p135_sidebar_nav.py`, `test_web.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_unbound_web_ui.py`, `test_p127_closure_rereview.py`, `test_p13_web_bridge_adapter.py`).
+  - Web selftest script passed: `tests/web-selftest.ps1`: PASS.
+  - Full test suite passed: 747 passed, 45 subtests passed in 237.70s (`python -m pytest tests_py -q`).
+  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3489 nodes, 9648 edges, 168 communities).
+  - Canonical worktree clean and ready for independent technical re-review.

@@ -275,43 +275,43 @@ global.fetch = async () => {{
 const app = require({json.dumps(APP_JS)});
 const {{ activateView }} = app;
 
-// Initial state: activate projects-section
-const ret1 = activateView('#projects-section');
-const check1 = {{
-  ret: ret1,
-  projectsHidden: sections[1].hasAttribute('hidden'),
-  projectsActive: sections[1].classList.contains('is-active'),
-  overviewHidden: sections[0].hasAttribute('hidden'),
-  overviewActive: sections[0].classList.contains('is-active'),
-  link0Aria: links[0].getAttribute('aria-current'),
-  link1Aria: links[1].getAttribute('aria-current'),
-  heading1Focused: headings[1].focused,
-}};
+    // Initial state: activate projects-section (initial activation performs no focus move)
+    const ret1 = activateView('#projects-section');
+    const check1 = {{
+      ret: ret1,
+      projectsHidden: sections[1].hasAttribute('hidden'),
+      projectsActive: sections[1].classList.contains('is-active'),
+      overviewHidden: sections[0].hasAttribute('hidden'),
+      overviewActive: sections[0].classList.contains('is-active'),
+      link0Aria: links[0].getAttribute('aria-current'),
+      link1Aria: links[1].getAttribute('aria-current'),
+      heading1Focused: headings[1].focused,
+    }};
 
-// Switch to system-section via legacy alias #watchdog-section
-headings[1].focused = false;
-const ret2 = activateView('#watchdog-section');
-const check2 = {{
-  ret: ret2,
-  systemHidden: sections[5].hasAttribute('hidden'),
-  systemActive: sections[5].classList.contains('is-active'),
-  projectsHidden: sections[1].hasAttribute('hidden'),
-  projectsActive: sections[1].classList.contains('is-active'),
-  link1Aria: links[1].getAttribute('aria-current'),
-  link5Aria: links[5].getAttribute('aria-current'),
-  heading5Focused: headings[5].focused,
-}};
+    // Switch to system-section via user-initiated navigation ({{ focusHeading: true }})
+    headings[1].focused = false;
+    const ret2 = activateView('#watchdog-section', {{ focusHeading: true }});
+    const check2 = {{
+      ret: ret2,
+      systemHidden: sections[5].hasAttribute('hidden'),
+      systemActive: sections[5].classList.contains('is-active'),
+      projectsHidden: sections[1].hasAttribute('hidden'),
+      projectsActive: sections[1].classList.contains('is-active'),
+      link1Aria: links[1].getAttribute('aria-current'),
+      link5Aria: links[5].getAttribute('aria-current'),
+      heading5Focused: headings[5].focused,
+    }};
 
-console.log(JSON.stringify({{
-  fetchCalls,
-  check1,
-  check2,
-}}));
-"""
+    console.log(JSON.stringify({{
+      fetchCalls,
+      check1,
+      check2,
+    }}));
+    """
         out = run_node(script)
         self.assertEqual(out["fetchCalls"], 0, "activateView must never call fetch")
 
-        # Check 1: projects-section active
+        # Check 1: projects-section active, heading not focused (initial activation does not steal focus)
         self.assertEqual(out["check1"]["ret"], "projects-section")
         self.assertFalse(out["check1"]["projectsHidden"])
         self.assertTrue(out["check1"]["projectsActive"])
@@ -319,9 +319,9 @@ console.log(JSON.stringify({{
         self.assertFalse(out["check1"]["overviewActive"])
         self.assertIsNone(out["check1"]["link0Aria"])
         self.assertEqual(out["check1"]["link1Aria"], "page")
-        self.assertTrue(out["check1"]["heading1Focused"])
+        self.assertFalse(out["check1"]["heading1Focused"], "Initial activation must not move focus to heading")
 
-        # Check 2: legacy alias watchdog-section activates system-section
+        # Check 2: legacy alias watchdog-section activates system-section with user focus
         self.assertEqual(out["check2"]["ret"], "system-section")
         self.assertFalse(out["check2"]["systemHidden"])
         self.assertTrue(out["check2"]["systemActive"])
@@ -329,7 +329,7 @@ console.log(JSON.stringify({{
         self.assertFalse(out["check2"]["projectsActive"])
         self.assertIsNone(out["check2"]["link1Aria"])
         self.assertEqual(out["check2"]["link5Aria"], "page")
-        self.assertTrue(out["check2"]["heading5Focused"])
+        self.assertTrue(out["check2"]["heading5Focused"], "User navigation must focus target heading")
 
     def test_refresh_populates_hosts_inside_inactive_views(self):
         script = f"""
@@ -485,6 +485,247 @@ console.log(JSON.stringify(result));
                 content.lower(),
                 f"OpenCode branding or strings must not exist in {filename}",
             )
+
+    def test_is_known_view_hash_identifies_views_aliases_and_rejects_non_view_fragments(self):
+        script = f"""
+const app = require({json.dumps(APP_JS)});
+const {{ isKnownViewHash }} = app;
+
+const testCases = [
+  // 6 canonical view IDs (with and without hash)
+  {{ input: '#overview', expected: true }},
+  {{ input: 'overview', expected: true }},
+  {{ input: '#projects-section', expected: true }},
+  {{ input: 'projects-section', expected: true }},
+  {{ input: '#resources-section', expected: true }},
+  {{ input: 'resources-section', expected: true }},
+  {{ input: '#accounting-section', expected: true }},
+  {{ input: 'accounting-section', expected: true }},
+  {{ input: '#logs-section', expected: true }},
+  {{ input: 'logs-section', expected: true }},
+  {{ input: '#system-section', expected: true }},
+  {{ input: 'system-section', expected: true }},
+
+  // 4 legacy aliases (with and without hash)
+  {{ input: '#controls', expected: true }},
+  {{ input: 'controls', expected: true }},
+  {{ input: '#orchestration-section', expected: true }},
+  {{ input: 'orchestration-section', expected: true }},
+  {{ input: '#runs-section', expected: true }},
+  {{ input: 'runs-section', expected: true }},
+  {{ input: '#watchdog-section', expected: true }},
+  {{ input: 'watchdog-section', expected: true }},
+
+  // Non-view fragments must return false
+  {{ input: '#mainContent', expected: false }},
+  {{ input: 'mainContent', expected: false }},
+  {{ input: '#kpis', expected: false }},
+  {{ input: '#not-a-real-view', expected: false }},
+  {{ input: 'random-text', expected: false }},
+
+  // Empty / whitespace / null / undefined must return false
+  {{ input: '', expected: false }},
+  {{ input: '#', expected: false }},
+  {{ input: '   ', expected: false }},
+  {{ input: null, expected: false }},
+  {{ input: undefined, expected: false }},
+];
+
+const results = testCases.map(tc => ({{
+  input: String(tc.input),
+  actual: isKnownViewHash(tc.input),
+  expected: tc.expected,
+  ok: isKnownViewHash(tc.input) === tc.expected,
+}}));
+
+console.log(JSON.stringify(results));
+"""
+        results = run_node(script)
+        for res in results:
+            self.assertTrue(
+                res["ok"],
+                f"isKnownViewHash failed for input: {res['input']!r} -> got {res['actual']!r}, expected {res['expected']!r}",
+            )
+
+    def test_navigation_initial_activation_no_focus_and_non_view_hash_preserves_view(self):
+        script = f"""
+class MockElement {{
+  constructor(tag = 'div', id = '', className = '') {{
+    this.tag = tag;
+    this.id = id;
+    this.className = className;
+    this.children = [];
+    this.attributes = new Map();
+    this.focused = false;
+    this.listeners = new Map();
+    this.classList = {{
+      _set: new Set(),
+      add: (c) => this.classList._set.add(c),
+      remove: (c) => this.classList._set.delete(c),
+      contains: (c) => this.classList._set.has(c),
+    }};
+  }}
+  setAttribute(k, v) {{ this.attributes.set(k, String(v)); }}
+  getAttribute(k) {{ return this.attributes.get(k) || null; }}
+  removeAttribute(k) {{ this.attributes.delete(k); }}
+  hasAttribute(k) {{ return this.attributes.has(k); }}
+  focus() {{ this.focused = true; }}
+  addEventListener(event, fn) {{
+    if (!this.listeners.has(event)) this.listeners.set(event, []);
+    this.listeners.get(event).push(fn);
+  }}
+  dispatch(event, e = {{}}) {{
+    for (const fn of (this.listeners.get(event) || [])) fn(e);
+  }}
+}}
+
+const viewIds = ['overview', 'projects-section', 'resources-section', 'accounting-section', 'logs-section', 'system-section'];
+const sections = viewIds.map(id => new MockElement('section', id, 'view-section'));
+const headings = viewIds.map(id => new MockElement('h2', id + '-heading'));
+const links = viewIds.map(id => {{
+  const el = new MockElement('a');
+  el.setAttribute('href', '#' + id);
+  return el;
+}});
+const skipLink = new MockElement('a', '', 'skip-link');
+skipLink.setAttribute('href', '#mainContent');
+const mainContent = new MockElement('main', 'mainContent');
+
+const byId = new Map();
+viewIds.forEach((id, idx) => {{
+  byId.set(id, sections[idx]);
+  byId.set(id + '-heading', headings[idx]);
+}});
+byId.set('mainContent', mainContent);
+
+global.setInterval = () => {{}};
+global.fetch = async () => ({{ ok: true, json: async () => ({{}}) }});
+
+const windowListeners = new Map();
+global.window = {{
+  location: {{ hash: '' }},
+  addEventListener: (event, fn) => {{
+    if (!windowListeners.has(event)) windowListeners.set(event, []);
+    windowListeners.get(event).push(fn);
+  }},
+}};
+function fireHashChange(newHash) {{
+  global.window.location.hash = newHash;
+  for (const fn of (windowListeners.get('hashchange') || [])) fn({{}});
+}}
+
+global.document = {{
+  querySelectorAll: (selector) => {{
+    if (selector.includes('.view-section')) return sections;
+    if (selector.includes('sidebar a') || selector.includes('.sidebar-nav a')) return links;
+    return [];
+  }},
+  getElementById: (id) => byId.get(id) || null,
+  querySelector: (selector) => {{
+    if (selector === '.skip-link') return skipLink;
+    if (selector === '#mainContent') return mainContent;
+    return null;
+  }},
+}};
+
+const app = require({json.dumps(APP_JS)});
+app.initNavigation();
+
+// 1. Initial page load (hash = '')
+const initialCheck = {{
+  overviewActive: sections[0].classList.contains('is-active'),
+  overviewHidden: sections[0].hasAttribute('hidden'),
+  overviewHeadingFocused: headings[0].focused,
+}};
+
+// 2. User navigates via hash to #logs-section
+fireHashChange('#logs-section');
+const logsNavCheck = {{
+  logsActive: sections[4].classList.contains('is-active'),
+  logsHidden: sections[4].hasAttribute('hidden'),
+  logsHeadingFocused: headings[4].focused,
+  overviewActive: sections[0].classList.contains('is-active'),
+}};
+
+// 3. User navigates with non-view fragment #mainContent (e.g. skip link or in-page anchor)
+headings[0].focused = false;
+headings[4].focused = false;
+fireHashChange('#mainContent');
+const nonViewFragmentCheck = {{
+  logsActiveStill: sections[4].classList.contains('is-active'),
+  overviewActive: sections[0].classList.contains('is-active'),
+  overviewHeadingFocused: headings[0].focused,
+  logsHeadingFocused: headings[4].focused,
+}};
+
+// 4. User navigates with unknown arbitrary fragment #arbitrarySection
+fireHashChange('#arbitrarySection');
+const arbitraryFragmentCheck = {{
+  logsActiveStill: sections[4].classList.contains('is-active'),
+  overviewActive: sections[0].classList.contains('is-active'),
+  overviewHeadingFocused: headings[0].focused,
+}};
+
+// 5. User clicks skip-link
+let defaultPrevented = false;
+skipLink.dispatch('click', {{ preventDefault: () => {{ defaultPrevented = true; }} }});
+const skipLinkClickCheck = {{
+  defaultPrevented,
+  mainContentFocused: mainContent.focused,
+  mainContentTabindex: mainContent.getAttribute('tabindex'),
+  logsActiveStill: sections[4].classList.contains('is-active'),
+}};
+
+console.log(JSON.stringify({{
+  initialCheck,
+  logsNavCheck,
+  nonViewFragmentCheck,
+  arbitraryFragmentCheck,
+  skipLinkClickCheck,
+}}));
+"""
+        out = run_node(script)
+
+        # 1. Initial activation: Overview active, heading focus NOT moved
+        self.assertTrue(out["initialCheck"]["overviewActive"])
+        self.assertFalse(out["initialCheck"]["overviewHidden"])
+        self.assertFalse(
+            out["initialCheck"]["overviewHeadingFocused"],
+            "Initial activation must perform no focus move to preserve skip-link -> sidebar -> header -> main order",
+        )
+
+        # 2. User navigation via hash: Logs active, heading focused
+        self.assertTrue(out["logsNavCheck"]["logsActive"])
+        self.assertFalse(out["logsNavCheck"]["logsHidden"])
+        self.assertTrue(out["logsNavCheck"]["logsHeadingFocused"])
+        self.assertFalse(out["logsNavCheck"]["overviewActive"])
+
+        # 3. Non-view fragment (#mainContent): active view preserved, no focus stolen to overview
+        self.assertTrue(
+            out["nonViewFragmentCheck"]["logsActiveStill"],
+            "Non-view fragment #mainContent must preserve the currently active view rather than resetting to overview",
+        )
+        self.assertFalse(out["nonViewFragmentCheck"]["overviewActive"])
+        self.assertFalse(
+            out["nonViewFragmentCheck"]["overviewHeadingFocused"],
+            "Non-view fragment #mainContent must not steal focus to #overview-heading",
+        )
+
+        # 4. Arbitrary unknown fragment: active view preserved
+        self.assertTrue(
+            out["arbitraryFragmentCheck"]["logsActiveStill"],
+            "Arbitrary unknown fragment must preserve the currently active view",
+        )
+        self.assertFalse(out["arbitraryFragmentCheck"]["overviewActive"])
+
+        # 5. Skip link click: mainContent focused, active view preserved
+        self.assertTrue(out["skipLinkClickCheck"]["defaultPrevented"])
+        self.assertTrue(
+            out["skipLinkClickCheck"]["mainContentFocused"],
+            "Skip link activation must focus #mainContent directly",
+        )
+        self.assertEqual(out["skipLinkClickCheck"]["mainContentTabindex"], "-1")
+        self.assertTrue(out["skipLinkClickCheck"]["logsActiveStill"])
 
 
 if __name__ == "__main__":

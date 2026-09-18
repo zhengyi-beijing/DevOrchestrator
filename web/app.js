@@ -1118,6 +1118,13 @@ const LEGACY_HASH_ALIASES = {
   'watchdog-section': 'system-section',
 };
 
+function isKnownViewHash(rawHash) {
+  if (!rawHash) return false;
+  const cleaned = String(rawHash).replace(/^#/, '').trim();
+  if (!cleaned) return false;
+  return Boolean(LEGACY_HASH_ALIASES[cleaned] || VIEW_IDS.has(cleaned));
+}
+
 function resolveViewId(rawHash) {
   if (!rawHash) return 'overview';
   const cleaned = String(rawHash).replace(/^#/, '').trim();
@@ -1127,7 +1134,9 @@ function resolveViewId(rawHash) {
   return 'overview';
 }
 
-function activateView(targetInput) {
+function activateView(targetInput, options = {}) {
+  const opts = typeof options === 'boolean' ? { focusHeading: options } : (options || {});
+  const shouldFocusHeading = Boolean(opts.focusHeading);
   const targetViewId = resolveViewId(targetInput);
   if (typeof document !== 'undefined') {
     const sections = (typeof document.querySelectorAll === 'function')
@@ -1162,13 +1171,15 @@ function activateView(targetInput) {
       }
     }
 
-    const heading = (typeof document.getElementById === 'function' ? document.getElementById(`${targetViewId}-heading`) : null) ||
-      (typeof document.querySelector === 'function' ? document.querySelector(`#${targetViewId} h2`) : null);
-    if (heading && typeof heading.focus === 'function') {
-      if (typeof heading.hasAttribute === 'function' && !heading.hasAttribute('tabindex') && typeof heading.setAttribute === 'function') {
-        heading.setAttribute('tabindex', '-1');
+    if (shouldFocusHeading) {
+      const heading = (typeof document.getElementById === 'function' ? document.getElementById(`${targetViewId}-heading`) : null) ||
+        (typeof document.querySelector === 'function' ? document.querySelector(`#${targetViewId} h2`) : null);
+      if (heading && typeof heading.focus === 'function') {
+        if (typeof heading.hasAttribute === 'function' && !heading.hasAttribute('tabindex') && typeof heading.setAttribute === 'function') {
+          heading.setAttribute('tabindex', '-1');
+        }
+        heading.focus();
       }
-      heading.focus();
     }
   }
   return targetViewId;
@@ -1176,10 +1187,41 @@ function activateView(targetInput) {
 
 function initNavigation() {
   if (typeof window === 'undefined' || typeof document === 'undefined') return;
-  activateView(resolveViewId(window.location.hash));
+
+  // Initial activation at load: do not move focus so tab order skip-link -> sidebar -> header -> main is preserved
+  activateView(resolveViewId(window.location ? window.location.hash : ''), { focusHeading: false });
+
+  // Skip-link activation: focus #mainContent directly without resetting active view
+  const skipLink = (typeof document.querySelector === 'function')
+    ? document.querySelector('.skip-link')
+    : null;
+  if (skipLink && typeof skipLink.addEventListener === 'function') {
+    skipLink.addEventListener('click', (e) => {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      const mainEl = (typeof document.getElementById === 'function')
+        ? document.getElementById('mainContent')
+        : (typeof document.querySelector === 'function' ? document.querySelector('#mainContent') : null);
+      if (mainEl && typeof mainEl.focus === 'function') {
+        if (typeof mainEl.hasAttribute === 'function' && !mainEl.hasAttribute('tabindex') && typeof mainEl.setAttribute === 'function') {
+          mainEl.setAttribute('tabindex', '-1');
+        }
+        mainEl.focus();
+      }
+    });
+  }
+
+  // Hash change: user-initiated navigation via URL hash
   window.addEventListener('hashchange', () => {
-    activateView(resolveViewId(window.location.hash));
+    const rawHash = (window.location && window.location.hash) ? window.location.hash : '';
+    const cleaned = String(rawHash).replace(/^#/, '').trim();
+    // Non-view fragments (e.g. #mainContent or in-page anchors) must not switch view or steal focus
+    if (cleaned && !isKnownViewHash(cleaned)) {
+      return;
+    }
+    activateView(resolveViewId(rawHash), { focusHeading: true });
   });
+
+  // Sidebar links: user-initiated navigation
   const sidebarLinks = (typeof document.querySelectorAll === 'function')
     ? document.querySelectorAll('nav.sidebar a, .sidebar-nav a')
     : [];
@@ -1187,7 +1229,7 @@ function initNavigation() {
     if (typeof link.addEventListener === 'function') {
       link.addEventListener('click', () => {
         const href = (typeof link.getAttribute === 'function') ? link.getAttribute('href') : link.href;
-        activateView(resolveViewId(href));
+        activateView(resolveViewId(href), { focusHeading: true });
       });
     }
   }
@@ -1216,6 +1258,7 @@ if (typeof module !== 'undefined' && module.exports) {
     renderDaemonBadge,
     renderWatchdogBadge,
     resolveViewId,
+    isKnownViewHash,
     activateView,
     initNavigation,
     VIEW_IDS,
