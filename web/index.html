@@ -7,189 +7,212 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <div class="eyebrow">LOCAL DEVELOPMENT CONTROL PLANE</div>
-      <h1>Dev Orchestrator</h1>
-    </div>
-    <nav class="section-nav" aria-label="Sections">
-      <a href="#overview">Overview</a>
-      <a href="#projects-section">Projects</a>
-      <a href="#runs-section">Runs</a>
-      <a href="#resources-section">Resources</a>
-      <a href="#watchdog-section">Watchdog</a>
-      <a href="#accounting-section">Accounting</a>
-      <a href="#controls">Controls</a>
+  <a href="#mainContent" class="skip-link">Skip to content</a>
+  <div class="app-shell">
+    <nav class="sidebar" aria-label="Primary">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">D</div>
+        <div class="brand-text">
+          <div class="brand-name">DevO</div>
+          <div class="brand-subtitle">Dev Orchestrator</div>
+        </div>
+      </div>
+      <div class="sidebar-nav">
+        <a href="#overview" class="nav-item is-active" aria-current="page">Overview</a>
+        <a href="#projects-section" class="nav-item">Projects</a>
+        <a href="#resources-section" class="nav-item">AI Resources</a>
+        <a href="#accounting-section" class="nav-item">Usage &amp; Accounting</a>
+        <a href="#logs-section" class="nav-item">Logs</a>
+        <a href="#system-section" class="nav-item">System</a>
+      </div>
+      <div class="sidebar-footer">
+        <div class="sidebar-meta">Loopback Control Plane</div>
+      </div>
     </nav>
-    <div class="header-status">
-      <div id="daemonBadge" class="badge unknown">Daemon unknown</div>
-      <div id="monitorBadge" class="badge unknown">Monitor unknown</div>
-      <div id="watchdogBadge" class="badge unknown">Watchdog unknown</div>
-      <div id="freshnessBadge" class="badge unknown">Unknown</div>
-      <span id="lastRefresh" class="meta-time">—</span>
-      <button id="refreshBtn" type="button" class="btn btn-sm">Refresh</button>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="header-title">
+          <div class="eyebrow">LOCAL DEVELOPMENT CONTROL PLANE</div>
+          <h1 id="pageTitle">Dev Orchestrator</h1>
+        </div>
+        <div class="header-status">
+          <div id="daemonBadge" class="badge unknown">Daemon unknown</div>
+          <div id="monitorBadge" class="badge unknown">Monitor unknown</div>
+          <div id="watchdogBadge" class="badge unknown">Watchdog unknown</div>
+          <div id="freshnessBadge" class="badge unknown">Unknown</div>
+          <span id="lastRefresh" class="meta-time">—</span>
+          <button id="refreshBtn" type="button" class="btn btn-sm">Refresh</button>
+        </div>
+      </header>
+
+      <main id="mainContent">
+        <section id="kpis" class="kpi-strip" aria-label="Key Performance Indicators">
+          <div class="kpi-cell">
+            <div class="kpi-label">Projects (Active / Total)</div>
+            <div id="kpiProjects" class="kpi-value">—</div>
+          </div>
+          <div class="kpi-cell">
+            <div class="kpi-label">Active AI Roles</div>
+            <div id="kpiRoles" class="kpi-value">—</div>
+          </div>
+          <div class="kpi-cell">
+            <div class="kpi-label">Incidents &amp; Stalls</div>
+            <div id="kpiIncidents" class="kpi-value">—</div>
+          </div>
+          <div class="kpi-cell">
+            <div class="kpi-label">AI Executions</div>
+            <div id="kpiExecutions" class="kpi-value">—</div>
+          </div>
+          <div class="kpi-cell">
+            <div class="kpi-label">AI Resources (Avail / Deg / Unavail)</div>
+            <div id="kpiResources" class="kpi-value">—</div>
+          </div>
+        </section>
+
+        <section id="overview" class="view-section" aria-labelledby="overview-heading">
+          <div class="section-heading"><h2 id="overview-heading" tabindex="-1">Overview</h2><span>system &amp; daemon status</span></div>
+          <div class="hero-grid">
+            <article class="panel">
+              <div class="section-title">Monitor &amp; Heartbeat</div>
+              <div id="monitorDetails" class="kv-grid"></div>
+            </article>
+            <article class="panel">
+              <div class="section-title">Runtime Summary</div>
+              <div id="overviewDetails" class="kv-grid"></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="projects-section" class="view-section" aria-labelledby="projects-heading" hidden>
+          <div class="section-heading"><h2 id="projects-heading" tabindex="-1">Projects</h2><span>active orchestration state</span></div>
+          <div id="projects" class="project-grid"></div>
+
+          <div id="orchestration-section" class="section-spaced">
+            <div class="section-heading"><h3>Orchestration Requests</h3><span>unbound &amp; pending queues</span></div>
+            <div id="orchestration" class="project-grid"></div>
+          </div>
+
+          <div id="controls" class="controls-region section-spaced" aria-label="Guarded Project Controls">
+            <div class="section-heading"><h3>Guarded Project Controls</h3><span id="controlStatus">loading</span></div>
+            <div id="controlProjects" class="project-grid"></div>
+          </div>
+        </section>
+
+        <section id="resources-section" class="view-section" aria-labelledby="resources-heading" hidden>
+          <div class="section-heading"><h2 id="resources-heading" tabindex="-1">AI Resources</h2><span>provider &amp; model infrastructure</span></div>
+          <div id="brokerResources" class="project-grid"></div>
+          <div class="split-grid">
+            <article class="panel">
+              <div class="section-heading"><h3>AI Executions</h3></div>
+              <div id="brokerExecutions" class="timeline"></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="accounting-section" class="view-section" aria-labelledby="accounting-heading" hidden>
+          <div class="section-heading"><h2 id="accounting-heading" tabindex="-1">Usage &amp; Accounting</h2><span>measured · derived · unavailable</span></div>
+          <div class="split-grid">
+            <article class="panel">
+              <div class="section-heading"><h3>Token / Usage</h3></div>
+              <div id="brokerUsage" class="timeline"></div>
+            </article>
+          </div>
+          <div class="hero-grid section-spaced">
+            <article class="panel">
+              <div class="section-title">Accounting / EDR</div>
+              <div id="accountingSummary" class="kv-grid"></div>
+            </article>
+            <article class="panel">
+              <div class="section-title">Dominant bottleneck</div>
+              <div id="accountingBottleneck" class="kv-grid"></div>
+            </article>
+          </div>
+          <div class="split-grid evidence-grid">
+            <article class="panel">
+              <div class="section-heading"><h3>Provider / context</h3></div>
+              <div id="providerEvidence" class="kv-grid"></div>
+            </article>
+            <article class="panel">
+              <div class="section-heading"><h3>RDC contention</h3></div>
+              <div id="rdcEvidence" class="timeline"></div>
+            </article>
+          </div>
+          <div class="split-grid evidence-grid">
+            <article class="panel">
+              <div class="section-heading"><h3>Original hypotheses</h3></div>
+              <div id="hypothesisEvidence" class="timeline"></div>
+            </article>
+            <article class="panel">
+              <div class="section-heading"><h3>Quantitative gates</h3></div>
+              <div id="acceptanceGates" class="timeline"></div>
+            </article>
+          </div>
+          <div class="split-grid evidence-grid">
+            <article class="panel">
+              <div class="section-heading"><h3>Project / task / role time</h3></div>
+              <div id="scopeBreakdown" class="timeline"></div>
+            </article>
+            <article class="panel">
+              <div class="section-heading"><h3>Evidence warnings</h3></div>
+              <div id="evidenceWarnings" class="timeline"></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="logs-section" class="view-section" aria-labelledby="logs-heading" hidden>
+          <div class="section-heading"><h2 id="logs-heading" tabindex="-1">Logs</h2><span>transitions &amp; execution history</span></div>
+          <div class="split-grid">
+            <article class="panel">
+              <div class="section-heading"><h3>Recent transitions</h3></div>
+              <div id="events" class="timeline"></div>
+            </article>
+            <article id="runs-section" class="panel">
+              <div class="section-heading"><h3>Recent runs</h3></div>
+              <div id="runs" class="timeline"></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="system-section" class="view-section" aria-labelledby="system-heading" hidden>
+          <div class="section-heading"><h2 id="system-heading" tabindex="-1">System</h2><span>watchdog diagnostics &amp; system controls</span></div>
+          <div id="watchdog-section" class="hero-grid">
+            <article class="panel">
+              <div class="section-title">Watchdog Status</div>
+              <div id="watchdogStatus" class="kv-grid"></div>
+            </article>
+            <article class="panel">
+              <div class="section-title">Project Diagnostics</div>
+              <div id="watchdogProjects" class="timeline"></div>
+            </article>
+          </div>
+
+          <div class="controls-region section-spaced" aria-label="Guarded System Controls">
+            <div class="section-heading"><h3>Guarded System Controls</h3></div>
+            <div class="pairing-bar">
+              <button id="pairAdapter" type="button" class="btn btn-sm">Pair ChatGPT heartbeat</button>
+              <button id="revokeAdapter" type="button" class="btn btn-sm" disabled>Revoke pairing</button>
+              <span id="pairingCode">Create a single-use code, then paste it from the userscript menu.</span>
+            </div>
+            <div class="split-grid">
+              <article class="panel">
+                <div class="section-heading"><h3>Conversation bindings</h3></div>
+                <div id="controlBindings" class="timeline"></div>
+              </article>
+              <article class="panel">
+                <div class="section-heading"><h3>Command outcomes</h3></div>
+                <div id="controlCommands" class="timeline"></div>
+              </article>
+            </div>
+          </div>
+
+          <footer class="system-footer">
+            Loopback unified observation and guarded owner control · no arbitrary prompts, shell, file, or hardware controls
+          </footer>
+        </section>
+      </main>
     </div>
-  </header>
-
-  <main>
-    <section id="kpis" class="kpi-strip" aria-label="Key Performance Indicators">
-      <div class="kpi-cell">
-        <div class="kpi-label">Projects (Active / Total)</div>
-        <div id="kpiProjects" class="kpi-value">—</div>
-      </div>
-      <div class="kpi-cell">
-        <div class="kpi-label">Active AI Roles</div>
-        <div id="kpiRoles" class="kpi-value">—</div>
-      </div>
-      <div class="kpi-cell">
-        <div class="kpi-label">Incidents &amp; Stalls</div>
-        <div id="kpiIncidents" class="kpi-value">—</div>
-      </div>
-      <div class="kpi-cell">
-        <div class="kpi-label">AI Executions</div>
-        <div id="kpiExecutions" class="kpi-value">—</div>
-      </div>
-      <div class="kpi-cell">
-        <div class="kpi-label">AI Resources (Avail / Deg / Unavail)</div>
-        <div id="kpiResources" class="kpi-value">—</div>
-      </div>
-    </section>
-
-    <section id="overview" class="view-section">
-      <div class="section-heading"><h2>Overview</h2><span>system &amp; daemon status</span></div>
-      <div class="hero-grid">
-        <article class="panel">
-          <div class="section-title">Monitor &amp; Heartbeat</div>
-          <div id="monitorDetails" class="kv-grid"></div>
-        </article>
-        <article class="panel">
-          <div class="section-title">Runtime Summary</div>
-          <div id="overviewDetails" class="kv-grid"></div>
-        </article>
-      </div>
-    </section>
-
-    <section id="projects-section" class="view-section">
-      <div class="section-heading"><h2>Projects</h2><span>active orchestration state</span></div>
-      <div id="projects" class="project-grid"></div>
-    </section>
-
-    <section id="runs-section" class="view-section">
-      <div class="section-heading"><h2>Runs / Activity</h2><span>transitions &amp; execution history</span></div>
-      <div class="split-grid">
-        <article class="panel">
-          <div class="section-heading"><h3>Recent transitions</h3></div>
-          <div id="events" class="timeline"></div>
-        </article>
-        <article class="panel">
-          <div class="section-heading"><h3>Recent runs</h3></div>
-          <div id="runs" class="timeline"></div>
-        </article>
-      </div>
-    </section>
-
-    <section id="resources-section" class="view-section">
-      <div class="section-heading"><h2>AI Resources</h2><span>provider &amp; model infrastructure</span></div>
-      <div id="brokerResources" class="project-grid"></div>
-      <div class="split-grid">
-        <article class="panel">
-          <div class="section-heading"><h3>AI Executions</h3></div>
-          <div id="brokerExecutions" class="timeline"></div>
-        </article>
-        <article class="panel">
-          <div class="section-heading"><h3>Token / Usage</h3></div>
-          <div id="brokerUsage" class="timeline"></div>
-        </article>
-      </div>
-    </section>
-
-    <section id="watchdog-section" class="view-section">
-      <div class="section-heading"><h2>Watchdog / Diagnostics</h2><span>stalls, failures &amp; automatic recovery</span></div>
-      <div class="hero-grid">
-        <article class="panel">
-          <div class="section-title">Watchdog Status</div>
-          <div id="watchdogStatus" class="kv-grid"></div>
-        </article>
-        <article class="panel">
-          <div class="section-title">Project Diagnostics</div>
-          <div id="watchdogProjects" class="timeline"></div>
-        </article>
-      </div>
-    </section>
-
-    <section id="accounting-section" class="view-section">
-      <div class="section-heading"><h2>Accounting &amp; Execution Evidence</h2><span>measured · derived · unavailable</span></div>
-      <div class="hero-grid">
-        <article class="panel">
-          <div class="section-title">Accounting / EDR</div>
-          <div id="accountingSummary" class="kv-grid"></div>
-        </article>
-        <article class="panel">
-          <div class="section-title">Dominant bottleneck</div>
-          <div id="accountingBottleneck" class="kv-grid"></div>
-        </article>
-      </div>
-      <div class="split-grid evidence-grid">
-        <article class="panel">
-          <div class="section-heading"><h3>Provider / context</h3></div>
-          <div id="providerEvidence" class="kv-grid"></div>
-        </article>
-        <article class="panel">
-          <div class="section-heading"><h3>RDC contention</h3></div>
-          <div id="rdcEvidence" class="timeline"></div>
-        </article>
-      </div>
-      <div class="split-grid evidence-grid">
-        <article class="panel">
-          <div class="section-heading"><h3>Original hypotheses</h3></div>
-          <div id="hypothesisEvidence" class="timeline"></div>
-        </article>
-        <article class="panel">
-          <div class="section-heading"><h3>Quantitative gates</h3></div>
-          <div id="acceptanceGates" class="timeline"></div>
-        </article>
-      </div>
-      <div class="split-grid evidence-grid">
-        <article class="panel">
-          <div class="section-heading"><h3>Project / task / role time</h3></div>
-          <div id="scopeBreakdown" class="timeline"></div>
-        </article>
-        <article class="panel">
-          <div class="section-heading"><h3>Evidence warnings</h3></div>
-          <div id="evidenceWarnings" class="timeline"></div>
-        </article>
-      </div>
-    </section>
-
-    <section id="controls" class="view-section controls-region" aria-label="Guarded Controls">
-      <div class="section-heading"><h2>Guarded Controls</h2><span id="controlStatus">loading</span></div>
-      <div class="pairing-bar">
-        <button id="pairAdapter" type="button" class="btn btn-sm">Pair ChatGPT heartbeat</button>
-        <button id="revokeAdapter" type="button" class="btn btn-sm" disabled>Revoke pairing</button>
-        <span id="pairingCode">Create a single-use code, then paste it from the userscript menu.</span>
-      </div>
-      <div id="controlProjects" class="project-grid"></div>
-      <div class="split-grid">
-        <article class="panel">
-          <div class="section-heading"><h3>Conversation bindings</h3></div>
-          <div id="controlBindings" class="timeline"></div>
-        </article>
-        <article class="panel">
-          <div class="section-heading"><h3>Command outcomes</h3></div>
-          <div id="controlCommands" class="timeline"></div>
-        </article>
-      </div>
-    </section>
-
-    <section id="orchestration-section" class="view-section">
-      <div class="section-heading"><h2>Orchestration Requests</h2><span>unbound &amp; pending queues</span></div>
-      <div id="orchestration" class="project-grid"></div>
-    </section>
-  </main>
-
-  <footer>
-    Loopback unified observation and guarded owner control · no arbitrary prompts, shell, file, or hardware controls
-  </footer>
+  </div>
   <script src="/app.js"></script>
 </body>
 </html>

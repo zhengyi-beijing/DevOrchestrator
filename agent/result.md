@@ -631,3 +631,34 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (3459 nodes, 9608 edges, 171 communities).
   - Canonical worktree clean and ready for independent technical re-review.
+
+## P13.5 Canonical Dashboard Sidebar Migration (2026-09-18)
+
+- Migrated the approved left-sidebar dashboard information architecture from the `dashboard-redesign` reference worktree into canonical `DevOrchestrator-dev` without regressing P12.7 functionality:
+  1. Two-Column App Shell (`web/index.html`):
+     - Replaced the top-tab navigation (`<nav class="section-nav">`) with a persistent left sidebar (`<nav class="sidebar" aria-label="Primary">`) containing the brand block, six primary view links, and loopback metadata footer.
+     - Added `<a href="#mainContent" class="skip-link">` for keyboard accessibility.
+     - Retained persistent health chrome (`daemonBadge`, `monitorBadge`, `watchdogBadge`, `freshnessBadge`, `lastRefresh`, `refreshBtn`) in a slim top header strip and persistent KPI strip (`#kpis`) outside the switchable views.
+  2. Authoritative Six-View Host Mapping:
+     - All six view sections (`overview`, `projects-section`, `resources-section`, `accounting-section`, `logs-section`, `system-section`) remain permanently in the DOM and toggle via `hidden` attribute and `.is-active` class, ensuring `refresh()` populates all 35 compatibility DOM IDs unconditionally.
+     - Overview: `monitorDetails`, `overviewDetails`.
+     - Projects: `projects`, `orchestration` (`#orchestration-section` subregion), and guarded project controls (`controlStatus`, `controlProjects` in `#controls.controls-region`).
+     - AI Resources: `brokerResources`, `brokerExecutions`.
+     - Usage & Accounting: `brokerUsage`, `accountingSummary`, `accountingBottleneck`, `providerEvidence`, `rdcEvidence`, `hypothesisEvidence`, `acceptanceGates`, `scopeBreakdown`, `evidenceWarnings`.
+     - Logs: `events`, `runs` (`#runs-section` subregion).
+     - System: `watchdogStatus`, `watchdogProjects` (`#watchdog-section` subregion), guarded system controls (`pairAdapter`, `revokeAdapter`, `pairingCode`, `controlBindings`, `controlCommands` in `.controls-region`), and loopback safety statement footer.
+  3. Strict Read-Only Navigation (`web/app.js`):
+     - Added pure `resolveViewId(hash)` resolving the six canonical views and aliasing legacy anchors (`#controls` -> `#projects-section`, `#orchestration-section` -> `#projects-section`, `#runs-section` -> `#logs-section`, `#watchdog-section` -> `#system-section`) with fallback to `#overview`.
+     - Added `activateView(target)` toggling `hidden` and `aria-current="page"` and moving heading focus with zero fetch or state mutation.
+     - Wired navigation to `hashchange` and anchor click events; exported both functions for unit testing.
+  4. Ergonomic Layout & Responsive Collapse (`web/style.css`):
+     - Added fixed left sidebar (232px width), neutral surface hierarchy, skip-to-content link, `aria-current` accent indicators, and responsive collapse below 960px to a horizontal scrollable rail without hamburger menus, keeping health and failure signals accessible.
+     - Preserved all `:root` tokens, `*:focus-visible`, and `prefers-reduced-motion`.
+  5. Information Architecture Documentation:
+     - Documented the reconciled information architecture, host mappings, legacy aliases, and controls distribution in `docs/P12_7_WEB_UI_DESIGN.md` Section 9.
+- Verification:
+  - Focused web & control regression passed: 73 passed, 11 subtests passed across 8 suites (`test_web_ui_refresh.py`, `test_p135_sidebar_nav.py`, `test_web.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_unbound_web_ui.py`, `test_p127_closure_rereview.py`, `test_p13_web_bridge_adapter.py`).
+  - Web selftest script passed: `tests/web-selftest.ps1`: PASS.
+  - Full test suite passed: 745 passed, 45 subtests passed in 245.31s (`python -m pytest tests_py -q`).
+  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3484 nodes, 9640 edges, 174 communities).

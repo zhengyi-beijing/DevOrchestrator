@@ -114,3 +114,50 @@ its persistent-harness/reviewer-recovery acceptance is complete.
 - Keyboard operation, focus visibility and acceptable contrast are retained.
 - No OpenCode branding, wording, logos, proprietary assets or pixel-copying are used.
 - Web tests and representative P12 dashboard fixtures pass after the refresh.
+
+## 9. P13.5 Canonical Sidebar Information Architecture
+
+P13.5 migrates the web control surface from top-tab navigation to a persistent left-sidebar layout referencing the visual and interaction structure from the `dashboard-redesign` reference worktree.
+
+### 9.1 Two-Column App Shell
+- **Left Sidebar (`nav.sidebar`)**: Persistent 232px rail holding brand mark/title, exactly six primary navigation links, and loopback metadata footer. On viewports below 960px, collapses into a horizontally scrollable top rail without off-canvas state or hamburger menus, ensuring health and failure signals remain discoverable.
+- **Header Status Strip (`header.topbar`)**: Persistent chrome above `<main>` retaining first-viewport operational health: `daemonBadge`, `monitorBadge`, `watchdogBadge`, `freshnessBadge`, `lastRefresh`, and `refreshBtn`.
+- **KPI Strip (`#kpis`)**: Persistent above switchable views so active projects, active roles, incidents, executions, and resource status remain visible across all deep links.
+
+### 9.2 Six-View Information Architecture and Host Mapping
+The six views are permanently present in the DOM and toggled via the `hidden` attribute and `.is-active` class to guarantee `refresh()` populates all data hosts unconditionally without dropping projections:
+
+1. **Overview (`#overview`)**:
+   - `monitorDetails`: Monitor, daemon PID, heartbeat age, interval, last error.
+   - `overviewDetails`: Project counts, observed age, active/review/blocked summary.
+2. **Projects (`#projects-section`)**:
+   - `projects`: Primary orchestration projects grid sorted by severity.
+   - `orchestration`: Unbound and pending queue cards (subregion `#orchestration-section`).
+   - `controlStatus` & `controlProjects`: Guarded project-level actions in a visually separated `controls-region` (subregion `#controls`).
+3. **AI Resources (`#resources-section`)**:
+   - `brokerResources`: AI provider, model, account, availability, and health cards.
+   - `brokerExecutions`: Recent AI role executions timeline.
+4. **Usage & Accounting (`#accounting-section`)**:
+   - `brokerUsage`: Token usage and execution counts timeline.
+   - `accountingSummary`: EDR and exclusive duration by phase.
+   - `accountingBottleneck`: Dominant measured bottleneck and recommendations.
+   - `providerEvidence`, `rdcEvidence`, `hypothesisEvidence`, `acceptanceGates`, `scopeBreakdown`, `evidenceWarnings`: Quantitative accounting metrics and evidence.
+5. **Logs (`#logs-section`)**:
+   - `events`: Recent lifecycle transition events timeline.
+   - `runs`: Recent task run outcomes and duration timeline (subregion `#runs-section`).
+6. **System (`#system-section`)**:
+   - `watchdogStatus` & `watchdogProjects`: Watchdog state, degraded reason, and diagnostics (subregion `#watchdog-section`).
+   - `pairAdapter`, `revokeAdapter`, `pairingCode`: Single-use pairing and revocation controls.
+   - `controlBindings` & `controlCommands`: Active conversation bindings and recent command outcomes.
+   - System safety statement footer.
+
+### 9.3 Legacy Hash Aliases and Navigation
+Navigation is strictly read-only and issues zero network requests or state mutations. A pure resolver maps URL hashes to view IDs:
+- `#controls` → `#projects-section`
+- `#orchestration-section` → `#projects-section`
+- `#runs-section` → `#logs-section`
+- `#watchdog-section` → `#system-section`
+- Empty, `#`, or unknown hashes fall back to `#overview`.
+
+### 9.4 Guarded Controls and Read-Only Separation
+P12.7 section 5 read-only/mutation separation is strictly preserved. Mutation controls are not a standalone view; they are distributed to their owning domain (per-project controls in Projects, adapter pairing/bindings in System) inside an explicitly demarcated `.controls-region` with prominent headings (`Guarded Project Controls`, `Guarded System Controls`), ensuring safety-critical actions remain discoverable within two clicks while preventing accidental interaction.

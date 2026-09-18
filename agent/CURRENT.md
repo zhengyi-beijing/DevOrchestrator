@@ -5,21 +5,28 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P13 Transport-Independent Control Bridge** — **TECHNICAL REVIEW REMEDIATION COMPLETE / READY FOR INDEPENDENT RE-REVIEW**.
+Current task: **P13.5 Canonical Dashboard Sidebar Migration** — **IMPLEMENTATION COMPLETE / READY FOR TECHNICAL REVIEW**.
 
 Latest continuation state (2026-09-18):
-- Remediated all Technical Review findings from `ai_review:p13-generated-only-recovery-ff547d4`:
-  1. `SSHTransport.dispatch` request_id correlation: Added `"request_id": request.request_id` and `"probe": config.probe_before_dispatch` into `envelope["request"]` using `LocalTransport._request_payload(request, config)` for complete parity; ensured `remote_helper.execute_request` injects `req_id` into `role_req` if missing. Prevents correlation mismatch in `AIBrokerExecutionPort._result_from_payload`.
-  2. Broker CLI argv contract alignment: Updated `remote_helper.execute_request` to strictly conform to `LocalTransport._build_argv` and the legacy broker CLI contract: uses `--cwd` (not `--working-directory`), `--timeout` (not `--timeout-seconds`), `--excluded-resource-id` (not `--exclude-resource-id`), passes `--probe`, unpacks and passes `--previous-*` resource-context flags (`--previous-resource-id`, `--previous-provider`, `--previous-account`, `--previous-model`), and omits `--project-id`.
-  3. Child environment and error handling: Configured `PYTHONUTF8="1"`, `PYTHONIOENCODING="utf-8"`, and `PYTHONPATH` with `broker_repo/src` across dispatch, status, and interrupt subprocesses in `remote_helper.py`. Validates `returncode in (0, 1)` and catches `json.JSONDecodeError` to emit correlated `RuntimeError` with exit code and stdout/stderr detail instead of opaque JSONDecodeErrors.
-  4. Hardened remote helper service client: Hardened `remote_helper._service_call` to enforce loopback HTTP URL validation (`validate_loopback_url`), URL sanitization (`sanitize_url`), redirect rejection via `_SERVICE_OPENER` (`_NoRedirectHandler`), forward token via `X-AIResourceBroker-Token` (not bearer `Authorization`), redact secret tokens in diagnostics and connection errors, and return `{"status": "not_found"}` on 404s, mirroring P12.6 hardening.
-  5. Preserved pairing revocation contract: Updated `ControlSecurity.revoke_pairing` and `revoke_capability` to preserve the `pairing_id` return key alongside `capability_id` and `revoked: True`.
+- Implemented the approved left-sidebar dashboard information architecture from the `dashboard-redesign` reference worktree in the canonical `DevOrchestrator-dev` web UI without regressing P12.7 functionality:
+  1. Two-Column App Shell (`web/index.html`): Replaced the top-tab navigation (`<nav class="section-nav">`) with a persistent left sidebar (`<nav class="sidebar" aria-label="Primary">`) containing the brand block, six primary view links, and loopback metadata footer. Retained persistent health chrome (`daemonBadge`, `monitorBadge`, `watchdogBadge`, `freshnessBadge`, `lastRefresh`, `refreshBtn`) in a slim header strip and persistent KPI strip (`#kpis`) outside the switchable views. Added skip-to-content link for keyboard accessibility.
+  2. Authoritative Six-View Host Mapping: All six view sections (`overview`, `projects-section`, `resources-section`, `accounting-section`, `logs-section`, `system-section`) remain permanently in the DOM and toggle via the `hidden` attribute and `.is-active` class, ensuring `refresh()` populates all 35 compatibility DOM IDs unconditionally.
+     - Overview: `monitorDetails`, `overviewDetails`.
+     - Projects: `projects`, `orchestration` (`#orchestration-section` subregion), and guarded project controls (`controlStatus`, `controlProjects` in `#controls.controls-region`).
+     - AI Resources: `brokerResources`, `brokerExecutions`.
+     - Usage & Accounting: `brokerUsage`, `accountingSummary`, `accountingBottleneck`, `providerEvidence`, `rdcEvidence`, `hypothesisEvidence`, `acceptanceGates`, `scopeBreakdown`, `evidenceWarnings`.
+     - Logs: `events`, `runs` (`#runs-section` subregion).
+     - System: `watchdogStatus`, `watchdogProjects` (`#watchdog-section` subregion), guarded system controls (`pairAdapter`, `revokeAdapter`, `pairingCode`, `controlBindings`, `controlCommands` in `.controls-region`), and loopback safety statement footer.
+  3. Strict Read-Only Navigation (`web/app.js`): Added pure `resolveViewId(hash)` resolving the six canonical views and aliasing legacy anchors (`#controls` -> `#projects-section`, `#orchestration-section` -> `#projects-section`, `#runs-section` -> `#logs-section`, `#watchdog-section` -> `#system-section`) with fallback to `#overview`. Added `activateView(target)` toggling `hidden` and `aria-current="page"` and moving heading focus with zero fetch or state mutation. Exported both for unit testing.
+  4. Ergonomic Layout & Responsive Collapse (`web/style.css`): Added fixed left sidebar (232px width), neutral surface hierarchy, skip-to-content link, `aria-current` accent indicators not relying on color alone, and responsive collapse below 960px to a horizontal scrollable rail without hamburger menus, keeping health and failure signals accessible. Preserved all `:root` tokens, `*:focus-visible`, and `prefers-reduced-motion`.
+  5. Information Architecture Documentation: Documented the reconciled information architecture, host mappings, legacy aliases, and controls distribution in `docs/P12_7_WEB_UI_DESIGN.md` Section 9.
 - Verification:
-  - Focused P13 suites passed: 92 tests passed across 6 suites (10 control_logs, 28 execution_transport, 16 mcp_adapter, 2 software_acceptance, 12 web_bridge_adapter, 24 aibroker_execution_port).
-  - Full test suite passed: 737 passed, 45 subtests passed in 239.26s (`python -m pytest tests_py -q`).
+  - Focused web & control regression passed: 73 passed, 11 subtests passed across 8 suites (`test_web_ui_refresh.py`, `test_p135_sidebar_nav.py`, `test_web.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_unbound_web_ui.py`, `test_p127_closure_rereview.py`, `test_p13_web_bridge_adapter.py`).
+  - Web selftest script passed: `tests/web-selftest.ps1`: PASS.
+  - Full test suite passed: 745 passed, 45 subtests passed in 245.31s (`python -m pytest tests_py -q`).
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
-  - Knowledge graph updated with `graphify update .` (3459 nodes, 9608 edges, 171 communities).
-- Immediate continuation rule: perform independent technical re-review of P13 remediation on clean worktree.
+  - Knowledge graph updated with `graphify update .` (3484 nodes, 9640 edges, 174 communities).
+- Immediate continuation rule: conduct independent technical review on clean worktree.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.

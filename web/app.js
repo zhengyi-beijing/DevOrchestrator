@@ -1102,6 +1102,97 @@ async function refresh() {
   if (lastRefreshEl) lastRefreshEl.textContent = `refreshed ${new Date().toLocaleTimeString()}`;
 }
 
+const VIEW_IDS = new Set([
+  'overview',
+  'projects-section',
+  'resources-section',
+  'accounting-section',
+  'logs-section',
+  'system-section',
+]);
+
+const LEGACY_HASH_ALIASES = {
+  'controls': 'projects-section',
+  'orchestration-section': 'projects-section',
+  'runs-section': 'logs-section',
+  'watchdog-section': 'system-section',
+};
+
+function resolveViewId(rawHash) {
+  if (!rawHash) return 'overview';
+  const cleaned = String(rawHash).replace(/^#/, '').trim();
+  if (!cleaned) return 'overview';
+  if (LEGACY_HASH_ALIASES[cleaned]) return LEGACY_HASH_ALIASES[cleaned];
+  if (VIEW_IDS.has(cleaned)) return cleaned;
+  return 'overview';
+}
+
+function activateView(targetInput) {
+  const targetViewId = resolveViewId(targetInput);
+  if (typeof document !== 'undefined') {
+    const sections = (typeof document.querySelectorAll === 'function')
+      ? document.querySelectorAll('.view-section')
+      : [];
+    for (const section of sections) {
+      const active = section.id === targetViewId;
+      if (active) {
+        if (typeof section.removeAttribute === 'function') section.removeAttribute('hidden');
+        else section.hidden = false;
+        if (section.classList && typeof section.classList.add === 'function') section.classList.add('is-active');
+      } else {
+        if (typeof section.setAttribute === 'function') section.setAttribute('hidden', '');
+        else section.hidden = true;
+        if (section.classList && typeof section.classList.remove === 'function') section.classList.remove('is-active');
+      }
+    }
+
+    const links = (typeof document.querySelectorAll === 'function')
+      ? document.querySelectorAll('nav.sidebar a, .sidebar-nav a')
+      : [];
+    for (const link of links) {
+      const href = (typeof link.getAttribute === 'function') ? (link.getAttribute('href') || '') : (link.href || '');
+      const resolved = resolveViewId(href);
+      const active = resolved === targetViewId;
+      if (active) {
+        if (typeof link.setAttribute === 'function') link.setAttribute('aria-current', 'page');
+        if (link.classList && typeof link.classList.add === 'function') link.classList.add('is-active');
+      } else {
+        if (typeof link.removeAttribute === 'function') link.removeAttribute('aria-current');
+        if (link.classList && typeof link.classList.remove === 'function') link.classList.remove('is-active');
+      }
+    }
+
+    const heading = (typeof document.getElementById === 'function' ? document.getElementById(`${targetViewId}-heading`) : null) ||
+      (typeof document.querySelector === 'function' ? document.querySelector(`#${targetViewId} h2`) : null);
+    if (heading && typeof heading.focus === 'function') {
+      if (typeof heading.hasAttribute === 'function' && !heading.hasAttribute('tabindex') && typeof heading.setAttribute === 'function') {
+        heading.setAttribute('tabindex', '-1');
+      }
+      heading.focus();
+    }
+  }
+  return targetViewId;
+}
+
+function initNavigation() {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  activateView(resolveViewId(window.location.hash));
+  window.addEventListener('hashchange', () => {
+    activateView(resolveViewId(window.location.hash));
+  });
+  const sidebarLinks = (typeof document.querySelectorAll === 'function')
+    ? document.querySelectorAll('nav.sidebar a, .sidebar-nav a')
+    : [];
+  for (const link of sidebarLinks) {
+    if (typeof link.addEventListener === 'function') {
+      link.addEventListener('click', () => {
+        const href = (typeof link.getAttribute === 'function') ? link.getAttribute('href') : link.href;
+        activateView(resolveViewId(href));
+      });
+    }
+  }
+}
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     renderAccounting,
@@ -1124,6 +1215,11 @@ if (typeof module !== 'undefined' && module.exports) {
     renderMonitor,
     renderDaemonBadge,
     renderWatchdogBadge,
+    resolveViewId,
+    activateView,
+    initNavigation,
+    VIEW_IDS,
+    LEGACY_HASH_ALIASES,
   };
 }
 
@@ -1138,6 +1234,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   }));
   const refreshBtn = $('refreshBtn');
   if (refreshBtn) refreshBtn.addEventListener('click', () => refresh());
+  initNavigation();
   refresh();
   setInterval(refresh, 10000);
 }
