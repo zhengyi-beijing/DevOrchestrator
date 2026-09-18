@@ -74,7 +74,7 @@ Status: **FUTURE / design constraint frozen 2026-09-17**
 - Adapt reference concepts to DevO: execution trends, project health, provider/model utilization, bottleneck/recovery ranking, watchdog incidents and accounting evidence. Do not reproduce irrelevant OpenCode metrics.
 - Begin with a fixture-backed low-cost prototype; validate hierarchy before production styling changes.
 - Frozen design: docs/P12_7_WEB_UI_DESIGN.md.
-- P12.7 starts only after P12.6 closure and does not replace the P13/P14 roadmap; P13 is the remote-execution resilience foundation and P14 is the Android/mobile client track.
+- P12.7 starts only after P12.6 closure and does not replace the P13-P15 roadmap; P13 establishes transport-independent control/execution, P14 adds durable recoverable jobs, P14.5 adds the Reviewer Harness/OpenCodeReview adapter, and P15 is the Android/mobile observability track.
 
 ## P13 staged roadmap
 
@@ -107,13 +107,31 @@ Goal: make long-running local/SSH/remote execution durable and recoverable acros
 
 Sequence: P14 follows P13 and builds recoverable jobs on the transport-independent boundary established by P13.
 
+## P14.5 staged roadmap
+
+### P14.5 - Reviewer Harness & OpenCodeReview Adapter
+
+Goal: standardize code-review preparation, project rule enforcement, model delegation and structured findings without making any review engine or model the DevO lifecycle authority.
+
+- Introduce a provider-neutral `ReviewerHarness` boundary owned by DevO; OpenCodeReview is the first adapter/backend, not a hard architectural dependency.
+- Use OpenCodeReview for deterministic diff/full-scan preparation, file selection, rule packs, review sessions, coverage and structured finding localization.
+- Keep reviewer model selection in AIBroker by role/quota/cost policy; OCR must not directly own provider selection when running under DevO.
+- Support delegated review so Codex/Claude/Web Sol can perform semantic reasoning while OCR supplies bounded context and project-specific rules.
+- Normalize results into a DevO finding contract with file/line/severity/category/rule/evidence/reviewer/status plus JSON/SARIF artifact retention.
+- Preserve independent build/test/static-analysis gates; OCR findings complement compiler/tests/clang-tidy/cppcheck and do not replace them.
+- Run review as a durable P14 job with stable job/session identity, resumable evidence and idempotent retry/reconcile semantics.
+- First qualification target: LabDemo, with rules covering Service-only hardware authority, fail-safe X-ray OFF convergence, manual-vs-transactional scan separation, state-machine reachability and protection against false dead-code deletion of compatibility paths such as `scan.run`.
+- Acceptance: a representative repository can run diff review and bounded full scan without RDC as the normal transport, delegate to an AIBroker-selected reviewer, persist structured findings/coverage, survive transport interruption via P14 recovery, and feed evidence to DevO without allowing OCR to issue lifecycle decisions directly.
+
+Sequence: P14.5 follows P14 because review sessions must rely on durable/recoverable jobs, and precedes P15 so mobile observability can consume normalized review/job/finding state from the start.
+
 ## P15 staged roadmap
 
 ### P15 - Mobile Observability & Guarded Control
 
 Goal: provide an Android-native, failure-independent observation and bounded-control client without creating a second lifecycle authority.
 
-- Connect Android directly to DevO over Tailscale and consume authoritative P12-P14 state.
+- Connect Android directly to DevO over Tailscale and consume authoritative P12-P14.5 lifecycle, durable-job and normalized review/finding state.
 - Show project/task/stage, worker/reviewer/provider, current/next action, job progress, freshness, watchdog/diagnostics and OWNER_GATE.
 - Provide reconnectable event updates and guarded continue/pause/resume/stop/retry/reconcile/OWNER_GATE controls through DevO authority.
 - Raise deduplicated vibration/optional sound alerts for confirmed no-progress; disconnected/unknown remains a separate alert class.
@@ -121,4 +139,4 @@ Goal: provide an Android-native, failure-independent observation and bounded-con
 - Initial scope: project list/detail, event stream, reconnect, stall alerts and minimum guarded controls; voice/Bluetooth-ring interaction is later scope.
 - Acceptance: with ChatGPT/browser/RDC unavailable, Android can observe authoritative execution, distinguish running/stalled/disconnected states, receive alerts and execute supported guarded controls.
 
-Sequence: P15 follows P14 and consumes existing lifecycle, transport and durable-job contracts.
+Sequence: P15 follows P14.5 and consumes existing lifecycle, transport, durable-job and reviewer-harness contracts.
