@@ -1,76 +1,19 @@
-# P13 Transport-Independent Control Bridge
+# P13.5 Canonical Dashboard Sidebar Migration
 
-Status: **READY_TO_RUN**
+Status: **PENDING DESIGN**
 
-Goal: remove RDC as the normal ChatGPT-to-DevO control dependency while preserving DevOrchestrator as the sole lifecycle authority.
+Goal: migrate the approved left-sidebar dashboard information architecture from the dashboard-redesign worktree into the canonical DevOrchestrator web control surface without regressing P12.7 functionality.
 
 Scope:
-- Add a Control Adapter boundary above the existing P12 Control API.
-- Provide an MCPAdapter MVP for bounded semantic status, log and lifecycle-control operations.
-- Stabilize WebBridgeAdapter as a secondary transport with durable request identity, freshness and fail-closed handling.
-- Separate ExecutionTransport from control transport: Local first, SSH over Tailscale for remote hosts, RDC only as fallback/emergency GUI/debug transport.
-- Preserve idempotency, repository-truth/revision guards, authentication/origin protections, audit and explicit stale/unknown states.
-- Do not expose unrestricted remote shell through the Control API.
+- Use `C:\work\github\DevOrchestrator-dashboard-redesign` as read-only visual/interaction reference; do not merge that branch wholesale.
+- Replace the current top-tab navigation with a persistent left sidebar in the canonical `DevOrchestrator-dev` web UI.
+- Preserve all current canonical functions and authoritative data projections, including project state, runs, resources, watchdog, accounting and controls.
+- Map the sidebar into coherent sections such as Overview, Projects, AI Resources, Usage/Accounting, Logs and System; keep safety-critical controls discoverable.
+- Preserve P12/P12.7 authentication, CSRF/origin/Host protections, stale/unknown rendering and fail-closed behavior.
+- Keep this phase UI/information-architecture only; do not redesign lifecycle, AIBroker routing or P13 transport contracts.
 
 Acceptance:
-- With RDC unavailable, a supported Control Adapter can inspect authoritative DevO state and issue bounded lifecycle controls.
-- DevO can execute through Local/SSH transport without changing lifecycle authority.
-- RDC remains available only as a fallback transport.
-
-Design note: detailed executable design must be produced and independently reviewed before implementation.
-
-## Approved executable design
-
-Add transport-independent control and execution boundaries while preserving the P12 Control API and daemon-owned ControlCommandCoordinator as the sole lifecycle authority. Deliver a local stdio MCP adapter as the primary ChatGPT path, a separately authenticated WebBridge adapter as the secondary path, Local and SSH execution transports, and an explicit manual-only RDC fallback. Implementation starts only after independent review approves the detailed P13 contract.
-
-### Implementation steps
-- Document the P13 authority and trust model before production changes: adapters translate bounded operations into P12 reads or durable commands, ExecutionTransport carries execution requests and evidence only, and all lifecycle decisions remain with existing daemon coordinators. Independently review this contract before implementation.
-- Introduce a shared ControlAdapter service/client above the P12 HTTP API with bounded status, log, submit-control, and command-status operations. It must use authenticated loopback API calls, require stable caller request IDs, preserve versioned envelopes and provenance, and never invoke lifecycle coordinators or mutate runtime stores directly.
-- Add a bounded paginated /api/v1/control/logs read route backed by existing durable event, run, command, and audit evidence. Support project filtering and an opaque cursor, redact secrets, enforce response limits, and report source availability, observation time, stale state, and unknown fields without fabricating values.
-- Implement an MCPAdapter MVP as a local stdio MCP/JSON-RPC process exposing only semantic status, logs, lifecycle control, and command-status tools. For lifecycle control, require project_id, command_id, expected_revision, action, and the closed action-specific target; resolve the complete P12 expected identity from the matching projection and enqueue through POST /api/v1/control/commands.
-- Implement WebBridgeAdapter as a secondary client of the same ControlAdapter service on the daemon-hosted 8770 surface. Keep the existing 8765 Browser Bridge transport-only and prohibit lifecycle endpoints there.
-- Give WebBridgeAdapter a durable request store keyed by adapter request ID and canonical request hash. Identical retries return the recorded acknowledgement or result reference, changed-body reuse conflicts, lifecycle command IDs are deterministic, and corrupt or incomplete records are quarantined and surfaced as degraded rather than discarded.
-- Extend control security with a separate owner-created, hash-only, revocable WebBridge control capability bound to an exact project and live conversation binding. Preserve the current heartbeat-only capability, Host/Origin/CORS/CSRF checks, request-size limits, and audit redaction; reject expired capabilities, stale sessions, changed bindings, stale revisions, unsupported actions, and missing freshness timestamps.
-- Add an ExecutionTransport protocol beneath AIBrokerExecutionPort for bounded dispatch, status, and interrupt invocations with correlated transport evidence. Implement LocalTransport using the current subprocess behavior so absent transport configuration remains backward compatible.
-- Implement SSHTransport using the system OpenSSH client and a fixed remote DevOrchestrator helper over an explicitly configured Tailscale peer. Send structured requests over stdin, use noninteractive authentication and strict host verification, accept only broker dispatch/status/interrupt operations, validate returned request and host identity, and prohibit arbitrary command text, shell fragments, environment injection, or unrestricted paths.
-- Extend ignored machine-local execution configuration with explicit local or SSH selection, Tailscale peer identity, remote broker configuration, and repository-path mapping. Require execution effects to be visible to the authoritative local repository and let existing repository-truth guards reject mismatched branch, HEAD, dirty state, task, or revision evidence.
-- Keep RDC outside automatic transport selection. Preserve existing RDC evidence/import and emergency GUI/debug procedures, require explicit operator action to use it, and never fall back automatically after an ambiguous Local or SSH failure. Record such failures as unavailable or unknown/recovery-required without replay; durable job recovery remains P14 scope.
-- Wire the new adapters and transports into the daemon and CLI without changing planner, reviewer, transition-executor, watchdog, command-store, or owner-gate ownership. Update P13 operator documentation and refresh Graphify after implementation.
-
-### Interfaces / contracts
-- ControlAdapter operations are status(project_id optional), logs(project_id, cursor optional, limit), submit_control(adapter_request_id, project_id, action, expected_revision, target), and command_status(command_id), returning versioned envelopes with provenance, timestamps, availability, unknown fields, and correlation IDs.
-- MCP exposes only devorch_status, devorch_logs, devorch_control, and devorch_command_status over local stdio. Tool input schemas are closed and bounded and provide no shell, arbitrary prompt, filesystem, patch, provider-selection, or raw HTTP facility.
-- WebBridge requests contain schema_version, adapter_request_id, operation, issued_at, exact binding identity, project_id, expected_revision when mutating, and a closed operation payload. Exact canonical replay is idempotent; identity or body conflict fails closed.
-- The existing P12 routes remain authoritative: adapters consume /api/v1/control projections, lifecycle mutations enter POST /api/v1/control/commands, and outcomes come from /api/v1/control/commands/{command_id}. The additive logs route follows the same envelope and provenance conventions.
-- ExecutionTransport accepts only internally constructed broker dispatch, status, and interrupt requests and returns exit/result data, timestamps, transport and host identity, and explicit available, unavailable, or unknown evidence. It does not interpret model output or lifecycle actions.
-- Machine-local execution configuration defaults to LocalTransport and may select one validated SSH/Tailscale target with remote path mapping. Credentials, tokens, SSH keys, host-specific paths, and remote configuration remain outside project source control.
-- ControlCommandCoordinator remains the sole mutation consumer; project_runtime_status, repository truth, planner/reviewer ledgers, owner gates, and exact revision checks remain authoritative regardless of adapter or execution transport.
-
-### Validation plan
-- Obtain independent approval of the P13 design for authority ownership, public interfaces, WebBridge capability scope, SSH trust and repository visibility, idempotency, and failure recovery before implementation begins.
-- Add MCP protocol transcript and unit tests covering initialization, tool discovery and calls, malformed JSON-RPC, unknown tools, closed schemas, bounded output, authentication failure, stale revision, unavailable capability, command replay/conflict, and command polling.
-- Add control-log tests for filtering, cursor stability, bounds, redaction, corrupt sources, cross-project isolation, provenance, and explicit stale, unavailable, and unknown values.
-- Add WebBridge tests for identical replay, changed-body conflict, restart recovery, freshness expiry, moved or stale bindings, dead sessions, capability scope and revocation, cross-project isolation, Host/Origin/CORS/CSRF rejection, audit redaction, and confirmation that port 8765 exposes no lifecycle mutation route.
-- Add LocalTransport and SSHTransport tests using deterministic fake processes and a fake remote helper. Cover large and Unicode stdin payloads, fixed argv construction, hostile identifiers, timeouts and disconnects, Tailscale-peer and host-key rejection, result-correlation mismatch, status and interrupt behavior, local compatibility, and absence of implicit RDC fallback or duplicate dispatch.
-- Run a software-only acceptance with RDC disabled: inspect authoritative state and bounded logs through MCP, submit a guarded lifecycle command, observe its audited terminal result, execute one representative role through LocalTransport and one through the SSH fixture, and prove that only the daemon changes lifecycle state.
-- Run focused control, bridge, security, daemon, CLI, AIBroker, transition-executor, and accounting suites, then run python -m pytest tests_py -q, python -m compileall -q src ops tests_py, node --check web/app.js, node --check browser/chatgpt-web-adapter.user.js, git diff --check, and graphify update .. Run PowerShell commands as separate statements with explicit exit-code checks and never place && or || directly in Windows PowerShell 5.1 commands, preserving failure-memory provenance seed:p11b:rdc-powershell-5.1.
-
-### Risks / failure modes
-- An adapter could become a second lifecycle authority; prevent this by routing every mutation through the existing P12 command ingress and testing that adapter modules do not call planner, reviewer, executor, or coordinator mutation methods.
-- Repository state may change between adapter projection and command dequeue; require the caller's expected revision, construct the complete expected identity from that exact projection, and retain daemon-side dequeue revalidation.
-- A WebBridge control token has more authority than the current heartbeat capability; keep it separate, narrowly scoped, hash-only, revocable, freshness-limited, bound to a live exact conversation, and fail closed whenever binding or session state is unknown.
-- SSH quoting, peer spoofing, credential disclosure, or an overly permissive helper could create a remote-shell vulnerability; use fixed argv, structured stdin, strict host identity, explicit Tailscale peer configuration, redacted diagnostics, and a closed helper operation set.
-- Remote execution may affect a repository copy that is not visible to the authoritative local worktree; require configured path mapping and post-execution local repository-truth validation, reporting mismatch as unavailable or recovery-required rather than success.
-- An SSH disconnect can leave execution outcome ambiguous; P13 must record unknown state and avoid automatic replay, while durable asynchronous recovery and reconciliation remain for P14.
-- Refactoring AIBroker subprocess invocation could regress the existing persistent service or local CLI paths; preserve LocalTransport defaults and run both compatibility and lifecycle regressions.
-
-### Out of scope
-- Public or network-hosted MCP service, built-in TLS, reverse-proxy deployment, multi-user RBAC, or a general remote-access product.
-- Arbitrary local or remote shell, command execution, prompt submission, filesystem browsing or writes, patch application, and provider or account configuration through ControlAdapter or the Control API.
-- Durable asynchronous jobs, reconnectable execution streams, automatic retry after ambiguous transport loss, daemon-restart job recovery, and job migration; these belong to P14.
-- Repository replication or synchronization, remote worktree provisioning, Tailscale installation or administration, SSH key provisioning, remote package installation, and host-fleet management.
-- Automatic RDC selection, RDC GUI automation, weakening owner or hardware gates, or treating RDC observations as lifecycle authority.
-- P13.5 dashboard/sidebar migration, provider scheduler redesign, AIBroker resource ownership changes, Android/mobile clients, hardware-project activation, and unrelated lifecycle remediation.
-
-### Independent plan review
-- Approved: Execution-readiness confirmed against the repo. The plan preserves the verified authority model: adapters are clients of the existing authenticated loopback P12 surface (src/dev_orchestrator/web/server.py:809 command ingress with command_id replay, /api/v1/control/commands/{id} outcomes, control/api-token bearer auth as already used by cli.py:370-410), and ControlCommandCoordinator (core/control_commands.py:97, wired at daemon.py:259) stays the sole mutation consumer. Transport separation matches reality: 8770 daemon control surface vs 8765 bridge (bridge/server.py:4) kept transport-only with no lifecycle route; ExecutionTransport sits beneath the existing AIExecutionPort protocol (ai/execution_port.py) with LocalTransport reproducing current aibroker_subprocess behavior, so absent config is backward compatible. Scope tracks the pending-design task and docs/backlog.md P13 lines 81-92 (adapter boundary, MCP MVP, WebBridge hardening, Local/SSH, RDC manual-only) without inflation; P14 durable jobs, P13.5 UI, replication/provisioning are explicitly excluded. Security boundaries are concrete and fail-closed: separate hash-only revocable WebBridge control capability distinct from the existing heartbeat-only pairing capability in control/security.py, Host/Origin/CORS/CSRF and size limits preserved, no arbitrary shell or prompt/filesystem tools, SSH restricted to fixed argv + structured stdin + strict host verification + closed helper operation set. Idempotency, expected-revision/repository-truth guards, quarantine-as-degraded, and explicit stale/unavailable/unknown states are specified rather than implied. Verification is real and reproducible: closed MCP tool surface tests, control-log cursor/redaction/isolation tests, WebBridge replay/conflict/restart/binding tests, fake-process and fake-remote-helper transport tests, a software-only RDC-disabled acceptance, plus the standard suites, and it correctly carries failure-memory seed:p11b:rdc-powershell-5.1 by forbidding && / || in Windows PowerShell 5.1 commands. NON_BLOCKING notes for acceptance/Technical Review, not grounds to delay: (1) implementation_steps[0] and validation[0] restate a pre-implementation independent design approval, which this review satisfies — the Worker should not stall waiting for a further gate; (2) 'AIBrokerExecutionPort' is a naming mismatch with the actual AIExecutionPort protocol and AIBrokerSubprocess adapter; (3) the remote helper's distribution, versioning, and version-skew handling are underspecified, acceptable because the fixture-backed tests plus host/request identity validation make it safely testable; (4) the /api/v1/control/logs cursor encoding, limit ceiling, and envelope field names are left to implementation, consistent with the existing bounded-limit convention in web/server.py; (5) the work is large for one pass and would benefit from landing control-adapter/MCP before SSH transport, but sequencing granularity is a Worker choice. No architecture, data-loss, irreversible-interface, security, source-of-truth, or missing-verification-path failure found; a Worker can begin without guessing the core contract.
+- The canonical dashboard uses the left-sidebar layout and no longer depends on the old top-tab navigation.
+- All capabilities available before the migration remain reachable and functional.
+- Existing P12/P12.7 control and dashboard regressions remain green, with new navigation/layout tests added.
+- The old dashboard-redesign worktree is treated only as source reference; canonical `main` remains the sole production implementation.
