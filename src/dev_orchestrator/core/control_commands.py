@@ -445,16 +445,38 @@ class ControlCommandCoordinator:
             target_id = _nonblank(target.get("target_id"))
             if self.reviewer is None:
                 return self._blocked(command_id, project_id, action, "reviewer coordinator unavailable", now, record)
+            # Crash/restart idempotency: the re-review launch is persisted before
+            # this command result.  On replay the durable rereview_of row consumes
+            # the stale candidate, so recover the exact same review before
+            # resolving a new candidate rather than incorrectly settling blocked.
+            review_id = "ai_review:rereview:" + command_id
+            reviews_state = self.reviewer.state().get("reviews", {})
+            existing_review = reviews_state.get(review_id) if isinstance(reviews_state, dict) else None
+            if isinstance(existing_review, dict):
+                telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+                current_task_id = _nonblank(telemetry.get("task_id"))
+                if (
+                    existing_review.get("rereview_of") == target_id
+                    and existing_review.get("project_id") == project_id
+                    and _nonblank(existing_review.get("task_id")) == current_task_id
+                ):
+                    return {
+                        **record, "state": "accepted", "processed_at": now,
+                        "effect": "rereview_technical_review_no_worker_started",
+                        "target_id": target_id, "review_id": review_id,
+                        "reason": "descendant re-review already launched for command_id",
+                    }
+                return self._blocked(command_id, project_id, action, "conflicting descendant re-review replay", now, record)
             from dev_orchestrator.control.reconcile import resolve_rereview_candidate
             candidate, candidate_reason = resolve_rereview_candidate(snapshot, self.runtime_root, projects[project_id])
             if candidate is None:
                 return self._blocked(command_id, project_id, action, candidate_reason, now, record)
             if target_id != candidate["target_id"]:
                 return self._blocked(command_id, project_id, action, "target_id does not match the currently projected re-review target", now, record)
-            review_id, launch_reason = self.reviewer.rereview_failed_descendant(projects[project_id], snapshot, candidate, command_id)
+            review_id, launch_reason = self.reviewer.rereview_descendant(projects[project_id], snapshot, candidate, command_id)
             if review_id is None:
                 return self._blocked(command_id, project_id, action, launch_reason, now, record)
-            return {**record, "state": "accepted", "processed_at": now, "effect": "rereview_failed_technical_review_no_worker_started", "target_id": target_id, "review_id": review_id, "reason": launch_reason}
+            return {**record, "state": "accepted", "processed_at": now, "effect": "rereview_technical_review_no_worker_started", "target_id": target_id, "review_id": review_id, "reason": launch_reason}
         if action == "retry":
             target_id = _nonblank(target.get("target_id"))
             if self.reviewer is None:

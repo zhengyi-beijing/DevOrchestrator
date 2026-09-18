@@ -225,7 +225,7 @@ def project_control_view(
         },
         {
             "action": "rereview", "available": rereview_target is not None,
-            "reason": "failed reviewer lineage can be re-reviewed at current descendant HEAD" if rereview_target is not None else rereview_reason,
+            "reason": "stale technical review can be re-reviewed at current descendant HEAD" if rereview_target is not None else rereview_reason,
             **({"target_id": rereview_target["target_id"]} if rereview_target is not None else {}),
         },
         {

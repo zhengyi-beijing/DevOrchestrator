@@ -202,7 +202,7 @@ class P126ReviewRetryTests(unittest.TestCase):
             port = ReviewerPort(); reviewer = AIReviewerCoordinator(runtime, port); executor = FakeExecutor()
             result = ControlCommandCoordinator(runtime, reviewer=reviewer).advance(config, {"projects": [snapshot]}, executor)[0]
             self.assertEqual(result["state"], "accepted", result)
-            self.assertEqual(result["effect"], "rereview_failed_technical_review_no_worker_started")
+            self.assertEqual(result["effect"], "rereview_technical_review_no_worker_started")
             self.assertEqual(executor.calls, [])
             review_id = "ai_review:rereview:rereview-one"
             reviewer._threads[review_id].join(timeout=2)

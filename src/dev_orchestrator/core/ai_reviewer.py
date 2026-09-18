@@ -354,8 +354,8 @@ class AIReviewerCoordinator:
         return review_id, "stale technical review re-anchored at current clean HEAD"
 
 
-    def rereview_failed_descendant(self, project, snapshot, candidate, command_id):
-        """Re-review current clean descendant HEAD while preserving the failed review lineage."""
+    def rereview_descendant(self, project, snapshot, candidate, command_id):
+        """Re-review current clean descendant HEAD while preserving the stale review lineage."""
         from dev_orchestrator.control.reconcile import resolve_rereview_candidate
         target, reason = resolve_rereview_candidate(snapshot, self.runtime_root, project)
         if target is None or target.get("target_id") != candidate.get("target_id"):
@@ -376,9 +376,16 @@ class AIReviewerCoordinator:
         from dev_orchestrator.core.project_context import context_prompt_block
         context_block, resolution = context_prompt_block(project, "reviewer")
         binding = project.get("conversation_binding") or self._project_bindings.get(str(project["project_id"]))
-        reanchor = ("[FAILED_REVIEW_DESCENDANT_REREVIEW]\nPrior reviewer infrastructure failed at HEAD {0}: {1}\n"
-                    "The current clean HEAD is a descendant containing bounded recovery fixes. Independently review CURRENT HEAD; do not inherit a verdict.\n"
-                    "[/FAILED_REVIEW_DESCENDANT_REREVIEW]").format(target.get("reviewed_head"), target.get("prior_reason"))
+        if target.get("kind") == "next":
+            reanchor = ("[ACCEPTED_NEXT_DESCENDANT_REREVIEW]\n"
+                        "A prior technical review accepted NEXT (next_task) at HEAD {0}: {1}\n"
+                        "That acceptance anchor is now stale because the current clean HEAD is a descendant. "
+                        "Independently review the CURRENT HEAD from repository evidence; do not inherit or import the prior accepted verdict.\n"
+                        "[/ACCEPTED_NEXT_DESCENDANT_REREVIEW]").format(target.get("reviewed_head"), target.get("prior_reason"))
+        else:
+            reanchor = ("[FAILED_REVIEW_DESCENDANT_REREVIEW]\nPrior reviewer infrastructure failed at HEAD {0}: {1}\n"
+                        "The current clean HEAD is a descendant containing bounded recovery fixes. Independently review CURRENT HEAD; do not inherit a verdict.\n"
+                        "[/FAILED_REVIEW_DESCENDANT_REREVIEW]").format(target.get("reviewed_head"), target.get("prior_reason"))
         request = AIRoleRequest(project_id=str(project["project_id"]), task_run_id=task_id, stage_run_id="review",
             role_run_id="reviewer-rereview-" + command_id, request_id=review_id, role="reviewer",
             prompt=self._review_prompt(str(project["project_id"]), task_id, source_id, truth, context_block=context_block, reanchor_context=reanchor),
@@ -386,6 +393,8 @@ class AIReviewerCoordinator:
             timeout_seconds=policy["timeout_seconds"], metadata={"worker_source_request_id": source_id, "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
             "failure_environment": environment_for_project(project), "rereview_of": target["target_id"]})
         self._launch_review(review_id, source_id, request, truth, conversation_binding=binding, resolution=resolution)
+        if target.get("kind") == "next":
+            return review_id, "stale accepted NEXT re-reviewed at current clean descendant HEAD"
         return review_id, "failed reviewer lineage re-anchored at current clean descendant HEAD"
 
     def retry_failed(

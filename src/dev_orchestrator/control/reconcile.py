@@ -240,7 +240,19 @@ def _git_distance(repo_path: str, ancestor: str, descendant: str) -> int | None:
 def resolve_rereview_candidate(
     snapshot: dict[str, Any], runtime_root: Path | str, project_config: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, str]:
-    """Resolve one failed reviewer lineage that may be re-reviewed at a clean descendant HEAD."""
+    """Resolve one stale reviewer lineage that may be re-reviewed at a clean descendant HEAD.
+
+    Two immutable lineages qualify:
+
+    - a failed reviewer attempt that produced no durable decision, and
+    - an accepted NEXT decision whose reviewed HEAD is now an ancestor of the
+      current clean descendant HEAD (a stale accepted NEXT for the same
+      completed current task).
+
+    Either way the re-review launches one independent reviewer at the current
+    clean descendant HEAD; it never launches a Worker and never imports the
+    prior verdict.
+    """
     if not isinstance(snapshot, dict):
         return None, "project snapshot is unavailable"
     project_id = _text(snapshot.get("project_id") or snapshot.get("id"))
@@ -266,14 +278,44 @@ def resolve_rereview_candidate(
     consumed = {target for row in reviews.values() if row.get("project_id") == project_id for target in [_text(row.get("rereview_of"))] if target}
     matches = []
     for review_id, review in sorted(reviews.items()):
+        if review_id in consumed:
+            continue
         old_head = _text(review.get("head"))
-        if review_id in consumed or review_id in decisions or not (
+        if not (
             review.get("project_id") == project_id and review.get("task_id") == task_id
-            and review.get("state") == "failed" and review.get("branch") == truth.branch
+            and review.get("branch") == truth.branch
             and old_head and old_head != truth.head and review.get("review_dirty") is False
             and is_git_ancestor(repo_path or "", old_head, truth.head)
         ):
             continue
+        decision = decisions.get(review_id)
+        if isinstance(decision, dict):
+            # Accepted NEXT lineage: a durable next/next_task decision whose
+            # reviewed HEAD is now stale relative to the current descendant HEAD.
+            decision_hash = _text(decision.get("review_status_hash"))
+            if not (
+                review.get("state") == "completed"
+                and decision.get("request_id") == review_id
+                and decision.get("project_id") == project_id
+                and decision.get("task_id") == task_id
+                and decision.get("decision") == "next"
+                and decision.get("next_action") == "next_task"
+                and decision.get("disposition") == "apply"
+                and decision.get("role") == "reviewer"
+                and decision.get("event") == "worker_done"
+                and decision.get("branch") == truth.branch
+                and _text(decision.get("head")) == old_head
+                and decision_hash is not None
+                and review.get("review_status_hash") == decision_hash
+            ):
+                continue
+            kind = "next"
+            prior_reason = _text(review.get("reason")) or _text(decision.get("reason")) or "stale accepted NEXT review"
+        else:
+            if review.get("state") != "failed":
+                continue
+            kind = "failed"
+            prior_reason = _text(review.get("reason")) or "review infrastructure failure"
         source_id = _text(review.get("source_request_id")); source = executions.get(source_id or "")
         resource = source.get("resource_context") if isinstance(source, dict) else None
         if not (isinstance(source, dict) and source.get("state") == "completed" and source.get("engine") == "aibroker"
@@ -282,18 +324,19 @@ def resolve_rereview_candidate(
             continue
         matches.append({"target_id": review_id, "source_request_id": source_id, "task_id": task_id,
                         "branch": truth.branch, "reviewed_head": old_head, "current_head": truth.head,
-                        "prior_reason": _text(review.get("reason")) or "review infrastructure failure",
-                        "resource_context": copy.deepcopy(resource)})
+                        "prior_reason": prior_reason, "resource_context": copy.deepcopy(resource),
+                        "kind": kind})
     if matches:
-        # Failed attempts are immutable audit history.  For descendant re-review,
-        # select the nearest failed ancestor deterministically; older failures
-        # remain preserved but must not globally block the current task anchor.
+        # Reviews and decisions are immutable audit history.  For descendant
+        # re-review, select the nearest stale ancestor deterministically; older
+        # lineage remains preserved but must not globally block the current
+        # task anchor.
         matches.sort(key=lambda row: (
             int(_git_distance(repo_path or "", row["reviewed_head"], truth.head) or 10**9),
             row["target_id"],
         ))
         return matches[0], ""
-    return None, "no safe failed-review descendant re-review target"
+    return None, "no safe stale-review descendant re-review target"
 
 
 def resolve_retry_candidate(
