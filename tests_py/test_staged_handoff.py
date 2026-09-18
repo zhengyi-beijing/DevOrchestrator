@@ -16,7 +16,7 @@ if str(SRC) not in sys.path:
 
 from dev_orchestrator.ai.contracts import AIRoleRequest, AIRoleResult, ResourceContext
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
-from dev_orchestrator.core.control_commands import ControlCommandCoordinator
+from dev_orchestrator.core.control_commands import ControlCommandCoordinator, _continuation_id
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_successor, sha256_bytes
 from dev_orchestrator.core.transition_executor import TransitionExecutor
@@ -534,20 +534,20 @@ class TestStagedHandoffPlannerGuards(unittest.TestCase):
 
 
 class TestStagedHandoffEndToEnd(unittest.TestCase):
-    def test_end_to_end_and_restart_idempotency(self):
+    def test_p127_next_terminal_settles_and_activates_p13_across_restart(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             repo = base / "repo"
-            head = make_git_repo(repo, "P11x")
-            spec_path, spec_bytes = setup_staged_spec(repo, "P11b")
-            setup_roadmap(repo, "P11x", "P11b", spec_path)
+            head = make_git_repo(repo, "P12.7")
+            spec_path, spec_bytes = setup_staged_spec(repo, "P13")
+            setup_roadmap(repo, "P12.7", "P13", spec_path)
             subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-m", "setup staged"], check=True, capture_output=True)
             reviewed_head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
 
             runtime = base / "runtime"
             runtime.mkdir(parents=True, exist_ok=True)
-            port = FakeHandoffPort("P11b")
+            port = FakeHandoffPort("P13")
             planner = AIPlannerCoordinator(runtime, port)
             config_path = base / "projects.json"
             config_data = {
@@ -566,12 +566,12 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
             }
             config_path.write_text(json.dumps(config_data), encoding="utf-8")
 
-            # Write websol-decisions.json for P11x COMPLETE
+            # Independent Reviewer NEXT for accepted P12.7.
             repo_truth = read_repository_truth(repo)
             record = {
                 "project_id": "p1", "request_id": "worker_done:p1:r1",
                 "disposition": "apply", "decision": "next", "next_action": "next_task",
-                "task_id": "P11x", "stage_id": None,
+                "task_id": "P12.7", "stage_id": None,
                 "branch": repo_truth.branch, "head": reviewed_head,
                 "role": "reviewer", "event": "worker_done",
                 "consumed_at": "2026-09-05T00:00:00+00:00",
@@ -588,7 +588,7 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
                     "project_id": "p1",
                     "state": "IDLE",
                     "next_status": "**COMPLETE**",
-                    "telemetry": {"task_id": "P11x"},
+                    "telemetry": {"task_id": "P12.7"},
                     "git": {"head": reviewed_head},
                 }]
             }
@@ -597,15 +597,15 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
             executor.advance(summary, config_path)
             exec_row = executor.state()["executions"]["worker_done:p1:r1"]
             self.assertEqual(exec_row["state"], "handoff")
-            self.assertEqual(exec_row["next_task_id"], "P11b")
-            self.assertEqual(exec_row["staged_successor"], "P11b")
+            self.assertEqual(exec_row["next_task_id"], "P13")
+            self.assertEqual(exec_row["staged_successor"], "P13")
 
             # Repository state before plan start: unchanged
             cur_head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
             self.assertEqual(cur_head, reviewed_head)
             self.assertEqual(
                 (repo / "agent" / "next.md").read_bytes(),
-                b"# P11x Predecessor Task\nStatus: **COMPLETE**\n\nGoal: completed.\n",
+                b"# P12.7 Predecessor Task\nStatus: **COMPLETE**\n\nGoal: completed.\n",
             )
 
             # 2. Control tick resumes handoff and starts deferred planner
@@ -613,6 +613,12 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
             self.assertEqual(len(outcomes), 1)
             self.assertEqual(outcomes[0]["lifecycle_action"], "plan")
             self.assertTrue(executor.state()["executions"]["worker_done:p1:r1"]["handoff_consumed"])
+            handoff = executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual(handoff["predecessor_terminal_state"], "settled")
+            handoff_audit = runtime / "control" / "history" / (outcomes[0]["command_id"] + ".json")
+            audit_before_restart = handoff_audit.read_bytes()
+            self.assertEqual(json.loads(audit_before_restart)["source"], "automatic_review_handoff")
+            self.assertEqual(json.loads(audit_before_restart)["parent_request_id"], "worker_done:p1:r1")
 
             # Wait for planner thread to complete
             plan_id = outcomes[0]["plan_id"]
@@ -624,18 +630,24 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
 
             self.assertEqual(plan_state.get("state"), "ready")
 
-            # 3. Verify exactly one commit produced
+            # 3. The lifecycle first activates P13, then freezes its approved
+            # design.  The completed predecessor cannot remain current while
+            # P11b is being planned.
             new_head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
             self.assertNotEqual(new_head, reviewed_head)
             rev_list = subprocess.check_output(
                 ["git", "-C", str(repo), "rev-list", f"{reviewed_head}..HEAD"], text=True
             ).strip().splitlines()
-            self.assertEqual(len(rev_list), 1)
+            self.assertEqual(len(rev_list), 2)
 
             commit_msg = subprocess.check_output(
                 ["git", "-C", str(repo), "log", "-1", "--pretty=%B"], text=True
             ).strip()
-            self.assertEqual(commit_msg, "plan(P11b): freeze executable design")
+            self.assertEqual(commit_msg, "plan(P13): freeze executable design")
+            activation_msg = subprocess.check_output(
+                ["git", "-C", str(repo), "log", "-2", "--pretty=%B"], text=True
+            ).strip().splitlines()[-1]
+            self.assertEqual(activation_msg, "lifecycle(P12.7): activate staged successor P13")
 
             diff_files = subprocess.check_output(
                 ["git", "-C", str(repo), "diff", "--name-only", f"{reviewed_head}", "HEAD"], text=True
@@ -643,7 +655,7 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
             self.assertEqual(diff_files, ["agent/next.md"])
 
             new_next = (repo / "agent" / "next.md").read_text(encoding="utf-8")
-            self.assertTrue(new_next.startswith("# P11b Successor Task"))
+            self.assertTrue(new_next.startswith("# P13 Successor Task"))
             self.assertIn("Status: **READY_TO_RUN**", new_next)
             self.assertIn("## Approved executable design", new_next)
 
@@ -660,7 +672,7 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
                     "project_id": "p1",
                     "state": "IDLE",
                     "next_status": "**READY_TO_RUN**",
-                    "telemetry": {"task_id": "P11b"},
+                    "telemetry": {"task_id": "P13"},
                     "git": {"head": new_head},
                 }]
             }
@@ -673,6 +685,77 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
             head_after_restart = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
             self.assertEqual(head_after_restart, new_head)
             self.assertEqual(len(new_planner.state()["plans"]), 1)
+            self.assertEqual(new_planner.state()["plans"][plan_id]["task_id"], "P13")
+            self.assertEqual(handoff_audit.read_bytes(), audit_before_restart)
+
+    def test_p127_legacy_deferred_reconcile_activates_p13_without_replaying_p127(self):
+        """A restart repairs the pre-fix durable handoff at the P13 boundary."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_git_repo(repo, "P12.7")
+            spec_path, spec_bytes = setup_staged_spec(repo, "P13")
+            setup_roadmap(repo, "P12.7", "P13", spec_path)
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "setup staged"], check=True, capture_output=True)
+            truth = read_repository_truth(repo)
+            runtime.mkdir()
+            config_path = base / "projects.json"
+            project = {
+                "project_id": "p1", "repo_path": str(repo), "adapter": "agent_files",
+                "execution": {"enabled": True, "engine": "aibroker", "owner_authorized": True,
+                              "allowed_next_actions": ["next_task"]},
+                "ai_roles": {"planner": {"enabled": True}},
+            }
+            config_path.write_text(json.dumps({"projects": [project]}), encoding="utf-8")
+            source_id = "review:p127:accepted"; continuation_id = _continuation_id(source_id)
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": FakeBackend("agy")})
+            staged = read_successor(repo, "P12.7")
+            executor._record_handoff(
+                source_id, "p1", "P12.7", "P13", "accepted Reviewer NEXT",
+                staged=staged, reviewed_branch=truth.branch, reviewed_head=truth.head,
+            )
+            executor.mark_handoff_consumed(source_id, continuation_id, "ai_plan:" + continuation_id)
+            planner = AIPlannerCoordinator(runtime, FakeHandoffPort("P13"))
+            planner._save_state({"version": 1, "plans": {"ai_plan:" + continuation_id: {
+                "plan_id": "ai_plan:" + continuation_id, "command_id": continuation_id,
+                "project_id": "p1", "task_id": "P13", "repo_path": str(repo),
+                "branch": truth.branch, "head": truth.head, "status_hash": truth.status_hash,
+                "state": "recovery_required", "deferred": True,
+                "predecessor_task_id": "P12.7", "staged_spec_path": spec_path,
+                "staged_spec_sha256": sha256_bytes(spec_bytes),
+            }}})
+            predecessor_summary = {"projects": [{
+                "project_id": "p1", "state": "IDLE", "next_status": "**COMPLETE**",
+                "telemetry": {"task_id": "P12.7"}, "git": {"head": truth.head},
+            }]}
+            control = ControlCommandCoordinator(runtime, planner)
+            reconcile_outcomes = control.advance(config_path, predecessor_summary, executor)
+            self.assertEqual(len(reconcile_outcomes), 1)
+            self.assertEqual(reconcile_outcomes[0]["plan_state"], "recovery_required")
+            activated_truth = read_repository_truth(repo)
+            self.assertFalse(activated_truth.dirty)
+            self.assertNotEqual(activated_truth.head, truth.head)
+            self.assertEqual((repo / "agent" / "next.md").read_bytes(), spec_bytes)
+            plan = planner.state()["plans"]["ai_plan:" + continuation_id]
+            self.assertEqual(plan["task_id"], "P13")
+            self.assertFalse(plan["deferred"])
+            self.assertEqual(plan["head"], activated_truth.head)
+
+            # A later restart/reconcile sees P13, starts no role and creates
+            # neither another activation nor a P12.7 Worker/planner.
+            restarted = AIPlannerCoordinator(runtime, FakeHandoffPort("P13"))
+            restarted_executor = TransitionExecutor(runtime, backend_overrides={"agy": FakeBackend("agy")})
+            successor_summary = {"projects": [{
+                "project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**",
+                "telemetry": {"task_id": "P13"}, "git": {"head": activated_truth.head},
+            }]}
+            restart_outcomes = ControlCommandCoordinator(runtime, restarted).advance(
+                config_path, successor_summary, restarted_executor,
+            )
+            self.assertTrue(all(row.get("lifecycle_action") != "execute" for row in restart_outcomes))
+            self.assertEqual(read_repository_truth(repo).head, activated_truth.head)
+            self.assertEqual(len(restarted.state()["plans"]), 1)
+            self.assertEqual(next(iter(restarted.state()["plans"].values()))["task_id"], "P13")
 
     def test_restart_idempotency_after_deferred_start_before_apply(self):
         with tempfile.TemporaryDirectory() as td:
@@ -770,16 +853,17 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
             self.assertEqual(len(new_planner.state()["plans"]), 1)
             self.assertEqual(len(port.requests), initial_port_requests)
 
-            # Verify no commit produced, HEAD equals reviewed_head, agent/next.md unchanged
+            # The successor activation is already a durable terminal handoff.
+            # Restart must not re-plan P11x or make a second activation commit.
             cur_head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-            self.assertEqual(cur_head, reviewed_head)
+            self.assertNotEqual(cur_head, reviewed_head)
             rev_list = subprocess.check_output(
                 ["git", "-C", str(repo), "rev-list", f"{reviewed_head}..HEAD"], text=True
-            ).strip()
-            self.assertEqual(rev_list, "")
+            ).strip().splitlines()
+            self.assertEqual(len(rev_list), 1)
             self.assertEqual(
                 (repo / "agent" / "next.md").read_bytes(),
-                b"# P11x Predecessor Task\nStatus: **COMPLETE**\n\nGoal: completed.\n",
+                b"# P11b Successor Task\n\nStatus: **PENDING DESIGN**\n\nGoal: implement successor.\n",
             )
             self.assertEqual((repo / spec_path).read_bytes(), spec_bytes)
 

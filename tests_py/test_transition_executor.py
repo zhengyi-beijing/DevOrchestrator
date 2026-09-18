@@ -635,6 +635,8 @@ class TransitionExecutorActuationTests(unittest.TestCase):
                 (row["state"], row["outcome"], row["next_task_id"]),
                 ("handoff", "planning_required", "P2"),
             )
+            self.assertEqual(row["predecessor_terminal_state"], "settled")
+            self.assertTrue(row["predecessor_settled_at"])
             self.assertIs(row["reviewed_ready"], True)
             self.assertEqual(len(backend.started), 0)
 

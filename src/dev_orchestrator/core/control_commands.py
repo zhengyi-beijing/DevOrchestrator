@@ -169,32 +169,54 @@ class ControlCommandCoordinator:
             return []
         outcomes: list[dict[str, Any]] = []
         for source_id, row in sorted(executions.items()):
-            if not isinstance(row, dict) or row.get("state") != "handoff" or row.get("outcome") != "planning_required" or row.get("handoff_consumed") is True:
+            if not isinstance(row, dict) or row.get("state") != "handoff" or row.get("outcome") != "planning_required":
                 continue
             project_id = _nonblank(row.get("project_id")); next_task_id = _nonblank(row.get("next_task_id"))
             project = projects.get(project_id or ""); snapshot = snapshots.get(project_id or "")
             if project is None or snapshot is None or next_task_id is None:
                 continue
+            staged_successor = _nonblank(row.get("staged_successor"))
+            if row.get("handoff_consumed") is True:
+                # Only old deferred handoffs reach this path: new handoffs
+                # activate the staged successor before their P13 planner is
+                # created.  Reconcile at the restart boundary rather than
+                # allowing P12.7 to become current again.
+                if staged_successor is not None:
+                    continuation_id = _continuation_id(source_id)
+                    reconcile = getattr(self.planner, "reconcile_deferred_activation", None)
+                    if callable(reconcile):
+                        reason = reconcile(project, row, continuation_id)
+                        if reason:
+                            outcomes.append({
+                                "version": CONTROL_VERSION, "command_id": continuation_id,
+                                "project_id": project_id, "action": "continue", "state": "blocked",
+                                "source": "automatic_review_handoff", "parent_request_id": source_id,
+                                "reason": reason, "processed_at": utc_now_iso(),
+                            })
+                continue
             if self.owner_store.is_paused(project_id or ""):
                 continue
             telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
-            staged_successor = _nonblank(row.get("staged_successor"))
             is_staged = staged_successor is not None
             if not is_staged:
                 if _nonblank(telemetry.get("task_id")) != next_task_id or "PENDING DESIGN" not in str(snapshot.get("next_status") or "").upper():
                     continue
             else:
                 status = str(snapshot.get("next_status") or "")
+                current_task = _nonblank(telemetry.get("task_id"))
+                successor_already_current = (
+                    current_task == staged_successor
+                    and "PENDING DESIGN" in status.upper()
+                )
                 if row.get("reviewed_ready") is True:
                     status_ok = re.search(
                         r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE
                     ) is not None
                 else:
                     status_ok = re.search(r"\bCOMPLETED?\b", status, re.IGNORECASE) is not None
-                if (
-                    _nonblank(telemetry.get("task_id")) != _nonblank(row.get("task_id"))
-                    or not status_ok
-                    or staged_successor != next_task_id
+                if staged_successor != next_task_id or (
+                    not successor_already_current
+                    and (current_task != _nonblank(row.get("task_id")) or not status_ok)
                 ):
                     continue
             continuation_id = _continuation_id(source_id)

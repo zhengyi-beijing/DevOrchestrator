@@ -667,6 +667,11 @@ class TransitionExecutor:
                 "next_task_id": next_task_id, "state": "handoff",
                 "outcome": "planning_required", "reason": reason,
                 "recorded_at": utc_now_iso(),
+                # `handoff` is the successor activation work item.  The
+                # reviewed task itself is terminal at this point and must
+                # never be eligible for a new planner/Worker launch.
+                "predecessor_terminal_state": "settled",
+                "predecessor_settled_at": utc_now_iso(),
                 **({"legacy_reconciled_from": existing} if existing is not None else {}),
             }
             if staged is not None:

@@ -347,15 +347,11 @@ class AIPlannerCoordinator:
         truth = read_repository_truth(repo)
         if not truth.valid or truth.dirty:
             return None, "planner requires a clean repository"
-        if truth.branch != reviewed_branch or truth.head != reviewed_head:
+        if truth.branch != reviewed_branch:
             return None, "repository moved since review"
 
         predecessor_bytes = read_raw(repo, "agent/next.md")
         if predecessor_bytes is None:
-            return None, "agent/next.md unavailable"
-        try:
-            predecessor_text = predecessor_bytes.decode("utf-8")
-        except UnicodeDecodeError:
             return None, "agent/next.md unavailable"
 
         rm_res = read_successor(repo, handoff_task_id)
@@ -369,19 +365,196 @@ class AIPlannerCoordinator:
             or rm_res.spec_sha256 != staged_spec_sha256
         ):
             return None, "staged spec changed since handoff"
+        successor_bytes = rm_res.spec_text.encode("utf-8")
+
+        # If a crash landed after the activation commit but before the planner
+        # state write, the staged successor is already the current task.  Do
+        # not reject it as a predecessor mismatch or create another commit.
+        if predecessor_bytes == successor_bytes:
+            return self._begin_lifecycle(
+                project, policy, command_id, staged_successor, truth,
+                {
+                    "predecessor_task_id": handoff_task_id,
+                    "predecessor_next_sha256": sha256_bytes(predecessor_bytes),
+                    "predecessor_settled_at": utc_now_iso(),
+                    "activation_commit": truth.head,
+                    "activation_recovered_at": utc_now_iso(),
+                    "staged_spec_path": staged_spec_path,
+                    "staged_spec_sha256": staged_spec_sha256,
+                    "staged_spec_text": rm_res.spec_text,
+                    "next_text": rm_res.spec_text,
+                },
+            )
+        if truth.head != reviewed_head:
+            return None, "repository moved since review"
+
+        # A deferred handoff used to leave agent/next.md on the predecessor
+        # until the successor's plan was approved.  That made the monitor,
+        # restart recovery and reconcile all rediscover the completed task
+        # while the planner was already working on its successor.  Activate
+        # the immutable staged task before creating its planner lifecycle.
+        # This is a lifecycle transition (with a durable commit), not a UI
+        # projection or an ad-hoc edit of agent/next.md.
+        try:
+            activation_head = self._activate_staged_successor(
+                repo, predecessor_bytes, successor_bytes,
+                handoff_task_id, staged_successor,
+            )
+        except Exception as exc:
+            return None, "staged successor activation failed: " + str(exc)
+        activated_truth = read_repository_truth(repo)
+        if (
+            not activated_truth.valid or activated_truth.dirty
+            or activated_truth.branch != reviewed_branch
+            or activated_truth.head != activation_head
+        ):
+            return None, "staged successor activation did not produce clean repository truth"
 
         base_fields = {
-            "deferred": True,
             "predecessor_task_id": handoff_task_id,
             "predecessor_next_sha256": sha256_bytes(predecessor_bytes),
-            "next_text": predecessor_text,
+            "predecessor_settled_at": utc_now_iso(),
+            "activation_commit": activation_head,
             "staged_spec_path": staged_spec_path,
             "staged_spec_sha256": staged_spec_sha256,
             "staged_spec_text": rm_res.spec_text,
         }
         return self._begin_lifecycle(
-            project, policy, command_id, staged_successor, truth, base_fields
+            project, policy, command_id, staged_successor, activated_truth,
+            {**base_fields, "next_text": rm_res.spec_text},
         )
+
+    def reconcile_deferred_activation(
+        self, project: dict[str, Any], handoff: dict[str, Any], command_id: str,
+    ) -> str:
+        """Migrate a restart-recovered legacy deferred handoff once, safely.
+
+        Older handoffs recorded a P13 planner while leaving P12.7 in
+        agent/next.md.  At a restart-recovered or already terminal P13 plan,
+        make the same durable activation that new handoffs perform and
+        re-anchor the P13 record.  This deliberately never resumes an active
+        planner or replays a P12.7 role.
+        """
+        plan_id = "ai_plan:" + command_id
+        with self._lock:
+            record = copy.deepcopy(self._load_state()["plans"].get(plan_id))
+        if not isinstance(record, dict):
+            return "legacy deferred handoff plan is unavailable"
+        if record.get("deferred") is not True:
+            return ""
+        record_state = str(record.get("state") or "")
+        if record_state not in {"recovery_required", "failed"}:
+            return "legacy deferred handoff requires a failed or restart-recovery planner boundary"
+        repo_text = _nonblank(project.get("repo_path"))
+        successor = _nonblank(handoff.get("staged_successor"))
+        predecessor = _nonblank(handoff.get("task_id"))
+        spec_path = _nonblank(handoff.get("staged_spec_path"))
+        spec_sha = _nonblank(handoff.get("staged_spec_sha256"))
+        if (
+            repo_text is None or successor is None or predecessor is None
+            or spec_path is None or spec_sha is None or record.get("task_id") != successor
+        ):
+            return "legacy deferred handoff metadata is incomplete"
+        repo = Path(repo_text)
+        predecessor_bytes = read_raw(repo, "agent/next.md")
+        successor_bytes = read_raw(repo, spec_path)
+        if predecessor_bytes is None or successor_bytes is None or sha256_bytes(successor_bytes) != spec_sha:
+            return "legacy deferred staged spec changed or is unavailable"
+        try:
+            activation_head = self._activate_staged_successor(
+                repo, predecessor_bytes, successor_bytes, predecessor, successor,
+            )
+        except Exception as exc:
+            return "legacy deferred successor activation failed: " + str(exc)
+        truth = read_repository_truth(repo)
+        if not truth.valid or truth.dirty or truth.head != activation_head:
+            return "legacy deferred successor activation did not produce clean repository truth"
+        try:
+            successor_text = successor_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return "legacy deferred staged spec is not UTF-8"
+        with self._lock:
+            state = self._load_state()
+            current = state["plans"].get(plan_id)
+            if not isinstance(current, dict) or current.get("state") != record_state:
+                return "legacy deferred handoff changed during reconciliation"
+            current.update({
+                "deferred": False,
+                "next_text": successor_text,
+                "branch": truth.branch,
+                "head": truth.head,
+                "status_hash": truth.status_hash,
+                "activation_commit": activation_head,
+                "predecessor_settled_at": utc_now_iso(),
+                "legacy_deferred_activation_reconciled_at": utc_now_iso(),
+            })
+            self._save_state(state)
+        return ""
+
+    @staticmethod
+    def _activate_staged_successor(
+        repo: Path,
+        predecessor_bytes: bytes,
+        successor_bytes: bytes,
+        predecessor_task_id: str,
+        successor_task_id: str,
+    ) -> str:
+        """Commit the reviewed staged successor as the one current task.
+
+        The caller has already verified the roadmap and repository identity.
+        Recheck the exact predecessor bytes here because this is the write
+        boundary.  On failure before a commit, restore the worktree and index
+        to their observed clean contents without resetting unrelated paths.
+        """
+        next_path = repo / "agent" / "next.md"
+        current = read_raw(repo, "agent/next.md")
+        if current != predecessor_bytes:
+            raise RuntimeError("agent/next.md changed before successor activation")
+        if successor_bytes == predecessor_bytes:
+            raise RuntimeError("staged successor does not advance agent/next.md")
+        truth = read_repository_truth(repo)
+        if not truth.valid or truth.dirty:
+            raise RuntimeError("repository changed before successor activation")
+        try:
+            next_path.write_bytes(successor_bytes)
+            add = subprocess.run(
+                ["git", "-C", str(repo), "add", "--", "agent/next.md"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=20, check=False, **hidden_subprocess_kwargs(),
+            )
+            if add.returncode != 0:
+                raise RuntimeError("git add failed: " + (add.stderr or add.stdout).strip())
+            commit = subprocess.run(
+                [
+                    "git", "-C", str(repo), "commit", "-m",
+                    f"lifecycle({predecessor_task_id}): activate staged successor {successor_task_id}",
+                    "--", "agent/next.md",
+                ],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=60, check=False, **hidden_subprocess_kwargs(),
+            )
+            if commit.returncode != 0:
+                raise RuntimeError("git commit failed: " + (commit.stderr or commit.stdout).strip())
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
+                **hidden_subprocess_kwargs(),
+            )
+            if head.returncode != 0 or not head.stdout.strip():
+                raise RuntimeError("cannot read successor activation HEAD")
+            return head.stdout.strip()
+        except Exception:
+            post = read_repository_truth(repo)
+            if post.valid and post.head == truth.head:
+                try:
+                    next_path.write_bytes(predecessor_bytes)
+                    subprocess.run(
+                        ["git", "-C", str(repo), "add", "--", "agent/next.md"],
+                        capture_output=True, timeout=15, **hidden_subprocess_kwargs(),
+                    )
+                except Exception:
+                    pass
+            raise
 
     def ready_records(self) -> list[dict[str, Any]]:
         with self._lock:
