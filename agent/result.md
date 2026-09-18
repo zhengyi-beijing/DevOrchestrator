@@ -530,3 +530,16 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (3115 nodes, 8632 edges, 161 communities).
   - Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
+
+## P12.7 Third Review Remediation (2026-09-18)
+
+- Remediated findings from `ai_review:rereview:closure3`:
+  - Acceptance 2 (guarded-action CAS projection): Hardened `cmd_project_control` in `src/dev_orchestrator/cli.py` to mirror the daemon coordinator's per-action validation projection. For `retry` and `rereview`, expected CAS identity is derived using the orchestration lifecycle overlay (`overlay_orchestration_lifecycle` with `ai-reviewer.json` and `summary.json`), matching what `ControlCommandCoordinator._advance_command` observes (e.g. `REVIEW_FAILED`). For all other controls (e.g. `pause`), raw per-project snapshots are retained so commands are not rejected as stale project identity.
+  - Daemon reviewer fallback: Hardened `ControlCommandCoordinator._advance_command` in `src/dev_orchestrator/core/control_commands.py` to fall back to durable on-disk reviewer state (`ai-reviewer.json`) when `self.reviewer` is not injected.
+  - CLI CAS regression tests: Added `test_project_control_retry_uses_orchestration_lifecycle_overlay` and `test_project_control_rereview_uses_orchestration_lifecycle_overlay` in `tests_py/test_cli.py` verifying that both actions derive `expected.lifecycle_state = "REVIEW_FAILED"`.
+- Verification:
+  - Focused web/control/cli suites passed: 101 passed, 16 subtests passed (`test_cli.py`, `test_web.py`, `test_accounting_dashboard.py`, `test_unbound_web_ui.py`, `test_web_ui_refresh.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_control_commands.py`, `test_p126_review_retry.py`, `test_p127_closure_rereview.py`).
+  - `tests/web-selftest.ps1`: PASS.
+  - Full test suite passed: 658 passed, 45 subtests passed in 228.65s (`python -m pytest tests_py -q`).
+  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3146 nodes, 8781 edges, 159 communities). Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.

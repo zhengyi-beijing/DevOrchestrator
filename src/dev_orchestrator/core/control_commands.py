@@ -319,12 +319,20 @@ class ControlCommandCoordinator:
         # Project only that reviewer lifecycle for retry identity validation; all
         # other controls retain their established snapshot semantics.
         validation_snapshot = snapshot
-        if action in {"retry", "rereview"} and self.reviewer is not None:
-            reviewer_state_fn = getattr(self.reviewer, "state", None)
+        if action in {"retry", "rereview"}:
+            reviewer_state = None
+            if self.reviewer is not None:
+                reviewer_state_fn = getattr(self.reviewer, "state", None)
+                if callable(reviewer_state_fn):
+                    reviewer_state = reviewer_state_fn()
+            if reviewer_state is None:
+                raw_reviewer = read_json(self.runtime_root / "ai-reviewer.json", None)
+                if isinstance(raw_reviewer, dict):
+                    reviewer_state = raw_reviewer
             validation_snapshot = project_runtime_status(snapshot, self.runtime_root)
             validation_snapshot = overlay_orchestration_lifecycle(
                 {"projects": [validation_snapshot]},
-                reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
+                reviewer_state=reviewer_state,
             )["projects"][0]
         valid, reason, observed = validate_expected(record.get("expected"), validation_snapshot, self.runtime_root)
         if not valid:

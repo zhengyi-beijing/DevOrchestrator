@@ -463,12 +463,29 @@ def cmd_project_control(args: argparse.Namespace) -> int:
     from dev_orchestrator.control.surface import project_control_view
     config = load_projects_config(resolve_config_path(getattr(args, "config", None)))
     project_config = next((row for row in config.get("projects") or [] if row.get("project_id") == project_id), None)
-    # Command CAS identity must be derived from the same durable per-project
-    # snapshot that the daemon command coordinator will observe.  summary.json
-    # is a presentation overlay and can legitimately lag or carry a different
-    # lifecycle projection; using it here makes otherwise valid commands stale
-    # before the daemon can consume them.
-    projected = project_control_view(snapshot, runtime, project_config)
+    # Command CAS identity must be derived from the same projection that the
+    # daemon command coordinator will observe. The daemon validates retry and
+    # rereview against the orchestration lifecycle overlay (e.g. REVIEW_FAILED),
+    # while all other controls retain their raw per-project snapshot semantics.
+    control_snapshot = snapshot
+    if args.action in {"retry", "rereview"}:
+        from dev_orchestrator.core.project_status import project_runtime_status
+        from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lifecycle
+        reviewer_state = read_json(runtime / "ai-reviewer.json", None)
+        overlay_snapshot = project_runtime_status(snapshot, runtime)
+        overlay_res = overlay_orchestration_lifecycle(
+            {"projects": [overlay_snapshot]},
+            reviewer_state=reviewer_state if isinstance(reviewer_state, dict) else None,
+        )
+        if isinstance(overlay_res, dict) and isinstance(overlay_res.get("projects"), list) and overlay_res["projects"]:
+            control_snapshot = overlay_res["projects"][0]
+        if control_snapshot.get("lifecycle_state") not in {"REVIEW_FAILED", "RECOVERY_REQUIRED"}:
+            summary = read_json(runtime / "summary.json", {})
+            if isinstance(summary, dict) and isinstance(summary.get("projects"), list):
+                summary_project = next((row for row in summary["projects"] if isinstance(row, dict) and row.get("project_id") == project_id), None)
+                if isinstance(summary_project, dict) and summary_project.get("lifecycle_state") in {"REVIEW_FAILED", "RECOVERY_REQUIRED"}:
+                    control_snapshot = {**snapshot, "lifecycle_state": summary_project["lifecycle_state"]}
+    projected = project_control_view(control_snapshot, runtime, project_config)
     target = {}
     if args.binding_id and args.action in {"bind_conversation", "rebind_conversation"}:
         target.update({"adapter": args.adapter, "binding_id": args.binding_id})
