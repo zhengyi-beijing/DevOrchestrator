@@ -499,6 +499,8 @@ class AIPlannerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"
             make_repo(repo)
+            branch = subprocess.run(["git", "-C", str(repo), "branch", "--show-current"], capture_output=True, text=True, check=True).stdout.strip()
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
             next_text = (repo / "agent" / "next.md").read_text(encoding="utf-8")
             plan = {
                 "task_id": "P14", "summary": "Reuse this already generated plan.",
@@ -516,6 +518,8 @@ class AIPlannerTests(unittest.TestCase):
                         "project_id": "p1",
                         "task_id": "P14",
                         "repo_path": str(repo),
+                        "branch": branch,
+                        "head": head,
                         "state": "failed",
                         "started_at": "2026-09-18T00:00:00+00:00",
                         "completed_at": "2026-09-18T00:01:00+00:00",
@@ -563,6 +567,44 @@ class AIPlannerTests(unittest.TestCase):
             )
             self.assertEqual(row["planner_reused_from"], "ai_plan:failed-review")
             self.assertEqual(row["planner_resource"]["resource_id"], "codex/default/gpt-5.6-sol")
+            self.assertEqual(row["plan_review_recovery_count"], 1)
+
+    def test_failed_plan_review_retry_is_bounded(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            branch = subprocess.run(["git", "-C", str(repo), "branch", "--show-current"], capture_output=True, text=True, check=True).stdout.strip()
+            head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+            next_text = (repo / "agent" / "next.md").read_text(encoding="utf-8")
+            plan = {
+                "task_id": "P14", "summary": "Reuse this already generated plan.",
+                "implementation_steps": ["Step 1"], "interfaces": ["Interface 1"],
+                "validation": ["Validation 1"], "risks": ["Risk 1"], "out_of_scope": ["Scope 1"],
+            }
+            runtime.mkdir(parents=True)
+            (runtime / "ai-planner.json").write_text(json.dumps({
+                "version": 1, "plans": {"ai_plan:failed-review": {
+                    "plan_id": "ai_plan:failed-review", "command_id": "failed-review",
+                    "project_id": "p1", "task_id": "P14", "repo_path": str(repo),
+                    "branch": branch, "head": head, "state": "failed",
+                    "completed_at": "2026-09-18T00:01:00+00:00",
+                    "reason": "plan review failed: broker service invocation failed: timed out",
+                    "next_text": next_text, "plan": plan, "plan_review_recovery_count": 3,
+                    "planner_completed_at": "2026-09-18T00:00:30+00:00",
+                    "planner_resource": {"resource_id": "planner-r", "provider": "codex", "account": "default", "model": "gpt"},
+                }}
+            }), encoding="utf-8")
+            coordinator = AIPlannerCoordinator(runtime, FakePort())
+            project = {
+                "project_id": "p1", "repo_path": str(repo), "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {"enabled": True, "max_attempts": 3}},
+            }
+            snapshot = {"project_id": "p1", "state": "PLAN_FAILED", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P14"}}
+            handled, plan_id, reason = coordinator.continue_failed_plan_review(project, snapshot, "bounded-review-retry")
+            self.assertTrue(handled)
+            self.assertIsNone(plan_id)
+            self.assertIn("retry limit reached (3)", reason)
+            self.assertEqual(coordinator.port.requests, [])
 
     def test_planner_resource_failure_excludes_failed_resource_and_fails_over(self):
         with tempfile.TemporaryDirectory() as td:

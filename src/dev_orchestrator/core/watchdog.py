@@ -49,6 +49,7 @@ ACTIVE_LIFECYCLE_STATES = frozenset({
     "EXECUTING",
     "REVIEWING",
     "REVIEW_FAILED",
+    "PLAN_FAILED",
     "REMEDIATING",
 })
 
@@ -60,6 +61,7 @@ LIFECYCLE_OVERRIDE_FAMILY = {
     "EXECUTING": "EXECUTING",
     "REVIEWING": "REVIEWING",
     "REVIEW_FAILED": "REVIEWING",
+    "PLAN_FAILED": "PLANNING",
     "REMEDIATING": "REMEDIATING",
 }
 
@@ -1472,7 +1474,7 @@ class WatchdogCoordinator:
             return
 
         diag_code = attempt_record.get("diagnosis")
-        if diag_code not in ("agent_stalled", "process_dead", "reviewer_failed"):
+        if diag_code not in ("agent_stalled", "process_dead", "reviewer_failed", "plan_reviewer_failed"):
             self._emit_owner_gate_once(pid, attempt_record, f"diagnosis_{diag_code}_requires_owner")
             return
 
@@ -1523,6 +1525,13 @@ class WatchdogCoordinator:
                 return
             recovery_action = "retry"
             recovery_target = {"target_id": retry_candidate["target_id"]}
+
+        if diag_code == "plan_reviewer_failed":
+            if current_lifecycle != "PLAN_FAILED":
+                self._emit_owner_gate_once(pid, attempt_record, "plan_reviewer_failed_lifecycle_changed")
+                return
+            recovery_action = "continue"
+            recovery_target = {}
 
         if diag_code == "agent_stalled":
             # R3-F1: agent_stalled recovery is only valid when the current snapshot lifecycle

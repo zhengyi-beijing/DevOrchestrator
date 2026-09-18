@@ -25,6 +25,7 @@ DIAGNOSIS_CODES = (
     "agent_stalled",
     "process_dead",
     "reviewer_failed",
+    "plan_reviewer_failed",
     "provider_or_quota_blocked",
     "state_desync",
     "external_wait",
@@ -34,6 +35,19 @@ WORKER_EXPECTED_LIFECYCLE_STATES = frozenset({"EXECUTING", "REMEDIATING"})
 # Vocabulary of active worker states from the executor ledger and overlay projection.
 # "starting" is the overlay mapping for "launching" (see transition_executor.overlay_managed_runs).
 ACTIVE_WORKER_STATES = frozenset({"running", "active", "launching", "starting"})
+_PLAN_REVIEW_RESOURCE_FAILURES = frozenset({
+    "quota_exhausted",
+    "rate_limited",
+    "provider_temporarily_unavailable",
+    "resource_unavailable",
+})
+_PLAN_REVIEW_TRANSIENT_ERROR_MARKERS = (
+    "broker service invocation failed",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "no eligible resource",
+)
 
 _SECRET_PATTERN = re.compile(
     r"(?i)(api[_-]?key|secret|token|password|bearer|sk-[a-z0-9]{20,})[:=]\s*([^\s]{4,})"
@@ -199,7 +213,7 @@ def collect_evidence(
                     matched = [r for r in recs.values() if isinstance(r, dict) and str(r.get("project_id") or "") == project_id]
                     if matched:
                         latest = max(matched, key=lambda r: str(r.get("completed_at") or r.get("started_at") or r.get("updated_at") or ""))
-                        ledgers[ledger_name] = {
+                        ledger_row = {
                             "state": latest.get("state"),
                             "status": latest.get("status"),
                             "request_id": latest.get("request_id"),
@@ -210,6 +224,19 @@ def collect_evidence(
                             "started_at": latest.get("started_at"),
                             "updated_at": latest.get("updated_at"),
                         }
+                        if ledger_name == "ai-planner.json":
+                            attempts = latest.get("reviewer_attempts")
+                            last_attempt = attempts[-1] if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict) else {}
+                            ledger_row.update({
+                                "plan_present": isinstance(latest.get("plan"), dict),
+                                "planner_completed_at": latest.get("planner_completed_at"),
+                                "reviewer_attempt_count": latest.get("reviewer_attempt_count"),
+                                "reviewer_last_failure": _redact_secrets(str(latest.get("reviewer_last_failure") or ""))[:1000],
+                                "reviewer_last_failure_classification": last_attempt.get("failure_classification"),
+                                "reviewer_last_attempt_status": last_attempt.get("status"),
+                                "reviewer_last_attempt_error": _redact_secrets(str(last_attempt.get("error") or ""))[:1000],
+                            })
+                        ledgers[ledger_name] = ledger_row
         evidence["ledgers"] = ledgers
 
     # 5. Agent files existence and bounded safe tails
@@ -271,6 +298,39 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
             confidence=1.0,
             reason=str(review_ledger.get("reason") or "technical reviewer failed before durable decision"),
             recommended_action="retry the exact failed technical review at the unchanged clean HEAD",
+            owner_gate_required=False,
+            evidence=evidence,
+            evidence_hash=ev_hash,
+        )
+
+    # A failed plan-review transport/resource attempt is resumable from the durable
+    # planner output.  Do not classify semantic plan/review failures here: only an
+    # explicit resource failure class or a narrow transient transport signature is safe.
+    planner_ledger = ledgers.get("ai-planner.json") if isinstance(ledgers.get("ai-planner.json"), dict) else {}
+    plan_reason = str(planner_ledger.get("reason") or "")
+    plan_review_error = str(
+        planner_ledger.get("reviewer_last_attempt_error")
+        or planner_ledger.get("reviewer_last_failure")
+        or plan_reason
+    ).lower()
+    plan_review_classification = str(planner_ledger.get("reviewer_last_failure_classification") or "")
+    resumable_plan_review = (
+        lifecycle == "PLAN_FAILED"
+        and planner_ledger.get("state") == "failed"
+        and planner_ledger.get("plan_present") is True
+        and planner_ledger.get("planner_completed_at")
+        and plan_reason.startswith("plan review failed:")
+        and (
+            plan_review_classification in _PLAN_REVIEW_RESOURCE_FAILURES
+            or any(marker in plan_review_error for marker in _PLAN_REVIEW_TRANSIENT_ERROR_MARKERS)
+        )
+    )
+    if resumable_plan_review:
+        return Diagnosis(
+            code="plan_reviewer_failed",
+            confidence=1.0,
+            reason=str(planner_ledger.get("reviewer_last_failure") or plan_reason),
+            recommended_action="resume only the failed plan review from the existing planner output",
             owner_gate_required=False,
             evidence=evidence,
             evidence_hash=ev_hash,

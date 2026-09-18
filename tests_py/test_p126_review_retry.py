@@ -181,6 +181,50 @@ class P126ReviewRetryTests(unittest.TestCase):
             self.assertEqual(command["target"], {"target_id": failed_id})
 
 
+    def test_watchdog_enqueues_plan_review_continue_not_new_planner_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, runtime, _, project, snapshot, _ = self.fixture(Path(td))
+            project = {
+                **project,
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            }
+            snapshot["state"] = "IDLE"
+            snapshot["lifecycle_state"] = "PLAN_FAILED"
+            snapshot["next_status"] = "**PENDING DESIGN**"
+            evidence = {
+                "process_liveness": {"process_alive": False, "pid": None},
+                "ledgers": {"ai-planner.json": {
+                    "state": "failed",
+                    "reason": "plan review failed: broker service invocation failed: timed out",
+                }},
+            }
+            attempt = {
+                "attempt_key": "plan-review-failed-attempt",
+                "run_scope_key": "plan-review-failed-scope",
+                "task_id": "P1",
+                "state": "completed",
+                "diagnosis": "plan_reviewer_failed",
+                "owner_gate_required": False,
+                "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "evidence": evidence,
+                "evidence_hash": evidence_hash(evidence),
+            }
+            attempt["record_integrity_hash"] = compute_record_integrity_hash(attempt)
+            project_row = {"attempts": {attempt["attempt_key"]: attempt}}
+            watchdog = WatchdogCoordinator(runtime)
+            watchdog._cached_state["projects"]["p1"] = project_row
+            watchdog._check_and_trigger_recovery(
+                project, snapshot, project_row, attempt["attempt_key"], attempt
+            )
+            recovery = attempt["recovery"]
+            self.assertEqual(recovery["action"], "continue")
+            self.assertEqual(recovery["target"], {})
+            inbox = runtime / "control" / "inbox" / f"{recovery['command_id']}.json"
+            command = json.loads(inbox.read_text(encoding="utf-8"))
+            self.assertEqual(command["action"], "continue")
+            self.assertEqual(command["target"], {})
+
+
     def test_failed_review_can_rereview_clean_descendant_without_worker(self):
         with tempfile.TemporaryDirectory() as td:
             repo, runtime, config, project, snapshot, failed_id = self.fixture(Path(td))

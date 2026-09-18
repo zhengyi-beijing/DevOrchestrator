@@ -713,6 +713,11 @@ class AIPlannerCoordinator:
         truth = read_repository_truth(repo_text)
         if not truth.valid or truth.dirty:
             return True, None, "plan review retry requires a clean repository"
+        if truth.branch != source.get("branch") or truth.head != source.get("head"):
+            return True, None, "repository branch/HEAD changed since the failed plan review"
+        recovery_count = int(source.get("plan_review_recovery_count") or 0)
+        if recovery_count >= int(policy["max_attempts"]):
+            return True, None, f"failed plan review retry limit reached ({policy['max_attempts']})"
         next_path = Path(repo_text) / "agent" / "next.md"
         try:
             next_text = next_path.read_text(encoding="utf-8")
@@ -732,6 +737,7 @@ class AIPlannerCoordinator:
             "seed_planner_completed_at": source.get("planner_completed_at"),
             "reused_plan_from": source.get("plan_id"),
             "reused_plan_reason": source.get("reason"),
+            "plan_review_recovery_count": recovery_count + 1,
         }
         plan_id, reason = self._begin_lifecycle(
             project, policy, command_id, task_id, truth, base_fields,

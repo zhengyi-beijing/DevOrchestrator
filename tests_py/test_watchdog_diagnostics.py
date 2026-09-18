@@ -30,9 +30,9 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
     def tearDown(self):
         self.tmp_dir.cleanup()
 
-    def test_8_diagnostic_classifications(self):
-        """Verify all 8 diagnosis codes can be classified deterministically."""
-        self.assertEqual(len(DIAGNOSIS_CODES), 8)
+    def test_9_diagnostic_classifications(self):
+        """Verify all 9 diagnosis codes can be classified deterministically."""
+        self.assertEqual(len(DIAGNOSIS_CODES), 9)
         assessment = DummyAssessment()
 
         # 1. process_dead
@@ -57,7 +57,27 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag_review.code, "reviewer_failed")
         self.assertFalse(diag_review.owner_gate_required)
 
-        # 3. provider_or_quota_blocked
+        # 3. plan_reviewer_failed
+        ev_plan_review_failed = {
+            "process_liveness": {"process_alive": False, "pid": None},
+            "repository_truth": {"valid": True},
+            "ledgers": {"ai-planner.json": {
+                "state": "failed",
+                "reason": "plan review failed: broker service invocation failed: timed out",
+                "plan_present": True,
+                "planner_completed_at": "2026-09-18T08:18:33+00:00",
+                "reviewer_last_failure": "broker service invocation failed: timed out",
+                "reviewer_last_failure_classification": None,
+                "reviewer_last_attempt_error": "broker service invocation failed: timed out",
+            }},
+        }
+        diag_plan_review = classify_evidence(
+            ev_plan_review_failed, DummyAssessment(lifecycle_state="PLAN_FAILED")
+        )
+        self.assertEqual(diag_plan_review.code, "plan_reviewer_failed")
+        self.assertFalse(diag_plan_review.owner_gate_required)
+
+        # 4. provider_or_quota_blocked
         ev_quota = {
             "process_liveness": {"process_alive": True, "pid": 1234},
             "broker": {"status": "rate_limit_exceeded (429)"},
@@ -114,6 +134,24 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         diag7 = classify_evidence(ev_unknown, assessment)
         self.assertEqual(diag7.code, "unknown")
         self.assertTrue(diag7.owner_gate_required)
+
+    def test_plan_failed_semantic_review_error_is_not_auto_recoverable(self):
+        evidence = {
+            "process_liveness": {"process_alive": False, "pid": None},
+            "repository_truth": {"valid": True},
+            "ledgers": {"ai-planner.json": {
+                "state": "failed",
+                "reason": "plan review failed: reviewer output must be one JSON object",
+                "plan_present": True,
+                "planner_completed_at": "2026-09-18T08:18:33+00:00",
+                "reviewer_last_failure": "reviewer output must be one JSON object",
+                "reviewer_last_failure_classification": None,
+                "reviewer_last_attempt_error": "reviewer output must be one JSON object",
+            }},
+        }
+        diag = classify_evidence(evidence, DummyAssessment(lifecycle_state="PLAN_FAILED"))
+        self.assertEqual(diag.code, "unknown")
+        self.assertTrue(diag.owner_gate_required)
 
     def test_evidence_hash_stability(self):
         """evidence_hash produces identical deterministic hash regardless of key order or volatile timings."""
