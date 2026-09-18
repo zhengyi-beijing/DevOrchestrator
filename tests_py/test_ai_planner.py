@@ -298,6 +298,51 @@ class FailReviewOnRemediationPort:
         )
 
 
+class ReviewerTransportTimeoutFailoverPort(FakePort):
+    def __init__(self):
+        super().__init__()
+        self.review_calls = 0
+
+    def execute(self, request):
+        if request.role == "planner":
+            return super().execute(request)
+        self.requests.append(request)
+        self.review_calls += 1
+        if self.review_calls == 1:
+            raise RuntimeError("broker service invocation failed for http://127.0.0.1:8875/api/dispatch: timed out")
+        return AIRoleResult(
+            request_id=request.request_id,
+            role_run_id=request.role_run_id,
+            status="succeeded",
+            output=json.dumps({"decision": "approve", "reason": "fallback reviewer approved"}),
+            dispatch_id="dispatch-review-fallback",
+            decision_id="decision-review-fallback",
+            execution_id="execution-review-fallback",
+            resource_context=ResourceContext("reviewer-gemini", "agy", "agy-1", "gemini-pro"),
+        )
+
+    def status(self, request_id):
+        if request_id.endswith(":reviewer"):
+            return {
+                "dispatch_id": "dispatch-review-websol",
+                "request_id": request_id,
+                "decision_id": "decision-review-websol",
+                "execution_id": "execution-review-websol",
+                "resource_id": "chatgpt/default/sol",
+                "started_at": "2026-09-18T08:42:07+00:00",
+                "finished_at": "2026-09-18T08:57:07+00:00",
+                "status": "failed",
+                "execution_status": "failed",
+                "execution_finished_at": "2026-09-18T08:57:07+00:00",
+                "execution_session_id": "session-websol",
+                "execution_error": "execution timed out after 900.0 seconds",
+                "provider": "chatgpt",
+                "account": "default",
+                "model": "sol",
+            }
+        return None
+
+
 class ReviewerResourceFailoverPort:
     def __init__(self, failures: int = 1, classification: str | None = "quota_exhausted"):
         self.requests = []
@@ -451,6 +496,33 @@ class AIPlannerTests(unittest.TestCase):
             self.assertEqual(accepted["excluded_resource_ids"], ["reviewer-r-1"])
             self.assertEqual(accepted["failover_from_resource_ids"], ["reviewer-r-1"])
 
+    def test_reviewer_transport_timeout_reconciles_terminal_failure_and_fails_over(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = ReviewerTransportTimeoutFailoverPort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {"enabled": True, "review_independence": "provider"}},
+            }
+            snapshot = {"project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P14"}}
+            plan_id, _ = coordinator.start(project, snapshot, "command-reviewer-timeout-failover")
+            row = wait_terminal(coordinator, plan_id)
+
+            self.assertEqual(row["state"], "ready", row)
+            reviews = [request for request in port.requests if request.role == "reviewer"]
+            self.assertEqual(len(reviews), 2)
+            self.assertEqual(reviews[1].excluded_resource_ids, ("chatgpt/default/sol",))
+            self.assertEqual(row["reviewer_attempt_count"], 2)
+            self.assertEqual(row["reviewer_failover_count"], 1)
+            failed, accepted = row["reviewer_attempts"]
+            self.assertEqual(failed["resource"]["resource_id"], "chatgpt/default/sol")
+            self.assertEqual(failed["failure_classification"], "provider_temporarily_unavailable")
+            self.assertIn("timed out", failed["error"])
+            self.assertEqual(accepted["resource"]["resource_id"], "reviewer-gemini")
+
     def test_reviewer_non_resource_failure_does_not_fail_over(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"
@@ -538,6 +610,11 @@ class AIPlannerTests(unittest.TestCase):
                     }
                 },
             }), encoding="utf-8")
+            (repo / "unrelated.txt").write_text("new unrelated commit\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "unrelated.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "unrelated change"], check=True)
+            current_head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+            self.assertNotEqual(head, current_head)
             port = FakePort()
             coordinator = AIPlannerCoordinator(runtime, port)
             project = {
@@ -566,6 +643,8 @@ class AIPlannerTests(unittest.TestCase):
                 "codex/default/gpt-5.6-sol",
             )
             self.assertEqual(row["planner_reused_from"], "ai_plan:failed-review")
+            self.assertEqual(row["reused_plan_source_head"], head)
+            self.assertEqual(row["reused_plan_reanchored_head"], current_head)
             self.assertEqual(row["planner_resource"]["resource_id"], "codex/default/gpt-5.6-sol")
             self.assertEqual(row["plan_review_recovery_count"], 1)
 

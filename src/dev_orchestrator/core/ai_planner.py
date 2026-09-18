@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from dev_orchestrator.ai.contracts import AIRoleRequest, ResourceContext
+from dev_orchestrator.ai.contracts import AIRoleRequest, AIRoleResult, ResourceContext
 from dev_orchestrator.ai.execution_port import AIExecutionPort
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.control.owner_store import OwnerControlStore
@@ -36,6 +36,19 @@ def _nonblank(value: Any) -> str | None:
         return None
     text = value.strip()
     return text or None
+
+
+def _classify_reconciled_dispatch_failure(error: str | None) -> str | None:
+    text = str(error or "").lower()
+    if any(token in text for token in ("session limit", "no quota", "quota exhausted")):
+        return "quota_exhausted"
+    if "rate limit" in text or "too many requests" in text:
+        return "rate_limited"
+    if any(token in text for token in ("timed out", "timeout", "temporarily unavailable", "connection reset", "connection refused")):
+        return "provider_temporarily_unavailable"
+    if "resource unavailable" in text or "no eligible resource" in text:
+        return "resource_unavailable"
+    return None
 
 
 def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
@@ -713,8 +726,8 @@ class AIPlannerCoordinator:
         truth = read_repository_truth(repo_text)
         if not truth.valid or truth.dirty:
             return True, None, "plan review retry requires a clean repository"
-        if truth.branch != source.get("branch") or truth.head != source.get("head"):
-            return True, None, "repository branch/HEAD changed since the failed plan review"
+        if truth.branch != source.get("branch"):
+            return True, None, "repository branch changed since the failed plan review"
         recovery_count = int(source.get("plan_review_recovery_count") or 0)
         if recovery_count >= int(policy["max_attempts"]):
             return True, None, f"failed plan review retry limit reached ({policy['max_attempts']})"
@@ -737,6 +750,8 @@ class AIPlannerCoordinator:
             "seed_planner_completed_at": source.get("planner_completed_at"),
             "reused_plan_from": source.get("plan_id"),
             "reused_plan_reason": source.get("reason"),
+            "reused_plan_source_head": source.get("head"),
+            "reused_plan_reanchored_head": truth.head,
             "plan_review_recovery_count": recovery_count + 1,
         }
         plan_id, reason = self._begin_lifecycle(
@@ -1064,11 +1079,56 @@ class AIPlannerCoordinator:
                 return decision, reason, review_result
             except Exception as exc:
                 review_failure = str(exc)
+                reconciled = None
+                if self.port is not None:
+                    try:
+                        reconciled = self.port.status(review_request.request_id)
+                    except Exception:
+                        reconciled = None
+                classification = None
+                if isinstance(reconciled, dict) and str(reconciled.get("status") or "") == "failed":
+                    resource_id = _nonblank(reconciled.get("resource_id"))
+                    provider = _nonblank(reconciled.get("provider"))
+                    account = _nonblank(reconciled.get("account"))
+                    model = _nonblank(reconciled.get("model"))
+                    terminal_error = _nonblank(reconciled.get("execution_error")) or review_failure
+                    classification = _classify_reconciled_dispatch_failure(terminal_error)
+                    if resource_id is not None:
+                        review_result = AIRoleResult(
+                            request_id=review_request.request_id,
+                            role_run_id=review_request.role_run_id,
+                            status="failed",
+                            error=terminal_error,
+                            dispatch_id=_nonblank(reconciled.get("dispatch_id")),
+                            decision_id=_nonblank(reconciled.get("decision_id")),
+                            execution_id=_nonblank(reconciled.get("execution_id")),
+                            session_id=_nonblank(reconciled.get("execution_session_id")),
+                            resource_context=ResourceContext(resource_id, provider, account, model),
+                            started_at=_nonblank(reconciled.get("started_at")),
+                            finished_at=_nonblank(reconciled.get("finished_at")),
+                            failure_classification=classification,
+                        )
+                        review_failure = terminal_error
                 self._record_reviewer_attempt(
                     plan_id, attempt, review_request, review_result, review_failure,
-                    classification=getattr(review_result, "failure_classification", None), round_no=round_no,
+                    classification=classification, round_no=round_no,
                 )
-                self._finish(plan_id, "failed", f"plan review failed: {exc}")
+                resource = getattr(review_result, "resource_context", None)
+                can_failover = (
+                    classification in _ROLE_RESOURCE_FAILURES
+                    and resource is not None
+                    and resource.resource_id is not None
+                )
+                if can_failover and attempt < max_attempts:
+                    failed_resource_ids.add(resource.resource_id)
+                    continue
+                if can_failover:
+                    self._finish(
+                        plan_id, "failed",
+                        "plan review failed: all eligible reviewer resources exhausted/unavailable: " + review_failure,
+                    )
+                else:
+                    self._finish(plan_id, "failed", f"plan review failed: {review_failure}")
                 return None
             finally:
                 if self.accounting is not None:
