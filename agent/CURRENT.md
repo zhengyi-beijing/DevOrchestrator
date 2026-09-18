@@ -5,33 +5,29 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P13 Transport-Independent Control Bridge** — **IMPLEMENTATION COMPLETE / TECHNICAL REVIEW PENDING**.
+Current task: **P13 Transport-Independent Control Bridge** — **TECHNICAL REVIEW REMEDIATION COMPLETE / READY FOR INDEPENDENT RE-REVIEW**.
 
 Latest continuation state (2026-09-18):
-- Implemented P13 Transport-Independent Control Bridge:
-  1. Contract: Added `docs/P13_CONTROL_BRIDGE_CONTRACT.md` establishing the authoritative P13 architecture, authority/trust boundaries, Control Adapter specifications, ExecutionTransport protocol, security models, and explicit manual-only RDC fallback exclusion.
-  2. Bounded Paginated Control Logs: Implemented `src/dev_orchestrator/control/logs.py` with secret redaction, opaque base64 cursor pagination, source availability reporting, and limit clamping. Exposed via authenticated `GET /api/v1/control/logs` on Port 8770.
-  3. Shared ControlAdapter Client: Added `src/dev_orchestrator/control/adapter.py` above P12 HTTP routes for loopback authenticated `status`, `logs`, `submit_control` (with complete `EXPECTED_IDENTITY_FIELDS` and expected-revision CAS validation), and `command_status`.
-  4. Stdio MCP Adapter MVP: Implemented `src/dev_orchestrator/control/mcp_adapter.py` (`MCPAdapter`, `run_mcp_adapter`) exposing four closed semantic tools (`devorch_status`, `devorch_logs`, `devorch_control`, `devorch_command_status`) with JSON-RPC 2.0 stdio framing.
-  5. WebBridge Adapter & Store: Implemented `src/dev_orchestrator/control/web_bridge.py` (`WebBridgeRequestStore`) with canonical request hashing, deduplication/idempotent replay, 409 conflict detection, corruption quarantine to degraded health, and freshness window enforcement.
-  6. Scoped Capabilities: Extended `src/dev_orchestrator/control/security.py` with `create_web_bridge_capability`, `validate_web_bridge_capability`, and `revoke_capability` for project- and conversation-bound tokens.
-  7. HTTP Control Surface: Wired `server.py` for `/api/v1/control/logs`, `/api/v1/control/web-bridge/requests`, `/api/v1/control/bridge/requests`, `/api/v1/control/web-bridge-capabilities`, and revocation. Port 8765 remains transport-only; Port 8770 hosts control routes.
-  8. ExecutionTransport: Implemented `src/dev_orchestrator/ai/execution_transport.py` with `@runtime_checkable class ExecutionTransport(Protocol)`, `LocalTransport` (subprocess & service calls), and `SSHTransport` (OpenSSH over Tailscale, structured stdin/stdout, path mapping, result correlation, strict fail-closed on connection/timeout error with NO RDC fallback).
-  9. Remote Helper: Implemented `src/dev_orchestrator/ai/remote_helper.py` (`execute_request`, `handle_request`, `main`) for remote OpenSSH invocation.
-  10. Runtime Config & Integration: Extended `src/dev_orchestrator/ai/aibroker_subprocess.py` and `src/dev_orchestrator/ai/runtime_config.py` to support `transport` configuration (`local` or `ssh`).
-  11. CLI Commands: Added `mcp-adapter`, `create-web-bridge-capability`, `revoke-web-bridge-capability` in `src/dev_orchestrator/cli.py`.
+- Remediated all 7 Technical Review findings for P13 Transport-Independent Control Bridge:
+  1. `LocalTransport`: Normalized `status` and `interrupt` to return `None` when payload has `{"status": "not_found"}` (consistent with HTTP 404 contract).
+  2. `SSHTransport`: Added `expected_host_identity` configuration and validation in `_run_remote_helper`; fails closed on missing or mismatched remote host identity. Decodes stdout and stderr robustly for both bytes and str.
+  3. `SSHTransport.map_path`: Added directory boundary check (`norm_target == norm_local or norm_target.startswith(norm_local + os.sep)`) and relative `..` rejection to prevent sibling directory collisions.
+  4. Cross-project isolation: Added `project_id: str | None = None` validation to `ControlAdapterClient.command_status`; passed `project_id=proj_id` in `WebBridgeRequestStore._dispatch` to prevent cross-project command snooping.
+  5. Cursor pagination stability: Upgraded `read_control_logs` to encode `last_ts` and `last_id` in cursor, filtering descending records by `< (cursor_last_ts, cursor_last_id)`, preventing skipped or duplicate items under concurrent log appends.
+  6. Software acceptance upgrade: Upgraded `tests_py/test_p13_software_acceptance.py` to advance `ControlCommandCoordinator` on the enqueued command, assert settled state (`accepted`) via MCP `devorch_command_status`, assert terminal record in `control/audit.jsonl`, execute representative roles through `LocalTransport` and `SSHTransport`, and verify transport failures fail closed with `AIBrokerInvocationError` without invoking `import_rdc_evidence`.
+  7. Hygiene and test expansion:
+     - Freshness check in `web_bridge.py` rejects future timestamps (`age < 0.0`).
+     - Replaced `sys.modules` inspection with clean `subprocess_module` parameter in `LocalTransport` and `SSHTransport`.
+     - Replaced private attribute access in `server.py` with public `security.token()`.
+     - `tests_py/test_p13_execution_transport.py`: expanded to 23 tests (host identity validation, host key failure, hostile identifiers, large/unicode stdin, timeout vs disconnect).
+     - `tests_py/test_p13_web_bridge_adapter.py`: expanded to 12 tests (restart recovery, secret redaction, dead/stale session rejection, moved binding rejection, cross-project command_status isolation, port 8765 route exclusion).
+     - `tests_py/test_p13_control_logs.py`: expanded to 9 tests (cursor stability with concurrent appends, cross-project isolation, degraded status with corrupt line count and unknown provenance preservation).
 - Verification:
-  - 43 focused P13 tests across 5 test suites passed 100%:
-    - `tests_py/test_p13_control_logs.py` (6 passed)
-    - `tests_py/test_p13_mcp_adapter.py` (16 passed)
-    - `tests_py/test_p13_web_bridge_adapter.py` (6 passed)
-    - `tests_py/test_p13_execution_transport.py` (13 passed)
-    - `tests_py/test_p13_software_acceptance.py` (2 passed)
-  - Existing execution port suite verified: `test_aibroker_execution_port.py` (24 passed).
-  - Full test suite passed: 712 passed, 45 subtests passed in 238.73s (`python -m pytest tests_py -q`).
+  - Focused P13 suites passed: 73 passed in 8.25s (`test_p13_execution_transport.py`, `test_p13_web_bridge_adapter.py`, `test_p13_control_logs.py`, `test_p13_software_acceptance.py`, `test_aibroker_execution_port.py`, `test_bridge_http.py`).
+  - Full test suite passed: 731 passed, 45 subtests passed in 237.18s (`python -m pytest tests_py -q`).
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
-  - Knowledge graph updated with `graphify update .` (3421 nodes, 9490 edges, 174 communities).
-- Immediate continuation rule: perform independent technical review of P13 changes on clean worktree.
+  - Knowledge graph updated with `graphify update .` (3441 nodes, 9569 edges, 161 communities).
+- Immediate continuation rule: perform independent technical re-review of P13 remediation on clean worktree.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.

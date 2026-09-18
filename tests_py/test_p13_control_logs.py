@@ -114,6 +114,88 @@ class P13ControlLogsUnitTests(unittest.TestCase):
             self.assertIn("corrupt_lines_skipped", res["sources"]["events"])
             self.assertEqual(res["sources"]["events"]["corrupt_lines_skipped"], 1)
 
+    def test_control_logs_cursor_stability_with_concurrent_appends(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            events_file = p / "events.jsonl"
+            # Write 10 initial records
+            with events_file.open("w", encoding="utf-8") as f:
+                for i in range(10):
+                    f.write(json.dumps({
+                        "timestamp": f"2026-09-18T10:{i:02d}:00Z",
+                        "project_id": "proj-1",
+                        "item_num": i,
+                    }) + "\n")
+
+            # Page 1: limit 5. Since logs are ordered descending, gets items 9, 8, 7, 6, 5
+            page1 = read_control_logs(td, project_id="proj-1", limit=5)
+            self.assertEqual(len(page1["items"]), 5)
+            self.assertEqual([it["data"]["item_num"] for it in page1["items"]], [9, 8, 7, 6, 5])
+            self.assertTrue(page1["has_more"])
+            self.assertIsNotNone(page1["next_cursor"])
+
+            # Concurrently append new records (items 10, 11) to the log
+            with events_file.open("a", encoding="utf-8") as f:
+                for i in (10, 11):
+                    f.write(json.dumps({
+                        "timestamp": f"2026-09-18T10:{i:02d}:00Z",
+                        "project_id": "proj-1",
+                        "item_num": i,
+                    }) + "\n")
+
+            # Page 2 using page 1 cursor: should return 4, 3, 2, 1, 0 without seeing 10, 11 or duplicating 5..9
+            page2 = read_control_logs(td, project_id="proj-1", limit=5, cursor=page1["next_cursor"])
+            self.assertEqual(len(page2["items"]), 5)
+            self.assertEqual([it["data"]["item_num"] for it in page2["items"]], [4, 3, 2, 1, 0])
+            self.assertFalse(page2["has_more"])
+            self.assertIsNone(page2["next_cursor"])
+
+    def test_control_logs_cross_project_isolation(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            events_file = p / "events.jsonl"
+            with events_file.open("w", encoding="utf-8") as f:
+                f.write(json.dumps({"timestamp": "2026-09-18T10:00:00Z", "project_id": "p1", "msg": "p1_msg"}) + "\n")
+                f.write(json.dumps({"timestamp": "2026-09-18T10:01:00Z", "project_id": "p2", "msg": "p2_msg"}) + "\n")
+                f.write(json.dumps({"timestamp": "2026-09-18T10:02:00Z", "project_id": "p1", "msg": "p1_msg2"}) + "\n")
+                f.write(json.dumps({"timestamp": "2026-09-18T10:03:00Z", "msg": "no_project"}) + "\n")
+
+            # Filter for p1: should return only p1 events
+            res_p1 = read_control_logs(td, project_id="p1")
+            self.assertEqual(len(res_p1["items"]), 2)
+            self.assertTrue(all(it["project_id"] == "p1" for it in res_p1["items"]))
+
+            # Filter for p2: should return only p2 events
+            res_p2 = read_control_logs(td, project_id="p2")
+            self.assertEqual(len(res_p2["items"]), 1)
+            self.assertEqual(res_p2["items"][0]["project_id"], "p2")
+            self.assertEqual(res_p2["items"][0]["data"]["msg"], "p2_msg")
+
+    def test_control_logs_degraded_and_unknown_provenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            events_file = p / "events.jsonl"
+            with events_file.open("w", encoding="utf-8") as f:
+                f.write("corrupted line 1\n")
+                f.write(json.dumps({
+                    "timestamp": "2026-09-18T10:00:00Z",
+                    "project_id": "p1",
+                    "provenance": "custom_worker_agent",
+                    "unknown_field_123": "preserve_me",
+                }) + "\n")
+                f.write("corrupted line 2\n")
+
+            res = read_control_logs(td)
+            self.assertEqual(len(res["items"]), 1)
+            # Check degraded status
+            self.assertEqual(res["sources"]["events"]["status"], "degraded")
+            self.assertEqual(res["sources"]["events"]["corrupt_lines_skipped"], 2)
+            self.assertTrue(len(res["warnings"]) >= 1)
+            # Check preservation of unknown provenance and fields
+            item = res["items"][0]
+            self.assertEqual(item["data"]["provenance"], "custom_worker_agent")
+            self.assertEqual(item["data"]["unknown_field_123"], "preserve_me")
+
 
 class P13ControlLogsHTTPTests(unittest.TestCase):
     def setUp(self):

@@ -855,7 +855,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             )
             client = ControlAdapterClient(
                 base_url=f"http://127.0.0.1:{self.server.server_address[1]}",
-                token=security._master,
+                token=security.token(),
                 runtime_root=runtime,
             )
             store = WebBridgeRequestStore(runtime)

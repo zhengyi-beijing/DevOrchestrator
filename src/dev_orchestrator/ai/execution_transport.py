@@ -22,13 +22,6 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 from dev_orchestrator.storage.json_store import utc_now_iso
 
 
-def _get_subprocess() -> Any:
-    mod = sys.modules.get("dev_orchestrator.ai.aibroker_subprocess")
-    if mod is not None and hasattr(mod, "subprocess"):
-        return mod.subprocess
-    return subprocess
-
-
 if TYPE_CHECKING:
     from .contracts import AIRoleRequest
     from .aibroker_subprocess import AIBrokerClientConfig
@@ -94,6 +87,9 @@ class ExecutionTransport(Protocol):
 class LocalTransport:
     """Default local subprocess/service execution transport."""
 
+    def __init__(self, *, subprocess_module: Any = None) -> None:
+        self._subprocess = subprocess_module or subprocess
+
     def dispatch(
         self,
         request: "AIRoleRequest",
@@ -126,7 +122,7 @@ class LocalTransport:
                 prompt_file = Path(temp_dir) / "prompt.txt"
                 prompt_file.write_text(request.prompt, encoding="utf-8")
                 argv = self._build_argv(request, prompt_file, config)
-                completed = _get_subprocess().run(
+                completed = self._subprocess.run(
                     argv,
                     cwd=str(config.broker_repo),
                     env=env,
@@ -178,7 +174,8 @@ class LocalTransport:
             payload = service_caller("/api/dispatches/" + urllib.parse.quote(str(request_id), safe=""), None)
             return None if payload.get("status") == "not_found" else payload
 
-        return self._reconcile_call(["dispatch-status", str(request_id)], config, env)
+        payload = self._reconcile_call(["dispatch-status", str(request_id)], config, env)
+        return None if payload.get("status") == "not_found" else payload
 
     def interrupt(
         self,
@@ -197,7 +194,8 @@ class LocalTransport:
             )
             return None if payload.get("status") == "not_found" else payload
 
-        return self._reconcile_call(["interrupt-dispatch", str(request_id), "--reason", reason], config, env)
+        payload = self._reconcile_call(["interrupt-dispatch", str(request_id), "--reason", reason], config, env)
+        return None if payload.get("status") == "not_found" else payload
 
     def _reconcile_call(
         self,
@@ -216,7 +214,7 @@ class LocalTransport:
             argv += ["--database", str(config.database_path)]
         argv += args
         try:
-            completed = _get_subprocess().run(
+            completed = self._subprocess.run(
                 argv,
                 cwd=str(config.broker_repo),
                 env=env,
@@ -316,6 +314,7 @@ class SSHTransportConfig:
     path_mapping: Mapping[str, str] = field(default_factory=dict)
     ssh_executable: str = "ssh"
     connect_timeout_seconds: float = 30.0
+    expected_host_identity: str | None = None
 
 
 class SSHTransport:
@@ -326,8 +325,9 @@ class SSHTransport:
     result-correlation checks. Prohibits arbitrary shell fragments or environment injection.
     """
 
-    def __init__(self, ssh_config: SSHTransportConfig) -> None:
+    def __init__(self, ssh_config: SSHTransportConfig, *, subprocess_module: Any = None) -> None:
         self.ssh_config = ssh_config
+        self._subprocess = subprocess_module or subprocess
 
     def map_path(self, local_path: str | Path) -> str:
         """Translate a local filesystem path to the corresponding remote path."""
@@ -341,10 +341,12 @@ class SSHTransport:
         for local_prefix, remote_prefix in sorted_mappings:
             norm_local = os.path.normcase(os.path.abspath(local_prefix))
             norm_target = os.path.normcase(os.path.abspath(p_str))
-            if norm_target.startswith(norm_local):
+            if norm_target == norm_local:
+                return remote_prefix
+            if norm_target.startswith(norm_local + os.sep):
                 relative = os.path.relpath(norm_target, norm_local)
-                if relative == ".":
-                    return remote_prefix
+                if relative.startswith(".."):
+                    continue
                 # Join with POSIX forward slashes for remote
                 return remote_prefix.rstrip("/") + "/" + relative.replace("\\", "/")
         return p_str
@@ -378,7 +380,7 @@ class SSHTransport:
         req_bytes = json.dumps(request_envelope, ensure_ascii=False).encode("utf-8")
 
         try:
-            completed = subprocess.run(
+            completed = self._subprocess.run(
                 argv,
                 input=req_bytes,
                 capture_output=True,
@@ -391,13 +393,14 @@ class SSHTransport:
             raise ExecutionTransportError(f"SSH invocation failed: {exc}") from exc
 
         if completed.returncode != 0:
-            stderr_text = completed.stderr.decode("utf-8", errors="replace").strip()
-            stdout_text = completed.stdout.decode("utf-8", errors="replace").strip()
+            stderr_text = (completed.stderr.decode("utf-8", errors="replace") if isinstance(completed.stderr, bytes) else str(completed.stderr or "")).strip()
+            stdout_text = (completed.stdout.decode("utf-8", errors="replace") if isinstance(completed.stdout, bytes) else str(completed.stdout or "")).strip()
             detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
             raise ExecutionTransportError(f"SSH transport failed (exit {completed.returncode}): {detail}")
 
         try:
-            resp = json.loads(completed.stdout.decode("utf-8"))
+            raw_stdout = completed.stdout.decode("utf-8") if isinstance(completed.stdout, bytes) else str(completed.stdout)
+            resp = json.loads(raw_stdout)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ExecutionTransportError("SSH remote helper returned invalid JSON response") from exc
 
@@ -411,6 +414,19 @@ class SSHTransport:
             raise ExecutionTransportError(
                 f"SSH result correlation mismatch: sent {sent_req_id!r}, received {returned_req_id!r}"
             )
+
+        # Host identity validation
+        returned_host_id = resp.get("host_identity")
+        if not returned_host_id or not isinstance(returned_host_id, str):
+            raise ExecutionTransportError("SSH remote helper response missing valid host_identity")
+
+        expected_host = (self.ssh_config.expected_host_identity or self.ssh_config.peer).strip().lower()
+        actual_host = returned_host_id.strip().lower()
+        if actual_host != expected_host:
+            if actual_host.split(".")[0] != expected_host.split(".")[0]:
+                raise ExecutionTransportError(
+                    f"SSH host identity mismatch: expected {expected_host!r}, received {actual_host!r}"
+                )
 
         if resp.get("status") != "success":
             err_msg = str(resp.get("error") or "remote helper execution failed")

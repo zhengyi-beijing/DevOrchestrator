@@ -202,7 +202,7 @@ class AIBrokerExecutionPort:
     ) -> None:
         self.config = config
         self.accounting = accounting
-        self.transport = transport if transport is not None else LocalTransport()
+        self.transport = transport if transport is not None else LocalTransport(subprocess_module=subprocess)
 
     def _build_env(self) -> dict[str, str]:
         env = dict(os.environ)

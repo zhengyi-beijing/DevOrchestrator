@@ -17,6 +17,7 @@ from typing import Any, Mapping
 from dev_orchestrator.accounting.events import InterProcessFileLock
 from dev_orchestrator.control.adapter import ControlAdapterClient
 from dev_orchestrator.control.command_store import safe_command_id
+from dev_orchestrator.control.logs import redact_secrets
 from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
 WEB_BRIDGE_SCHEMA_VERSION = 1
@@ -134,7 +135,7 @@ class WebBridgeRequestStore:
         age = (now_dt - dt).total_seconds()
         if age > window_seconds:
             raise WebBridgeFreshnessError(f"request timestamp expired (age {round(age, 1)}s > {window_seconds}s)")
-        if age < -30.0:
+        if age < 0.0:
             raise WebBridgeFreshnessError(f"request timestamp is in the future ({round(-age, 1)}s ahead)")
 
     def _quarantine(self, path: Path, reason: str) -> None:
@@ -219,7 +220,7 @@ class WebBridgeRequestStore:
                 command_id = payload.get("command_id")
                 if not command_id:
                     raise ValueError("command_status requires payload.command_id")
-                result = client.command_status(command_id)
+                result = client.command_status(command_id, project_id=proj_id)
             else:
                 raise ValueError(f"unsupported operation: {op!r}")
 
@@ -232,7 +233,7 @@ class WebBridgeRequestStore:
                 "project_id": proj_id,
                 "issued_at": canonical["issued_at"],
                 "processed_at": utc_now_iso(),
-                "response": result,
+                "response": redact_secrets(result),
             }
             write_json(record_path, record, indent=2)
 

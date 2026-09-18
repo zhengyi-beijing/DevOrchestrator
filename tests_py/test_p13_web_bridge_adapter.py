@@ -132,6 +132,49 @@ class WebBridgeRequestStoreUnitTests(unittest.TestCase):
             health = json.loads(health_file.read_text(encoding="utf-8"))
             self.assertTrue(health.get("degraded"))
 
+    def test_restart_recovery_and_persistence(self):
+        with tempfile.TemporaryDirectory() as td:
+            store1 = WebBridgeRequestStore(td)
+            client1 = MagicMock(spec=ControlAdapterClient)
+            client1.status.return_value = {"project_id": "p1", "recovered": True}
+
+            req = make_valid_wb_request(adapter_request_id="req-restart-1", operation="status")
+            res1 = store1.handle_request(req, client1)
+            self.assertTrue(res1["recovered"])
+            self.assertEqual(client1.status.call_count, 1)
+
+            # Fresh instance pointing to same storage simulates daemon restart
+            store2 = WebBridgeRequestStore(td)
+            client2 = MagicMock(spec=ControlAdapterClient)
+            res2 = store2.handle_request(req, client2)
+            self.assertTrue(res2["recovered"])
+            # Proves response replayed from disk without invoking client2
+            self.assertEqual(client2.status.call_count, 0)
+
+    def test_audit_and_record_secret_redaction(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = WebBridgeRequestStore(td)
+            client = MagicMock(spec=ControlAdapterClient)
+            client.status.return_value = {
+                "project_id": "p1",
+                "api_key": "secret-key-12345",
+                "auth_token": "bearer-token-abcde",
+                "password": "super-secret-password",
+            }
+
+            req = make_valid_wb_request(adapter_request_id="req-redact-1", operation="status")
+            res = store.handle_request(req, client)
+
+            # Verify persisted record has secrets redacted
+            record_path = store.requests_dir / "req-redact-1.json"
+            self.assertTrue(record_path.is_file())
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            stored_resp = record["response"]
+            self.assertEqual(stored_resp["api_key"], "[REDACTED]")
+            self.assertEqual(stored_resp["auth_token"], "[REDACTED]")
+            self.assertEqual(stored_resp["password"], "[REDACTED]")
+            self.assertNotIn("secret-key-12345", record_path.read_text(encoding="utf-8"))
+
 
 class WebBridgeHTTPIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -322,3 +365,139 @@ class WebBridgeHTTPIntegrationTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {token}", "Origin": "https://evil.com"},
         )
         self.assertEqual(status, 403)
+
+    def test_dead_or_stale_session_rejected(self):
+        cap = self.security.create_web_bridge_capability("p1", "conv-1", adapter="chatgpt_web")
+        token = cap["token"]
+
+        # Make session stale by rewinding last_seen_at
+        sessions = self.conv_store._sessions()
+        key = self.conv_store._key("chatgpt_web", "conv-1")
+        if key in sessions:
+            stale_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+            sessions[key]["last_seen_at"] = stale_time
+            if "tabs" in sessions[key] and "tab-1" in sessions[key]["tabs"]:
+                sessions[key]["tabs"]["tab-1"]["last_seen_at"] = stale_time
+            from dev_orchestrator.storage.json_store import write_json
+            write_json(self.conv_store.sessions_path, sessions, indent=2)
+
+        req = make_valid_wb_request(adapter_request_id="req-stale-sess")
+        status, _, body = self.post(
+            "/api/v1/control/web-bridge/requests",
+            req,
+            headers={"Authorization": f"Bearer {token}", "Origin": "https://chatgpt.com"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("stale", body.decode("utf-8").lower())
+
+    def test_moved_binding_rejected(self):
+        cap = self.security.create_web_bridge_capability("p1", "conv-1", adapter="chatgpt_web")
+        token = cap["token"]
+
+        # Move project binding to conv-2
+        self.conv_store.heartbeat(
+            "chatgpt_web",
+            "conv-2",
+            title="P1 Conversation 2",
+            url="https://chatgpt.com/c/conv-2",
+            tab_instance_id="tab-2",
+        )
+        self.conv_store.rebind("p1", "chatgpt_web", "conv-2")
+
+        req = make_valid_wb_request(adapter_request_id="req-moved-bind", binding_id="conv-1")
+        status, _, body = self.post(
+            "/api/v1/control/web-bridge/requests",
+            req,
+            headers={"Authorization": f"Bearer {token}", "Origin": "https://chatgpt.com"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("not bound", body.decode("utf-8").lower())
+
+    def test_cross_project_command_status_isolation(self):
+        cap = self.security.create_web_bridge_capability("p1", "conv-1", adapter="chatgpt_web")
+        token = cap["token"]
+
+        # Create two commands: one for p1, one for p2
+        store = self.server.command_store
+        exp_base = {
+            "revision": "r1", "repo_path": "repo",
+            "branch": "main", "head": "head", "dirty": False,
+            "status_hash": None, "task_id": "T", "lifecycle_state": "READY_TO_RUN",
+            "gate_id": None, "paused": False, "binding_state": None,
+            "binding_id": None, "binding_adapter": None,
+        }
+        store.submit({
+            "schema_version": 1,
+            "command_id": "cmd-for-p1",
+            "project_id": "p1",
+            "action": "pause",
+            "expected": {**exp_base, "project_id": "p1"},
+            "target": {},
+        }, source="test")
+        store.submit({
+            "schema_version": 1,
+            "command_id": "cmd-for-p2",
+            "project_id": "p2",
+            "action": "pause",
+            "expected": {**exp_base, "project_id": "p2"},
+            "target": {},
+        }, source="test")
+
+        # 1. Inspect command belonging to p1 -> succeeds
+        req_own = make_valid_wb_request(
+            adapter_request_id="req-stat-own",
+            operation="command_status",
+            payload={"command_id": "cmd-for-p1"},
+        )
+        status, _, body = self.post(
+            "/api/v1/control/web-bridge/requests",
+            req_own,
+            headers={"Authorization": f"Bearer {token}", "Origin": "https://chatgpt.com"},
+        )
+        self.assertEqual(status, 200)
+
+        # 2. Inspect command belonging to p2 -> cross-project access denied (400)
+        req_foreign = make_valid_wb_request(
+            adapter_request_id="req-stat-foreign",
+            operation="command_status",
+            payload={"command_id": "cmd-for-p2"},
+        )
+        status, _, body = self.post(
+            "/api/v1/control/web-bridge/requests",
+            req_foreign,
+            headers={"Authorization": f"Bearer {token}", "Origin": "https://chatgpt.com"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("cross-project access denied", body.decode("utf-8").lower())
+
+    def test_port_8765_bridge_server_exposes_no_lifecycle_routes(self):
+        from dev_orchestrator.bridge.server import BridgeHTTPServer
+        from dev_orchestrator.bridge.store import BrowserBridgeStore
+        bridge_store = BrowserBridgeStore(self.runtime)
+        bridge_server = BridgeHTTPServer(("127.0.0.1", 0), bridge_store)
+        bridge_thread = threading.Thread(target=bridge_server.serve_forever, daemon=True)
+        bridge_thread.start()
+        bridge_port = bridge_server.server_address[1]
+
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", bridge_port, timeout=3)
+            conn.request("POST", "/api/v1/control/commands", body=b"{}", headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 404)
+            conn.close()
+
+            conn = http.client.HTTPConnection("127.0.0.1", bridge_port, timeout=3)
+            conn.request("POST", "/api/v1/control/web-bridge/requests", body=b"{}", headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 404)
+            conn.close()
+
+            conn = http.client.HTTPConnection("127.0.0.1", bridge_port, timeout=3)
+            conn.request("POST", "/v1/control", body=b"{}", headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 404)
+            conn.close()
+        finally:
+            bridge_server.shutdown()
+            bridge_server.server_close()
+            bridge_thread.join(timeout=2)

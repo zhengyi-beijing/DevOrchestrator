@@ -152,14 +152,23 @@ def read_control_logs(
     limit = max(1, min(100, int(limit)))
 
     offset = 0
+    cursor_last_ts: str | None = None
+    cursor_last_id: str | None = None
     if cursor:
         try:
             decoded_bytes = base64.urlsafe_b64decode(cursor.strip().encode("ascii"))
             decoded = json.loads(decoded_bytes.decode("utf-8"))
-            if isinstance(decoded, dict) and isinstance(decoded.get("offset"), int):
-                offset = max(0, decoded["offset"])
+            if isinstance(decoded, dict):
+                cursor_last_ts = decoded.get("last_ts")
+                cursor_last_id = decoded.get("last_id")
+                if isinstance(decoded.get("offset"), int):
+                    offset = max(0, decoded["offset"])
+                if cursor_last_ts is not None and not isinstance(cursor_last_ts, str):
+                    cursor_last_ts = None
+                if cursor_last_id is not None and not isinstance(cursor_last_id, str):
+                    cursor_last_id = None
             else:
-                raise ValueError("cursor missing valid offset")
+                raise ValueError("cursor must be a JSON object")
         except Exception as exc:
             raise ValueError(f"invalid cursor: {exc}") from exc
 
@@ -217,12 +226,27 @@ def read_control_logs(
     filtered.sort(key=lambda r: (str(r.get("timestamp") or ""), str(r.get("entry_id") or "")), reverse=True)
 
     total_matched = len(filtered)
-    page_records = filtered[offset: offset + limit]
+    if cursor_last_ts is not None and cursor_last_id is not None:
+        target_tuple = (str(cursor_last_ts), str(cursor_last_id))
+        subsequent = [
+            r for r in filtered
+            if (str(r.get("timestamp") or ""), str(r.get("entry_id") or "")) < target_tuple
+        ]
+        page_records = subsequent[:limit]
+        has_more = len(subsequent) > len(page_records)
+    else:
+        page_records = filtered[offset: offset + limit]
+        has_more = (offset + limit) < total_matched
 
-    has_more = (offset + limit) < total_matched
     next_cursor = None
-    if has_more:
-        next_payload = {"offset": offset + limit, "project_id": project_id}
+    if has_more and page_records:
+        last_rec = page_records[-1]
+        next_payload = {
+            "offset": offset + limit,
+            "last_ts": str(last_rec.get("timestamp") or ""),
+            "last_id": str(last_rec.get("entry_id") or ""),
+            "project_id": project_id,
+        }
         next_cursor = base64.urlsafe_b64encode(json.dumps(next_payload).encode("utf-8")).decode("ascii")
 
     envelope = {

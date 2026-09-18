@@ -223,9 +223,17 @@ class ControlAdapterClient:
         # 4. Enqueue through POST /api/v1/control/commands
         return self._request("POST", "/api/v1/control/commands", body=body)
 
-    def command_status(self, command_id: str) -> dict[str, Any]:
+    def command_status(self, command_id: str, project_id: str | None = None) -> dict[str, Any]:
         """Check status and outcome of a submitted lifecycle control command."""
         safe_id = safe_command_id(command_id)
         if safe_id is None:
             raise ValueError(f"invalid command_id: {command_id!r}")
-        return self._request("GET", f"/api/v1/control/commands/{safe_id}")
+        result = self._request("GET", f"/api/v1/control/commands/{safe_id}")
+        if project_id is not None:
+            cmd_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            cmd_project = cmd_data.get("project_id")
+            if cmd_project and cmd_project != project_id.strip():
+                raise ControlAdapterError(
+                    f"cross-project access denied: command {command_id!r} belongs to project {cmd_project!r}, not {project_id!r}"
+                )
+        return result

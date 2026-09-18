@@ -43,7 +43,6 @@ class P13SoftwareAcceptanceTests(unittest.TestCase):
         (self.runtime / "projects").mkdir()
         (self.runtime / "history").mkdir()
         self.config = self.runtime / "projects.json"
-        write_config(self.config, ROOT)
 
         # Setup test project
         self.project_id = "test-p13"
@@ -57,6 +56,7 @@ class P13SoftwareAcceptanceTests(unittest.TestCase):
             "git": {"branch": "main", "head": "abc1234", "dirty": False},
             "telemetry": {"task_id": "P13-TASK"},
         }
+        self.config.write_text(json.dumps({"projects": [project]}), encoding="utf-8")
         (self.runtime / "projects" / f"{self.project_id}.json").write_text(
             json.dumps(project), encoding="utf-8"
         )
@@ -194,7 +194,46 @@ class P13SoftwareAcceptanceTests(unittest.TestCase):
         text = output["result"]["content"][0]["text"]
         self.assertIn("pending", text)
 
-        # 5. Write an event record with secrets into events.jsonl
+        # 5. Advance ControlCommandCoordinator to settle the pending command
+        from dev_orchestrator.core.control_commands import ControlCommandCoordinator
+        from tests_py.test_control_commands import FakeExecutor
+
+        summary = json.loads((self.runtime / "summary.json").read_text(encoding="utf-8"))
+        coordinator = ControlCommandCoordinator(self.runtime)
+        outcomes = coordinator.advance(self.config, summary, FakeExecutor())
+        self.assertTrue(any(o.get("command_id") == "cmd-wb-1" for o in outcomes))
+
+        # Check command status via MCP again -> now settled / accepted
+        in_stream2 = io.StringIO(
+            json.dumps({
+                "jsonrpc": "2.0",
+                "id": "mcp-cmd-status-settled",
+                "method": "tools/call",
+                "params": {
+                    "name": "devorch_command_status",
+                    "arguments": {"command_id": "cmd-wb-1"},
+                },
+            }) + "\n"
+        )
+        out_stream2 = io.StringIO()
+        mcp2 = MCPAdapter(client, stdin=in_stream2, stdout=out_stream2)
+        mcp2.run()
+
+        output2 = json.loads(out_stream2.getvalue().strip())
+        self.assertEqual(output2["id"], "mcp-cmd-status-settled")
+        self.assertFalse(output2["result"]["isError"])
+        text2 = output2["result"]["content"][0]["text"]
+        self.assertIn("accepted", text2)
+
+        # Assert terminal record in control/audit.jsonl
+        audit_path = self.runtime / "control" / "audit.jsonl"
+        self.assertTrue(audit_path.is_file())
+        audit_lines = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        settled_audits = [a for a in audit_lines if a.get("event") == "command_settled" and a.get("command_id") == "cmd-wb-1"]
+        self.assertEqual(len(settled_audits), 1)
+        self.assertEqual(settled_audits[0]["state"], "accepted")
+
+        # 6. Write an event record with secrets into events.jsonl
         events_path = self.runtime / "history" / "events.jsonl"
         with events_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps({
@@ -206,7 +245,7 @@ class P13SoftwareAcceptanceTests(unittest.TestCase):
                 "message": "Enqueued pause control command",
             }) + "\n")
 
-        # 6. Read logs via GET /api/v1/control/logs
+        # 7. Read logs via GET /api/v1/control/logs
         log_code, _, log_body = self.get(
             f"/api/v1/control/logs?project_id={self.project_id}",
             headers={"Authorization": f"Bearer {self.master_token}"},
@@ -222,7 +261,7 @@ class P13SoftwareAcceptanceTests(unittest.TestCase):
         self.assertNotIn("secret-token-12345", log_body.decode("utf-8"))
 
     def test_transport_failure_fails_closed_without_rdc_fallback(self):
-        """Acceptance: Verification that ExecutionTransport failures NEVER trigger RDC fallback."""
+        """Acceptance: Verification of representative Local/SSH execution and fail-closed without RDC fallback."""
         cfg = AIBrokerClientConfig(
             broker_repo=ROOT,
             config_path=ROOT / "config.json",
@@ -236,25 +275,78 @@ class P13SoftwareAcceptanceTests(unittest.TestCase):
             request_id="req-accept-1",
         )
 
-        ssh_cfg = SSHTransportConfig(peer="100.64.0.99", connect_timeout_seconds=5.0)
-        ssh_transport = SSHTransport(ssh_cfg)
-        port = AIBrokerExecutionPort(config=cfg, transport=ssh_transport)
+        # 1. Representative role execution via LocalTransport
+        local_port = AIBrokerExecutionPort(config=cfg, transport=LocalTransport(subprocess_module=subprocess))
+        local_success = subprocess.CompletedProcess(
+            args=["python"],
+            returncode=0,
+            stdout=json.dumps({
+                "request_id": req.request_id,
+                "status": "succeeded",
+                "output": "planner plan generated via local transport",
+            }),
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=local_success):
+            res_local = local_port.execute(req)
+            self.assertEqual(res_local.status, "succeeded")
+            self.assertEqual(res_local.output, "planner plan generated via local transport")
 
-        # Mock SSH failure
-        mock_completed = subprocess.CompletedProcess(
+        # 2. Representative role execution via SSHTransport
+        ssh_cfg = SSHTransportConfig(
+            peer="100.64.0.50",
+            expected_host_identity="100.64.0.50",
+            connect_timeout_seconds=5.0,
+        )
+        ssh_port = AIBrokerExecutionPort(config=cfg, transport=SSHTransport(ssh_cfg, subprocess_module=subprocess))
+        ssh_success = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps({
+                "request_id": req.request_id,
+                "status": "success",
+                "host_identity": "100.64.0.50",
+                "payload": {
+                    "request_id": req.request_id,
+                    "status": "succeeded",
+                    "output": "reviewer feedback via ssh transport",
+                },
+            }),
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=ssh_success):
+            res_ssh = ssh_port.execute(req)
+            self.assertEqual(res_ssh.status, "succeeded")
+            self.assertEqual(res_ssh.output, "reviewer feedback via ssh transport")
+
+        # 3. Failures fail closed without RDC fallback
+        rdc_mock = MagicMock()
+        ssh_failure = subprocess.CompletedProcess(
             args=["ssh"],
             returncode=255,
             stdout=b"",
-            stderr=b"ssh: connect to host 100.64.0.99: No route to host",
+            stderr=b"ssh: connect to host 100.64.0.50: No route to host",
+        )
+        local_failure = subprocess.CompletedProcess(
+            args=["python"],
+            returncode=1,
+            stdout=b"",
+            stderr=b"fatal local execution crash",
         )
 
-        # Mock RDC / secondary fallback detector to prove it is NEVER invoked
-        rdc_mock = MagicMock()
-
-        with patch("subprocess.run", return_value=mock_completed), patch.dict(
+        with patch("dev_orchestrator.accounting.evidence.import_rdc_evidence", rdc_mock), patch.dict(
             "os.environ", {"DEVORCH_RDC_FALLBACK_CALLED": "0"}
         ):
-            with self.assertRaises(AIBrokerInvocationError):
-                port.execute(req)
-            # Proves no secondary fallback hook or RDC was called
+            # SSH failure fails closed
+            with patch("subprocess.run", return_value=ssh_failure):
+                with self.assertRaises(AIBrokerInvocationError) as ctx_ssh:
+                    ssh_port.execute(req)
+                self.assertIn("failed", str(ctx_ssh.exception).lower())
+            rdc_mock.assert_not_called()
+
+            # Local failure fails closed
+            with patch("subprocess.run", return_value=local_failure):
+                with self.assertRaises(AIBrokerInvocationError) as ctx_local:
+                    local_port.execute(req)
+                self.assertIn("failed", str(ctx_local.exception).lower())
             rdc_mock.assert_not_called()

@@ -75,6 +75,8 @@ def load_aibroker_execution_port(
             path_mapping = ssh_cfg_raw.get("path_mapping") or raw.get("path_mapping") or {}
             if not isinstance(path_mapping, dict):
                 raise ValueError("path_mapping must be an object")
+            expected_host_raw = ssh_cfg_raw.get("expected_host_identity") or raw.get("ssh_expected_host_identity")
+            expected_host = expected_host_raw.strip() if isinstance(expected_host_raw, str) and expected_host_raw.strip() else None
             ssh_cfg = SSHTransportConfig(
                 peer=peer.strip(),
                 user=user.strip() if isinstance(user, str) and user.strip() else None,
@@ -84,6 +86,7 @@ def load_aibroker_execution_port(
                 strict_host_key_checking=strict_host,
                 remote_python=remote_py,
                 path_mapping=path_mapping,
+                expected_host_identity=expected_host,
             )
             transport = SSHTransport(ssh_cfg)
         else:

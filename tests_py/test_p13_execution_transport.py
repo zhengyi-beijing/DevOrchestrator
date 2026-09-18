@@ -90,6 +90,58 @@ class P13LocalTransportTests(unittest.TestCase):
             self.assertIn("exit 1", str(ctx.exception))
             self.assertIn("Subprocess exploded", str(ctx.exception))
 
+    def test_status_subprocess_not_found_returns_none(self):
+        transport = LocalTransport()
+        cfg = make_dummy_config()
+        mock_completed = subprocess.CompletedProcess(
+            args=["python"],
+            returncode=0,
+            stdout=json.dumps({"status": "not_found"}),
+            stderr="",
+        )
+        with patch("dev_orchestrator.ai.execution_transport.subprocess.run", return_value=mock_completed):
+            result = transport.status("req-404", cfg, {})
+            self.assertIsNone(result)
+
+    def test_status_subprocess_found_returns_payload(self):
+        transport = LocalTransport()
+        cfg = make_dummy_config()
+        mock_completed = subprocess.CompletedProcess(
+            args=["python"],
+            returncode=0,
+            stdout=json.dumps({"status": "succeeded", "request_id": "req-1"}),
+            stderr="",
+        )
+        with patch("dev_orchestrator.ai.execution_transport.subprocess.run", return_value=mock_completed):
+            result = transport.status("req-1", cfg, {})
+            self.assertEqual(result, {"status": "succeeded", "request_id": "req-1"})
+
+    def test_interrupt_subprocess_not_found_returns_none(self):
+        transport = LocalTransport()
+        cfg = make_dummy_config()
+        mock_completed = subprocess.CompletedProcess(
+            args=["python"],
+            returncode=0,
+            stdout=json.dumps({"status": "not_found"}),
+            stderr="",
+        )
+        with patch("dev_orchestrator.ai.execution_transport.subprocess.run", return_value=mock_completed):
+            result = transport.interrupt("req-404", "stop", cfg, {})
+            self.assertIsNone(result)
+
+    def test_interrupt_subprocess_found_returns_payload(self):
+        transport = LocalTransport()
+        cfg = make_dummy_config()
+        mock_completed = subprocess.CompletedProcess(
+            args=["python"],
+            returncode=0,
+            stdout=json.dumps({"status": "interrupted", "request_id": "req-1"}),
+            stderr="",
+        )
+        with patch("dev_orchestrator.ai.execution_transport.subprocess.run", return_value=mock_completed):
+            result = transport.interrupt("req-1", "stop", cfg, {})
+            self.assertEqual(result, {"status": "interrupted", "request_id": "req-1"})
+
 
 class P13SSHTransportTests(unittest.TestCase):
     def test_satisfies_protocol(self):
@@ -113,6 +165,8 @@ class P13SSHTransportTests(unittest.TestCase):
         self.assertEqual(transport.map_path(sub), "/home/ubuntu/repo/src/file.py")
         # Unmapped path unchanged
         self.assertEqual(transport.map_path("/unmapped/path"), "/unmapped/path")
+        # Sibling directory sharing name prefix does not match
+        self.assertEqual(transport.map_path(str(ROOT) + "-dev"), str(ROOT) + "-dev")
 
     def test_build_ssh_argv(self):
         cfg = SSHTransportConfig(
@@ -151,6 +205,7 @@ class P13SSHTransportTests(unittest.TestCase):
         helper_response = {
             "status": "success",
             "request_id": "req-corr-1",
+            "host_identity": "100.64.0.10",
             "payload": {
                 "success": True,
                 "execution_id": "remote-exec-1",
@@ -188,6 +243,7 @@ class P13SSHTransportTests(unittest.TestCase):
         helper_response = {
             "status": "success",
             "request_id": "req-different",
+            "host_identity": "100.64.0.10",
             "payload": {"success": True},
         }
 
@@ -220,6 +276,230 @@ class P13SSHTransportTests(unittest.TestCase):
             with self.assertRaises(ExecutionTransportError) as ctx:
                 transport.dispatch(req, b_cfg, {}, 60.0)
             self.assertIn("Connection timed out", str(ctx.exception))
+
+    def test_host_identity_validation_mismatch_and_missing(self):
+        cfg = SSHTransportConfig(peer="100.64.0.10")
+        transport = SSHTransport(cfg)
+        req = make_dummy_request("req-host-1")
+        b_cfg = make_dummy_config()
+
+        # 1. Missing host_identity fails closed
+        resp_no_host = {
+            "status": "success",
+            "request_id": "req-host-1",
+            "payload": {"success": True},
+        }
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(resp_no_host).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=mock_completed):
+            with self.assertRaises(ExecutionTransportError) as ctx:
+                transport.dispatch(req, b_cfg, {}, 60.0)
+            self.assertIn("missing valid host_identity", str(ctx.exception))
+
+        # 2. Mismatched host_identity fails closed
+        resp_bad_host = {
+            "status": "success",
+            "request_id": "req-host-1",
+            "host_identity": "rogue-host",
+            "payload": {"success": True},
+        }
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(resp_bad_host).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=mock_completed):
+            with self.assertRaises(ExecutionTransportError) as ctx:
+                transport.dispatch(req, b_cfg, {}, 60.0)
+            self.assertIn("host identity mismatch", str(ctx.exception))
+
+        # 3. Expected host identity override config
+        cfg_custom = SSHTransportConfig(peer="100.64.0.10", expected_host_identity="worker-box")
+        transport_custom = SSHTransport(cfg_custom)
+        resp_good_custom = {
+            "status": "success",
+            "request_id": "req-host-1",
+            "host_identity": "worker-box",
+            "payload": {"success": True},
+        }
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(resp_good_custom).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=mock_completed):
+            res = transport_custom.dispatch(req, b_cfg, {}, 60.0)
+            self.assertEqual(res.host_identity, "worker-box")
+
+    def test_host_key_rejection_fails_closed(self):
+        cfg = SSHTransportConfig(peer="100.64.0.10")
+        transport = SSHTransport(cfg)
+        req = make_dummy_request("req-hk-fail")
+        b_cfg = make_dummy_config()
+
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=255,
+            stdout=b"",
+            stderr=b"Host key verification failed.",
+        )
+        with patch("subprocess.run", return_value=mock_completed):
+            with self.assertRaises(ExecutionTransportError) as ctx:
+                transport.dispatch(req, b_cfg, {}, 60.0)
+            self.assertIn("Host key verification failed", str(ctx.exception))
+
+    def test_hostile_identifiers_cleanly_serialized_in_json(self):
+        cfg = SSHTransportConfig(peer="100.64.0.10")
+        transport = SSHTransport(cfg)
+        req = AIRoleRequest(
+            role="planner; rm -rf / ; $(whoami)",
+            prompt="do planning",
+            working_directory=Path(ROOT),
+            task_run_id="<script>alert('xss')</script>\n\nDROP TABLE",
+            project_id="P1' OR '1'='1",
+            request_id="req-hostile; rm -rf / ; $(whoami)",
+        )
+        b_cfg = make_dummy_config()
+
+        helper_response = {
+            "status": "success",
+            "request_id": req.request_id,
+            "host_identity": "100.64.0.10",
+            "payload": {"success": True},
+        }
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(helper_response).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=mock_completed) as mock_run:
+            transport.dispatch(req, b_cfg, {}, 60.0)
+            mock_run.assert_called_once()
+            _, kwargs = mock_run.call_args
+            sent_data = json.loads(kwargs["input"].decode("utf-8"))
+            self.assertEqual(sent_data["request"]["role"], "planner; rm -rf / ; $(whoami)")
+            self.assertEqual(sent_data["request_id"], req.request_id)
+            self.assertEqual(sent_data["request"]["project_id"], "P1' OR '1'='1")
+
+    def test_large_and_unicode_stdin_payloads(self):
+        cfg = SSHTransportConfig(peer="100.64.0.10")
+        transport = SSHTransport(cfg)
+        unicode_prompt = "你好，世界！🚀🌟 " * 5000  # ~120KB unicode string
+        req = AIRoleRequest(
+            role="planner",
+            prompt=unicode_prompt,
+            working_directory=Path(ROOT),
+            task_run_id="T1",
+            project_id="P1",
+            request_id="req-unicode-large",
+        )
+        b_cfg = make_dummy_config()
+
+        helper_response = {
+            "status": "success",
+            "request_id": "req-unicode-large",
+            "host_identity": "100.64.0.10",
+            "payload": {"success": True, "output": "processed large unicode"},
+        }
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(helper_response).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=mock_completed) as mock_run:
+            result = transport.dispatch(req, b_cfg, {}, 60.0)
+            self.assertEqual(result.payload["output"], "processed large unicode")
+            _, kwargs = mock_run.call_args
+            sent_data = json.loads(kwargs["input"].decode("utf-8"))
+            self.assertEqual(sent_data["request"]["prompt"], unicode_prompt)
+
+    def test_timeout_vs_disconnect_distinction(self):
+        cfg = SSHTransportConfig(peer="100.64.0.10")
+        transport = SSHTransport(cfg)
+        req = make_dummy_request("req-t-vs-d")
+        b_cfg = make_dummy_config()
+
+        # 1. TimeoutExpired raises error with "timed out"
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["ssh"], timeout=30.0)):
+            with self.assertRaises(ExecutionTransportError) as ctx:
+                transport.dispatch(req, b_cfg, {}, 30.0)
+            self.assertIn("timed out", str(ctx.exception).lower())
+
+        # 2. Connection reset / disconnect raises error with "failed"
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=255,
+            stdout=b"",
+            stderr=b"ssh: Connection reset by peer",
+        )
+        with patch("subprocess.run", return_value=mock_completed):
+            with self.assertRaises(ExecutionTransportError) as ctx:
+                transport.dispatch(req, b_cfg, {}, 30.0)
+            self.assertIn("failed", str(ctx.exception).lower())
+            self.assertIn("Connection reset by peer", str(ctx.exception))
+
+    def test_ssh_status_and_interrupt(self):
+        cfg = SSHTransportConfig(peer="100.64.0.10")
+        transport = SSHTransport(cfg)
+        b_cfg = make_dummy_config()
+
+        # 1. Status found
+        resp_found = {
+            "status": "success",
+            "request_id": "req-stat-1",
+            "host_identity": "100.64.0.10",
+            "payload": {"status": "succeeded", "execution_id": "e1"},
+        }
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout=json.dumps(resp_found).encode("utf-8"), stderr=b""
+        )
+        with patch("subprocess.run", return_value=mock_completed):
+            st = transport.status("req-stat-1", b_cfg, {})
+            self.assertEqual(st, {"status": "succeeded", "execution_id": "e1"})
+
+        # 2. Status not_found returns None
+        resp_not_found = {
+            "status": "success",
+            "request_id": "req-stat-404",
+            "host_identity": "100.64.0.10",
+            "payload": {"status": "not_found"},
+        }
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout=json.dumps(resp_not_found).encode("utf-8"), stderr=b""
+        )
+        with patch("subprocess.run", return_value=mock_completed):
+            st = transport.status("req-stat-404", b_cfg, {})
+            self.assertIsNone(st)
+
+        # 3. Interrupt found
+        resp_interrupted = {
+            "status": "success",
+            "request_id": "req-int-1",
+            "host_identity": "100.64.0.10",
+            "payload": {"status": "interrupted"},
+        }
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout=json.dumps(resp_interrupted).encode("utf-8"), stderr=b""
+        )
+        with patch("subprocess.run", return_value=mock_completed):
+            res = transport.interrupt("req-int-1", "stop requested", b_cfg, {})
+            self.assertEqual(res, {"status": "interrupted"})
+
+        # 4. Interrupt not_found returns None
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout=json.dumps(resp_not_found).encode("utf-8"), stderr=b""
+        )
+        with patch("subprocess.run", return_value=mock_completed):
+            res = transport.interrupt("req-stat-404", "stop requested", b_cfg, {})
+            self.assertIsNone(res)
 
 
 class P13RemoteHelperTests(unittest.TestCase):
