@@ -181,7 +181,12 @@ class ControlSecurity:
         )
 
     def revoke_pairing(self, pairing_id: str) -> dict[str, Any]:
-        return self.revoke_capability(pairing_id)
+        res = self.revoke_capability(pairing_id)
+        return {
+            "pairing_id": pairing_id,
+            "capability_id": res.get("capability_id", pairing_id),
+            "revoked": bool(res.get("revoked", True)),
+        }
 
     def create_web_bridge_capability(
         self,
@@ -297,4 +302,4 @@ class ControlSecurity:
             if isinstance(capability, dict):
                 capability.update({"revoked": True, "revoked_at": now})
             write_json(self.pairings_path, data, indent=2)
-            return {"capability_id": capability_id, "revoked": True}
+            return {"capability_id": capability_id, "pairing_id": capability_id, "revoked": True}

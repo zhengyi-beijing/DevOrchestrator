@@ -223,10 +223,14 @@ class P12StoreTests(unittest.TestCase):
             self.assertTrue(security.adapter_authorized("Bearer " + redeemed["capability"]))
             with self.assertRaises(ValueError):
                 security.redeem_pairing(pairing["pairing_id"], pairing["code"])
-            security.revoke_pairing(pairing["pairing_id"])
+            rev_res = security.revoke_pairing(pairing["pairing_id"])
+            self.assertEqual(rev_res["pairing_id"], pairing["pairing_id"])
+            self.assertTrue(rev_res["revoked"])
             self.assertFalse(security.adapter_authorized("Bearer " + redeemed["capability"]))
             unused = security.create_pairing()
-            self.assertTrue(security.revoke_pairing(unused["pairing_id"])["revoked"])
+            unused_rev = security.revoke_pairing(unused["pairing_id"])
+            self.assertEqual(unused_rev["pairing_id"], unused["pairing_id"])
+            self.assertTrue(unused_rev["revoked"])
             with self.assertRaisesRegex(ValueError, "used"):
                 security.redeem_pairing(unused["pairing_id"], unused["code"])
             expired = security.create_pairing()

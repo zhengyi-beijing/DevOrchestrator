@@ -616,3 +616,18 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (3444 nodes, 9574 edges, 171 communities).
   - Canonical worktree clean and ready for independent technical re-review.
+
+## P13 Technical Review Remediation Round 3 (2026-09-18)
+
+- Remediated all Technical Review findings from `ai_review:p13-generated-only-recovery-ff547d4`:
+  1. `SSHTransport.dispatch` request_id correlation: Added `"request_id": request.request_id` and `"probe": config.probe_before_dispatch` into `envelope["request"]` using `LocalTransport._request_payload(request, config)` for complete parity; ensured `remote_helper.execute_request` injects `req_id` into `role_req` if missing. Prevents correlation mismatch in `AIBrokerExecutionPort._result_from_payload`.
+  2. Broker CLI argv contract alignment: Updated `remote_helper.execute_request` to strictly conform to `LocalTransport._build_argv` and the legacy broker CLI contract: uses `--cwd` (not `--working-directory`), `--timeout` (not `--timeout-seconds`), `--excluded-resource-id` (not `--exclude-resource-id`), passes `--probe`, unpacks and passes `--previous-*` resource-context flags (`--previous-resource-id`, `--previous-provider`, `--previous-account`, `--previous-model`), and omits `--project-id`.
+  3. Child environment and error handling: Configured `PYTHONUTF8="1"`, `PYTHONIOENCODING="utf-8"`, and `PYTHONPATH` with `broker_repo/src` across dispatch, status, and interrupt subprocesses in `remote_helper.py`. Validates `returncode in (0, 1)` and catches `json.JSONDecodeError` to emit correlated `RuntimeError` with exit code and stdout/stderr detail instead of opaque JSONDecodeErrors.
+  4. Hardened remote helper service client: Hardened `remote_helper._service_call` to enforce loopback HTTP URL validation (`validate_loopback_url`), URL sanitization (`sanitize_url`), redirect rejection via `_SERVICE_OPENER` (`_NoRedirectHandler`), forward token via `X-AIResourceBroker-Token` (not bearer `Authorization`), redact secret tokens in diagnostics and connection errors, and return `{"status": "not_found"}` on 404s, mirroring P12.6 hardening.
+  5. Preserved pairing revocation contract: Updated `ControlSecurity.revoke_pairing` and `revoke_capability` to preserve the `pairing_id` return key alongside `capability_id` and `revoked: True`.
+- Verification:
+  - Focused P13 suites passed: 92 tests passed across 6 suites (10 control_logs, 28 execution_transport, 16 mcp_adapter, 2 software_acceptance, 12 web_bridge_adapter, 24 aibroker_execution_port).
+  - Full test suite passed: 737 passed, 45 subtests passed in 239.26s (`python -m pytest tests_py -q`).
+  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3459 nodes, 9608 edges, 171 communities).
+  - Canonical worktree clean and ready for independent technical re-review.

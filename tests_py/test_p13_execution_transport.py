@@ -3,6 +3,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -16,7 +17,7 @@ from dev_orchestrator.ai.execution_transport import (
     SSHTransport,
     SSHTransportConfig,
 )
-from dev_orchestrator.ai.remote_helper import handle_request
+from dev_orchestrator.ai.remote_helper import execute_request, handle_request
 from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -250,6 +251,43 @@ class P13SSHTransportTests(unittest.TestCase):
             sent_data = json.loads(kwargs["input"].decode("utf-8"))
             self.assertEqual(sent_data["operation"], "dispatch")
             self.assertEqual(sent_data["request_id"], "req-corr-1")
+            self.assertEqual(sent_data["request"]["request_id"], "req-corr-1")
+
+    def test_ssh_dispatch_integrates_with_aibroker_execution_port(self):
+        cfg = SSHTransportConfig(peer="100.64.0.10")
+        transport = SSHTransport(cfg)
+        b_cfg = make_dummy_config()
+        port = AIBrokerExecutionPort(b_cfg, transport=transport)
+        req = make_dummy_request("req-port-corr-1")
+
+        helper_response = {
+            "status": "success",
+            "request_id": "req-port-corr-1",
+            "host_identity": "100.64.0.10",
+            "payload": {
+                "request_id": "req-port-corr-1",
+                "status": "succeeded",
+                "output": "remote model completed successfully",
+            },
+        }
+        mock_completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(helper_response).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=mock_completed) as mock_run:
+            result = port.execute(req)
+            self.assertEqual(result.request_id, "req-port-corr-1")
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.output, "remote model completed successfully")
+
+            # Verify request_id was sent in both envelope and role_payload
+            mock_run.assert_called_once()
+            _, kwargs = mock_run.call_args
+            sent_data = json.loads(kwargs["input"].decode("utf-8"))
+            self.assertEqual(sent_data["request_id"], "req-port-corr-1")
+            self.assertEqual(sent_data["request"]["request_id"], "req-port-corr-1")
 
     def test_dispatch_correlation_mismatch_fails_closed(self):
         cfg = SSHTransportConfig(peer="100.64.0.10")
@@ -618,6 +656,278 @@ class P13RemoteHelperTests(unittest.TestCase):
         self.assertEqual(resp["status"], "error")
         self.assertEqual(resp["request_id"], "req-bad")
         self.assertIn("unsupported", resp["error"].lower())
+
+    def test_execute_request_dispatch_cli_argv_contract_and_env(self):
+        request_envelope = {
+            "operation": "dispatch",
+            "request_id": "req-dispatch-contract-1",
+            "request": {
+                "project_id": "my-project",
+                "role": "worker",
+                "prompt": "implement task P13",
+                "working_directory": "/mapped/workdir",
+                "timeout_seconds": 150.0,
+                "quality": "high",
+                "independence": "isolated",
+                "excluded_resource_ids": ["res-ex-1", "res-ex-2"],
+                "previous_resource_context": {
+                    "resource_id": "res-prev-id",
+                    "provider": "anthropic",
+                    "account": "default",
+                    "model": "claude-sonnet-4.6",
+                },
+            },
+            "probe": True,
+            "broker_repo": "/opt/broker",
+            "config_path": "/opt/broker/config.yaml",
+            "database_path": "/opt/broker/db.sqlite",
+        }
+
+        captured = {}
+        def mock_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            prompt_idx = argv.index("--prompt-file") + 1
+            captured["prompt_content"] = Path(argv[prompt_idx]).read_text(encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout=json.dumps({"request_id": "req-dispatch-contract-1", "status": "succeeded"}),
+                stderr="",
+            )
+
+        with patch("dev_orchestrator.ai.remote_helper.subprocess.run", side_effect=mock_run):
+            result = execute_request(request_envelope)
+            self.assertEqual(result["request_id"], "req-dispatch-contract-1")
+            self.assertEqual(result["status"], "succeeded")
+
+            argv = captured["argv"]
+            kwargs = captured["kwargs"]
+            self.assertEqual(kwargs["cwd"], "/opt/broker")
+            env = kwargs["env"]
+            self.assertEqual(env["PYTHONUTF8"], "1")
+            self.assertEqual(env["PYTHONIOENCODING"], "utf-8")
+            self.assertIn(str(Path("/opt/broker/src")), env["PYTHONPATH"])
+
+            # Verify prompt file was populated
+            self.assertEqual(captured["prompt_content"], "implement task P13")
+
+            # Contract checks: LocalTransport contract flags
+            self.assertEqual(argv[1:4], ["-m", "ai_resource_broker.cli", "--config"])
+            self.assertEqual(argv[4], "/opt/broker/config.yaml")
+            self.assertEqual(argv[5:7], ["--database", "/opt/broker/db.sqlite"])
+            self.assertEqual(argv[7], "dispatch")
+
+            self.assertIn("--role", argv)
+            self.assertEqual(argv[argv.index("--role") + 1], "worker")
+            self.assertIn("--quality", argv)
+            self.assertEqual(argv[argv.index("--quality") + 1], "high")
+            self.assertIn("--independence", argv)
+            self.assertEqual(argv[argv.index("--independence") + 1], "isolated")
+            self.assertIn("--request-id", argv)
+            self.assertEqual(argv[argv.index("--request-id") + 1], "req-dispatch-contract-1")
+            self.assertIn("--cwd", argv)
+            self.assertEqual(argv[argv.index("--cwd") + 1], "/mapped/workdir")
+            self.assertIn("--timeout", argv)
+            self.assertEqual(argv[argv.index("--timeout") + 1], "150.0")
+            self.assertIn("--probe", argv)
+
+            # Excluded resources
+            excluded = [argv[i + 1] for i, flag in enumerate(argv) if flag == "--excluded-resource-id"]
+            self.assertEqual(excluded, ["res-ex-1", "res-ex-2"])
+
+            # Previous resource context
+            self.assertEqual(argv[argv.index("--previous-resource-id") + 1], "res-prev-id")
+            self.assertEqual(argv[argv.index("--previous-provider") + 1], "anthropic")
+            self.assertEqual(argv[argv.index("--previous-account") + 1], "default")
+            self.assertEqual(argv[argv.index("--previous-model") + 1], "claude-sonnet-4.6")
+
+            # Prohibited contradictory flags
+            self.assertNotIn("--project-id", argv)
+            self.assertNotIn("--working-directory", argv)
+            self.assertNotIn("--timeout-seconds", argv)
+            self.assertNotIn("--exclude-resource-id", argv)
+
+    def test_execute_request_dispatch_cli_errors_fail_closed(self):
+        request_envelope = {
+            "operation": "dispatch",
+            "request_id": "req-dispatch-fail",
+            "request": {"role": "planner", "prompt": "test"},
+            "broker_repo": "/opt/broker",
+            "config_path": "/opt/broker/config.yaml",
+        }
+
+        # Non-zero exit code (e.g. 2)
+        mock_exit2 = subprocess.CompletedProcess(
+            args=["python"],
+            returncode=2,
+            stdout="",
+            stderr="Unrecognized argument --foo",
+        )
+        with patch("dev_orchestrator.ai.remote_helper.subprocess.run", return_value=mock_exit2):
+            with self.assertRaises(RuntimeError) as ctx:
+                execute_request(request_envelope)
+            self.assertIn("(exit 2): Unrecognized argument --foo", str(ctx.exception))
+
+        # Non-JSON stdout
+        mock_non_json = subprocess.CompletedProcess(
+            args=["python"],
+            returncode=0,
+            stdout="Fatal: memory allocation error",
+            stderr="",
+        )
+        with patch("dev_orchestrator.ai.remote_helper.subprocess.run", return_value=mock_non_json):
+            with self.assertRaises(RuntimeError) as ctx:
+                execute_request(request_envelope)
+            self.assertIn("returned invalid JSON (exit 0)", str(ctx.exception))
+            self.assertIn("Fatal: memory allocation error", str(ctx.exception))
+
+    def test_execute_request_status_and_interrupt_cli_contract_and_errors(self):
+        # Status CLI
+        status_req = {
+            "operation": "status",
+            "request_id": "req-stat-100",
+            "broker_repo": "/opt/broker",
+            "config_path": "/opt/broker/config.yaml",
+            "database_path": "/opt/broker/db.sqlite",
+        }
+        captured_status = {}
+        def mock_status_run(argv, **kwargs):
+            captured_status["argv"] = argv
+            captured_status["kwargs"] = kwargs
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout=json.dumps({"request_id": "req-stat-100", "status": "running"}),
+                stderr="",
+            )
+        with patch("dev_orchestrator.ai.remote_helper.subprocess.run", side_effect=mock_status_run):
+            res = execute_request(status_req)
+            self.assertEqual(res["status"], "running")
+            self.assertEqual(captured_status["argv"][-2:], ["dispatch-status", "req-stat-100"])
+            self.assertEqual(captured_status["kwargs"]["env"]["PYTHONUTF8"], "1")
+            self.assertIn(str(Path("/opt/broker/src")), captured_status["kwargs"]["env"]["PYTHONPATH"])
+
+        # Status CLI error handling
+        mock_stat_err = subprocess.CompletedProcess(args=["python"], returncode=127, stdout="", stderr="command not found")
+        with patch("dev_orchestrator.ai.remote_helper.subprocess.run", return_value=mock_stat_err):
+            with self.assertRaises(RuntimeError) as ctx:
+                execute_request(status_req)
+            self.assertIn("(exit 127): command not found", str(ctx.exception))
+
+        # Interrupt CLI
+        interrupt_req = {
+            "operation": "interrupt",
+            "request_id": "req-int-100",
+            "reason": "operator abort",
+            "broker_repo": "/opt/broker",
+            "config_path": "/opt/broker/config.yaml",
+        }
+        captured_int = {}
+        def mock_int_run(argv, **kwargs):
+            captured_int["argv"] = argv
+            captured_int["kwargs"] = kwargs
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout=json.dumps({"request_id": "req-int-100", "status": "interrupted"}),
+                stderr="",
+            )
+        with patch("dev_orchestrator.ai.remote_helper.subprocess.run", side_effect=mock_int_run):
+            res = execute_request(interrupt_req)
+            self.assertEqual(res["status"], "interrupted")
+            self.assertEqual(captured_int["argv"][-4:], ["interrupt-dispatch", "req-int-100", "--reason", "operator abort"])
+            self.assertEqual(captured_int["kwargs"]["env"]["PYTHONUTF8"], "1")
+            self.assertIn(str(Path("/opt/broker/src")), captured_int["kwargs"]["env"]["PYTHONPATH"])
+
+        # Interrupt CLI error handling
+        mock_int_err = subprocess.CompletedProcess(args=["python"], returncode=2, stdout="syntax error", stderr="")
+        with patch("dev_orchestrator.ai.remote_helper.subprocess.run", return_value=mock_int_err):
+            with self.assertRaises(RuntimeError) as ctx:
+                execute_request(interrupt_req)
+            self.assertIn("(exit 2): syntax error", str(ctx.exception))
+
+    def test_remote_helper_service_call_hardened(self):
+        # 1. Reject non-loopback URL
+        remote_req = {
+            "operation": "dispatch",
+            "request_id": "req-service-1",
+            "request": {"role": "planner", "prompt": "test"},
+            "service_url": "http://example.com:8876",
+        }
+        resp = handle_request(remote_req)
+        self.assertEqual(resp["status"], "error")
+        self.assertIn("must be loopback HTTP", resp["error"])
+
+        # 2. Reject credentials in service_url
+        cred_req = {
+            "operation": "dispatch",
+            "request_id": "req-service-2",
+            "request": {"role": "planner", "prompt": "test"},
+            "service_url": "http://user:pass@127.0.0.1:8876",
+        }
+        resp = handle_request(cred_req)
+        self.assertEqual(resp["status"], "error")
+        self.assertIn("must not contain credentials", resp["error"])
+
+        # 3. Reject redirects (HTTP 301/302)
+        valid_req = {
+            "operation": "dispatch",
+            "request_id": "req-service-3",
+            "request": {"role": "planner", "prompt": "test"},
+            "service_url": "http://127.0.0.1:8876",
+            "service_token": "secret-svc-token",
+        }
+        redirect_err = urllib.error.HTTPError("http://127.0.0.1:8876/api/dispatch", 302, "Found", {}, None)
+        with patch("dev_orchestrator.ai.remote_helper._SERVICE_OPENER.open", side_effect=redirect_err):
+            with self.assertRaises(RuntimeError) as ctx:
+                execute_request(valid_req)
+            self.assertIn("redirect not permitted (302)", str(ctx.exception))
+
+        # 4. Header uses X-AIResourceBroker-Token and NOT Authorization Bearer
+        captured_req = []
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                return json.dumps({"request_id": "req-service-3", "status": "succeeded"}).encode("utf-8")
+
+        def fake_open(req, timeout=60.0):
+            captured_req.append(req)
+            return FakeResponse()
+
+        with patch("dev_orchestrator.ai.remote_helper._SERVICE_OPENER.open", side_effect=fake_open):
+            res = execute_request(valid_req)
+            self.assertEqual(res["status"], "succeeded")
+            self.assertEqual(len(captured_req), 1)
+            sent_http_req = captured_req[0]
+            self.assertEqual(sent_http_req.headers.get("X-airesourcebroker-token"), "secret-svc-token")
+            self.assertNotIn("Authorization", sent_http_req.headers)
+
+        # 5. Redact token in diagnostics / connection error
+        conn_err = urllib.error.URLError("Connection refused for secret-svc-token")
+        with patch("dev_orchestrator.ai.remote_helper._SERVICE_OPENER.open", side_effect=conn_err):
+            with self.assertRaises(RuntimeError) as ctx:
+                execute_request(valid_req)
+            self.assertIn("[REDACTED]", str(ctx.exception))
+            self.assertNotIn("secret-svc-token", str(ctx.exception))
+
+        # 6. 404 response returns {"status": "not_found"}
+        class Fake404Error(urllib.error.HTTPError):
+            def __init__(self):
+                super().__init__("http://127.0.0.1:8876/api/dispatch", 404, "Not Found", {}, None)
+            def read(self):
+                return json.dumps({"status": "not_found"}).encode("utf-8")
+
+        with patch("dev_orchestrator.ai.remote_helper._SERVICE_OPENER.open", side_effect=Fake404Error()):
+            res_404 = execute_request({
+                "operation": "status",
+                "request_id": "req-not-found",
+                "service_url": "http://127.0.0.1:8876",
+            })
+            self.assertEqual(res_404, {"status": "not_found"})
 
 
 class P13RuntimeConfigTransportTests(unittest.TestCase):

@@ -21,27 +21,73 @@ from pathlib import Path
 from typing import Any
 
 
-def _service_call(service_url: str, endpoint: str, body: dict[str, Any] | None, token: str | None) -> dict[str, Any]:
-    url = service_url.rstrip("/") + endpoint
+from dev_orchestrator.ai.aibroker_subprocess import (
+    _SERVICE_OPENER,
+    sanitize_url,
+    validate_loopback_url,
+)
+
+
+def _build_env(broker_repo: str | None) -> dict[str, str]:
+    env = dict(os.environ)
+    if broker_repo:
+        broker_src = str(Path(broker_repo) / "src")
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = broker_src + (os.pathsep + existing if existing else "")
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _service_call(
+    service_url: str,
+    endpoint: str,
+    body: dict[str, Any] | None,
+    token: str | None,
+    timeout_seconds: float = 60.0,
+) -> dict[str, Any]:
+    base = validate_loopback_url(service_url)
+    url = base + endpoint
+    safe_target = sanitize_url(url)
     req_headers = {"Accept": "application/json"}
     if token:
-        req_headers["Authorization"] = f"Bearer {token}"
+        req_headers["X-AIResourceBroker-Token"] = token
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     if data is not None:
         req_headers["Content-Type"] = "application/json"
 
     req = urllib.request.Request(url, data=data, headers=req_headers, method="POST" if body is not None else "GET")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        with _SERVICE_OPENER.open(req, timeout=timeout_seconds) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
+            try:
+                raw = exc.read().decode("utf-8")
+                parsed_404 = json.loads(raw)
+                if isinstance(parsed_404, dict) and parsed_404.get("status") == "not_found":
+                    return parsed_404
+            except Exception:
+                pass
             return {"status": "not_found"}
+        if 300 <= exc.code < 400:
+            raise RuntimeError(f"broker service redirect not permitted ({exc.code})") from exc
         err_body = exc.read().decode("utf-8", errors="replace")
         try:
             return json.loads(err_body)
         except Exception:
-            raise RuntimeError(f"Service error {exc.code}: {err_body}") from exc
+            err_msg = f"broker service error {exc.code} for {safe_target}: {err_body}"
+            if token and token in err_msg:
+                err_msg = err_msg.replace(token, "[REDACTED]")
+            raise RuntimeError(err_msg) from exc
+    except (OSError, urllib.error.URLError) as exc:
+        err_msg = str(exc)
+        if token and token in err_msg:
+            err_msg = err_msg.replace(token, "[REDACTED]")
+        raise RuntimeError(f"broker service invocation failed for {safe_target}: {err_msg}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"broker service returned invalid JSON for {safe_target}") from exc
 
 
 def execute_request(req: dict[str, Any]) -> dict[str, Any]:
@@ -58,17 +104,22 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
 
     if operation == "dispatch":
         role_req = req.get("request") or {}
+        if not isinstance(role_req, dict):
+            raise ValueError("dispatch request must be a dictionary")
+        if not role_req.get("request_id") and req_id:
+            role_req["request_id"] = req_id
+
         if service_url:
-            return _service_call(service_url, "/api/dispatch", role_req, service_token)
+            timeout_sec = 60.0
+            if role_req.get("timeout_seconds") is not None:
+                try:
+                    timeout_sec = max(60.0, float(role_req["timeout_seconds"]) + 60.0)
+                except (TypeError, ValueError):
+                    pass
+            return _service_call(service_url, "/api/dispatch", role_req, service_token, timeout_seconds=timeout_sec)
 
         # CLI subprocess execution
-        env = dict(os.environ)
-        if broker_repo:
-            broker_src = str(Path(broker_repo) / "src")
-            existing = env.get("PYTHONPATH")
-            env["PYTHONPATH"] = broker_src + (os.pathsep + existing if existing else "")
-        env["PYTHONUTF8"] = "1"
-        env["PYTHONIOENCODING"] = "utf-8"
+        env = _build_env(broker_repo)
 
         with tempfile.TemporaryDirectory(prefix="devorch-remote-") as temp_dir:
             prompt_file = Path(temp_dir) / "prompt.txt"
@@ -81,18 +132,32 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 argv += ["--database", str(database_path)]
             argv += [
                 "dispatch",
-                "--project-id", str(role_req.get("project_id", "")),
                 "--role", str(role_req.get("role", "")),
-                "--prompt-file", str(prompt_file),
-                "--request-id", str(role_req.get("request_id", "")),
                 "--quality", str(role_req.get("quality", "standard")),
                 "--independence", str(role_req.get("independence", "isolated")),
-                "--working-directory", str(role_req.get("working_directory", ".")),
+                "--prompt-file", str(prompt_file),
+                "--request-id", str(role_req.get("request_id", req_id)),
+                "--cwd", str(role_req.get("working_directory") or role_req.get("cwd") or "."),
             ]
-            if role_req.get("timeout_seconds") is not None:
-                argv += ["--timeout-seconds", str(role_req["timeout_seconds"])]
+            timeout = role_req.get("timeout_seconds") or role_req.get("timeout")
+            if timeout is not None:
+                argv += ["--timeout", str(timeout)]
+            if req.get("probe") or role_req.get("probe"):
+                argv.append("--probe")
             for res_id in role_req.get("excluded_resource_ids", []):
-                argv += ["--exclude-resource-id", str(res_id)]
+                argv += ["--excluded-resource-id", str(res_id)]
+
+            prev_context = role_req.get("previous_resource_context")
+            if isinstance(prev_context, dict):
+                for flag, key in (
+                    ("--previous-resource-id", "resource_id"),
+                    ("--previous-provider", "provider"),
+                    ("--previous-account", "account"),
+                    ("--previous-model", "model"),
+                ):
+                    val = prev_context.get(key)
+                    if val is not None:
+                        argv += [flag, str(val)]
 
             completed = subprocess.run(
                 argv,
@@ -108,7 +173,14 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
         if completed.returncode not in (0, 1):
             detail = (completed.stderr or completed.stdout).strip()
             raise RuntimeError(f"remote broker dispatch rejected (exit {completed.returncode}): {detail}")
-        return json.loads(completed.stdout)
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"remote broker dispatch returned invalid JSON (exit {completed.returncode}): {detail}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("remote broker dispatch payload must be a JSON object")
+        return payload
 
     if operation == "status":
         if service_url:
@@ -118,12 +190,32 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 None,
                 service_token,
             )
+        env = _build_env(broker_repo)
         argv = [sys.executable, "-m", "ai_resource_broker.cli", "--config", str(config_path)]
         if database_path:
             argv += ["--database", str(database_path)]
         argv += ["dispatch-status", str(req_id)]
-        completed = subprocess.run(argv, cwd=str(broker_repo) if broker_repo else None, capture_output=True, text=True, check=False)
-        return json.loads(completed.stdout)
+        completed = subprocess.run(
+            argv,
+            cwd=str(broker_repo) if broker_repo else None,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if completed.returncode not in (0, 1):
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"remote broker status rejected (exit {completed.returncode}): {detail}")
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"remote broker status returned invalid JSON (exit {completed.returncode}): {detail}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("remote broker status payload must be a JSON object")
+        return payload
 
     if operation == "interrupt":
         reason = req.get("reason", "DevOrchestrator managed stop")
@@ -134,12 +226,32 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 {"reason": reason},
                 service_token,
             )
+        env = _build_env(broker_repo)
         argv = [sys.executable, "-m", "ai_resource_broker.cli", "--config", str(config_path)]
         if database_path:
             argv += ["--database", str(database_path)]
         argv += ["interrupt-dispatch", str(req_id), "--reason", reason]
-        completed = subprocess.run(argv, cwd=str(broker_repo) if broker_repo else None, capture_output=True, text=True, check=False)
-        return json.loads(completed.stdout)
+        completed = subprocess.run(
+            argv,
+            cwd=str(broker_repo) if broker_repo else None,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if completed.returncode not in (0, 1):
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"remote broker interrupt rejected (exit {completed.returncode}): {detail}")
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"remote broker interrupt returned invalid JSON (exit {completed.returncode}): {detail}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("remote broker interrupt payload must be a JSON object")
+        return payload
 
     raise ValueError(f"unsupported remote helper operation: {operation!r}")
 

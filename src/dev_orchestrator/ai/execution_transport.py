@@ -482,34 +482,23 @@ class SSHTransport:
         mapped_config_path = self.map_path(config.config_path)
         mapped_database_path = self.map_path(config.database_path) if config.database_path else None
 
+        role_payload = LocalTransport._request_payload(request, config)
+        role_payload["working_directory"] = mapped_cwd
+        role_payload["stage_run_id"] = request.stage_run_id
+        role_payload["task_run_id"] = request.task_run_id
+        role_payload["role_run_id"] = request.role_run_id
+        role_payload["attempt_number"] = getattr(request, "attempt_number", 1)
+
         envelope = {
             "operation": "dispatch",
             "request_id": request.request_id,
-            "request": {
-                "project_id": request.project_id,
-                "role": request.role,
-                "prompt": request.prompt,
-                "working_directory": mapped_cwd,
-                "timeout_seconds": request.timeout_seconds,
-                "quality": request.quality,
-                "independence": request.independence,
-                "excluded_resource_ids": list(request.excluded_resource_ids),
-                "stage_run_id": request.stage_run_id,
-                "task_run_id": request.task_run_id,
-                "role_run_id": request.role_run_id,
-                "attempt_number": getattr(request, "attempt_number", 1),
-                **({"previous_resource_context": {
-                    "resource_id": request.previous_resource_context.resource_id,
-                    "provider": request.previous_resource_context.provider,
-                    "account": request.previous_resource_context.account,
-                    "model": request.previous_resource_context.model,
-                }} if request.previous_resource_context else {}),
-            },
+            "request": role_payload,
             "broker_repo": mapped_broker_repo,
             "config_path": mapped_config_path,
             "database_path": mapped_database_path,
             "service_url": config.service_url,
             "service_token": config.service_token,
+            "probe": config.probe_before_dispatch,
         }
 
         transport_timeout = timeout_seconds + self.ssh_config.connect_timeout_seconds
