@@ -147,7 +147,7 @@ def project_control_view(
         roles = project_config.get("ai_roles")
         planner_config = roles.get("planner") if isinstance(roles, dict) else None
         planning_ready = isinstance(planner_config, dict) and planner_config.get("enabled") is True
-    planning_start_ready = lifecycle == "IDLE" and "PENDING DESIGN" in next_status.upper() and planning_ready
+    planning_start_ready = lifecycle in {"IDLE", "PLAN_FAILED"} and "PENDING DESIGN" in next_status.upper() and planning_ready
     eligible_continue = not paused and gate is None and (
         (lifecycle == "READY_TO_RUN" and execution_ready)
         or planning_start_ready

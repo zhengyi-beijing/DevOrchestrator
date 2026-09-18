@@ -182,6 +182,25 @@ class ControlCommandTests(unittest.TestCase):
             latest=latest_control_result(runtime,"p1")
             self.assertEqual(latest["lifecycle_action"],"execute")
 
+    def test_pending_design_plan_failed_can_start_new_planner_lineage(self):
+        with tempfile.TemporaryDirectory() as td:
+            base=Path(td); repo=base/"repo"; repo.mkdir(); runtime=base/"runtime"
+            config=base/"projects.json"; write_config(config, repo)
+            planner=FakePlanner(); executor=FakeExecutor(launch=True)
+            coordinator=ControlCommandCoordinator(runtime, planner)
+            failed={"projects":[{"project_id":"p1","state":"PLAN_FAILED","lifecycle_state":"PLAN_FAILED",
+                                  "next_status":"**PENDING DESIGN**","telemetry":{"task_id":"P1"}}]}
+            command=submit_control_command(
+                runtime,"p1","continue",command_id="resume-plan-failed",
+                expected=project_identity(failed["projects"][0], runtime),
+            )
+            outcome=coordinator.advance(config,failed,executor)[0]
+            self.assertEqual(outcome["state"],"accepted")
+            self.assertEqual(outcome["lifecycle_action"],"plan")
+            self.assertEqual(outcome["plan_id"],"ai_plan:"+command["command_id"])
+            self.assertEqual(planner.calls,[("p1","resume-plan-failed")])
+            self.assertEqual(executor.calls,[])
+
     def test_review_next_to_pending_design_auto_routes_back_to_planner(self):
         with tempfile.TemporaryDirectory() as td:
             base=Path(td); repo=base/"repo"; repo.mkdir(); runtime=base/"runtime"

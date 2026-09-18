@@ -549,9 +549,9 @@ class ControlCommandCoordinator:
         next_status = str(snapshot.get("next_status") or "").upper()
         if "PENDING DESIGN" in next_status:
             lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "")
-            if lifecycle != "IDLE":
+            if lifecycle not in {"IDLE", "PLAN_FAILED"}:
                 return self._blocked(
-                    command_id, project_id, action, "PENDING DESIGN continue requires IDLE lifecycle", now, record
+                    command_id, project_id, action, "PENDING DESIGN continue requires IDLE or PLAN_FAILED lifecycle", now, record
                 )
             if self.planner is None:
                 return self._blocked(command_id, project_id, action, "planner coordinator unavailable", now, record)
