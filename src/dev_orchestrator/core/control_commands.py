@@ -566,6 +566,17 @@ class ControlCommandCoordinator:
                     "lifecycle_action": "plan", "plan_id": approved_plan_id,
                     "reason": approved_reason,
                 }
+            handled, review_plan_id, review_reason = self.planner.continue_failed_plan_review(
+                projects[project_id], snapshot, command_id
+            )
+            if handled:
+                if review_plan_id is None:
+                    return self._blocked(command_id, project_id, action, review_reason, now, record)
+                return {
+                    **record, "state": "accepted", "processed_at": now,
+                    "lifecycle_action": "plan_review", "plan_id": review_plan_id,
+                    "reason": review_reason,
+                }
             plan_id, reason = self.planner.start(projects[project_id], snapshot, command_id)
             if plan_id is None:
                 return self._blocked(command_id, project_id, action, reason, now, record)

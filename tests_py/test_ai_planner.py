@@ -495,6 +495,75 @@ class AIPlannerTests(unittest.TestCase):
                 ["reviewer-r-1", "reviewer-r-2", "reviewer-r-3"],
             )
 
+    def test_failed_plan_review_retry_reuses_existing_plan_without_planner(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            next_text = (repo / "agent" / "next.md").read_text(encoding="utf-8")
+            plan = {
+                "task_id": "P14", "summary": "Reuse this already generated plan.",
+                "implementation_steps": ["Step 1"], "interfaces": ["Interface 1"],
+                "validation": ["Validation 1"], "risks": ["Risk 1"],
+                "out_of_scope": ["Scope 1"],
+            }
+            runtime.mkdir(parents=True)
+            (runtime / "ai-planner.json").write_text(json.dumps({
+                "version": 1,
+                "plans": {
+                    "ai_plan:failed-review": {
+                        "plan_id": "ai_plan:failed-review",
+                        "command_id": "failed-review",
+                        "project_id": "p1",
+                        "task_id": "P14",
+                        "repo_path": str(repo),
+                        "state": "failed",
+                        "started_at": "2026-09-18T00:00:00+00:00",
+                        "completed_at": "2026-09-18T00:01:00+00:00",
+                        "reason": "plan review failed: no eligible resource",
+                        "next_text": next_text,
+                        "plan": plan,
+                        "planner_dispatch_id": "dispatch-existing-plan",
+                        "planner_execution_id": "execution-existing-plan",
+                        "planner_completed_at": "2026-09-18T00:00:30+00:00",
+                        "planner_resource": {
+                            "resource_id": "codex/default/gpt-5.6-sol",
+                            "provider": "codex",
+                            "account": "default",
+                            "model": "gpt-5.6-sol",
+                        },
+                    }
+                },
+            }), encoding="utf-8")
+            port = FakePort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {
+                    "enabled": True, "quality": "high", "review_quality": "high",
+                    "review_independence": "provider",
+                }},
+            }
+            snapshot = {
+                "project_id": "p1", "state": "PLAN_FAILED",
+                "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P14"},
+            }
+            handled, plan_id, reason = coordinator.continue_failed_plan_review(
+                project, snapshot, "review-only-retry"
+            )
+            self.assertTrue(handled)
+            self.assertEqual(plan_id, "ai_plan:review-only-retry")
+            self.assertIn("existing planner output", reason)
+            row = wait_terminal(coordinator, plan_id)
+            self.assertEqual(row["state"], "ready", row)
+            self.assertEqual([request.role for request in port.requests], ["reviewer"])
+            self.assertEqual(
+                port.requests[0].previous_resource_context.resource_id,
+                "codex/default/gpt-5.6-sol",
+            )
+            self.assertEqual(row["planner_reused_from"], "ai_plan:failed-review")
+            self.assertEqual(row["planner_resource"]["resource_id"], "codex/default/gpt-5.6-sol")
+
     def test_planner_resource_failure_excludes_failed_resource_and_fails_over(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"

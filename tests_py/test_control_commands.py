@@ -78,6 +78,8 @@ class FakePlanner:
         return plan_id, "planning started"
     def continue_owner_approved(self, project, snapshot, command_id):
         return False, None, "no owner-approved plan is pending"
+    def continue_failed_plan_review(self, project, snapshot, command_id):
+        return False, None, "no failed plan review can be resumed"
     def start_deferred(self, project, snapshot, command_id, handoff):
         self.calls.append(("deferred", project["project_id"], command_id, handoff.get("staged_successor")))
         plan_id = "ai_plan:" + command_id

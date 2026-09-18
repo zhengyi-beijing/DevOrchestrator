@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from dev_orchestrator.ai.contracts import AIRoleRequest, ResourceContext
@@ -671,6 +672,74 @@ class AIPlannerCoordinator:
             return True, None, str(final.get("reason") or "owner-approved plan apply failed")
         return True, plan_id, "owner-approved plan applied; Worker launch remains daemon-owned"
 
+    def continue_failed_plan_review(
+        self,
+        project: dict[str, Any],
+        snapshot: dict[str, Any],
+        command_id: str,
+    ) -> tuple[bool, str | None, str]:
+        """Retry only a resource-failed plan review without rerunning the accepted planner output."""
+        if self.port is None:
+            return False, None, "AIBroker execution port unavailable"
+        policy, error = _planner_policy(project)
+        if policy is None:
+            return False, None, error
+        project_id = _nonblank(project.get("project_id"))
+        repo_text = _nonblank(project.get("repo_path"))
+        telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+        task_id = _nonblank(telemetry.get("task_id"))
+        if project_id is None or repo_text is None or task_id is None:
+            return False, None, "planner project identity incomplete"
+        with self._lock:
+            candidates = [
+                copy.deepcopy(row) for row in self._load_state()["plans"].values()
+                if isinstance(row, dict)
+                and row.get("project_id") == project_id
+                and row.get("task_id") == task_id
+                and row.get("state") == "failed"
+                and isinstance(row.get("plan"), dict)
+                and isinstance(row.get("planner_resource"), dict)
+                and str(row.get("reason") or "").startswith("plan review failed:")
+            ]
+        if not candidates:
+            return False, None, "no failed plan review can be resumed"
+        candidates.sort(key=lambda row: str(row.get("completed_at") or row.get("started_at") or ""), reverse=True)
+        source = candidates[0]
+        plan = source.get("plan")
+        try:
+            _parse_plan(json.dumps(plan), task_id)
+        except ValueError as exc:
+            return True, None, f"failed plan review contains an invalid plan: {exc}"
+        truth = read_repository_truth(repo_text)
+        if not truth.valid or truth.dirty:
+            return True, None, "plan review retry requires a clean repository"
+        next_path = Path(repo_text) / "agent" / "next.md"
+        try:
+            next_text = next_path.read_text(encoding="utf-8")
+        except OSError:
+            return True, None, "agent/next.md unavailable"
+        if next_text != str(source.get("next_text") or ""):
+            return True, None, "current task specification changed since the failed plan review"
+        resource = source.get("planner_resource") or {}
+        if not all(_nonblank(resource.get(name)) for name in ("resource_id", "provider", "account", "model")):
+            return True, None, "failed plan review planner resource evidence is incomplete"
+        base_fields = {
+            "next_text": next_text,
+            "seed_plan": copy.deepcopy(plan),
+            "seed_planner_resource": copy.deepcopy(resource),
+            "seed_planner_dispatch_id": source.get("planner_dispatch_id"),
+            "seed_planner_execution_id": source.get("planner_execution_id"),
+            "seed_planner_completed_at": source.get("planner_completed_at"),
+            "reused_plan_from": source.get("plan_id"),
+            "reused_plan_reason": source.get("reason"),
+        }
+        plan_id, reason = self._begin_lifecycle(
+            project, policy, command_id, task_id, truth, base_fields,
+        )
+        if plan_id is None:
+            return True, None, reason
+        return True, plan_id, "failed plan review retry started from existing planner output"
+
     def mark_worker_launched(self, plan_id: str, source_request_id: str) -> None:
         with self._lock:
             state = self._load_state()
@@ -1042,21 +1111,38 @@ class AIPlannerCoordinator:
         prior_resource: ResourceContext | None = None
 
         for round_no in range(max_remediation_rounds + 1):
-            attempts_res = self._run_planner_attempts(
-                plan_id, record, policy, round_no,
-                rejection=rejection,
-                prior_plan=prior_plan,
-                prior_resource=prior_resource,
-            )
-            if attempts_res is None:
-                return
-            plan, planner_result = attempts_res
-            previous = planner_result.resource_context
-            if previous is None:
-                self._finish(plan_id, "failed", "planner resource context missing")
-                return
+            seeded = round_no == 0 and isinstance(record.get("seed_plan"), dict)
+            if seeded:
+                plan = copy.deepcopy(record["seed_plan"])
+                resource = record.get("seed_planner_resource") or {}
+                previous = ResourceContext(
+                    resource_id=resource.get("resource_id"),
+                    provider=resource.get("provider"),
+                    account=resource.get("account"),
+                    model=resource.get("model"),
+                )
+                planner_result = SimpleNamespace(
+                    resource_context=previous,
+                    dispatch_id=record.get("seed_planner_dispatch_id"),
+                    execution_id=record.get("seed_planner_execution_id"),
+                )
+                planner_completed_at = str(record.get("seed_planner_completed_at") or utc_now_iso())
+            else:
+                attempts_res = self._run_planner_attempts(
+                    plan_id, record, policy, round_no,
+                    rejection=rejection,
+                    prior_plan=prior_plan,
+                    prior_resource=prior_resource,
+                )
+                if attempts_res is None:
+                    return
+                plan, planner_result = attempts_res
+                previous = planner_result.resource_context
+                if previous is None:
+                    self._finish(plan_id, "failed", "planner resource context missing")
+                    return
+                planner_completed_at = utc_now_iso()
 
-            planner_completed_at = utc_now_iso()
             with self._lock:
                 state = self._load_state()
                 current = state["plans"].get(plan_id)
@@ -1069,6 +1155,7 @@ class AIPlannerCoordinator:
                     "planner_execution_id": planner_result.execution_id,
                     "planner_resource": self._resource_payload(previous),
                     "planner_completed_at": planner_completed_at,
+                    **({"planner_reused_from": record.get("reused_plan_from")} if seeded else {}),
                 })
                 self._save_state(state)
 
