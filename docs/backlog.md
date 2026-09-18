@@ -156,3 +156,36 @@ Goal: provide an Android-native, failure-independent observation and bounded-con
 - Acceptance: with ChatGPT/browser/RDC unavailable, Android can observe authoritative execution, distinguish running/stalled/disconnected states, receive alerts and execute supported guarded controls.
 
 Sequence: P15 follows P14.5 and consumes existing lifecycle, transport, durable-job and reviewer-harness contracts.
+
+## P16 staged roadmap
+
+### P16 - AI Capability Benchmark Project
+
+Goal: create an isolated benchmark project that measures the real capability, efficiency and reliability of the AI resources available to DevO/AIBroker, and separates model capability from retrieval/tooling effects.
+
+- Build a frozen benchmark repository with seeded defects, architecture/cross-file reasoning questions, implementation tasks, review tasks and root-cause/debugging tasks with known ground truth.
+- Evaluate resources by role: Planner, Reviewer, Worker/Implementer and Debugger/Root-cause Analyst.
+- Discover the active resource pool at runtime and include representative Codex, Claude, ChatGPT Web Sol, AGY Gemini Pro/Flash and Copilot resources when available.
+- Run repeated trials under fixed task/prompt/revision/tool policy/timeout/scoring conditions.
+- Capture correctness, evidence completeness, false findings, missed findings, patch validity, regressions, tool calls, reported tokens, wall time, retries/failover and quota/session metadata.
+- Keep benchmark execution isolated from production repositories.
+
+#### zvec-grep Repository Retrieval A/B track
+
+- Track A uses native project tools only: rg/grep, file reads, git, tests and normal agent tools.
+- Track B uses the same AI and task plus zvec-grep for semantic/BM25/vector discovery, followed by exact source verification.
+- Hold model, prompt, task, repository revision, timeout and scoring constant between A/B pairs.
+- Measure whether zvec-grep reduces discovery time, tool calls and context/token consumption while preserving or improving correctness and evidence quality.
+- Use semantic retrieval for unknown-location/cross-file/architecture/design-rationale tasks; keep known identifiers, regex and exhaustive occurrence searches on native rg/grep.
+- Treat zvec-grep as a discovery/ranking layer only; repository truth, exact source reads, tests and lifecycle authority remain independent.
+
+#### Promotion gate into Agent Harness
+
+- Do not make zvec-grep a mandatory DevO dependency from a single positive run.
+- Promote it into Agent Harness as the shared Repository Retrieval layer only after repeated representative A/B runs show meaningful benefit without unacceptable stale-index, false-retrieval, latency, privacy or maintenance costs.
+- If promoted, Planner/Reviewer/Worker may consume one shared workspace index through a bounded Harness interface, reducing repeated repository discovery after model failover.
+- Preserve a native-tool fallback whenever zvec-grep or its index is unavailable.
+
+Acceptance: the benchmark can reproducibly compare at least three AI resources across multiple role/task classes, produce machine-readable and human-readable results, execute at least one native-vs-zvec-grep paired experiment, and provide evidence sufficient for a documented promotion/no-promotion decision.
+
+Sequence: P16 follows P15. It is a benchmark/test-project phase rather than a production DevO feature phase.
