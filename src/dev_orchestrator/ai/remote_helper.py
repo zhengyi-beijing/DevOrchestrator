@@ -96,7 +96,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
     if not operation or not req_id:
         raise ValueError("operation and request_id are required")
 
-    _JOB_OPERATIONS = frozenset({"job_start", "job_status", "job_logs", "job_cancel"})
+    _JOB_OPERATIONS = frozenset({"job_start", "job_status", "job_logs", "job_cancel", "job_artifact"})
     if operation in _JOB_OPERATIONS:
         _ALLOWED_JOB_FIELDS = frozenset({
             "operation",
@@ -109,6 +109,9 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             "limit",
             "reason",
             "expected_working_directory",
+            "artifact_name",
+            "input_payload",
+            "input_digest",
         })
         unknown = sorted(set(req.keys()) - _ALLOWED_JOB_FIELDS)
         if unknown:
@@ -147,16 +150,20 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             idem_key = req.get("idempotency_key") or req.get("job_id")
             if not idem_key:
                 raise ValueError("job_id or idempotency_key is required")
+            input_digest = req.get("input_digest")
             spec = JobSpec(
                 project_id=proj_id,
                 command_ref=cmd_ref,
                 idempotency_key=str(idem_key),
                 expected_working_directory=expected_cwd,
+                input_digest=str(input_digest) if input_digest else None,
             )
             target_job_id = req.get("job_id") or job_id_for(spec)
 
             def _factory(jid: str, shash: str) -> JobRecord:
                 now = utc_now_iso()
+                jdir = store._job_dir(jid)
+                resolved_argv = [arg.replace("{job_dir}", str(jdir)) for arg in cmd_cfg.argv]
                 return JobRecord(
                     job_id=jid,
                     idempotency_key=spec.idempotency_key,
@@ -164,7 +171,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                     kind=spec.kind,
                     project_id=spec.project_id,
                     command_ref=spec.command_ref,
-                    resolved_argv=cmd_cfg.argv,
+                    resolved_argv=resolved_argv,
                     working_directory=str(resolved_cwd),
                     transport="local",
                     host_identity=socket.gethostname(),
@@ -172,12 +179,16 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                     max_runtime_seconds=cmd_cfg.max_runtime_seconds,
                     heartbeat_interval_seconds=cmd_cfg.heartbeat_interval_seconds,
                     log_caps=dict(jobs_cfg.log_caps),
+                    input_digest=spec.input_digest,
                     state="queued",
                     timestamps={"created_at": now, "queued_at": now, "updated_at": now},
                 )
 
             record, is_new = store.claim_or_get(spec, _factory, target_job_id=target_job_id)
             if is_new:
+                input_payload = req.get("input_payload")
+                if input_payload is not None:
+                    store.save_input_artifact(record.job_id, input_payload)
                 start_res = local_transport.job_start(spec, store._job_dir(record.job_id))
                 sup_pid = start_res.get("supervisor_pid") if isinstance(start_res, dict) else None
                 if isinstance(sup_pid, int) and sup_pid > 0:
@@ -212,6 +223,31 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("job_id is required for job_cancel")
             reason = str(req.get("reason") or "cancelled")
             return local_transport.job_cancel(job_id, store._job_dir(job_id), reason=reason)
+
+        if operation == "job_artifact":
+            job_id = req.get("job_id")
+            art_name = req.get("artifact_name")
+            if not job_id or not art_name:
+                raise ValueError("job_id and artifact_name are required for job_artifact")
+            art = store.get_output_artifact(job_id, art_name)
+            if art is None:
+                return {
+                    "job_id": job_id,
+                    "status": "not_found",
+                    "error": f"artifact {art_name} not found for job {job_id}",
+                    "host_identity": socket.gethostname(),
+                }
+            return {
+                "job_id": job_id,
+                "status": "ok",
+                "artifact": {
+                    "name": art["name"],
+                    "sha256": art["sha256"],
+                    "size_bytes": art["size_bytes"],
+                },
+                "content": art["content"],
+                "host_identity": socket.gethostname(),
+            }
 
     broker_repo = req.get("broker_repo")
     config_path = req.get("config_path")

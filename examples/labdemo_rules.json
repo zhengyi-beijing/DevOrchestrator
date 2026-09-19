@@ -1,0 +1,42 @@
+{
+  "name": "LabDemo Rules",
+  "version": "1.0.0",
+  "description": "Representative domain rule pack for LabDemo X-ray inspection control and data pipeline",
+  "rules": [
+    {
+      "rule_id": "service_hardware_authority",
+      "title": "Hardware Communication Authority",
+      "category": "architecture",
+      "severity": "blocking",
+      "description": "Hardware communication and direct driver control must strictly reside in service/hardware layer modules. UI, view models, and orchestrators must never issue raw hardware commands or access device buses directly."
+    },
+    {
+      "rule_id": "failsafe_xray_off",
+      "title": "Failsafe X-ray Power Off Interlock",
+      "category": "safety",
+      "severity": "blocking",
+      "description": "All hardware faults, communication timeouts, emergency stops, or safety boundary violations must immediately and deterministically trigger an X-ray generator power cut."
+    },
+    {
+      "rule_id": "scan_separation",
+      "title": "Acquisition and Reconstruction Pipeline Decoupling",
+      "category": "performance",
+      "severity": "blocking",
+      "description": "Scan data acquisition pipelines must be strictly decoupled from 3D reconstruction compute. Acquisition timing and real-time sensor ingestion must never be blocked by downstream image processing."
+    },
+    {
+      "rule_id": "state_machine_reachability",
+      "title": "Deterministic State Machine Reachability",
+      "category": "correctness",
+      "severity": "blocking",
+      "description": "Hardware state machine transitions must be explicit and deterministic. Any unexpected event, invalid transition, or unhandled response must transition safely to the well-defined fault state."
+    },
+    {
+      "rule_id": "preserve_compatibility",
+      "title": "Telemetry and Public Interface Compatibility",
+      "category": "compatibility",
+      "severity": "warning",
+      "description": "Public telemetry schemas and external RPC contracts must maintain backward compatibility with existing clients and tooling."
+    }
+  ]
+}

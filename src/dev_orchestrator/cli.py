@@ -1078,6 +1078,121 @@ def cmd_job_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review_submit(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.review.models import ReviewRequest
+    from dev_orchestrator.review.harness import DefaultReviewerHarness
+    from dev_orchestrator.core.repository import read_repository_truth
+    from dev_orchestrator.config import load_projects_config
+    from dev_orchestrator.storage.json_store import utc_now_iso
+
+    config_path = resolve_config_path(args.config) if getattr(args, "config", None) else None
+    repo_path = getattr(args, "repo_path", None)
+    if not repo_path and config_path:
+        try:
+            cfg = load_projects_config(config_path)
+            for p in cfg.get("projects", []):
+                if p.get("project_id") == args.project_id:
+                    repo_path = p.get("repo_path")
+                    break
+        except Exception:
+            pass
+    if not repo_path:
+        repo_path = "."
+    repo_path = str(Path(repo_path).resolve())
+
+    truth = read_repository_truth(repo_path)
+    if not truth.valid:
+        raise CliError(f"repository truth invalid at {repo_path}")
+
+    request_id = getattr(args, "request_id", None) or f"review-{truth.head[:8]}-{utc_now_iso().replace(':', '').replace('-', '')[:15]}"
+    diff_refs: dict[str, str] = {}
+    if getattr(args, "base", None):
+        diff_refs["base"] = str(args.base)
+    if getattr(args, "head", None):
+        diff_refs["head"] = str(args.head)
+
+    req = ReviewRequest(
+        request_id=request_id,
+        project_id=args.project_id,
+        task_id=getattr(args, "task_id", None) or "manual-review",
+        mode=getattr(args, "mode", "diff") or "diff",
+        diff_mode=getattr(args, "diff_mode", "workspace") or "workspace",
+        diff_refs=diff_refs,
+        scan_roots=list(getattr(args, "scan_roots", None) or []),
+        rule_pack_path=getattr(args, "rule_pack", None),
+        branch=truth.branch,
+        head=truth.head,
+        status_hash=truth.status_hash,
+        transport=getattr(args, "transport", "local") or "local",
+        metadata={"repo_path": repo_path},
+    )
+
+    harness = DefaultReviewerHarness(runtime)
+    try:
+        session = harness.submit(req)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(session.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_review_status(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.review.harness import DefaultReviewerHarness
+    harness = DefaultReviewerHarness(runtime)
+    try:
+        session = harness.status(args.session_id)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(session.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_review_reconcile(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.review.harness import DefaultReviewerHarness
+    harness = DefaultReviewerHarness(runtime)
+    try:
+        session = harness.reconcile(args.session_id)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(session.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_review_findings(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.review.harness import DefaultReviewerHarness
+    from dev_orchestrator.review.models import to_sarif, ReviewFinding
+    harness = DefaultReviewerHarness(runtime)
+    try:
+        session = harness.status(args.session_id)
+        if session.result is not None:
+            findings = list(session.result.findings)
+        else:
+            findings = []
+            if session.job_id:
+                art = harness.job_service.get_artifact(session.job_id, "findings.json")
+                if art and isinstance(art.get("content"), list):
+                    findings = [ReviewFinding.from_dict(f) for f in art["content"] if isinstance(f, dict)]
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+
+    if getattr(args, "severity", None):
+        findings = [f for f in findings if f.severity == args.severity]
+    if getattr(args, "rule_id", None):
+        findings = [f for f in findings if f.rule_id == args.rule_id]
+
+    fmt = getattr(args, "format", "json") or "json"
+    if fmt == "sarif":
+        sarif_doc = to_sarif(findings)
+        sys.stdout.write(json.dumps(sarif_doc, indent=2, ensure_ascii=False) + "\n")
+    else:
+        sys.stdout.write(json.dumps([f.to_dict() for f in findings], indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
@@ -1329,6 +1444,36 @@ def build_parser() -> argparse.ArgumentParser:
     job_reconcile.add_argument("job_id", help="job ID to reconcile")
     job_reconcile.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
+    review_submit = sub.add_parser("review-submit", help="submit a review session")
+    review_submit.add_argument("--project-id", required=True, help="project ID")
+    review_submit.add_argument("--task-id", default=None, help="task ID")
+    review_submit.add_argument("--request-id", default=None, help="custom review request ID")
+    review_submit.add_argument("--mode", choices=("diff", "scan"), default="diff", help="review mode")
+    review_submit.add_argument("--diff-mode", choices=("workspace", "range", "commit"), default="workspace", help="diff mode")
+    review_submit.add_argument("--scan-roots", nargs="*", default=None, help="scan root directories")
+    review_submit.add_argument("--rule-pack", default=None, help="relative path to rule pack JSON")
+    review_submit.add_argument("--base", default=None, help="base git ref for range diff")
+    review_submit.add_argument("--head", default=None, help="head git ref for range diff")
+    review_submit.add_argument("--transport", choices=("local", "ssh"), default="local", help="job transport")
+    review_submit.add_argument("--repo-path", default=None, help="path to repository root")
+    review_submit.add_argument("--config", default=None, help="path to projects.json")
+    review_submit.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    review_status = sub.add_parser("review-status", help="query review session status")
+    review_status.add_argument("session_id", help="review session ID")
+    review_status.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    review_reconcile = sub.add_parser("review-reconcile", help="reconcile an ambiguous or interrupted review session")
+    review_reconcile.add_argument("session_id", help="review session ID to reconcile")
+    review_reconcile.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    review_findings = sub.add_parser("review-findings", help="query findings for a review session")
+    review_findings.add_argument("session_id", help="review session ID")
+    review_findings.add_argument("--severity", default=None, help="filter by severity (blocking, warning, info)")
+    review_findings.add_argument("--rule-id", default=None, help="filter by rule ID")
+    review_findings.add_argument("--format", choices=("json", "sarif"), default="json", help="output format")
+    review_findings.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     return parser
 
 
@@ -1353,6 +1498,10 @@ _COMMANDS = {
     "job-cancel": cmd_job_cancel,
     "job-retry": cmd_job_retry,
     "job-reconcile": cmd_job_reconcile,
+    "review-submit": cmd_review_submit,
+    "review-status": cmd_review_status,
+    "review-reconcile": cmd_review_reconcile,
+    "review-findings": cmd_review_findings,
     "monitor": cmd_monitor,
     "web": cmd_web,
     "daemon": cmd_daemon,

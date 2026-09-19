@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import socket
 from pathlib import Path
 from typing import Any, Optional
@@ -112,10 +114,26 @@ class JobService:
         target_job_id: Optional[str] = None,
         retry_of: Optional[str] = None,
         attempt: int = 1,
+        input_payload: Optional[Any] = None,
     ) -> JobRecord:
         """Submit a job idempotently. If newly claimed, spawns exactly one supervisor."""
         if self.config is None:
             raise RuntimeError("execution-jobs.json is missing or jobs runtime is disabled")
+
+        if input_payload is not None and spec.input_digest is None:
+            if isinstance(input_payload, (dict, list)):
+                raw_p = json.dumps(input_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            elif isinstance(input_payload, str):
+                raw_p = input_payload.encode("utf-8")
+            elif isinstance(input_payload, bytes):
+                raw_p = input_payload
+            else:
+                raw_p = json.dumps(input_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            digest = "sha256:" + hashlib.sha256(raw_p).hexdigest()
+            spec_data = spec.to_canonical_dict()
+            spec_data["input_digest"] = digest
+            spec_data["metadata"] = dict(spec.metadata)
+            spec = JobSpec.from_dict(spec_data)
 
         ok, failure_kind, resolved_cwd, cmd_cfg = validate_and_resolve_execution(
             self.config,
@@ -134,6 +152,8 @@ class JobService:
                 "head_lines": DEFAULT_HEAD_LINES,
                 "tail_lines": DEFAULT_TAIL_LINES,
             }
+            jdir = self.store._job_dir(jid)
+            resolved_argv = [arg.replace("{job_dir}", str(jdir)) for arg in cmd_cfg.argv]
             rec = JobRecord(
                 job_id=jid,
                 idempotency_key=spec.idempotency_key,
@@ -141,7 +161,7 @@ class JobService:
                 kind=spec.kind,
                 project_id=spec.project_id,
                 command_ref=spec.command_ref,
-                resolved_argv=cmd_cfg.argv,
+                resolved_argv=resolved_argv,
                 working_directory=str(resolved_cwd),
                 transport=spec.transport,
                 host_identity=socket.gethostname(),
@@ -149,6 +169,7 @@ class JobService:
                 max_runtime_seconds=cmd_cfg.max_runtime_seconds,
                 heartbeat_interval_seconds=cmd_cfg.heartbeat_interval_seconds,
                 log_caps=caps,
+                input_digest=spec.input_digest,
                 state="queued",
                 task_id=spec.task_id,
                 stage_run_id=spec.stage_run_id,
@@ -175,6 +196,8 @@ class JobService:
 
         record, is_new = self.store.claim_or_get(spec, _factory, target_job_id=target_job_id)
         if is_new:
+            if input_payload is not None:
+                self.store.save_input_artifact(record.job_id, input_payload)
             transport = self._get_transport(spec.transport)
             jdir = self.store._job_dir(record.job_id)
             start_res = transport.job_start(spec, jdir)
@@ -185,6 +208,19 @@ class JobService:
                 record = self.store.update(record.job_id, _record_pid)
 
         return record
+
+    def get_artifact(self, job_id: str, name: str) -> dict[str, Any]:
+        """Retrieve output artifact and verify digest."""
+        record = self.store.get(job_id)
+        if record is None:
+            raise ValueError(f"job {job_id} not found")
+        transport = self._get_transport(record.transport)
+        jdir = self.store._job_dir(job_id)
+        return transport.job_artifact(job_id, jdir, name=name)
+
+    def list_artifacts(self, job_id: str) -> list[dict[str, Any]]:
+        """List output artifacts for job."""
+        return self.store.list_output_artifacts(job_id)
 
     def status(self, job_id: str) -> JobRecord | None:
         """Get job record from store."""

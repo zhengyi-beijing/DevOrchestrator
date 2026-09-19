@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -31,6 +32,18 @@ def _safe_job_id(job_id: str) -> str:
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
     if not all(c in allowed for c in cleaned):
         raise ValueError(f"invalid characters in job_id: {job_id!r}")
+    return cleaned
+
+
+def _safe_artifact_name(name: str) -> str:
+    cleaned = str(name).strip()
+    if not cleaned or len(cleaned) > 128:
+        raise ValueError(f"invalid artifact name: {name!r}")
+    if cleaned in (".", "..") or "/" in cleaned or "\\" in cleaned:
+        raise ValueError(f"artifact name cannot contain path separators or traversal: {name!r}")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    if not all(c in allowed for c in cleaned):
+        raise ValueError(f"invalid characters in artifact name: {name!r}")
     return cleaned
 
 
@@ -472,3 +485,153 @@ class ExecutionJobStore:
                 write_json(self.index_path, data, indent=2)
 
             return pruned_ids
+
+    def save_input_artifact(self, job_id: str, data: str | bytes | dict[str, Any]) -> str:
+        """Write content-addressed input.json to job directory and return its digest."""
+        jdir = self._job_dir(job_id)
+        if not self.read_only:
+            jdir.mkdir(parents=True, exist_ok=True)
+        input_file = jdir / "input.json"
+        if isinstance(data, (dict, list)):
+            raw = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        elif isinstance(data, str):
+            raw = data.encode("utf-8")
+        elif isinstance(data, bytes):
+            raw = data
+        else:
+            raise TypeError(f"unsupported input artifact type: {type(data)}")
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+
+        tmp = jdir / f"input.json.tmp.{uuid4().hex}"
+        with open(tmp, "wb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(input_file)
+
+        def _set_digest(rec: JobRecord) -> None:
+            rec.input_digest = digest
+            rec.timestamps["updated_at"] = utc_now_iso()
+
+        self.update(job_id, _set_digest)
+        return digest
+
+    def get_input_artifact(self, job_id: str) -> Optional[dict[str, Any] | str]:
+        """Read and digest-verify input.json from job directory."""
+        jdir = self._job_dir(job_id)
+        input_file = jdir / "input.json"
+        if not input_file.is_file():
+            return None
+        with open(input_file, "rb") as f:
+            raw = f.read()
+        rec = self.get(job_id)
+        if rec and rec.input_digest:
+            actual_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+            if actual_digest != rec.input_digest:
+                raise JobCorruptionError(f"input artifact digest mismatch for {job_id}: {actual_digest} != {rec.input_digest}")
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return raw.decode("utf-8", errors="replace")
+
+    def save_output_artifact(
+        self,
+        job_id: str,
+        name: str,
+        data: str | bytes | dict[str, Any],
+        max_bytes: int = 10 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Write size-bounded output artifact to <job_dir>/artifacts/<name> and index it."""
+        safe_name = _safe_artifact_name(name)
+        jdir = self._job_dir(job_id)
+        art_dir = jdir / "artifacts"
+        if not self.read_only:
+            art_dir.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(data, (dict, list)):
+            raw = json.dumps(data, sort_keys=True, indent=2, ensure_ascii=False).encode("utf-8")
+        elif isinstance(data, str):
+            raw = data.encode("utf-8")
+        elif isinstance(data, bytes):
+            raw = data
+        else:
+            raise TypeError(f"unsupported artifact data type: {type(data)}")
+
+        if len(raw) > max_bytes:
+            raise ValueError(f"artifact {safe_name} size {len(raw)} exceeds max_bytes {max_bytes}")
+
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        dest_file = art_dir / safe_name
+        tmp = art_dir / f"{safe_name}.tmp.{uuid4().hex}"
+        with open(tmp, "wb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(dest_file)
+
+        descriptor = {
+            "name": safe_name,
+            "sha256": digest,
+            "size_bytes": len(raw),
+            "updated_at": utc_now_iso(),
+        }
+
+        def _update_artifacts(rec: JobRecord) -> None:
+            if rec.artifacts is None:
+                rec.artifacts = {}
+            rec.artifacts[safe_name] = descriptor
+            rec.timestamps["updated_at"] = utc_now_iso()
+
+        self.update(job_id, _update_artifacts)
+        return descriptor
+
+    def get_output_artifact(self, job_id: str, name: str) -> Optional[dict[str, Any]]:
+        """Read and verify output artifact descriptor and content."""
+        safe_name = _safe_artifact_name(name)
+        jdir = self._job_dir(job_id)
+        art_file = jdir / "artifacts" / safe_name
+        if not art_file.is_file():
+            return None
+        with open(art_file, "rb") as f:
+            raw = f.read()
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        rec = self.get(job_id)
+        if rec and rec.artifacts and safe_name in rec.artifacts:
+            expected_digest = rec.artifacts[safe_name].get("sha256")
+            if expected_digest and digest != expected_digest:
+                raise JobCorruptionError(f"artifact digest mismatch for {safe_name} in {job_id}: {digest} != {expected_digest}")
+        content: Any
+        try:
+            content = json.loads(raw.decode("utf-8"))
+        except Exception:
+            content = raw.decode("utf-8", errors="replace")
+        return {
+            "name": safe_name,
+            "sha256": digest,
+            "size_bytes": len(raw),
+            "content": content,
+            "raw_bytes": raw,
+        }
+
+    def list_output_artifacts(self, job_id: str) -> list[dict[str, Any]]:
+        """List all output artifact descriptors for job."""
+        rec = self.get(job_id)
+        if rec and rec.artifacts:
+            return [dict(v) for v in rec.artifacts.values() if isinstance(v, dict)]
+        jdir = self._job_dir(job_id)
+        art_dir = jdir / "artifacts"
+        if not art_dir.is_dir():
+            return []
+        results = []
+        for p in sorted(art_dir.iterdir()):
+            if p.is_file() and not p.name.endswith((".tmp", ".lock")):
+                try:
+                    raw = p.read_bytes()
+                    results.append({
+                        "name": p.name,
+                        "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                        "size_bytes": len(raw),
+                    })
+                except OSError:
+                    pass
+        return results

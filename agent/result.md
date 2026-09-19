@@ -836,3 +836,34 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Full test suite: 790 passed, 45 subtests passed in 253.59s (`python -m pytest tests_py -q`).
   - Static checks passed: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check`.
 - Canonical worktree is ready for independent technical re-review.
+
+## P14.5 Reviewer Harness & OpenCodeReview Adapter (2026-09-19)
+
+- Executable Contract & Architecture Boundaries:
+  - Authored `docs/P14_5_REVIEWER_HARNESS_CONTRACT.md` and updated `docs/P14_DURABLE_JOBS_CONTRACT.md` (Section 10).
+  - Defined provider-neutral `ReviewerHarness` boundary, OpenCodeReview deterministic preparation adapter, strict evidence-only reviewer contract, SARIF 2.1.0 and canonical JSON artifacts, and independent gate requirements.
+  - Preserved the core lifecycle invariant: models, OpenCodeReview, and execution transports return evidence only; `AIReviewerCoordinator` remains the sole lifecycle authority writing `review-decisions.json`.
+- P14 Durable Job Substrate Extension:
+  - Added content-addressed `input_digest` in `JobSpec` and `JobRecord`, including input digest in `spec_hash` and conflict validation while remaining strictly additive (byte-identical hash when `input_digest` is absent).
+  - Added `JobArtifactDescriptor` and storage/retrieval APIs: `save_input_artifact`, `get_input_artifact`, `save_output_artifact`, `get_output_artifact`, `list_output_artifacts` with SHA-256 verification and size bounds.
+  - Extended `LocalJobTransport`, `SSHJobTransport`, `JobService`, and `remote_helper.py` with `job_artifact` operation.
+- Review Package (`src/dev_orchestrator/review`):
+  - `models.py`: versioned models (`ReviewRequest`, `ReviewSession`, `ReviewManifest`, `ReviewCoverage`, `ReviewFinding`, `ReviewResult`), deterministic SHA-256 finding fingerprinting, path containment validation, and SARIF 2.1.0 generator.
+  - `ocr_adapter.py`: `OpenCodeReviewAdapter` with capability probing, machine-readable JSON invocation (`shell=False`), workspace/range/commit diff preparation, bounded scan preparation, and rule resolution.
+  - `runner.py`: `ReviewRunner` CLI partitioning files into bounded packets, building evidence-only reviewer prompts, rejecting lifecycle tokens in model outputs, and persisting `findings.json`, `coverage.json`, `session.json`, and `review.sarif`.
+  - `store.py`: `ReviewSessionStore` persisting and retrieving review sessions with atomic JSON writes.
+  - `harness.py`: `ReviewerHarness` protocol and `DefaultReviewerHarness` implementation orchestrating OCR preparation, P14 job dispatch, status polling, and artifact reconciliation.
+- Coordinator Integration & Project Configuration:
+  - In `AIReviewerCoordinator`: added explicit project `reviewer_harness.enabled == True` opt-in while preserving direct legacy paths; enforces repository truth anchors (`branch`, `head`, `status_hash`), independent build/test gate checks, and coverage completeness (`complete` required for `next`); translates findings to deterministic `remediate` or `next` lifecycle decisions and progress milestones.
+  - In `config.py`: added `_normalize_reviewer_harness` validating `reviewer_harness` schema, backend/adapter, modes, rule pack paths, scan roots, transport, file limits, and independent gates.
+- Operator Surfaces & Domain Rules:
+  - Added CLI subcommands: `review-submit`, `review-status`, `review-reconcile`, and `review-findings` (with optional `--sarif` output).
+  - Added authenticated GET endpoints in Control API: `/api/v1/control/reviews`, `/api/v1/control/reviews/{session_id}`, `/api/v1/control/reviews/{session_id}/findings`, `/api/v1/control/reviews/{session_id}/coverage`, and `/api/v1/control/reviews/{session_id}/artifacts/{name}`.
+  - Authored `examples/labdemo_rules.json` with 5 domain rules: Service hardware authority, fail-safe X-ray OFF convergence, manual vs transactional scan separation, state-machine reachability, and preservation of compatibility paths (e.g., `scan.run`).
+- Verification:
+  - Focused P14.5 suites: 23 passed in 4.41s (`test_p145_reviewer_harness.py`, `test_p145_job_recovery.py`, `test_p145_software_acceptance.py`).
+  - P14 durable jobs suite: 43 passed in 10.91s (`test_p14_durable_jobs.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_job_recovery.py`, `test_p14_software_acceptance.py`).
+  - Full regression suite: 816 passed, 45 subtests passed in 264.05s (`python -m pytest tests_py -q`).
+  - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (4050 nodes, 11384 edges, 186 communities).
+- Canonical worktree clean and ready for independent technical review.

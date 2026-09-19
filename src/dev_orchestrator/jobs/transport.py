@@ -49,6 +49,12 @@ class JobTransport(Protocol):
         """Cancel active job on target host."""
         ...
 
+    def job_artifact(
+        self, job_id: str, job_dir: Optional[Path] = None, *, name: str
+    ) -> dict[str, Any]:
+        """Retrieve output artifact descriptor and content."""
+        ...
+
 
 class LocalJobTransport:
     """Default local detached supervisor transport."""
@@ -130,6 +136,27 @@ class LocalJobTransport:
             "host_identity": socket.gethostname(),
         }
 
+    def job_artifact(
+        self, job_id: str, job_dir: Optional[Path] = None, *, name: str
+    ) -> dict[str, Any]:
+        if job_dir is None:
+            raise ValueError("job_dir is required for LocalJobTransport.job_artifact")
+        from .store import ExecutionJobStore
+        store = ExecutionJobStore(job_dir.parent.parent, read_only=True)
+        art = store.get_output_artifact(job_id, name)
+        if art is None:
+            raise ValueError(f"artifact {name!r} not found for job {job_id}")
+        return {
+            "job_id": job_id,
+            "host_identity": socket.gethostname(),
+            "artifact": {
+                "name": art["name"],
+                "sha256": art["sha256"],
+                "size_bytes": art["size_bytes"],
+            },
+            "content": art["content"],
+        }
+
 
 class SSHJobTransport:
     """Remote job transport reusing SSH helper execution and correlation checks."""
@@ -165,6 +192,14 @@ class SSHJobTransport:
         }
         if spec.expected_working_directory:
             envelope["expected_working_directory"] = spec.expected_working_directory
+        if spec.input_digest:
+            envelope["input_digest"] = spec.input_digest
+            if job_dir is not None:
+                from .store import ExecutionJobStore
+                store = ExecutionJobStore(job_dir.parent.parent, read_only=True)
+                inp = store.get_input_artifact(actual_job_id)
+                if inp is not None:
+                    envelope["input_payload"] = inp
         return self._execute_op(envelope)
 
     def job_status(self, job_id: str, job_dir: Optional[Path] = None) -> dict[str, Any]:
@@ -200,3 +235,18 @@ class SSHJobTransport:
             "reason": reason,
         }
         return self._execute_op(envelope)
+
+    def job_artifact(
+        self, job_id: str, job_dir: Optional[Path] = None, *, name: str
+    ) -> dict[str, Any]:
+        req_id = f"job-art-{uuid4().hex[:12]}"
+        envelope = {
+            "operation": "job_artifact",
+            "request_id": req_id,
+            "job_id": job_id,
+            "artifact_name": name,
+        }
+        res = self._execute_op(envelope)
+        if res.get("status") == "not_found":
+            raise ValueError(f"artifact {name!r} not found for job {job_id}")
+        return res

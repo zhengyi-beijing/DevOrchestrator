@@ -65,6 +65,11 @@ _CONTROL_JOB_LOGS_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)/
 _CONTROL_JOB_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)$")
 _PAIRING_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/adapter-pairings/([A-Za-z0-9_-]+)/revoke$")
 _CAPABILITY_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/web-bridge-capabilities/([A-Za-z0-9_-]+)/revoke$")
+_CONTROL_REVIEWS_PATH_RE = re.compile(r"^/api/v1/control/reviews$")
+_CONTROL_REVIEW_SESSION_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_.:-]+)$")
+_CONTROL_REVIEW_FINDINGS_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_.:-]+)/findings$")
+_CONTROL_REVIEW_COVERAGE_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_.:-]+)/coverage$")
+_CONTROL_REVIEW_ARTIFACT_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_.:-]+)/artifacts/([A-Za-z0-9_.-]+)$")
 
 _ALLOW_HEADER = "GET, HEAD"
 _CONTROL_ALLOW_HEADER = "GET, HEAD, POST, OPTIONS"
@@ -720,6 +725,91 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     self._error(404, "Not Found", "job not found", head_only); return
                 redacted_rec = redact_secrets(rec.to_dict())
                 payload = _control_envelope(redacted_rec, sources=[{"name": "execution_jobs", "availability": "available"}])
+
+        elif path == "/api/v1/control/reviews":
+            if not self._owner_authorized():
+                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            from dev_orchestrator.review.store import ReviewSessionStore
+            store = ReviewSessionStore(runtime, read_only=True)
+            qs = parse_qs(parsed.query)
+            proj_filter = qs.get("project_id", [None])[0]
+            sessions = store.list_sessions(project_id=proj_filter)
+            payload = _control_envelope(sessions, sources=[{"name": "review_sessions", "availability": "available"}])
+
+        elif path.startswith("/api/v1/control/reviews/"):
+            if not self._owner_authorized():
+                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            from dev_orchestrator.review.store import ReviewSessionStore
+            store = ReviewSessionStore(runtime, read_only=True)
+
+            match_findings = _CONTROL_REVIEW_FINDINGS_PATH_RE.fullmatch(path)
+            match_coverage = _CONTROL_REVIEW_COVERAGE_PATH_RE.fullmatch(path)
+            match_artifact = _CONTROL_REVIEW_ARTIFACT_PATH_RE.fullmatch(path)
+            match_session = _CONTROL_REVIEW_SESSION_PATH_RE.fullmatch(path)
+
+            if match_findings:
+                session_id = match_findings.group(1)
+                session = store.get_session(session_id)
+                if session is None:
+                    self._error(404, "Not Found", "review session not found", head_only); return
+                findings_list = []
+                if session.result:
+                    findings_list = [f.to_dict() for f in session.result.findings]
+                elif session.job_id:
+                    from dev_orchestrator.jobs.store import ExecutionJobStore
+                    jstore = ExecutionJobStore(runtime, read_only=True)
+                    art = jstore.get_output_artifact(session.job_id, "findings.json")
+                    if art and isinstance(art.get("content"), list):
+                        findings_list = art["content"]
+                qs = parse_qs(parsed.query)
+                sev_filter = qs.get("severity", [None])[0]
+                rule_filter = qs.get("rule_id", [None])[0]
+                if sev_filter:
+                    findings_list = [f for f in findings_list if isinstance(f, dict) and f.get("severity") == sev_filter]
+                if rule_filter:
+                    findings_list = [f for f in findings_list if isinstance(f, dict) and f.get("rule_id") == rule_filter]
+                payload = _control_envelope(findings_list, sources=[{"name": "review_findings", "availability": "available"}])
+
+            elif match_coverage:
+                session_id = match_coverage.group(1)
+                session = store.get_session(session_id)
+                if session is None:
+                    self._error(404, "Not Found", "review session not found", head_only); return
+                cov_data = {}
+                if session.result and session.result.coverage:
+                    cov_data = session.result.coverage.to_dict()
+                elif session.job_id:
+                    from dev_orchestrator.jobs.store import ExecutionJobStore
+                    jstore = ExecutionJobStore(runtime, read_only=True)
+                    art = jstore.get_output_artifact(session.job_id, "coverage.json")
+                    if art and isinstance(art.get("content"), dict):
+                        cov_data = art["content"]
+                payload = _control_envelope(cov_data, sources=[{"name": "review_coverage", "availability": "available"}])
+
+            elif match_artifact:
+                session_id = match_artifact.group(1)
+                art_name = match_artifact.group(2)
+                session = store.get_session(session_id)
+                if session is None:
+                    self._error(404, "Not Found", "review session not found", head_only); return
+                if not session.job_id:
+                    self._error(404, "Not Found", "review job not found", head_only); return
+                from dev_orchestrator.jobs.store import ExecutionJobStore
+                jstore = ExecutionJobStore(runtime, read_only=True)
+                art = jstore.get_output_artifact(session.job_id, art_name)
+                if art is None:
+                    self._error(404, "Not Found", f"artifact {art_name!r} not found", head_only); return
+                payload = _control_envelope(art, sources=[{"name": "review_artifact", "availability": "available"}])
+
+            elif match_session:
+                session_id = match_session.group(1)
+                session = store.get_session(session_id)
+                if session is None:
+                    self._error(404, "Not Found", "review session not found", head_only); return
+                payload = _control_envelope(session.to_dict(), sources=[{"name": "review_sessions", "availability": "available"}])
+
+            else:
+                self._error(404, "Not Found", "route not found", head_only); return
 
         elif path == "/api/monitor":
             payload = monitor_payload(runtime)

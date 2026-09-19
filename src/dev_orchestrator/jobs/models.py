@@ -74,6 +74,7 @@ class JobSpec:
     broker_request_id: Optional[str] = None
     transport: str = "local"
     expected_working_directory: Optional[str] = None
+    input_digest: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -84,7 +85,7 @@ class JobSpec:
             raise ValueError(f"unsupported transport {self.transport!r}, must be 'local' or 'ssh'")
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "schema_version": JOB_SCHEMA_VERSION,
             "project_id": self.project_id,
             "command_ref": self.command_ref,
@@ -98,6 +99,9 @@ class JobSpec:
             "transport": self.transport,
             "expected_working_directory": self.expected_working_directory,
         }
+        if self.input_digest is not None:
+            d["input_digest"] = self.input_digest
+        return d
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> JobSpec:
@@ -113,6 +117,7 @@ class JobSpec:
             "broker_request_id",
             "transport",
             "expected_working_directory",
+            "input_digest",
             "metadata",
         }
         filtered = {k: data[k] for k in allowed if k in data and data[k] is not None}
@@ -217,6 +222,8 @@ class JobRecord:
         "recovery_safe_retry": False,
         "evidence": None,
     })
+    input_digest: Optional[str] = None
+    artifacts: dict[str, Any] = field(default_factory=dict)
 
     def transition_to(
         self,

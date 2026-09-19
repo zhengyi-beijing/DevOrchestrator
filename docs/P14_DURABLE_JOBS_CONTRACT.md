@@ -48,12 +48,13 @@ Submission requires a `JobSpec` containing:
 - `idempotency_key`: Caller-provided idempotency token.
 - `transport`: `"local"` or `"ssh"`.
 - `kind`: Phase/category (default `"validation"`).
-- Optional correlation fields: `task_id`, `stage_run_id`, `role_run_id`, `source_request_id`, `broker_request_id`, `expected_working_directory`.
+- Optional correlation fields: `task_id`, `stage_run_id`, `role_run_id`, `source_request_id`, `broker_request_id`, `expected_working_directory`, `input_digest`.
 
 The `spec_hash` is computed as:
 ```
 spec_hash = "sha256:" + sha256(canonical_json(spec))
 ```
+Note: `input_digest` is strictly additive; when omitted or `None`, `canonical_json(spec)` produces byte-identical results to existing specs.
 
 The deterministic `job_id` is derived as:
 ```
@@ -97,6 +98,116 @@ Before any command executes:
 4. Containment check `os.path.commonpath([realpath(repo_path), realpath(candidate)]) == realpath(repo_path)` is enforced. Any path traversal (`..`) or symlink escaping `repo_path` causes immediate fail-closed rejection with `failure_kind="cwd_escapes_repo_containment"`.
 5. If the request supplied `expected_working_directory`, it is evaluated solely as an equality assertion against `realpath(candidate)`. Any mismatch fails closed without execution.
 6. Execution always executes with `shell=False`.
+7. Allowlisted command `argv` may include the `{job_dir}` placeholder, which is securely resolved to the supervisor's canonical job directory, preventing arbitrary wire-supplied arguments.
+
+---
+
+## 5. Supervisor Execution and Process Isolation
+
+Execution is detached from daemon ticks via a dedicated supervisor process:
+- Invoked via: `python -m dev_orchestrator.jobs.supervisor --job-dir <dir>`
+- Single-instance enforcement: Verifies PID liveness and writes a unique `start_token` into `job.json`.
+- Process tree management: The child process is tracked and terminated on timeout or cancellation using OS-specific process tree termination.
+- Bounded logs: Child stdout and stderr are multiplexed into `<job_dir>/log.ndjson` with line-length and file-size caps, preserving head and tail lines with truncation markers.
+- Heartbeats: Periodically emitted to `<job_dir>/heartbeat.json` with strictly increasing sequence numbers.
+- Write-once result: Atomically writes `<job_dir>/result.json` upon child process exit.
+
+---
+
+## 6. Remote SSH Transport and Remote Helper Boundary
+
+Remote execution operates over SSH using `dev_orchestrator.ai.remote_helper`:
+- Fixed helper: The remote host executes `python -m dev_orchestrator.ai.remote_helper` over OpenSSH.
+- Protocol: JSON lines over stdin/stdout with request-response correlation.
+- Closed operations: `job_start`, `job_status`, `job_logs`, `job_cancel`, `job_artifact`.
+- No arbitrary commands: The helper resolves commands solely from the remote host's trusted configuration.
+- Host identity verification: SSH host keys are verified against configured known hosts.
+
+---
+
+## 7. Accounting and Progress Observability
+
+Execution jobs integrate into DevOrchestrator's accounting and observability systems:
+- Accounting intervals: Emits `managed_validation` accounting events keyed by `job_id`.
+- Watchdog integration: The progress watchdog inspects job heartbeats and state transitions without polling clock-dependent files.
+- Secret redaction: Secrets matching configured patterns are automatically redacted from logs and job records.
+
+---
+
+## 8. Documented Recovery Bounds
+
+1. **Max Runtime Bound**:
+   - Every job has an explicit `max_runtime_seconds` (default 300.0s).
+   - The supervisor forcibly terminates child processes exceeding this duration.
+
+2. **Heartbeat Freshness Bound**:
+   - Heartbeats are emitted at `heartbeat_interval_seconds` (default 5.0s).
+   - Reconcile detects stalled jobs if no heartbeat is received within `max(15.0, interval * 3)`.
+
+3. **Ambiguous Crash Bound**:
+   - If a supervisor process terminates without writing `result.json`, the job transitions to `unknown_recovery`.
+   - Automatic retry is refused until reconciled.
+
+4. **Process Never Started Bound**:
+   - If a supervisor PID fails to start or dies before emitting a start token, the job transitions to `failed` with `failure_kind="process_never_started"`.
+
+5. **Retry Intent Crash Bound**:
+   - If the daemon crashes after recording retry intent but before spawning the supervisor, startup recovery detects the pending intent and spawns the successor.
+
+6. **Transport Interruption Bound**:
+   - When an SSH connection drops or times out during dispatch or status check, the remote host retains its local durable store and detached supervisor execution.
+   - The local coordinator reconciles the job to `unknown_recovery` with `failure_kind="transport_unreachable"` and `recovery_safe_retry=False`, strictly refusing retry attempts to prevent duplicate remote execution.
+   - On reconnect, status is reconciled against the remote host-local durable store, resuming `running` observation or promoting to terminal completion; no automatic fallback to other transports or providers is attempted.
+
+7. **Orchestration Tick Budget Bound**:
+   - Periodic reconciliation during the daemon tick (`JobRecoveryCoordinator.advance()`) is bounded by `per_tick_budget` (default 10 jobs) to prevent daemon tick latency degradation.
+   - Startup sweep (`recover()`) processes all jobs once upon daemon launch.
+
+---
+
+## 9. Bounded Retention and Pruning Policy
+
+Job records and logs are managed under a strict retention policy declared in `execution-jobs.json`:
+
+1. **Retention Parameters**:
+   - `retention.max_jobs`: Maximum number of terminal jobs retained in the index (default 100).
+   - `retention.max_age_days`: Maximum age in days for terminal jobs before pruning (default 7 days).
+
+2. **Terminal-Only Pruning**:
+   - Only jobs in terminal states (`completed`, `failed`, `cancelled`) are eligible for pruning.
+   - Active and ambiguous jobs (`queued`, `running`, `unknown_recovery`) are strictly protected and NEVER pruned regardless of age or count.
+
+3. **Lineage Protection**:
+   - A predecessor job whose successor has not yet been spawned or settled is preserved to maintain retry audit lineage.
+
+4. **Atomic Store Pruning**:
+   - Pruning is executed under `InterProcessFileLock(jobs.lock)`.
+   - Pruned job directories `<runtime>/jobs/<job_id>` are removed and their entries are pruned from `index.json`.
+   - Retention is applied automatically during daemon startup recovery (`recover()`) and periodic tick sweeps (`advance()`).
+
+---
+
+## 10. Immutable Input and Bounded Output Artifacts
+
+Jobs support content-addressed immutable inputs and size-bounded output artifacts:
+
+1. **Content-Addressed Input Manifest**:
+   - Callers may supply an input payload (e.g. review request and prepared manifest) upon job submission.
+   - Stored in `<job_dir>/input.json` with cryptographic SHA-256 digest recorded in `JobSpec.input_digest` and `JobRecord.input_digest`.
+   - When present, `input_digest` participates in `spec_hash` and identity validation. When absent, `spec_hash` remains strictly byte-identical to predecessor job records.
+   - Input payloads are preserved byte-identically across retry successors.
+
+2. **Bounded Output Artifacts**:
+   - Jobs may write structured output artifacts into `<job_dir>/artifacts/<artifact_name>`.
+   - Artifact names are restricted to safe POSIX basenames (`[A-Za-z0-9_.-]+`); directory traversal (`..`), `/`, and `\\` are strictly prohibited.
+   - Artifacts enforce maximum byte limits (default 10MB per artifact).
+   - Output artifacts are indexed in `JobRecord.artifacts` with their file name, SHA-256 digest, and size in bytes.
+
+3. **Digest-Verified Local and Remote Retrieval**:
+   - `JobService.get_artifact(job_id, name)` retrieves output artifacts.
+   - For local jobs, the file is read from `<job_dir>/artifacts/<name>` and verified against the recorded SHA-256 digest.
+   - For SSH jobs, the artifact is retrieved via `remote_helper` (`operation="job_artifact"`), and its content SHA-256 is verified before being returned to the caller.
+
 
 ---
 

@@ -377,6 +377,127 @@ def _normalize_project_watchdog(raw: Any, index: int, config_path: Path) -> dict
     }
 
 
+_ALLOWED_HARNESS_KEYS = frozenset({
+    "enabled",
+    "backend",
+    "adapter",
+    "ocr_executable",
+    "command_ref",
+    "mode",
+    "diff_mode",
+    "rule_pack_path",
+    "rule_pack",
+    "scan_roots",
+    "file_limits",
+    "max_files",
+    "max_bytes",
+    "packet_size",
+    "max_packet_bytes",
+    "transport",
+    "blocking_severities",
+    "independent_gates",
+})
+
+
+def _normalize_reviewer_harness(raw: Any, index: int, config_path: Path) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness must be an object".format(config_path, index)
+        )
+    unknown = set(raw.keys()) - _ALLOWED_HARNESS_KEYS
+    if unknown:
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness has unknown keys: {2}".format(
+                config_path, index, sorted(unknown)
+            )
+        )
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.enabled must be a boolean".format(config_path, index)
+        )
+    backend = str(raw.get("backend") or raw.get("adapter") or "opencode_review").strip()
+    if backend not in ("opencode_review", "mock", "stub"):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.backend must be 'opencode_review'".format(config_path, index)
+        )
+    ocr_exec = raw.get("ocr_executable")
+    if ocr_exec is not None and not isinstance(ocr_exec, str):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.ocr_executable must be a string or null".format(config_path, index)
+        )
+    cmd_ref = str(raw.get("command_ref", "review-runner")).strip()
+    if not cmd_ref:
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.command_ref must be nonblank".format(config_path, index)
+        )
+    mode = str(raw.get("mode", "diff")).strip().lower()
+    if mode not in ("diff", "scan"):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.mode must be 'diff' or 'scan'".format(config_path, index)
+        )
+    diff_mode = str(raw.get("diff_mode", "workspace")).strip().lower()
+    if diff_mode not in ("workspace", "range", "commit"):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.diff_mode must be 'workspace', 'range', or 'commit'".format(config_path, index)
+        )
+    rule_pack = raw.get("rule_pack_path") or raw.get("rule_pack")
+    if rule_pack is not None and (not isinstance(rule_pack, str) or not rule_pack.strip()):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.rule_pack_path must be a nonblank string".format(config_path, index)
+        )
+    scan_roots = raw.get("scan_roots", ["."])
+    if not isinstance(scan_roots, list) or not all(isinstance(r, str) for r in scan_roots):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.scan_roots must be a list of strings".format(config_path, index)
+        )
+    transport = str(raw.get("transport", "local")).strip().lower()
+    if transport not in ("local", "ssh"):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.transport must be 'local' or 'ssh'".format(config_path, index)
+        )
+    blocking = raw.get("blocking_severities", ["blocking"])
+    if not isinstance(blocking, list) or not all(isinstance(b, str) for b in blocking):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.blocking_severities must be a list of strings".format(config_path, index)
+        )
+    gates = raw.get("independent_gates", [])
+    if not isinstance(gates, list) or not all(isinstance(g, str) for g in gates):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.independent_gates must be a list of strings".format(config_path, index)
+        )
+    raw_limits = raw.get("file_limits")
+    if raw_limits is None:
+        raw_limits = {}
+    elif not isinstance(raw_limits, dict):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.file_limits must be an object".format(config_path, index)
+        )
+    file_limits = {
+        "max_files": int(raw.get("max_files", raw_limits.get("max_files", 100))),
+        "max_total_bytes": int(raw.get("max_bytes", raw_limits.get("max_total_bytes", raw_limits.get("max_bytes", 1024 * 1024)))),
+        "max_packet_files": int(raw.get("packet_size", raw_limits.get("max_packet_files", raw_limits.get("packet_size", 10)))),
+        "max_packet_bytes": int(raw.get("max_packet_bytes", raw_limits.get("max_packet_bytes", 200 * 1024))),
+    }
+    normalized_rule_pack = rule_pack.strip() if isinstance(rule_pack, str) and rule_pack.strip() else None
+    return {
+        "enabled": enabled,
+        "backend": backend,
+        "adapter": backend,
+        "ocr_executable": ocr_exec.strip() if isinstance(ocr_exec, str) and ocr_exec.strip() else None,
+        "command_ref": cmd_ref,
+        "mode": mode,
+        "diff_mode": diff_mode,
+        "rule_pack_path": normalized_rule_pack,
+        "rule_pack": normalized_rule_pack,
+        "scan_roots": [r.strip() for r in scan_roots if r.strip()],
+        "transport": transport,
+        "blocking_severities": blocking,
+        "independent_gates": [g.strip() for g in gates if g.strip()],
+        "file_limits": file_limits,
+    }
+
+
 def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str, Any]:
     """One project entry -> canonical copy with legacy aliases preserved."""
     if not isinstance(project, dict):
@@ -424,10 +545,14 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
     raw_watchdog = project.get("watchdog")
     if raw_watchdog is not None:
         normalized["watchdog"] = _normalize_project_watchdog(raw_watchdog, index, config_path)
+    raw_harness = project.get("reviewer_harness")
+    if raw_harness is not None:
+        normalized["reviewer_harness"] = _normalize_reviewer_harness(raw_harness, index, config_path)
     normalized["orchestration_ready"] = (
         _binding_ready(normalized.get("conversation_binding"))
         or _direct_reviewer_ready(normalized)
         or _direct_planner_ready(normalized)
+        or (isinstance(normalized.get("reviewer_harness"), dict) and normalized["reviewer_harness"].get("enabled") is True)
     )
     return normalized
 

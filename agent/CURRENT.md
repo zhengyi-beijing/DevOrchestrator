@@ -5,31 +5,38 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P14 Remote Execution Resilience & Recoverable Jobs** — **TECHNICAL REVIEW REMEDIATION COMPLETE / READY FOR TECHNICAL RE-REVIEW**.
+Current task: **P14.5 Reviewer Harness & OpenCodeReview Adapter** — **IMPLEMENTATION COMPLETE / READY FOR TECHNICAL REVIEW**.
 
 Latest continuation state (2026-09-19):
-- Completed Third-Round Technical Review Remediation for P14 Remote Execution Resilience & Recoverable Jobs:
-  1. SSH Unreachable Transport Ambiguity & Retry Refusal (`service.py`, `store.py`, `models.py`):
-     - When remote status polling fails on non-local jobs (e.g. transport timeout, network interruption), `JobService.reconcile` transitions the job to non-terminal `unknown_recovery` with `failure_kind="transport_unreachable"` and `recovery_safe_retry=False`, strictly avoiding terminal `failed`.
-     - `ExecutionJobStore.claim_retry` and `JobService.retry` explicitly refuse retry attempts on `unknown_recovery` or `failure_kind="transport_unreachable"` jobs, preventing duplicate remote supervisor execution while the remote process is still running.
-     - `has_started_evidence` in `service.py` recognizes recorded supervisor PIDs (`supervisor.get("pid") > 0`), ensuring recorded dispatch PIDs are treated as start evidence.
-     - `VALID_TRANSITIONS` updated to legally permit `queued -> unknown_recovery` (for unreachable dispatch) and `unknown_recovery -> running` (when live remote execution resumes on reconnect).
-     - In `_sync_remote_job`, reconnecting to an actively running remote job cleanly transitions `unknown_recovery` back to `running`.
-  2. Contract Document (`docs/P14_DURABLE_JOBS_CONTRACT.md`):
-     - Updated Section 2 State Machine and Transition Table to include `queued -> unknown_recovery` and `unknown_recovery -> running`.
-     - Updated Section 8.6 Transport Interruption Bound documenting transition to `unknown_recovery` with `failure_kind="transport_unreachable"` and `recovery_safe_retry=False`, retry refusal, and status reconciliation on reconnect.
-  3. Acceptance and Regression Test Coverage (`tests_py/test_p14_software_acceptance.py`, `tests_py/test_p14_durable_jobs.py`, `tests_py/test_p14_job_retry_identity.py`):
-     - Updated Case 6b in `tests_py/test_p14_software_acceptance.py`: asserts transition to `unknown_recovery` with `failure_kind="transport_unreachable"`, asserts `service.retry` is refused, asserts reconnect reconciles to `running`, and asserts remote completion promotes to `completed`.
-     - Added Case 6c in `tests_py/test_p14_software_acceptance.py`: verifies that when `supervisor_pid` was recorded at submit and SSH drops during status check, it transitions to `unknown_recovery`, refuses retry, and reconciles to `running` on reconnect.
-     - Added transition tests for `queued -> unknown_recovery` and `unknown_recovery -> running` in `tests_py/test_p14_durable_jobs.py`.
-     - Added `test_refusal_to_retry_unknown_recovery_and_transport_unreachable_job` in `tests_py/test_p14_job_retry_identity.py`.
-  4. Verification:
-     - Focused P14 suite: 41 passed in 10.73s (`test_p14_durable_jobs.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_job_recovery.py`, `test_p14_software_acceptance.py`).
-     - Adjacent regression: 71 passed, 6 subtests passed in 18.99s (`test_p13_execution_transport.py`, `test_p13_software_acceptance.py`, `test_p12_control_foundation.py`, `test_p12_control_actions.py`, `test_web.py`, `test_watchdog.py`, `test_cli.py`).
-     - Full test suite: 788 passed, 45 subtests passed in 254.79s (`python -m pytest tests_py -q`).
+- Implemented P14.5 Reviewer Harness & OpenCodeReview Adapter:
+  1. Executable Contract & Architecture Boundary (`docs/P14_5_REVIEWER_HARNESS_CONTRACT.md`, `docs/P14_DURABLE_JOBS_CONTRACT.md`):
+     - Authored canonical P14.5 contract defining provider-neutral `ReviewerHarness` boundary, OpenCodeReview deterministic preparation adapter, strict evidence-only reviewer contract, SARIF 2.1.0 and canonical JSON artifacts, and independent gate requirements.
+     - Documented and preserved the core lifecycle invariant: models, OpenCodeReview, and execution transports return evidence only; `AIReviewerCoordinator` remains the sole lifecycle authority writing `review-decisions.json`.
+     - Updated P14 contract (Section 10) to specify content-addressed `input_digest` in `JobSpec`/`JobRecord` and bounded output artifact descriptors.
+  2. P14 Durable Job Substrate Extension (`models.py`, `store.py`, `transport.py`, `service.py`, `remote_helper.py`):
+     - Added content-addressed `input_digest` to `JobSpec` and `JobRecord`, including input digest in `spec_hash` and conflict validation while remaining strictly additive (byte-identical hash when `input_digest` is absent).
+     - Added `JobArtifactDescriptor` and storage/retrieval APIs: `save_input_artifact`, `get_input_artifact`, `save_output_artifact`, `get_output_artifact`, `list_output_artifacts` with SHA-256 verification and size bounds.
+     - Extended `LocalJobTransport`, `SSHJobTransport`, `JobService`, and `remote_helper.py` with `job_artifact` operation.
+  3. Review Package (`src/dev_orchestrator/review`):
+     - `models.py`: versioned models (`ReviewRequest`, `ReviewSession`, `ReviewManifest`, `ReviewCoverage`, `ReviewFinding`, `ReviewResult`), deterministic SHA-256 finding fingerprinting, path containment validation, and SARIF 2.1.0 generator.
+     - `ocr_adapter.py`: `OpenCodeReviewAdapter` with capability probing, machine-readable JSON invocation (`shell=False`), workspace/range/commit diff preparation, bounded scan preparation, and rule resolution.
+     - `runner.py`: `ReviewRunner` CLI partitioning files into bounded packets, building evidence-only reviewer prompts, rejecting lifecycle tokens in model outputs, and persisting `findings.json`, `coverage.json`, `session.json`, and `review.sarif`.
+     - `store.py`: `ReviewSessionStore` persisting and retrieving review sessions with atomic JSON writes.
+     - `harness.py`: `ReviewerHarness` protocol and `DefaultReviewerHarness` implementation orchestrating OCR preparation, P14 job dispatch, status polling, and artifact reconciliation.
+  4. Coordinator Integration & Project Configuration (`ai_reviewer.py`, `config.py`):
+     - In `AIReviewerCoordinator`: added explicit project `reviewer_harness.enabled == True` opt-in while preserving direct legacy paths; enforces repository truth anchors (`branch`, `head`, `status_hash`), independent build/test gate checks, and coverage completeness (`complete` required for `next`); translates findings to deterministic `remediate` or `next` lifecycle decisions and progress milestones.
+     - In `config.py`: added `_normalize_reviewer_harness` validating `reviewer_harness` schema, backend/adapter, modes, rule pack paths, scan roots, transport, file limits, and independent gates.
+  5. Operator Surfaces & Domain Rules (`cli.py`, `web/server.py`, `examples/labdemo_rules.json`):
+     - Added CLI subcommands: `review-submit`, `review-status`, `review-reconcile`, and `review-findings` (with optional `--sarif` output).
+     - Added authenticated GET endpoints in Control API: `/api/v1/control/reviews`, `/api/v1/control/reviews/{session_id}`, `/api/v1/control/reviews/{session_id}/findings`, `/api/v1/control/reviews/{session_id}/coverage`, and `/api/v1/control/reviews/{session_id}/artifacts/{name}`.
+     - Authored `examples/labdemo_rules.json` with 5 domain rules: Service hardware authority, fail-safe X-ray OFF convergence, manual vs transactional scan separation, state-machine reachability, and preservation of compatibility paths (e.g., `scan.run`).
+  6. Verification:
+     - Focused P14.5 suites: 23 passed in 4.41s (`test_p145_reviewer_harness.py`, `test_p145_job_recovery.py`, `test_p145_software_acceptance.py`).
+     - P14 durable jobs suite: 43 passed in 10.91s (`test_p14_durable_jobs.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_job_recovery.py`, `test_p14_software_acceptance.py`).
+     - Full regression suite: 816 passed, 45 subtests passed in 264.05s (`python -m pytest tests_py -q`).
      - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
-     - Knowledge graph updated with `graphify update .` (3806 nodes, 10630 edges, 184 communities).
-- Immediate continuation rule: conduct independent technical re-review on clean worktree.
+     - Knowledge graph updated with `graphify update .` (4050 nodes, 11384 edges, 186 communities).
+- Immediate continuation rule: conduct independent technical review on clean worktree.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
