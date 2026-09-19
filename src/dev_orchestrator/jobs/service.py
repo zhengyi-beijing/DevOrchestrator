@@ -216,7 +216,15 @@ class JobService:
             raise ValueError(f"job {job_id} not found")
         transport = self._get_transport(record.transport)
         jdir = self.store._job_dir(job_id)
-        return transport.job_artifact(job_id, jdir, name=name)
+        res = transport.job_artifact(job_id, jdir, name=name)
+        from .store import _safe_artifact_name, JobCorruptionError
+        safe_name = _safe_artifact_name(name)
+        if record.artifacts and safe_name in record.artifacts:
+            expected_sha = record.artifacts[safe_name].get("sha256")
+            actual_sha = (res.get("artifact") or {}).get("sha256") or res.get("sha256")
+            if expected_sha and actual_sha and actual_sha != expected_sha:
+                raise JobCorruptionError(f"artifact digest mismatch for {safe_name} in {job_id}: {actual_sha} != {expected_sha}")
+        return res
 
     def list_artifacts(self, job_id: str) -> list[dict[str, Any]]:
         """List output artifacts for job."""

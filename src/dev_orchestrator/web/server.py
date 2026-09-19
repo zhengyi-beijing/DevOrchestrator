@@ -66,10 +66,10 @@ _CONTROL_JOB_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)$")
 _PAIRING_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/adapter-pairings/([A-Za-z0-9_-]+)/revoke$")
 _CAPABILITY_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/web-bridge-capabilities/([A-Za-z0-9_-]+)/revoke$")
 _CONTROL_REVIEWS_PATH_RE = re.compile(r"^/api/v1/control/reviews$")
-_CONTROL_REVIEW_SESSION_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_.:-]+)$")
-_CONTROL_REVIEW_FINDINGS_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_.:-]+)/findings$")
-_CONTROL_REVIEW_COVERAGE_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_.:-]+)/coverage$")
-_CONTROL_REVIEW_ARTIFACT_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_.:-]+)/artifacts/([A-Za-z0-9_.-]+)$")
+_CONTROL_REVIEW_SESSION_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_:-]+)$")
+_CONTROL_REVIEW_FINDINGS_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_:-]+)/findings$")
+_CONTROL_REVIEW_COVERAGE_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_:-]+)/coverage$")
+_CONTROL_REVIEW_ARTIFACT_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_:-]+)/artifacts/([A-Za-z0-9_.-]+)$")
 
 _ALLOW_HEADER = "GET, HEAD"
 _CONTROL_ALLOW_HEADER = "GET, HEAD, POST, OPTIONS"

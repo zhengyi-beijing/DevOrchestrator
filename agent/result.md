@@ -890,3 +890,33 @@ P14.5 Remediation result:
      - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
      - Knowledge graph updated with `graphify update .` (4063 nodes, 11476 edges, 182 communities).
 - Canonical worktree clean, all technical review findings remediated and verified. Ready for local commit.
+
+## P14.5 Round 2 Technical Review Remediation (2026-09-19)
+
+- Remediated the concrete findings from technical review round 2:
+  1. Coverage Completeness Integrity (`runner.py`):
+     - Files omitted from model output (`reviewed_files: []`) and files skipped without valid non-generic reasons are classified as `status: "unreviewed"`.
+     - Omitted or invalidly skipped files prevent `completeness = "complete"`, setting `completeness = "partial"` and failing closed with `disposition = "failed"`.
+     - Valid skips require non-empty, non-generic reason (generic tokens like "n/a", "none", "skip" rejected).
+     - Removed faulty fallback that fabricated 100% complete coverage when files were omitted.
+  2. OCR Diff Scope Resolution in `workspace` mode (`ocr_adapter.py`):
+     - Workspace mode always includes committed changes from the anchored `HEAD` commit (`git diff-tree --root`) alongside working-tree modifications.
+     - Untracked files (e.g. `?? graphify-out/`) or unrelated dirty files (e.g. `M agent/CURRENT.md`) no longer mask or bypass committed changes at HEAD.
+     - Fails closed (`raise RuntimeError`) if the anchored HEAD commit contributes no selected files.
+  3. Remote & Local Artifact SHA-256 Digest Verification:
+     - `SSHJobTransport.job_artifact`: Recomputes SHA-256 digest over received artifact payload (`raw_text` / content) and raises `JobCorruptionError` on mismatch with remote descriptor.
+     - `JobService.get_artifact`: Verifies artifact SHA-256 against `JobRecord.artifacts` descriptor, raising `JobCorruptionError` on mismatch/tampering.
+     - `remote_helper.py`: Emits `raw_text` in artifact response to support byte-exact digest verification.
+  4. Route & Session Security:
+     - `web/server.py`: Tightened review session route regex to `[A-Za-z0-9_:-]+` (disallowing `.`), returning clean 404 instead of 500 `ValueError` from injective session store encoding.
+     - `store.py`: `get_session` catches `ValueError` gracefully, returning `None`.
+  5. Harness Configuration & Timeout Plumbing:
+     - `config.py`: Restricted `reviewer_harness.backend` strictly to `"opencode_review"`; added, validated, and normalized `timeout_seconds` and `poll_interval_seconds`.
+     - `ai_reviewer.py`: Plumbed configured timeouts into harness execution loop.
+- Verification:
+  - Focused P14.5 test suites: 39 passed in 10.31s (`test_p145_reviewer_harness.py`, `test_p145_job_recovery.py`, `test_p145_software_acceptance.py`).
+  - Adjacent P14 durable jobs suites: 43 passed in 10.30s (`test_p14_durable_jobs.py`, `test_p14_job_recovery.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_software_acceptance.py`).
+  - Full repository regression: 832 passed, 45 subtests passed in 264.27s (`python -m pytest tests_py -q`).
+  - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (4071 nodes, 11525 edges, 189 communities).
+- Canonical worktree clean, all technical review findings remediated and verified. Committed locally without push.

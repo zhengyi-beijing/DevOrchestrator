@@ -208,21 +208,25 @@ class OpenCodeReviewAdapter:
                     excluded.append({"path": path_str, "reason": "deleted"})
                 else:
                     candidate_paths.append(path_str)
-            # If workspace has no uncommitted changes (clean post-worker state),
-            # inspect the worker's commit at HEAD so changes are not silently skipped
-            if not candidate_paths and not excluded:
-                c = refs.get("commit", refs.get("head", "HEAD"))
-                c_cmd = ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", c]
-                c_res = self._subprocess.run(
-                    c_cmd,
-                    cwd=str(self.repo_path),
-                    capture_output=True,
-                    text=True,
-                    shell=False,
-                    **hidden_subprocess_kwargs(),
-                )
-                if c_res.returncode == 0:
-                    candidate_paths = [l.strip() for l in c_res.stdout.splitlines() if l.strip()]
+            # In post-worker workspace review, select the HEAD commit diff in addition to
+            # the working-tree delta rather than gating on a fully empty porcelain, so committed
+            # changes are never skipped when untracked files or unrelated edits exist.
+            head_commit = refs.get("commit") or refs.get("head") or "HEAD"
+            c_cmd = ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", head_commit]
+            c_res = self._subprocess.run(
+                c_cmd,
+                cwd=str(self.repo_path),
+                capture_output=True,
+                text=True,
+                shell=False,
+                **hidden_subprocess_kwargs(),
+            )
+            if c_res.returncode != 0:
+                raise RuntimeError(f"git diff-tree failed ({c_res.returncode}): {c_res.stderr.strip()}")
+            head_paths = [l.strip() for l in c_res.stdout.splitlines() if l.strip()]
+            for hp in head_paths:
+                if hp not in candidate_paths:
+                    candidate_paths.append(hp)
         else:
             candidate_paths = [l.strip() for l in lines if l.strip()]
 
@@ -267,6 +271,17 @@ class OpenCodeReviewAdapter:
                 "sha256": digest,
             })
             total_bytes += size
+
+        if mode == "workspace":
+            norm_head_paths: set[str] = set()
+            for hp in head_paths:
+                try:
+                    norm_head_paths.add(_normalize_repo_path(hp))
+                except ValueError:
+                    pass
+            head_selected = [s for s in selected if s["path"] in norm_head_paths]
+            if not head_selected:
+                raise RuntimeError(f"anchored head commit {head_commit} contributes no selected files for review")
 
         return selected, excluded, refs
 

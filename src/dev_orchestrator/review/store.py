@@ -49,7 +49,10 @@ class ReviewSessionStore:
 
     def get_session(self, session_id: str) -> Optional[ReviewSession]:
         """Load review session by identifier."""
-        file_p = self._session_file(session_id)
+        try:
+            file_p = self._session_file(session_id)
+        except ValueError:
+            return None
         if not file_p.is_file():
             return None
         data = read_json(file_p, None)

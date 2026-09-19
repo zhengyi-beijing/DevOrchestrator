@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import socket
 import subprocess
 import sys
@@ -249,4 +251,24 @@ class SSHJobTransport:
         res = self._execute_op(envelope)
         if res.get("status") == "not_found":
             raise ValueError(f"artifact {name!r} not found for job {job_id}")
+
+        art_meta = res.get("artifact", {})
+        expected_sha = art_meta.get("sha256")
+        raw_text = res.get("raw_text")
+        if raw_text is not None and expected_sha:
+            computed_sha = "sha256:" + hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+            if computed_sha != expected_sha:
+                from .store import JobCorruptionError
+                raise JobCorruptionError(f"SSH artifact digest verification failed for {name}: {computed_sha} != {expected_sha}")
+        elif res.get("content") is not None and expected_sha:
+            content = res["content"]
+            if isinstance(content, str):
+                raw_bytes = content.encode("utf-8")
+            else:
+                raw_bytes = json.dumps(content, sort_keys=True, indent=2, ensure_ascii=False).encode("utf-8")
+            computed_sha = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+            if computed_sha != expected_sha:
+                from .store import JobCorruptionError
+                raise JobCorruptionError(f"SSH artifact digest verification failed for {name}: {computed_sha} != {expected_sha}")
+
         return res

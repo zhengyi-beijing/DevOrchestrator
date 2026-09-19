@@ -745,8 +745,8 @@ class AIReviewerCoordinator:
                     rec["session_id"] = session.session_id
                     self._save_state(state)
 
-            timeout = float(policy.get("timeout_seconds", 600.0))
-            poll_interval = 0.2
+            timeout = float(harness_cfg.get("timeout_seconds", harness_cfg.get("timeout", policy.get("timeout_seconds", 600.0))))
+            poll_interval = float(harness_cfg.get("poll_interval_seconds", harness_cfg.get("poll_interval", 0.2)))
             start_poll = time.monotonic()
 
             while time.monotonic() - start_poll < timeout:

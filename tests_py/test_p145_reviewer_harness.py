@@ -190,6 +190,43 @@ class OpenCodeReviewAdapterTests(unittest.TestCase):
         paths = [s["path"] for s in selected]
         self.assertIn("src/driver.py", paths)
 
+    def test_diff_preview_workspace_selects_head_commit_when_untracked_files_exist(self):
+        # Clean working tree with untracked directory/file (like ?? graphify-out/)
+        (self.repo / "graphify-out").mkdir(parents=True, exist_ok=True)
+        (self.repo / "graphify-out" / "graph.json").write_text("{}", encoding="utf-8")
+        adapter = OpenCodeReviewAdapter(self.repo)
+        selected, excluded, refs = adapter.prepare_diff("workspace", {}, {"max_files": 10, "max_bytes": 100000})
+        paths = [s["path"] for s in selected]
+        self.assertIn("src/driver.py", paths)
+        self.assertIn("src/safety.py", paths)
+        ex_paths = [e["path"] for e in excluded]
+        self.assertTrue(any("graphify-out" in ep for ep in ex_paths))
+
+    def test_diff_preview_workspace_selects_both_unrelated_tracked_and_head_commit(self):
+        # Worker committed changes at HEAD, but left an unrelated tracked file dirty
+        (self.repo / "notes.txt").write_text("initial notes\n", encoding="utf-8")
+        subprocess.run(["git", "add", "notes.txt"], cwd=str(self.repo), capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "add notes"], cwd=str(self.repo), capture_output=True, check=True)
+        # Now commit driver change
+        (self.repo / "src" / "driver.py").write_text("def run(): print('committed worker change')\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(self.repo), capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "worker change"], cwd=str(self.repo), capture_output=True, check=True)
+        # Leave unrelated tracked file dirty
+        (self.repo / "notes.txt").write_text("unrelated working tree edit\n", encoding="utf-8")
+        adapter = OpenCodeReviewAdapter(self.repo)
+        selected, excluded, refs = adapter.prepare_diff("workspace", {}, {"max_files": 10, "max_bytes": 100000})
+        paths = [s["path"] for s in selected]
+        self.assertIn("notes.txt", paths)
+        self.assertIn("src/driver.py", paths)
+
+    def test_diff_preview_workspace_fails_closed_when_head_commit_contributes_no_selected_files(self):
+        # Commit an empty commit
+        subprocess.run(["git", "commit", "--allow-empty", "-m", "empty"], cwd=str(self.repo), capture_output=True, check=True)
+        adapter = OpenCodeReviewAdapter(self.repo)
+        with self.assertRaises(RuntimeError) as ctx:
+            adapter.prepare_diff("workspace", {}, {"max_files": 10, "max_bytes": 100000})
+        self.assertIn("contributes no selected files", str(ctx.exception))
+
     def test_resolve_rules_from_rule_pack(self):
         rule_pack = {
             "name": "Test Rules",
@@ -647,6 +684,171 @@ class DefaultReviewerHarnessTests(unittest.TestCase):
         self.assertEqual(c_art["content"]["completeness"], "failed")
         sess_art = store.get_output_artifact(session.job_id, "session.json")
         self.assertEqual(sess_art["content"]["result"]["disposition"], "failed")
+
+    def test_review_runner_omitted_reviewed_files_fails_completeness_and_fails_closed(self):
+        from dev_orchestrator.ai.contracts import AIRoleResult
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={"review-runner": JobCommandConfig(argv=["python", "-c", "import sys; sys.exit(0)"], cwd=".")},
+                )
+            },
+        )
+        job_service = JobService(self.runtime, config=job_cfg)
+        harness = DefaultReviewerHarness(self.runtime, job_service=job_service)
+        (self.repo / "test.py").write_text("print(1)\n", encoding="utf-8")
+        req = ReviewRequest(
+            request_id="runner_omitted_sess",
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_1",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["."],
+            metadata={"repo_path": str(self.repo)},
+        )
+        session = harness.submit(req)
+        store = ExecutionJobStore(self.runtime)
+        jdir = store._job_dir(session.job_id)
+
+        mock_port = MagicMock()
+        mock_port.execute.return_value = AIRoleResult(
+            request_id="ocr_review:runner_omitted_sess:0",
+            role_run_id="reviewer",
+            status="succeeded",
+            output=json.dumps({
+                "reviewed_files": [],
+                "skipped_files": [],
+                "findings": [],
+            }),
+        )
+
+        runner = ReviewRunner(jdir, port=mock_port)
+        ret = runner.run()
+        self.assertEqual(ret, 0)
+
+        c_art = store.get_output_artifact(session.job_id, "coverage.json")
+        sess_art = store.get_output_artifact(session.job_id, "session.json")
+        cov_data = c_art["content"]
+        self.assertEqual(cov_data["completeness"], "partial")
+        self.assertEqual(cov_data["reviewed_count"], 0)
+        self.assertEqual(cov_data["files"]["test.py"]["status"], "unreviewed")
+        self.assertEqual(sess_art["content"]["result"]["disposition"], "failed")
+
+    def test_review_runner_skip_without_valid_reason_fails_completeness(self):
+        from dev_orchestrator.ai.contracts import AIRoleResult
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={"review-runner": JobCommandConfig(argv=["python", "-c", "import sys; sys.exit(0)"], cwd=".")},
+                )
+            },
+        )
+        job_service = JobService(self.runtime, config=job_cfg)
+        harness = DefaultReviewerHarness(self.runtime, job_service=job_service)
+        (self.repo / "test.py").write_text("print(1)\n", encoding="utf-8")
+        req = ReviewRequest(
+            request_id="runner_invalid_skip_sess",
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_1",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["."],
+            metadata={"repo_path": str(self.repo)},
+        )
+        session = harness.submit(req)
+        store = ExecutionJobStore(self.runtime)
+        jdir = store._job_dir(session.job_id)
+
+        mock_port = MagicMock()
+        mock_port.execute.return_value = AIRoleResult(
+            request_id="ocr_review:runner_invalid_skip_sess:0",
+            role_run_id="reviewer",
+            status="succeeded",
+            output=json.dumps({
+                "reviewed_files": [],
+                "skipped_files": [{"path": "test.py", "reason": "skipped"}],
+                "findings": [],
+            }),
+        )
+
+        runner = ReviewRunner(jdir, port=mock_port)
+        ret = runner.run()
+        self.assertEqual(ret, 0)
+
+        c_art = store.get_output_artifact(session.job_id, "coverage.json")
+        sess_art = store.get_output_artifact(session.job_id, "session.json")
+        cov_data = c_art["content"]
+        self.assertEqual(cov_data["completeness"], "partial")
+        self.assertEqual(cov_data["skipped_count"], 0)
+        self.assertEqual(cov_data["files"]["test.py"]["status"], "unreviewed")
+        self.assertEqual(sess_art["content"]["result"]["disposition"], "failed")
+
+    def test_review_runner_skip_with_valid_reason_allows_complete_coverage(self):
+        from dev_orchestrator.ai.contracts import AIRoleResult
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={"review-runner": JobCommandConfig(argv=["python", "-c", "import sys; sys.exit(0)"], cwd=".")},
+                )
+            },
+        )
+        job_service = JobService(self.runtime, config=job_cfg)
+        harness = DefaultReviewerHarness(self.runtime, job_service=job_service)
+        (self.repo / "test.py").write_text("print(1)\n", encoding="utf-8")
+        req = ReviewRequest(
+            request_id="runner_valid_skip_sess",
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_1",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["."],
+            metadata={"repo_path": str(self.repo)},
+        )
+        session = harness.submit(req)
+        store = ExecutionJobStore(self.runtime)
+        jdir = store._job_dir(session.job_id)
+
+        mock_port = MagicMock()
+        mock_port.execute.return_value = AIRoleResult(
+            request_id="ocr_review:runner_valid_skip_sess:0",
+            role_run_id="reviewer",
+            status="succeeded",
+            output=json.dumps({
+                "reviewed_files": [],
+                "skipped_files": [{"path": "test.py", "reason": "generated test fixture data"}],
+                "findings": [],
+            }),
+        )
+
+        runner = ReviewRunner(jdir, port=mock_port)
+        ret = runner.run()
+        self.assertEqual(ret, 0)
+
+        c_art = store.get_output_artifact(session.job_id, "coverage.json")
+        sess_art = store.get_output_artifact(session.job_id, "session.json")
+        cov_data = c_art["content"]
+        self.assertEqual(cov_data["completeness"], "complete")
+        self.assertEqual(cov_data["skipped_count"], 1)
+        self.assertEqual(cov_data["files"]["test.py"]["status"], "skipped")
+        self.assertEqual(sess_art["content"]["result"]["disposition"], "next")
 
 
 if __name__ == "__main__":

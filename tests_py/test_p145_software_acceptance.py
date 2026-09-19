@@ -36,7 +36,7 @@ from dev_orchestrator.jobs.config import (
     JobProjectConfig,
     JobsConfig,
 )
-from dev_orchestrator.jobs.models import JobSpec
+from dev_orchestrator.jobs.models import JobCorruptionError, JobSpec
 from dev_orchestrator.jobs.service import JobService
 from dev_orchestrator.review.harness import DefaultReviewerHarness
 from dev_orchestrator.review.models import (
@@ -142,6 +142,27 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
         labdemo = loaded["projects"][0]
         self.assertTrue(labdemo["orchestration_ready"])
         self.assertEqual(labdemo["reviewer_harness"]["mode"], "diff")
+        self.assertEqual(labdemo["reviewer_harness"]["backend"], "opencode_review")
+        self.assertEqual(labdemo["reviewer_harness"]["timeout_seconds"], 600.0)
+        self.assertEqual(labdemo["reviewer_harness"]["poll_interval_seconds"], 0.2)
+
+        # Config with custom timeouts normalizes properly
+        custom_config = dict(self.config_data)
+        custom_config["projects"] = [
+            dict(
+                self.config_data["projects"][0],
+                reviewer_harness=dict(
+                    self.config_data["projects"][0]["reviewer_harness"],
+                    timeout_seconds=120,
+                    poll_interval_seconds=1.5,
+                ),
+            )
+        ]
+        custom_path = self.runtime / "custom_projects.json"
+        write_json(custom_path, custom_config, indent=2)
+        loaded_custom = load_projects_config(custom_path)
+        self.assertEqual(loaded_custom["projects"][0]["reviewer_harness"]["timeout_seconds"], 120.0)
+        self.assertEqual(loaded_custom["projects"][0]["reviewer_harness"]["poll_interval_seconds"], 1.5)
 
         # Invalid reviewer_harness mode fails validation
         bad_config = dict(self.config_data)
@@ -153,6 +174,17 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             load_projects_config(bad_path)
         self.assertIn("reviewer_harness", str(ctx.exception))
+
+        # Unsupported reviewer_harness backend fails validation
+        bad_backend_config = dict(self.config_data)
+        bad_backend_config["projects"] = [
+            dict(self.config_data["projects"][0], reviewer_harness={"enabled": True, "backend": "mock"})
+        ]
+        bad_backend_path = self.runtime / "bad_backend_projects.json"
+        write_json(bad_backend_path, bad_backend_config, indent=2)
+        with self.assertRaises(ValueError) as ctx:
+            load_projects_config(bad_backend_path)
+        self.assertIn("backend", str(ctx.exception))
 
     def test_coordinator_blocking_finding_triggers_remediate(self):
         truth = read_repository_truth(str(self.repo))
@@ -747,10 +779,82 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
             st, _ = do_get("/api/v1/control/reviews/non_existent_session")
             self.assertEqual(st, 404)
 
+            # Session with dots returns 404 (rejected by route regex, not 500)
+            st, _ = do_get("/api/v1/control/reviews/session.with.dots")
+            self.assertEqual(st, 404)
+            st, _ = do_get("/api/v1/control/reviews/session.with.dots/findings")
+            self.assertEqual(st, 404)
+
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_job_artifact_digest_mismatch_raises_corruption_error(self):
+        import hashlib
+        from dev_orchestrator.ai.execution_transport import SSHTransportConfig
+        from dev_orchestrator.jobs.models import JobCorruptionError, JobRecord
+        from dev_orchestrator.jobs.transport import SSHJobTransport
+
+        # 1. Test SSHJobTransport re-verification of remote artifact digest
+        ssh_cfg = SSHTransportConfig(peer="10.0.0.1", expected_host_identity="10.0.0.1")
+        fake_subp = MagicMock()
+        transport = SSHJobTransport(ssh_cfg, subprocess_module=fake_subp)
+
+        tampered_artifact_payload = {
+            "status": "success",
+            "artifact": {
+                "name": "findings.json",
+                "sha256": "sha256:" + hashlib.sha256(b"original content").hexdigest(),
+                "size_bytes": 16,
+                "content_type": "application/json",
+            },
+            "raw_text": "tampered content",
+        }
+        resp = {
+            "request_id": "test-req-id",
+            "host_identity": "10.0.0.1",
+            "status": "success",
+            "payload": tampered_artifact_payload,
+        }
+
+        def side_effect(argv, **kwargs):
+            env = json.loads(kwargs.get("input", b"{}").decode("utf-8"))
+            resp["request_id"] = env["request_id"]
+            return subprocess.CompletedProcess(
+                args=["ssh"],
+                returncode=0,
+                stdout=json.dumps(resp).encode("utf-8"),
+                stderr=b"",
+            )
+
+        fake_subp.run.side_effect = side_effect
+
+        with self.assertRaises(JobCorruptionError) as ctx:
+            transport.job_artifact("job-123", name="findings.json")
+        self.assertIn("digest verification failed", str(ctx.exception))
+
+        # 2. Test JobService.get_artifact detects local tampering against JobRecord descriptor
+        service = JobService(self.runtime)
+        job_rec = service.submit(
+            JobSpec(
+                project_id="labdemo",
+                command_ref="review-runner",
+                idempotency_key="tamper-key",
+            )
+        )
+        service.store.save_output_artifact(
+            job_rec.job_id,
+            "findings.json",
+            [{"rule_id": "failsafe_xray_off"}],
+        )
+        # Tamper with the artifact file on disk
+        art_path = self.runtime / "jobs" / job_rec.job_id / "artifacts" / "findings.json"
+        art_path.write_text("tampered file content", encoding="utf-8")
+
+        with self.assertRaises(JobCorruptionError) as ctx:
+            service.get_artifact(job_rec.job_id, "findings.json")
+        self.assertIn("artifact digest mismatch", str(ctx.exception))
 
 
 if __name__ == "__main__":

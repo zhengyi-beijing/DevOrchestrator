@@ -246,6 +246,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                     "size_bytes": art["size_bytes"],
                 },
                 "content": art["content"],
+                "raw_text": art["raw_bytes"].decode("utf-8", errors="replace"),
                 "host_identity": socket.gethostname(),
             }
 

@@ -197,16 +197,44 @@ def parse_packet_output(
 
     packet_paths = {str(f.get("path")) for f in packet.files}
 
-    reviewed_files = [_normalize_repo_path(str(p)) for p in reviewed_raw if isinstance(p, str)]
+    reviewed_files: list[str] = []
+    for p in reviewed_raw:
+        if isinstance(p, str):
+            try:
+                norm_p = _normalize_repo_path(p)
+                if norm_p in packet_paths:
+                    reviewed_files.append(norm_p)
+            except ValueError:
+                pass
+
     skipped_files: list[dict[str, Any]] = []
     for s in skipped_raw:
+        raw_p: Any = None
+        raw_reason: Any = None
         if isinstance(s, dict) and s.get("path"):
-            skipped_files.append({
-                "path": _normalize_repo_path(str(s["path"])),
-                "reason": str(s.get("reason", "skipped_by_reviewer")),
-            })
+            raw_p = s.get("path")
+            raw_reason = s.get("reason")
         elif isinstance(s, str):
-            skipped_files.append({"path": _normalize_repo_path(s), "reason": "skipped_by_reviewer"})
+            raw_p = s
+            raw_reason = None
+
+        if raw_p:
+            try:
+                norm_p = _normalize_repo_path(str(raw_p))
+            except ValueError:
+                continue
+            if norm_p not in packet_paths:
+                continue
+
+            cleaned_reason = str(raw_reason or "").strip()
+            is_valid = bool(cleaned_reason) and cleaned_reason.lower() not in {
+                "skipped", "skip", "skipped_by_reviewer", "none", "n/a", "no reason", "uninspected"
+            }
+            skipped_files.append({
+                "path": norm_p,
+                "reason": cleaned_reason if is_valid else (cleaned_reason or "missing_skip_reason"),
+                "valid": is_valid,
+            })
 
     findings: list[ReviewFinding] = []
     for f in findings_raw:
@@ -321,7 +349,8 @@ class ReviewRunner:
 
         all_findings: list[ReviewFinding] = []
         all_reviewed_files: set[str] = set()
-        all_skipped_files: dict[str, str] = {}
+        all_valid_skipped_files: dict[str, str] = {}
+        all_invalid_skipped_files: dict[str, str] = {}
         failed_files: set[str] = set()
 
         packet_records: list[dict[str, Any]] = []
@@ -381,12 +410,10 @@ class ReviewRunner:
                     all_findings.extend(p_findings)
                     all_reviewed_files.update(p_reviewed)
                     for sk in p_skipped:
-                        all_skipped_files[sk["path"]] = sk.get("reason", "skipped")
-                    # If model didn't explicitly mention files in reviewed/skipped, mark the rest as reviewed
-                    for f in pkt.files:
-                        fp = str(f.get("path"))
-                        if fp not in all_reviewed_files and fp not in all_skipped_files:
-                            all_reviewed_files.add(fp)
+                        if sk.get("valid"):
+                            all_valid_skipped_files[sk["path"]] = sk.get("reason", "skipped")
+                        else:
+                            all_invalid_skipped_files[sk["path"]] = sk.get("reason", "invalid_skip_reason")
                 except Exception as exc:
                     sys.stderr.write(f"runner packet {pkt.packet_id} parse error: {exc}\n")
                     failed_packets += 1
@@ -407,10 +434,12 @@ class ReviewRunner:
                 files_coverage[fp] = {"status": "failed", "reason": "packet_execution_failure"}
             elif fp in all_reviewed_files:
                 files_coverage[fp] = {"status": "reviewed", "reason": "reviewed"}
-            elif fp in all_skipped_files:
-                files_coverage[fp] = {"status": "skipped", "reason": all_skipped_files[fp]}
+            elif fp in all_valid_skipped_files:
+                files_coverage[fp] = {"status": "skipped", "reason": all_valid_skipped_files[fp]}
+            elif fp in all_invalid_skipped_files:
+                files_coverage[fp] = {"status": "unreviewed", "reason": f"invalid_skip_reason: {all_invalid_skipped_files[fp]}"}
             else:
-                files_coverage[fp] = {"status": "skipped", "reason": "uninspected"}
+                files_coverage[fp] = {"status": "unreviewed", "reason": "uninspected"}
 
         for exf in manifest.excluded_files:
             ep = str(exf.get("path"))

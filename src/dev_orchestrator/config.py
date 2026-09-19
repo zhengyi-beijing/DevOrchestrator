@@ -396,6 +396,8 @@ _ALLOWED_HARNESS_KEYS = frozenset({
     "transport",
     "blocking_severities",
     "independent_gates",
+    "timeout_seconds",
+    "poll_interval_seconds",
 })
 
 
@@ -417,7 +419,7 @@ def _normalize_reviewer_harness(raw: Any, index: int, config_path: Path) -> dict
             "config {0} project #{1} reviewer_harness.enabled must be a boolean".format(config_path, index)
         )
     backend = str(raw.get("backend") or raw.get("adapter") or "opencode_review").strip()
-    if backend not in ("opencode_review", "mock", "stub"):
+    if backend != "opencode_review":
         raise ValueError(
             "config {0} project #{1} reviewer_harness.backend must be 'opencode_review'".format(config_path, index)
         )
@@ -479,6 +481,16 @@ def _normalize_reviewer_harness(raw: Any, index: int, config_path: Path) -> dict
         "max_packet_files": int(raw.get("packet_size", raw_limits.get("max_packet_files", raw_limits.get("packet_size", 10)))),
         "max_packet_bytes": int(raw.get("max_packet_bytes", raw_limits.get("max_packet_bytes", 200 * 1024))),
     }
+    timeout_raw = raw.get("timeout_seconds")
+    if timeout_raw is not None and (not isinstance(timeout_raw, (int, float)) or timeout_raw <= 0):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.timeout_seconds must be a positive number".format(config_path, index)
+        )
+    poll_raw = raw.get("poll_interval_seconds")
+    if poll_raw is not None and (not isinstance(poll_raw, (int, float)) or poll_raw <= 0):
+        raise ValueError(
+            "config {0} project #{1} reviewer_harness.poll_interval_seconds must be a positive number".format(config_path, index)
+        )
     normalized_rule_pack = rule_pack.strip() if isinstance(rule_pack, str) and rule_pack.strip() else None
     return {
         "enabled": enabled,
@@ -495,6 +507,8 @@ def _normalize_reviewer_harness(raw: Any, index: int, config_path: Path) -> dict
         "blocking_severities": blocking,
         "independent_gates": [g.strip() for g in gates if g.strip()],
         "file_limits": file_limits,
+        "timeout_seconds": float(timeout_raw) if timeout_raw is not None else 600.0,
+        "poll_interval_seconds": float(poll_raw) if poll_raw is not None else 0.2,
     }
 
 
