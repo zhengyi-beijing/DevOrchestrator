@@ -169,13 +169,13 @@ class ReviewFinding:
 
 @dataclass
 class ReviewCoverage:
-    completeness: str = "complete"
+    completeness: str = "failed"
     selected_count: int = 0
     reviewed_count: int = 0
     skipped_count: int = 0
     failed_count: int = 0
     excluded_count: int = 0
-    coverage_rate: float = 1.0
+    coverage_rate: float = 0.0
     files: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -258,7 +258,7 @@ class ReviewResult:
             session_id=str(data["session_id"]),
             job_id=str(data["job_id"]),
             disposition=str(data.get("disposition", "failed")),
-            completeness=str(data.get("completeness", "partial")),
+            completeness=str(data.get("completeness", "failed")),
             findings=findings,
             coverage=cov,
             artifacts=dict(data.get("artifacts") or {}),

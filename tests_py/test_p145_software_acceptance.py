@@ -785,6 +785,14 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
             st, _ = do_get("/api/v1/control/reviews/session.with.dots/findings")
             self.assertEqual(st, 404)
 
+            # Artifact traversal ('..' returns 400 from global path check, '.' and non-existent return 404)
+            st, _ = do_get("/api/v1/control/reviews/api_sess_1/artifacts/..")
+            self.assertEqual(st, 400)
+            st, _ = do_get("/api/v1/control/reviews/api_sess_1/artifacts/.")
+            self.assertEqual(st, 404)
+            st, _ = do_get("/api/v1/control/reviews/api_sess_1/artifacts/non_existent.json")
+            self.assertEqual(st, 404)
+
         finally:
             server.shutdown()
             server.server_close()

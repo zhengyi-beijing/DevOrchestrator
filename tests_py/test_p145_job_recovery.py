@@ -24,11 +24,13 @@ from dev_orchestrator.jobs.config import (
     JobsConfig,
 )
 from dev_orchestrator.jobs.models import (
+    JobCorruptionError,
     JobRecord,
     JobSpec,
     job_id_for,
     spec_hash,
 )
+from dev_orchestrator.jobs.recovery import JobRecoveryCoordinator
 from dev_orchestrator.jobs.service import JobService
 from dev_orchestrator.jobs.store import ExecutionJobStore
 from dev_orchestrator.jobs.transport import LocalJobTransport
@@ -267,6 +269,117 @@ class P145RecoveryAndReconciliationTests(unittest.TestCase):
         self.assertEqual(reconciled.result.disposition, "next")
         self.assertEqual(len(reconciled.result.findings), 1)
         self.assertEqual(reconciled.result.findings[0].rule_id, "r_style")
+
+    def test_job_service_retry_preserves_input_digest_and_copies_input_json_to_successor(self):
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={
+                        "review-runner": JobCommandConfig(
+                            argv=["python", "-c", "import sys; sys.exit(0)"],
+                            cwd=".",
+                        )
+                    },
+                )
+            },
+        )
+        mock_transport = MagicMock()
+        mock_transport.job_start.return_value = {"status": "started", "supervisor_pid": 1234}
+        job_service = JobService(self.runtime, transports={"local": mock_transport}, config=job_cfg)
+
+        payload = {"request": {"project_id": "p1"}, "manifest": {"selected_files": ["test.py"]}}
+        payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        expected_digest = "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
+
+        spec = JobSpec(
+            project_id="p1",
+            command_ref="review-runner",
+            idempotency_key="initial_review_job_key",
+            input_digest=expected_digest,
+        )
+        initial_rec = job_service.submit(spec, input_payload=payload)
+        self.assertEqual(initial_rec.input_digest, expected_digest)
+
+        # Predecessor input.json exists on disk and in store
+        pred_input_file = job_service.store._job_dir(initial_rec.job_id) / "input.json"
+        self.assertTrue(pred_input_file.is_file())
+        self.assertEqual(pred_input_file.read_bytes(), payload_bytes)
+
+        # Mark predecessor terminal failed
+        job_service.cancel(initial_rec.job_id, reason="reviewer timed out")
+        reconciled_pred = job_service.status(initial_rec.job_id)
+        self.assertEqual(reconciled_pred.state, "cancelled")
+
+        # 1. Retry creates successor with identical input_digest and copies input.json
+        succ_rec = job_service.retry(initial_rec.job_id, "retry_attempt_1")
+        self.assertEqual(succ_rec.input_digest, expected_digest)
+        self.assertEqual(succ_rec.retry.get("retry_of"), initial_rec.job_id)
+
+        succ_input_file = job_service.store._job_dir(succ_rec.job_id) / "input.json"
+        self.assertTrue(succ_input_file.is_file())
+        self.assertEqual(succ_input_file.read_bytes(), payload_bytes)
+        self.assertEqual(job_service.store.get_input_artifact(succ_rec.job_id), payload)
+
+        # 2. Replay retry returns identical successor
+        replay_succ = job_service.retry(initial_rec.job_id, "retry_attempt_1")
+        self.assertEqual(replay_succ.job_id, succ_rec.job_id)
+        self.assertEqual(replay_succ.input_digest, expected_digest)
+
+        # 3. Mismatched input artifact digest raises JobCorruptionError
+        corrupt_spec = JobSpec(
+            project_id="p1",
+            command_ref="review-runner",
+            idempotency_key="corrupt_review_job_key",
+            input_digest=expected_digest,
+        )
+        corrupt_rec = job_service.submit(corrupt_spec, input_payload=payload)
+        job_service.cancel(corrupt_rec.job_id, reason="fail")
+        # Tamper with input.json
+        (job_service.store._job_dir(corrupt_rec.job_id) / "input.json").write_bytes(b"{\"tampered\": true}")
+        with self.assertRaises(JobCorruptionError) as ctx:
+            job_service.retry(corrupt_rec.job_id, "retry_tampered")
+        self.assertIn("input artifact digest mismatch", str(ctx.exception))
+
+        # 4. Missing input.json when input_digest is set raises JobCorruptionError
+        missing_spec = JobSpec(
+            project_id="p1",
+            command_ref="review-runner",
+            idempotency_key="missing_input_job_key",
+            input_digest=expected_digest,
+        )
+        missing_rec = job_service.submit(missing_spec, input_payload=payload)
+        job_service.cancel(missing_rec.job_id, reason="fail")
+        # Delete input.json
+        (job_service.store._job_dir(missing_rec.job_id) / "input.json").unlink()
+        with self.assertRaises(JobCorruptionError) as ctx:
+            job_service.retry(missing_rec.job_id, "retry_missing")
+        self.assertIn("input.json is missing", str(ctx.exception))
+
+        # 5. Stranded retry re-drive via JobRecoveryCoordinator copies input.json to successor
+        stranded_spec = JobSpec(
+            project_id="p1",
+            command_ref="review-runner",
+            idempotency_key="stranded_retry_job_key",
+            input_digest=expected_digest,
+        )
+        stranded_rec = job_service.submit(stranded_spec, input_payload=payload)
+        job_service.cancel(stranded_rec.job_id, reason="fail")
+        succ_id, is_new = job_service.store.claim_retry(stranded_rec.job_id, "stranded_req_1")
+        self.assertTrue(is_new)
+        self.assertIsNone(job_service.store.get(succ_id))
+
+        coord = JobRecoveryCoordinator(self.runtime, service=job_service)
+        res = coord.advance()
+        self.assertIn(succ_id, res["redriven"])
+        redriven_succ = job_service.store.get(succ_id)
+        self.assertIsNotNone(redriven_succ)
+        self.assertEqual(redriven_succ.input_digest, expected_digest)
+        redriven_input = job_service.store._job_dir(succ_id) / "input.json"
+        self.assertTrue(redriven_input.is_file())
+        self.assertEqual(redriven_input.read_bytes(), payload_bytes)
 
 
 if __name__ == "__main__":

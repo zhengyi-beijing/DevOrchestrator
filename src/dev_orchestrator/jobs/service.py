@@ -22,6 +22,7 @@ from .config import (
     validate_and_resolve_execution,
 )
 from .models import (
+    JobCorruptionError,
     JobRecord,
     JobSpec,
 )
@@ -567,13 +568,31 @@ class JobService:
             broker_request_id=pred.broker_request_id,
             transport=pred.transport,
             expected_working_directory=pred.working_directory,
+            input_digest=pred.input_digest,
         )
+
+        input_payload: Optional[bytes] = None
+        pred_jdir = self.store._job_dir(job_id)
+        pred_input_file = pred_jdir / "input.json"
+        if pred_input_file.is_file():
+            input_payload = pred_input_file.read_bytes()
+            if pred.input_digest:
+                actual_digest = "sha256:" + hashlib.sha256(input_payload).hexdigest()
+                if actual_digest != pred.input_digest:
+                    raise JobCorruptionError(
+                        f"predecessor job {job_id} input artifact digest mismatch: {actual_digest} != {pred.input_digest}"
+                    )
+        elif pred.input_digest:
+            raise JobCorruptionError(
+                f"predecessor job {job_id} specifies input_digest {pred.input_digest} but input.json is missing"
+            )
 
         succ_record = self.submit(
             succ_spec,
             target_job_id=successor_id,
             retry_of=job_id,
             attempt=new_attempt,
+            input_payload=input_payload,
         )
 
         def _record_spawn(rec: JobRecord) -> None:

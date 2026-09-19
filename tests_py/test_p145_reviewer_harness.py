@@ -142,6 +142,21 @@ class ReviewModelsAndSARIFTests(unittest.TestCase):
         self.assertEqual(loc["region"]["startLine"], 42)
         self.assertEqual(loc["region"]["endLine"], 45)
 
+    def test_review_coverage_defaults_fail_closed(self):
+        cov = ReviewCoverage()
+        self.assertEqual(cov.completeness, "failed")
+        self.assertEqual(cov.coverage_rate, 0.0)
+
+        # from_dict({}) must fail closed
+        cov_empty = ReviewCoverage.from_dict({})
+        self.assertEqual(cov_empty.completeness, "failed")
+        self.assertEqual(cov_empty.coverage_rate, 0.0)
+
+        # explicit completeness preserved
+        cov_complete = ReviewCoverage.from_dict({"completeness": "complete", "coverage_rate": 1.0})
+        self.assertEqual(cov_complete.completeness, "complete")
+        self.assertEqual(cov_complete.coverage_rate, 1.0)
+
 
 class OpenCodeReviewAdapterTests(unittest.TestCase):
     def setUp(self):
@@ -849,6 +864,74 @@ class DefaultReviewerHarnessTests(unittest.TestCase):
         self.assertEqual(cov_data["skipped_count"], 1)
         self.assertEqual(cov_data["files"]["test.py"]["status"], "skipped")
         self.assertEqual(sess_art["content"]["result"]["disposition"], "next")
+
+    def test_status_artifact_fallback_with_missing_or_malformed_coverage_fails_closed(self):
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={"review-runner": JobCommandConfig(argv=["python", "-c", "import sys; sys.exit(0)"], cwd=".")},
+                )
+            },
+        )
+        job_service = JobService(self.runtime, config=job_cfg)
+        harness = DefaultReviewerHarness(self.runtime, job_service=job_service)
+        req = ReviewRequest(
+            request_id="fallback_cov_sess",
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_1",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["."],
+            metadata={"repo_path": str(self.repo)},
+        )
+        session = harness.submit(req)
+        store = ExecutionJobStore(self.runtime)
+
+        # Mark job completed
+        def _mark_done(r: JobRecord):
+            if r.state == "queued":
+                r.transition_to("running", reason="started")
+            r.transition_to("completed", reason="finished")
+            r.exit_code = 0
+            r.terminal = {"outcome": "completed", "exit_code": 0}
+        store.update(session.job_id, _mark_done)
+
+        # Case A: findings.json is empty list, coverage.json has empty dict {} (omits completeness)
+        store.save_output_artifact(session.job_id, "findings.json", [])
+        store.save_output_artifact(session.job_id, "coverage.json", {})
+
+        st = harness.status(session.session_id)
+        self.assertIsNotNone(st.result)
+        self.assertEqual(st.result.completeness, "failed")
+        self.assertEqual(st.result.disposition, "failed")
+        self.assertIn("Coverage failed", st.result.reason)
+
+        # Case B: coverage.json has malformed completeness value
+        req2 = ReviewRequest(
+            request_id="fallback_cov_sess_2",
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_2",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["."],
+            metadata={"repo_path": str(self.repo)},
+        )
+        session2 = harness.submit(req2)
+        store.update(session2.job_id, _mark_done)
+        store.save_output_artifact(session2.job_id, "findings.json", [])
+        store.save_output_artifact(session2.job_id, "coverage.json", {"completeness": "bogus_status"})
+        st2 = harness.status(session2.session_id)
+        self.assertEqual(st2.state, "failed")
+        self.assertIn("artifact loading failed", st2.failure_reason or "")
 
 
 if __name__ == "__main__":

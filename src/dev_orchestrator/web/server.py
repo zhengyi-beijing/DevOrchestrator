@@ -796,9 +796,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     self._error(404, "Not Found", "review session not found", head_only); return
                 if not session.job_id:
                     self._error(404, "Not Found", "review job not found", head_only); return
+                if art_name in (".", ".."):
+                    self._error(404, "Not Found", f"artifact {art_name!r} not found", head_only); return
                 from dev_orchestrator.jobs.store import ExecutionJobStore
                 jstore = ExecutionJobStore(runtime, read_only=True)
-                art = jstore.get_output_artifact(session.job_id, art_name)
+                try:
+                    art = jstore.get_output_artifact(session.job_id, art_name)
+                except ValueError:
+                    self._error(404, "Not Found", f"artifact {art_name!r} not found", head_only); return
                 if art is None:
                     self._error(404, "Not Found", f"artifact {art_name!r} not found", head_only); return
                 art_clean = {k: v for k, v in art.items() if k != "raw_bytes"}
