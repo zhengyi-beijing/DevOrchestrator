@@ -165,6 +165,14 @@ function Invoke-Tick {
     $config = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $snapshots = @()
     foreach ($project in @($config.projects)) {
+        # Accept the canonical project schema used by the Python control plane.
+        # Legacy monitor fields remain supported for backward compatibility.
+        if (-not ($project.PSObject.Properties.Name -contains 'id')) {
+            $project | Add-Member -NotePropertyName id -NotePropertyValue ([string]$project.project_id)
+        }
+        if (-not ($project.PSObject.Properties.Name -contains 'root')) {
+            $project | Add-Member -NotePropertyName root -NotePropertyValue ([string]$project.repo_path)
+        }
         $snapshotPath = Join-Path $script:ProjectsRuntime ($project.id + '.json')
         $previous = $null
         if (Test-Path -LiteralPath $snapshotPath) {
