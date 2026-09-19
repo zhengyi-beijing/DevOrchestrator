@@ -1506,7 +1506,7 @@ class WatchdogCoordinator:
             return
 
         diag_code = attempt_record.get("diagnosis")
-        if diag_code not in ("agent_stalled", "process_dead", "reviewer_failed", "plan_reviewer_failed"):
+        if diag_code not in ("agent_stalled", "process_dead", "reviewer_failed", "plan_reviewer_failed", "planner_failed"):
             self._emit_owner_gate_once(pid, attempt_record, f"diagnosis_{diag_code}_requires_owner")
             return
 
@@ -1561,6 +1561,13 @@ class WatchdogCoordinator:
         if diag_code == "plan_reviewer_failed":
             if current_lifecycle != "PLAN_FAILED":
                 self._emit_owner_gate_once(pid, attempt_record, "plan_reviewer_failed_lifecycle_changed")
+                return
+            recovery_action = "continue"
+            recovery_target = {}
+
+        if diag_code == "planner_failed":
+            if current_lifecycle != "PLAN_FAILED":
+                self._emit_owner_gate_once(pid, attempt_record, "planner_failed_lifecycle_changed")
                 return
             recovery_action = "continue"
             recovery_target = {}

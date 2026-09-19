@@ -120,6 +120,20 @@ def _parse_plan(text: str | None, task_id: str) -> dict[str, Any]:
         raise ValueError("planner summary must be nonblank")
     for key in ("implementation_steps", "interfaces", "validation", "risks", "out_of_scope"):
         value = payload.get(key)
+        # Narrow compatibility: named sequences from otherwise-valid planner JSON
+        # are canonicalized to the contract's list-of-strings representation.
+        # Nested/arbitrary objects remain rejected.
+        if isinstance(value, dict):
+            if not value or len(value) > 24 or any(
+                _nonblank(str(name)) is None
+                or _nonblank(item) is None
+                or len(str(name)) > 120
+                or len(str(item)) > 1000
+                for name, item in value.items()
+            ):
+                raise ValueError(f"planner {key} must be a non-empty bounded list")
+            value = [f"{name}: {item}" for name, item in value.items()]
+            payload[key] = value
         if not isinstance(value, list) or not value or len(value) > 24:
             raise ValueError(f"planner {key} must be a non-empty bounded list")
         if any(_nonblank(item) is None or len(str(item)) > 1000 for item in value):

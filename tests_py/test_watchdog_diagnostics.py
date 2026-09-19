@@ -31,8 +31,8 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         self.tmp_dir.cleanup()
 
     def test_9_diagnostic_classifications(self):
-        """Verify all 9 diagnosis codes can be classified deterministically."""
-        self.assertEqual(len(DIAGNOSIS_CODES), 9)
+        """Verify all diagnosis codes can be classified deterministically."""
+        self.assertEqual(len(DIAGNOSIS_CODES), 10)
         assessment = DummyAssessment()
 
         # 1. process_dead
@@ -77,7 +77,25 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag_plan_review.code, "plan_reviewer_failed")
         self.assertFalse(diag_plan_review.owner_gate_required)
 
-        # 4. provider_or_quota_blocked
+        # planner_failed: terminal planner protocol/schema failures are safe to
+        # restart through the bounded planning control path.
+        ev_planner_failed = {
+            "process_liveness": {"process_alive": False, "pid": None},
+            "repository_truth": {"valid": True},
+            "ledgers": {"ai-planner.json": {
+                "state": "failed",
+                "reason": "planner failed after 3 attempts: planner implementation_steps must be a non-empty bounded list",
+                "plan_present": False,
+                "planner_completed_at": None,
+            }},
+        }
+        diag_planner = classify_evidence(
+            ev_planner_failed, DummyAssessment(lifecycle_state="PLAN_FAILED")
+        )
+        self.assertEqual(diag_planner.code, "planner_failed")
+        self.assertFalse(diag_planner.owner_gate_required)
+
+        # provider_or_quota_blocked
         ev_quota = {
             "process_liveness": {"process_alive": True, "pid": 1234},
             "broker": {"status": "rate_limit_exceeded (429)"},

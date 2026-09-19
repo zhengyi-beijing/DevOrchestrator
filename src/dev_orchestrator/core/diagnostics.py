@@ -26,6 +26,7 @@ DIAGNOSIS_CODES = (
     "process_dead",
     "reviewer_failed",
     "plan_reviewer_failed",
+    "planner_failed",
     "provider_or_quota_blocked",
     "state_desync",
     "external_wait",
@@ -331,6 +332,25 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
             confidence=1.0,
             reason=str(planner_ledger.get("reviewer_last_failure") or plan_reason),
             recommended_action="resume only the failed plan review from the existing planner output",
+            owner_gate_required=False,
+            evidence=evidence,
+            evidence_hash=ev_hash,
+        )
+
+    # A terminal planner protocol/schema failure is recoverable through the
+    # normal planning control path. Watchdog recovery remains bounded by its
+    # durable attempt ledger, preventing an unbounded retry loop.
+    planner_protocol_failure = (
+        lifecycle == "PLAN_FAILED"
+        and planner_ledger.get("state") == "failed"
+        and plan_reason.startswith("planner failed after ")
+    )
+    if planner_protocol_failure:
+        return Diagnosis(
+            code="planner_failed",
+            confidence=1.0,
+            reason=plan_reason,
+            recommended_action="restart the bounded planner lifecycle at the unchanged clean HEAD",
             owner_gate_required=False,
             evidence=evidence,
             evidence_hash=ev_hash,

@@ -6,7 +6,35 @@ import unittest
 from pathlib import Path
 
 from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
-from dev_orchestrator.core.ai_planner import AIPlannerCoordinator, _parse_plan_review
+from dev_orchestrator.core.ai_planner import AIPlannerCoordinator, _parse_plan, _parse_plan_review
+
+
+class PlanParserCompatibilityTests(unittest.TestCase):
+    def test_named_sequence_object_is_canonicalized(self):
+        payload = {
+            "task_id": "P14.5",
+            "summary": "bounded",
+            "implementation_steps": {"step_1": "first", "step_2": "second"},
+            "interfaces": ["stable"],
+            "validation": ["tests"],
+            "risks": ["bounded"],
+            "out_of_scope": ["unrelated"],
+        }
+        parsed = _parse_plan(json.dumps(payload), "P14.5")
+        self.assertEqual(parsed["implementation_steps"], ["step_1: first", "step_2: second"])
+
+    def test_nested_named_sequence_still_fails_closed(self):
+        payload = {
+            "task_id": "P14.5",
+            "summary": "bounded",
+            "implementation_steps": {"step_1": {"nested": "invalid"}},
+            "interfaces": ["stable"],
+            "validation": ["tests"],
+            "risks": ["bounded"],
+            "out_of_scope": ["unrelated"],
+        }
+        with self.assertRaisesRegex(ValueError, "non-empty bounded list"):
+            _parse_plan(json.dumps(payload), "P14.5")
 
 
 class PlanReviewParserTests(unittest.TestCase):
