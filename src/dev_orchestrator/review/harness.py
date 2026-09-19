@@ -54,14 +54,14 @@ class DefaultReviewerHarness:
         session_store: Optional[ReviewSessionStore] = None,
         ocr_adapter_factory: Optional[Callable[[Path], OpenCodeReviewAdapter]] = None,
         ocr_executable: Optional[str] = None,
+        command_ref: str = "review-runner",
     ) -> None:
         self.runtime_root = Path(runtime_root).resolve()
         self.session_store = session_store or ReviewSessionStore(self.runtime_root)
         self.job_service = job_service or JobService(self.runtime_root)
         self.ocr_executable = ocr_executable
-        self._ocr_factory = ocr_adapter_factory or (
-            lambda repo_p: OpenCodeReviewAdapter(repo_p, executable=self.ocr_executable)
-        )
+        self.command_ref = command_ref
+        self._ocr_adapter_factory = ocr_adapter_factory
 
     def submit(self, request: ReviewRequest) -> ReviewSession:
         """Prepare review manifest and submit as P14 durable job."""
@@ -80,7 +80,11 @@ class DefaultReviewerHarness:
         repo_path = Path(repo_path_str).resolve()
 
         # Step 1: OpenCodeReview preparation
-        adapter = self._ocr_factory(repo_path)
+        ocr_exec = request.metadata.get("ocr_executable") or self.ocr_executable
+        if self._ocr_adapter_factory:
+            adapter = self._ocr_adapter_factory(repo_path)
+        else:
+            adapter = OpenCodeReviewAdapter(repo_path, executable=ocr_exec)
         manifest = adapter.build_manifest(request)
 
         # Step 2: Content-addressed input payload
@@ -88,9 +92,12 @@ class DefaultReviewerHarness:
             "request": request.to_dict(),
             "manifest": manifest.to_dict(),
         }
+        import hashlib
+        payload_raw = json.dumps(input_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        input_digest = "sha256:" + hashlib.sha256(payload_raw).hexdigest()
 
         # Step 3: P14 Job submission
-        command_ref = str(request.metadata.get("command_ref") or "review-runner")
+        command_ref = str(request.metadata.get("command_ref") or self.command_ref or "review-runner")
         idem_key = request.idempotency_key or request.request_id
         spec = JobSpec(
             project_id=request.project_id,
@@ -100,7 +107,7 @@ class DefaultReviewerHarness:
             task_id=request.task_id,
             source_request_id=request.source_request_id,
             transport=request.transport,
-            input_digest=manifest.input_digest,
+            input_digest=input_digest,
             metadata=dict(request.metadata),
         )
 

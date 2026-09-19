@@ -141,6 +141,22 @@ Goal: standardize code-review preparation, project rule enforcement, model deleg
 
 Sequence: P14.5 follows P14 because review sessions must rely on durable/recoverable jobs, and precedes P15 so mobile observability can consume normalized review/job/finding state from the start.
 
+## NEXT - Watchdog recovery-epoch / stale OWNER_GATE cleanup
+
+Status: **NEXT AFTER P14.5**
+
+Goal: prevent a historical watchdog-generated OWNER_GATE/recovery budget from contaminating a newer valid execution epoch, while preserving genuine owner-decision gates.
+
+- Define a durable recovery-epoch identity from current task/plan/control command/HEAD/execution evidence.
+- When newer valid execution evidence supersedes the evidence that created a watchdog-generated OWNER_GATE, invalidate the stale watchdog gate, attempts, diagnosis and evidence hash automatically.
+- Never auto-clear an explicit owner-decision OWNER_GATE; only watchdog/recovery-generated stale gates are eligible.
+- Project health/watchdog projection must not report historical owner_gate/unknown while a newer authoritative execution is healthy.
+- Reset attempts_this_run and recovery budget only on a proven epoch transition, not merely because a worker process appeared.
+- Add regression coverage for stale historical gate cleanup, genuine owner gate preservation, restart/replay, and new Worker/Reviewer epochs.
+- Acceptance: reproduce the current P14.5 case (new WORKER_RUNNING/EXECUTING while watchdog retains old owner_gate/attempts=20), advance to a newer epoch, and prove automatic cleanup without a manual watchdog-clear or user continue.
+
+Sequence: execute immediately after P14.5 closes, before P15.
+
 ## P15 staged roadmap
 
 ### P15 - Mobile Observability & Guarded Control

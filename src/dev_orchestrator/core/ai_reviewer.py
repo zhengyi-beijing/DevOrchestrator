@@ -130,6 +130,25 @@ class AIReviewerCoordinator:
             changed = False
             for record in state["reviews"].values():
                 if record.get("state") in _ACTIVE_STATES:
+                    if record.get("harness") and (record.get("session_id") or record.get("review_id")):
+                        session_id = record.get("session_id") or record.get("review_id")
+                        try:
+                            harness = self._get_harness()
+                            session = harness.reconcile(session_id)
+                            record["session_id"] = session.session_id
+                            record["job_id"] = session.job_id
+                            if session.state in ("completed", "failed", "cancelled", "unknown_recovery"):
+                                record["state"] = session.state
+                                if session.failure_reason:
+                                    record["reason"] = session.failure_reason
+                            else:
+                                record["state"] = "recovery_required"
+                                record["reason"] = f"daemon restarted during reviewer execution; job state {session.state}"
+                            record["recovered_at"] = utc_now_iso()
+                            changed = True
+                            continue
+                        except Exception:
+                            pass
                     record["state"] = "recovery_required"
                     record["reason"] = "daemon restarted during reviewer execution; automatic replay forbidden"
                     record["recovered_at"] = utc_now_iso()
@@ -643,15 +662,57 @@ class AIReviewerCoordinator:
                 attempt_id=source_request_id or None,
             )
 
+        def _fail_review(err_msg: str) -> None:
+            if self.accounting is not None:
+                self.accounting.end_interval(
+                    "technical_review",
+                    review_id,
+                    outcome="failed",
+                    project_id=project_id,
+                    task_id=task_id,
+                    role="reviewer",
+                    request_id=review_id,
+                    stage_run_id="review",
+                    role_run_id=record.get("role_run_id") or f"reviewer-{review_id}",
+                    source_request_id=source_request_id or None,
+                    attempt_id=source_request_id or None,
+                )
+                self.accounting.record_attempt_outcome(
+                    source_request_id,
+                    "rejected",
+                    project_id=project_id,
+                    task_id=task_id,
+                    role="reviewer",
+                    request_id=review_id,
+                    source_request_id=source_request_id,
+                    metadata={"review_kind": "technical_harness", "decision": "failed", "reason": err_msg},
+                )
+            self._finish_harness_terminal(
+                review_id, project_id, task_id, source_request_id, "failed", err_msg,
+                binding=binding,
+            )
+
         try:
             from dev_orchestrator.review.models import ReviewRequest
             harness = self._get_harness()
 
+            raw_limits = harness_cfg.get("file_limits") or {}
             file_limits = {
-                "max_files": harness_cfg.get("max_files", 50),
-                "max_bytes": harness_cfg.get("max_bytes", 500 * 1024),
-                "max_packet_files": harness_cfg.get("packet_size", 10),
-                "max_packet_bytes": harness_cfg.get("max_packet_bytes", 200 * 1024),
+                "max_files": int(raw_limits.get("max_files", harness_cfg.get("max_files", 100))),
+                "max_total_bytes": int(raw_limits.get("max_total_bytes", raw_limits.get("max_bytes", harness_cfg.get("max_bytes", harness_cfg.get("max_total_bytes", 1024 * 1024))))),
+                "max_packet_files": int(raw_limits.get("max_packet_files", raw_limits.get("packet_size", harness_cfg.get("packet_size", harness_cfg.get("max_packet_files", 10))))),
+                "max_packet_bytes": int(raw_limits.get("max_packet_bytes", harness_cfg.get("max_packet_bytes", 200 * 1024))),
+            }
+            file_limits["max_bytes"] = file_limits["max_total_bytes"]
+
+            diff_refs = {"head": truth.head, "commit": truth.head, "base": f"{truth.head}~1"}
+
+            metadata = {
+                "repo_path": repo_path,
+                "worker_source_request_id": source_request_id,
+                "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
+                "command_ref": harness_cfg.get("command_ref", "review-runner"),
+                "ocr_executable": harness_cfg.get("ocr_executable"),
             }
 
             req = ReviewRequest(
@@ -661,6 +722,7 @@ class AIReviewerCoordinator:
                 source_request_id=source_request_id,
                 mode=harness_cfg.get("mode", "diff"),
                 diff_mode=harness_cfg.get("diff_mode", "workspace"),
+                diff_refs=diff_refs,
                 scan_roots=list(harness_cfg.get("scan_roots") or []),
                 rule_pack_path=harness_cfg.get("rule_pack"),
                 blocking_severities=list(harness_cfg.get("blocking_severities") or ["blocking"]),
@@ -670,11 +732,7 @@ class AIReviewerCoordinator:
                 status_hash=truth.status_hash,
                 transport=harness_cfg.get("transport", "local"),
                 file_limits=file_limits,
-                metadata={
-                    "repo_path": repo_path,
-                    "worker_source_request_id": source_request_id,
-                    "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
-                },
+                metadata=metadata,
             )
 
             session = harness.submit(req)
@@ -702,33 +760,13 @@ class AIReviewerCoordinator:
 
             if session.state != "completed":
                 err_msg = session.failure_reason or f"review session {session.state}"
-                self._finish_harness_terminal(
-                    review_id, project_id, task_id, source_request_id, "failed", err_msg,
-                    binding=binding,
-                )
+                _fail_review(err_msg)
                 return
 
             review_result = harness.result(session.session_id)
 
         except Exception as exc:
-            if self.accounting is not None:
-                self.accounting.end_interval(
-                    "technical_review",
-                    review_id,
-                    outcome="failed",
-                    project_id=project_id,
-                    task_id=task_id,
-                    role="reviewer",
-                    request_id=review_id,
-                    stage_run_id="review",
-                    role_run_id=record.get("role_run_id") or f"reviewer-{review_id}",
-                    source_request_id=source_request_id or None,
-                    attempt_id=source_request_id or None,
-                )
-            self._finish_harness_terminal(
-                review_id, project_id, task_id, source_request_id, "failed", f"reviewer harness error: {exc}",
-                binding=binding,
-            )
+            _fail_review(f"reviewer harness error: {exc}")
             return
 
         # Post-execution verification:
@@ -742,28 +780,19 @@ class AIReviewerCoordinator:
             or current_truth.head != rec.get("head")
             or current_truth.status_hash != rec.get("review_status_hash")
         ):
-            self._finish_harness_terminal(
-                review_id, project_id, task_id, source_request_id, "failed", "repository changed during review",
-                binding=binding,
-            )
+            _fail_review("repository changed during review")
             return
 
         # 2. Independent gates check
         required_gates = harness_cfg.get("independent_gates") or []
         gates_ok, gate_err = self._check_independent_gates(worker, required_gates)
         if not gates_ok:
-            self._finish_harness_terminal(
-                review_id, project_id, task_id, source_request_id, "failed", f"independent gate failed: {gate_err}",
-                binding=binding,
-            )
+            _fail_review(f"independent gate failed: {gate_err}")
             return
 
         # 3. Coverage completeness check
         if review_result.completeness != "complete":
-            self._finish_harness_terminal(
-                review_id, project_id, task_id, source_request_id, "failed", f"review coverage incomplete: {review_result.completeness}",
-                binding=binding,
-            )
+            _fail_review(f"review coverage incomplete: {review_result.completeness} ({review_result.reason})")
             return
 
         # 4. Findings classification
@@ -797,10 +826,7 @@ class AIReviewerCoordinator:
                 reason=reason,
             )
         except Exception as exc:
-            self._finish_harness_terminal(
-                review_id, project_id, task_id, source_request_id, "failed", f"decision persistence failed: {exc}",
-                binding=binding,
-            )
+            _fail_review(f"decision persistence failed: {exc}")
             return
 
         if self.accounting is not None:

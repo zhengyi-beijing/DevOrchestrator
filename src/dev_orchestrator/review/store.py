@@ -18,7 +18,7 @@ def _safe_session_id(session_id: str) -> str:
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_:")
     if not all(c in allowed for c in cleaned):
         raise ValueError(f"invalid characters in session_id: {session_id!r}")
-    return cleaned.replace(":", "-")
+    return cleaned.replace("_", "__").replace(":", "_colon_")
 
 
 class ReviewSessionStore:

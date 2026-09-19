@@ -729,16 +729,18 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/v1/control/reviews":
             if not self._owner_authorized():
                 self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            from dev_orchestrator.control.logs import redact_secrets
             from dev_orchestrator.review.store import ReviewSessionStore
             store = ReviewSessionStore(runtime, read_only=True)
             qs = parse_qs(parsed.query)
             proj_filter = qs.get("project_id", [None])[0]
             sessions = store.list_sessions(project_id=proj_filter)
-            payload = _control_envelope(sessions, sources=[{"name": "review_sessions", "availability": "available"}])
+            payload = _control_envelope(redact_secrets(sessions), sources=[{"name": "review_sessions", "availability": "available"}])
 
         elif path.startswith("/api/v1/control/reviews/"):
             if not self._owner_authorized():
                 self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            from dev_orchestrator.control.logs import redact_secrets
             from dev_orchestrator.review.store import ReviewSessionStore
             store = ReviewSessionStore(runtime, read_only=True)
 
@@ -768,7 +770,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     findings_list = [f for f in findings_list if isinstance(f, dict) and f.get("severity") == sev_filter]
                 if rule_filter:
                     findings_list = [f for f in findings_list if isinstance(f, dict) and f.get("rule_id") == rule_filter]
-                payload = _control_envelope(findings_list, sources=[{"name": "review_findings", "availability": "available"}])
+                payload = _control_envelope(redact_secrets(findings_list), sources=[{"name": "review_findings", "availability": "available"}])
 
             elif match_coverage:
                 session_id = match_coverage.group(1)
@@ -784,7 +786,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     art = jstore.get_output_artifact(session.job_id, "coverage.json")
                     if art and isinstance(art.get("content"), dict):
                         cov_data = art["content"]
-                payload = _control_envelope(cov_data, sources=[{"name": "review_coverage", "availability": "available"}])
+                payload = _control_envelope(redact_secrets(cov_data), sources=[{"name": "review_coverage", "availability": "available"}])
 
             elif match_artifact:
                 session_id = match_artifact.group(1)
@@ -799,14 +801,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 art = jstore.get_output_artifact(session.job_id, art_name)
                 if art is None:
                     self._error(404, "Not Found", f"artifact {art_name!r} not found", head_only); return
-                payload = _control_envelope(art, sources=[{"name": "review_artifact", "availability": "available"}])
+                art_clean = {k: v for k, v in art.items() if k != "raw_bytes"}
+                payload = _control_envelope(redact_secrets(art_clean), sources=[{"name": "review_artifact", "availability": "available"}])
 
             elif match_session:
                 session_id = match_session.group(1)
                 session = store.get_session(session_id)
                 if session is None:
                     self._error(404, "Not Found", "review session not found", head_only); return
-                payload = _control_envelope(session.to_dict(), sources=[{"name": "review_sessions", "availability": "available"}])
+                payload = _control_envelope(redact_secrets(session.to_dict()), sources=[{"name": "review_sessions", "availability": "available"}])
 
             else:
                 self._error(404, "Not Found", "route not found", head_only); return

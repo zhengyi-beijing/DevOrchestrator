@@ -355,7 +355,19 @@ class DefaultReviewerHarnessTests(unittest.TestCase):
         subprocess.run(["git", "commit", "-m", "init"], cwd=str(self.repo), capture_output=True, check=True)
 
     def tearDown(self):
-        self.temp_dir.cleanup()
+        try:
+            from dev_orchestrator.process import terminate_pid
+            store = ExecutionJobStore(self.runtime)
+            for j in store.list():
+                rec = store.get(j["job_id"])
+                if rec and rec.supervisor.get("pid"):
+                    terminate_pid(rec.supervisor["pid"])
+        except Exception:
+            pass
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
 
     def test_harness_submit_and_status(self):
         job_cfg = JobsConfig(
@@ -403,6 +415,238 @@ class DefaultReviewerHarnessTests(unittest.TestCase):
         # Status check
         st = harness.status(session.session_id)
         self.assertEqual(st.session_id, session.session_id)
+
+    def test_harness_input_digest_consistency(self):
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={
+                        "review-runner": JobCommandConfig(
+                            argv=["python", "-c", "import sys; sys.exit(0)"],
+                            cwd=".",
+                        )
+                    },
+                )
+            },
+        )
+        job_service = JobService(self.runtime, config=job_cfg)
+        harness = DefaultReviewerHarness(self.runtime, job_service=job_service)
+
+        req = ReviewRequest(
+            request_id="review_sess_digest_test",
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_1",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["."],
+            metadata={"repo_path": str(self.repo)},
+        )
+
+        session = harness.submit(req)
+        store = ExecutionJobStore(self.runtime)
+        rec = store.get(session.job_id)
+        self.assertIsNotNone(rec)
+        self.assertTrue(rec.input_digest.startswith("sha256:"))
+        # Verify input.json on disk matches rec.input_digest
+        input_file = store._job_dir(session.job_id) / "input.json"
+        import hashlib
+        disk_digest = "sha256:" + hashlib.sha256(input_file.read_bytes()).hexdigest()
+        self.assertEqual(rec.input_digest, disk_digest)
+
+    def test_safe_session_id_collision_prevention(self):
+        from dev_orchestrator.review.store import _safe_session_id
+        id1 = _safe_session_id("review:123-abc")
+        id2 = _safe_session_id("review-123-abc")
+        id3 = _safe_session_id("review_123-abc")
+        self.assertNotEqual(id1, id2)
+        self.assertNotEqual(id1, id3)
+        self.assertNotEqual(id2, id3)
+
+    def test_ocr_adapter_fails_closed_on_error(self):
+        adapter = OpenCodeReviewAdapter(self.repo, executable="fake_ocr")
+        mock_sub = MagicMock()
+        adapter._subprocess = mock_sub
+
+        probe_res = MagicMock(returncode=0, stdout=json.dumps({"capabilities": ["diff_preview", "scan_preview"]}))
+        fail_res = MagicMock(returncode=1, stderr="internal error")
+        mock_sub.run.side_effect = [probe_res, fail_res]
+
+        with self.assertRaises(RuntimeError) as ctx:
+            adapter.prepare_diff("workspace", {}, {"max_files": 10})
+        self.assertIn("OCR review-preview failed", str(ctx.exception))
+
+    def test_workspace_diff_falls_back_to_head_when_clean(self):
+        adapter = OpenCodeReviewAdapter(self.repo, executable=None)
+        selected, excluded, refs = adapter.prepare_diff("workspace", {}, {"max_files": 10})
+        sel_paths = [f["path"] for f in selected]
+        self.assertIn("test.py", sel_paths)
+
+    def test_review_runner_run_full_flow(self):
+        from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={"review-runner": JobCommandConfig(argv=["python", "-c", "import sys; sys.exit(0)"], cwd=".")},
+                )
+            },
+        )
+        job_service = JobService(self.runtime, config=job_cfg)
+        harness = DefaultReviewerHarness(self.runtime, job_service=job_service)
+        req = ReviewRequest(
+            request_id="runner_sess_1",
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_1",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["."],
+            metadata={"repo_path": str(self.repo)},
+        )
+        session = harness.submit(req)
+        store = ExecutionJobStore(self.runtime)
+        jdir = store._job_dir(session.job_id)
+
+        mock_port = MagicMock()
+        mock_port.execute.return_value = AIRoleResult(
+            request_id="ocr_review:runner_sess_1:0",
+            role_run_id="reviewer",
+            status="succeeded",
+            output=json.dumps({
+                "reviewed_files": ["test.py"],
+                "skipped_files": [],
+                "findings": [
+                    {
+                        "file": "test.py",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "severity": "warning",
+                        "category": "style",
+                        "rule_id": "pep8",
+                        "message": "naming convention",
+                    }
+                ],
+            }),
+            resource_context=ResourceContext("res1", "mock_prov", "acc1", "model1"),
+        )
+
+        runner = ReviewRunner(jdir, port=mock_port)
+        ret = runner.run()
+        self.assertEqual(ret, 0)
+
+        f_art = store.get_output_artifact(session.job_id, "findings.json")
+        c_art = store.get_output_artifact(session.job_id, "coverage.json")
+        s_art = store.get_output_artifact(session.job_id, "review.sarif")
+        sess_art = store.get_output_artifact(session.job_id, "session.json")
+        self.assertIsNotNone(f_art)
+        self.assertIsNotNone(c_art)
+        self.assertIsNotNone(s_art)
+        self.assertIsNotNone(sess_art)
+
+        cov_data = c_art["content"]
+        self.assertEqual(cov_data["completeness"], "complete")
+        self.assertEqual(cov_data["reviewed_count"], 1)
+
+        sess_data = sess_art["content"]
+        self.assertEqual(sess_data["result"]["disposition"], "next")
+
+    def test_review_runner_run_empty_scope_fails_closed(self):
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={"review-runner": JobCommandConfig(argv=["python", "-c", "import sys; sys.exit(0)"], cwd=".")},
+                )
+            },
+        )
+        job_service = JobService(self.runtime, config=job_cfg)
+        harness = DefaultReviewerHarness(self.runtime, job_service=job_service)
+        req = ReviewRequest(
+            request_id="runner_empty_sess",
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_1",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["non_existent_dir"],
+            metadata={"repo_path": str(self.repo)},
+        )
+        session = harness.submit(req)
+        store = ExecutionJobStore(self.runtime)
+        jdir = store._job_dir(session.job_id)
+
+        mock_port = MagicMock()
+        runner = ReviewRunner(jdir, port=mock_port)
+        ret = runner.run()
+        self.assertEqual(ret, 0)
+
+        c_art = store.get_output_artifact(session.job_id, "coverage.json")
+        sess_art = store.get_output_artifact(session.job_id, "session.json")
+        self.assertEqual(c_art["content"]["completeness"], "failed")
+        self.assertEqual(c_art["content"]["selected_count"], 0)
+        self.assertEqual(sess_art["content"]["result"]["disposition"], "failed")
+        self.assertIn("empty", sess_art["content"]["result"]["reason"].lower())
+
+    def test_review_runner_rejects_lifecycle_tokens(self):
+        from dev_orchestrator.ai.contracts import AIRoleResult
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={"review-runner": JobCommandConfig(argv=["python", "-c", "import sys; sys.exit(0)"], cwd=".")},
+                )
+            },
+        )
+        job_service = JobService(self.runtime, config=job_cfg)
+        harness = DefaultReviewerHarness(self.runtime, job_service=job_service)
+        req = ReviewRequest(
+            request_id="runner_token_sess",
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_1",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["."],
+            metadata={"repo_path": str(self.repo)},
+        )
+        session = harness.submit(req)
+        store = ExecutionJobStore(self.runtime)
+        jdir = store._job_dir(session.job_id)
+
+        mock_port = MagicMock()
+        mock_port.execute.return_value = AIRoleResult(
+            request_id="ocr_review:runner_token_sess:0",
+            role_run_id="reviewer",
+            status="succeeded",
+            output=json.dumps({"decision": "next", "reviewed_files": ["test.py"]}),
+        )
+
+        runner = ReviewRunner(jdir, port=mock_port)
+        ret = runner.run()
+        self.assertEqual(ret, 0)
+
+        c_art = store.get_output_artifact(session.job_id, "coverage.json")
+        self.assertEqual(c_art["content"]["completeness"], "failed")
+        sess_art = store.get_output_artifact(session.job_id, "session.json")
+        self.assertEqual(sess_art["content"]["result"]["disposition"], "failed")
 
 
 if __name__ == "__main__":

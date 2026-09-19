@@ -1106,6 +1106,7 @@ def cmd_review_submit(args: argparse.Namespace) -> int:
         raise CliError(f"repository truth invalid at {repo_path}")
 
     request_id = getattr(args, "request_id", None) or f"review-{truth.head[:8]}-{utc_now_iso().replace(':', '').replace('-', '')[:15]}"
+    source_request_id = getattr(args, "source_request_id", None) or f"operator-{request_id}"
     diff_refs: dict[str, str] = {}
     if getattr(args, "base", None):
         diff_refs["base"] = str(args.base)
@@ -1116,6 +1117,7 @@ def cmd_review_submit(args: argparse.Namespace) -> int:
         request_id=request_id,
         project_id=args.project_id,
         task_id=getattr(args, "task_id", None) or "manual-review",
+        source_request_id=source_request_id,
         mode=getattr(args, "mode", "diff") or "diff",
         diff_mode=getattr(args, "diff_mode", "workspace") or "workspace",
         diff_refs=diff_refs,
@@ -1447,6 +1449,7 @@ def build_parser() -> argparse.ArgumentParser:
     review_submit = sub.add_parser("review-submit", help="submit a review session")
     review_submit.add_argument("--project-id", required=True, help="project ID")
     review_submit.add_argument("--task-id", default=None, help="task ID")
+    review_submit.add_argument("--source-request-id", default=None, help="originating source or worker request ID")
     review_submit.add_argument("--request-id", default=None, help="custom review request ID")
     review_submit.add_argument("--mode", choices=("diff", "scan"), default="diff", help="review mode")
     review_submit.add_argument("--diff-mode", choices=("workspace", "range", "commit"), default="workspace", help="diff mode")

@@ -106,50 +106,55 @@ class OpenCodeReviewAdapter:
         # Try OCR preview command if executable is available
         probe = self.probe_capabilities()
         if probe.get("available") and "diff_preview" in probe.get("capabilities", []):
-            try:
-                argv = [
-                    self.executable,
-                    "review-preview",
-                    "--diff-mode",
-                    mode,
-                    "--repo",
-                    str(self.repo_path),
-                ]
-                if refs.get("base"):
-                    argv.extend(["--base", refs["base"]])
-                if refs.get("head"):
-                    argv.extend(["--head", refs["head"]])
-                if refs.get("commit"):
-                    argv.extend(["--commit", refs["commit"]])
+            argv = [
+                self.executable,
+                "review-preview",
+                "--diff-mode",
+                mode,
+                "--repo",
+                str(self.repo_path),
+            ]
+            if refs.get("base"):
+                argv.extend(["--base", refs["base"]])
+            if refs.get("head"):
+                argv.extend(["--head", refs["head"]])
+            if refs.get("commit"):
+                argv.extend(["--commit", refs["commit"]])
 
-                res = self._subprocess.run(
-                    argv,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    shell=False,
-                    cwd=str(self.repo_path),
-                    **hidden_subprocess_kwargs(),
-                )
-                if res.returncode == 0:
-                    data = json.loads(res.stdout.strip())
-                    if isinstance(data, dict):
-                        raw_sel = data.get("selected_files", [])
-                        raw_ex = data.get("excluded_files", [])
-                        resolved_refs = dict(data.get("resolved_refs") or refs)
-                        # Validate containment
-                        selected: list[dict[str, Any]] = []
-                        excluded: list[dict[str, Any]] = list(raw_ex)
-                        for f in raw_sel:
-                            rel_p = _normalize_repo_path(f["path"])
-                            full_p = self.repo_path / rel_p
-                            if not _is_path_contained(self.repo_path, full_p):
-                                excluded.append({"path": rel_p, "reason": "escapes_repo_containment"})
-                                continue
-                            selected.append(f)
-                        return selected, excluded, resolved_refs
-            except Exception:
-                pass
+            res = self._subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                shell=False,
+                cwd=str(self.repo_path),
+                **hidden_subprocess_kwargs(),
+            )
+            if res.returncode != 0:
+                raise RuntimeError(f"OCR review-preview failed ({res.returncode}): {res.stderr.strip()}")
+            try:
+                data = json.loads(res.stdout.strip())
+            except Exception as exc:
+                raise ValueError(f"OCR review-preview output is not valid JSON: {exc}") from exc
+            if not isinstance(data, dict):
+                raise ValueError("OCR review-preview output must be a JSON object")
+
+            raw_sel = data.get("selected_files", [])
+            raw_ex = data.get("excluded_files", [])
+            resolved_refs = dict(data.get("resolved_refs") or refs)
+            # Validate containment
+            selected: list[dict[str, Any]] = []
+            excluded: list[dict[str, Any]] = list(raw_ex)
+            for f in raw_sel:
+                rel_p = _normalize_repo_path(f["path"])
+                full_p = self.repo_path / rel_p
+                if not _is_path_contained(self.repo_path, full_p):
+                    excluded.append({"path": rel_p, "reason": "escapes_repo_containment"})
+                    continue
+                selected.append(f)
+            return selected, excluded, resolved_refs
+        elif probe.get("available"):
+            raise RuntimeError(f"OCR executable {self.executable} lacks required diff_preview capability")
 
         # Deterministic git diff fallback
         return self._git_diff_preview(mode, refs, max_files, max_bytes)
@@ -171,7 +176,7 @@ class OpenCodeReviewAdapter:
             git_cmd = ["git", "diff", "--name-only", f"{base}...{head}"]
         elif mode == "commit":
             c = refs.get("commit", "HEAD")
-            git_cmd = ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", c]
+            git_cmd = ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", c]
 
         res = self._subprocess.run(
             git_cmd,
@@ -203,6 +208,21 @@ class OpenCodeReviewAdapter:
                     excluded.append({"path": path_str, "reason": "deleted"})
                 else:
                     candidate_paths.append(path_str)
+            # If workspace has no uncommitted changes (clean post-worker state),
+            # inspect the worker's commit at HEAD so changes are not silently skipped
+            if not candidate_paths and not excluded:
+                c = refs.get("commit", refs.get("head", "HEAD"))
+                c_cmd = ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", c]
+                c_res = self._subprocess.run(
+                    c_cmd,
+                    cwd=str(self.repo_path),
+                    capture_output=True,
+                    text=True,
+                    shell=False,
+                    **hidden_subprocess_kwargs(),
+                )
+                if c_res.returncode == 0:
+                    candidate_paths = [l.strip() for l in c_res.stdout.splitlines() if l.strip()]
         else:
             candidate_paths = [l.strip() for l in lines if l.strip()]
 
@@ -258,6 +278,49 @@ class OpenCodeReviewAdapter:
         """Scan repository files under configured scan roots within bounds."""
         max_files = int(limits.get("max_files", 100))
         max_bytes = int(limits.get("max_total_bytes", 1024 * 1024))
+
+        probe = self.probe_capabilities()
+        if probe.get("available") and "scan_preview" in probe.get("capabilities", []):
+            argv = [
+                self.executable,
+                "scan-preview",
+                "--roots",
+                ",".join(roots),
+                "--repo",
+                str(self.repo_path),
+            ]
+            res = self._subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                shell=False,
+                cwd=str(self.repo_path),
+                **hidden_subprocess_kwargs(),
+            )
+            if res.returncode != 0:
+                raise RuntimeError(f"OCR scan-preview failed ({res.returncode}): {res.stderr.strip()}")
+            try:
+                data = json.loads(res.stdout.strip())
+            except Exception as exc:
+                raise ValueError(f"OCR scan-preview output is not valid JSON: {exc}") from exc
+            if not isinstance(data, dict):
+                raise ValueError("OCR scan-preview output must be a JSON object")
+
+            raw_sel = data.get("selected_files", [])
+            raw_ex = data.get("excluded_files", [])
+            selected: list[dict[str, Any]] = []
+            excluded: list[dict[str, Any]] = list(raw_ex)
+            for f in raw_sel:
+                rel_p = _normalize_repo_path(f["path"])
+                full_p = self.repo_path / rel_p
+                if not _is_path_contained(self.repo_path, full_p):
+                    excluded.append({"path": rel_p, "reason": "escapes_repo_containment"})
+                    continue
+                selected.append(f)
+            return selected, excluded
+        elif probe.get("available"):
+            raise RuntimeError(f"OCR executable {self.executable} lacks required scan_preview capability")
 
         selected: list[dict[str, Any]] = []
         excluded: list[dict[str, Any]] = []

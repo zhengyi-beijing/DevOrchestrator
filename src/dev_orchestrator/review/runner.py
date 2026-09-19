@@ -69,7 +69,7 @@ def partition_packets(
         current_files.append(f)
         current_bytes += f_size
 
-    if current_files or not packets:
+    if current_files:
         p_idx = len(packets)
         p_id = f"{session_id}:packet:{p_idx}"
         packets.append(
@@ -285,6 +285,13 @@ class ReviewRunner:
             sys.stderr.write(f"runner error: job record {self.job_dir.name} not found\n")
             return 1
 
+        if rec.state == "queued":
+            def _mark_running(r: JobRecord) -> None:
+                if r.state == "queued":
+                    r.transition_to("running", reason="review_execution_started", timestamp=utc_now_iso())
+            self.store.update(rec.job_id, _mark_running)
+            rec = self.store.get(self.job_dir.name) or rec
+
         try:
             raw_input = json.loads(input_file.read_text(encoding="utf-8"))
         except Exception as exc:
@@ -319,6 +326,21 @@ class ReviewRunner:
 
         packet_records: list[dict[str, Any]] = []
 
+        prev_res = request.metadata.get("previous_resource_context") or request.metadata.get("worker_resource_context")
+        prev_ctx = None
+        if isinstance(prev_res, dict) and prev_res.get("resource_id"):
+            prev_ctx = ResourceContext(
+                resource_id=prev_res.get("resource_id"),
+                provider=prev_res.get("provider"),
+                account=prev_res.get("account"),
+                model=prev_res.get("model"),
+            )
+
+        independence = request.metadata.get("independence", "resource" if prev_ctx else "none")
+        if independence != "none" and prev_ctx is None:
+            independence = "none"
+
+        failed_packets = 0
         for pkt in packets:
             prompt = build_packet_prompt(pkt, repo_path, request)
             ai_req = AIRoleRequest(
@@ -331,7 +353,8 @@ class ReviewRunner:
                 prompt=prompt,
                 working_directory=repo_path,
                 quality=request.metadata.get("quality", "high"),
-                independence=request.metadata.get("independence", "resource"),
+                independence=independence,
+                previous_resource_context=prev_ctx,
                 timeout_seconds=float(request.metadata.get("timeout_seconds", 300.0)),
             )
 
@@ -366,9 +389,11 @@ class ReviewRunner:
                             all_reviewed_files.add(fp)
                 except Exception as exc:
                     sys.stderr.write(f"runner packet {pkt.packet_id} parse error: {exc}\n")
+                    failed_packets += 1
                     for f in pkt.files:
                         failed_files.add(str(f.get("path")))
             else:
+                failed_packets += 1
                 for f in pkt.files:
                     failed_files.add(str(f.get("path")))
 
@@ -397,9 +422,11 @@ class ReviewRunner:
         excluded_count = len([f for f in files_coverage.values() if f["status"] == "excluded"])
         selected_count = len(selected_set)
 
-        if failed_count > 0:
+        if failed_count > 0 or failed_packets > 0:
             completeness = "failed"
-        elif selected_count > 0 and (reviewed_count + skipped_count) < selected_count:
+        elif selected_count == 0:
+            completeness = "failed"
+        elif (reviewed_count + skipped_count) < selected_count:
             completeness = "partial"
         else:
             completeness = "complete"
@@ -423,7 +450,10 @@ class ReviewRunner:
         ]
         if completeness != "complete":
             disposition = "failed"
-            reason = f"Review coverage is {completeness} ({reviewed_count}/{selected_count} files reviewed)"
+            if selected_count == 0:
+                reason = "Review scope is empty: zero files selected for inspection"
+            else:
+                reason = f"Review coverage is {completeness} ({reviewed_count}/{selected_count} files reviewed)"
         elif blocking_findings:
             disposition = "remediate"
             reason = f"Detected {len(blocking_findings)} blocking finding(s)"
@@ -488,6 +518,8 @@ class ReviewRunner:
         self.store.save_result(rec.job_id, result_record)
 
         def _mark_done(r: JobRecord) -> None:
+            if r.state == "queued":
+                r.transition_to("running", reason="review_execution_started", timestamp=utc_now_iso())
             r.transition_to("completed", reason=reason, timestamp=utc_now_iso())
             r.exit_code = 0
             r.terminal = result_record

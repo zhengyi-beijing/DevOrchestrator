@@ -510,6 +510,10 @@ class ExecutionJobStore:
         tmp.replace(input_file)
 
         def _set_digest(rec: JobRecord) -> None:
+            if rec.input_digest and rec.input_digest != digest:
+                raise JobCorruptionError(
+                    f"input artifact digest mismatch for {job_id}: {digest} != {rec.input_digest}"
+                )
             rec.input_digest = digest
             rec.timestamps["updated_at"] = utc_now_iso()
 

@@ -36,6 +36,7 @@ from dev_orchestrator.jobs.config import (
     JobProjectConfig,
     JobsConfig,
 )
+from dev_orchestrator.jobs.models import JobSpec
 from dev_orchestrator.jobs.service import JobService
 from dev_orchestrator.review.harness import DefaultReviewerHarness
 from dev_orchestrator.review.models import (
@@ -113,6 +114,23 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
             ],
         }
         write_json(self.config_path, self.config_data, indent=2)
+
+        jobs_config = {
+            "version": 1,
+            "enabled": True,
+            "projects": {
+                "labdemo": {
+                    "repo_path": str(self.repo),
+                    "commands": {
+                        "review-runner": {
+                            "argv": ["python", "-c", "import sys; sys.exit(0)"],
+                            "cwd": ".",
+                        }
+                    },
+                }
+            },
+        }
+        write_json(self.runtime / "execution-jobs.json", jobs_config, indent=2)
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -436,6 +454,30 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
             self.assertEqual(len(data), 1)
             self.assertEqual(data[0]["rule_id"], "failsafe_xray_off")
 
+        # Test review-submit CLI
+        submit_args = argparse.Namespace(
+            project_id="labdemo",
+            task_id="task_cli_submit",
+            source_request_id="src_cli_submit",
+            request_id="cli_submit_sess",
+            mode="diff",
+            diff_mode="workspace",
+            scan_roots=None,
+            rule_pack=None,
+            base=None,
+            head=None,
+            transport="local",
+            repo_path=str(self.repo),
+            config=str(self.config_path),
+            runtime_root=str(self.runtime),
+        )
+        with patch("sys.stdout", new_callable=io.StringIO) as out:
+            ret = cmd_review_submit(submit_args)
+            self.assertEqual(ret, 0)
+            data = json.loads(out.getvalue())
+            self.assertEqual(data["session_id"], "cli_submit_sess")
+            self.assertEqual(data["request"]["source_request_id"], "src_cli_submit")
+
         # Test review-findings CLI (sarif format)
         sarif_args = argparse.Namespace(
             session_id="cli_sess_1",
@@ -451,14 +493,145 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
             self.assertEqual(data["version"], "2.1.0")
             self.assertEqual(len(data["runs"][0]["results"]), 1)
 
+    def test_coordinator_partial_coverage_fails_closed(self):
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_partial"
+        worker_record = {
+            "engine": "aibroker",
+            "state": "completed",
+            "project_id": "labdemo",
+            "task_id": "task_lab_partial",
+            "repo_path": str(self.repo),
+            "completed_at": utc_now_iso(),
+            "independent_gates": {"tests": "passed"},
+            "resource_context": {"resource_id": "res_1", "provider": "p", "account": "a", "model": "m"},
+        }
+        texec_path = self.runtime / "transition-executor.json"
+        write_json(texec_path, {"version": 1, "executions": {source_id: worker_record}}, indent=2)
+
+        mock_harness = MagicMock()
+        mock_session = ReviewSession(
+            session_id="ai_review:" + source_id,
+            request=ReviewRequest(
+                request_id="ai_review:" + source_id,
+                project_id="labdemo",
+                task_id="task_lab_partial",
+                source_request_id=source_id,
+                branch=truth.branch,
+                head=truth.head,
+                status_hash=truth.status_hash,
+            ),
+            state="completed",
+            job_id="job_lab_partial",
+        )
+        mock_harness.submit.return_value = mock_session
+        mock_harness.status.return_value = mock_session
+        mock_result = ReviewResult(
+            session_id=mock_session.session_id,
+            job_id="job_lab_partial",
+            disposition="failed",
+            completeness="partial",
+            findings=[],
+            coverage=ReviewCoverage(completeness="partial", selected_count=2, reviewed_count=1),
+            reason="Partial coverage",
+        )
+        mock_harness.result.return_value = mock_result
+
+        progress_mock = MagicMock()
+        coordinator = AIReviewerCoordinator(
+            self.runtime,
+            port=None,
+            progress_channel=progress_mock,
+            harness=mock_harness,
+        )
+
+        coordinator.advance(self.config_path)
+        for t in list(coordinator._threads.values()):
+            t.join(timeout=3)
+
+        decisions_file = self.runtime / "review-decisions.json"
+        decisions_data = read_json(decisions_file, {}) if decisions_file.is_file() else {}
+        self.assertNotIn("ai_review:" + source_id, decisions_data.get("decisions", {}))
+
+        calls = [c[0] for c in progress_mock.emit.call_args_list]
+        event_names = [c[1] for c in calls]
+        self.assertIn("REVIEW_FAILED", event_names)
+
+    def test_coordinator_daemon_restart_reconciliation(self):
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_rec"
+        review_id = "ai_review:" + source_id
+
+        # Write interrupted state to ai-reviewer.json
+        reviewer_state = {
+            "version": 1,
+            "reviews": {
+                review_id: {
+                    "review_id": review_id,
+                    "project_id": "labdemo",
+                    "task_id": "task_lab_rec",
+                    "source_request_id": source_id,
+                    "state": "running",
+                    "harness": True,
+                    "session_id": review_id,
+                    "started_at": utc_now_iso(),
+                }
+            }
+        }
+        write_json(self.runtime / "ai-reviewer.json", reviewer_state, indent=2)
+
+        mock_harness = MagicMock()
+        reconciled_session = ReviewSession(
+            session_id=review_id,
+            request=ReviewRequest(
+                request_id=review_id,
+                project_id="labdemo",
+                task_id="task_lab_rec",
+                source_request_id=source_id,
+                branch=truth.branch,
+                head=truth.head,
+                status_hash=truth.status_hash,
+            ),
+            state="completed",
+            job_id="job_lab_rec",
+        )
+        mock_harness.reconcile.return_value = reconciled_session
+
+        coordinator = AIReviewerCoordinator(
+            self.runtime,
+            port=None,
+            harness=mock_harness,
+        )
+
+        mock_harness.reconcile.assert_called_once_with(review_id)
+        saved_state = read_json(self.runtime / "ai-reviewer.json", {})
+        self.assertEqual(saved_state["reviews"][review_id]["state"], "completed")
+        self.assertEqual(saved_state["reviews"][review_id]["job_id"], "job_lab_rec")
+
     def test_control_api_review_endpoints(self):
         import http.client
         import threading
         from dev_orchestrator.control.security import ControlSecurity
+        from dev_orchestrator.jobs.store import ExecutionJobStore
         from dev_orchestrator.web.server import make_server
 
         # 1. Populate a review session with findings and coverage in the store
         store = ReviewSessionStore(self.runtime)
+        job_service = JobService(self.runtime)
+        job_rec = job_service.submit(
+            JobSpec(
+                project_id="labdemo",
+                command_ref="review-runner",
+                idempotency_key="idemp_api",
+            )
+        )
+        jstore = ExecutionJobStore(self.runtime)
+        jstore.save_output_artifact(
+            job_rec.job_id,
+            "findings.json",
+            [{"rule_id": "failsafe_xray_off", "secret_key": "supersecretpassword123"}],
+        )
+
         req = ReviewRequest(
             request_id="api_sess_1",
             project_id="labdemo",
@@ -476,16 +649,17 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
             severity="blocking",
             category="safety",
             rule_id="failsafe_xray_off",
-            message="Missing power cut",
+            message="Missing power cut with Bearer supersecrettoken123",
         )
         coverage = ReviewCoverage(completeness="complete", selected_count=1, reviewed_count=1)
         sess = ReviewSession(
             session_id="api_sess_1",
             request=req,
             state="completed",
+            job_id=job_rec.job_id,
             result=ReviewResult(
                 session_id="api_sess_1",
-                job_id="job_api",
+                job_id=job_rec.job_id,
                 disposition="remediate",
                 completeness="complete",
                 findings=[finding],
@@ -544,6 +718,9 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
             data = json.loads(body.decode("utf-8"))
             self.assertEqual(len(data["data"]), 1)
             self.assertEqual(data["data"][0]["rule_id"], "failsafe_xray_off")
+            # Secret should be redacted
+            self.assertNotIn("supersecrettoken123", body.decode("utf-8"))
+            self.assertIn("Bearer [REDACTED]", body.decode("utf-8"))
 
             # Findings with filter
             st, body = do_get("/api/v1/control/reviews/api_sess_1/findings?severity=warning")
@@ -556,6 +733,15 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
             self.assertEqual(st, 200)
             data = json.loads(body.decode("utf-8"))
             self.assertEqual(data["data"]["completeness"], "complete")
+
+            # Artifact GET endpoint (verifies raw_bytes excluded and secret redacted)
+            st, body = do_get("/api/v1/control/reviews/api_sess_1/artifacts/findings.json")
+            self.assertEqual(st, 200)
+            data = json.loads(body.decode("utf-8"))
+            self.assertNotIn("raw_bytes", data["data"])
+            self.assertIn("content", data["data"])
+            self.assertNotIn("supersecretpassword123", body.decode("utf-8"))
+            self.assertEqual(data["data"]["content"][0]["secret_key"], "[REDACTED]")
 
             # Non-existent session returns 404
             st, _ = do_get("/api/v1/control/reviews/non_existent_session")

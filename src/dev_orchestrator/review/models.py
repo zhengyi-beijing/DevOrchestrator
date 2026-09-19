@@ -84,7 +84,7 @@ class ReviewRequest:
     blocking_severities: list[str] = field(default_factory=lambda: ["blocking"])
     transport: str = "local"
     idempotency_key: str = ""
-    independent_gates: dict[str, Any] = field(default_factory=dict)
+    independent_gates: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -113,6 +113,12 @@ class ReviewRequest:
     def from_dict(cls, data: Mapping[str, Any]) -> ReviewRequest:
         allowed = {f for f in cls.__dataclass_fields__}
         filtered = {k: data[k] for k in allowed if k in data and data[k] is not None}
+        if "independent_gates" in filtered:
+            raw_gates = filtered["independent_gates"]
+            if isinstance(raw_gates, dict):
+                filtered["independent_gates"] = [str(k) for k in raw_gates.keys()]
+            elif isinstance(raw_gates, list):
+                filtered["independent_gates"] = [str(g) for g in raw_gates]
         return cls(**filtered)
 
 

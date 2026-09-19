@@ -866,4 +866,27 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Full regression suite: 816 passed, 45 subtests passed in 264.05s (`python -m pytest tests_py -q`).
   - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (4050 nodes, 11384 edges, 186 communities).
-- Canonical worktree clean and ready for independent technical review.
+
+P14.5 Remediation result:
+- Completed Technical Review Remediation for P14.5 Reviewer Harness & OpenCodeReview Adapter:
+  1. Fail-Open Scope Fix: In `ocr_adapter.py`, clean post-worker workspace diff falls back to inspecting `HEAD` using `git diff-tree --root` so committed files are selected. In `runner.py`, empty selected file list produces `completeness = "failed"` and `disposition = "failed"` with explicit empty scope reason.
+  2. CLI Review Submit Contract: In `cli.py`, added `--source-request-id` to argument parser and plumbed required `source_request_id` in `cmd_review_submit`.
+  3. Control API Artifact Serialization: In `web/server.py`, stripped `raw_bytes` from artifact payload before JSON encoding so GET `/api/v1/control/reviews/{id}/artifacts/{name}` succeeds without TypeError.
+  4. Bounds & Configuration Plumbing: In `AIReviewerCoordinator._run_harness_review`, correctly plumbed `file_limits`, `command_ref`, `ocr_executable`, and `diff_refs` to `DefaultReviewerHarness`.
+  5. Accounting Interval & Attempt Tracking: Added `_fail_review` helper ensuring `start_interval('technical_review')` ends and attempt outcome is recorded across all post-execution failure branches (repository truth drift, independent gate failure, coverage incomplete, decision persistence failure).
+  6. Daemon-Restart Reconciliation: Implemented active session reconciliation in `AIReviewerCoordinator._recover_interrupted()` calling `harness.reconcile(session_id)`.
+  7. Robustness & Security Hardening:
+     - `ocr_adapter.py`: Fails closed with `RuntimeError`/`ValueError` on non-zero exit or malformed JSON instead of silent fallback.
+     - `jobs/store.py`: `save_input_artifact` validates digest consistency with `JobRecord.input_digest` to prevent divergence.
+     - `review/models.py`: `ReviewRequest.independent_gates` typed `list[str]` and accepts dictionary mappings in `from_dict`.
+     - `review/store.py`: `_safe_session_id` uses injective encoding (`:` -> `_colon_`, `_` -> `__`) to prevent cross-session collision.
+     - `web/server.py`: Enforces `redact_secrets` across all review control endpoints.
+     - `review/runner.py`: Ensures job transitions from `queued` to `running` before completing and properly derives `AIRoleRequest.independence` and `previous_resource_context`.
+  8. Verification:
+     - Focused P14.5 test suites: 32 passed in 7.21s (`test_p145_reviewer_harness.py`, `test_p145_job_recovery.py`, `test_p145_software_acceptance.py`).
+     - Adjacent P14 durable jobs suites: 43 passed in 10.30s (`test_p14_durable_jobs.py`, `test_p14_job_recovery.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_software_acceptance.py`).
+     - Review coordinator test suite: 5 passed in 1.63s (`test_ai_reviewer.py`).
+     - Full repository regression: 825 passed, 45 subtests passed in 262.74s (`python -m pytest tests_py -q`).
+     - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
+     - Knowledge graph updated with `graphify update .` (4063 nodes, 11476 edges, 182 communities).
+- Canonical worktree clean, all technical review findings remediated and verified. Ready for local commit.

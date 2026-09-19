@@ -5,38 +5,31 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P14.5 Reviewer Harness & OpenCodeReview Adapter** — **IMPLEMENTATION COMPLETE / READY FOR TECHNICAL REVIEW**.
+Current task: **P14.5 Reviewer Harness & OpenCodeReview Adapter** — **REMEDIATION COMPLETE / VERIFIED CLEAN**.
 
 Latest continuation state (2026-09-19):
-- Implemented P14.5 Reviewer Harness & OpenCodeReview Adapter:
-  1. Executable Contract & Architecture Boundary (`docs/P14_5_REVIEWER_HARNESS_CONTRACT.md`, `docs/P14_DURABLE_JOBS_CONTRACT.md`):
-     - Authored canonical P14.5 contract defining provider-neutral `ReviewerHarness` boundary, OpenCodeReview deterministic preparation adapter, strict evidence-only reviewer contract, SARIF 2.1.0 and canonical JSON artifacts, and independent gate requirements.
-     - Documented and preserved the core lifecycle invariant: models, OpenCodeReview, and execution transports return evidence only; `AIReviewerCoordinator` remains the sole lifecycle authority writing `review-decisions.json`.
-     - Updated P14 contract (Section 10) to specify content-addressed `input_digest` in `JobSpec`/`JobRecord` and bounded output artifact descriptors.
-  2. P14 Durable Job Substrate Extension (`models.py`, `store.py`, `transport.py`, `service.py`, `remote_helper.py`):
-     - Added content-addressed `input_digest` to `JobSpec` and `JobRecord`, including input digest in `spec_hash` and conflict validation while remaining strictly additive (byte-identical hash when `input_digest` is absent).
-     - Added `JobArtifactDescriptor` and storage/retrieval APIs: `save_input_artifact`, `get_input_artifact`, `save_output_artifact`, `get_output_artifact`, `list_output_artifacts` with SHA-256 verification and size bounds.
-     - Extended `LocalJobTransport`, `SSHJobTransport`, `JobService`, and `remote_helper.py` with `job_artifact` operation.
-  3. Review Package (`src/dev_orchestrator/review`):
-     - `models.py`: versioned models (`ReviewRequest`, `ReviewSession`, `ReviewManifest`, `ReviewCoverage`, `ReviewFinding`, `ReviewResult`), deterministic SHA-256 finding fingerprinting, path containment validation, and SARIF 2.1.0 generator.
-     - `ocr_adapter.py`: `OpenCodeReviewAdapter` with capability probing, machine-readable JSON invocation (`shell=False`), workspace/range/commit diff preparation, bounded scan preparation, and rule resolution.
-     - `runner.py`: `ReviewRunner` CLI partitioning files into bounded packets, building evidence-only reviewer prompts, rejecting lifecycle tokens in model outputs, and persisting `findings.json`, `coverage.json`, `session.json`, and `review.sarif`.
-     - `store.py`: `ReviewSessionStore` persisting and retrieving review sessions with atomic JSON writes.
-     - `harness.py`: `ReviewerHarness` protocol and `DefaultReviewerHarness` implementation orchestrating OCR preparation, P14 job dispatch, status polling, and artifact reconciliation.
-  4. Coordinator Integration & Project Configuration (`ai_reviewer.py`, `config.py`):
-     - In `AIReviewerCoordinator`: added explicit project `reviewer_harness.enabled == True` opt-in while preserving direct legacy paths; enforces repository truth anchors (`branch`, `head`, `status_hash`), independent build/test gate checks, and coverage completeness (`complete` required for `next`); translates findings to deterministic `remediate` or `next` lifecycle decisions and progress milestones.
-     - In `config.py`: added `_normalize_reviewer_harness` validating `reviewer_harness` schema, backend/adapter, modes, rule pack paths, scan roots, transport, file limits, and independent gates.
-  5. Operator Surfaces & Domain Rules (`cli.py`, `web/server.py`, `examples/labdemo_rules.json`):
-     - Added CLI subcommands: `review-submit`, `review-status`, `review-reconcile`, and `review-findings` (with optional `--sarif` output).
-     - Added authenticated GET endpoints in Control API: `/api/v1/control/reviews`, `/api/v1/control/reviews/{session_id}`, `/api/v1/control/reviews/{session_id}/findings`, `/api/v1/control/reviews/{session_id}/coverage`, and `/api/v1/control/reviews/{session_id}/artifacts/{name}`.
-     - Authored `examples/labdemo_rules.json` with 5 domain rules: Service hardware authority, fail-safe X-ray OFF convergence, manual vs transactional scan separation, state-machine reachability, and preservation of compatibility paths (e.g., `scan.run`).
-  6. Verification:
-     - Focused P14.5 suites: 23 passed in 4.41s (`test_p145_reviewer_harness.py`, `test_p145_job_recovery.py`, `test_p145_software_acceptance.py`).
-     - P14 durable jobs suite: 43 passed in 10.91s (`test_p14_durable_jobs.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_job_recovery.py`, `test_p14_software_acceptance.py`).
-     - Full regression suite: 816 passed, 45 subtests passed in 264.05s (`python -m pytest tests_py -q`).
+- Completed Technical Review Remediation for P14.5 Reviewer Harness & OpenCodeReview Adapter:
+  1. Fail-Open Scope Fix: In `ocr_adapter.py`, clean post-worker workspace diff falls back to inspecting `HEAD` using `git diff-tree --root` so committed files are selected. In `runner.py`, empty selected file list produces `completeness = "failed"` and `disposition = "failed"` with explicit empty scope reason.
+  2. CLI Review Submit Contract: In `cli.py`, added `--source-request-id` to argument parser and plumbed required `source_request_id` in `cmd_review_submit`.
+  3. Control API Artifact Serialization: In `web/server.py`, stripped `raw_bytes` from artifact payload before JSON encoding so GET `/api/v1/control/reviews/{id}/artifacts/{name}` succeeds without TypeError.
+  4. Bounds & Configuration Plumbing: In `AIReviewerCoordinator._run_harness_review`, correctly plumbed `file_limits`, `command_ref`, `ocr_executable`, and `diff_refs` to `DefaultReviewerHarness`.
+  5. Accounting Interval & Attempt Tracking: Added `_fail_review` helper ensuring `start_interval('technical_review')` ends and attempt outcome is recorded across all post-execution failure branches (repository truth drift, independent gate failure, coverage incomplete, decision persistence failure).
+  6. Daemon-Restart Reconciliation: Implemented active session reconciliation in `AIReviewerCoordinator._recover_interrupted()` calling `harness.reconcile(session_id)`.
+  7. Robustness & Security Hardening:
+     - `ocr_adapter.py`: Fails closed with `RuntimeError`/`ValueError` on non-zero exit or malformed JSON instead of silent fallback.
+     - `jobs/store.py`: `save_input_artifact` validates digest consistency with `JobRecord.input_digest` to prevent divergence.
+     - `review/models.py`: `ReviewRequest.independent_gates` typed `list[str]` and accepts dictionary mappings in `from_dict`.
+     - `review/store.py`: `_safe_session_id` uses injective encoding (`:` -> `_colon_`, `_` -> `__`) to prevent cross-session collision.
+     - `web/server.py`: Enforces `redact_secrets` across all review control endpoints.
+     - `review/runner.py`: Ensures job transitions from `queued` to `running` before completing and properly derives `AIRoleRequest.independence` and `previous_resource_context`.
+  8. Verification:
+     - Focused P14.5 test suites: 32 passed in 7.21s (`test_p145_reviewer_harness.py`, `test_p145_job_recovery.py`, `test_p145_software_acceptance.py`).
+     - Adjacent P14 durable jobs suites: 43 passed in 10.30s (`test_p14_durable_jobs.py`, `test_p14_job_recovery.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_software_acceptance.py`).
+     - Review coordinator test suite: 5 passed in 1.63s (`test_ai_reviewer.py`).
+     - Full repository regression: 825 passed, 45 subtests passed in 262.74s (`python -m pytest tests_py -q`).
      - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
-     - Knowledge graph updated with `graphify update .` (4050 nodes, 11384 edges, 186 communities).
-- Immediate continuation rule: conduct independent technical review on clean worktree.
+     - Knowledge graph updated with `graphify update .` (4063 nodes, 11476 edges, 182 communities).
+- Immediate continuation rule: preserve clean handoff for next task; commit locally clean without push.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.
