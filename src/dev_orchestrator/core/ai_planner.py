@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import subprocess
 import threading
@@ -913,7 +914,26 @@ class AIPlannerCoordinator:
                         )
                         return None
                     raise RuntimeError(attempt_reason)
-                plan = _parse_plan(attempt_result.output, record["task_id"])
+                # Preserve the exact provider output before parsing. Protocol failures
+                # must be diagnosable without reproducing an expensive model call.
+                raw_output = attempt_result.output if isinstance(attempt_result.output, str) else ""
+                with self._lock:
+                    state = self._load_state()
+                    current = state["plans"].get(plan_id)
+                    if isinstance(current, dict):
+                        captures = current.setdefault("planner_raw_outputs", [])
+                        captures.append({
+                            "round": round_no,
+                            "attempt": attempt,
+                            "request_id": planner_request.request_id,
+                            "sha256": hashlib.sha256(raw_output.encode("utf-8")).hexdigest(),
+                            "output": raw_output,
+                            "captured_at": utc_now_iso(),
+                        })
+                        if len(captures) > 12:
+                            del captures[:-12]
+                        self._save_state(state)
+                plan = _parse_plan(raw_output, record["task_id"])
                 if attempt_result.resource_context is None:
                     raise RuntimeError("planner resource context missing")
                 planner_result = attempt_result
