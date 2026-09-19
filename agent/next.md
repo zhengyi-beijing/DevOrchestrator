@@ -1,104 +1,19 @@
-# P14 Remote Execution Resilience & Recoverable Jobs
+# P14.5 Reviewer Harness & OpenCodeReview Adapter
 
-Status: **READY_TO_RUN**
+Status: **PENDING DESIGN**
 
-Goal: make long-running local/SSH/remote execution durable and recoverable across client, transport or tool-result interruption without duplicate side effects.
+Goal: standardize code-review preparation, project rule enforcement, model delegation and structured findings without making any review engine or model the DevO lifecycle authority.
 
 Scope:
-- Use durable asynchronous jobs with stable job_id/request_id and explicit queued/running/completed/failed/cancelled/unknown-recovery states.
-- Persist execution identity, project/task/stage correlation, process evidence, timestamps, bounded logs, heartbeat/progress and terminal result.
-- Make retries idempotent and reconcile ambiguous timeouts before creating new work.
-- Separate execution from message delivery; client disconnect must not terminate a healthy job.
-- Add bounded logs, long-operation classification, cancel/retry/reconcile, daemon-restart recovery and watchdog/accounting integration.
-- Preserve DevO lifecycle authority; ExecutionTransport owns execution evidence only.
+- Introduce a provider-neutral ReviewerHarness boundary owned by DevO; OpenCodeReview is the first adapter/backend, not a hard architectural dependency.
+- Use OpenCodeReview for deterministic diff/full-scan preparation, file selection, rule packs, review sessions, coverage and structured finding localization.
+- Keep reviewer model selection in AIBroker by role/quota/cost policy.
+- Support delegated semantic review while preserving independent build/test/static-analysis gates.
+- Normalize findings into a durable DevO finding contract and run review as a P14 durable job.
 
 Acceptance:
-- Interrupt a representative long build/test, recover the same job_id/log/result later, and prove retries create no duplicate side effects.
-- Recovery survives daemon/client/transport interruption within the documented bounds.
+- A representative repository can run diff review and bounded full scan without RDC as the normal transport.
+- Review can delegate to an AIBroker-selected model, persist structured findings/coverage and recover across transport interruption.
+- ReviewerHarness supplies evidence only; DevO remains the sole lifecycle authority.
 
-Design note: detailed executable design must be produced and independently reviewed before implementation.
-
-## Approved executable design
-
-Add a durable asynchronous job runtime beneath the P13 ExecutionTransport boundary so long-running local and SSH build/test executions survive client, transport and daemon interruption without duplicate side effects. A new `dev_orchestrator.jobs` package persists one atomic per-job record plus bounded logs and heartbeat evidence under `<runtime>/jobs/`, runs work in a detached supervisor that outlives its caller, and exposes queued/running/completed/failed/cancelled/unknown_recovery states. Both submit and retry are replay-safe: submit derives a deterministic job_id from an idempotency key, and retry requires a caller-supplied stable `retry_request_id` that deterministically maps to exactly one successor job_id, recorded write-once in the predecessor under the store lock, so a lost or ambiguously acknowledged retry response replays to the same successor and never forks a second one. Retry always reconciles the prior attempt from durable evidence first and fails closed to unknown_recovery rather than duplicating side effects, preserving the P13 no-duplicate-dispatch and no-automatic-RDC-fallback rules. Command execution stays closed: on every executing host, both local and SSH, the runtime root, project repo path and argv allowlist are resolved exclusively from host-local trusted configuration that never crosses the wire, with realpath containment checks rejecting traversal and symlink escape. The daemon gains startup and bounded per-tick recovery, the watchdog consumes job heartbeat as clock-free durable progress evidence, accounting records managed_validation intervals keyed by job_id, and read-only CLI commands plus `/api/v1/control/jobs*` routes expose job state independently of any message-delivery channel. DevO coordinators keep sole lifecycle authority; jobs carry execution evidence only.
-
-### Implementation steps
-- Add `jobs/models.py` with the six-state machine, validated JobSpec/JobRecord, canonical `spec_hash()` mirroring `control/command_store.request_hash`, deterministic `job_id_for(spec)`, and deterministic `retry_successor_id(predecessor_job_id, retry_request_id)`; map rejections to `failed` with an explicit failure_kind rather than new states.
-- Add `jobs/config.py` loading host-local trusted `execution-jobs.json` (absent file disables the runtime) that is the sole source of the runtime root, per-project repo_path and per-project command_ref allowlist (argv, repo-relative cwd, duration_class, heartbeat interval, max runtime, log caps, retention); argv always runs without a shell and no execution path, root or command ever originates from a request.
-- Make config resolution anchor-only: the local side resolves it from the daemon's own `<runtime>` root, and the remote helper resolves it strictly from host-local sources in fixed order (a `DEVORCH_JOBS_CONFIG` value set in the remote account's own environment, else `~/.devorch/execution-jobs.json`), never from any wire-supplied path.
-- Resolve every execution path by realpath before use and require containment inside the host-local configured repo_path and runtime root, rejecting `..` traversal, absolute overrides and symlink escape fail-closed with no execution.
-- Add `jobs/store.py` with `ExecutionJobStore` owning `<runtime>/jobs/<job_id>/{job.json,heartbeat.json,log.ndjson,result.json}` plus `index.json`, serialized by `InterProcessFileLock` and written with `storage.json_store` atomic+fsync helpers, providing `claim_or_get` idempotency, conflict on spec_hash mismatch, quarantine plus degraded health mirroring `ControlCommandStore`, and index rebuild from per-job records.
-- Add write-once retry-intent persistence to the store: under the predecessor's lock, `claim_retry(predecessor_job_id, retry_request_id)` records `retry.successor_job_id` plus the retry request hash, returns the identical successor on replay of the same retry_request_id, and raises a conflict for a different retry_request_id once a successor exists, enforcing at most one successor per predecessor atomically.
-- Add `jobs/logs.py` with a bounded append-only NDJSON writer (per-line and per-job caps, head+tail retention with explicit truncation counters, torn-tail tolerant reader) and cursor/limit paging that applies `control.logs.redact_secrets` on every read.
-- Add `jobs/supervisor.py` with a `python -m dev_orchestrator.jobs.supervisor --job-dir <dir>` entrypoint that refuses to run when a terminal result or live supervisor exists, records pid plus start_token, runs the resolved argv with `hidden_subprocess_kwargs()`, streams output into the bounded log, emits a strictly increasing heartbeat_sequence, enforces max runtime, and writes the terminal result write-once and atomically.
-- Add `jobs/transport.py` with a `JobTransport` protocol (`job_start`, `job_status`, `job_logs`, `job_cancel`), a `LocalJobTransport` using `platform.process.spawn_detached`, and an `SSHJobTransport` reusing existing SSH argv construction, request correlation and host-identity validation as shared helpers with no P13 behavior change.
-- Extend `ai/remote_helper.py` with the same four closed job operations under the existing correlated envelope, accepting only request_id, job_id, project_id, command_ref, cursor/limit, reason and an optional `expected_working_directory` used solely as an equality assertion against the host-locally resolved path; unknown fields, unknown project_id or command_ref, and any assertion mismatch fail closed with no execution.
-- Add `jobs/service.py` with `JobService(runtime_root, transports, accounting=None)` exposing idempotent `submit`, `status`, `logs`, `cancel`, `reconcile` and `retry(job_id, retry_request_id)`, spawning at most one supervisor per job_id under the store lock.
-- Implement `reconcile` from durable evidence only, promoting to a terminal state when proven, otherwise to `unknown_recovery`, and setting `recovery_safe_retry` only when no process ever started.
-- Implement `retry` as reconcile-then-claim: it requires a stable `retry_request_id`, refuses when the predecessor is non-terminal and not recovery-safe, and otherwise calls `claim_retry` so the successor job_id is deterministic and created exactly once; a crash between intent and spawn is recovered by re-driving the recorded successor rather than creating a new one.
-- Add `jobs/recovery.py` with a `JobRecoveryCoordinator` providing startup `recover()` and a bounded per-tick `advance()` that also completes any recorded-but-unspawned retry intent, and wire them into daemon startup and `_run_orchestration_tick` in `daemon.py` as read-mostly, evidence-only steps.
-- Record `managed_validation` accounting intervals keyed by job_id with project/task/stage/role correlation from the daemon-side coordinator, guarded exactly-once by an `accounting_recorded_at` marker in the record.
-- Extend `core/watchdog.py` `collect_progress_signals` to consume the project-scoped job index as durable progress evidence (ids and durable timestamps only, watchdog-originated jobs excluded) and add a `job_records` key to `FINGERPRINT_FIELDS`, keeping the fingerprint clock-free.
-- Add CLI subcommands `jobs-list`, `job-status`, `job-logs`, `job-submit`, `job-cancel`, `job-retry` (requiring `--retry-request-id`) and `job-reconcile` in `cli.py`, plus read-only `GET /api/v1/control/jobs`, `/api/v1/control/jobs/{job_id}` and `/api/v1/control/jobs/{job_id}/logs` routes in `web/server.py` reusing existing auth, envelope, cursor and redaction behavior.
-- Add `docs/P14_DURABLE_JOBS_CONTRACT.md` covering the state machine and legal transitions, submit and retry identity derivation, the one-successor-per-predecessor rule and retry replay semantics, durability guarantees, reconcile-before-retry, fail-closed ambiguity, bounded-log and retention policy, the host-local-anchored allowlist trust model and path containment rules, documented recovery bounds, and the evidence-only job boundary versus DevO lifecycle authority.
-- Add `tests_py/test_p14_durable_jobs.py` covering identity determinism, idempotent submit with a single spawn, spec conflict, corruption quarantine, index rebuild, log truncation and redaction, and legal versus illegal transitions.
-- Add `tests_py/test_p14_job_retry_identity.py` covering deterministic successor mapping, replay of the same retry_request_id returning the identical successor with no second spawn, conflict on a different retry_request_id after a successor exists, refusal to retry a non-terminal non-recovery-safe job, and crash-between-intent-and-spawn recovery re-driving the same successor.
-- Add `tests_py/test_p14_job_transport.py` covering local detached launch and SSH operations through a fake subprocess module, asserting only closed correlation fields cross the wire, and that request-supplied runtime roots or working directories, `..` traversal, symlink escape outside the configured repo_path, alternate config roots, unknown project_id/command_ref, correlation mismatch and host-identity mismatch are all rejected without execution.
-- Add `tests_py/test_p14_job_recovery.py` covering supervisor kill mid-run, daemon restart recovery, stale versus advancing heartbeat_sequence, pid reuse defeated by start_token mismatch, ambiguous evidence yielding unknown_recovery with no successor, and recovery_safe_retry only for never-started work.
-- Add `tests_py/test_p14_software_acceptance.py` modeled on `test_p13_software_acceptance.py`: run a long job appending one line to a sentinel file, interrupt client then daemon, recover the same job_id with accumulated log and terminal result, replay both submit and retry across a simulated lost response, assert exactly one sentinel entry per intended attempt with no duplicate successor, and assert recovery within the documented bounds.
-
-### Interfaces / contracts
-- `dev_orchestrator.jobs.models`: `JOB_STATES` (queued, running, completed, failed, cancelled, unknown_recovery), `TERMINAL_JOB_STATES` (completed, failed, cancelled), `JobSpec`, `JobRecord`, `spec_hash(spec) -> str`, `job_id_for(spec) -> str`, `retry_successor_id(predecessor_job_id, retry_request_id) -> str`.
-- Durable `JobRecord` schema v1: job_id, idempotency_key, spec_hash, kind, project_id, task_id, stage_run_id, role_run_id, source_request_id, optional broker_request_id, command_ref, resolved argv, working_directory, transport, host_identity, duration_class, state, state_reason/failure_kind, supervisor{pid,start_token,started_at}, heartbeat{sequence,reported_at,observed_at,progress}, timestamps, exit_code, terminal{outcome,error,truncated_lines,truncated_bytes}, retry{retry_of,attempt,retry_request_id,retry_request_hash,successor_job_id,successor_spawned_at}, recovery{recovery_safe_retry,evidence}, accounting_recorded_at.
-- `ExecutionJobStore(runtime_root)`: `claim_or_get`, `claim_retry(predecessor_job_id, retry_request_id)`, `get`, `update`, `list`, `quarantine`, `repair_corruption`, `health`; raises `JobConflictError` and `JobCorruptionError`.
-- `JobService(runtime_root, transports, accounting=None)`: `submit(spec)`, `status(job_id)`, `logs(job_id, cursor, limit)`, `cancel(job_id, reason)`, `reconcile(job_id)`, `retry(job_id, retry_request_id)` where `retry_request_id` is required and stable across replays.
-- `JobTransport` protocol with `job_start`, `job_status`, `job_logs`, `job_cancel`, implemented by `LocalJobTransport` and `SSHJobTransport`; existing `ExecutionTransport.dispatch/status/interrupt` signatures unchanged.
-- Remote helper closed job envelope: accepts only request_id, job_id, project_id, command_ref, cursor/limit, reason and optional `expected_working_directory` (assertion only); returns the existing `{request_id, host_identity, status, payload}` envelope. Runtime root, repo path and argv are resolved solely from host-local configuration.
-- Host-local `execution-jobs.json` (daemon `<runtime>` locally; `DEVORCH_JOBS_CONFIG` from the remote account environment or `~/.devorch/execution-jobs.json` remotely): `enabled`, log caps, retention, and per-project `{repo_path, commands: {command_ref: {argv, cwd, duration_class, heartbeat_interval_seconds, max_runtime_seconds}}}`.
-- CLI: `jobs-list`, `job-status`, `job-logs`, `job-submit`, `job-cancel`, `job-retry --retry-request-id <id>`, `job-reconcile`.
-- Read-only control API: `GET /api/v1/control/jobs`, `GET /api/v1/control/jobs/{job_id}`, `GET /api/v1/control/jobs/{job_id}/logs`.
-- Supervisor entrypoint `python -m dev_orchestrator.jobs.supervisor --job-dir <path>`, single-instance per job directory, write-once terminal result.
-- Watchdog `collect_progress_signals` gains a clock-free `job_records` fingerprint field added to `FINGERPRINT_FIELDS`, excluding watchdog-originated jobs.
-
-### Validation plan
-- Focused: `python -m pytest tests_py/test_p14_durable_jobs.py tests_py/test_p14_job_retry_identity.py tests_py/test_p14_job_transport.py tests_py/test_p14_job_recovery.py tests_py/test_p14_software_acceptance.py -q`.
-- Retry replay evidence: the same `retry_request_id` submitted twice, including after a simulated lost/ambiguous retry response and after a crash between retry-intent persistence and supervisor spawn, yields one successor job_id, one supervisor spawn and one sentinel side-effect entry; a different `retry_request_id` against a job that already has a successor is rejected as a conflict.
-- Remote trust-boundary evidence: SSH job tests assert that request-supplied runtime roots or working directories are rejected by the closed schema, that `..` traversal and symlink targets escaping the host-local configured repo_path are rejected after realpath resolution, that an alternate config root is never consulted, and that unknown project_id or command_ref fails closed with no execution.
-- Adjacent regression: `python -m pytest tests_py/test_p13_execution_transport.py tests_py/test_p13_software_acceptance.py tests_py/test_p12_control_foundation.py tests_py/test_p12_control_actions.py tests_py/test_web.py tests_py/test_watchdog.py tests_py/test_watchdog_fingerprint.py tests_py/test_watchdog_self_exclusion.py tests_py/test_transition_executor_aibroker.py tests_py/test_cli.py -q`.
-- Full regression `python -m pytest tests_py -q` passes with no new failures.
-- Static checks: `python -m compileall -q src tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and a clean `git diff --check`.
-- Acceptance evidence: a long build/test job interrupted by client detach then daemon kill recovers the identical job_id, accumulated bounded log and terminal result after restart, within the bounds documented in the contract document.
-- Ambiguity evidence: a reconcile with unresolvable liveness yields `unknown_recovery`, refuses retry, and creates no successor job.
-- Run all verification commands with PowerShell 5.1-safe sequencing (`;` plus explicit `if ($LASTEXITCODE -eq 0) { ... }` or `if ($?) { ... }`, or invoke cmd.exe when cmd syntax is required); never place `&&` or `||` in a Windows PowerShell 5.1 command — verified failure memory `seed:p11b:rdc-powershell-5.1`.
-- Refresh the knowledge graph with `graphify update .` after implementation, per AGENTS.md.
-
-### Risks / failure modes
-- A lost or ambiguously acknowledged retry response could fork successors; mitigated by a required stable `retry_request_id`, deterministic successor id derivation, and a write-once successor claim under the predecessor lock that permits at most one successor.
-- A crash between persisting retry intent and spawning the successor supervisor could strand or duplicate work; mitigated by recovery re-driving the recorded successor job_id rather than creating new work.
-- Request-controlled paths could undermine the closed-command guarantee; mitigated by resolving runtime root, repo path and argv only from host-local trusted configuration, treating any wire path as an assertion, and failing closed on mismatch.
-- Symlink or TOCTOU escape from the configured repo_path; mitigated by realpath resolution immediately before use plus containment checks, with rejection tests for traversal, absolute overrides and symlink escape.
-- PID reuse could falsely prove death or liveness and drive a duplicate run; mitigated by requiring pid liveness plus a matching start_token and treating mismatch as ambiguous.
-- Remote clock skew makes SSH heartbeat timestamps unreliable; mitigated by judging liveness primarily on a locally observed strictly increasing heartbeat_sequence.
-- Windows detached-process, file-sharing and atomic-replace behavior is a historical flakiness source; mitigated by reusing `spawn_detached`, `hidden_subprocess_kwargs`, `json_store` atomic replace and `InterProcessFileLock`.
-- A race between claim and spawn could start two processes for one job_id; mitigated by doing claim, spawn decision and pid/start_token write inside one store lock plus supervisor self-refusal.
-- Job logs surfaced over the control API could leak secrets; mitigated by applying `control.logs.redact_secrets` on every read path and capping page size.
-- Widening watchdog progress signals risks self-induced progress or a clock-dependent fingerprint; mitigated by excluding watchdog-originated jobs, restricting the field to ids and durable timestamps, and honoring `FINGERPRINT_FORBIDDEN`.
-- A misconfigured allowlist entry could still run something destructive; mitigated by keeping `execution-jobs.json` host-local and owner-trusted at the broker-config trust tier and failing closed on unknown refs.
-- Unbounded per-tick reconciliation could slow the daemon tick; mitigated by a capped per-tick job budget and short transport timeouts, with startup recovery doing the one-time sweep.
-- Adding control routes touches the P12 security surface; mitigated by reusing existing authentication, envelope, cursor and redaction machinery and adding no write path or new control action.
-
-### Out of scope
-- Migrating AI role dispatch (AIBrokerExecutionPort and TransitionExecutor broker runs) onto the job runtime; existing dispatch/status/interrupt and `recovery_required` semantics stay, with only correlation fields recorded for later phases.
-- Dashboard or web UI surfaces for jobs; P13.5 navigation and views remain unchanged.
-- New lifecycle control actions in the P12 command inbox; `CONTROL_ACTIONS` and `canonical_request` stay unchanged.
-- Changes to DevO lifecycle authority, transition decisions, owner gates, plan/review flow or project-status projection semantics.
-- RDC transport work, automatic RDC fallback, or changes to RDC evidence import.
-- P14.5 reviewer harness / OpenCodeReview integration and P15 mobile observability consumption of job state.
-- Cross-host job migration, multi-node scheduling, priority queues or any distributed scheduler beyond per-host durable jobs.
-- Arbitrary or ad-hoc command execution from adapters, the browser bridge, MCP or the control API.
-- Automatic provisioning or remote installation of the host-local `execution-jobs.json` on SSH peers; operators configure each executing host out of band.
-- Changes to accounting phase taxonomy, EDR definitions or event ledger schema beyond emitting existing `managed_validation` intervals keyed by job_id.
-- Agent lifecycle bookkeeping files (`agent/next.md`, `agent/CURRENT.md`, `agent/staged/roadmap.json`) beyond the new contract document.
-
-### Independent plan review
-- Approved: No BLOCKING findings. The revised plan resolves retry replay safety with a durable, deterministic, one-successor claim and closes the SSH trust-boundary issue by anchoring configuration and execution paths exclusively in host-local trusted state. Architecture ownership, persistence, recovery sequencing, interfaces, bounded logs, watchdog/accounting integration, and verification paths are specific enough for implementation without core-contract guessing. NON_BLOCKING: Worker validation should explicitly simulate an ambiguous SSH job_start/status transport interruption, in addition to the planned client/daemon and retry-response interruptions, to directly evidence the original transport-interruption acceptance criterion.
+Design note: detailed executable design must be independently reviewed before implementation.
