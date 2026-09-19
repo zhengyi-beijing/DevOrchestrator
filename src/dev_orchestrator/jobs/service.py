@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import socket
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Optional
 
 from dev_orchestrator.platform.process import is_pid_alive
 from dev_orchestrator.storage.json_store import utc_now_iso
 
 from .config import (
+    DEFAULT_HEAD_LINES,
+    DEFAULT_MAX_JOB_BYTES,
+    DEFAULT_MAX_LINE_BYTES,
+    DEFAULT_TAIL_LINES,
     JobsConfig,
     load_jobs_config,
     resolve_local_jobs_config_path,
@@ -18,8 +22,6 @@ from .config import (
 from .models import (
     JobRecord,
     JobSpec,
-    job_id_for,
-    retry_successor_id,
 )
 from .store import ExecutionJobStore
 from .transport import JobTransport, LocalJobTransport, SSHJobTransport
@@ -46,9 +48,57 @@ class JobService:
             cfg_p = Path(config_path) if config_path else resolve_local_jobs_config_path(self.runtime_root)
             self.config = load_jobs_config(cfg_p)
 
-        self.transports: dict[str, JobTransport] = transports or {
+        self.transports: dict[str, JobTransport] = dict(transports) if transports else {
             "local": LocalJobTransport(),
         }
+        if "ssh" not in self.transports:
+            ssh_t = self._resolve_ssh_transport()
+            if ssh_t is not None:
+                self.transports["ssh"] = ssh_t
+
+    def _resolve_ssh_transport(self) -> Optional[JobTransport]:
+        """Auto-wire SSHJobTransport from JobsConfig or aibroker-execution.json."""
+        if self.config and self.config.ssh:
+            from dev_orchestrator.ai.execution_transport import SSHTransportConfig
+            s = self.config.ssh
+            peer = s.get("peer") or s.get("host")
+            if peer:
+                ssh_cfg = SSHTransportConfig(
+                    peer=str(peer).strip(),
+                    user=str(s["user"]).strip() if s.get("user") else None,
+                    port=int(s.get("port") or 22),
+                    identity_file=Path(s["identity_file"]) if s.get("identity_file") else None,
+                    known_hosts_file=Path(s["known_hosts_file"]) if s.get("known_hosts_file") else None,
+                    strict_host_key_checking=str(s.get("strict_host_key_checking") or "yes"),
+                    remote_python=str(s.get("remote_python") or "python3"),
+                    path_mapping=dict(s.get("path_mapping") or {}),
+                    expected_host_identity=str(s["expected_host_identity"]).strip() if s.get("expected_host_identity") else None,
+                )
+                return SSHJobTransport(ssh_cfg)
+
+        aibroker_file = self.runtime_root / "aibroker-execution.json"
+        if aibroker_file.is_file():
+            from dev_orchestrator.storage.json_store import read_json
+            data = read_json(aibroker_file, None)
+            if isinstance(data, dict):
+                raw_transport = data.get("transport")
+                if isinstance(raw_transport, dict) and raw_transport.get("type") == "ssh":
+                    from dev_orchestrator.ai.execution_transport import SSHTransportConfig
+                    peer = raw_transport.get("peer") or raw_transport.get("host")
+                    if peer:
+                        ssh_cfg = SSHTransportConfig(
+                            peer=str(peer).strip(),
+                            user=str(raw_transport["user"]).strip() if raw_transport.get("user") else None,
+                            port=int(raw_transport.get("port") or 22),
+                            identity_file=Path(raw_transport["identity_file"]) if raw_transport.get("identity_file") else None,
+                            known_hosts_file=Path(raw_transport["known_hosts_file"]) if raw_transport.get("known_hosts_file") else None,
+                            strict_host_key_checking=str(raw_transport.get("strict_host_key_checking") or "yes"),
+                            remote_python=str(raw_transport.get("remote_python") or "python3"),
+                            path_mapping=dict(raw_transport.get("path_mapping") or {}),
+                            expected_host_identity=str(raw_transport["expected_host_identity"]).strip() if raw_transport.get("expected_host_identity") else None,
+                        )
+                        return SSHJobTransport(ssh_cfg)
+        return None
 
     def _get_transport(self, transport_name: str) -> JobTransport:
         if transport_name not in self.transports:
@@ -78,6 +128,12 @@ class JobService:
 
         def _factory(jid: str, shash: str) -> JobRecord:
             now = utc_now_iso()
+            caps = dict(self.config.log_caps) if self.config else {
+                "max_line_bytes": DEFAULT_MAX_LINE_BYTES,
+                "max_job_bytes": DEFAULT_MAX_JOB_BYTES,
+                "head_lines": DEFAULT_HEAD_LINES,
+                "tail_lines": DEFAULT_TAIL_LINES,
+            }
             rec = JobRecord(
                 job_id=jid,
                 idempotency_key=spec.idempotency_key,
@@ -90,6 +146,9 @@ class JobService:
                 transport=spec.transport,
                 host_identity=socket.gethostname(),
                 duration_class=cmd_cfg.duration_class,
+                max_runtime_seconds=cmd_cfg.max_runtime_seconds,
+                heartbeat_interval_seconds=cmd_cfg.heartbeat_interval_seconds,
+                log_caps=caps,
                 state="queued",
                 task_id=spec.task_id,
                 stage_run_id=spec.stage_run_id,
@@ -170,6 +229,22 @@ class JobService:
         if record.state in ("completed", "failed", "cancelled"):
             return record
 
+        # If remote transport, poll status to sync evidence
+        if record.transport != "local":
+            try:
+                transport = self._get_transport(record.transport)
+                jdir = self.store._job_dir(job_id)
+                rem_status = transport.job_status(job_id, jdir)
+                if isinstance(rem_status, dict):
+                    rem_res = rem_status.get("result")
+                    if isinstance(rem_res, dict):
+                        self.store.save_result(job_id, rem_res)
+                    rem_hb = rem_status.get("heartbeat")
+                    if isinstance(rem_hb, dict):
+                        self.store.save_heartbeat(job_id, rem_hb)
+            except Exception:
+                pass
+
         result_data = self.store.get_result(job_id)
         if result_data is not None:
             # Result exists: promote to terminal state
@@ -178,6 +253,8 @@ class JobService:
             err = result_data.get("error")
 
             def _promote_terminal(rec: JobRecord) -> None:
+                if rec.state in ("completed", "failed", "cancelled"):
+                    return
                 if outcome == "cancelled":
                     rec.transition_to("cancelled", reason=err or "cancelled", failure_kind="cancelled")
                 elif exit_code == 0:
@@ -190,15 +267,68 @@ class JobService:
 
             return self.store.update(job_id, _promote_terminal)
 
-        # Result does not exist; check supervisor liveness
+        # Result does not exist; check supervisor liveness and heartbeat evidence
         hb = self.store.get_heartbeat(job_id)
         pid = record.supervisor.get("pid")
         start_token = record.supervisor.get("start_token")
         live_pid = (hb.get("pid") if hb else None) or pid
         hb_token = (hb.get("start_token") if hb else None) or start_token
 
+        # Check start_token mismatch
+        if hb and start_token and hb.get("start_token") and hb.get("start_token") != start_token:
+            def _fail_token_mismatch(rec: JobRecord) -> None:
+                if rec.state in ("completed", "failed", "cancelled"):
+                    return
+                rec.transition_to(
+                    "unknown_recovery",
+                    reason="start_token mismatch in heartbeat evidence",
+                    failure_kind="start_token_mismatch",
+                    timestamp=utc_now_iso(),
+                )
+                rec.recovery["recovery_safe_retry"] = False
+            return self.store.update(job_id, _fail_token_mismatch)
+
+        # Durably consume heartbeat if sequence has advanced or first observation
+        if hb:
+            hb_seq = int(hb.get("heartbeat_sequence") or hb.get("sequence") or 0)
+            prev_seq = int(record.heartbeat.get("heartbeat_sequence") or record.heartbeat.get("sequence") or 0)
+            now_iso = utc_now_iso()
+            if hb_seq > prev_seq or not record.heartbeat.get("observed_at"):
+                updated_hb = dict(hb)
+                updated_hb["sequence"] = hb_seq
+                updated_hb["heartbeat_sequence"] = hb_seq
+                updated_hb["observed_at"] = now_iso
+                self.store.save_heartbeat(job_id, updated_hb)
+                record = self.store.get(job_id) or record
+
         if live_pid and is_pid_alive(live_pid) and hb_token == start_token:
-            # Process is currently alive with matching start_token
+            # Process appears alive with matching token; check if heartbeat sequence has stalled
+            hb_interval = float(getattr(record, "heartbeat_interval_seconds", 5.0) or 5.0)
+            stalled_timeout = max(15.0, hb_interval * 3)
+            last_observed_iso = record.heartbeat.get("observed_at")
+            if last_observed_iso and hb:
+                hb_seq = int(hb.get("heartbeat_sequence") or hb.get("sequence") or 0)
+                prev_seq = int(record.heartbeat.get("heartbeat_sequence") or record.heartbeat.get("sequence") or 0)
+                try:
+                    from datetime import datetime, timezone
+                    obs_dt = datetime.fromisoformat(str(last_observed_iso).replace("Z", "+00:00"))
+                    now_dt = datetime.now(timezone.utc)
+                    elapsed = (now_dt - obs_dt).total_seconds()
+                    if hb_seq <= prev_seq and elapsed > stalled_timeout:
+                        def _promote_stalled(rec: JobRecord) -> None:
+                            if rec.state in ("completed", "failed", "cancelled"):
+                                return
+                            rec.transition_to(
+                                "unknown_recovery",
+                                reason=f"heartbeat stalled: sequence {hb_seq} did not advance for {elapsed:.1f}s",
+                                failure_kind="heartbeat_stalled",
+                                timestamp=utc_now_iso(),
+                            )
+                            rec.recovery["recovery_safe_retry"] = False
+                        return self.store.update(job_id, _promote_stalled)
+                except Exception:
+                    pass
+
             return record
 
         # Process is not alive and no result.json exists
@@ -209,6 +339,8 @@ class JobService:
         if record.state == "queued" or (not started_at and (not pid or pid <= 0)):
             # Process never started (or died before transitioning to running)
             def _fail_never_started(rec: JobRecord) -> None:
+                if rec.state in ("completed", "failed", "cancelled"):
+                    return
                 rec.transition_to(
                     "failed",
                     reason="supervisor process never started",
@@ -220,7 +352,26 @@ class JobService:
             return self.store.update(job_id, _fail_never_started)
 
         # Process started and died without writing result.json: ambiguous
+        # Check result.json one more time under lock before promoting to unknown_recovery!
         def _promote_unknown(rec: JobRecord) -> None:
+            if rec.state in ("completed", "failed", "cancelled"):
+                return
+            res = self.store.get_result(job_id)
+            if res is not None:
+                res_exit = res.get("exit_code")
+                res_outcome = res.get("outcome")
+                res_err = res.get("error")
+                if res_outcome == "cancelled":
+                    rec.transition_to("cancelled", reason=res_err or "cancelled", failure_kind="cancelled")
+                elif res_exit == 0:
+                    rec.transition_to("completed", reason=None, failure_kind=None)
+                else:
+                    rec.transition_to("failed", reason=res_err or f"exit code {res_exit}", failure_kind="non_zero_exit")
+                rec.exit_code = res_exit
+                rec.terminal = dict(res)
+                rec.timestamps["finished_at"] = res.get("finished_at") or utc_now_iso()
+                return
+
             rec.transition_to(
                 "unknown_recovery",
                 reason="supervisor died mid-run without terminal result",

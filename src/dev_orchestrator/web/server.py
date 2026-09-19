@@ -669,22 +669,31 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/v1/control/jobs":
             if not self._owner_authorized():
                 self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            from dev_orchestrator.jobs.models import JobCorruptionError
             from dev_orchestrator.jobs.store import ExecutionJobStore
-            store = ExecutionJobStore(runtime)
+            store = ExecutionJobStore(runtime, read_only=True)
             qs = parse_qs(parsed.query)
             proj_filter = qs.get("project_id", [None])[0]
-            jobs_list = store.list(project_id=proj_filter)
+            try:
+                jobs_list = store.list(project_id=proj_filter)
+            except JobCorruptionError as exc:
+                self._error(500, "Internal Server Error", f"job store corruption: {exc}", head_only); return
             payload = _control_envelope(jobs_list, sources=[{"name": "execution_jobs", "availability": "available"}])
         elif path.startswith("/api/v1/control/jobs/"):
             match_logs = _CONTROL_JOB_LOGS_PATH_RE.fullmatch(path)
             if match_logs:
                 if not self._owner_authorized():
                     self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+                from dev_orchestrator.jobs.models import JobCorruptionError
                 from dev_orchestrator.jobs.store import ExecutionJobStore
                 from dev_orchestrator.jobs.logs import BoundedNDJSONLog
-                store = ExecutionJobStore(runtime)
+                store = ExecutionJobStore(runtime, read_only=True)
                 job_id = match_logs.group(1)
-                if store.get(job_id) is None:
+                try:
+                    rec = store.get(job_id)
+                except JobCorruptionError as exc:
+                    self._error(500, "Internal Server Error", f"job record corrupted: {exc}", head_only); return
+                if rec is None:
                     self._error(404, "Not Found", "job not found", head_only); return
                 qs = parse_qs(parsed.query)
                 cursor = int(qs.get("cursor", [0])[0])
@@ -698,13 +707,19 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     self._error(404, "Not Found", "route not found", head_only); return
                 if not self._owner_authorized():
                     self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+                from dev_orchestrator.control.logs import redact_secrets
+                from dev_orchestrator.jobs.models import JobCorruptionError
                 from dev_orchestrator.jobs.store import ExecutionJobStore
-                store = ExecutionJobStore(runtime)
+                store = ExecutionJobStore(runtime, read_only=True)
                 job_id = match_job.group(1)
-                rec = store.get(job_id)
+                try:
+                    rec = store.get(job_id)
+                except JobCorruptionError as exc:
+                    self._error(500, "Internal Server Error", f"job record corrupted: {exc}", head_only); return
                 if rec is None:
                     self._error(404, "Not Found", "job not found", head_only); return
-                payload = _control_envelope(rec.to_dict(), sources=[{"name": "execution_jobs", "availability": "available"}])
+                redacted_rec = redact_secrets(rec.to_dict())
+                payload = _control_envelope(redacted_rec, sources=[{"name": "execution_jobs", "availability": "available"}])
 
         elif path == "/api/monitor":
             payload = monitor_payload(runtime)

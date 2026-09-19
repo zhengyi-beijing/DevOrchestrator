@@ -291,6 +291,182 @@ class P14DurableJobsFoundationTests(unittest.TestCase):
         rec2.transition_to("failed", failure_kind="reconciled_fail")
         self.assertEqual(rec2.state, "failed")
 
+    def test_config_propagation_to_job_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            repo = rt / "repo"
+            repo.mkdir()
+            custom_cfg = JobsConfig(
+                runtime_root=rt,
+                enabled=True,
+                log_caps={
+                    "max_line_bytes": 1024,
+                    "max_job_bytes": 65536,
+                    "head_lines": 50,
+                    "tail_lines": 50,
+                },
+                projects={
+                    "p1": JobProjectConfig(
+                        repo_path=repo,
+                        commands={
+                            "long_build": JobCommandConfig(
+                                argv=["python", "-c", "print('build')"],
+                                cwd=".",
+                                duration_class="long",
+                                heartbeat_interval_seconds=2.5,
+                                max_runtime_seconds=900.0,
+                            )
+                        },
+                    )
+                },
+            )
+            mock_transport = MagicMock()
+            mock_transport.job_start.return_value = {"status": "started"}
+            service = JobService(rt, transports={"local": mock_transport}, config=custom_cfg)
+            spec = JobSpec(project_id="p1", command_ref="long_build", idempotency_key="cfg-prop-1")
+            rec = service.submit(spec)
+
+            self.assertEqual(rec.max_runtime_seconds, 900.0)
+            self.assertEqual(rec.heartbeat_interval_seconds, 2.5)
+            self.assertEqual(rec.log_caps["max_line_bytes"], 1024)
+            self.assertEqual(rec.log_caps["max_job_bytes"], 65536)
+            self.assertEqual(rec.log_caps["head_lines"], 50)
+            self.assertEqual(rec.log_caps["tail_lines"], 50)
+
+            # Check serialization to dict and reading from store
+            stored_rec = service.store.get(rec.job_id)
+            self.assertIsNotNone(stored_rec)
+            self.assertEqual(stored_rec.max_runtime_seconds, 900.0)
+            self.assertEqual(stored_rec.heartbeat_interval_seconds, 2.5)
+            self.assertEqual(stored_rec.log_caps["max_line_bytes"], 1024)
+
+    def test_retention_pruning_policy(self):
+        from datetime import datetime, timezone, timedelta
+        from dev_orchestrator.storage.json_store import write_json
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            store = ExecutionJobStore(rt)
+            now = datetime.now(timezone.utc)
+
+            # Create 1: old terminal job (> 7 days)
+            rec_old = JobRecord(
+                job_id="job-old",
+                idempotency_key="k-old",
+                spec_hash="h1",
+                kind="validation",
+                project_id="p1",
+                command_ref="c",
+                resolved_argv=["echo"],
+                working_directory=".",
+                transport="local",
+                host_identity="host",
+                duration_class="short",
+                state="completed",
+                timestamps={
+                    "created_at": (now - timedelta(days=10)).isoformat(),
+                    "finished_at": (now - timedelta(days=9)).isoformat(),
+                },
+            )
+            store.save(rec_old)
+
+            # Create 2: active running job (must NOT be pruned)
+            rec_active = JobRecord(
+                job_id="job-active",
+                idempotency_key="k-active",
+                spec_hash="h2",
+                kind="validation",
+                project_id="p1",
+                command_ref="c",
+                resolved_argv=["echo"],
+                working_directory=".",
+                transport="local",
+                host_identity="host",
+                duration_class="short",
+                state="running",
+                timestamps={
+                    "created_at": (now - timedelta(days=12)).isoformat(),
+                },
+            )
+            store.save(rec_active)
+
+            # Create 3: unknown_recovery job (must NOT be pruned)
+            rec_unk = JobRecord(
+                job_id="job-unk",
+                idempotency_key="k-unk",
+                spec_hash="h3",
+                kind="validation",
+                project_id="p1",
+                command_ref="c",
+                resolved_argv=["echo"],
+                working_directory=".",
+                transport="local",
+                host_identity="host",
+                duration_class="short",
+                state="unknown_recovery",
+                timestamps={
+                    "created_at": (now - timedelta(days=15)).isoformat(),
+                },
+            )
+            store.save(rec_unk)
+
+            # Create 4: recent terminal job (within retention)
+            rec_recent1 = JobRecord(
+                job_id="job-recent1",
+                idempotency_key="k-rec1",
+                spec_hash="h4",
+                kind="validation",
+                project_id="p1",
+                command_ref="c",
+                resolved_argv=["echo"],
+                working_directory=".",
+                transport="local",
+                host_identity="host",
+                duration_class="short",
+                state="completed",
+                timestamps={
+                    "created_at": (now - timedelta(hours=2)).isoformat(),
+                    "finished_at": (now - timedelta(hours=1)).isoformat(),
+                },
+            )
+            store.save(rec_recent1)
+
+            # Create 5: recent terminal job (within retention)
+            rec_recent2 = JobRecord(
+                job_id="job-recent2",
+                idempotency_key="k-rec2",
+                spec_hash="h5",
+                kind="validation",
+                project_id="p1",
+                command_ref="c",
+                resolved_argv=["echo"],
+                working_directory=".",
+                transport="local",
+                host_identity="host",
+                duration_class="short",
+                state="failed",
+                timestamps={
+                    "created_at": (now - timedelta(minutes=30)).isoformat(),
+                    "finished_at": (now - timedelta(minutes=20)).isoformat(),
+                },
+            )
+            store.save(rec_recent2)
+
+            # Apply retention: max_jobs=1, max_age_days=7
+            pruned = store.apply_retention(retention={"max_jobs": 1, "max_age_days": 7})
+
+            # job-old pruned by age; job-recent1 pruned as excess beyond max_jobs=1
+            self.assertIn("job-old", pruned)
+            self.assertIn("job-recent1", pruned)
+            # job-active and job-unk MUST NOT be pruned!
+            self.assertNotIn("job-active", pruned)
+            self.assertNotIn("job-unk", pruned)
+            self.assertIsNotNone(store.get("job-active"))
+            self.assertIsNotNone(store.get("job-unk"))
+            self.assertIsNotNone(store.get("job-recent2"))
+            self.assertIsNone(store.get("job-old"))
+            self.assertIsNone(store.get("job-recent1"))
+
 
 if __name__ == "__main__":
     unittest.main()

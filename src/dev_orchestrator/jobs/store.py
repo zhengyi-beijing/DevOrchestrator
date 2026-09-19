@@ -37,14 +37,16 @@ def _safe_job_id(job_id: str) -> str:
 class ExecutionJobStore:
     """Serialize job submission, retry claims, and status updates with durable fsync."""
 
-    def __init__(self, runtime_root: Path | str) -> None:
+    def __init__(self, runtime_root: Path | str, *, read_only: bool = False) -> None:
         self.runtime_root = Path(runtime_root)
         self.jobs_root = self.runtime_root / "jobs"
         self.index_path = self.jobs_root / "index.json"
         self.health_path = self.jobs_root / "health.json"
         self.quarantine_dir = self.jobs_root / "quarantine"
         self.lock_path = self.jobs_root / "jobs.lock"
-        self.jobs_root.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
+        if not read_only:
+            self.jobs_root.mkdir(parents=True, exist_ok=True)
 
     def _job_dir(self, job_id: str) -> Path:
         safe_id = _safe_job_id(job_id)
@@ -177,6 +179,8 @@ class ExecutionJobStore:
 
     def get(self, job_id: str) -> JobRecord | None:
         """Get job record; raises JobCorruptionError if unreadable."""
+        if not self.jobs_root.is_dir():
+            return None
         with InterProcessFileLock(self.lock_path):
             return self._read_record_unlocked(job_id)
 
@@ -210,7 +214,11 @@ class ExecutionJobStore:
             write_json(jdir / "heartbeat.json", heartbeat_data, indent=2)
             record = self._read_record_unlocked(job_id)
             if record is not None:
-                record.heartbeat = dict(heartbeat_data)
+                record.heartbeat.update(heartbeat_data)
+                seq = heartbeat_data.get("heartbeat_sequence") or heartbeat_data.get("sequence")
+                if seq is not None:
+                    record.heartbeat["sequence"] = int(seq)
+                    record.heartbeat["heartbeat_sequence"] = int(seq)
                 record.timestamps["updated_at"] = utc_now_iso()
                 write_json(jdir / "job.json", record.to_dict(), indent=2)
                 self._update_index_entry_unlocked(record)
@@ -244,11 +252,19 @@ class ExecutionJobStore:
 
     def list(self, project_id: Optional[str] = None) -> list[dict[str, Any]]:
         """List jobs from index.json (rebuilding if index missing)."""
+        if not self.jobs_root.is_dir():
+            return []
         with InterProcessFileLock(self.lock_path):
             if not self.index_path.is_file():
                 self._rebuild_index_unlocked()
-            data = read_json(self.index_path, {})
-            jobs_map = data.get("jobs", {}) if isinstance(data, dict) else {}
+            try:
+                with open(self.index_path, "r", encoding="utf-8-sig") as handle:
+                    data = json.load(handle)
+            except Exception as exc:
+                raise JobCorruptionError(f"corrupt jobs index at {self.index_path}: {exc}") from exc
+            if not isinstance(data, dict):
+                raise JobCorruptionError(f"invalid jobs index schema at {self.index_path}")
+            jobs_map = data.get("jobs", {})
             results: list[dict[str, Any]] = []
             for jdata in jobs_map.values():
                 if isinstance(jdata, dict):
@@ -378,3 +394,81 @@ class ExecutionJobStore:
                 quarantined = sorted(p.name for p in self.quarantine_dir.iterdir() if p.is_dir() or p.is_file())
             result["quarantined"] = quarantined
             return result
+
+    def apply_retention(self, retention: dict[str, Any] | None = None) -> list[str]:
+        """Prune terminal jobs exceeding max_jobs or max_age_days.
+
+        Active and unknown_recovery jobs are never pruned.
+        Predecessors with unspawned retry intent are preserved.
+        Returns list of pruned job_ids.
+        """
+        from datetime import datetime, timezone
+        from .config import DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_JOBS_RETENTION
+
+        ret_dict = retention or {}
+        max_jobs = int(ret_dict.get("max_jobs", DEFAULT_MAX_JOBS_RETENTION))
+        max_age_days = int(ret_dict.get("max_age_days", DEFAULT_MAX_AGE_DAYS))
+
+        if not self.jobs_root.is_dir():
+            return []
+
+        with InterProcessFileLock(self.lock_path):
+            if not self.index_path.is_file():
+                self._rebuild_index_unlocked()
+            data = read_json(self.index_path, {})
+            jobs_map = data.get("jobs", {}) if isinstance(data, dict) else {}
+            if not isinstance(jobs_map, dict):
+                return []
+
+            # Identify candidates: only terminal jobs (completed, failed, cancelled)
+            terminal_jobs: list[dict[str, Any]] = []
+            for jid, jinfo in jobs_map.items():
+                if isinstance(jinfo, dict):
+                    state = jinfo.get("state")
+                    if state in ("completed", "failed", "cancelled"):
+                        # If it has an unspawned successor, preserve it
+                        succ_id = jinfo.get("successor_job_id")
+                        if succ_id and succ_id not in jobs_map:
+                            continue
+                        terminal_jobs.append(dict(jinfo))
+
+            now = datetime.now(timezone.utc)
+            to_prune: set[str] = set()
+
+            # 1. Prune jobs older than max_age_days
+            for tj in terminal_jobs:
+                fin = tj.get("finished_at") or tj.get("created_at")
+                if fin:
+                    try:
+                        fin_dt = datetime.fromisoformat(str(fin).replace("Z", "+00:00"))
+                        age_days = (now - fin_dt).total_seconds() / 86400.0
+                        if age_days > max_age_days:
+                            to_prune.add(tj["job_id"])
+                    except Exception:
+                        pass
+
+            # 2. Prune excess jobs over max_jobs (oldest first)
+            remaining_terminal = [tj for tj in terminal_jobs if tj["job_id"] not in to_prune]
+            if len(remaining_terminal) > max_jobs:
+                remaining_terminal.sort(key=lambda x: str(x.get("finished_at") or x.get("created_at") or ""))
+                excess_count = len(remaining_terminal) - max_jobs
+                for tj in remaining_terminal[:excess_count]:
+                    to_prune.add(tj["job_id"])
+
+            pruned_ids: list[str] = []
+            for pid in sorted(to_prune):
+                pdir = self._job_dir(pid)
+                if pdir.is_dir():
+                    try:
+                        shutil.rmtree(pdir, ignore_errors=True)
+                    except OSError:
+                        pass
+                jobs_map.pop(pid, None)
+                pruned_ids.append(pid)
+
+            if pruned_ids:
+                data["updated_at"] = utc_now_iso()
+                data["jobs"] = jobs_map
+                write_json(self.index_path, data, indent=2)
+
+            return pruned_ids

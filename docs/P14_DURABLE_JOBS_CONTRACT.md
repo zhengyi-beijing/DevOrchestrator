@@ -152,3 +152,57 @@ Logs are stored at `<runtime>/jobs/<job_id>/log.ndjson`:
 - `dev_orchestrator job-cancel <job_id> [--reason <r>]`
 - `dev_orchestrator job-retry <job_id> --retry-request-id <req_id>`
 - `dev_orchestrator job-reconcile <job_id>`
+
+---
+
+## 8. Documented Recovery Bounds
+
+The recovery runtime operates within explicit, deterministic bounds to ensure that failures and interruptions cannot cause unboundedly delayed or duplicate work:
+
+1. **Max Runtime and Child Process Bound**:
+   - Each command declares `max_runtime_seconds` (default 300.0s).
+   - If the child process tree does not exit before `max_runtime_seconds`, the supervisor terminates the entire process tree (`terminate_process_tree`) and writes `result.json` with `failure_kind="timeout"`.
+
+2. **Heartbeat Freshness and Stalled Detection Bound**:
+   - The supervisor emits heartbeat records at `heartbeat_interval_seconds` (default 5.0s) with strictly increasing `heartbeat_sequence`.
+   - If the supervisor process is alive but `heartbeat_sequence` fails to advance for `max(15.0, heartbeat_interval_seconds * 3)` seconds, `reconcile` detects the job as stalled / PID-reused and transitions it to `unknown_recovery` with `failure_kind="heartbeat_stalled"`.
+
+3. **Ambiguous Crash and Supervisor Disappearance Bound**:
+   - If a supervisor process disappears mid-run without writing `result.json`, `reconcile` transitions the job to `unknown_recovery` with `failure_kind="supervisor_died_without_result"`.
+   - `recovery_safe_retry` is set to `False`; automatic retry is strictly prohibited and requires manual intervention.
+
+4. **Process Never Started Bound**:
+   - If a job is queued or the supervisor fails before child process launch (`started_at` is null and PID is null/0), `reconcile` transitions the job to `failed` with `failure_kind="never_started"` and `recovery_safe_retry=True`, permitting deterministic retry.
+
+5. **Retry Intent Crash Bound**:
+   - If the daemon crashes between recording retry intent (`claim_retry`) and spawning the successor supervisor, daemon startup recovery (`JobRecoveryCoordinator.recover()`) detects the recorded-but-unspawned successor intent and re-drives the exact same successor `job_id` without creating duplicate successor records.
+
+6. **Transport Interruption Bound**:
+   - When an SSH connection drops or times out during dispatch or status check, the remote host retains its local durable store and detached supervisor execution.
+   - The local coordinator reconciles status against the remote host-local durable store on reconnect; no automatic fallback to other transports or providers is attempted.
+
+7. **Orchestration Tick Budget Bound**:
+   - Periodic reconciliation during the daemon tick (`JobRecoveryCoordinator.advance()`) is bounded by `per_tick_budget` (default 10 jobs) to prevent daemon tick latency degradation.
+   - Startup sweep (`recover()`) processes all jobs once upon daemon launch.
+
+---
+
+## 9. Bounded Retention and Pruning Policy
+
+Job records and logs are managed under a strict retention policy declared in `execution-jobs.json`:
+
+1. **Retention Parameters**:
+   - `retention.max_jobs`: Maximum number of terminal jobs retained in the index (default 100).
+   - `retention.max_age_days`: Maximum age in days for terminal jobs before pruning (default 7 days).
+
+2. **Terminal-Only Pruning**:
+   - Only jobs in terminal states (`completed`, `failed`, `cancelled`) are eligible for pruning.
+   - Active and ambiguous jobs (`queued`, `running`, `unknown_recovery`) are strictly protected and NEVER pruned regardless of age or count.
+
+3. **Lineage Protection**:
+   - A predecessor job whose successor has not yet been spawned or settled is preserved to maintain retry audit lineage.
+
+4. **Atomic Store Pruning**:
+   - Pruning is executed under `InterProcessFileLock(jobs.lock)`.
+   - Pruned job directories `<runtime>/jobs/<job_id>` are removed and their entries are pruned from `index.json`.
+   - Retention is applied automatically during daemon startup recovery (`recover()`) and periodic tick sweeps (`advance()`).

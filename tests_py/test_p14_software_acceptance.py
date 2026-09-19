@@ -39,14 +39,15 @@ from dev_orchestrator.jobs.models import (
 from dev_orchestrator.jobs.recovery import JobRecoveryCoordinator
 from dev_orchestrator.jobs.service import JobService
 from dev_orchestrator.jobs.store import ExecutionJobStore
-from dev_orchestrator.jobs.transport import LocalJobTransport
+from dev_orchestrator.jobs.transport import LocalJobTransport, SSHJobTransport
+from dev_orchestrator.platform.process import is_pid_alive, terminate_process_tree
 from dev_orchestrator.storage.json_store import write_json
 from dev_orchestrator.web.server import make_server
 
 
 class P14SoftwareAcceptanceTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.runtime = Path(self.temp.name) / "runtime"
         self.runtime.mkdir(parents=True)
         self.repo = Path(self.temp.name) / "repo"
@@ -94,7 +95,7 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
                                 (
                                     "import time, sys; "
                                     "sys.stdout.write('BEGIN_LONG_JOB Bearer secret-super-token-12345\\n'); sys.stdout.flush(); "
-                                    "time.sleep(0.3); "
+                                    "time.sleep(0.6); "
                                     "open('sentinel.txt', 'a', encoding='utf-8').write('success_attempt\\n'); "
                                     "sys.stdout.write('FINISH_LONG_JOB\\n'); sys.stdout.flush()"
                                 ),
@@ -120,6 +121,23 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
                             heartbeat_interval_seconds=0.2,
                             max_runtime_seconds=30.0,
                         ),
+                        "interrupt_task": JobCommandConfig(
+                            argv=[
+                                sys.executable,
+                                "-c",
+                                (
+                                    "import time, sys; "
+                                    "sys.stdout.write('INTERRUPT_START\\n'); sys.stdout.flush(); "
+                                    "open('sentinel_interrupt.txt', 'a', encoding='utf-8').write('start\\n'); "
+                                    "time.sleep(15); "
+                                    "open('sentinel_interrupt.txt', 'a', encoding='utf-8').write('end\\n'); "
+                                ),
+                            ],
+                            cwd=".",
+                            duration_class="long",
+                            heartbeat_interval_seconds=0.2,
+                            max_runtime_seconds=60.0,
+                        ),
                     },
                 )
             },
@@ -141,6 +159,11 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
                             "argv": self.jobs_cfg.projects[self.project_id].commands["fail_task"].argv,
                             "cwd": ".",
                             "duration_class": "short",
+                        },
+                        "interrupt_task": {
+                            "argv": self.jobs_cfg.projects[self.project_id].commands["interrupt_task"].argv,
+                            "cwd": ".",
+                            "duration_class": "long",
                         },
                     },
                 }
@@ -170,10 +193,21 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        if hasattr(self, "service") and self.service:
+            try:
+                for job in self.service.store.list():
+                    rec = self.service.store.get(job["job_id"])
+                    if rec and rec.supervisor.get("pid"):
+                        terminate_process_tree(rec.supervisor["pid"])
+            except Exception:
+                pass
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
-        self.temp.cleanup()
+        try:
+            self.temp.cleanup()
+        except Exception:
+            pass
 
     def get(self, path, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -203,7 +237,7 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         5. Different retry_request_id is rejected as conflict
         6. Control API surfaces status, list and secret-redacted logs
         """
-        # --- PHASE 1: Submit long job and simulate client disconnect ---
+        # --- PHASE 1: Submit long job and simulate client disconnect & daemon reboot ---
         spec_long = JobSpec(
             project_id=self.project_id,
             command_ref="long_task",
@@ -213,8 +247,15 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         expected_jid = job_id_for(spec_long)
         self.assertEqual(rec_long.job_id, expected_jid)
 
-        # Client immediately disconnects / does not hold socket open.
-        # Background detached supervisor runs independently.
+        # Simulate client disconnect & daemon reboot mid-execution:
+        # discard in-memory service reference while supervisor process runs in the OS background.
+        del self.service
+        self.service = JobService(
+            self.runtime,
+            transports={"local": LocalJobTransport()},
+            config=self.jobs_cfg,
+        )
+
         terminal_rec = self._wait_for_terminal(rec_long.job_id)
         self.assertEqual(terminal_rec.state, "completed")
         self.assertEqual(terminal_rec.exit_code, 0)
@@ -328,6 +369,9 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         job_env2 = json.loads(body2.decode("utf-8"))
         self.assertEqual(job_env2["data"]["job_id"], rec_long.job_id)
         self.assertEqual(job_env2["data"]["state"], "completed")
+        # Assert secret redaction on job record: start_token must be redacted
+        self.assertEqual(job_env2["data"]["supervisor"].get("start_token"), "[REDACTED]")
+        self.assertNotIn("secret-super-token-12345", body2.decode("utf-8"))
 
         # 3. GET /api/v1/control/jobs/{job_id}/logs
         status_code3, _, body3 = self.get(
@@ -340,6 +384,113 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         logs_text = body3.decode("utf-8")
         self.assertNotIn("secret-super-token-12345", logs_text)
         self.assertIn("[REDACTED]", logs_text)
+
+    def test_real_detached_supervisor_interrupted_mid_run_and_recovered(self):
+        """Simulate real supervisor process interruption mid-run.
+
+        Spawns a long-running supervisor process, verifies it is actively executing,
+        then terminates the supervisor process tree mid-run.
+        Reconciliation must detect supervisor disappearance without result.json,
+        transition the job to unknown_recovery, set recovery_safe_retry=False,
+        preserve accumulated logs, and refuse automatic retry.
+        """
+        spec_interrupt = JobSpec(
+            project_id=self.project_id,
+            command_ref="interrupt_task",
+            idempotency_key="accept-interrupt-1",
+        )
+        rec = self.service.submit(spec_interrupt)
+        self.assertIn(rec.state, ("queued", "running"))
+
+        # Wait until supervisor is actively running and sentinel_interrupt.txt has started
+        sentinel_interrupt = self.repo / "sentinel_interrupt.txt"
+        deadline = time.monotonic() + 5.0
+        while not sentinel_interrupt.is_file() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(sentinel_interrupt.is_file())
+
+        rec = self.service.reconcile(rec.job_id)
+        self.assertEqual(rec.state, "running")
+        pid = rec.supervisor.get("pid")
+        self.assertIsNotNone(pid)
+        self.assertTrue(is_pid_alive(pid))
+
+        # Abruptly terminate the live supervisor process tree (simulating kill/crash)
+        terminate_process_tree(pid)
+        self.assertFalse(is_pid_alive(pid))
+
+        # Daemon restart / recovery sweep
+        del self.service
+        self.service = JobService(
+            self.runtime,
+            transports={"local": LocalJobTransport()},
+            config=self.jobs_cfg,
+        )
+        reconciled = self.service.reconcile(rec.job_id)
+        self.assertEqual(reconciled.state, "unknown_recovery")
+        self.assertEqual(reconciled.failure_kind, "supervisor_died_without_result")
+        self.assertFalse(reconciled.recovery.get("recovery_safe_retry"))
+
+        # Logs accumulated before termination must be preserved
+        logs_page = self.service.logs(rec.job_id)
+        raw_logs = json.dumps(logs_page)
+        self.assertIn("INTERRUPT_START", raw_logs)
+
+        # Automatic retry must be rejected because state is unknown_recovery
+        with self.assertRaises(ValueError):
+            self.service.retry(rec.job_id, "retry-interrupted-attempt")
+
+        # Sentinel file has 'start' but never 'end'
+        content = sentinel_interrupt.read_text(encoding="utf-8").strip()
+        self.assertIn("start", content)
+        self.assertNotIn("end", content)
+
+    def test_control_jobs_api_corruption_handling_and_read_only_store(self):
+        """Verify GET /api/v1/control/jobs error handling and read-only behavior."""
+        # 1. On an isolated runtime without a jobs directory, GET must not create the directory
+        empty_runtime = Path(self.temp.name) / "empty_runtime"
+        empty_runtime.mkdir(parents=True)
+        store = ExecutionJobStore(empty_runtime, read_only=True)
+        self.assertEqual(store.list(), [])
+        self.assertFalse((empty_runtime / "jobs").exists())
+
+        # 2. Corrupt job.json handling on GET /api/v1/control/jobs/{job_id}
+        corrupt_job_dir = self.runtime / "jobs" / "corrupt-job-001"
+        corrupt_job_dir.mkdir(parents=True, exist_ok=True)
+        (corrupt_job_dir / "job.json").write_text("{corrupt json", encoding="utf-8")
+
+        status_code2, _, body2 = self.get(
+            "/api/v1/control/jobs/corrupt-job-001",
+            headers={"Authorization": f"Bearer {self.master_token}"},
+        )
+        self.assertEqual(status_code2, 500)
+        resp2 = json.loads(body2.decode("utf-8"))
+        self.assertIn("error", resp2)
+
+        # 3. Corrupt index.json handling on GET /api/v1/control/jobs
+        (self.runtime / "jobs" / "index.json").write_text("{corrupt index json", encoding="utf-8")
+        status_code, _, body = self.get(
+            f"/api/v1/control/jobs?project_id={self.project_id}",
+            headers={"Authorization": f"Bearer {self.master_token}"},
+        )
+        self.assertEqual(status_code, 500)
+        resp = json.loads(body.decode("utf-8"))
+        self.assertIn("error", resp)
+
+    def test_ssh_job_submit_configuration_wiring(self):
+        """Verify SSHJobTransport auto-wiring from JobsConfig ssh settings."""
+        cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            ssh={"host": "remote-host.example.com", "user": "dev", "port": 2222},
+        )
+        service = JobService(
+            self.runtime,
+            transports={"local": LocalJobTransport()},
+            config=cfg,
+        )
+        self.assertIn("ssh", service.transports)
+        self.assertIsInstance(service.transports["ssh"], SSHJobTransport)
 
 
 if __name__ == "__main__":

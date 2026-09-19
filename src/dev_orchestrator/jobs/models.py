@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import socket
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping, Optional
+
+from .config import (
+    DEFAULT_HEAD_LINES,
+    DEFAULT_MAX_JOB_BYTES,
+    DEFAULT_MAX_LINE_BYTES,
+    DEFAULT_TAIL_LINES,
+)
 
 JOB_SCHEMA_VERSION = 1
 
@@ -155,6 +161,14 @@ class JobRecord:
     transport: str
     host_identity: str
     duration_class: str
+    max_runtime_seconds: float = 300.0
+    heartbeat_interval_seconds: float = 5.0
+    log_caps: dict[str, int] = field(default_factory=lambda: {
+        "max_line_bytes": DEFAULT_MAX_LINE_BYTES,
+        "max_job_bytes": DEFAULT_MAX_JOB_BYTES,
+        "head_lines": DEFAULT_HEAD_LINES,
+        "tail_lines": DEFAULT_TAIL_LINES,
+    })
     state: str = "queued"
     state_reason: Optional[str] = None
     failure_kind: Optional[str] = None
@@ -173,6 +187,7 @@ class JobRecord:
     })
     heartbeat: dict[str, Any] = field(default_factory=lambda: {
         "sequence": 0,
+        "heartbeat_sequence": 0,
         "reported_at": None,
         "observed_at": None,
         "progress": None,

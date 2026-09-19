@@ -98,7 +98,19 @@ def run_supervisor(job_dir_path: Path | str) -> int:
     max_runtime = float(data.get("max_runtime_seconds") or 300.0)
     hb_interval = float(data.get("heartbeat_interval_seconds") or 5.0)
 
-    log_writer = BoundedNDJSONLog(job_dir / "log.ndjson")
+    log_caps = data.get("log_caps") or {}
+    max_line_bytes = int(log_caps.get("max_line_bytes") or 4096)
+    max_job_bytes = int(log_caps.get("max_job_bytes") or 2 * 1024 * 1024)
+    head_lines = int(log_caps.get("head_lines") or 1000)
+    tail_lines = int(log_caps.get("tail_lines") or 1000)
+
+    log_writer = BoundedNDJSONLog(
+        job_dir / "log.ndjson",
+        max_line_bytes=max_line_bytes,
+        max_job_bytes=max_job_bytes,
+        head_lines=head_lines,
+        tail_lines=tail_lines,
+    )
     log_writer.append(f"supervisor started PID={my_pid} start_token={start_token}", stream="system")
 
     # Start child process
@@ -170,6 +182,7 @@ def run_supervisor(job_dir_path: Path | str) -> int:
         # Emit heartbeat
         hb_data = {
             "sequence": seq,
+            "heartbeat_sequence": seq,
             "reported_at": utc_now_iso(),
             "pid": my_pid,
             "child_pid": child.pid,

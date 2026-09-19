@@ -174,6 +174,8 @@ class P14JobRecoveryTests(unittest.TestCase):
             with patch("dev_orchestrator.jobs.service.is_pid_alive", return_value=True):
                 rec_check1 = service.reconcile(rec.job_id)
                 self.assertEqual(rec_check1.state, "running")
+                self.assertEqual(rec_check1.heartbeat.get("heartbeat_sequence"), 1)
+                self.assertIsNotNone(rec_check1.heartbeat.get("observed_at"))
 
             write_json(service.store._job_dir(rec.job_id) / "heartbeat.json", {
                 "job_id": rec.job_id,
@@ -185,11 +187,55 @@ class P14JobRecoveryTests(unittest.TestCase):
             with patch("dev_orchestrator.jobs.service.is_pid_alive", return_value=True):
                 rec_check2 = service.reconcile(rec.job_id)
                 self.assertEqual(rec_check2.state, "running")
+                self.assertEqual(rec_check2.heartbeat.get("heartbeat_sequence"), 2)
 
             # Stale heartbeat & process dead: reconcile transitions to unknown_recovery
             with patch("dev_orchestrator.jobs.service.is_pid_alive", return_value=False):
                 rec_dead = service.reconcile(rec.job_id)
                 self.assertEqual(rec_dead.state, "unknown_recovery")
+
+    def test_stalled_heartbeat_detected_when_process_alive_but_sequence_frozen(self):
+        from datetime import datetime, timezone, timedelta
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            repo = rt / "repo"
+            repo.mkdir()
+            cfg = make_test_config(rt, repo)
+
+            mock_transport = MagicMock()
+            service = JobService(rt, transports={"local": mock_transport}, config=cfg)
+            spec = JobSpec(project_id="p1", command_ref="build_cmd", idempotency_key="hb-stalled")
+            rec = service.submit(spec)
+
+            past_time = (datetime.now(timezone.utc) - timedelta(seconds=25)).isoformat()
+            service.store.update(rec.job_id, lambda r: (
+                r.transition_to("running", timestamp=past_time),
+                r.supervisor.update({"pid": 55555, "start_token": "tok-stalled", "started_at": past_time}),
+                r.heartbeat.update({
+                    "sequence": 10,
+                    "heartbeat_sequence": 10,
+                    "reported_at": past_time,
+                    "observed_at": past_time,
+                }),
+                r.timestamps.update({"started_at": past_time}),
+            ))
+            # Write heartbeat with same sequence 10 (not advancing)
+            write_json(service.store._job_dir(rec.job_id) / "heartbeat.json", {
+                "job_id": rec.job_id,
+                "pid": 55555,
+                "start_token": "tok-stalled",
+                "sequence": 10,
+                "heartbeat_sequence": 10,
+                "reported_at": past_time,
+            })
+
+            # Process is still reported alive by OS, but heartbeat has not advanced past timeout
+            with patch("dev_orchestrator.jobs.service.is_pid_alive", return_value=True):
+                reconciled = service.reconcile(rec.job_id)
+                self.assertEqual(reconciled.state, "unknown_recovery")
+                self.assertEqual(reconciled.failure_kind, "heartbeat_stalled")
+                self.assertFalse(reconciled.recovery.get("recovery_safe_retry", True))
 
     def test_pid_reuse_defeated_by_start_token_mismatch(self):
         with tempfile.TemporaryDirectory() as td:

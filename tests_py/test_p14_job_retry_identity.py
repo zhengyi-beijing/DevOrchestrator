@@ -28,6 +28,7 @@ from dev_orchestrator.jobs.models import (
 from dev_orchestrator.jobs.recovery import JobRecoveryCoordinator
 from dev_orchestrator.jobs.service import JobService
 from dev_orchestrator.jobs.store import ExecutionJobStore
+from dev_orchestrator.storage.json_store import write_json
 
 
 def make_test_config(temp_dir: Path, repo_path: Path) -> JobsConfig:
@@ -239,6 +240,108 @@ class P14JobRetryIdentityTests(unittest.TestCase):
             self.assertIsNotNone(succ_rec)
             self.assertEqual(succ_rec.job_id, succ_id)
             self.assertEqual(mock_transport.job_start.call_count, 2)
+
+    def test_ssh_retry_remote_job_correlation(self):
+        """SSH retry claims successor under retry_successor_id and sends exact successor id over wire."""
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            repo = rt / "repo"
+            repo.mkdir()
+            cfg = make_test_config(rt, repo)
+
+            mock_transport = MagicMock()
+            mock_transport.job_start.return_value = {"status": "started", "supervisor_pid": 8888}
+
+            service = JobService(rt, transports={"ssh": mock_transport}, config=cfg)
+            spec = JobSpec(
+                project_id="p1",
+                command_ref="test_cmd",
+                idempotency_key="ssh-retry-idem-1",
+                transport="ssh",
+            )
+            initial_rec = service.submit(spec)
+            self.assertEqual(mock_transport.job_start.call_count, 1)
+            # Fail initial job
+            service.cancel(initial_rec.job_id, reason="build failed")
+
+            # Retry with stable retry_request_id
+            retry_req_id = "retry-ssh-req-456"
+            succ_rec = service.retry(initial_rec.job_id, retry_req_id)
+            self.assertEqual(mock_transport.job_start.call_count, 2)
+
+            # Check that transport was invoked with the exact successor id, NOT job_id_for(succ_spec)
+            second_call_spec, second_call_jdir = mock_transport.job_start.call_args_list[1][0]
+            self.assertEqual(second_call_jdir.name, succ_rec.job_id)
+            self.assertEqual(succ_rec.job_id, retry_successor_id(initial_rec.job_id, retry_req_id))
+
+            # Now verify SSHJobTransport packaging preserves that successor id
+            from dev_orchestrator.jobs.transport import SSHJobTransport
+            from dev_orchestrator.ai.execution_transport import SSHTransportConfig
+            fake_subp = MagicMock()
+            ssh_t = SSHJobTransport(SSHTransportConfig(peer="remote.host"), subprocess_module=fake_subp)
+
+            # Mock _execute_op to inspect envelope sent over wire
+            with patch.object(ssh_t, "_execute_op") as mock_exec:
+                mock_exec.return_value = {"job_id": succ_rec.job_id, "status": "started"}
+                res = ssh_t.job_start(second_call_spec, second_call_jdir)
+                sent_env = mock_exec.call_args[0][0]
+                # Over-the-wire job_id MUST be the successor ID!
+                self.assertEqual(sent_env["job_id"], succ_rec.job_id)
+
+            # Verify remote_helper handles this target_job_id without stranding
+            from dev_orchestrator.ai.remote_helper import execute_request
+            remote_rt = rt / "remote_rt"
+            remote_rt.mkdir()
+            remote_repo = rt / "remote_repo"
+            remote_repo.mkdir()
+            remote_cfg_file = rt / "remote_jobs.json"
+            write_json(remote_cfg_file, {
+                "runtime_root": str(remote_rt),
+                "enabled": True,
+                "projects": {
+                    "p1": {
+                        "repo_path": str(remote_repo),
+                        "commands": {
+                            "test_cmd": {
+                                "argv": ["python", "-c", "print('remote ok')"],
+                                "cwd": ".",
+                            }
+                        }
+                    }
+                }
+            })
+            with patch("dev_orchestrator.jobs.config.resolve_remote_jobs_config_path", return_value=remote_cfg_file), \
+                 patch("dev_orchestrator.jobs.transport.spawn_detached") as mock_remote_spawn:
+                mock_remote_proc = MagicMock()
+                mock_remote_proc.pid = 9999
+                mock_remote_spawn.return_value = mock_remote_proc
+
+                start_res = execute_request({
+                    "operation": "job_start",
+                    "request_id": "req-rem-1",
+                    "job_id": succ_rec.job_id,
+                    "project_id": "p1",
+                    "command_ref": "test_cmd",
+                    "idempotency_key": second_call_spec.idempotency_key,
+                })
+                self.assertEqual(start_res["job_id"], succ_rec.job_id)
+                self.assertEqual(start_res["supervisor_pid"], 9999)
+
+                # Remote store now has the job in the successor directory!
+                remote_store = ExecutionJobStore(remote_rt)
+                rem_rec = remote_store.get(succ_rec.job_id)
+                self.assertIsNotNone(rem_rec)
+                self.assertEqual(rem_rec.job_id, succ_rec.job_id)
+                self.assertEqual(rem_rec.supervisor["pid"], 9999)
+
+                # Remote status query by successor ID succeeds
+                status_res = execute_request({
+                    "operation": "job_status",
+                    "request_id": "req-rem-2",
+                    "job_id": succ_rec.job_id,
+                })
+                self.assertEqual(status_res["job_id"], succ_rec.job_id)
+                self.assertIsNotNone(status_res.get("job"))
 
 
 if __name__ == "__main__":

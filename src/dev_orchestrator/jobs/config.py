@@ -68,6 +68,7 @@ class JobsConfig:
         "max_age_days": DEFAULT_MAX_AGE_DAYS,
     })
     projects: dict[str, JobProjectConfig] = field(default_factory=dict)
+    ssh: Optional[dict[str, Any]] = None
 
 
 def resolve_local_jobs_config_path(runtime_root: Path | str) -> Path:
@@ -151,12 +152,16 @@ def load_jobs_config(config_path: Path | str | None) -> JobsConfig | None:
 
             projects[pid] = JobProjectConfig(repo_path=repo_path, commands=commands)
 
+    ssh_raw = raw.get("ssh") or raw.get("transports", {}).get("ssh")
+    ssh_dict = dict(ssh_raw) if isinstance(ssh_raw, dict) else None
+
     return JobsConfig(
         runtime_root=rt_root,
         enabled=True,
         log_caps=log_caps,
         retention=retention,
         projects=projects,
+        ssh=ssh_dict,
     )
 
 

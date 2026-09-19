@@ -29,8 +29,9 @@ class JobRecoveryCoordinator:
         self.per_tick_budget = max(1, int(per_tick_budget))
 
     def recover(self) -> dict[str, Any]:
-        """Startup sweep: cleans corruption, re-drives stranded retry intent, reconciles active jobs."""
+        """Startup sweep: cleans corruption, re-drives stranded retry intent, reconciles active jobs, applies retention."""
         quarantined = self.service.store.repair_corruption()
+        pruned = self.service.store.apply_retention(self.service.config.retention if self.service.config else None)
         reconciled: list[dict[str, Any]] = []
         redriven: list[str] = []
 
@@ -70,12 +71,14 @@ class JobRecoveryCoordinator:
 
         return {
             "quarantined": [q.get("quarantined_path") for q in quarantined if isinstance(q, dict)],
+            "pruned": pruned,
             "reconciled": reconciled,
             "redriven": redriven,
         }
 
     def advance(self) -> dict[str, Any]:
-        """Bounded per-tick sweep over active jobs and stranded retries."""
+        """Bounded per-tick sweep over active jobs, stranded retries, and retention."""
+        self.service.store.apply_retention(self.service.config.retention if self.service.config else None)
         all_jobs = self.service.store.list()
         reconciled: list[dict[str, Any]] = []
         redriven: list[str] = []

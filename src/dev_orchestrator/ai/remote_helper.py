@@ -169,18 +169,22 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                     transport="local",
                     host_identity=socket.gethostname(),
                     duration_class=cmd_cfg.duration_class,
+                    max_runtime_seconds=cmd_cfg.max_runtime_seconds,
+                    heartbeat_interval_seconds=cmd_cfg.heartbeat_interval_seconds,
+                    log_caps=dict(jobs_cfg.log_caps),
                     state="queued",
                     timestamps={"created_at": now, "queued_at": now, "updated_at": now},
                 )
 
-            record, is_new = store.claim_or_get(spec, _factory)
+            record, is_new = store.claim_or_get(spec, _factory, target_job_id=target_job_id)
             if is_new or record.state == "queued":
-                start_res = local_transport.job_start(spec, store._job_dir(target_job_id))
+                start_res = local_transport.job_start(spec, store._job_dir(record.job_id))
                 sup_pid = start_res.get("supervisor_pid") if isinstance(start_res, dict) else None
                 if isinstance(sup_pid, int) and sup_pid > 0:
                     def _record_pid(rec: JobRecord) -> None:
                         rec.supervisor["pid"] = sup_pid
                     store.update(record.job_id, _record_pid)
+                start_res["job_id"] = record.job_id
                 return start_res
             return {
                 "job_id": record.job_id,

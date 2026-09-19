@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import os
 import socket
 import subprocess
 import sys
@@ -144,12 +142,15 @@ class SSHJobTransport:
             raise ExecutionTransportError("remote helper payload must be a JSON object")
         return payload
 
-    def job_start(self, spec: JobSpec, job_dir: Optional[Path] = None) -> dict[str, Any]:
+    def job_start(
+        self, spec: JobSpec, job_dir: Optional[Path] = None, *, job_id: Optional[str] = None
+    ) -> dict[str, Any]:
         req_id = f"job-start-{uuid4().hex[:12]}"
+        actual_job_id = job_id or (job_dir.name if job_dir is not None else job_id_for(spec))
         envelope = {
             "operation": "job_start",
             "request_id": req_id,
-            "job_id": job_id_for(spec),
+            "job_id": actual_job_id,
             "project_id": spec.project_id,
             "command_ref": spec.command_ref,
             "idempotency_key": spec.idempotency_key,
