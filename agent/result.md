@@ -824,3 +824,15 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
      - Knowledge graph updated with `graphify update .` (3806 nodes, 10630 edges, 184 communities).
 - Canonical worktree clean and ready for independent technical re-review.
 
+## P14 Fourth Technical Review Remediation (2026-09-19)
+
+- Remediated the final bounded Technical Review finding at base `3a0b4d6`:
+  - `JobRecord.transition_to` now clears stale `state_reason` and `failure_kind` when a job leaves `unknown_recovery` for `running` or successful `completed`, while explicit failure/cancel metadata remains preserved.
+  - Removed redundant sticky `failure_kind == "transport_unreachable"` retry refusal from both `JobService.retry` and `ExecutionJobStore.claim_retry`; unresolved `unknown_recovery` remains non-retryable through state/recovery-safety rules, while a genuinely recovered completed predecessor is retryable again.
+  - Added regressions covering reconnect-to-running, reconnect-to-completed metadata clearing, recovered-completed retry, unresolved unknown-recovery retry refusal, and preservation of explicit failed/cancelled metadata.
+- Verification performed outside the Claude Code permission layer after its test command was denied:
+  - Focused P14 suites: 43 passed in 10.65s.
+  - Adjacent regression: 71 passed, 6 subtests passed in 18.64s.
+  - Full test suite: 790 passed, 45 subtests passed in 253.59s (`python -m pytest tests_py -q`).
+  - Static checks passed: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check`.
+- Canonical worktree is ready for independent technical re-review.

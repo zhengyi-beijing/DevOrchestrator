@@ -255,3 +255,9 @@ P12.7 third review remediation result (2026-09-18):
   - Full test suite passed: 658 passed, 45 subtests passed in 228.65s (`python -m pytest tests_py -q`).
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (3146 nodes, 8781 edges, 159 communities). Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
+P14 fourth review remediation result (2026-09-19):
+- Cleared stale `transport_unreachable` failure metadata on successful recovery from `unknown_recovery` to `running`/`completed`.
+- Restored legal retry of genuinely recovered completed predecessors while unresolved `unknown_recovery` remains fail-closed and non-retryable.
+- Added regression coverage for recovered metadata clearing, retry eligibility, unresolved ambiguity refusal, and explicit failure metadata preservation.
+- Verification: 43 focused P14 passed; 71 passed + 6 subtests adjacent; 790 passed + 45 subtests full; compileall/node/diff-check clean.
+- Ready for independent P14 technical re-review; do not advance to P14.5 before reviewer NEXT.

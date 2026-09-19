@@ -154,10 +154,10 @@ class ExecutionJobStore:
                     f"for different retry_request_id ({existing_req!r} != {safe_req_id!r})"
                 )
 
-            # Refuse retry if predecessor is non-terminal and not recovery-safe, or in unknown_recovery / transport_unreachable
+            # Refuse retry if predecessor is non-terminal and not recovery-safe, or in unknown_recovery
             is_terminal = pred.state in ("completed", "failed", "cancelled")
             is_recovery_safe = bool(pred.recovery.get("recovery_safe_retry", False))
-            if pred.state == "unknown_recovery" or pred.failure_kind == "transport_unreachable" or (not is_terminal and not is_recovery_safe):
+            if pred.state == "unknown_recovery" or (not is_terminal and not is_recovery_safe):
                 raise ValueError(
                     f"predecessor job {predecessor_job_id} is in state {pred.state!r} "
                     "which is non-terminal and not marked recovery_safe_retry"

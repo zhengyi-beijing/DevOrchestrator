@@ -312,11 +312,67 @@ class P14DurableJobsFoundationTests(unittest.TestCase):
             duration_class="short",
             state="queued",
         )
-        rec3.transition_to("unknown_recovery", failure_kind="transport_unreachable")
+        rec3.transition_to(
+            "unknown_recovery",
+            reason="remote host unreachable",
+            failure_kind="transport_unreachable",
+        )
         self.assertEqual(rec3.state, "unknown_recovery")
-        # unknown_recovery can transition to completed when reconciled
+        self.assertEqual(rec3.failure_kind, "transport_unreachable")
+        self.assertEqual(rec3.state_reason, "remote host unreachable")
+        # unknown_recovery can transition to completed when reconciled, clearing stale evidence
         rec3.transition_to("completed")
         self.assertEqual(rec3.state, "completed")
+        self.assertIsNone(rec3.failure_kind)
+        self.assertIsNone(rec3.state_reason)
+
+    def test_recovery_from_unknown_recovery_clears_stale_failure_metadata(self):
+        def make(state: str) -> JobRecord:
+            return JobRecord(
+                job_id="job-x",
+                idempotency_key="kx",
+                spec_hash="hx",
+                kind="validation",
+                project_id="p1",
+                command_ref="c",
+                resolved_argv=["echo"],
+                working_directory=".",
+                transport="ssh",
+                host_identity="host",
+                duration_class="short",
+                state=state,
+            )
+
+        # unknown_recovery -> running clears stale metadata
+        rec = make("queued")
+        rec.transition_to("unknown_recovery", reason="unreachable", failure_kind="transport_unreachable")
+        rec.transition_to("running")
+        self.assertEqual(rec.state, "running")
+        self.assertIsNone(rec.failure_kind)
+        self.assertIsNone(rec.state_reason)
+
+        # unknown_recovery -> running -> completed remains clean
+        rec.transition_to("completed")
+        self.assertIsNone(rec.failure_kind)
+        self.assertIsNone(rec.state_reason)
+
+        # Explicit nonzero / cancel metadata is preserved on leaving unknown_recovery
+        failed = make("queued")
+        failed.transition_to("unknown_recovery", reason="unreachable", failure_kind="transport_unreachable")
+        failed.transition_to("failed", reason="exit code 2", failure_kind="non_zero_exit")
+        self.assertEqual(failed.failure_kind, "non_zero_exit")
+        self.assertEqual(failed.state_reason, "exit code 2")
+
+        cancelled = make("queued")
+        cancelled.transition_to("unknown_recovery", reason="unreachable", failure_kind="transport_unreachable")
+        cancelled.transition_to("cancelled", reason="cancelled", failure_kind="cancelled")
+        self.assertEqual(cancelled.failure_kind, "cancelled")
+        self.assertEqual(cancelled.state_reason, "cancelled")
+
+        # Failure metadata of a non-recovery transition is untouched
+        plain = make("running")
+        plain.transition_to("failed", reason="boom", failure_kind="non_zero_exit")
+        self.assertEqual(plain.failure_kind, "non_zero_exit")
 
     def test_config_propagation_to_job_record(self):
         with tempfile.TemporaryDirectory() as td:

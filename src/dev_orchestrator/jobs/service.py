@@ -495,7 +495,7 @@ class JobService:
 
         is_terminal = pred.state in ("completed", "failed", "cancelled")
         is_safe = bool(pred.recovery.get("recovery_safe_retry", False))
-        if pred.state == "unknown_recovery" or pred.failure_kind == "transport_unreachable" or (not is_terminal and not is_safe):
+        if pred.state == "unknown_recovery" or (not is_terminal and not is_safe):
             raise ValueError(
                 f"cannot retry job {job_id} in state {pred.state!r}; "
                 "job is neither terminal nor marked recovery_safe_retry"

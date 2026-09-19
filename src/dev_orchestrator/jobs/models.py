@@ -234,7 +234,11 @@ class JobRecord:
             raise JobTransitionError(
                 f"illegal job transition from {self.state!r} to {new_state!r}"
             )
+        recovered = self.state == "unknown_recovery" and new_state in ("running", "completed")
         self.state = new_state
+        if recovered:
+            self.state_reason = None
+            self.failure_kind = None
         if reason is not None:
             self.state_reason = reason
         if failure_kind is not None:

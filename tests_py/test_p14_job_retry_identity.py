@@ -188,6 +188,46 @@ class P14JobRetryIdentityTests(unittest.TestCase):
                 service.retry(rec.job_id, "retry-req-refused-unreachable")
             self.assertIn("neither terminal nor marked recovery_safe_retry", str(ctx.exception))
 
+            # The store-level claim also refuses while the interruption is unresolved
+            with self.assertRaises(ValueError):
+                service.store.claim_retry(rec.job_id, "retry-req-refused-unreachable")
+
+    def test_recovered_completed_predecessor_is_retryable(self):
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            repo = rt / "repo"
+            repo.mkdir()
+            cfg = make_test_config(rt, repo)
+
+            mock_transport = MagicMock()
+            mock_transport.job_start.return_value = {"status": "started"}
+
+            service = JobService(rt, transports={"local": mock_transport}, config=cfg)
+            rec = service.submit(
+                JobSpec(project_id="p1", command_ref="test_cmd", idempotency_key="recovered-key")
+            )
+
+            # Transport interruption, then reconnect -> running -> completed
+            service.store.update(rec.job_id, lambda r: (
+                r.transition_to(
+                    "unknown_recovery",
+                    reason="remote host unreachable",
+                    failure_kind="transport_unreachable",
+                ),
+                r.recovery.update({"recovery_safe_retry": False}),
+            ))
+            service.store.update(rec.job_id, lambda r: r.transition_to("running"))
+            service.store.update(rec.job_id, lambda r: r.transition_to("completed"))
+
+            done = service.store.get(rec.job_id)
+            self.assertEqual(done.state, "completed")
+            self.assertIsNone(done.failure_kind)
+            self.assertIsNone(done.state_reason)
+
+            succ = service.retry(rec.job_id, "retry-recovered")
+            self.assertEqual(succ.retry.get("retry_of"), rec.job_id)
+            self.assertEqual(succ.retry.get("attempt"), 2)
+
     def test_crash_between_intent_and_spawn_service_redrive(self):
         """When retry intent is claimed in store but supervisor was never spawned (crash),
 

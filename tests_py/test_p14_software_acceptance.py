@@ -682,6 +682,9 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         reconciled_reconnected = service.reconcile(rec4.job_id)
         self.assertEqual(reconciled_reconnected.state, "running")
         self.assertEqual(reconciled_reconnected.supervisor["pid"], 88888)
+        # Reconnect to running clears the stale transport interruption evidence
+        self.assertIsNone(reconciled_reconnected.failure_kind)
+        self.assertIsNone(reconciled_reconnected.state_reason)
 
         # And if it finishes on remote, reconcile promotes to completed
         mock_ssh.job_status.return_value["result"] = {
@@ -693,6 +696,18 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         reconciled_done = service.reconcile(rec4.job_id)
         self.assertEqual(reconciled_done.state, "completed")
         self.assertEqual(reconciled_done.exit_code, 0)
+        self.assertIsNone(reconciled_done.failure_kind)
+        self.assertIsNone(reconciled_done.state_reason)
+
+        # A genuinely recovered completed predecessor is legally retryable
+        mock_ssh.job_start.return_value = {
+            "status": "started",
+            "supervisor_pid": 55555,
+            "host_identity": "remote-worker-node",
+        }
+        retried = service.retry(rec4.job_id, "retry-after-recovered-completion")
+        self.assertEqual(retried.retry["retry_of"], rec4.job_id)
+        self.assertEqual(retried.retry["attempt"], 2)
 
         # 6c. Remote unreachable with supervisor_pid recorded at submit: must transition to unknown_recovery
         spec4b = JobSpec(
