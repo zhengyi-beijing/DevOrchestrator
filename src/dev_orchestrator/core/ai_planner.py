@@ -812,6 +812,12 @@ class AIPlannerCoordinator:
         prior_resource: ResourceContext | None = None,
     ) -> tuple[dict[str, Any], Any] | None:
         max_attempts = policy["max_attempts"]
+        # Resource availability failures do not consume the planner's semantic/protocol
+        # retry budget. Keep a separate bounded failover allowance so a quota failure
+        # on the last semantic attempt can still move to another eligible resource.
+        max_resource_failovers = 2
+        max_dispatches = max_attempts + max_resource_failovers
+        semantic_failures = 0
         failed_resource_ids: set[str] = set()
         planner_result = None
         plan = None
@@ -827,7 +833,7 @@ class AIPlannerCoordinator:
             }
         base_req_id = plan_id + ":planner" if round_no == 0 else f"{plan_id}:planner:remediate-{round_no}"
 
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, max_dispatches + 1):
             if not self._wait_for_launch_barrier(plan_id, record["project_id"]):
                 return None
             retry_suffix = "" if attempt == 1 else f":retry-{attempt - 1}"
@@ -906,7 +912,7 @@ class AIPlannerCoordinator:
                         failed_resource_ids.add(resource.resource_id)
                         previous_attempt_resource = resource
                         failure_reason = attempt_reason
-                        if attempt < max_attempts:
+                        if len(failed_resource_ids) <= max_resource_failovers and attempt < max_dispatches:
                             continue
                         self._finish(
                             plan_id, "failed",
@@ -951,7 +957,8 @@ class AIPlannerCoordinator:
                 if attempt_result is not None and attempt_result.resource_context is not None:
                     previous_attempt_resource = attempt_result.resource_context
                 failure_reason = attempt_reason
-                if attempt >= max_attempts:
+                semantic_failures += 1
+                if semantic_failures >= max_attempts:
                     self._finish(
                         plan_id,
                         "failed",

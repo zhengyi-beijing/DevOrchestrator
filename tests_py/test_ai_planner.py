@@ -155,6 +155,48 @@ class PlannerResourceFailoverPort(FakePort):
         return super().execute(request)
 
 
+class LateQuotaPlannerFailoverPort(FakePort):
+    """Two protocol failures, then quota failure, then a different resource succeeds."""
+
+    def __init__(self):
+        super().__init__()
+        self.planner_calls = 0
+
+    def execute(self, request):
+        if request.role != "planner":
+            return super().execute(request)
+        self.requests.append(request)
+        self.planner_calls += 1
+        if self.planner_calls <= 2:
+            return AIRoleResult(
+                request_id=request.request_id, role_run_id=request.role_run_id,
+                status="succeeded", output=json.dumps({
+                    "task_id": request.task_run_id, "summary": "Malformed",
+                    "implementation_steps": [], "interfaces": ["i"],
+                    "validation": ["v"], "risks": ["r"], "out_of_scope": ["o"],
+                }),
+                resource_context=ResourceContext("planner-opus", "anthropic", "default", "opus"),
+            )
+        if self.planner_calls == 3:
+            return AIRoleResult(
+                request_id=request.request_id, role_run_id=request.role_run_id,
+                status="failed", error="You've hit your session limit",
+                resource_context=ResourceContext("planner-opus", "anthropic", "default", "opus"),
+                failure_classification="quota_exhausted",
+            )
+        payload = {
+            "task_id": request.task_run_id, "summary": "Recovered",
+            "implementation_steps": ["Step 1"], "interfaces": ["Interface 1"],
+            "validation": ["Validation 1"], "risks": ["Risk 1"],
+            "out_of_scope": ["Scope 1"],
+        }
+        return AIRoleResult(
+            request_id=request.request_id, role_run_id=request.role_run_id,
+            status="succeeded", output=json.dumps(payload),
+            resource_context=ResourceContext("planner-codex", "codex", "default", "sol"),
+        )
+
+
 class RecordingProgressChannel:
     def __init__(self):
         self.emissions = []
@@ -739,6 +781,29 @@ class AIPlannerTests(unittest.TestCase):
             self.assertEqual(row["planner_attempts"][0]["failure_classification"], "quota_exhausted")
             self.assertEqual(row["planner_attempts"][1]["excluded_resource_ids"], ["planner-opus"])
             self.assertEqual(row["planner_resource"]["resource_id"], "planner-codex")
+
+    def test_late_quota_failure_still_fails_over_after_protocol_retries(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = LateQuotaPlannerFailoverPort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {
+                    "enabled": True, "review_independence": "provider", "max_attempts": 3,
+                }},
+            }
+            snapshot = {"project_id": "p1", "state": "IDLE", "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P14"}}
+            plan_id, _ = coordinator.start(project, snapshot, "command-late-quota")
+            row = wait_terminal(coordinator, plan_id)
+            self.assertEqual(row["state"], "ready", row)
+            planners = [r for r in port.requests if r.role == "planner"]
+            self.assertEqual(len(planners), 4)
+            self.assertEqual(planners[3].excluded_resource_ids, ("planner-opus",))
+            self.assertEqual(row["planner_resource"]["resource_id"], "planner-codex")
+            self.assertEqual(row["planner_attempts"][2]["failure_classification"], "quota_exhausted")
 
     def test_planner_failure_retries_and_recovers_without_new_control(self):
         with tempfile.TemporaryDirectory() as td:
