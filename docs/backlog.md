@@ -155,7 +155,24 @@ Goal: prevent a historical watchdog-generated OWNER_GATE/recovery budget from co
 - Add regression coverage for stale historical gate cleanup, genuine owner gate preservation, restart/replay, and new Worker/Reviewer epochs.
 - Acceptance: reproduce the current P14.5 case (new WORKER_RUNNING/EXECUTING while watchdog retains old owner_gate/attempts=20), advance to a newer epoch, and prove automatic cleanup without a manual watchdog-clear or user continue.
 
-Sequence: execute immediately after P14.5 closes, before P15.
+Sequence: execute immediately after P14.5 closes, before Stabilization Gate and P15.
+
+## P14.6 - Unattended Execution Stabilization Gate
+
+Status: **REQUIRED BEFORE P15**
+
+Goal: prove that the existing DevO control/recovery stack can sustain real unattended development before adding another client surface.
+
+- Consolidate Planner protocol handling into Raw Capture -> JSON Extract -> Normalize -> Schema Validate -> Semantic Validate -> Reviewer, with bounded format repair for schema-only failures.
+- Verify provider/session/quota failures trigger resource failover without consuming semantic-remediation budget or requiring user continue.
+- Require canonical lifecycle/health/watchdog projections to agree on the current recovery epoch; historical failure evidence must not poison a newer task/plan/execution.
+- Exercise automatic Review -> Remediation -> Re-review -> completion and automatic promotion/launch of the next eligible task.
+- Run a real 4-6 hour unattended development workload and inject at least: malformed AI schema output, provider quota/unavailable, reviewer rejection, execution interruption, and daemon restart.
+- Acceptance requires automatic recovery/failover/remediation/re-review/next-task progression with manual continue count = 0.
+- Repeat representative unattended runs 2-3 times before declaring the gate stable enough for P15.
+- Preserve durable evidence for every injected fault, recovery decision, provider switch and lifecycle transition so failures are diagnosable rather than hidden by retries.
+
+Sequence: P14.5 -> watchdog recovery-epoch cleanup -> P14.6 Stabilization Gate -> P15.
 
 ## P15 staged roadmap
 
