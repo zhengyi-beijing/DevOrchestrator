@@ -22,15 +22,15 @@ The execution job state machine contains six explicit states:
 - `completed`: The process completed with return code 0 and wrote an immutable, atomic `result.json` record. (Terminal)
 - `failed`: The process failed (non-zero exit, timeout, spawn error, or rejected validation) and wrote an immutable `result.json` record. (Terminal)
 - `cancelled`: The job was explicitly cancelled by operator command or cancel token. (Terminal)
-- `unknown_recovery`: A running supervisor process disappeared without writing `result.json` or terminal evidence. The outcome cannot be verified from durable evidence. (Non-terminal, non-retryable without intervention)
+- `unknown_recovery`: A running supervisor process disappeared without writing `result.json` or terminal evidence, or remote transport is unreachable with ambiguous execution outcome. The outcome cannot be verified from durable evidence. (Non-terminal, non-retryable without intervention)
 
 ### Transition Table
 
 | Current State | Permitted Next States | Guard / Condition |
 | :--- | :--- | :--- |
-| `queued` | `running`, `cancelled`, `failed` | `running` on supervisor spawn; `cancelled` on cancel before start; `failed` on spawn failure |
-| `running` | `completed`, `failed`, `cancelled`, `unknown_recovery` | Terminal states on process termination / timeout / cancellation; `unknown_recovery` on supervisor disappearance without result |
-| `unknown_recovery` | `completed`, `failed`, `cancelled` | Reconciled if late terminal evidence or durable result is subsequently discovered |
+| `queued` | `running`, `cancelled`, `failed`, `unknown_recovery` | `running` on supervisor spawn; `cancelled` on cancel before start; `failed` on spawn failure; `unknown_recovery` on transport unreachable / ambiguous dispatch |
+| `running` | `completed`, `failed`, `cancelled`, `unknown_recovery` | Terminal states on process termination / timeout / cancellation; `unknown_recovery` on supervisor disappearance without result or transport unreachable |
+| `unknown_recovery` | `running`, `completed`, `failed`, `cancelled` | Reconciled if remote process liveness, late terminal evidence, or durable result is subsequently discovered on reconnect |
 | `completed` | *(none)* | Write-once terminal state |
 | `failed` | *(none)* | Write-once terminal state |
 | `cancelled` | *(none)* | Write-once terminal state |
@@ -179,7 +179,8 @@ The recovery runtime operates within explicit, deterministic bounds to ensure th
 
 6. **Transport Interruption Bound**:
    - When an SSH connection drops or times out during dispatch or status check, the remote host retains its local durable store and detached supervisor execution.
-   - The local coordinator reconciles status against the remote host-local durable store on reconnect; no automatic fallback to other transports or providers is attempted.
+   - The local coordinator reconciles the job to `unknown_recovery` with `failure_kind="transport_unreachable"` and `recovery_safe_retry=False`, strictly refusing retry attempts to prevent duplicate remote execution.
+   - On reconnect, status is reconciled against the remote host-local durable store, resuming `running` observation or promoting to terminal completion; no automatic fallback to other transports or providers is attempted.
 
 7. **Orchestration Tick Budget Bound**:
    - Periodic reconciliation during the daemon tick (`JobRecoveryCoordinator.advance()`) is bounded by `per_tick_budget` (default 10 jobs) to prevent daemon tick latency degradation.

@@ -8,29 +8,27 @@
 Current task: **P14 Remote Execution Resilience & Recoverable Jobs** — **TECHNICAL REVIEW REMEDIATION COMPLETE / READY FOR TECHNICAL RE-REVIEW**.
 
 Latest continuation state (2026-09-19):
-- Completed Second-Round Technical Review Remediation for P14 Remote Execution Resilience & Recoverable Jobs:
-  1. SSH Job Path Liveness & Remote Correlation (`service.py`, `transport.py`):
-     - In `JobService.reconcile`, remote status polling now syncs remote `job` data (`supervisor` token/pid/started_at, `timestamps`, `state`, `host_identity`) into the local store.
-     - Liveness for `transport != "local"` no longer checks local `is_pid_alive` against remote PIDs with null tokens; it evaluates remote `supervisor_alive` (surfaced in `LocalJobTransport.job_status`), remote `state == "running"`, and advancing locally observed `heartbeat_sequence`.
-     - Active SSH jobs stay `running` and do not fall through to `never_started` or set `recovery_safe_retry = True`.
-     - Stalled heartbeat sequences (> 15s / 3 intervals) transition cleanly to `unknown_recovery` with `failure_kind="heartbeat_stalled"` and `recovery_safe_retry=False`.
-     - Positive evidence is strictly required for `never_started` (local: dead/missing pid + no start evidence; remote: confirmed unstarted remote record). If remote status polling fails with no prior start evidence, it transitions to `failed` with `failure_kind="transport_unreachable"` and `recovery_safe_retry=False` (never assuming safe retry).
-     - In `_promote_terminal`, queued records transition `queued -> running -> completed` when producing exit code 0 to maintain legal `VALID_TRANSITIONS`.
-  2. Concurrent `job.json` Synchronization & Store Locking (`supervisor.py`, `remote_helper.py`):
-     - Eliminated raw uncoordinated `write_json(job_file, ...)` in `jobs/supervisor.py`; all mutations now route through `ExecutionJobStore.update(job_id, ...)` under `InterProcessFileLock(jobs.lock)` and `ExecutionJobStore.save_result`.
-     - Concurrent `submit()` (`_record_pid`) and supervisor startup (`_start_sup`) no longer produce lost updates or reset state back to `queued`.
-     - In `remote_helper.py`, replaced `if is_new or record.state == "queued":` with `if is_new:`, returning `already_exists: True` on subsequent calls and preventing duplicate supervisor spawns.
-  3. Acceptance and Regression Test Coverage (`tests_py/test_p14_software_acceptance.py`, `tests_py/test_p14_job_transport.py`):
-     - Added comprehensive SSH job submission, live reconcile, stalled heartbeat, mid-run supervisor crash, positive `never_started` check, unreachable transport fail-closed, and remote completion tests in `tests_py/test_p14_software_acceptance.py` (`test_ssh_job_submit_reconcile_and_liveness_recovery`).
-     - Added `test_supervisor_and_submit_concurrent_lock_synchronization` testing concurrent supervisor start and `_record_pid` under lock without lost updates.
-     - Added `test_remote_helper_job_start_idempotency_no_respawn` verifying idempotent `job_start` handling.
-     - Fixed `test_alternate_config_roots_never_consulted` in `tests_py/test_p14_job_transport.py` to patch `os.environ.get` instead of mutating `os.environ` to avoid Windows 32k environment variable limits.
+- Completed Third-Round Technical Review Remediation for P14 Remote Execution Resilience & Recoverable Jobs:
+  1. SSH Unreachable Transport Ambiguity & Retry Refusal (`service.py`, `store.py`, `models.py`):
+     - When remote status polling fails on non-local jobs (e.g. transport timeout, network interruption), `JobService.reconcile` transitions the job to non-terminal `unknown_recovery` with `failure_kind="transport_unreachable"` and `recovery_safe_retry=False`, strictly avoiding terminal `failed`.
+     - `ExecutionJobStore.claim_retry` and `JobService.retry` explicitly refuse retry attempts on `unknown_recovery` or `failure_kind="transport_unreachable"` jobs, preventing duplicate remote supervisor execution while the remote process is still running.
+     - `has_started_evidence` in `service.py` recognizes recorded supervisor PIDs (`supervisor.get("pid") > 0`), ensuring recorded dispatch PIDs are treated as start evidence.
+     - `VALID_TRANSITIONS` updated to legally permit `queued -> unknown_recovery` (for unreachable dispatch) and `unknown_recovery -> running` (when live remote execution resumes on reconnect).
+     - In `_sync_remote_job`, reconnecting to an actively running remote job cleanly transitions `unknown_recovery` back to `running`.
+  2. Contract Document (`docs/P14_DURABLE_JOBS_CONTRACT.md`):
+     - Updated Section 2 State Machine and Transition Table to include `queued -> unknown_recovery` and `unknown_recovery -> running`.
+     - Updated Section 8.6 Transport Interruption Bound documenting transition to `unknown_recovery` with `failure_kind="transport_unreachable"` and `recovery_safe_retry=False`, retry refusal, and status reconciliation on reconnect.
+  3. Acceptance and Regression Test Coverage (`tests_py/test_p14_software_acceptance.py`, `tests_py/test_p14_durable_jobs.py`, `tests_py/test_p14_job_retry_identity.py`):
+     - Updated Case 6b in `tests_py/test_p14_software_acceptance.py`: asserts transition to `unknown_recovery` with `failure_kind="transport_unreachable"`, asserts `service.retry` is refused, asserts reconnect reconciles to `running`, and asserts remote completion promotes to `completed`.
+     - Added Case 6c in `tests_py/test_p14_software_acceptance.py`: verifies that when `supervisor_pid` was recorded at submit and SSH drops during status check, it transitions to `unknown_recovery`, refuses retry, and reconciles to `running` on reconnect.
+     - Added transition tests for `queued -> unknown_recovery` and `unknown_recovery -> running` in `tests_py/test_p14_durable_jobs.py`.
+     - Added `test_refusal_to_retry_unknown_recovery_and_transport_unreachable_job` in `tests_py/test_p14_job_retry_identity.py`.
   4. Verification:
-     - Focused P14 suite: 40 passed in 9.19s (`test_p14_durable_jobs.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_job_recovery.py`, `test_p14_software_acceptance.py`).
-     - Adjacent regression: 71 passed, 6 subtests passed in 19.48s (`test_p13_execution_transport.py`, `test_p13_software_acceptance.py`, `test_p12_control_foundation.py`, `test_p12_control_actions.py`, `test_web.py`, `test_watchdog.py`, `test_cli.py`).
-     - Full test suite: 787 passed, 45 subtests passed in 249.81s (`python -m pytest tests_py -q`).
+     - Focused P14 suite: 41 passed in 10.73s (`test_p14_durable_jobs.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_job_recovery.py`, `test_p14_software_acceptance.py`).
+     - Adjacent regression: 71 passed, 6 subtests passed in 18.99s (`test_p13_execution_transport.py`, `test_p13_software_acceptance.py`, `test_p12_control_foundation.py`, `test_p12_control_actions.py`, `test_web.py`, `test_watchdog.py`, `test_cli.py`).
+     - Full test suite: 788 passed, 45 subtests passed in 254.79s (`python -m pytest tests_py -q`).
      - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
-     - Knowledge graph updated with `graphify update .` (3804 nodes, 10624 edges, 180 communities).
+     - Knowledge graph updated with `graphify update .` (3806 nodes, 10630 edges, 184 communities).
 - Immediate continuation rule: conduct independent technical re-review on clean worktree.
 
 Implementation summary:

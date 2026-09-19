@@ -32,9 +32,9 @@ TERMINAL_JOB_STATES = (
 )
 
 VALID_TRANSITIONS: dict[str, frozenset[str]] = {
-    "queued": frozenset({"running", "cancelled", "failed"}),
+    "queued": frozenset({"running", "cancelled", "failed", "unknown_recovery"}),
     "running": frozenset({"completed", "failed", "cancelled", "unknown_recovery"}),
-    "unknown_recovery": frozenset({"completed", "failed", "cancelled"}),
+    "unknown_recovery": frozenset({"running", "completed", "failed", "cancelled"}),
     "completed": frozenset(),
     "failed": frozenset(),
     "cancelled": frozenset(),

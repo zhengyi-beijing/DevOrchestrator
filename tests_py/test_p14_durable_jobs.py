@@ -287,9 +287,36 @@ class P14DurableJobsFoundationTests(unittest.TestCase):
         )
         rec2.transition_to("unknown_recovery")
         self.assertEqual(rec2.state, "unknown_recovery")
+        # unknown_recovery can transition to running on reconnect
+        rec2.transition_to("running")
+        self.assertEqual(rec2.state, "running")
+        # running can transition back to unknown_recovery
+        rec2.transition_to("unknown_recovery")
+        self.assertEqual(rec2.state, "unknown_recovery")
         # unknown_recovery can transition to terminal when reconciled
         rec2.transition_to("failed", failure_kind="reconciled_fail")
         self.assertEqual(rec2.state, "failed")
+
+        # Legal: queued -> unknown_recovery (ambiguous dispatch / unreachable transport)
+        rec3 = JobRecord(
+            job_id="job-3",
+            idempotency_key="k3",
+            spec_hash="h3",
+            kind="validation",
+            project_id="p1",
+            command_ref="c",
+            resolved_argv=["echo"],
+            working_directory=".",
+            transport="ssh",
+            host_identity="host",
+            duration_class="short",
+            state="queued",
+        )
+        rec3.transition_to("unknown_recovery", failure_kind="transport_unreachable")
+        self.assertEqual(rec3.state, "unknown_recovery")
+        # unknown_recovery can transition to completed when reconciled
+        rec3.transition_to("completed")
+        self.assertEqual(rec3.state, "completed")
 
     def test_config_propagation_to_job_record(self):
         with tempfile.TemporaryDirectory() as td:

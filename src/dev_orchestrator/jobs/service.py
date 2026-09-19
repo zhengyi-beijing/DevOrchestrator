@@ -260,7 +260,7 @@ class JobService:
                                 for k, v in rem_ts.items():
                                     if v is not None:
                                         rec.timestamps[k] = v
-                            if rem_job.get("state") == "running" and rec.state == "queued":
+                            if rem_job.get("state") == "running" and rec.state in ("queued", "unknown_recovery"):
                                 rec.transition_to(
                                     "running",
                                     reason=None,
@@ -399,10 +399,26 @@ class JobService:
         if record.state == "unknown_recovery":
             return record
 
+        # Remote transport poll failed: outcome cannot be verified from durable evidence
+        if record.transport != "local" and not remote_polled_ok:
+            def _fail_transport_unreachable(rec: JobRecord) -> None:
+                if rec.state in ("completed", "failed", "cancelled"):
+                    return
+                rec.transition_to(
+                    "unknown_recovery",
+                    reason="remote host unreachable: transport error during status check",
+                    failure_kind="transport_unreachable",
+                    timestamp=utc_now_iso(),
+                )
+                rec.recovery["recovery_safe_retry"] = False
+
+            return self.store.update(job_id, _fail_transport_unreachable)
+
         # Check positive evidence of never started
         has_started_evidence = bool(
             record.timestamps.get("started_at")
             or record.supervisor.get("start_token")
+            or (isinstance(record.supervisor.get("pid"), int) and record.supervisor.get("pid") > 0)
             or (hb and (hb.get("heartbeat_sequence") or hb.get("sequence") or hb.get("start_token")))
             or record.state == "running"
         )
@@ -437,20 +453,6 @@ class JobService:
                         rec.recovery["recovery_safe_retry"] = True
 
                     return self.store.update(job_id, _fail_never_started_remote)
-                else:
-                    # Remote poll failed or ambiguous: do NOT set recovery_safe_retry=True!
-                    def _fail_ambiguous_remote(rec: JobRecord) -> None:
-                        if rec.state in ("completed", "failed", "cancelled"):
-                            return
-                        rec.transition_to(
-                            "failed",
-                            reason="remote host unreachable or ambiguous start evidence",
-                            failure_kind="transport_unreachable",
-                            timestamp=utc_now_iso(),
-                        )
-                        rec.recovery["recovery_safe_retry"] = False
-
-                    return self.store.update(job_id, _fail_ambiguous_remote)
 
         # Process started and died without writing result.json: ambiguous
         # Check result.json one more time under lock before promoting to unknown_recovery!
@@ -493,7 +495,7 @@ class JobService:
 
         is_terminal = pred.state in ("completed", "failed", "cancelled")
         is_safe = bool(pred.recovery.get("recovery_safe_retry", False))
-        if not is_terminal and not is_safe:
+        if pred.state == "unknown_recovery" or pred.failure_kind == "transport_unreachable" or (not is_terminal and not is_safe):
             raise ValueError(
                 f"cannot retry job {job_id} in state {pred.state!r}; "
                 "job is neither terminal nor marked recovery_safe_retry"

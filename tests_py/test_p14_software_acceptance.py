@@ -641,7 +641,7 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         self.assertEqual(reconciled_never.failure_kind, "never_started")
         self.assertTrue(reconciled_never.recovery["recovery_safe_retry"])
 
-        # 6b. Remote unreachable (poll exception): must NOT assume never_started or set safe retry
+        # 6b. Remote unreachable (poll exception): must transition to unknown_recovery without safe retry
         spec4 = JobSpec(
             project_id=self.project_id,
             command_ref="long_task",
@@ -657,10 +657,85 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         rec4 = service.submit(spec4)
         mock_ssh.job_status.side_effect = ExecutionTransportError("SSH connection timeout")
         reconciled_unreachable = service.reconcile(rec4.job_id)
-        self.assertEqual(reconciled_unreachable.state, "failed")
+        self.assertEqual(reconciled_unreachable.state, "unknown_recovery")
         self.assertEqual(reconciled_unreachable.failure_kind, "transport_unreachable")
         self.assertFalse(reconciled_unreachable.recovery["recovery_safe_retry"])
+
+        # Retry must be refused after transport_unreachable
+        with self.assertRaises(ValueError):
+            service.retry(rec4.job_id, "retry-on-unreachable-refused")
+
+        # Later successful poll reconciles the job on reconnect
         mock_ssh.job_status.side_effect = None
+        mock_ssh.job_status.return_value = {
+            "job_id": rec4.job_id,
+            "host_identity": "remote-worker-node",
+            "job": {
+                "state": "running",
+                "supervisor": {"pid": 88888, "start_token": "tok-rec4", "started_at": now_iso},
+                "timestamps": {"started_at": now_iso},
+            },
+            "heartbeat": {"sequence": 1, "heartbeat_sequence": 1, "start_token": "tok-rec4", "pid": 88888},
+            "result": None,
+            "supervisor_alive": True,
+        }
+        reconciled_reconnected = service.reconcile(rec4.job_id)
+        self.assertEqual(reconciled_reconnected.state, "running")
+        self.assertEqual(reconciled_reconnected.supervisor["pid"], 88888)
+
+        # And if it finishes on remote, reconcile promotes to completed
+        mock_ssh.job_status.return_value["result"] = {
+            "job_id": rec4.job_id,
+            "exit_code": 0,
+            "outcome": "success",
+            "finished_at": now_iso,
+        }
+        reconciled_done = service.reconcile(rec4.job_id)
+        self.assertEqual(reconciled_done.state, "completed")
+        self.assertEqual(reconciled_done.exit_code, 0)
+
+        # 6c. Remote unreachable with supervisor_pid recorded at submit: must transition to unknown_recovery
+        spec4b = JobSpec(
+            project_id=self.project_id,
+            command_ref="long_task",
+            idempotency_key="ssh-job-reconcile-4b",
+            transport="ssh",
+        )
+        mock_ssh.job_start.return_value = {
+            "job_id": job_id_for(spec4b),
+            "status": "started",
+            "supervisor_pid": 99999,
+            "host_identity": "remote-worker-node",
+        }
+        rec4b = service.submit(spec4b)
+        self.assertEqual(rec4b.state, "queued")
+        self.assertEqual(rec4b.supervisor["pid"], 99999)
+        mock_ssh.job_status.side_effect = ExecutionTransportError("SSH connection dropped")
+        reconciled_unreachable_pid = service.reconcile(rec4b.job_id)
+        self.assertEqual(reconciled_unreachable_pid.state, "unknown_recovery")
+        self.assertEqual(reconciled_unreachable_pid.failure_kind, "transport_unreachable")
+        self.assertFalse(reconciled_unreachable_pid.recovery["recovery_safe_retry"])
+
+        # Retry must be refused
+        with self.assertRaises(ValueError):
+            service.retry(rec4b.job_id, "retry-on-pid-unreachable-refused")
+
+        # Later successful poll reconciles
+        mock_ssh.job_status.side_effect = None
+        mock_ssh.job_status.return_value = {
+            "job_id": rec4b.job_id,
+            "host_identity": "remote-worker-node",
+            "job": {
+                "state": "running",
+                "supervisor": {"pid": 99999, "start_token": "tok-rec4b", "started_at": now_iso},
+                "timestamps": {"started_at": now_iso},
+            },
+            "heartbeat": {"sequence": 1, "heartbeat_sequence": 1, "start_token": "tok-rec4b", "pid": 99999},
+            "result": None,
+            "supervisor_alive": True,
+        }
+        reconciled_reconnected_pid = service.reconcile(rec4b.job_id)
+        self.assertEqual(reconciled_reconnected_pid.state, "running")
 
         # 7. Remote completion
         spec5 = JobSpec(

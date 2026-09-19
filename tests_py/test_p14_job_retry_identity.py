@@ -160,6 +160,34 @@ class P14JobRetryIdentityTests(unittest.TestCase):
                     service.retry(rec.job_id, "retry-req-refused")
                 self.assertIn("neither terminal nor marked recovery_safe_retry", str(ctx.exception))
 
+    def test_refusal_to_retry_unknown_recovery_and_transport_unreachable_job(self):
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            repo = rt / "repo"
+            repo.mkdir()
+            cfg = make_test_config(rt, repo)
+
+            mock_transport = MagicMock()
+            mock_transport.job_start.return_value = {"status": "started"}
+
+            service = JobService(rt, transports={"local": mock_transport}, config=cfg)
+            spec = JobSpec(
+                project_id="p1",
+                command_ref="test_cmd",
+                idempotency_key="unknown-rec-key",
+            )
+            rec = service.submit(spec)
+
+            # Move to unknown_recovery with transport_unreachable
+            service.store.update(rec.job_id, lambda r: (
+                r.transition_to("unknown_recovery", failure_kind="transport_unreachable"),
+                r.recovery.update({"recovery_safe_retry": False}),
+            ))
+
+            with self.assertRaises(ValueError) as ctx:
+                service.retry(rec.job_id, "retry-req-refused-unreachable")
+            self.assertIn("neither terminal nor marked recovery_safe_retry", str(ctx.exception))
+
     def test_crash_between_intent_and_spawn_service_redrive(self):
         """When retry intent is claimed in store but supervisor was never spawned (crash),
 
