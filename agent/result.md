@@ -772,3 +772,30 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Knowledge graph updated with `graphify update .` (3787 nodes, 10586 edges, 185 communities).
 - Canonical worktree clean and ready for independent technical re-review.
 
+## P14 Second Technical Review Remediation (2026-09-19)
+
+- Remediated Technical Review findings:
+  1. SSH Job Path Liveness & Remote Correlation (`service.py`, `transport.py`):
+     - In `JobService.reconcile`, remote status polling now syncs remote `job` data (`supervisor` token/pid/started_at, `timestamps`, `state`, `host_identity`) into the local store.
+     - Liveness for `transport != "local"` no longer checks local `is_pid_alive` against remote PIDs with null tokens; it evaluates remote `supervisor_alive` (surfaced in `LocalJobTransport.job_status`), remote `state == "running"`, and advancing locally observed `heartbeat_sequence`.
+     - Active SSH jobs stay `running` and do not fall through to `never_started` or set `recovery_safe_retry = True`.
+     - Stalled heartbeat sequences (> 15s / 3 intervals) transition cleanly to `unknown_recovery` with `failure_kind="heartbeat_stalled"` and `recovery_safe_retry=False`.
+     - Positive evidence is strictly required for `never_started` (local: dead/missing pid + no start evidence; remote: confirmed unstarted remote record). If remote status polling fails with no prior start evidence, it transitions to `failed` with `failure_kind="transport_unreachable"` and `recovery_safe_retry=False` (never assuming safe retry).
+     - In `_promote_terminal`, queued records transition `queued -> running -> completed` when producing exit code 0 to maintain legal `VALID_TRANSITIONS`.
+  2. Concurrent `job.json` Synchronization & Store Locking (`supervisor.py`, `remote_helper.py`):
+     - Eliminated raw uncoordinated `write_json(job_file, ...)` in `jobs/supervisor.py`; all mutations now route through `ExecutionJobStore.update(job_id, ...)` under `InterProcessFileLock(jobs.lock)` and `ExecutionJobStore.save_result`.
+     - Concurrent `submit()` (`_record_pid`) and supervisor startup (`_start_sup`) no longer produce lost updates or reset state back to `queued`.
+     - In `remote_helper.py`, replaced `if is_new or record.state == "queued":` with `if is_new:`, returning `already_exists: True` on subsequent calls and preventing duplicate supervisor spawns.
+  3. Acceptance and Regression Test Coverage (`tests_py/test_p14_software_acceptance.py`, `tests_py/test_p14_job_transport.py`):
+     - Added comprehensive SSH job submission, live reconcile, stalled heartbeat, mid-run supervisor crash, positive `never_started` check, unreachable transport fail-closed, and remote completion tests in `tests_py/test_p14_software_acceptance.py` (`test_ssh_job_submit_reconcile_and_liveness_recovery`).
+     - Added `test_supervisor_and_submit_concurrent_lock_synchronization` testing concurrent supervisor start and `_record_pid` under lock without lost updates.
+     - Added `test_remote_helper_job_start_idempotency_no_respawn` verifying idempotent `job_start` handling.
+     - Fixed `test_alternate_config_roots_never_consulted` in `tests_py/test_p14_job_transport.py` to patch `os.environ.get` instead of mutating `os.environ` to avoid Windows 32k environment variable limits.
+- Verification:
+  - Focused P14 suites passed: 40 passed in 9.19s (`test_p14_durable_jobs.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_job_recovery.py`, `test_p14_software_acceptance.py`).
+  - Adjacent regression passed: 71 passed, 6 subtests passed in 19.48s (`test_p13_execution_transport.py`, `test_p13_software_acceptance.py`, `test_p12_control_foundation.py`, `test_p12_control_actions.py`, `test_web.py`, `test_watchdog.py`, `test_cli.py`).
+  - Full test suite passed: 787 passed, 45 subtests passed in 249.81s (`python -m pytest tests_py -q`).
+  - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3804 nodes, 10624 edges, 180 communities).
+- Canonical worktree clean and ready for independent technical re-review.
+

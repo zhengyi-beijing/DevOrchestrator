@@ -80,12 +80,20 @@ class LocalJobTransport:
         job_data = read_json(target_dir / "job.json", None)
         heartbeat = read_json(target_dir / "heartbeat.json", None)
         result = read_json(target_dir / "result.json", None)
+        sup_alive = None
+        if isinstance(job_data, dict):
+            sup = job_data.get("supervisor", {})
+            if isinstance(sup, dict):
+                pid = sup.get("pid")
+                if isinstance(pid, int) and pid > 0:
+                    sup_alive = is_pid_alive(pid)
         return {
             "job_id": job_id,
             "host_identity": socket.gethostname(),
             "job": job_data,
             "heartbeat": heartbeat,
             "result": result,
+            "supervisor_alive": sup_alive,
         }
 
     def job_logs(

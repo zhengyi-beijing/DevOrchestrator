@@ -229,19 +229,49 @@ class JobService:
         if record.state in ("completed", "failed", "cancelled"):
             return record
 
+        remote_polled_ok = False
+        rem_status: dict[str, Any] | None = None
+
         # If remote transport, poll status to sync evidence
         if record.transport != "local":
             try:
                 transport = self._get_transport(record.transport)
                 jdir = self.store._job_dir(job_id)
-                rem_status = transport.job_status(job_id, jdir)
-                if isinstance(rem_status, dict):
+                polled = transport.job_status(job_id, jdir)
+                if isinstance(polled, dict):
+                    rem_status = polled
+                    remote_polled_ok = True
                     rem_res = rem_status.get("result")
                     if isinstance(rem_res, dict):
                         self.store.save_result(job_id, rem_res)
                     rem_hb = rem_status.get("heartbeat")
                     if isinstance(rem_hb, dict):
                         self.store.save_heartbeat(job_id, rem_hb)
+                    rem_job = rem_status.get("job")
+                    if isinstance(rem_job, dict):
+                        def _sync_remote_job(rec: JobRecord) -> None:
+                            rem_sup = rem_job.get("supervisor")
+                            if isinstance(rem_sup, dict):
+                                for k, v in rem_sup.items():
+                                    if v is not None:
+                                        rec.supervisor[k] = v
+                            rem_ts = rem_job.get("timestamps")
+                            if isinstance(rem_ts, dict):
+                                for k, v in rem_ts.items():
+                                    if v is not None:
+                                        rec.timestamps[k] = v
+                            if rem_job.get("state") == "running" and rec.state == "queued":
+                                rec.transition_to(
+                                    "running",
+                                    reason=None,
+                                    failure_kind=None,
+                                    timestamp=rec.timestamps.get("started_at") or utc_now_iso(),
+                                )
+                            host_id = rem_status.get("host_identity")
+                            if host_id:
+                                rec.host_identity = host_id
+                        self.store.update(job_id, _sync_remote_job)
+                        record = self.store.get(job_id) or record
             except Exception:
                 pass
 
@@ -255,6 +285,8 @@ class JobService:
             def _promote_terminal(rec: JobRecord) -> None:
                 if rec.state in ("completed", "failed", "cancelled"):
                     return
+                if rec.state == "queued" and outcome != "cancelled" and exit_code == 0:
+                    rec.transition_to("running", timestamp=rec.timestamps.get("started_at") or utc_now_iso())
                 if outcome == "cancelled":
                     rec.transition_to("cancelled", reason=err or "cancelled", failure_kind="cancelled")
                 elif exit_code == 0:
@@ -301,8 +333,40 @@ class JobService:
                 self.store.save_heartbeat(job_id, updated_hb)
                 record = self.store.get(job_id) or record
 
-        if live_pid and is_pid_alive(live_pid) and hb_token == start_token:
-            # Process appears alive with matching token; check if heartbeat sequence has stalled
+        # Determine supervisor liveness
+        if record.transport == "local":
+            is_alive = bool(live_pid and is_pid_alive(live_pid) and (not start_token or hb_token == start_token))
+        else:
+            # Remote/SSH transport: do NOT check is_pid_alive locally against a remote PID!
+            # Judge liveness by remote status and locally observed heartbeat sequence
+            if remote_polled_ok and rem_status is not None:
+                if rem_status.get("supervisor_alive") is not None:
+                    is_alive = bool(rem_status.get("supervisor_alive"))
+                elif rem_status.get("job") and rem_status["job"].get("state") == "running":
+                    is_alive = True
+                elif rem_status.get("heartbeat"):
+                    is_alive = True
+                else:
+                    is_alive = False
+            else:
+                # Remote poll failed (e.g. transport interruption / network blip):
+                # If job was running and last heartbeat was observed within stalled timeout, consider in-flight
+                last_obs = record.heartbeat.get("observed_at")
+                if last_obs and record.state == "running":
+                    try:
+                        from datetime import datetime, timezone
+                        obs_dt = datetime.fromisoformat(str(last_obs).replace("Z", "+00:00"))
+                        now_dt = datetime.now(timezone.utc)
+                        hb_interval = float(getattr(record, "heartbeat_interval_seconds", 5.0) or 5.0)
+                        stalled_timeout = max(15.0, hb_interval * 3)
+                        is_alive = (now_dt - obs_dt).total_seconds() <= stalled_timeout
+                    except Exception:
+                        is_alive = False
+                else:
+                    is_alive = False
+
+        if is_alive:
+            # Process appears alive; check if heartbeat sequence has stalled
             hb_interval = float(getattr(record, "heartbeat_interval_seconds", 5.0) or 5.0)
             stalled_timeout = max(15.0, hb_interval * 3)
             last_observed_iso = record.heartbeat.get("observed_at")
@@ -335,21 +399,58 @@ class JobService:
         if record.state == "unknown_recovery":
             return record
 
-        started_at = record.timestamps.get("started_at")
-        if record.state == "queued" or (not started_at and (not pid or pid <= 0)):
-            # Process never started (or died before transitioning to running)
-            def _fail_never_started(rec: JobRecord) -> None:
-                if rec.state in ("completed", "failed", "cancelled"):
-                    return
-                rec.transition_to(
-                    "failed",
-                    reason="supervisor process never started",
-                    failure_kind="never_started",
-                    timestamp=utc_now_iso(),
-                )
-                rec.recovery["recovery_safe_retry"] = True
+        # Check positive evidence of never started
+        has_started_evidence = bool(
+            record.timestamps.get("started_at")
+            or record.supervisor.get("start_token")
+            or (hb and (hb.get("heartbeat_sequence") or hb.get("sequence") or hb.get("start_token")))
+            or record.state == "running"
+        )
 
-            return self.store.update(job_id, _fail_never_started)
+        if not has_started_evidence:
+            if record.transport == "local":
+                # Local job with no start evidence and no alive process
+                def _fail_never_started_local(rec: JobRecord) -> None:
+                    if rec.state in ("completed", "failed", "cancelled"):
+                        return
+                    rec.transition_to(
+                        "failed",
+                        reason="supervisor process never started",
+                        failure_kind="never_started",
+                        timestamp=utc_now_iso(),
+                    )
+                    rec.recovery["recovery_safe_retry"] = True
+
+                return self.store.update(job_id, _fail_never_started_local)
+            else:
+                # SSH/remote job: require POSITIVE confirmation from remote host that job was never started
+                if remote_polled_ok and (rem_status is None or not rem_status.get("job") or rem_status.get("job", {}).get("state") == "queued"):
+                    def _fail_never_started_remote(rec: JobRecord) -> None:
+                        if rec.state in ("completed", "failed", "cancelled"):
+                            return
+                        rec.transition_to(
+                            "failed",
+                            reason="remote supervisor process never started",
+                            failure_kind="never_started",
+                            timestamp=utc_now_iso(),
+                        )
+                        rec.recovery["recovery_safe_retry"] = True
+
+                    return self.store.update(job_id, _fail_never_started_remote)
+                else:
+                    # Remote poll failed or ambiguous: do NOT set recovery_safe_retry=True!
+                    def _fail_ambiguous_remote(rec: JobRecord) -> None:
+                        if rec.state in ("completed", "failed", "cancelled"):
+                            return
+                        rec.transition_to(
+                            "failed",
+                            reason="remote host unreachable or ambiguous start evidence",
+                            failure_kind="transport_unreachable",
+                            timestamp=utc_now_iso(),
+                        )
+                        rec.recovery["recovery_safe_retry"] = False
+
+                    return self.store.update(job_id, _fail_ambiguous_remote)
 
         # Process started and died without writing result.json: ambiguous
         # Check result.json one more time under lock before promoting to unknown_recovery!

@@ -15,13 +15,18 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
+
+from dev_orchestrator.ai.execution_transport import ExecutionTransportError
+from dev_orchestrator.ai.remote_helper import handle_request
 
 from dev_orchestrator.control.security import ControlSecurity
 from dev_orchestrator.jobs.config import (
@@ -491,6 +496,251 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         )
         self.assertIn("ssh", service.transports)
         self.assertIsInstance(service.transports["ssh"], SSHJobTransport)
+
+    def test_ssh_job_submit_reconcile_and_liveness_recovery(self):
+        """Submit a transport='ssh' job through JobService and verify reconcile/liveness semantics."""
+        mock_ssh = MagicMock()
+        service = JobService(
+            self.runtime,
+            transports={"local": LocalJobTransport(), "ssh": mock_ssh},
+            config=self.jobs_cfg,
+        )
+
+        # 1. Submit SSH job
+        spec1 = JobSpec(
+            project_id=self.project_id,
+            command_ref="long_task",
+            idempotency_key="ssh-job-reconcile-1",
+            transport="ssh",
+        )
+        mock_ssh.job_start.return_value = {
+            "job_id": job_id_for(spec1),
+            "status": "started",
+            "supervisor_pid": 88888,
+            "host_identity": "remote-worker-node",
+        }
+        rec1 = service.submit(spec1)
+        self.assertEqual(rec1.transport, "ssh")
+        self.assertEqual(rec1.state, "queued")
+        self.assertEqual(rec1.supervisor["pid"], 88888)
+
+        # 2. First reconcile while remote job is actively running
+        now_iso = datetime.now(timezone.utc).isoformat()
+        mock_ssh.job_status.return_value = {
+            "job_id": rec1.job_id,
+            "host_identity": "remote-worker-node",
+            "job": {
+                "state": "running",
+                "supervisor": {
+                    "pid": 88888,
+                    "start_token": "token-remote-xyz",
+                    "started_at": now_iso,
+                },
+                "timestamps": {"started_at": now_iso},
+            },
+            "heartbeat": {
+                "sequence": 1,
+                "heartbeat_sequence": 1,
+                "start_token": "token-remote-xyz",
+                "pid": 88888,
+                "child_pid": 88889,
+                "reported_at": now_iso,
+            },
+            "result": None,
+            "supervisor_alive": True,
+        }
+
+        reconciled1 = service.reconcile(rec1.job_id)
+        # Must sync remote state to running without checking local is_pid_alive against remote PID 88888
+        self.assertEqual(reconciled1.state, "running")
+        self.assertEqual(reconciled1.supervisor["start_token"], "token-remote-xyz")
+        self.assertEqual(reconciled1.heartbeat["heartbeat_sequence"], 1)
+        self.assertIsNotNone(reconciled1.heartbeat.get("observed_at"))
+        self.assertFalse(reconciled1.recovery.get("recovery_safe_retry", False))
+
+        # 3. Advancing heartbeat sequence on remote is consumed
+        mock_ssh.job_status.return_value["heartbeat"]["sequence"] = 2
+        mock_ssh.job_status.return_value["heartbeat"]["heartbeat_sequence"] = 2
+        reconciled2 = service.reconcile(rec1.job_id)
+        self.assertEqual(reconciled2.state, "running")
+        self.assertEqual(reconciled2.heartbeat["heartbeat_sequence"], 2)
+
+        # 4. Stalled heartbeat on remote triggers unknown_recovery without safe retry
+        def _backdate(r: JobRecord) -> None:
+            r.heartbeat["observed_at"] = (datetime.now(timezone.utc) - timedelta(seconds=25)).isoformat()
+        service.store.update(rec1.job_id, _backdate)
+
+        reconciled_stalled = service.reconcile(rec1.job_id)
+        self.assertEqual(reconciled_stalled.state, "unknown_recovery")
+        self.assertEqual(reconciled_stalled.failure_kind, "heartbeat_stalled")
+        self.assertFalse(reconciled_stalled.recovery["recovery_safe_retry"])
+        # Automatic retry must be refused!
+        with self.assertRaises(ValueError):
+            service.retry(rec1.job_id, "retry-on-stalled-should-fail")
+
+        # 5. Remote supervisor mid-run death without terminal result -> unknown_recovery
+        spec2 = JobSpec(
+            project_id=self.project_id,
+            command_ref="long_task",
+            idempotency_key="ssh-job-reconcile-2",
+            transport="ssh",
+        )
+        mock_ssh.job_start.return_value = {
+            "job_id": job_id_for(spec2),
+            "status": "started",
+            "supervisor_pid": 77777,
+            "host_identity": "remote-worker-node",
+        }
+        rec2 = service.submit(spec2)
+
+        # Remote supervisor died mid-run: supervisor_alive=False, result=None, but start evidence exists
+        mock_ssh.job_status.return_value = {
+            "job_id": rec2.job_id,
+            "host_identity": "remote-worker-node",
+            "job": {
+                "state": "running",
+                "supervisor": {"pid": 77777, "start_token": "token-mid-run", "started_at": now_iso},
+                "timestamps": {"started_at": now_iso},
+            },
+            "heartbeat": {"sequence": 1, "heartbeat_sequence": 1, "start_token": "token-mid-run", "pid": 77777},
+            "result": None,
+            "supervisor_alive": False,
+        }
+        reconciled_died = service.reconcile(rec2.job_id)
+        self.assertEqual(reconciled_died.state, "unknown_recovery")
+        self.assertEqual(reconciled_died.failure_kind, "supervisor_died_without_result")
+        self.assertFalse(reconciled_died.recovery["recovery_safe_retry"])
+        with self.assertRaises(ValueError):
+            service.retry(rec2.job_id, "retry-on-midrun-death-refused")
+
+        # 6. Positive evidence required for never_started
+        # 6a. Positive confirmation from remote that supervisor never started
+        spec3 = JobSpec(
+            project_id=self.project_id,
+            command_ref="long_task",
+            idempotency_key="ssh-job-reconcile-3",
+            transport="ssh",
+        )
+        mock_ssh.job_start.return_value = {
+            "job_id": job_id_for(spec3),
+            "status": "started",
+            "supervisor_pid": None,
+            "host_identity": "remote-worker-node",
+        }
+        rec3 = service.submit(spec3)
+        mock_ssh.job_status.return_value = {
+            "job_id": rec3.job_id,
+            "host_identity": "remote-worker-node",
+            "job": None,
+            "heartbeat": None,
+            "result": None,
+            "supervisor_alive": False,
+        }
+        reconciled_never = service.reconcile(rec3.job_id)
+        self.assertEqual(reconciled_never.state, "failed")
+        self.assertEqual(reconciled_never.failure_kind, "never_started")
+        self.assertTrue(reconciled_never.recovery["recovery_safe_retry"])
+
+        # 6b. Remote unreachable (poll exception): must NOT assume never_started or set safe retry
+        spec4 = JobSpec(
+            project_id=self.project_id,
+            command_ref="long_task",
+            idempotency_key="ssh-job-reconcile-4",
+            transport="ssh",
+        )
+        mock_ssh.job_start.return_value = {
+            "job_id": job_id_for(spec4),
+            "status": "started",
+            "supervisor_pid": None,
+            "host_identity": "remote-worker-node",
+        }
+        rec4 = service.submit(spec4)
+        mock_ssh.job_status.side_effect = ExecutionTransportError("SSH connection timeout")
+        reconciled_unreachable = service.reconcile(rec4.job_id)
+        self.assertEqual(reconciled_unreachable.state, "failed")
+        self.assertEqual(reconciled_unreachable.failure_kind, "transport_unreachable")
+        self.assertFalse(reconciled_unreachable.recovery["recovery_safe_retry"])
+        mock_ssh.job_status.side_effect = None
+
+        # 7. Remote completion
+        spec5 = JobSpec(
+            project_id=self.project_id,
+            command_ref="long_task",
+            idempotency_key="ssh-job-reconcile-5",
+            transport="ssh",
+        )
+        mock_ssh.job_start.return_value = {
+            "job_id": job_id_for(spec5),
+            "status": "started",
+            "supervisor_pid": 66666,
+            "host_identity": "remote-worker-node",
+        }
+        rec5 = service.submit(spec5)
+        mock_ssh.job_status.return_value = {
+            "job_id": rec5.job_id,
+            "host_identity": "remote-worker-node",
+            "job": {"state": "completed"},
+            "heartbeat": {"sequence": 3, "heartbeat_sequence": 3},
+            "result": {"job_id": rec5.job_id, "exit_code": 0, "outcome": "success", "finished_at": now_iso},
+            "supervisor_alive": False,
+        }
+        reconciled_comp = service.reconcile(rec5.job_id)
+        self.assertEqual(reconciled_comp.state, "completed")
+        self.assertEqual(reconciled_comp.exit_code, 0)
+
+    def test_supervisor_and_submit_concurrent_lock_synchronization(self):
+        """Verify supervisor.py and submit() update job.json under InterProcessFileLock without lost updates."""
+        service = JobService(self.runtime, transports={"local": LocalJobTransport()}, config=self.jobs_cfg)
+        spec = JobSpec(
+            project_id=self.project_id,
+            command_ref="long_task",
+            idempotency_key="lock-sync-test-1",
+        )
+        record = service.submit(spec)
+
+        # Simulate supervisor updating to running with start_token
+        def _sup_start(r: JobRecord) -> None:
+            r.transition_to("running", timestamp=datetime.now(timezone.utc).isoformat())
+            r.supervisor["pid"] = 55555
+            r.supervisor["start_token"] = "sup-token-12345"
+            r.supervisor["started_at"] = datetime.now(timezone.utc).isoformat()
+            r.timestamps["started_at"] = r.supervisor["started_at"]
+        service.store.update(record.job_id, _sup_start)
+
+        # Simulate submit() _record_pid running under lock
+        def _record_pid(r: JobRecord) -> None:
+            r.supervisor["pid"] = 55555
+        updated = service.store.update(record.job_id, _record_pid)
+
+        # Verify state is NOT reset to queued and start_token is preserved
+        self.assertEqual(updated.state, "running")
+        self.assertEqual(updated.supervisor["start_token"], "sup-token-12345")
+        self.assertEqual(updated.supervisor["pid"], 55555)
+
+    def test_remote_helper_job_start_idempotency_no_respawn(self):
+        """Verify remote_helper job_start does not re-spawn supervisor for already-claimed jobs."""
+        from unittest.mock import patch
+        cfg_file = self.runtime / "execution-jobs.json"
+        with patch.object(os.environ, "get", side_effect=lambda k, d=None: str(cfg_file) if k == "DEVORCH_JOBS_CONFIG" else d):
+            req = {
+                "operation": "job_start",
+                "request_id": "req-idemp-1",
+                "project_id": self.project_id,
+                "command_ref": "long_task",
+                "idempotency_key": "idem-remote-no-respawn",
+            }
+            resp1 = handle_request(req)
+            self.assertEqual(resp1.get("status"), "success")
+            payload1 = resp1.get("payload", {})
+            self.assertEqual(payload1.get("status"), "started")
+            jid = payload1.get("job_id")
+
+            # Second call with same idempotency key
+            resp2 = handle_request(req)
+            self.assertEqual(resp2.get("status"), "success")
+            payload2 = resp2.get("payload", {})
+            self.assertEqual(payload2.get("job_id"), jid)
+            self.assertTrue(payload2.get("already_exists"))
 
 
 if __name__ == "__main__":

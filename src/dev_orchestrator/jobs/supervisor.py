@@ -25,6 +25,7 @@ from dev_orchestrator.storage.json_store import (
 
 from .logs import BoundedNDJSONLog
 from .models import JobRecord
+from .store import ExecutionJobStore
 
 
 def run_supervisor(job_dir_path: Path | str) -> int:
@@ -43,14 +44,17 @@ def run_supervisor(job_dir_path: Path | str) -> int:
         sys.stderr.write(f"supervisor refusal: {result_file} already exists\n")
         return 0
 
+    job_id = job_dir.name
+    store = ExecutionJobStore(job_dir.parent.parent)
+
     # Load existing job record
-    data = read_json(job_file, None)
-    if not isinstance(data, dict):
-        sys.stderr.write(f"supervisor error: {job_file} is not valid JSON\n")
+    rec = store.get(job_id)
+    if rec is None:
+        sys.stderr.write(f"supervisor error: {job_file} is not valid or cannot be read\n")
         return 1
 
     # Check if a supervisor is already alive
-    existing_sup = data.get("supervisor", {})
+    existing_sup = rec.supervisor or {}
     if isinstance(existing_sup, dict):
         live_pid = existing_sup.get("pid")
         if live_pid and live_pid != os.getpid() and is_pid_alive(live_pid):
@@ -58,47 +62,53 @@ def run_supervisor(job_dir_path: Path | str) -> int:
             return 2
 
     # Check state is not terminal
-    curr_state = data.get("state")
-    if curr_state in ("completed", "failed", "cancelled"):
-        sys.stderr.write(f"supervisor refusal: job is already in terminal state {curr_state!r}\n")
+    if rec.state in ("completed", "failed", "cancelled"):
+        sys.stderr.write(f"supervisor refusal: job is already in terminal state {rec.state!r}\n")
         return 0
 
-    # Setup supervisor identity
+    # Setup supervisor identity under lock
     my_pid = os.getpid()
     start_token = uuid4().hex
     started_at = utc_now_iso()
 
-    data["state"] = "running"
-    data["supervisor"] = {
-        "pid": my_pid,
-        "start_token": start_token,
-        "started_at": started_at,
-    }
-    timestamps = data.setdefault("timestamps", {})
-    timestamps["started_at"] = started_at
-    timestamps["updated_at"] = started_at
-    write_json(job_file, data, indent=2)
+    def _start_sup(r: JobRecord) -> None:
+        if r.state in ("completed", "failed", "cancelled"):
+            return
+        r.transition_to("running", reason=None, failure_kind=None, timestamp=started_at)
+        r.supervisor["pid"] = my_pid
+        r.supervisor["start_token"] = start_token
+        r.supervisor["started_at"] = started_at
+        r.timestamps["started_at"] = started_at
+        r.timestamps["updated_at"] = started_at
+
+    store.update(job_id, _start_sup)
+    rec = store.get(job_id) or rec
 
     # Prepare command execution
-    argv = data.get("resolved_argv")
+    argv = rec.resolved_argv
     if not isinstance(argv, list) or not argv:
-        data["state"] = "failed"
-        data["failure_kind"] = "empty_argv"
-        write_json(job_file, data, indent=2)
-        write_json(result_file, {
-            "job_id": data.get("job_id"),
+        err_res = {
+            "job_id": job_id,
             "exit_code": -1,
             "outcome": "failed",
             "error": "resolved_argv is empty or missing",
             "finished_at": utc_now_iso(),
-        }, indent=2)
+        }
+        store.save_result(job_id, err_res)
+
+        def _fail_empty(r: JobRecord) -> None:
+            r.transition_to("failed", reason="resolved_argv is empty or missing", failure_kind="empty_argv", timestamp=utc_now_iso())
+            r.exit_code = -1
+            r.terminal = err_res
+
+        store.update(job_id, _fail_empty)
         return 1
 
-    cwd = data.get("working_directory", ".")
-    max_runtime = float(data.get("max_runtime_seconds") or 300.0)
-    hb_interval = float(data.get("heartbeat_interval_seconds") or 5.0)
+    cwd = rec.working_directory or "."
+    max_runtime = float(rec.max_runtime_seconds or 300.0)
+    hb_interval = float(rec.heartbeat_interval_seconds or 5.0)
 
-    log_caps = data.get("log_caps") or {}
+    log_caps = rec.log_caps or {}
     max_line_bytes = int(log_caps.get("max_line_bytes") or 4096)
     max_job_bytes = int(log_caps.get("max_job_bytes") or 2 * 1024 * 1024)
     head_lines = int(log_caps.get("head_lines") or 1000)
@@ -129,19 +139,22 @@ def run_supervisor(job_dir_path: Path | str) -> int:
             **hidden_subprocess_kwargs(),
         )
     except Exception as exc:
-        data["state"] = "failed"
-        data["failure_kind"] = "spawn_error"
-        data["state_reason"] = str(exc)
-        timestamps["finished_at"] = utc_now_iso()
-        timestamps["updated_at"] = utc_now_iso()
-        write_json(job_file, data, indent=2)
-        write_json(result_file, {
-            "job_id": data.get("job_id"),
+        spawn_err_res = {
+            "job_id": job_id,
             "exit_code": -1,
             "outcome": "failed",
             "error": f"spawn failed: {exc}",
             "finished_at": utc_now_iso(),
-        }, indent=2)
+        }
+        store.save_result(job_id, spawn_err_res)
+
+        def _fail_spawn(r: JobRecord) -> None:
+            r.transition_to("failed", reason=str(exc), failure_kind="spawn_error", timestamp=utc_now_iso())
+            r.exit_code = -1
+            r.terminal = spawn_err_res
+            r.timestamps["finished_at"] = utc_now_iso()
+
+        store.update(job_id, _fail_spawn)
         log_writer.append(f"spawn failed: {exc}", stream="system")
         return 1
 
@@ -154,7 +167,7 @@ def run_supervisor(job_dir_path: Path | str) -> int:
         except Exception:
             pass
 
-    stream_thread = threading.Thread(target=_stream_output, name=f"job-log-{data.get('job_id')}", daemon=True)
+    stream_thread = threading.Thread(target=_stream_output, name=f"job-log-{job_id}", daemon=True)
     stream_thread.start()
 
     # Heartbeat and monitoring loop
@@ -241,7 +254,7 @@ def run_supervisor(job_dir_path: Path | str) -> int:
 
     # Write terminal result write-once
     term_result = {
-        "job_id": data.get("job_id"),
+        "job_id": job_id,
         "exit_code": exit_code,
         "outcome": outcome,
         "error": error_msg,
@@ -249,18 +262,18 @@ def run_supervisor(job_dir_path: Path | str) -> int:
         "truncated_lines": trunc_lines,
         "truncated_bytes": trunc_bytes,
     }
-    write_json(result_file, term_result, indent=2)
+    store.save_result(job_id, term_result)
 
-    # Update job.json
-    data["state"] = final_state
-    data["failure_kind"] = failure_kind
-    data["state_reason"] = error_msg
-    data["exit_code"] = exit_code
-    data["terminal"] = term_result
-    timestamps["finished_at"] = finished_at
-    timestamps["updated_at"] = finished_at
-    write_json(job_file, data, indent=2)
+    def _finish_sup(r: JobRecord) -> None:
+        if r.state in ("completed", "failed", "cancelled"):
+            return
+        r.transition_to(final_state, reason=error_msg, failure_kind=failure_kind, timestamp=finished_at)
+        r.exit_code = exit_code
+        r.terminal = term_result
+        r.timestamps["finished_at"] = finished_at
+        r.timestamps["updated_at"] = finished_at
 
+    store.update(job_id, _finish_sup)
     return 0
 
 

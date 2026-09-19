@@ -249,13 +249,11 @@ class P14JobTransportTests(unittest.TestCase):
 
     def test_alternate_config_roots_never_consulted(self):
         # Configuration resolution checks strictly DEVORCH_JOBS_CONFIG or ~/.devorch/execution-jobs.json
-        with patch.dict(os.environ, {"DEVORCH_JOBS_CONFIG": "/trusted/path/execution-jobs.json"}, clear=False):
+        with patch.object(os.environ, "get", side_effect=lambda k, d=None: "/trusted/path/execution-jobs.json" if k == "DEVORCH_JOBS_CONFIG" else d):
             resolved = resolve_remote_jobs_config_path()
             self.assertEqual(str(resolved), str(Path("/trusted/path/execution-jobs.json")))
 
-        env_without = dict(os.environ)
-        env_without.pop("DEVORCH_JOBS_CONFIG", None)
-        with patch.dict(os.environ, env_without, clear=True):
+        with patch.object(os.environ, "get", side_effect=lambda k, d=None: None if k == "DEVORCH_JOBS_CONFIG" else d):
             resolved = resolve_remote_jobs_config_path()
             expected = Path.home() / ".devorch" / "execution-jobs.json"
             self.assertEqual(resolved, expected)

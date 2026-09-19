@@ -177,7 +177,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 )
 
             record, is_new = store.claim_or_get(spec, _factory, target_job_id=target_job_id)
-            if is_new or record.state == "queued":
+            if is_new:
                 start_res = local_transport.job_start(spec, store._job_dir(record.job_id))
                 sup_pid = start_res.get("supervisor_pid") if isinstance(start_res, dict) else None
                 if isinstance(sup_pid, int) and sup_pid > 0:
