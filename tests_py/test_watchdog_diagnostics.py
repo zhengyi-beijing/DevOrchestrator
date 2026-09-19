@@ -32,7 +32,7 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
 
     def test_9_diagnostic_classifications(self):
         """Verify all diagnosis codes can be classified deterministically."""
-        self.assertEqual(len(DIAGNOSIS_CODES), 10)
+        self.assertEqual(len(DIAGNOSIS_CODES), 11)
         assessment = DummyAssessment()
 
         # 1. process_dead
@@ -94,6 +94,18 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
         )
         self.assertEqual(diag_planner.code, "planner_failed")
         self.assertFalse(diag_planner.owner_gate_required)
+
+        # READY_TO_RUN with no process identity is a safe guarded-continue
+        # recovery shape, not a human decision gate.
+        ev_ready = {
+            "process_liveness": {"process_alive": False, "pid": None},
+            "repository_truth": {"valid": True, "dirty": False},
+        }
+        ready_assessment = DummyAssessment(lifecycle_state="READY_TO_RUN", no_progress_seconds=2000.0)
+        ready_assessment.active_execution = False
+        diag_ready = classify_evidence(ev_ready, ready_assessment)
+        self.assertEqual(diag_ready.code, "ready_to_run_unlaunched")
+        self.assertFalse(diag_ready.owner_gate_required)
 
         # provider_or_quota_blocked
         ev_quota = {

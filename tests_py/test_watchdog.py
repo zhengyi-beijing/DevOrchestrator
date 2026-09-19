@@ -191,6 +191,47 @@ class WatchdogPolicyAndLifecycleTests(unittest.TestCase):
         self.assertEqual(len(results4), 1)
         self.assertEqual(results4[0].get("status"), "cooldown")
 
+    def test_ready_to_run_without_execution_is_monitored(self):
+        """A stale launch gap is monitored, while an active run remains excluded."""
+        now = datetime.now(timezone.utc)
+        old_time = (now - timedelta(hours=2)).isoformat()
+        policy = resolve_watchdog_policy({"watchdog": {"enabled": True}})
+        ready = evaluate_stall(
+            snapshot={"project_id": "p1", "state": "READY_TO_RUN", "task_id": "T1"},
+            policy=policy,
+            signals=(old_time, "fp1", {"activity_evidence": "available"}),
+            now=now,
+        )
+        self.assertTrue(ready.monitored)
+        self.assertTrue(ready.breached)
+        self.assertFalse(ready.active_execution)
+
+        # A terminal run_id may remain in telemetry after a prior Worker.  It
+        # is not an active execution and must not hide a new launch gap.
+        stale_telemetry = evaluate_stall(
+            snapshot={
+                "project_id": "p1", "state": "READY_TO_RUN", "task_id": "T1",
+                "telemetry": {"run_id": "completed-run"},
+            },
+            policy=policy,
+            signals=(old_time, "fp1", {"activity_evidence": "available"}),
+            now=now,
+        )
+        self.assertTrue(stale_telemetry.monitored)
+        self.assertFalse(stale_telemetry.active_execution)
+
+        active = evaluate_stall(
+            snapshot={
+                "project_id": "p1", "state": "READY_TO_RUN", "task_id": "T1",
+                "worker": {"state": "running", "pid": 1234},
+            },
+            policy=policy,
+            signals=(old_time, "fp1", {"activity_evidence": "available"}),
+            now=now,
+        )
+        self.assertFalse(active.monitored)
+        self.assertFalse(active.breached)
+
 
 if __name__ == "__main__":
     unittest.main()

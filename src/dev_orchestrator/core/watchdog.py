@@ -51,6 +51,10 @@ ACTIVE_LIFECYCLE_STATES = frozenset({
     "REVIEW_FAILED",
     "PLAN_FAILED",
     "REMEDIATING",
+    # READY_TO_RUN normally moves promptly through the guarded control path.
+    # When it remains stale with no managed execution, it is a recoverable
+    # launch gap rather than an owner decision.
+    "READY_TO_RUN",
 })
 
 LIFECYCLE_OVERRIDE_FAMILY = {
@@ -63,6 +67,7 @@ LIFECYCLE_OVERRIDE_FAMILY = {
     "REVIEW_FAILED": "REVIEWING",
     "PLAN_FAILED": "PLANNING",
     "REMEDIATING": "REMEDIATING",
+    "READY_TO_RUN": "EXECUTING",
 }
 
 WATCHDOG_MILESTONES = frozenset({
@@ -379,6 +384,79 @@ def resolve_attempt_key(run_scope_key: str, progress_fingerprint: str) -> str:
     return hashlib.sha256(f"{run_scope_key}|{progress_fingerprint}".encode("utf-8")).hexdigest()[:16]
 
 
+def _active_execution_id(
+    snapshot: dict[str, Any], executor_state: dict[str, Any] | None = None,
+) -> str | None:
+    """Return a durable active execution identifier, never a worker PID."""
+    telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+    project_id = str(snapshot.get("project_id") or snapshot.get("id") or "")
+    if isinstance(executor_state, dict):
+        executions = executor_state.get("executions")
+        if isinstance(executions, dict):
+            active: list[dict[str, Any]] = [
+                rec for rec in executions.values()
+                if isinstance(rec, dict)
+                and str(rec.get("project_id") or "") == project_id
+                and str(rec.get("state") or "").lower() in {"launching", "running"}
+            ]
+            if active:
+                latest = max(active, key=lambda rec: str(rec.get("started_at") or ""))
+                value = latest.get("execution_id") or latest.get("request_id") or latest.get("run_id") or latest.get("source_request_id")
+                if value:
+                    return str(value).strip()
+
+    broker = snapshot.get("broker_execution") if isinstance(snapshot.get("broker_execution"), dict) else {}
+    broker_active = str(broker.get("state") or "").lower() in {"launching", "running"}
+    worker = snapshot.get("worker") if isinstance(snapshot.get("worker"), dict) else {}
+    worker_active = str(worker.get("state") or "").lower() in ACTIVE_WORKER_STATES
+    if not broker_active and not worker_active:
+        return None
+    run_id = str(telemetry.get("run_id") or "").strip()
+    role_run_id = str(broker.get("role_run_id") or snapshot.get("role_run_id") or "").strip()
+    return run_id or role_run_id or None
+
+
+def _has_active_execution(
+    snapshot: dict[str, Any], executor_state: dict[str, Any] | None = None,
+) -> bool:
+    """Use durable execution state, not a possibly recycled PID, as the guard."""
+    if _active_execution_id(snapshot, executor_state):
+        return True
+    worker = snapshot.get("worker") if isinstance(snapshot.get("worker"), dict) else {}
+    return str(worker.get("state") or "").lower() in ACTIVE_WORKER_STATES
+
+
+def resolve_recovery_epoch(
+    snapshot: dict[str, Any], executor_state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Build a durable epoch from authoritative task/plan/control/HEAD/run facts.
+
+    A PID, timestamps, and watchdog observations are deliberately excluded.  An
+    epoch transition is therefore evidence of a new authority boundary, rather
+    than a transient liveness observation.
+    """
+    project_id = str(snapshot.get("project_id") or snapshot.get("id") or "").strip()
+    telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+    task_id = str(telemetry.get("task_id") or snapshot.get("task_id") or "").strip()
+    git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
+    head = str(git.get("head") or "").strip()
+    if not project_id or not task_id or not head:
+        return None
+
+    planner = snapshot.get("planner") if isinstance(snapshot.get("planner"), dict) else {}
+    actuation = snapshot.get("actuation") if isinstance(snapshot.get("actuation"), dict) else {}
+    evidence = {
+        "project_id": project_id,
+        "task_id": task_id,
+        "head": head,
+        "plan_id": str(planner.get("plan_id") or telemetry.get("plan_id") or "").strip() or None,
+        "control_id": str(actuation.get("source_request_id") or snapshot.get("source_request_id") or "").strip() or None,
+        "execution_id": _active_execution_id(snapshot, executor_state),
+    }
+    raw = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return {"id": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16], "evidence": evidence}
+
+
 def compute_record_integrity_hash(attempt_record: dict[str, Any]) -> str:
     """Stable integrity hash over all fields that affect recovery actuation.
 
@@ -390,6 +468,7 @@ def compute_record_integrity_hash(attempt_record: dict[str, Any]) -> str:
         "completed_at": str(attempt_record.get("completed_at") or ""),
         "diagnosis": str(attempt_record.get("diagnosis") or ""),
         "evidence_hash": str(attempt_record.get("evidence_hash") or ""),
+        "recovery_epoch_id": str(attempt_record.get("recovery_epoch_id") or ""),
         "run_scope_key": str(attempt_record.get("run_scope_key") or ""),
     }
     canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -608,6 +687,8 @@ class StallAssessment:
     breached: bool
     progress_fingerprint: str
     activity_evidence: str
+    active_execution: bool
+    recovery_epoch: dict[str, Any] | None
 
 
 def evaluate_stall(
@@ -625,7 +706,10 @@ def evaluate_stall(
     telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
     task_id = telemetry.get("task_id") or snapshot.get("task_id")
 
-    monitored = lifecycle_state in ACTIVE_LIFECYCLE_STATES
+    active_execution = _has_active_execution(snapshot, executor_state)
+    monitored = lifecycle_state in ACTIVE_LIFECYCLE_STATES and not (
+        lifecycle_state == "READY_TO_RUN" and active_execution
+    )
     threshold_seconds = resolve_threshold_seconds(policy, lifecycle_state)
     run_key = resolve_run_key(snapshot, executor_state)
     r_scope_key = resolve_run_scope_key(project_id, str(task_id or ""), lifecycle_state, run_key)
@@ -653,6 +737,8 @@ def evaluate_stall(
         breached=breached,
         progress_fingerprint=progress_fingerprint,
         activity_evidence=evidence_state,
+        active_execution=active_execution,
+        recovery_epoch=resolve_recovery_epoch(snapshot, executor_state),
     )
 
 
@@ -1122,6 +1208,52 @@ class WatchdogCoordinator:
                             details={"source": "watchdog", "gate": "recovery-unresolved", "command_id": cid},
                         )
 
+    @staticmethod
+    def _reset_epoch_state(project_row: dict[str, Any]) -> None:
+        """Discard watchdog-only state from a conclusively superseded epoch.
+
+        Incrementing the fence invalidates an in-memory diagnostic that began
+        under the old epoch.  Lifecycle state is intentionally not touched:
+        recovery remains a normal guarded control command.
+        """
+        project_row["fence_generation"] = int(project_row.get("fence_generation", 0)) + 1
+        project_row["attempts"] = {}
+        project_row["attempt_counts"] = {}
+        project_row["recovery_slots"] = {}
+        project_row["cooldown_until"] = None
+        project_row["last_diagnosis"] = None
+        project_row["last_evidence_hash"] = None
+        project_row["last_recovery_result"] = None
+        project_row["owner_gate"] = None
+        project_row.pop("stall", None)
+
+    def _reconcile_recovery_epoch(
+        self,
+        project_row: dict[str, Any],
+        assessment: StallAssessment,
+    ) -> bool:
+        """Persist the current epoch and reset only watchdog state on supersession.
+
+        A current OWNER_GATE is authoritative owner/planner state and is never
+        cleared here.  Legacy watchdog rows have no epoch binding; the first
+        complete authoritative epoch safely supersedes only that watchdog data.
+        """
+        epoch = assessment.recovery_epoch
+        if epoch is None:
+            return False
+        previous = project_row.get("recovery_epoch")
+        previous_id = previous.get("id") if isinstance(previous, dict) else None
+        current_id = epoch["id"]
+        if previous_id == current_id:
+            return False
+        if assessment.lifecycle_state == "OWNER_GATE":
+            # Do not let a newer incidental observation bypass a genuine
+            # current owner decision.  Retain the pending watchdog data too.
+            return False
+        self._reset_epoch_state(project_row)
+        project_row["recovery_epoch"] = copy.deepcopy(epoch)
+        return True
+
     def _emit_milestone(
         self,
         project_id: str,
@@ -1262,11 +1394,17 @@ class WatchdogCoordinator:
                     now=tick_now,
                     executor_state=executor_state,
                 )
+                epoch_advanced = self._reconcile_recovery_epoch(prow, assessment)
 
                 if not assessment.breached:
                     # Not breached; clean stall state
                     prow.pop("stall", None)
-                    results.append({"project_id": pid, "status": "ok", "breached": False})
+                    results.append({
+                        "project_id": pid,
+                        "status": "ok",
+                        "breached": False,
+                        "epoch_advanced": epoch_advanced,
+                    })
                     continue
 
                 # Stall detected!
@@ -1276,6 +1414,9 @@ class WatchdogCoordinator:
                     "task_id": assessment.task_id,
                     "run_key": assessment.run_key,
                     "run_scope_key": assessment.run_scope_key,
+                    "recovery_epoch_id": (
+                        assessment.recovery_epoch.get("id") if assessment.recovery_epoch else None
+                    ),
                     "threshold_minutes": round(assessment.threshold_seconds / 60.0, 1),
                     "no_progress_seconds": assessment.no_progress_seconds,
                 }
@@ -1308,6 +1449,8 @@ class WatchdogCoordinator:
                 # Guard 4: Max attempts per run
                 if current_run_attempts >= policy["max_attempts_per_run"]:
                     prow["owner_gate"] = {
+                        "source": "watchdog",
+                        "recovery_epoch_id": assessment.recovery_epoch.get("id") if assessment.recovery_epoch else None,
                         "reason": f"exhausted max_attempts_per_run ({policy['max_attempts_per_run']})",
                         "triggered_at": now_iso,
                     }
@@ -1331,6 +1474,7 @@ class WatchdogCoordinator:
                     "attempt_key": att_key,
                     "run_scope_key": assessment.run_scope_key,
                     "task_id": assessment.task_id,
+                    "recovery_epoch_id": assessment.recovery_epoch.get("id") if assessment.recovery_epoch else None,
                     "fence_token": fence_token,
                     "state": "running",
                     "started_at": now_iso,
@@ -1498,6 +1642,16 @@ class WatchdogCoordinator:
         if attempt_record.get("recovery") is not None:
             return  # Already reserved or executed for this attempt
 
+        # An epoch transition invalidates old diagnostics before they can
+        # reserve a slot or emit another gate.  Direct unit callers without an
+        # epoch retain the compatibility path; durable coordinator records are
+        # always bound when authoritative identity is available.
+        current_epoch = project_row.get("recovery_epoch")
+        current_epoch_id = current_epoch.get("id") if isinstance(current_epoch, dict) else None
+        attempt_epoch_id = attempt_record.get("recovery_epoch_id")
+        if current_epoch_id and attempt_epoch_id and current_epoch_id != attempt_epoch_id:
+            return
+
         pid = str(project_config.get("project_id") or project_config.get("id") or "")
         policy = resolve_watchdog_policy(project_config)
         if not policy["auto_recovery"]:
@@ -1506,7 +1660,10 @@ class WatchdogCoordinator:
             return
 
         diag_code = attempt_record.get("diagnosis")
-        if diag_code not in ("agent_stalled", "process_dead", "reviewer_failed", "plan_reviewer_failed", "planner_failed"):
+        if diag_code not in (
+            "agent_stalled", "process_dead", "reviewer_failed",
+            "plan_reviewer_failed", "planner_failed", "ready_to_run_unlaunched",
+        ):
             self._emit_owner_gate_once(pid, attempt_record, f"diagnosis_{diag_code}_requires_owner")
             return
 
@@ -1546,6 +1703,13 @@ class WatchdogCoordinator:
 
         recovery_action = "continue"
         recovery_target: dict[str, Any] = {}
+        if diag_code == "ready_to_run_unlaunched":
+            if current_lifecycle != "READY_TO_RUN":
+                self._emit_owner_gate_once(pid, attempt_record, "ready_to_run_lifecycle_changed")
+                return
+            if _has_active_execution(snapshot):
+                self._emit_owner_gate_once(pid, attempt_record, "ready_to_run_execution_started")
+                return
         if diag_code == "reviewer_failed":
             if current_lifecycle != "REVIEW_FAILED":
                 self._emit_owner_gate_once(pid, attempt_record, "reviewer_failed_lifecycle_changed")

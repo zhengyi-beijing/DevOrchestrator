@@ -27,6 +27,7 @@ DIAGNOSIS_CODES = (
     "reviewer_failed",
     "plan_reviewer_failed",
     "planner_failed",
+    "ready_to_run_unlaunched",
     "provider_or_quota_blocked",
     "state_desync",
     "external_wait",
@@ -288,6 +289,26 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
     # prior EXECUTING run and would otherwise cause spurious process_dead during PLANNING /
     # REVIEWING_PLAN / APPLYING_PLAN / REVIEWING.
     worker_active = lifecycle in WORKER_EXPECTED_LIFECYCLE_STATES
+
+    # READY_TO_RUN is a normal execution-launch boundary, not an owner gate.
+    # The watchdog only reaches this classifier after it has independently
+    # established that no execution is active.  A guarded continue command is
+    # safe: the control consumer revalidates the full identity and executor
+    # launch guards before it can start anything.
+    if (
+        lifecycle == "READY_TO_RUN"
+        and not bool(getattr(assessment, "active_execution", False))
+        and pid is None
+    ):
+        return Diagnosis(
+            code="ready_to_run_unlaunched",
+            confidence=1.0,
+            reason="READY_TO_RUN remained stale with no active managed execution",
+            recommended_action="submit guarded continue to launch the current ready task",
+            owner_gate_required=False,
+            evidence=evidence,
+            evidence_hash=ev_hash,
+        )
 
     # A terminal technical-review infrastructure failure is recoverable only
     # through the exact-review retry control path; never map it to Worker continue.

@@ -2431,6 +2431,126 @@ class WatchdogRecoveryTests(unittest.TestCase):
         self.assertEqual(len(gate_events), 1)
         self.assertEqual(gate_events[0][2]["details"]["reason"], "process_dead_current_started_at_absent")
 
+    def test_new_authoritative_epoch_clears_stale_watchdog_budget_and_recovers_ready_gap(self):
+        """A stale watchdog gate cannot block a newer READY_TO_RUN control epoch."""
+        import hashlib
+        from dev_orchestrator.core.watchdog import canonical_path
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        old_activity = (now - _dt.timedelta(hours=2)).isoformat()
+        head = subprocess.check_output(
+            ["git", "-C", str(self.repo_dir), "rev-parse", "HEAD"], text=True
+        ).strip()
+        repo_fp = hashlib.sha256(canonical_path(self.repo_dir).encode("utf-8")).hexdigest()[:16]
+        config_path = self.root / "projects.json"
+        config_path.write_text(json.dumps({"projects": [{
+            "project_id": "p1", "repo_path": str(self.repo_dir),
+            "watchdog": {
+                "enabled": True, "auto_recovery": True,
+                "no_progress_threshold_minutes": 1, "cooldown_minutes": 1,
+            },
+        }]}), encoding="utf-8")
+        snapshot = {
+            "project_id": "p1", "repo_path": str(self.repo_dir),
+            "lifecycle_state": "READY_TO_RUN", "state": "READY_TO_RUN",
+            "telemetry": {"task_id": "P14.5"},
+            "git": {"head": head, "branch": "master", "dirty": False},
+            "activity": {"watchdog_safe": {
+                "last_activity_at": old_activity, "newest_kind": "agent_file",
+                "newest_path": "agent/next.md", "sources": {},
+                "changed_entries_considered": 0, "repo_scope": "canonical",
+                "repo_root_fingerprint": repo_fp,
+            }},
+        }
+        channel = DummyProgressChannel()
+        coordinator = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        coordinator._cached_state["projects"]["p1"] = {
+            "recovery_epoch": {"id": "historical-epoch", "evidence": {"task_id": "old"}},
+            "attempts": {"old-attempt": {"attempt_key": "old-attempt", "state": "completed"}},
+            "attempt_counts": {"old-scope": 20},
+            "recovery_slots": {"old-scope": "wd-old"},
+            "cooldown_until": (now + _dt.timedelta(hours=1)).isoformat(),
+            "last_diagnosis": "unknown", "last_evidence_hash": "old-evidence",
+            "last_recovery_result": "blocked",
+            "owner_gate": {"source": "watchdog", "reason": "historical max attempts"},
+            "fence_generation": 0,
+        }
+
+        first = coordinator.advance(config_path, {"projects": [snapshot]}, now=now)
+        self.assertEqual(first[0]["status"], "attempt_started")
+        worker = coordinator._threads["p1"]
+        worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+
+        row = coordinator.project_state("p1")
+        self.assertNotIn("old-attempt", row["attempts"])
+        self.assertNotIn("old-scope", row["attempt_counts"])
+        self.assertEqual(sum(row["attempt_counts"].values()), 1)
+        self.assertEqual(row["recovery_slots"], {})
+        self.assertIsNone(row["owner_gate"])
+        self.assertNotEqual(row["recovery_epoch"]["id"], "historical-epoch")
+        self.assertEqual(row["last_diagnosis"], "ready_to_run_unlaunched")
+
+        # The next tick uses the normal two-phase recovery path, yielding a
+        # fully guarded control command instead of mutating lifecycle state.
+        second = coordinator.advance(config_path, {"projects": [snapshot]}, now=now)
+        self.assertEqual(second[0]["status"], "deduplicated")
+        attempt = next(iter(coordinator.project_state("p1")["attempts"].values()))
+        self.assertEqual(attempt["diagnosis"], "ready_to_run_unlaunched")
+        self.assertEqual(attempt["recovery"]["state"], "requested")
+        command = json.loads((self.runtime_dir / "control" / "inbox" / attempt["recovery"]["command_id"]).with_suffix(".json").read_text(encoding="utf-8"))
+        self.assertEqual(command["action"], "continue")
+        self.assertEqual(command["expected"]["task_id"], "P14.5")
+        self.assertEqual(command["expected"]["head"], head)
+
+        # Restart/replay retains the same epoch-bound reservation and does not
+        # reset its budget or enqueue a duplicate command.
+        restarted = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
+        replay = restarted.advance(config_path, {"projects": [snapshot]}, now=now)
+        self.assertEqual(replay[0]["status"], "deduplicated")
+        replay_row = restarted.project_state("p1")
+        self.assertEqual(replay_row["recovery_epoch"], row["recovery_epoch"])
+        self.assertEqual(len(replay_row["attempts"]), 1)
+        self.assertEqual(len(list((self.runtime_dir / "control" / "inbox").glob("wd-*.json"))), 1)
+
+    def test_current_owner_gate_is_never_cleared_by_epoch_reconciliation(self):
+        """A current OWNER_GATE remains a hard stop even if old watchdog data differs."""
+        import hashlib
+        from dev_orchestrator.core.watchdog import canonical_path
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        head = subprocess.check_output(
+            ["git", "-C", str(self.repo_dir), "rev-parse", "HEAD"], text=True
+        ).strip()
+        repo_fp = hashlib.sha256(canonical_path(self.repo_dir).encode("utf-8")).hexdigest()[:16]
+        config_path = self.root / "projects.json"
+        config_path.write_text(json.dumps({"projects": [{
+            "project_id": "p1", "repo_path": str(self.repo_dir), "watchdog": {"enabled": True},
+        }]}), encoding="utf-8")
+        snapshot = {
+            "project_id": "p1", "repo_path": str(self.repo_dir),
+            "lifecycle_state": "OWNER_GATE", "state": "OWNER_GATE",
+            "telemetry": {"task_id": "P14.5"}, "git": {"head": head, "dirty": False},
+            "activity": {"watchdog_safe": {
+                "last_activity_at": (now - _dt.timedelta(hours=2)).isoformat(),
+                "newest_kind": "agent_file", "newest_path": "agent/next.md", "sources": {},
+                "changed_entries_considered": 0, "repo_scope": "canonical", "repo_root_fingerprint": repo_fp,
+            }},
+        }
+        coordinator = WatchdogCoordinator(self.runtime_dir)
+        coordinator._cached_state["projects"]["p1"] = {
+            "recovery_epoch": {"id": "old", "evidence": {}},
+            "attempts": {"old-attempt": {"attempt_key": "old-attempt", "state": "completed"}},
+            "attempt_counts": {"old-scope": 20}, "recovery_slots": {"old-scope": "wd-old"},
+            "owner_gate": {"source": "watchdog", "reason": "old"}, "fence_generation": 0,
+        }
+        result = coordinator.advance(config_path, {"projects": [snapshot]}, now=now)
+        self.assertEqual(result[0]["status"], "ok")
+        preserved = coordinator.project_state("p1")
+        self.assertEqual(preserved["recovery_epoch"]["id"], "old")
+        self.assertIn("old-attempt", preserved["attempts"])
+        self.assertIsNotNone(preserved["owner_gate"])
+
 
 if __name__ == "__main__":
     unittest.main()
