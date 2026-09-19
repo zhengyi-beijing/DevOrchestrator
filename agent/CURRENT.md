@@ -5,31 +5,50 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P13.5 Canonical Dashboard Sidebar Migration** — **REMEDIATION COMPLETE / READY FOR TECHNICAL RE-REVIEW**.
+Current task: **P14 Remote Execution Resilience & Recoverable Jobs** — **IMPLEMENTATION COMPLETE / READY FOR TECHNICAL REVIEW**.
 
 Latest continuation state (2026-09-19):
-- Remediated Technical Review findings from `ai_review:retry:p135-review-retry-json-contract`:
-  1. Skip-Link Fragment View Preservation (`web/app.js`, `web/index.html`):
-     - Added pure `isKnownViewHash(rawHash)` returning true only for the 6 canonical view IDs and 4 legacy aliases; exported for unit testing.
-     - Updated `hashchange` listener in `initNavigation()` to ignore non-view fragments (e.g. `#mainContent`, in-page anchors, arbitrary hashes) instead of coercing them to `overview`, preserving the active view.
-     - Attached click listener to `.skip-link` calling `preventDefault()` and focusing `#mainContent` directly with `tabindex="-1"`. Added `tabindex="-1"` attribute to `<main id="mainContent">` in `web/index.html`.
-  2. Initial Activation Heading Focus (`web/app.js`):
-     - Updated `activateView(targetInput, options = {})` to make heading focus opt-in (`options.focusHeading` boolean). Defaults to false so initial/programmatic activation performs no focus move.
-     - In `initNavigation()`, initial activation passes `{ focusHeading: false }`, ensuring initial document focus is undisturbed and keyboard Tab order begins at `.skip-link` -> sidebar links -> header refresh button -> main content.
-     - User-initiated navigation (sidebar clicks and valid view `hashchange` events) passes `{ focusHeading: true }`, moving focus to target section heading for accessibility.
-  3. Reference Worktree Placement Reconciliation (`docs/P12_7_WEB_UI_DESIGN.md` Section 9.5):
-     - Documented the placement delta against reference worktree `C:\work\github\DevOrchestrator-dashboard-redesign`: the reference placed projects, events, and runs under Overview and bindings/command outcomes under Projects; the canonical architecture deliberately reconciled this into Overview (daemon/monitor health and project counts), Projects (project grid, orchestration queue, guarded project controls), Logs (events and runs timelines), and System (watchdog diagnostics, pairing, bindings, command outcomes) to maintain P12.7 first-viewport visibility and P12 mutation/read-only separation.
-  4. Regression Coverage (`tests_py/test_p135_sidebar_nav.py`):
-     - Updated `test_activator_toggles_sections_and_aria_current_with_zero_fetch` to assert initial activation without `focusHeading` does not focus heading, while user navigation with `focusHeading: true` does.
-     - Added `test_is_known_view_hash_identifies_views_aliases_and_rejects_non_view_fragments` testing canonical views, legacy aliases, and rejection of non-view fragments (`#mainContent`, `#kpis`, `#not-a-view`) and empty/falsy inputs.
-     - Added `test_navigation_initial_activation_no_focus_and_non_view_hash_preserves_view` verifying initial load performs no focus move, hash navigation focuses target heading, non-view fragment `#mainContent` preserves active view and steals no focus, arbitrary unknown fragments preserve active view, and skip-link click focuses `#mainContent` directly while preserving active view.
+- Implemented durable asynchronous execution job runtime beneath P13 ExecutionTransport boundary (`src/dev_orchestrator/jobs/`):
+  1. Six-State Machine & Identity (`jobs/models.py`):
+     - Explicit states: `queued`, `running`, `completed`, `failed`, `cancelled`, `unknown_recovery`.
+     - Deterministic `job_id_for(spec)` from project_id + idempotency_key, canonical `spec_hash` mirroring control command store, and deterministic `retry_successor_id(predecessor_id, retry_req_id)`.
+     - Legal transitions enforced by `VALID_TRANSITIONS` with rejections mapped to `failed` and explicit `failure_kind`.
+  2. Host-Local Trusted Configuration & Path Containment (`jobs/config.py`):
+     - Sole source of runtime root, per-project repo paths and command allowlists via `execution-jobs.json`.
+     - Absolute overrides, `..` traversal, and symlinks escaping `repo_path` rejected fail-closed with no execution.
+     - Remote helper resolves strictly from host-local sources (`DEVORCH_JOBS_CONFIG` or `~/.devorch/execution-jobs.json`), never wire-supplied paths.
+  3. Atomic Store & Write-Once Retry Intent (`jobs/store.py`):
+     - `ExecutionJobStore` manages `<runtime>/jobs/<job_id>/{job.json,heartbeat.json,log.ndjson,result.json}` plus `index.json`.
+     - `claim_or_get` idempotency with `InterProcessFileLock` and atomic fsync updates.
+     - `claim_retry(predecessor_id, retry_req_id)` records write-once successor intent under lock, returns identical successor on replay, raises `JobConflictError` on conflicting `retry_request_id`, and enforces at most one successor per predecessor.
+     - Corrupted records quarantined with degraded health reporting, and automatic index rebuild.
+  4. Bounded NDJSON Logs with Secret Redaction (`jobs/logs.py`):
+     - Append-only log with per-line and per-job byte caps, head+tail retention with explicit truncation markers, and torn-tail tolerance.
+     - Secret redaction (`control.logs.redact_secrets`) applied on every read and cursor/limit pagination.
+  5. Detached Supervisor Runtime (`jobs/supervisor.py`):
+     - Invoked via `python -m dev_orchestrator.jobs.supervisor --job-dir <dir>`.
+     - Single-instance per directory with PID and `start_token` fencing.
+     - Streams child process stdout/stderr into bounded NDJSON log, emits strictly increasing `heartbeat_sequence`, enforces `max_runtime_seconds`, and writes `result.json` write-once atomically.
+  6. Transports & Remote Boundaries (`jobs/transport.py`, `ai/remote_helper.py`):
+     - `LocalJobTransport` using `platform.process.spawn_detached`.
+     - `SSHJobTransport` reusing correlation and host-identity verification.
+     - `remote_helper.py` extended with closed operations (`job_start`, `job_status`, `job_logs`, `job_cancel`), accepting only closed correlation fields and failing closed on unknown fields, commands, or path assertion mismatches.
+  7. Service, Recovery, Watchdog & Accounting (`jobs/service.py`, `jobs/recovery.py`, `core/watchdog.py`, `daemon.py`):
+     - `JobService` provides idempotent `submit`, `status`, `logs`, `cancel`, `reconcile`, and `retry`.
+     - `JobRecoveryCoordinator` handles daemon startup sweep (`recover()`) and bounded per-tick sweep (`advance()`), re-driving stranded retry intent.
+     - Emits `managed_validation` accounting intervals keyed by job_id with idempotency marker.
+     - Watchdog collects clock-free durable progress signals from job records index, honoring `FINGERPRINT_FORBIDDEN`.
+  8. Operator Surfaces & Contract (`cli.py`, `web/server.py`, `docs/P14_DURABLE_JOBS_CONTRACT.md`):
+     - CLI commands: `jobs-list`, `job-status`, `job-logs`, `job-submit`, `job-cancel`, `job-retry` (requiring `--retry-request-id`), `job-reconcile`.
+     - Read-only control API: `GET /api/v1/control/jobs`, `GET /api/v1/control/jobs/{job_id}`, `GET /api/v1/control/jobs/{job_id}/logs` with bearer auth and secret redaction.
+     - Authoritative contract document in `docs/P14_DURABLE_JOBS_CONTRACT.md`.
 - Verification:
-  - Focused web & control regression passed: 75 passed, 11 subtests passed across 8 suites (`test_web_ui_refresh.py`, `test_p135_sidebar_nav.py`, `test_web.py`, `test_p12_control_actions.py`, `test_p12_control_foundation.py`, `test_unbound_web_ui.py`, `test_p127_closure_rereview.py`, `test_p13_web_bridge_adapter.py`).
-  - Web selftest script passed: `tests/web-selftest.ps1`: PASS.
-  - Full test suite passed: 747 passed, 45 subtests passed in 237.70s (`python -m pytest tests_py -q`).
-  - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
-  - Knowledge graph updated with `graphify update .` (3489 nodes, 9648 edges, 168 communities).
-- Immediate continuation rule: conduct independent technical re-review on clean worktree.
+  - Focused P14 suites passed: 30 passed in 5.53s (`test_p14_durable_jobs.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_job_recovery.py`, `test_p14_software_acceptance.py`).
+  - Adjacent regression passed: 104 passed, 10 subtests passed in 34.87s (`test_p13_execution_transport.py`, `test_p13_software_acceptance.py`, `test_p12_control_foundation.py`, `test_p12_control_actions.py`, `test_web.py`, `test_watchdog.py`, `test_watchdog_fingerprint.py`, `test_watchdog_self_exclusion.py`, `test_transition_executor_aibroker.py`, `test_cli.py`).
+  - Full test suite passed: 777 passed, 45 subtests passed in 255.07s (`python -m pytest tests_py -q`).
+  - Static checks: `python -m compileall -q src tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3767 nodes, 10498 edges, 173 communities).
+- Immediate continuation rule: conduct independent technical review on clean worktree.
 
 Implementation summary:
 - Added the opt-in `dev_orchestrator.accounting` package with a cross-thread/process serialized, fsynced JSONL event ledger; closed event/phase/role taxonomy; deterministic replay IDs; bounded corruption evidence; and explicit torn-tail quarantine/recovery.

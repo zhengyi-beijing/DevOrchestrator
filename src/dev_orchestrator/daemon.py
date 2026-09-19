@@ -39,6 +39,7 @@ from dev_orchestrator.core.watchdog import WatchdogCoordinator
 from dev_orchestrator.core.project_status import write_project_statuses
 from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.control.store import ConversationControlStore
+from dev_orchestrator.jobs.recovery import JobRecoveryCoordinator
 from dev_orchestrator.monitor.project import run_monitor_once
 from dev_orchestrator.storage.json_store import utc_now_iso, write_json, write_text
 from dev_orchestrator.web.server import make_server
@@ -81,7 +82,8 @@ def _run_orchestration_tick(
     config: Path | str, runtime: Path, bridge_store: BrowserBridgeStore,
     executor: TransitionExecutor, reviewer: AIReviewerCoordinator | None = None,
     controls: ControlCommandCoordinator | None = None,
-    watchdog: WatchdogCoordinator | None = None, *, pid: int,
+    watchdog: WatchdogCoordinator | None = None,
+    job_recovery: JobRecoveryCoordinator | None = None, *, pid: int,
 ) -> dict[str, Any]:
     """Run one ordered control-plane tick and return the projected summary."""
     watchdog_error: Optional[str] = None
@@ -144,6 +146,11 @@ def _run_orchestration_tick(
         except Exception as _wd_exc:
             watchdog.record_tick_error(_wd_exc)
             watchdog_error = str(_wd_exc)
+    if job_recovery is not None:
+        try:
+            job_recovery.advance()
+        except Exception:
+            pass
     write_project_statuses(projected, runtime, phase="actuation", daemon_state="running", pid=pid)
     write_json(runtime / "summary.json", projected)
     if watchdog_error is not None:
@@ -264,13 +271,21 @@ def run_daemon(
     watchdog_coordinator = WatchdogCoordinator(
         runtime, ai_execution_port=ai_execution_port, progress_channel=progress_channel
     )
+    job_recovery_coordinator = JobRecoveryCoordinator(
+        runtime, accounting=accounting
+    )
+    try:
+        job_recovery_coordinator.recover()
+    except Exception:
+        pass
     try:
         while True:
             last_error: Optional[str] = None
             try:
                 tick_result = _run_orchestration_tick(
                     config, runtime, bridge_store, transition_executor, reviewer_coordinator,
-                    control_coordinator, watchdog=watchdog_coordinator, pid=pid
+                    control_coordinator, watchdog=watchdog_coordinator,
+                    job_recovery=job_recovery_coordinator, pid=pid
                 )
                 if isinstance(tick_result, dict) and tick_result.get("_watchdog_tick_error"):
                     last_error = str(tick_result["_watchdog_tick_error"])

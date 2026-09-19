@@ -61,6 +61,8 @@ _STATIC = {
 _PROJECT_PATH_RE = re.compile(r"^/api/projects/([A-Za-z0-9_-]+)$")
 _CONTROL_PROJECT_PATH_RE = re.compile(r"^/api/v1/control/projects/([A-Za-z0-9_-]+)$")
 _CONTROL_COMMAND_PATH_RE = re.compile(r"^/api/v1/control/commands/([A-Za-z0-9_-]+)$")
+_CONTROL_JOB_LOGS_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)/logs$")
+_CONTROL_JOB_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)$")
 _PAIRING_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/adapter-pairings/([A-Za-z0-9_-]+)/revoke$")
 _CAPABILITY_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/web-bridge-capabilities/([A-Za-z0-9_-]+)/revoke$")
 
@@ -664,6 +666,45 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 payload = build_control_logs(runtime, parsed.query)
             except ValueError as exc:
                 self._error(400, "Bad Request", str(exc), head_only); return
+        elif path == "/api/v1/control/jobs":
+            if not self._owner_authorized():
+                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            from dev_orchestrator.jobs.store import ExecutionJobStore
+            store = ExecutionJobStore(runtime)
+            qs = parse_qs(parsed.query)
+            proj_filter = qs.get("project_id", [None])[0]
+            jobs_list = store.list(project_id=proj_filter)
+            payload = _control_envelope(jobs_list, sources=[{"name": "execution_jobs", "availability": "available"}])
+        elif path.startswith("/api/v1/control/jobs/"):
+            match_logs = _CONTROL_JOB_LOGS_PATH_RE.fullmatch(path)
+            if match_logs:
+                if not self._owner_authorized():
+                    self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+                from dev_orchestrator.jobs.store import ExecutionJobStore
+                from dev_orchestrator.jobs.logs import BoundedNDJSONLog
+                store = ExecutionJobStore(runtime)
+                job_id = match_logs.group(1)
+                if store.get(job_id) is None:
+                    self._error(404, "Not Found", "job not found", head_only); return
+                qs = parse_qs(parsed.query)
+                cursor = int(qs.get("cursor", [0])[0])
+                limit = int(qs.get("limit", [100])[0])
+                log_reader = BoundedNDJSONLog(store._job_dir(job_id) / "log.ndjson")
+                logs_data = log_reader.read_paginated(cursor=cursor, limit=limit)
+                payload = _control_envelope(logs_data, sources=[{"name": "job_logs", "availability": "available"}])
+            else:
+                match_job = _CONTROL_JOB_PATH_RE.fullmatch(path)
+                if not match_job:
+                    self._error(404, "Not Found", "route not found", head_only); return
+                if not self._owner_authorized():
+                    self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+                from dev_orchestrator.jobs.store import ExecutionJobStore
+                store = ExecutionJobStore(runtime)
+                job_id = match_job.group(1)
+                rec = store.get(job_id)
+                if rec is None:
+                    self._error(404, "Not Found", "job not found", head_only); return
+                payload = _control_envelope(rec.to_dict(), sources=[{"name": "execution_jobs", "availability": "available"}])
 
         elif path == "/api/monitor":
             payload = monitor_payload(runtime)

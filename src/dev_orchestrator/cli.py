@@ -984,6 +984,101 @@ def cmd_stop_daemon(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# execution jobs commands
+# --------------------------------------------------------------------------
+
+def cmd_jobs_list(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.jobs.service import JobService
+    service = JobService(runtime)
+    jobs = service.store.list(project_id=args.project_id)
+    sys.stdout.write(json.dumps(jobs, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_job_status(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.jobs.service import JobService
+    service = JobService(runtime)
+    rec = service.status(args.job_id)
+    if rec is None:
+        raise CliError(f"job {args.job_id} not found")
+    sys.stdout.write(json.dumps(rec.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_job_logs(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.jobs.service import JobService
+    service = JobService(runtime)
+    try:
+        data = service.logs(args.job_id, cursor=args.cursor, limit=args.limit)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_job_submit(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.jobs.models import JobSpec
+    from dev_orchestrator.jobs.service import JobService
+    service = JobService(runtime)
+    spec = JobSpec(
+        project_id=args.project_id,
+        command_ref=args.command_ref,
+        idempotency_key=args.idempotency_key,
+        kind=getattr(args, "kind", "validation") or "validation",
+        transport=getattr(args, "transport", "local") or "local",
+        expected_working_directory=getattr(args, "expected_working_directory", None),
+    )
+    try:
+        rec = service.submit(spec)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(rec.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_job_cancel(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.jobs.service import JobService
+    service = JobService(runtime)
+    try:
+        rec = service.cancel(args.job_id, reason=args.reason or "cancelled")
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(rec.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_job_retry(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    if not getattr(args, "retry_request_id", None):
+        raise CliError("--retry-request-id is required")
+    from dev_orchestrator.jobs.service import JobService
+    service = JobService(runtime)
+    try:
+        rec = service.retry(args.job_id, args.retry_request_id)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(rec.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_job_reconcile(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.jobs.service import JobService
+    service = JobService(runtime)
+    try:
+        rec = service.reconcile(args.job_id)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(rec.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
 
@@ -1197,6 +1292,43 @@ def build_parser() -> argparse.ArgumentParser:
     stop_daemon = sub.add_parser("stop-daemon", help="stop the recorded unified daemon process")
     stop_daemon.add_argument("--runtime-root", default=None)
 
+    jobs_list = sub.add_parser("jobs-list", help="list execution jobs")
+    jobs_list.add_argument("--project-id", default=None, help="optional project id filter")
+    jobs_list.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    job_status = sub.add_parser("job-status", help="get execution job status")
+    job_status.add_argument("job_id", help="job ID")
+    job_status.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    job_logs = sub.add_parser("job-logs", help="read paginated execution job logs")
+    job_logs.add_argument("job_id", help="job ID")
+    job_logs.add_argument("--cursor", type=int, default=0, help="cursor offset")
+    job_logs.add_argument("--limit", type=int, default=100, help="maximum log lines to return")
+    job_logs.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    job_submit = sub.add_parser("job-submit", help="submit a durable execution job")
+    job_submit.add_argument("--project-id", required=True, help="project ID")
+    job_submit.add_argument("--command-ref", required=True, help="command reference from execution-jobs.json")
+    job_submit.add_argument("--idempotency-key", required=True, help="idempotency key")
+    job_submit.add_argument("--kind", default="validation", help="job kind (default: validation)")
+    job_submit.add_argument("--transport", choices=("local", "ssh"), default="local", help="execution transport")
+    job_submit.add_argument("--expected-working-directory", default=None, help="expected working directory assertion")
+    job_submit.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    job_cancel = sub.add_parser("job-cancel", help="cancel an active execution job")
+    job_cancel.add_argument("job_id", help="job ID")
+    job_cancel.add_argument("--reason", default="cancelled", help="cancellation reason")
+    job_cancel.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    job_retry = sub.add_parser("job-retry", help="retry a terminal or recovery-safe execution job")
+    job_retry.add_argument("job_id", help="job ID to retry")
+    job_retry.add_argument("--retry-request-id", required=True, help="stable caller-provided retry request ID")
+    job_retry.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    job_reconcile = sub.add_parser("job-reconcile", help="reconcile an ambiguous or interrupted execution job")
+    job_reconcile.add_argument("job_id", help="job ID to reconcile")
+    job_reconcile.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     return parser
 
 
@@ -1214,6 +1346,13 @@ _COMMANDS = {
     "revoke-web-bridge-capability": cmd_revoke_web_bridge_capability,
     "import-rdc-evidence": cmd_import_rdc_evidence,
     "execution-report": cmd_execution_report,
+    "jobs-list": cmd_jobs_list,
+    "job-status": cmd_job_status,
+    "job-logs": cmd_job_logs,
+    "job-submit": cmd_job_submit,
+    "job-cancel": cmd_job_cancel,
+    "job-retry": cmd_job_retry,
+    "job-reconcile": cmd_job_reconcile,
     "monitor": cmd_monitor,
     "web": cmd_web,
     "daemon": cmd_daemon,

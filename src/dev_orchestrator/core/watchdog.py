@@ -100,6 +100,7 @@ FINGERPRINT_FIELDS = frozenset({
     "changed_entries_considered",
     "role_records",
     "progress_entry",
+    "job_records",
 })
 
 FINGERPRINT_FORBIDDEN = frozenset({
@@ -520,8 +521,38 @@ def collect_progress_signals(
                             }
                             latest_progress_timestamp = _latest_timestamp_value((latest_progress_timestamp, ts))
 
+    # Job records (from jobs/index.json if runtime_root is provided)
+    job_records_summary: Optional[dict[str, Any]] = None
+    latest_job_timestamp: Optional[str] = None
+    if runtime_root is not None:
+        jobs_index_file = Path(runtime_root) / "jobs" / "index.json"
+        if jobs_index_file.is_file():
+            jobs_index_data = read_json(jobs_index_file, {})
+            if isinstance(jobs_index_data, dict):
+                raw_jobs = jobs_index_data.get("jobs", {})
+                if isinstance(raw_jobs, dict):
+                    for jdata in raw_jobs.values():
+                        if not isinstance(jdata, dict) or str(jdata.get("project_id") or "") != project_id:
+                            continue
+                        jid = str(jdata.get("job_id") or "")
+                        if jid.startswith("wd-") or jdata.get("source") == "watchdog" or str(jdata.get("command_ref") or "").startswith("wd-"):
+                            continue
+                        ts = (
+                            jdata.get("finished_at")
+                            or jdata.get("started_at")
+                            or jdata.get("updated_at")
+                            or jdata.get("created_at")
+                        )
+                        if ts and jid:
+                            if job_records_summary is None or _timestamp_is_newer(ts, job_records_summary.get("timestamp")):
+                                job_records_summary = {
+                                    "id": str(jid),
+                                    "timestamp": str(ts),
+                                }
+                                latest_job_timestamp = _latest_timestamp_value((latest_job_timestamp, ts))
+
     # Determine latest durable progress timestamp
-    last_progress_at = _latest_timestamp_value((safe_last_activity, latest_role_timestamp, latest_progress_timestamp))
+    last_progress_at = _latest_timestamp_value((safe_last_activity, latest_role_timestamp, latest_progress_timestamp, latest_job_timestamp))
 
     # Assemble fingerprint payload strictly from allowlisted fields
     sources_summary: dict[str, Any] = {}
@@ -542,6 +573,7 @@ def collect_progress_signals(
         "changed_entries_considered": changed_considered,
         "role_records": role_records_summary,
         "progress_entry": progress_summary,
+        "job_records": job_records_summary,
     }
 
     progress_fingerprint = build_progress_fingerprint(fingerprint_payload)

@@ -96,6 +96,119 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
     if not operation or not req_id:
         raise ValueError("operation and request_id are required")
 
+    _JOB_OPERATIONS = frozenset({"job_start", "job_status", "job_logs", "job_cancel"})
+    if operation in _JOB_OPERATIONS:
+        _ALLOWED_JOB_FIELDS = frozenset({
+            "operation",
+            "request_id",
+            "job_id",
+            "project_id",
+            "command_ref",
+            "idempotency_key",
+            "cursor",
+            "limit",
+            "reason",
+            "expected_working_directory",
+        })
+        unknown = sorted(set(req.keys()) - _ALLOWED_JOB_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown fields in remote job request: {unknown}")
+
+        from dev_orchestrator.jobs.config import (
+            load_jobs_config,
+            resolve_remote_jobs_config_path,
+            validate_and_resolve_execution,
+        )
+        from dev_orchestrator.jobs.models import JobRecord, JobSpec, job_id_for
+        from dev_orchestrator.jobs.store import ExecutionJobStore
+        from dev_orchestrator.jobs.transport import LocalJobTransport
+        from dev_orchestrator.storage.json_store import utc_now_iso
+
+        cfg_path = resolve_remote_jobs_config_path()
+        jobs_cfg = load_jobs_config(cfg_path)
+        if jobs_cfg is None:
+            raise RuntimeError(f"host-local jobs configuration absent or disabled at {cfg_path}")
+
+        store = ExecutionJobStore(jobs_cfg.runtime_root)
+        local_transport = LocalJobTransport()
+
+        if operation == "job_start":
+            proj_id = req.get("project_id")
+            cmd_ref = req.get("command_ref")
+            if not proj_id or not cmd_ref:
+                raise ValueError("project_id and command_ref are required for job_start")
+            expected_cwd = req.get("expected_working_directory")
+            ok, failure_kind, resolved_cwd, cmd_cfg = validate_and_resolve_execution(
+                jobs_cfg, proj_id, cmd_ref, expected_working_directory=expected_cwd
+            )
+            if not ok:
+                raise ValueError(f"execution validation failed: {failure_kind}")
+
+            idem_key = req.get("idempotency_key") or req.get("job_id")
+            if not idem_key:
+                raise ValueError("job_id or idempotency_key is required")
+            spec = JobSpec(
+                project_id=proj_id,
+                command_ref=cmd_ref,
+                idempotency_key=str(idem_key),
+                expected_working_directory=expected_cwd,
+            )
+            target_job_id = req.get("job_id") or job_id_for(spec)
+
+            def _factory(jid: str, shash: str) -> JobRecord:
+                now = utc_now_iso()
+                return JobRecord(
+                    job_id=jid,
+                    idempotency_key=spec.idempotency_key,
+                    spec_hash=shash,
+                    kind=spec.kind,
+                    project_id=spec.project_id,
+                    command_ref=spec.command_ref,
+                    resolved_argv=cmd_cfg.argv,
+                    working_directory=str(resolved_cwd),
+                    transport="local",
+                    host_identity=socket.gethostname(),
+                    duration_class=cmd_cfg.duration_class,
+                    state="queued",
+                    timestamps={"created_at": now, "queued_at": now, "updated_at": now},
+                )
+
+            record, is_new = store.claim_or_get(spec, _factory)
+            if is_new or record.state == "queued":
+                start_res = local_transport.job_start(spec, store._job_dir(target_job_id))
+                sup_pid = start_res.get("supervisor_pid") if isinstance(start_res, dict) else None
+                if isinstance(sup_pid, int) and sup_pid > 0:
+                    def _record_pid(rec: JobRecord) -> None:
+                        rec.supervisor["pid"] = sup_pid
+                    store.update(record.job_id, _record_pid)
+                return start_res
+            return {
+                "job_id": record.job_id,
+                "status": record.state,
+                "already_exists": True,
+            }
+
+        if operation == "job_status":
+            job_id = req.get("job_id")
+            if not job_id:
+                raise ValueError("job_id is required for job_status")
+            return local_transport.job_status(job_id, store._job_dir(job_id))
+
+        if operation == "job_logs":
+            job_id = req.get("job_id")
+            if not job_id:
+                raise ValueError("job_id is required for job_logs")
+            cursor = int(req.get("cursor") or 0)
+            limit = int(req.get("limit") or 100)
+            return local_transport.job_logs(job_id, store._job_dir(job_id), cursor=cursor, limit=limit)
+
+        if operation == "job_cancel":
+            job_id = req.get("job_id")
+            if not job_id:
+                raise ValueError("job_id is required for job_cancel")
+            reason = str(req.get("reason") or "cancelled")
+            return local_transport.job_cancel(job_id, store._job_dir(job_id), reason=reason)
+
     broker_repo = req.get("broker_repo")
     config_path = req.get("config_path")
     database_path = req.get("database_path")

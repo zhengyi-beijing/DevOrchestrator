@@ -688,3 +688,48 @@ P10 R8 Bounded Remediation (two high-severity blockers closed):
   - Python compilation (`compileall`), node syntax checks (`web/app.js`, `browser/chatgpt-web-adapter.user.js`), and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (3489 nodes, 9648 edges, 168 communities).
   - Canonical worktree clean and ready for independent technical re-review.
+
+## P14 Remote Execution Resilience & Recoverable Jobs (2026-09-19)
+
+- Implemented durable asynchronous execution job runtime beneath P13 ExecutionTransport boundary (`src/dev_orchestrator/jobs/`):
+  1. Six-State Machine & Identity (`jobs/models.py`):
+     - Explicit states: `queued`, `running`, `completed`, `failed`, `cancelled`, `unknown_recovery`.
+     - Deterministic `job_id_for(spec)` from project_id + idempotency_key, canonical `spec_hash` mirroring control command store, and deterministic `retry_successor_id(predecessor_id, retry_req_id)`.
+     - Legal transitions enforced by `VALID_TRANSITIONS` with rejections mapped to `failed` and explicit `failure_kind`.
+  2. Host-Local Trusted Configuration & Path Containment (`jobs/config.py`):
+     - Sole source of runtime root, per-project repo paths and command allowlists via `execution-jobs.json`.
+     - Absolute overrides, `..` traversal, and symlinks escaping `repo_path` rejected fail-closed with no execution.
+     - Remote helper resolves strictly from host-local sources (`DEVORCH_JOBS_CONFIG` or `~/.devorch/execution-jobs.json`), never wire-supplied paths.
+  3. Atomic Store & Write-Once Retry Intent (`jobs/store.py`):
+     - `ExecutionJobStore` manages `<runtime>/jobs/<job_id>/{job.json,heartbeat.json,log.ndjson,result.json}` plus `index.json`.
+     - `claim_or_get` idempotency with `InterProcessFileLock` and atomic fsync updates.
+     - `claim_retry(predecessor_id, retry_req_id)` records write-once successor intent under lock, returns identical successor on replay, raises `JobConflictError` on conflicting `retry_request_id`, and enforces at most one successor per predecessor.
+     - Corrupted records quarantined with degraded health reporting, and automatic index rebuild.
+  4. Bounded NDJSON Logs with Secret Redaction (`jobs/logs.py`):
+     - Append-only log with per-line and per-job byte caps, head+tail retention with explicit truncation markers, and torn-tail tolerance.
+     - Secret redaction (`control.logs.redact_secrets`) applied on every read and cursor/limit pagination.
+  5. Detached Supervisor Runtime (`jobs/supervisor.py`):
+     - Invoked via `python -m dev_orchestrator.jobs.supervisor --job-dir <dir>`.
+     - Single-instance per directory with PID and `start_token` fencing.
+     - Streams child process stdout/stderr into bounded NDJSON log, emits strictly increasing `heartbeat_sequence`, enforces `max_runtime_seconds`, and writes `result.json` write-once atomically.
+  6. Transports & Remote Boundaries (`jobs/transport.py`, `ai/remote_helper.py`):
+     - `LocalJobTransport` using `platform.process.spawn_detached`.
+     - `SSHJobTransport` reusing correlation and host-identity verification.
+     - `remote_helper.py` extended with closed operations (`job_start`, `job_status`, `job_logs`, `job_cancel`), accepting only closed correlation fields and failing closed on unknown fields, commands, or path assertion mismatches.
+  7. Service, Recovery, Watchdog & Accounting (`jobs/service.py`, `jobs/recovery.py`, `core/watchdog.py`, `daemon.py`):
+     - `JobService` provides idempotent `submit`, `status`, `logs`, `cancel`, `reconcile`, and `retry`.
+     - `JobRecoveryCoordinator` handles daemon startup sweep (`recover()`) and bounded per-tick sweep (`advance()`), re-driving stranded retry intent.
+     - Emits `managed_validation` accounting intervals keyed by job_id with idempotency marker.
+     - Watchdog collects clock-free durable progress signals from job records index, honoring `FINGERPRINT_FORBIDDEN`.
+  8. Operator Surfaces & Contract (`cli.py`, `web/server.py`, `docs/P14_DURABLE_JOBS_CONTRACT.md`):
+     - CLI commands: `jobs-list`, `job-status`, `job-logs`, `job-submit`, `job-cancel`, `job-retry` (requiring `--retry-request-id`), `job-reconcile`.
+     - Read-only control API: `GET /api/v1/control/jobs`, `GET /api/v1/control/jobs/{job_id}`, `GET /api/v1/control/jobs/{job_id}/logs` with bearer auth and secret redaction.
+     - Authoritative contract document in `docs/P14_DURABLE_JOBS_CONTRACT.md`.
+- Verification:
+  - Focused P14 suites passed: 30 passed in 5.53s (`test_p14_durable_jobs.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_job_recovery.py`, `test_p14_software_acceptance.py`).
+  - Adjacent regression passed: 104 passed, 10 subtests passed in 34.87s (`test_p13_execution_transport.py`, `test_p13_software_acceptance.py`, `test_p12_control_foundation.py`, `test_p12_control_actions.py`, `test_web.py`, `test_watchdog.py`, `test_watchdog_fingerprint.py`, `test_watchdog_self_exclusion.py`, `test_transition_executor_aibroker.py`, `test_cli.py`).
+  - Full test suite passed: 777 passed, 45 subtests passed in 255.07s (`python -m pytest tests_py -q`).
+  - Static checks: `python -m compileall -q src tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
+  - Knowledge graph updated with `graphify update .` (3767 nodes, 10498 edges, 173 communities).
+- Canonical worktree clean and ready for independent technical review.
+
