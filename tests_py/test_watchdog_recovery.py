@@ -2486,15 +2486,14 @@ class WatchdogRecoveryTests(unittest.TestCase):
         self.assertNotIn("old-attempt", row["attempts"])
         self.assertNotIn("old-scope", row["attempt_counts"])
         self.assertEqual(sum(row["attempt_counts"].values()), 1)
-        self.assertEqual(row["recovery_slots"], {})
+        self.assertEqual(len(row["recovery_slots"]), 1)
         self.assertIsNone(row["owner_gate"])
         self.assertNotEqual(row["recovery_epoch"]["id"], "historical-epoch")
         self.assertEqual(row["last_diagnosis"], "ready_to_run_unlaunched")
 
-        # The next tick uses the normal two-phase recovery path, yielding a
-        # fully guarded control command instead of mutating lifecycle state.
-        second = coordinator.advance(config_path, {"projects": [snapshot]}, now=now)
-        self.assertEqual(second[0]["status"], "deduplicated")
+        # Exact live-shape regression: a completed, high-confidence READY_TO_RUN
+        # diagnosis must submit the normal guarded control command before its
+        # cooldown can hide the launch gap.  It does not mutate lifecycle state.
         attempt = next(iter(coordinator.project_state("p1")["attempts"].values()))
         self.assertEqual(attempt["diagnosis"], "ready_to_run_unlaunched")
         self.assertEqual(attempt["recovery"]["state"], "requested")

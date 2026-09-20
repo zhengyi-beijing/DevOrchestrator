@@ -1674,6 +1674,20 @@ class WatchdogCoordinator:
             prow["last_diagnosis"] = diagnosis.code
             prow["last_evidence_hash"] = diagnosis.evidence_hash
 
+            # A READY_TO_RUN launch-gap diagnosis is an explicit, high-confidence
+            # recommendation to submit the existing guarded ``continue`` path.
+            # Submit it while the completed diagnostic is still current, before
+            # arming cooldown.  This does not launch a Worker directly:
+            # _check_and_trigger_recovery writes the normal two-phase control
+            # command, whose consumer revalidates the complete identity (including
+            # current owner-gate, pause, repository, and active-execution facts)
+            # before it can actuate.  Other diagnoses retain FR-1's deferred
+            # actuation because their liveness bindings depend on a fresh tick.
+            if diagnosis.code == "ready_to_run_unlaunched":
+                self._check_and_trigger_recovery(
+                    project_config, snapshot, prow, attempt_key, att,
+                )
+
             # Increment attempt counts for run_scope_key
             counts = prow.setdefault("attempt_counts", {})
             counts[assessment.run_scope_key] = int(counts.get(assessment.run_scope_key, 0)) + 1
@@ -1697,12 +1711,9 @@ class WatchdogCoordinator:
                 },
             )
 
-            # FR-1: Recovery actuation is deferred to the next watchdog advance tick,
-            # where it uses the latest projected snapshot via the dedup path.  Calling
-            # _check_and_trigger_recovery here — with the snapshot captured at diagnostic
-            # start — risks acting on a stale lifecycle, run_scope_key, or worker identity
-            # if the project transitioned (e.g. EXECUTING → PLANNING/REVIEWING) while the
-            # diagnostic was running.  The next advance() will call it with fresh state.
+            # FR-1: diagnoses other than the guarded READY_TO_RUN launch gap defer
+            # recovery actuation to the next watchdog advance tick, where it uses
+            # the latest projected snapshot.
             self._save_state(self._cached_state)
 
     def _check_and_trigger_recovery(
