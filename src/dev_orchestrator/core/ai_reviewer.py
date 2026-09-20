@@ -1745,7 +1745,10 @@ class AIReviewerCoordinator:
                 details={"review_id": review_id, "worker_source_request_id": source_request_id},
             )
 
-    def _record_terminal(self, review_id: str, project_id: str, source_request_id: str, state_name: str, reason: str) -> None:
+    def _record_terminal(
+        self, review_id: str, project_id: str, source_request_id: str,
+        state_name: str, reason: str, **kwargs: Any,
+    ) -> None:
         with self._lock:
             state = self._load_state()
             state["reviews"].setdefault(review_id, {
@@ -1754,6 +1757,7 @@ class AIReviewerCoordinator:
             })
             state["reviews"][review_id].update({
                 "state": state_name, "reason": reason, "completed_at": utc_now_iso(),
+                **kwargs,
             })
             self._save_state(state)
 
@@ -1871,9 +1875,13 @@ class AIReviewerCoordinator:
                         request_id=current_request.request_id,
                         source_request_id=source_request_id or None,
                     )
+                extra_terminal: dict[str, Any] = {}
+                if failed_resource_ids:
+                    extra_terminal["failover_from_resource_ids"] = sorted(failed_resource_ids)
                 self._record_terminal(
                     review_id, request.project_id, source_request_id, "failed",
                     f"reviewer lifecycle error: {exc}",
+                    **extra_terminal,
                 )
                 return
 
@@ -1929,7 +1937,10 @@ class AIReviewerCoordinator:
                     if can_failover
                     else (result.error or f"reviewer_{result.status}")
                 )
-                self._finish_result(review_id, result, "failed", fail_reason)
+                extra_failed: dict[str, Any] = {}
+                if failed_resource_ids:
+                    extra_failed["failover_from_resource_ids"] = sorted(failed_resource_ids)
+                self._finish_result(review_id, result, "failed", fail_reason, **extra_failed)
                 return
 
             break

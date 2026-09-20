@@ -2435,13 +2435,44 @@ class TransitionExecutor:
                 if reviewer_enabled:
                     worker_completed = any(
                         rec.get("project_id") == project_id
-                        and rec.get("task_id") == current_task
+                        and (rec.get("task_id") == current_task or rec.get("source_task_id") == current_task)
                         and rec.get("state") == "completed"
-                        and rec.get("head") == truth.head
                         for rec in ledger["executions"].values()
                         if isinstance(rec, dict)
                     )
-                    if worker_completed or snapshot.get("state") in ("WAITING_REVIEW", "REVIEWING"):
+                    reviews_raw = read_json(self.runtime_root / "ai-reviewer.json", {})
+                    reviews_dict = reviews_raw.get("reviews") if isinstance(reviews_raw, dict) else None
+                    reviews = reviews_dict if isinstance(reviews_dict, dict) else {}
+                    task_completed_workers = {
+                        str(rec.get("source_request_id") or rec.get("request_id") or "")
+                        for rec in ledger["executions"].values()
+                        if isinstance(rec, dict)
+                        and rec.get("project_id") == project_id
+                        and (rec.get("task_id") == current_task or rec.get("source_task_id") == current_task)
+                    } - {""}
+                    review_in_flight_or_pending = any(
+                        isinstance(r, dict)
+                        and str(r.get("project_id") or "") == project_id
+                        and (
+                            str(r.get("task_id") or "") == current_task
+                            or str(r.get("source_request_id") or "") in task_completed_workers
+                            or (
+                                str(r.get("review_id") or "").startswith("ai_review:")
+                                and str(r.get("review_id") or "")[len("ai_review:"):] in task_completed_workers
+                            )
+                        )
+                        and (
+                            r.get("state") in ("launching", "running")
+                            or (r.get("state") == "completed" and not r.get("decision"))
+                        )
+                        for r in reviews.values()
+                    )
+                    if (
+                        worker_completed
+                        or review_in_flight_or_pending
+                        or snapshot.get("state") in ("WAITING_REVIEW", "REVIEWING")
+                        or snapshot.get("lifecycle_state") in ("WAITING_REVIEW", "REVIEWING")
+                    ):
                         continue
             if rm_res.kind == "successor":
                 request_id = f"auto-handoff:{current_task}:{truth.head[:12]}"

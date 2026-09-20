@@ -7,15 +7,20 @@
 
 Current task: **P15 Mobile Observability & Guarded Control** — **PENDING DESIGN**.
 
-P14.6 Unattended Execution Stabilization Gate closure (2026-09-20):
-- Implemented and closed all unattended execution stabilization gates:
+P14.6 Technical Review Remediation & Gate closure (2026-09-20):
+- Remediated all Technical Review findings from ai_review:p146-owner-continue-20260920:
+  1. Blocker closed: Hardened `TransitionExecutor._advance_completed_predecessor_handoffs` against premature predecessor promotion bypassing technical review. When reviewer is enabled, auto-handoff is safely blocked if worker has completed on the task, if review is pending or in flight (`runtime/ai-reviewer.json`), or if snapshot lifecycle state is WAITING_REVIEW/REVIEWING. Predecessor handoff is only created after technical review produces an accepted decision (`next` / `next_task`).
+  2. AC-2 demonstrated: Upgraded `test_recovery_epoch_cross_component_agreement` with a discriminating fixture that verifies both an empty baseline and an active scenario with active plan, active review, active execution, and active control request where `WatchdogCoordinator.advance` ticks; all 5 components (`resolve_recovery_epoch`, `_watchdog_view`, `project_runtime_status`, `build_project_status`, `project_control_view`) produce identical epoch IDs and fully populated, non-trivial evidence dictionaries. Sensitivity verified via mutation.
+  3. AC-1 / AC-5 demonstrated: Added `test_end_to_end_unattended_multi_task_with_failure_injection_and_failover` qualifying full unattended multi-task lifecycle with failure injection: Worker quota failover -> Reviewer rate-limit failover -> Remediation worker -> Re-review accept -> Auto-handoff -> Planner plan & plan review -> Unlaunched ready launch.
+  4. Non-blocking closed: Fixed reviewer failover exhaustion exception path in `src/dev_orchestrator/core/ai_reviewer.py` (`_record_terminal` and `_finish_result`) to capture and persist `failover_from_resource_ids`.
+- Implemented and verified all unattended execution stabilization gates:
   1. Planner protocol normalization & schema repair pipeline: Raw Capture -> JSON Extract -> Normalize -> Schema Validate -> Semantic Validate -> Reviewer. Bounded single-cycle schema repair without consuming semantic failure budget. Ambiguous JSON objects fail closed.
   2. Reviewer & Worker resource failover: retries on ROLE_RESOURCE_FAILURES (quota_exhausted, rate_limited, provider_temporarily_unavailable, resource_unavailable) on alternative resources (:failover-{attempt}, tracking failover_from_resource_ids). Preserves semantic remediation budget. Worker enforces clean repository check before failover, refusing failover safely on dirty repo.
   3. Recovery epoch agreement: synchronized resolve_recovery_epoch, project_runtime_status, build_project_status, _watchdog_view, and project_control_view. Watchdog, runtime status, monitor, and control overview all compute matching recovery epoch dictionaries and SHA256 hashes.
   4. Closed-loop unattended promotion: _advance_completed_predecessor_handoffs creates automatic handoffs for completed predecessors with roadmap successors, deduplicated against active decisions/handoffs/reviews. _advance_unlaunched_ready automatically launches unlaunched READY_TO_RUN tasks without human intervention.
-  5. Acceptance suite: tests_py/test_p14_6_unattended_gate.py (6 passed in 4.63s).
-  6. Verification: focused/adjacent suites (100 passed + 15 subtests, 73 passed + 8 subtests, 24 passed), full regression 895 passed + 87 subtests in 302.78s; compileall and git diff --check passed cleanly. Graphify updated.
-- Next task: P15 Mobile Observability & Guarded Control (Status: **PENDING DESIGN**).
+  5. Acceptance suite: tests_py/test_p14_6_unattended_gate.py (8 passed in 10.44s).
+  6. Verification: focused/adjacent suites (106 passed + 5 subtests passed), full regression 897 passed + 87 subtests in 310.28s; compileall, git diff --check, and graphify update all passed cleanly.
+- Preserved handoff: P15 Mobile Observability & Guarded Control (Status: **PENDING DESIGN**).
 
 
 Watchdog recovery-epoch cleanup closure (2026-09-20):
