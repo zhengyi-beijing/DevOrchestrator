@@ -273,6 +273,17 @@ def build_project_status(
     decision = _latest_decision(runtime, project_id)
     dispatch = _latest_dispatch(runtime, project_id)
     actuation = _latest_actuation(runtime, project_id)
+    current_task_id = str(telemetry.get("task_id") or "").strip() or None
+    if actuation is not None:
+        actuation_task_id = str(actuation.get("task_id") or "").strip() or None
+        if (
+            current_task_id is not None
+            and actuation_task_id is not None
+            and current_task_id != actuation_task_id
+        ):
+            # Historical actuation remains in transition-executor.json for audit,
+            # but must not be presented as the current task's actuation.
+            actuation = None
     web_sol = None
     if decision is not None:
         web_sol = {

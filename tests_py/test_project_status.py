@@ -85,6 +85,35 @@ class ProjectStatusTests(unittest.TestCase):
             self.assertFalse(status["worker"]["process_alive"])
             self.assertEqual(status["actuation"]["exit_code"], 0)
 
+    def test_project_status_hides_historical_actuation_from_previous_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            head = make_repo(repo); runtime.mkdir()
+            (runtime / "transition-executor.json").write_text(json.dumps({
+                "version": 1,
+                "executions": {"old-p145": {
+                    "project_id": "p1", "source_request_id": "old-p145",
+                    "source_kind": "remediation", "task_id": "P14.5",
+                    "backend_id": "aibroker", "state": "failed",
+                    "started_at": "2026-09-20T02:14:42+00:00",
+                    "completed_at": "2026-09-20T02:38:27+00:00",
+                }},
+            }), encoding="utf-8")
+            snapshot = {
+                "project_id": "p1", "repo_path": str(repo), "state": "IDLE",
+                "orchestration_ready": True,
+                "next_title": "NEXT — P14.6 Unattended Execution Stabilization Gate",
+                "telemetry": {"task_id": "P14.6", "run_id": None},
+                "worker": {"kind": "none", "state": "not_started", "process_alive": False},
+                "git": {"branch": "master", "head": head, "dirty": False, "changed_entries": 0},
+            }
+            target = write_project_status(
+                snapshot, runtime, phase="actuation", daemon_state="running", pid=123
+            )
+            status = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(status["task_id"], "P14.6")
+            self.assertIsNone(status["actuation"])
+
     def test_web_sol_decision_and_disposition_are_distinct(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"
