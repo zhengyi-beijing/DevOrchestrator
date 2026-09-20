@@ -1,0 +1,77 @@
+{
+  "name": "DevOrchestrator core correctness rules",
+  "version": "0.1.0-draft",
+  "description": "Rules derived from the seven blocking defects confirmed during P14.5 (B1, B2, F1, F2, G1, G2, H1, H2, H3, J1). Each rule encodes a defect shape that actually reached a review anchor in this repository, not a general style preference. Rules apply to every selected file in a review packet; the rule pack loader performs no path filtering, so each description states its own scope.",
+  "rules": [
+    {
+      "rule_id": "durable_write_pairing",
+      "title": "Paired durable writes must converge on replay",
+      "category": "durability",
+      "severity": "blocking",
+      "description": "Scope: any code that persists one logical transition across more than one durable store, or that persists state and then performs an owed side effect. A process that crashes between the two writes must converge on the next run rather than producing contradictory stores. Report a finding when: a second store is written after a first without a durable marker recording that the second is owed; a terminal state is persisted before its side effect with no marker cleared only after the side effect succeeds; a replay guard reads the store written second (so a crash between the writes leaves the guard blind); or a record is moved to a state that a later recovery scan does not revisit while work for it remains outstanding. Defect precedent: a review decision was written to review-decisions.json before ai-reviewer.json, and the replay guard tested the reviewer record, so a crash between them produced a durable NEXT decision alongside a failed reviewer state and a REVIEW_FAILED event."
+    },
+    {
+      "rule_id": "validate_durable_evidence_semantically",
+      "title": "Durable evidence must be validated for validity, not presence",
+      "category": "correctness",
+      "severity": "blocking",
+      "description": "Scope: any code that reads a record back from durable storage, an external process, or another component, and then uses it to drive a decision or state transition. Presence and non-blankness are not validation. Report a finding when: a timestamp field is accepted without being parsed and checked for timezone awareness; an enumerated field (source, role, event, stage, disposition, state) is accepted as any non-empty string rather than checked against its allowed set; fields that must agree with one another are checked independently and never cross-compared; or a record is trusted because it exists under an expected key without verifying it belongs to that key. Atomic file writes prevent torn bytes; they do not prevent structurally invalid records, stale schemas, or a competing writer's entry landing under the same key. Defect precedent: a decision-ledger entry containing only {\"decision\": \"next\"} was projected as a completed review with a null next_action and an empty project_id, and separately a record with consumed_at='not-a-timestamp' and source='foreign-authority' was accepted."
+    },
+    {
+      "rule_id": "canonical_identity_is_the_key",
+      "title": "Collection key is the authoritative identity",
+      "category": "correctness",
+      "severity": "blocking",
+      "description": "Scope: any code iterating a keyed collection of records where each record also carries a duplicated identity field. The key is authoritative; the embedded copy is data that may be absent, stale, or wrong. Report a finding when: code iterates .values() and derives identity from an embedded field; a missing embedded id is coerced to a default such as empty string and then used for lookup, side effects, or event correlation; or an embedded id that disagrees with its key is acted on under either value without being reconciled or quarantined first. Defect precedent: recovery iterated state['reviews'].values(), converted a missing review_id to '', then looked up reviews[''], which does not exist, leaving the real record active forever and emitting a duplicate failure event on every restart."
+    },
+    {
+      "rule_id": "fail_closed_on_missing_evidence",
+      "title": "Missing or degenerate evidence must fail closed",
+      "category": "security",
+      "severity": "blocking",
+      "description": "Scope: any code where a security, isolation, identity, or repository-anchor constraint depends on supplied evidence. Absent, empty, blank, or malformed evidence must fail closed. Report a finding when: a requested constraint is silently downgraded or disabled because the evidence needed to enforce it is missing; an empty or missing path, identifier, or anchor is replaced with a default that happens to resolve to something usable (an empty path resolving to the process working directory is the canonical case); an isinstance or presence check is treated as sufficient validation of a constraint's inputs; or an absent field is interpreted as 'no constraint' rather than 'cannot verify'. Defect precedent: a worker resource context of {} propagated until ReviewRunner silently set independence='none', allowing a reviewer to be allocated the worker's own resource and still return an advancing decision; separately an anchorless legacy record let a ledger entry naming a foreign branch and zero HEAD settle it as completed."
+    },
+    {
+      "rule_id": "anchor_verified_before_decision",
+      "title": "Repository anchor must be present and re-verified before any decision",
+      "category": "correctness",
+      "severity": "blocking",
+      "description": "Scope: any code that produces or persists a decision attributed to a specific repository state. Report a finding when: branch, HEAD, or status hash is compared only if present, so an absent value skips verification entirely; a decision is anchored to the repository state observed at decision time rather than the state that was actually reviewed; or a drift check is weakened to a conditional (for example `anchor and current != anchor`) such that missing anchor evidence passes. Missing anchor evidence means the decision cannot be verified and must fail closed. Defect precedent: a proposed remediation weakened the drift check to skip verification when anchor fields were absent, and would have persisted decisions anchored to recovery-time HEAD rather than the reviewed commit."
+    },
+    {
+      "rule_id": "writer_consumer_contract_agreement",
+      "title": "Persisted values must match what every consumer gate expects",
+      "category": "architecture",
+      "severity": "blocking",
+      "description": "Scope: any change to a value written into a durable record that other components read to gate behavior. The written value and every reader's expectation form one contract. Report a finding when: a writer's computed value is changed without evidence that all consumer gates were checked; two writers of the same durable field produce different values for equivalent situations; or a validation table is introduced that disagrees with the values already present in live durable data. Note for the reviewer: consumers usually live in other files and may not be in this packet. When the change is to a value that is clearly consumed elsewhere, report it as a finding and name the contract that needs checking, rather than assuming agreement. Defect precedent: a remediate decision's disposition was changed from 'apply' to 'remediate' to satisfy a new validation table, which silently broke three actuation gates requiring 'apply' and meant remediation workers were never launched."
+    },
+    {
+      "rule_id": "guard_test_must_be_able_to_fail",
+      "title": "A guard test must fail when its guard is removed",
+      "category": "test",
+      "severity": "blocking",
+      "description": "Scope: tests added or modified to guard a specific correctness, durability, or security guarantee. Such a test must assert the guarantee, so that removing the guard makes the test fail. Report a finding when a test: asserts only the shape of the current implementation (a state name, a field's presence) while the guarantee it claims to cover is a decision, event, or invariant it never checks; asserts against a mock's behavior where the guarantee is actually provided by a real collaborator; counts entries in a structure that is overwritten rather than appended, so the count is invariant to the behavior under test; or asserts the absence of an action that the intended design performs and relies on a downstream component to deduplicate. Defect precedent: three separate tests in this repository asserted implementation rather than guarantee and could not fail; each was caught by independent review, never by the full regression suite, which was green throughout."
+    },
+    {
+      "rule_id": "single_invariant_source",
+      "title": "One invariant, one definition",
+      "category": "architecture",
+      "severity": "warning",
+      "description": "Scope: any invariant enforced on more than one code path, especially a security or isolation invariant with both a direct and an indirect or delegated path. Report a finding when the same requirement is re-derived independently in two places rather than resolved from one shared definition, or when one path enforces a requirement that a parallel path does not. Divergent copies drift, and the weaker copy becomes the fail-open path. Defect precedent: reviewer independence was enforced by AIRoleRequest on the direct path but re-implemented in ReviewRunner on the harness path, where it silently downgraded instead of failing closed; the fix made both derive from one shared helper."
+    },
+    {
+      "rule_id": "evidence_producers_emit_no_lifecycle_tokens",
+      "title": "Evidence-only components must not emit lifecycle decisions",
+      "category": "architecture",
+      "severity": "warning",
+      "description": "Scope: components that are contractually limited to producing evidence — review harnesses, adapters, delegated model output parsers, job runners. Report a finding when such a component emits a field whose name or values are lifecycle decisions ('decision', 'next_action', 'disposition' carrying values such as next, remediate, approve, reject), even when no current consumer reads it. A lifecycle-shaped token inside an evidence-only boundary invites a future consumer to read it and quietly relocates authority. Defect precedent: the review runner forbids the delegated model from emitting lifecycle tokens, then emits a field named disposition with values next and remediate one layer up; DevO does not read it today, which is the only reason authority is currently intact."
+    },
+    {
+      "rule_id": "recovery_leaves_no_unactionable_state",
+      "title": "Recovery must leave every record actionable",
+      "category": "durability",
+      "severity": "blocking",
+      "description": "Scope: any restart, reconcile, or recovery path that transitions interrupted records. Every interrupted record must end in a state that some component can act on: either carrying a durable decision, or eligible for retry, or explicitly classified as terminal with a recorded reason. Report a finding when a recovery path writes a state that no downstream resolver accepts, that no later scan revisits, or that is treated as active by one component and terminal by another. Check the actual resolver conditions rather than assuming a state is handled. Defect precedent: recovery wrote 'recovery_required', which reconcile treated as an active review and therefore refused, while retry and stale-review resolution both required 'failed' — so a daemon restart mid-review stalled the task permanently with no automatic or operator path forward."
+    }
+  ]
+}
