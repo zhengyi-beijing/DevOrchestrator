@@ -40,7 +40,7 @@ _ALLOWED_DECISIONS = {
 }
 _DECISION_DISPOSITIONS = {
     ("next", "next_task"): "apply",
-    ("remediate", "continue_current_stage"): "remediate",
+    ("remediate", "continue_current_stage"): "apply",
     ("owner_gate", "stop"): "owner_gate",
     ("stop", "stop"): "stop",
 }
@@ -1484,14 +1484,14 @@ class AIReviewerCoordinator:
         if blocking_findings:
             decision = "remediate"
             next_action = "continue_current_stage"
-            disposition = "remediate"
+            disposition = _DECISION_DISPOSITIONS[(decision, next_action)]
             reason = f"{len(blocking_findings)} blocking finding(s) detected: " + "; ".join(
                 f"{f.rule_id} at {f.file}:{f.start_line}" for f in blocking_findings[:3]
             )
         else:
             decision = "next"
             next_action = "next_task"
-            disposition = "apply"
+            disposition = _DECISION_DISPOSITIONS[(decision, next_action)]
             reason = f"Review accepted clean ({len(review_result.findings)} non-blocking finding(s))"
 
         try:

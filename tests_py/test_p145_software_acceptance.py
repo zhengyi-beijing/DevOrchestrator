@@ -267,7 +267,7 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
         self.assertIsNotNone(d_record)
         self.assertEqual(d_record["decision"], "remediate")
         self.assertEqual(d_record["next_action"], "continue_current_stage")
-        self.assertEqual(d_record["disposition"], "remediate")
+        self.assertEqual(d_record["disposition"], "apply")
 
         # Verify progress event REMEDIATE emitted
         calls = [c[0] for c in progress_mock.emit.call_args_list]
@@ -1396,7 +1396,7 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
             "remediate_wrong_disposition": {
                 "decision": "remediate",
                 "next_action": "continue_current_stage",
-                "disposition": "apply",
+                "disposition": "remediate",
             },
         }
         for label, override in cases.items():
@@ -1629,6 +1629,30 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
         self.assertEqual(saved["decision"], "next")
         self.assertIn("REVIEW_ACCEPTED", events)
         self.assertEqual(ledger["decisions"][review_id]["consumed_at"], record["consumed_at"])
+        self.assertNotIn(review_id, ledger.get("quarantined_decisions", {}))
+
+    def test_production_shaped_remediate_durable_decision_is_projected(self):
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_good_remediate_ledger"
+        review_id = "ai_review:" + source_id
+        record = self._valid_ledger_record(
+            review_id,
+            truth,
+            decision="remediate",
+            next_action="continue_current_stage",
+            disposition="apply",
+            reason="Blocking review finding requires remediation",
+        )
+
+        saved, ledger, events = self._run_with_ledger(
+            review_id, source_id, truth, record,
+        )
+
+        self.assertEqual(saved["state"], "completed")
+        self.assertEqual(saved["decision"], "remediate")
+        self.assertEqual(saved["disposition"], "apply")
+        self.assertIn("REMEDIATE", events)
+        self.assertEqual(ledger["decisions"][review_id], record)
         self.assertNotIn(review_id, ledger.get("quarantined_decisions", {}))
 
     def test_recovery_failure_event_survives_emit_failure_and_is_replayed(self):

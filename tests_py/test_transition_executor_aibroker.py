@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
 from dev_orchestrator.ai.execution_port import MANAGED_INTERRUPT_REASON
+from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.transition_executor import TransitionExecutor, _execution_policy
 
@@ -28,6 +29,32 @@ class FakePort:
             execution_id="execution-1",
             resource_context=ResourceContext(
                 "dsh/default/model", "deepseek", "default", "model"
+            ),
+        )
+
+
+class ReviewerVerdictPort:
+    def __init__(self, decision, next_action):
+        self.decision = decision
+        self.next_action = next_action
+        self.requests = []
+
+    def execute(self, request):
+        self.requests.append(request)
+        return AIRoleResult(
+            request_id=request.request_id,
+            role_run_id=request.role_run_id,
+            status="succeeded",
+            output=json.dumps({
+                "decision": self.decision,
+                "next_action": self.next_action,
+                "reason": "review verdict",
+            }),
+            dispatch_id="review-dispatch",
+            decision_id="review-decision",
+            execution_id="review-execution",
+            resource_context=ResourceContext(
+                "reviewer/default/model", "reviewer-provider", "default", "model",
             ),
         )
 
@@ -141,6 +168,83 @@ class AIBrokerTransitionTests(unittest.TestCase):
                          "repo_path": str(repo), "started_at": "2026-09-10T01:00:00+00:00",
                          "review_state": "pending"}
         }}), encoding="utf-8")
+
+    def test_direct_reviewer_dispositions_drive_the_real_advance_gate(self):
+        cases = (
+            ("next", "next_task", "apply", False),
+            ("remediate", "continue_current_stage", "apply", True),
+            ("owner_gate", "stop", "owner_gate", False),
+            ("stop", "stop", "stop", False),
+        )
+        for decision, next_action, disposition, should_launch in cases:
+            with self.subTest(decision=decision), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                repo = self.make_repo(root)
+                runtime = root / "runtime"
+                runtime.mkdir()
+                truth = read_repository_truth(repo)
+                project = broker_project(repo)
+                project["execution"]["allowed_next_actions"] = [
+                    "next_task", "continue_current_stage",
+                ]
+                project["ai_roles"] = {
+                    "reviewer": {
+                        "enabled": True,
+                        "quality": "high",
+                        "independence": "resource",
+                    },
+                }
+                config = root / "projects.json"
+                config.write_text(
+                    json.dumps({"version": 1, "projects": [project]}),
+                    encoding="utf-8",
+                )
+                source_id = "worker-source"
+                (runtime / "transition-executor.json").write_text(json.dumps({
+                    "version": 1,
+                    "executions": {source_id: {
+                        "project_id": "p1",
+                        "source_request_id": source_id,
+                        "source_kind": "remediation",
+                        "task_id": "P1",
+                        "repo_path": str(repo),
+                        "branch": truth.branch,
+                        "head": truth.head,
+                        "engine": "aibroker",
+                        "state": "completed",
+                        "completed_at": "2026-09-20T01:00:00+00:00",
+                        "resource_context": {
+                            "resource_id": "worker/default/model",
+                            "provider": "worker-provider",
+                            "account": "default",
+                            "model": "model",
+                        },
+                    }},
+                }), encoding="utf-8")
+
+                reviewer_port = ReviewerVerdictPort(decision, next_action)
+                reviewer = AIReviewerCoordinator(runtime, reviewer_port)
+                launched_reviews = reviewer.advance(config)
+                self.assertEqual(launched_reviews, ["ai_review:" + source_id])
+                reviewer._threads[launched_reviews[0]].join(timeout=2)
+                self.assertFalse(reviewer._threads[launched_reviews[0]].is_alive())
+
+                review_id = launched_reviews[0]
+                durable = json.loads(
+                    (runtime / "review-decisions.json").read_text(encoding="utf-8")
+                )["decisions"][review_id]
+                worker_port = FakePort()
+                executor = TransitionExecutor(runtime, ai_execution_port=worker_port)
+                launches = executor.advance(
+                    {"projects": [self._remediation_snapshot()]}, config,
+                )
+                self.assertEqual(len(launches), 1 if should_launch else 0)
+                self.assertEqual(durable["disposition"], disposition)
+                if should_launch:
+                    executor._threads[review_id].join(timeout=2)
+                    self.assertEqual(len(worker_port.requests), 1)
+                else:
+                    self.assertEqual(worker_port.requests, [])
 
     def _write_recovery_next_chain(self, runtime: Path, truth, *, descendant_state="completed", terminal_state="settled"):
         """Persist recovery -> review NEXT -> Worker -> review terminal lineage."""
