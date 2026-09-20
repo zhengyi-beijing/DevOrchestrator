@@ -105,40 +105,151 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     }, ""
 
 
-def _parse_plan(text: str | None, task_id: str) -> dict[str, Any]:
+_PLAN_REQUIRED_KEYS = {
+    "task_id", "summary", "implementation_steps", "interfaces",
+    "validation", "risks", "out_of_scope",
+}
+_PLAN_SEQUENCE_KEYS = (
+    "implementation_steps", "interfaces", "validation", "risks", "out_of_scope",
+)
+
+
+class PlannerProtocolError(ValueError):
+    """Planner protocol failure with a machine-readable pipeline stage."""
+
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage
+
+
+def _strip_exact_json_fence(text: str) -> str:
+    candidate = text.strip()
+    if not candidate.startswith("```"):
+        return candidate
+    lines = candidate.splitlines()
+    if (
+        len(lines) < 3
+        or lines[0].strip().casefold() not in {"```", "```json"}
+        or lines[-1].strip() != "```"
+    ):
+        raise PlannerProtocolError("extract", "planner output must contain one JSON object")
+    body = "\n".join(lines[1:-1]).strip()
+    if "```" in body:
+        raise PlannerProtocolError("extract", "planner output must contain one JSON object")
+    return body
+
+
+def _top_level_object_spans(text: str) -> list[str]:
+    """Return balanced top-level JSON-object spans while respecting strings."""
+    spans: list[str] = []
+    depth = 0
+    start: int | None = None
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                spans.append(text[start:index + 1])
+                start = None
+    return spans
+
+
+def _extract_plan_json_object(text: str | None) -> dict[str, Any]:
+    """Raw Capture -> JSON Extract: recover exactly one unambiguous object."""
     if not isinstance(text, str) or not text.strip():
-        raise ValueError("planner output is empty")
+        raise PlannerProtocolError("extract", "planner output is empty")
+    candidate = _strip_exact_json_fence(text)
     try:
-        payload = json.loads(text.strip())
-    except json.JSONDecodeError as exc:
-        raise ValueError("planner output must be one JSON object") from exc
-    required = {"task_id", "summary", "implementation_steps", "interfaces", "validation", "risks", "out_of_scope"}
-    if not isinstance(payload, dict) or set(payload) != required:
-        raise ValueError("planner JSON schema mismatch")
-    if _nonblank(payload.get("task_id")) != task_id:
-        raise ValueError("planner task_id mismatch")
-    if _nonblank(payload.get("summary")) is None:
-        raise ValueError("planner summary must be nonblank")
-    for key in ("implementation_steps", "interfaces", "validation", "risks", "out_of_scope"):
-        value = payload.get(key)
-        # Narrow compatibility: named sequences from otherwise-valid planner JSON
-        # are canonicalized to the contract's list-of-strings representation.
-        # Nested/arbitrary objects remain rejected.
-        if isinstance(value, dict):
-            if not value or len(value) > 24 or any(
-                _nonblank(str(name)) is None
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        decoded: list[dict[str, Any]] = []
+        for span in _top_level_object_spans(candidate):
+            try:
+                value = json.loads(span)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                decoded.append(value)
+        if len(decoded) != 1:
+            raise PlannerProtocolError("extract", "planner output must contain exactly one JSON object")
+        payload = decoded[0]
+    if not isinstance(payload, dict):
+        raise PlannerProtocolError("schema", "planner JSON root must be an object")
+    return payload
+
+
+def _normalize_plan_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize only closed, known compatibility shapes; never invent fields."""
+    normalized = dict(payload)
+    for key in _PLAN_SEQUENCE_KEYS:
+        value = normalized.get(key)
+        if not isinstance(value, dict):
+            continue
+        if not value or len(value) > 24:
+            raise PlannerProtocolError("schema", f"planner {key} must be a non-empty bounded list")
+        items: list[str] = []
+        for name, item in value.items():
+            name_text = str(name)
+            if (
+                _nonblank(name_text) is None
+                or not isinstance(item, str)
                 or _nonblank(item) is None
-                or len(str(name)) > 120
-                or len(str(item)) > 1000
-                for name, item in value.items()
+                or len(name_text) > 120
+                or len(item) > 1000
             ):
-                raise ValueError(f"planner {key} must be a non-empty bounded list")
-            value = [f"{name}: {item}" for name, item in value.items()]
-            payload[key] = value
+                raise PlannerProtocolError("schema", f"planner {key} must be a non-empty bounded list")
+            items.append(f"{name_text}: {item}")
+        normalized[key] = items
+    return normalized
+
+
+def _validate_plan_schema(payload: dict[str, Any]) -> None:
+    if set(payload) != _PLAN_REQUIRED_KEYS:
+        raise PlannerProtocolError("schema", "planner JSON schema mismatch")
+    if not isinstance(payload.get("task_id"), str):
+        raise PlannerProtocolError("schema", "planner task_id must be a string")
+    if not isinstance(payload.get("summary"), str):
+        raise PlannerProtocolError("schema", "planner summary must be a string")
+    for key in _PLAN_SEQUENCE_KEYS:
+        value = payload.get(key)
         if not isinstance(value, list) or not value or len(value) > 24:
-            raise ValueError(f"planner {key} must be a non-empty bounded list")
-        if any(_nonblank(item) is None or len(str(item)) > 1000 for item in value):
-            raise ValueError(f"planner {key} entries must be bounded strings")
+            raise PlannerProtocolError("schema", f"planner {key} must be a non-empty bounded list")
+        if any(not isinstance(item, str) or len(item) > 1000 for item in value):
+            raise PlannerProtocolError("schema", f"planner {key} entries must be bounded strings")
+
+
+def _validate_plan_semantics(payload: dict[str, Any], task_id: str) -> None:
+    if _nonblank(payload.get("task_id")) != task_id:
+        raise PlannerProtocolError("semantic", "planner task_id mismatch")
+    if _nonblank(payload.get("summary")) is None:
+        raise PlannerProtocolError("semantic", "planner summary must be nonblank")
+    for key in _PLAN_SEQUENCE_KEYS:
+        if any(_nonblank(item) is None for item in payload[key]):
+            raise PlannerProtocolError("semantic", f"planner {key} entries must be nonblank")
+
+
+def _parse_plan(text: str | None, task_id: str) -> dict[str, Any]:
+    """Raw Capture -> JSON Extract -> Normalize -> Schema -> Semantic validation."""
+    payload = _extract_plan_json_object(text)
+    payload = _normalize_plan_payload(payload)
+    _validate_plan_schema(payload)
+    _validate_plan_semantics(payload, task_id)
     return payload
 
 
@@ -816,8 +927,10 @@ class AIPlannerCoordinator:
         # retry budget. Keep a separate bounded failover allowance so a quota failure
         # on the last semantic attempt can still move to another eligible resource.
         max_resource_failovers = 2
-        max_dispatches = max_attempts + max_resource_failovers
+        max_format_repairs = 1
+        max_dispatches = max_attempts + max_resource_failovers + max_format_repairs
         semantic_failures = 0
+        format_repairs = 0
         failed_resource_ids: set[str] = set()
         planner_result = None
         plan = None
@@ -841,6 +954,8 @@ class AIPlannerCoordinator:
                 "control_command_id": record["command_id"],
                 "planner_attempt": attempt,
                 "planner_max_attempts": max_attempts,
+                "planner_semantic_failures": semantic_failures,
+                "planner_format_repairs": format_repairs,
             }
             if failed_resource_ids:
                 metadata["planner_failover_from_resource_ids"] = sorted(failed_resource_ids)
@@ -950,9 +1065,25 @@ class AIPlannerCoordinator:
                 return None
             except Exception as exc:
                 attempt_reason = str(exc)
+                protocol_stage = exc.stage if isinstance(exc, PlannerProtocolError) else None
+                classification = getattr(attempt_result, "failure_classification", None)
+                if protocol_stage is not None:
+                    classification = f"planner_{protocol_stage}_error"
+                if protocol_stage in {"extract", "schema"} and format_repairs < max_format_repairs:
+                    format_repairs += 1
+                    self._record_planner_attempt(
+                        plan_id, attempt, planner_request, attempt_result, attempt_reason,
+                        classification=f"planner_{protocol_stage}_repair", round_no=round_no,
+                    )
+                    if attempt_result is not None and attempt_result.resource_context is not None:
+                        previous_attempt_resource = attempt_result.resource_context
+                    failure_reason = (
+                        f"{protocol_stage} format/schema repair required: {attempt_reason}"
+                    )
+                    continue
                 self._record_planner_attempt(
                     plan_id, attempt, planner_request, attempt_result, attempt_reason,
-                    classification=getattr(attempt_result, "failure_classification", None), round_no=round_no,
+                    classification=classification, round_no=round_no,
                 )
                 if attempt_result is not None and attempt_result.resource_context is not None:
                     previous_attempt_resource = attempt_result.resource_context

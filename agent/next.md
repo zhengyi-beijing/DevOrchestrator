@@ -24,11 +24,13 @@ Acceptance evidence:
 Prove that the existing DevO control/recovery stack can sustain real unattended development before adding another client surface.
 
 Immediate implementation sequence:
-1. Consolidate Planner protocol handling into Raw Capture -> JSON Extract -> Normalize -> Schema Validate -> Semantic Validate -> Reviewer, with bounded format repair for schema-only failures.
-2. Verify provider/session/quota failures trigger resource failover without consuming semantic-remediation budget or requiring user continue.
+1. **COMPLETE** — Planner protocol is now Raw Capture -> JSON Extract -> Normalize -> Schema Validate -> Semantic Validate -> Reviewer. One bounded extract/schema repair is allowed without consuming semantic failure budget; ambiguous multiple JSON objects fail closed.
+2. **IN PROGRESS** — provider/session/quota failures must trigger resource failover without consuming semantic-remediation budget or requiring user continue. Existing quota failover still passes; next close the self-host successor-promotion gap exposed by externally closed P14.5.
 3. Require lifecycle/health/watchdog projections to agree on the current recovery epoch.
 4. Exercise automatic Review -> Remediation -> Re-review -> completion and automatic promotion/launch of the next eligible task.
 5. Build the unattended fault-injection acceptance harness before the long qualification run.
+
+Phase-1 verification: planner focused 29 passed; planner/control/staged-roadmap/transition adjacency 82 passed + 10 subtests; full repository regression 885 passed + 87 subtests; compileall and diff-check passed.
 
 ## Carried forward from P14.5 — residual NON_BLOCKING items
 

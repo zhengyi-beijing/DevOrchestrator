@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
-from dev_orchestrator.core.ai_planner import AIPlannerCoordinator, _parse_plan, _parse_plan_review
+from dev_orchestrator.core.ai_planner import AIPlannerCoordinator, PlannerProtocolError, _parse_plan, _parse_plan_review
 
 
 class PlanParserCompatibilityTests(unittest.TestCase):
@@ -35,6 +35,45 @@ class PlanParserCompatibilityTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "non-empty bounded list"):
             _parse_plan(json.dumps(payload), "P14.5")
+
+    def test_unique_json_object_is_extracted_from_surrounding_prose(self):
+        payload = {
+            "task_id": "P14.6", "summary": "bounded",
+            "implementation_steps": ["one"], "interfaces": ["stable"],
+            "validation": ["tests"], "risks": ["bounded"],
+            "out_of_scope": ["unrelated"],
+        }
+        text = "Planner result follows:\n" + json.dumps(payload) + "\nEnd result."
+        self.assertEqual(_parse_plan(text, "P14.6"), payload)
+
+    def test_multiple_json_objects_fail_closed_at_extract_stage(self):
+        payload = {
+            "task_id": "P14.6", "summary": "bounded",
+            "implementation_steps": ["one"], "interfaces": ["stable"],
+            "validation": ["tests"], "risks": ["bounded"],
+            "out_of_scope": ["unrelated"],
+        }
+        with self.assertRaises(PlannerProtocolError) as ctx:
+            _parse_plan(json.dumps(payload) + "\n" + json.dumps({"extra": True}), "P14.6")
+        self.assertEqual(ctx.exception.stage, "extract")
+
+    def test_schema_and_semantic_failures_are_distinct(self):
+        base = {
+            "task_id": "P14.6", "summary": "bounded",
+            "implementation_steps": ["one"], "interfaces": ["stable"],
+            "validation": ["tests"], "risks": ["bounded"],
+            "out_of_scope": ["unrelated"],
+        }
+        bad_schema = dict(base)
+        bad_schema["validation"] = []
+        with self.assertRaises(PlannerProtocolError) as schema_ctx:
+            _parse_plan(json.dumps(bad_schema), "P14.6")
+        self.assertEqual(schema_ctx.exception.stage, "schema")
+        bad_semantic = dict(base)
+        bad_semantic["task_id"] = "P14.5"
+        with self.assertRaises(PlannerProtocolError) as semantic_ctx:
+            _parse_plan(json.dumps(bad_semantic), "P14.6")
+        self.assertEqual(semantic_ctx.exception.stage, "semantic")
 
 
 class PlanReviewParserTests(unittest.TestCase):
@@ -801,6 +840,11 @@ class AIPlannerTests(unittest.TestCase):
             self.assertEqual(row["state"], "ready", row)
             planners = [r for r in port.requests if r.role == "planner"]
             self.assertEqual(len(planners), 4)
+            self.assertEqual(planners[1].metadata["planner_format_repairs"], 1)
+            self.assertEqual(planners[1].metadata["planner_semantic_failures"], 0)
+            self.assertEqual(planners[2].metadata["planner_semantic_failures"], 1)
+            self.assertEqual(row["planner_attempts"][0]["failure_classification"], "planner_schema_repair")
+            self.assertEqual(row["planner_attempts"][1]["failure_classification"], "planner_schema_error")
             self.assertEqual(planners[3].excluded_resource_ids, ("planner-opus",))
             self.assertEqual(row["planner_resource"]["resource_id"], "planner-codex")
             self.assertEqual(row["planner_attempts"][2]["failure_classification"], "quota_exhausted")
