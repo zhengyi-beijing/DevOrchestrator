@@ -173,6 +173,13 @@ class AIReviewerCoordinator:
         marked ``failed`` so ``resolve_retry_candidate`` can retry it. No
         interrupted review is left in a state that neither carries a decision
         nor is retry-eligible.
+
+        Terminal transitions are never written inline here. Every one of them
+        goes through :meth:`_finish_harness_terminal`, which persists the
+        terminal state together with its ``lifecycle_event_pending`` marker
+        before emitting, so a crash or transport failure at any point still
+        leaves the owed event replayable. Records whose terminal write has not
+        happened yet simply stay active and are rescanned on the next restart.
         """
         pending_finalize: list[tuple[dict[str, Any], Any]] = []
         resume: list[tuple[dict[str, Any], str]] = []
@@ -208,27 +215,21 @@ class AIReviewerCoordinator:
                                 "daemon restarted during reviewer execution; "
                                 f"job state {session.state}"
                             )
-                            record["state"] = "failed"
-                            record["reason"] = reason
-                            failed.append((record, reason))
+                            failed.append((copy.deepcopy(record), reason))
                         continue
                     except Exception as exc:
                         reason = (
                             "daemon restarted during reviewer execution; "
                             f"harness reconcile failed: {exc}"
                         )
-                        record["state"] = "failed"
-                        record["reason"] = reason
                         record["recovered_at"] = utc_now_iso()
                         changed = True
-                        failed.append((record, reason))
+                        failed.append((copy.deepcopy(record), reason))
                         continue
                 reason = "daemon restarted during reviewer execution; automatic replay forbidden"
-                record["state"] = "failed"
-                record["reason"] = reason
                 record["recovered_at"] = utc_now_iso()
                 changed = True
-                failed.append((record, reason))
+                failed.append((copy.deepcopy(record), reason))
             if changed:
                 self._save_state(state)
 
@@ -239,7 +240,7 @@ class AIReviewerCoordinator:
         # Side effects run outside the state write so a slow disposition never
         # holds the interrupted-review scan open.
         for record, reason in failed:
-            self._emit_review_failed(record, reason)
+            self._fail_recovered_review(self._recovery_context(record), reason)
         for record, session in pending_finalize:
             self._finalize_recovered_harness_review(record, session)
         for record, session_id in resume:
@@ -253,6 +254,81 @@ class AIReviewerCoordinator:
             return None
         record = decisions.get(review_id)
         return record if isinstance(record, dict) else None
+
+    def _validate_durable_decision(
+        self, review_id: str, durable: dict[str, Any], rec: dict[str, Any]
+    ) -> str:
+        """Return "" when ``durable`` may be projected, else the rejection reason.
+
+        Atomic writes protect the ledger from torn bytes, not from structurally
+        invalid records, stale schemas, or a competing writer's entry landing
+        under this review id. A decision is only projected onto terminal
+        reviewer state when it is complete, internally consistent, and agrees
+        with the reviewer record's own identity and reviewed anchor.
+        """
+        missing = [
+            name for name in _DECISION_IDENTITY_FIELDS
+            if _nonblank(durable.get(name)) is None
+        ]
+        if missing:
+            return f"incomplete decision record; missing {', '.join(sorted(missing))}"
+        if _nonblank(durable.get("consumed_at")) is None:
+            return "incomplete decision record; missing consumed_at"
+        if _nonblank(durable.get("request_id")) != review_id:
+            return "decision request_id does not match review id"
+        if durable.get("role") != "reviewer" or durable.get("event") != "worker_done":
+            return "decision role/event identity is not a reviewer worker_done record"
+        if durable.get("stage_id") != "review":
+            return "decision stage identity is not review"
+        pair = (durable.get("decision"), durable.get("next_action"))
+        if pair not in _ALLOWED_DECISIONS:
+            return "decision/next_action pair is not allowed"
+        # The reviewer record is the local identity authority; a ledger entry
+        # that disagrees with it belongs to a different review or a stale
+        # schema and must not settle this one.
+        for name, rec_name in (
+            ("project_id", "project_id"),
+            ("task_id", "task_id"),
+            ("branch", "branch"),
+            ("head", "head"),
+            ("review_status_hash", "review_status_hash"),
+        ):
+            expected = _nonblank(rec.get(rec_name))
+            if expected is not None and _nonblank(durable.get(name)) != expected:
+                return f"decision {name} does not match the reviewer record"
+        return ""
+
+    def _quarantine_decision(self, review_id: str, reason: str) -> None:
+        """Move an unusable ledger entry out of the decided set.
+
+        Leaving a malformed entry in ``decisions`` would both invite a later
+        replay and keep the review inside ``resolve_retry_candidate``'s decided
+        set, leaving it with no repair path. Quarantining preserves the record
+        for forensics while restoring retry eligibility.
+        """
+        with self._lock:
+            raw = read_json(self.decisions_path, None)
+            payload = raw if isinstance(raw, dict) else {}
+            decisions = payload.get("decisions")
+            if not isinstance(decisions, dict) or review_id not in decisions:
+                return
+            quarantined = payload.get("quarantined_decisions")
+            if not isinstance(quarantined, dict):
+                quarantined = {}
+            quarantined[review_id] = {
+                "record": decisions.pop(review_id),
+                "quarantined_at": utc_now_iso(),
+                "reason": reason,
+            }
+            write_json(
+                self.decisions_path,
+                {
+                    "version": _DECISION_VERSION,
+                    "decisions": decisions,
+                    "quarantined_decisions": quarantined,
+                },
+                indent=2,
+            )
 
     def _project_durable_decision(
         self,
@@ -282,20 +358,6 @@ class AIReviewerCoordinator:
             next_action=next_action or None,
             binding=binding,
             extra={"disposition": durable.get("disposition"), "recovered_decision": True},
-        )
-
-    def _emit_review_failed(self, record: dict[str, Any], reason: str) -> None:
-        if self.progress_channel is None:
-            return
-        payload = {"project_id": record.get("project_id")}
-        binding = record.get("conversation_binding")
-        if isinstance(binding, dict) and binding:
-            payload["conversation_binding"] = binding
-        self.progress_channel.emit(
-            payload, "REVIEW_FAILED",
-            task_id=record.get("task_id"),
-            occurrence_key=record.get("review_id"),
-            details={"reason": reason},
         )
 
     def _recovery_repo_path(self, record: dict[str, Any], source: dict[str, Any]) -> Optional[str]:
@@ -1149,19 +1211,6 @@ class AIReviewerCoordinator:
             role_run_id = rec.get("role_run_id") or f"reviewer-{review_id}"
             durable = self._durable_decision(review_id)
 
-        if durable is not None:
-            # The decision ledger is the source of truth, and it is written
-            # before the reviewer-state terminal write. A replay that lands
-            # between those two writes must converge on the durable decision
-            # rather than re-deriving one: re-deriving would raise a spurious
-            # replay conflict and settle the review as failed while a real
-            # decision already exists. Re-emitting the terminal state is safe
-            # because the progress channel deduplicates on occurrence key.
-            if rec.get("decision") and rec.get("state") in _TERMINAL_STATES:
-                return
-            self._project_durable_decision(review_id, durable, binding)
-            return
-
         def _fail(err_msg: str) -> None:
             if self.accounting is not None:
                 self.accounting.end_interval(
@@ -1191,6 +1240,28 @@ class AIReviewerCoordinator:
                 review_id, project_id, task_id, source_request_id, "failed", err_msg,
                 binding=binding,
             )
+
+        if durable is not None:
+            # The decision ledger is the source of truth, and it is written
+            # before the reviewer-state terminal write. A replay that lands
+            # between those two writes must converge on the durable decision
+            # rather than re-deriving one: re-deriving would raise a spurious
+            # replay conflict and settle the review as failed while a real
+            # decision already exists. Re-emitting the terminal state is safe
+            # because the progress channel deduplicates on occurrence key.
+            #
+            # The ledger is trusted only after validation: an entry that is
+            # incomplete, internally inconsistent, or belongs to another review
+            # must never settle this one as completed.
+            invalid = self._validate_durable_decision(review_id, durable, rec)
+            if invalid:
+                self._quarantine_decision(review_id, invalid)
+                _fail(f"durable decision rejected: {invalid}")
+                return
+            if rec.get("decision") and rec.get("state") in _TERMINAL_STATES:
+                return
+            self._project_durable_decision(review_id, durable, binding)
+            return
 
         # 1. Repository truth check. The reviewed anchor and the repository it
         #    refers to must both be present and must still match; missing
@@ -1389,11 +1460,18 @@ class AIReviewerCoordinator:
             details = {"reason": reason}
             if decision:
                 details["decision"] = decision
-            self.progress_channel.emit(
-                proj_payload, milestone,
-                task_id=task_id, occurrence_key=review_id,
-                details=details,
-            )
+            try:
+                self.progress_channel.emit(
+                    proj_payload, milestone,
+                    task_id=task_id, occurrence_key=review_id,
+                    details=details,
+                )
+            except Exception:
+                # Delivery failed: leave `lifecycle_event_pending` set so the
+                # next recovery replays it. A transport fault must never
+                # propagate out of recovery (and thus out of coordinator
+                # construction) or abort daemon startup.
+                return
         with self._lock:
             state = self._load_state()
             record = state["reviews"].get(review_id)

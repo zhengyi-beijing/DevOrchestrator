@@ -1063,10 +1063,14 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
         mock_harness.result.return_value = self._review_result(review_id)
 
         def emitted_accepted():
+            # Count delivered notifications, not dedup-map keys: the dedup map
+            # assigns to a single key, so counting keys stays 1 even if dedup
+            # were removed entirely and would not test the guarantee at all.
             raw = read_json(self.runtime / "progress-channel.json", {})
             return [
-                key for key in (raw.get("emitted") or {})
-                if "REVIEW_ACCEPTED" in key and review_id in key
+                item for item in (raw.get("history") or [])
+                if item.get("milestone") == "REVIEW_ACCEPTED"
+                and (item.get("details") or {}).get("review_id", review_id) == review_id
             ]
 
         AIReviewerCoordinator(
@@ -1275,6 +1279,197 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
                 saved = run_with_source(mismatched)
                 self.assertEqual(saved["state"], "failed")
                 self.assertIn("repository path evidence", saved["reason"])
+
+    def _valid_ledger_record(self, review_id, truth, **overrides):
+        record = {
+            "project_id": "labdemo",
+            "request_id": review_id,
+            "disposition": "apply",
+            "next_action": "next_task",
+            "decision": "next",
+            "reason": "Review accepted clean (0 non-blocking finding(s))",
+            "review_status_hash": truth.status_hash,
+            "task_id": "task_lab_rec",
+            "stage_id": "review",
+            "branch": truth.branch,
+            "head": truth.head,
+            "role": "reviewer",
+            "event": "worker_done",
+            "source": "aibroker",
+            "consumed_at": utc_now_iso(),
+        }
+        record.update(overrides)
+        return record
+
+    def _run_with_ledger(self, review_id, source_id, truth, ledger_record):
+        self._restart_reviewer_state(review_id, source_id, truth)
+        write_json(
+            self.runtime / "review-decisions.json",
+            {"version": 1, "decisions": {review_id: ledger_record}},
+            indent=2,
+        )
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+        progress = MagicMock()
+        AIReviewerCoordinator(
+            self.runtime, port=None, harness=mock_harness, progress_channel=progress,
+        )
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        ledger = read_json(self.runtime / "review-decisions.json", {})
+        events = [c[0][1] for c in progress.emit.call_args_list]
+        return saved, ledger, events
+
+    def test_malformed_durable_decision_is_quarantined_not_projected(self):
+        # A structurally invalid ledger entry must never settle a review as
+        # completed. Atomic writes prevent torn bytes, not invalid structure,
+        # stale schemas, or a competing writer's entry under this review id.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_bad_ledger"
+        review_id = "ai_review:" + source_id
+
+        saved, ledger, events = self._run_with_ledger(
+            review_id, source_id, truth, {"decision": "next"},
+        )
+
+        self.assertEqual(saved["state"], "failed")
+        self.assertIsNone(saved.get("decision"))
+        self.assertIn("durable decision rejected", saved["reason"])
+        self.assertIn("REVIEW_FAILED", events)
+        self.assertNotIn("REVIEW_ACCEPTED", events)
+        # Quarantined out of the decided set so retry remains possible.
+        self.assertNotIn(review_id, ledger.get("decisions", {}))
+        self.assertIn(review_id, ledger.get("quarantined_decisions", {}))
+
+    def test_durable_decision_mismatching_reviewer_record_is_rejected(self):
+        truth = read_repository_truth(str(self.repo))
+        for field, bad in (
+            ("head", "0" * 40),
+            ("branch", "other-branch"),
+            ("task_id", "another_task"),
+            ("project_id", "another_project"),
+            ("review_status_hash", "deadbeef"),
+        ):
+            with self.subTest(mismatched=field):
+                source_id = f"worker_req_mismatch_{field}"
+                review_id = "ai_review:" + source_id
+                saved, ledger, events = self._run_with_ledger(
+                    review_id, source_id, truth,
+                    self._valid_ledger_record(review_id, truth, **{field: bad}),
+                )
+                self.assertEqual(saved["state"], "failed")
+                self.assertIsNone(saved.get("decision"))
+                self.assertNotIn("REVIEW_ACCEPTED", events)
+                self.assertNotIn(review_id, ledger.get("decisions", {}))
+                self.assertIn(review_id, ledger.get("quarantined_decisions", {}))
+
+    def test_durable_decision_with_disallowed_pair_or_identity_is_rejected(self):
+        truth = read_repository_truth(str(self.repo))
+        cases = {
+            "bad_pair": {"decision": "next", "next_action": "continue_current_stage"},
+            "wrong_role": {"role": "planner"},
+            "wrong_event": {"event": "plan_done"},
+            "wrong_stage": {"stage_id": "plan"},
+            "wrong_request_id": {"request_id": "ai_review:someone_else"},
+            "blank_reason": {"reason": "   "},
+        }
+        for label, override in cases.items():
+            with self.subTest(case=label):
+                source_id = f"worker_req_bad_{label}"
+                review_id = "ai_review:" + source_id
+                saved, ledger, events = self._run_with_ledger(
+                    review_id, source_id, truth,
+                    self._valid_ledger_record(review_id, truth, **override),
+                )
+                self.assertEqual(saved["state"], "failed")
+                self.assertNotIn("REVIEW_ACCEPTED", events)
+                self.assertIn(review_id, ledger.get("quarantined_decisions", {}))
+
+    def test_valid_durable_decision_is_still_projected(self):
+        # Guard against the validation being so strict that legitimate
+        # convergence stops working.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_good_ledger"
+        review_id = "ai_review:" + source_id
+        record = self._valid_ledger_record(review_id, truth)
+
+        saved, ledger, events = self._run_with_ledger(review_id, source_id, truth, record)
+
+        self.assertEqual(saved["state"], "completed")
+        self.assertEqual(saved["decision"], "next")
+        self.assertIn("REVIEW_ACCEPTED", events)
+        self.assertEqual(ledger["decisions"][review_id]["consumed_at"], record["consumed_at"])
+        self.assertNotIn(review_id, ledger.get("quarantined_decisions", {}))
+
+    def test_recovery_failure_event_survives_emit_failure_and_is_replayed(self):
+        # Recovery failure outcomes must use the same crash-recoverable outbox
+        # as the normal terminal path: terminal state and pending marker are
+        # persisted together, and the event is replayed until delivered.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_emit_fault"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth)
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(
+            review_id, source_id, truth, state="failed",
+        )
+
+        failing = MagicMock()
+        failing.emit.side_effect = RuntimeError("emit crashed")
+        # A transport fault must not escape coordinator construction.
+        AIReviewerCoordinator(
+            self.runtime, port=None, harness=mock_harness, progress_channel=failing,
+        )
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["lifecycle_event_pending"], "REVIEW_FAILED")
+
+        healthy = MagicMock()
+        AIReviewerCoordinator(
+            self.runtime, port=None, harness=mock_harness, progress_channel=healthy,
+        )
+        self.assertIn("REVIEW_FAILED", [c[0][1] for c in healthy.emit.call_args_list])
+        replayed = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertNotIn("lifecycle_event_pending", replayed)
+
+    def test_non_harness_recovery_failure_uses_the_lifecycle_outbox(self):
+        # The non-harness interruption path wrote terminal state inline and
+        # bypassed the outbox entirely; assert it no longer does.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_nonharness_fault"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth, harness=False, session_id=None)
+
+        failing = MagicMock()
+        failing.emit.side_effect = RuntimeError("emit crashed")
+        AIReviewerCoordinator(self.runtime, port=None, progress_channel=failing)
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["lifecycle_event_pending"], "REVIEW_FAILED")
+
+    def test_legacy_in_flight_guard_rejects_before_starting_a_poller(self):
+        # Route-specific: the resume entry point must refuse, rather than
+        # relying on the finalizer's defence-in-depth guard after a poll.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_no_poller"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth, repo_path=None, worker={})
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(
+            review_id, source_id, truth, state="running",
+        )
+
+        coordinator = AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness)
+
+        self.assertIsNone(coordinator._threads.get(review_id))
+        mock_harness.status.assert_not_called()
+        mock_harness.result.assert_not_called()
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "failed")
 
     def test_coordinator_daemon_restart_failed_session_is_retry_eligible(self):
         truth = read_repository_truth(str(self.repo))
