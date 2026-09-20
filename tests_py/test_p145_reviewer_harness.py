@@ -678,6 +678,136 @@ class DefaultReviewerHarnessTests(unittest.TestCase):
         self.assertEqual(dispatched_req.previous_resource_context.account, "default")
         self.assertEqual(dispatched_req.previous_resource_context.model, "claude-3-opus")
 
+    def _independence_runner(self, request_id, metadata):
+        """Build a ReviewRunner over one scan session with the given metadata."""
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={"review-runner": JobCommandConfig(argv=["python", "-c", "import sys; sys.exit(0)"], cwd=".")},
+                )
+            },
+        )
+        job_service = JobService(self.runtime, config=job_cfg)
+        harness = DefaultReviewerHarness(self.runtime, job_service=job_service)
+        base = {"repo_path": str(self.repo)}
+        base.update(metadata)
+        req = ReviewRequest(
+            request_id=request_id,
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_1",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["."],
+            metadata=base,
+        )
+        session = harness.submit(req)
+        store = ExecutionJobStore(self.runtime)
+        return ReviewRunner(store._job_dir(session.job_id), port=MagicMock())
+
+    def test_review_runner_fails_closed_on_degenerate_previous_resource_context(self):
+        # Reviewer independence must never be silently downgraded to "none":
+        # that would let the broker allocate the worker's own resource to the
+        # reviewer and still produce an advancing decision. Each degenerate
+        # evidence shape must fail closed instead.
+        degenerate = {
+            "empty_mapping": {},
+            "resource_id_none": {"resource_id": None, "provider": "anthropic"},
+            "resource_id_blank": {"resource_id": "   ", "provider": "anthropic"},
+            "absent": None,
+        }
+        for label, prev in degenerate.items():
+            with self.subTest(previous=label):
+                meta = {"independence": "resource"}
+                if prev is not None:
+                    meta["previous_resource_context"] = prev
+                runner = self._independence_runner(f"indep_degenerate_{label}", meta)
+                with self.assertRaises(ValueError) as ctx:
+                    runner.run()
+                self.assertIn("independence requires prior resource evidence", str(ctx.exception))
+                self.assertEqual(runner.port.execute.call_count, 0)
+
+    def test_review_runner_fails_closed_on_mode_specific_missing_identity(self):
+        # Account and provider independence need their own identity fields; a
+        # resource_id alone does not satisfy them.
+        for independence, prev, missing in (
+            ("provider", {"resource_id": "w1"}, "provider"),
+            ("account", {"resource_id": "w1", "provider": "anthropic"}, "account"),
+            ("account", {"resource_id": "w1", "provider": "anthropic", "account": "  "}, "account"),
+        ):
+            with self.subTest(independence=independence, missing=missing):
+                runner = self._independence_runner(
+                    f"indep_mode_{independence}_{missing}_{len(prev)}",
+                    {"independence": independence, "previous_resource_context": prev},
+                )
+                with self.assertRaises(ValueError) as ctx:
+                    runner.run()
+                self.assertIn(missing, str(ctx.exception))
+                self.assertEqual(runner.port.execute.call_count, 0)
+
+    def test_review_runner_does_not_fall_back_to_worker_context_on_blank_previous(self):
+        # A blank previous_resource_context must not silently fall through to
+        # worker_resource_context and then be downgraded; it must fail closed.
+        runner = self._independence_runner(
+            "indep_no_silent_fallback",
+            {
+                "independence": "resource",
+                "previous_resource_context": {},
+                "worker_resource_context": {},
+            },
+        )
+        with self.assertRaises(ValueError):
+            runner.run()
+        self.assertEqual(runner.port.execute.call_count, 0)
+
+    def test_coordinator_rejects_degenerate_worker_resource_context(self):
+        # The coordinator must reject degenerate worker evidence before a
+        # harness review is ever launched, matching the fail-closed behavior of
+        # the direct (non-harness) AIRoleRequest path.
+        from dev_orchestrator.ai.contracts import missing_independence_fields
+
+        for independence, resource, expected in (
+            ("resource", {}, "resource_id"),
+            ("resource", {"resource_id": None}, "resource_id"),
+            ("resource", {"resource_id": ""}, "resource_id"),
+            ("provider", {"resource_id": "w1"}, "provider"),
+            ("account", {"resource_id": "w1", "provider": "p"}, "account"),
+        ):
+            with self.subTest(independence=independence, resource=resource):
+                self.assertIn(expected, missing_independence_fields(independence, resource))
+
+        self.assertEqual(
+            missing_independence_fields("resource", {"resource_id": "w1"}), ()
+        )
+        self.assertEqual(missing_independence_fields("none", {}), ())
+
+    def test_airolerequest_and_runner_share_one_independence_invariant(self):
+        # Regression guard for the original defect: the direct path failed
+        # closed while the harness path failed open. Both must now derive the
+        # requirement from the same contract helper.
+        from dev_orchestrator.ai.contracts import (
+            AIRoleRequest,
+            ResourceContext,
+            missing_independence_fields,
+        )
+
+        degenerate = ResourceContext(resource_id=None, provider="anthropic")
+        self.assertTrue(missing_independence_fields("resource", degenerate))
+        with self.assertRaises(ValueError):
+            AIRoleRequest(
+                project_id="p1",
+                role="reviewer",
+                prompt="x",
+                working_directory=self.repo,
+                independence="resource",
+                previous_resource_context=degenerate,
+            )
+
     def test_review_runner_run_empty_scope_fails_closed(self):
         job_cfg = JobsConfig(
             runtime_root=self.runtime,

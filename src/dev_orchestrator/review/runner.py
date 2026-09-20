@@ -8,9 +8,13 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
-from dev_orchestrator.ai.contracts import AIRoleRequest, ResourceContext
+from dev_orchestrator.ai.contracts import (
+    AIRoleRequest,
+    ResourceContext,
+    missing_independence_fields,
+)
 from dev_orchestrator.ai.execution_port import AIExecutionPort
 from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
 from dev_orchestrator.jobs.models import JobRecord
@@ -30,6 +34,13 @@ from .models import (
     compute_finding_fingerprint,
     to_sarif,
 )
+
+
+def _clean(value: Any) -> Optional[str]:
+    """Normalize one resource-identity field to a nonblank string or ``None``."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def partition_packets(
@@ -355,21 +366,32 @@ class ReviewRunner:
 
         packet_records: list[dict[str, Any]] = []
 
-        prev_res = request.metadata.get("previous_resource_context") or request.metadata.get("worker_resource_context")
+        prev_res = request.metadata.get("previous_resource_context")
+        if prev_res is None:
+            prev_res = request.metadata.get("worker_resource_context")
         prev_ctx = None
         if isinstance(prev_res, ResourceContext):
             prev_ctx = prev_res
-        elif isinstance(prev_res, dict) and prev_res.get("resource_id"):
+        elif isinstance(prev_res, Mapping):
             prev_ctx = ResourceContext(
-                resource_id=prev_res.get("resource_id"),
-                provider=prev_res.get("provider"),
-                account=prev_res.get("account"),
-                model=prev_res.get("model"),
+                resource_id=_clean(prev_res.get("resource_id")),
+                provider=_clean(prev_res.get("provider")),
+                account=_clean(prev_res.get("account")),
+                model=_clean(prev_res.get("model")),
             )
 
         independence = request.metadata.get("independence", "resource" if prev_ctx else "none")
-        if independence != "none" and prev_ctx is None:
-            independence = "none"
+        # Reviewer independence must never be silently downgraded: degrading a
+        # requested mode to "none" would let the broker allocate the worker's
+        # own resource to the reviewer. Fail closed on missing or degenerate
+        # prior-resource evidence, using the same invariant AIRoleRequest
+        # enforces on the direct (non-harness) path.
+        missing = missing_independence_fields(independence, prev_ctx)
+        if missing:
+            raise ValueError(
+                "independence requires prior resource evidence: "
+                f"mode {independence!r} missing {', '.join(missing)}"
+            )
 
         failed_packets = 0
         for pkt in packets:

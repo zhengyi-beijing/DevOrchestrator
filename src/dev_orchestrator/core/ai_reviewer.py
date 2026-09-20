@@ -8,7 +8,11 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from dev_orchestrator.ai.contracts import AIRoleRequest, ResourceContext
+from dev_orchestrator.ai.contracts import (
+    AIRoleRequest,
+    ResourceContext,
+    missing_independence_fields,
+)
 from dev_orchestrator.ai.execution_port import AIExecutionPort
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.config import load_projects_config
@@ -22,6 +26,11 @@ _STATE_VERSION = 1
 _DECISION_VERSION = 1
 _ACTIVE_STATES = frozenset({"launching", "running"})
 _TERMINAL_STATES = frozenset({"completed", "failed", "recovery_required"})
+#: States a daemon restart must resolve. ``recovery_required`` is no longer
+#: produced by this coordinator, but records written by an earlier daemon are
+#: picked up here so legacy state is migrated to a retry-eligible outcome
+#: instead of remaining permanently unactionable.
+_RECOVERABLE_STATES = frozenset(_ACTIVE_STATES | {"recovery_required"})
 _ALLOWED_DECISIONS = {
     ("next", "next_task"),
     ("remediate", "continue_current_stage"),
@@ -125,36 +134,196 @@ class AIReviewerCoordinator:
         write_json(self.state_path, state, indent=2)
 
     def _recover_interrupted(self) -> None:
+        """Reconcile reviews interrupted by a daemon restart.
+
+        Every interrupted review must end in a state the lifecycle can act on.
+        A reconciled harness session that already finished is dispositioned
+        through the normal deterministic path so its durable evidence yields a
+        real decision; a session still in flight is resumed; anything else is
+        marked ``failed`` so ``resolve_retry_candidate`` can retry it. No
+        interrupted review is left in a state that neither carries a decision
+        nor is retry-eligible.
+        """
+        pending_finalize: list[tuple[dict[str, Any], Any]] = []
+        resume: list[tuple[dict[str, Any], str]] = []
+        failed: list[tuple[dict[str, Any], str]] = []
+
         with self._lock:
             state = self._load_state()
             changed = False
             for record in state["reviews"].values():
-                if record.get("state") in _ACTIVE_STATES:
-                    if record.get("harness") and (record.get("session_id") or record.get("review_id")):
-                        session_id = record.get("session_id") or record.get("review_id")
-                        try:
-                            harness = self._get_harness()
-                            session = harness.reconcile(session_id)
-                            record["session_id"] = session.session_id
-                            record["job_id"] = session.job_id
-                            if session.state in ("completed", "failed", "cancelled", "unknown_recovery"):
-                                record["state"] = session.state
-                                if session.failure_reason:
-                                    record["reason"] = session.failure_reason
-                            else:
-                                record["state"] = "recovery_required"
-                                record["reason"] = f"daemon restarted during reviewer execution; job state {session.state}"
-                            record["recovered_at"] = utc_now_iso()
-                            changed = True
-                            continue
-                        except Exception:
-                            pass
-                    record["state"] = "recovery_required"
-                    record["reason"] = "daemon restarted during reviewer execution; automatic replay forbidden"
-                    record["recovered_at"] = utc_now_iso()
-                    changed = True
+                if record.get("state") not in _RECOVERABLE_STATES:
+                    continue
+                review_id = record.get("review_id") or ""
+                session_id = record.get("session_id") or review_id
+                if record.get("harness") and session_id:
+                    try:
+                        harness = self._get_harness()
+                        session = harness.reconcile(session_id)
+                        record["session_id"] = session.session_id
+                        record["job_id"] = session.job_id
+                        record["recovered_at"] = utc_now_iso()
+                        changed = True
+                        if session.state == "completed":
+                            # Keep the record active until the disposition runs,
+                            # so a crash here is retried rather than silently
+                            # settled as complete-without-decision.
+                            record["state"] = "running"
+                            pending_finalize.append((record, session))
+                        elif session.state in ("queued", "running", "launching"):
+                            record["state"] = "running"
+                            resume.append((record, session.session_id))
+                        else:
+                            reason = session.failure_reason or (
+                                "daemon restarted during reviewer execution; "
+                                f"job state {session.state}"
+                            )
+                            record["state"] = "failed"
+                            record["reason"] = reason
+                            failed.append((record, reason))
+                        continue
+                    except Exception as exc:
+                        reason = (
+                            "daemon restarted during reviewer execution; "
+                            f"harness reconcile failed: {exc}"
+                        )
+                        record["state"] = "failed"
+                        record["reason"] = reason
+                        record["recovered_at"] = utc_now_iso()
+                        changed = True
+                        failed.append((record, reason))
+                        continue
+                reason = "daemon restarted during reviewer execution; automatic replay forbidden"
+                record["state"] = "failed"
+                record["reason"] = reason
+                record["recovered_at"] = utc_now_iso()
+                changed = True
+                failed.append((record, reason))
             if changed:
                 self._save_state(state)
+
+        # Side effects run outside the state write so a slow disposition never
+        # holds the interrupted-review scan open.
+        for record, reason in failed:
+            self._emit_review_failed(record, reason)
+        for record, session in pending_finalize:
+            self._finalize_recovered_harness_review(record, session)
+        for record, session_id in resume:
+            self._resume_harness_polling(record, session_id)
+
+    def _emit_review_failed(self, record: dict[str, Any], reason: str) -> None:
+        if self.progress_channel is None:
+            return
+        payload = {"project_id": record.get("project_id")}
+        binding = record.get("conversation_binding")
+        if isinstance(binding, dict) and binding:
+            payload["conversation_binding"] = binding
+        self.progress_channel.emit(
+            payload, "REVIEW_FAILED",
+            task_id=record.get("task_id"),
+            occurrence_key=record.get("review_id"),
+            details={"reason": reason},
+        )
+
+    def _recovery_context(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild the disposition inputs for a recovered review record."""
+        worker = record.get("worker")
+        if not isinstance(worker, dict) or not worker:
+            worker = self._transition_records().get(record.get("source_request_id") or "") or {}
+        harness_cfg = record.get("harness_cfg")
+        if not isinstance(harness_cfg, dict):
+            harness_cfg = {}
+        binding = record.get("conversation_binding")
+        return {
+            "review_id": record.get("review_id") or "",
+            "project_id": record.get("project_id") or "",
+            "task_id": record.get("task_id") or "",
+            "source_request_id": record.get("source_request_id") or "",
+            "repo_path": record.get("repo_path") or "",
+            "harness_cfg": harness_cfg,
+            "worker": worker,
+            "binding": binding if isinstance(binding, dict) and binding else None,
+        }
+
+    def _finalize_recovered_harness_review(self, record: dict[str, Any], session: Any) -> None:
+        """Disposition a harness session that completed while the daemon was down."""
+        ctx = self._recovery_context(record)
+        if not ctx["repo_path"]:
+            reason = "recovered review lacks repository path evidence"
+            self._finish_harness_terminal(
+                ctx["review_id"], ctx["project_id"], ctx["task_id"],
+                ctx["source_request_id"], "failed", reason, binding=ctx["binding"],
+            )
+            return
+        try:
+            harness = self._get_harness()
+            review_result = harness.result(session.session_id)
+        except Exception as exc:
+            reason = f"recovered harness result unavailable: {exc}"
+            self._finish_harness_terminal(
+                ctx["review_id"], ctx["project_id"], ctx["task_id"],
+                ctx["source_request_id"], "failed", reason, binding=ctx["binding"],
+            )
+            return
+        self._finalize_harness_review(review_result=review_result, **ctx)
+
+    def _resume_harness_polling(self, record: dict[str, Any], session_id: str) -> None:
+        """Resume polling a harness session still in flight after a restart."""
+        review_id = record.get("review_id") or session_id
+        thread = threading.Thread(
+            target=self._run_resumed_harness_poll,
+            args=(copy.deepcopy(record), session_id),
+            name=f"devorch-review-resume-{review_id}",
+            daemon=True,
+        )
+        with self._lock:
+            self._threads[review_id] = thread
+        thread.start()
+
+    def _run_resumed_harness_poll(self, record: dict[str, Any], session_id: str) -> None:
+        ctx = self._recovery_context(record)
+        harness_cfg = ctx["harness_cfg"]
+        policy = record.get("policy") if isinstance(record.get("policy"), dict) else {}
+        timeout = float(
+            harness_cfg.get("timeout_seconds")
+            or harness_cfg.get("timeout")
+            or policy.get("timeout_seconds")
+            or 600.0
+        )
+        poll_interval = float(
+            harness_cfg.get("poll_interval_seconds")
+            or harness_cfg.get("poll_interval")
+            or 0.2
+        )
+        try:
+            harness = self._get_harness()
+            session = harness.status(session_id)
+            start_poll = time.monotonic()
+            while time.monotonic() - start_poll < timeout:
+                if session.state in ("completed", "failed", "cancelled"):
+                    break
+                time.sleep(poll_interval)
+                session = harness.status(session_id)
+            if session.state != "completed":
+                reason = session.failure_reason or (
+                    f"resumed review session {session.state}"
+                    if session.state in ("failed", "cancelled")
+                    else "resumed review session timed out waiting for completion"
+                )
+                self._finish_harness_terminal(
+                    ctx["review_id"], ctx["project_id"], ctx["task_id"],
+                    ctx["source_request_id"], "failed", reason, binding=ctx["binding"],
+                )
+                return
+            review_result = harness.result(session_id)
+        except Exception as exc:
+            self._finish_harness_terminal(
+                ctx["review_id"], ctx["project_id"], ctx["task_id"],
+                ctx["source_request_id"], "failed",
+                f"resumed reviewer harness error: {exc}", binding=ctx["binding"],
+            )
+            return
+        self._finalize_harness_review(review_result=review_result, **ctx)
 
     def state(self) -> dict[str, Any]:
         with self._lock:
@@ -257,6 +426,17 @@ class AIReviewerCoordinator:
             resource = worker.get("resource_context")
             if not isinstance(resource, dict):
                 self._record_terminal(review_id, project_id, source_request_id, "failed", "worker resource context missing")
+                continue
+            # Reviewer independence is a core contract: degenerate worker
+            # evidence ({} or blank/None identity fields) must fail closed here
+            # rather than silently degrading independence downstream.
+            missing = missing_independence_fields(policy.get("independence", "resource"), resource)
+            if missing:
+                self._record_terminal(
+                    review_id, project_id, source_request_id, "failed",
+                    "worker resource context incomplete for independence "
+                    f"{policy.get('independence', 'resource')!r}: missing {', '.join(missing)}",
+                )
                 continue
 
             harness_cfg = proj_dict.get("reviewer_harness")
@@ -611,6 +791,13 @@ class AIReviewerCoordinator:
                 "role_run_id": "reviewer-" + source_request_id.replace(":", "-"),
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 "harness": True,
+                # Recovery context: a daemon restart must be able to run the
+                # full deterministic disposition without the in-memory launch
+                # arguments, so the inputs it needs are durable on the record.
+                "repo_path": repo_path,
+                "harness_cfg": copy.deepcopy(harness_cfg) if isinstance(harness_cfg, dict) else {},
+                "worker": copy.deepcopy(worker) if isinstance(worker, dict) else {},
+                "policy": copy.deepcopy(policy) if isinstance(policy, dict) else {},
             }
             if binding and isinstance(binding, dict):
                 self._project_bindings[project_id] = copy.deepcopy(binding)
@@ -706,6 +893,14 @@ class AIReviewerCoordinator:
             if not isinstance(worker_resource, dict):
                 _fail_review("worker resource context missing")
                 return
+            independence = policy.get("independence", "resource")
+            missing = missing_independence_fields(independence, worker_resource)
+            if missing:
+                _fail_review(
+                    f"worker resource context incomplete for independence {independence!r}: "
+                    f"missing {', '.join(missing)}"
+                )
+                return
 
             from dev_orchestrator.review.models import ReviewRequest
             harness = self._get_harness()
@@ -788,30 +983,109 @@ class AIReviewerCoordinator:
             _fail_review(f"reviewer harness error: {exc}")
             return
 
-        # Post-execution verification:
-        # 1. Repository truth check
-        current_truth = read_repository_truth(repo_path)
+        self._finalize_harness_review(
+            review_id=review_id,
+            project_id=project_id,
+            task_id=task_id,
+            source_request_id=source_request_id,
+            repo_path=repo_path,
+            harness_cfg=harness_cfg,
+            worker=worker,
+            binding=binding,
+            review_result=review_result,
+        )
+
+    def _finalize_harness_review(
+        self,
+        *,
+        review_id: str,
+        project_id: str,
+        task_id: str,
+        source_request_id: str,
+        repo_path: str,
+        harness_cfg: dict[str, Any],
+        worker: dict[str, Any],
+        binding: Optional[dict[str, Any]],
+        review_result: Any,
+    ) -> None:
+        """Run the deterministic post-harness disposition for one review.
+
+        This is the single authoritative path from harness evidence to a DevO
+        lifecycle decision: repository-truth recheck, independent gates,
+        coverage completeness, findings classification, durable decision
+        persistence and exactly one terminal lifecycle event. It is shared by
+        normal completion and by daemon-restart recovery so a recovered review
+        can never settle without a decision.
+
+        Idempotent: a review that already holds a durable decision is left
+        untouched and no duplicate event is emitted.
+        """
         with self._lock:
-            rec = self._load_state()["reviews"].get(review_id, {})
+            rec = self._load_state()["reviews"].get(review_id) or {}
+            if rec.get("decision"):
+                # Already dispositioned (e.g. duplicate recovery pass).
+                return
+            role_run_id = rec.get("role_run_id") or f"reviewer-{review_id}"
+
+        def _fail(err_msg: str) -> None:
+            if self.accounting is not None:
+                self.accounting.end_interval(
+                    "technical_review",
+                    review_id,
+                    outcome="failed",
+                    project_id=project_id,
+                    task_id=task_id,
+                    role="reviewer",
+                    request_id=review_id,
+                    stage_run_id="review",
+                    role_run_id=role_run_id,
+                    source_request_id=source_request_id or None,
+                    attempt_id=source_request_id or None,
+                )
+                self.accounting.record_attempt_outcome(
+                    source_request_id,
+                    "rejected",
+                    project_id=project_id,
+                    task_id=task_id,
+                    role="reviewer",
+                    request_id=review_id,
+                    source_request_id=source_request_id,
+                    metadata={"review_kind": "technical_harness", "decision": "failed", "reason": err_msg},
+                )
+            self._finish_harness_terminal(
+                review_id, project_id, task_id, source_request_id, "failed", err_msg,
+                binding=binding,
+            )
+
+        # 1. Repository truth check. The reviewed anchor must be present and
+        #    must still match; a record without a recorded anchor cannot be
+        #    verified and therefore fails closed rather than being accepted.
+        branch = _nonblank(rec.get("branch"))
+        head = _nonblank(rec.get("head"))
+        status_hash = _nonblank(rec.get("review_status_hash"))
+        if branch is None or head is None or status_hash is None:
+            _fail("review anchor evidence missing; cannot verify repository truth")
+            return
+        current_truth = read_repository_truth(repo_path)
         if (
             not current_truth.valid
-            or current_truth.branch != rec.get("branch")
-            or current_truth.head != rec.get("head")
-            or current_truth.status_hash != rec.get("review_status_hash")
+            or current_truth.branch != branch
+            or current_truth.head != head
+            or current_truth.status_hash != status_hash
         ):
-            _fail_review("repository changed during review")
+            _fail("repository changed during review")
             return
 
         # 2. Independent gates check
         required_gates = harness_cfg.get("independent_gates") or []
         gates_ok, gate_err = self._check_independent_gates(worker, required_gates)
         if not gates_ok:
-            _fail_review(f"independent gate failed: {gate_err}")
+            _fail(f"independent gate failed: {gate_err}")
             return
 
         # 3. Coverage completeness check
         if review_result.completeness != "complete":
-            _fail_review(f"review coverage incomplete: {review_result.completeness} ({review_result.reason})")
+            _fail(f"review coverage incomplete: {review_result.completeness} ({review_result.reason})")
             return
 
         # 4. Findings classification
@@ -836,16 +1110,16 @@ class AIReviewerCoordinator:
                 review_id=review_id,
                 project_id=project_id,
                 task_id=task_id,
-                branch=str(rec.get("branch") or ""),
-                head=str(rec.get("head") or ""),
-                status_hash=str(rec.get("review_status_hash") or ""),
+                branch=branch,
+                head=head,
+                status_hash=status_hash,
                 decision=decision,
                 next_action=next_action,
                 disposition=disposition,
                 reason=reason,
             )
         except Exception as exc:
-            _fail_review(f"decision persistence failed: {exc}")
+            _fail(f"decision persistence failed: {exc}")
             return
 
         if self.accounting is not None:
@@ -858,7 +1132,7 @@ class AIReviewerCoordinator:
                 role="reviewer",
                 request_id=review_id,
                 stage_run_id="review",
-                role_run_id=record.get("role_run_id") or f"reviewer-{review_id}",
+                role_run_id=role_run_id,
                 source_request_id=source_request_id or None,
                 attempt_id=source_request_id or None,
             )

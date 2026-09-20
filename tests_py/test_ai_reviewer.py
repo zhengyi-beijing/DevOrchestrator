@@ -106,7 +106,12 @@ class DirectReviewerTests(unittest.TestCase):
             self.assertFalse(normalized["orchestration_ready"])
             self.assertNotIn("legacy", AIReviewerCoordinator(root / "runtime", ReviewerPort()).enabled_project_ids(config))
 
-    def test_restart_marks_active_review_recovery_required(self):
+    def test_restart_marks_active_non_harness_review_retry_eligible(self):
+        # A non-harness review interrupted by a daemon restart must land in a
+        # state the lifecycle can act on. `failed` is retry-eligible via
+        # resolve_retry_candidate; the previous `recovery_required` state was
+        # accepted by neither retry nor stale reconciliation and stalled the
+        # task permanently.
         with tempfile.TemporaryDirectory() as td:
             runtime = Path(td)
             (runtime / "ai-reviewer.json").write_text(json.dumps({
@@ -117,8 +122,25 @@ class DirectReviewerTests(unittest.TestCase):
             }), encoding="utf-8")
             reviewer = AIReviewerCoordinator(runtime, ReviewerPort())
             record = reviewer.state()["reviews"]["r1"]
-            self.assertEqual(record["state"], "recovery_required")
+            self.assertEqual(record["state"], "failed")
             self.assertIn("automatic replay forbidden", record["reason"])
+
+    def test_restart_migrates_legacy_recovery_required_review(self):
+        # Records written by an earlier daemon may still carry the dead-end
+        # `recovery_required` state; a restart must migrate them to a
+        # retry-eligible outcome rather than leaving them unactionable.
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td)
+            (runtime / "ai-reviewer.json").write_text(json.dumps({
+                "version": 1, "reviews": {"r1": {
+                    "review_id": "r1", "project_id": "p1", "source_request_id": "w1",
+                    "state": "recovery_required",
+                    "reason": "daemon restarted during reviewer execution",
+                }}
+            }), encoding="utf-8")
+            reviewer = AIReviewerCoordinator(runtime, ReviewerPort())
+            record = reviewer.state()["reviews"]["r1"]
+            self.assertEqual(record["state"], "failed")
 
     def test_project_context_injected_into_review_prompt(self):
         with tempfile.TemporaryDirectory() as td:

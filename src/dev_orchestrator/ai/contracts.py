@@ -18,6 +18,46 @@ _RESOURCE_FAILURE_CLASSIFICATIONS = {
 }
 
 
+#: Identity fields that prior-resource evidence must carry for each
+#: independence mode. This is the single source of truth for the reviewer
+#: independence invariant; every path that allocates a reviewer must enforce
+#: it through :func:`missing_independence_fields` rather than re-deriving it.
+INDEPENDENCE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "none": (),
+    "resource": ("resource_id",),
+    "account": ("provider", "account"),
+    "provider": ("provider",),
+}
+
+
+def missing_independence_fields(independence: str, previous: Any) -> tuple[str, ...]:
+    """Return required identity fields absent from ``previous`` evidence.
+
+    ``previous`` may be a :class:`ResourceContext`, a plain mapping (as carried
+    through harness request metadata), or ``None``. A field is considered
+    missing when it is absent, ``None``, or blank/whitespace, so degenerate
+    evidence such as ``{}`` or ``{"resource_id": None}`` fails closed exactly
+    like missing evidence. An empty result means the evidence satisfies the
+    mode.
+    """
+    if independence not in INDEPENDENCE_REQUIREMENTS:
+        raise ValueError("invalid independence")
+    required = INDEPENDENCE_REQUIREMENTS[independence]
+    if not required:
+        return ()
+    if previous is None:
+        return required
+    missing: list[str] = []
+    for name in required:
+        if isinstance(previous, Mapping):
+            value = previous.get(name)
+        else:
+            value = getattr(previous, name, None)
+        if not isinstance(value, str) or not value.strip():
+            missing.append(name)
+    return tuple(missing)
+
+
 def _nonblank(name: str, value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be nonblank")
@@ -88,12 +128,7 @@ class AIRoleRequest:
         if self.timeout_seconds is not None:
             if isinstance(self.timeout_seconds, bool) or self.timeout_seconds <= 0:
                 raise ValueError("timeout_seconds must be positive")
-        previous = self.previous_resource_context
-        required = {
-            "none": (), "resource": ("resource_id",),
-            "account": ("provider", "account"), "provider": ("provider",),
-        }[self.independence]
-        if any(previous is None or not getattr(previous, name) for name in required):
+        if missing_independence_fields(self.independence, self.previous_resource_context):
             raise ValueError("independence requires prior resource evidence")
         excluded = self.excluded_resource_ids
         if not isinstance(excluded, (tuple, list)):

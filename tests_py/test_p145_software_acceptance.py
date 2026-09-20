@@ -864,31 +864,31 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
         event_names = [c[1] for c in calls]
         self.assertIn("REVIEW_FAILED", event_names)
 
-    def test_coordinator_daemon_restart_reconciliation(self):
-        truth = read_repository_truth(str(self.repo))
-        source_id = "worker_req_rec"
-        review_id = "ai_review:" + source_id
-
-        # Write interrupted state to ai-reviewer.json
-        reviewer_state = {
-            "version": 1,
-            "reviews": {
-                review_id: {
-                    "review_id": review_id,
-                    "project_id": "labdemo",
-                    "task_id": "task_lab_rec",
-                    "source_request_id": source_id,
-                    "state": "running",
-                    "harness": True,
-                    "session_id": review_id,
-                    "started_at": utc_now_iso(),
-                }
-            }
+    def _restart_reviewer_state(self, review_id, source_id, truth, **overrides):
+        record = {
+            "review_id": review_id,
+            "project_id": "labdemo",
+            "task_id": "task_lab_rec",
+            "source_request_id": source_id,
+            "state": "running",
+            "harness": True,
+            "session_id": review_id,
+            "started_at": utc_now_iso(),
+            "branch": truth.branch,
+            "head": truth.head,
+            "review_status_hash": truth.status_hash,
+            "review_dirty": False,
+            "repo_path": str(self.repo),
+            "harness_cfg": {"blocking_severities": ["blocking"]},
+            "worker": {"resource_context": {"resource_id": "w/res/1", "provider": "w", "account": "a"}},
+            "policy": {"independence": "resource", "quality": "high", "timeout_seconds": 600.0},
         }
-        write_json(self.runtime / "ai-reviewer.json", reviewer_state, indent=2)
+        record.update(overrides)
+        write_json(self.runtime / "ai-reviewer.json", {"version": 1, "reviews": {review_id: record}}, indent=2)
+        return record
 
-        mock_harness = MagicMock()
-        reconciled_session = ReviewSession(
+    def _reconciled_session(self, review_id, source_id, truth, state="completed", job_id="job_lab_rec"):
+        return ReviewSession(
             session_id=review_id,
             request=ReviewRequest(
                 request_id=review_id,
@@ -899,21 +899,189 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
                 head=truth.head,
                 status_hash=truth.status_hash,
             ),
-            state="completed",
-            job_id="job_lab_rec",
+            state=state,
+            job_id=job_id,
         )
-        mock_harness.reconcile.return_value = reconciled_session
 
-        coordinator = AIReviewerCoordinator(
-            self.runtime,
-            port=None,
-            harness=mock_harness,
+    @staticmethod
+    def _review_result(review_id, findings=None, completeness="complete"):
+        return ReviewResult(
+            session_id=review_id,
+            job_id="job_lab_rec",
+            disposition="evidence",
+            completeness=completeness,
+            findings=list(findings or []),
+            coverage=ReviewCoverage(),
         )
+
+    def test_coordinator_daemon_restart_reconciliation_emits_clean_next_decision(self):
+        # A session completed while the daemon was down must yield a durable
+        # decision. Recovering harness/job state alone leaves the review
+        # complete-but-undecided, which neither advances nor retries.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_rec"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth)
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+        progress = MagicMock()
+
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness, progress_channel=progress)
 
         mock_harness.reconcile.assert_called_once_with(review_id)
-        saved_state = read_json(self.runtime / "ai-reviewer.json", {})
-        self.assertEqual(saved_state["reviews"][review_id]["state"], "completed")
-        self.assertEqual(saved_state["reviews"][review_id]["job_id"], "job_lab_rec")
+        mock_harness.result.assert_called_once_with(review_id)
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "completed")
+        self.assertEqual(saved["job_id"], "job_lab_rec")
+        self.assertEqual(saved["decision"], "next")
+        self.assertEqual(saved["next_action"], "next_task")
+
+        decisions = read_json(self.runtime / "review-decisions.json", {}).get("decisions", {})
+        self.assertIn(review_id, decisions)
+        self.assertEqual(decisions[review_id]["decision"], "next")
+        self.assertEqual(decisions[review_id]["head"], truth.head)
+        self.assertEqual(decisions[review_id]["review_status_hash"], truth.status_hash)
+
+        events = [c[0][1] for c in progress.emit.call_args_list]
+        self.assertIn("REVIEW_ACCEPTED", events)
+
+    def test_coordinator_daemon_restart_reconciliation_emits_blocking_remediate(self):
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_rec_block"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth)
+
+        finding = ReviewFinding(
+            file="src/x.py", start_line=1, end_line=2, severity="blocking",
+            category="correctness", rule_id="R1", message="boom",
+        )
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id, findings=[finding])
+        progress = MagicMock()
+
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness, progress_channel=progress)
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["decision"], "remediate")
+        decisions = read_json(self.runtime / "review-decisions.json", {}).get("decisions", {})
+        self.assertEqual(decisions[review_id]["decision"], "remediate")
+        self.assertEqual(decisions[review_id]["next_action"], "continue_current_stage")
+        self.assertIn("REMEDIATE", [c[0][1] for c in progress.emit.call_args_list])
+
+    def test_coordinator_daemon_restart_fails_closed_on_repository_drift(self):
+        # Recovery must re-verify the reviewed anchor, not trust stale evidence.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_rec_drift"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth, head="0" * 40)
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+        progress = MagicMock()
+
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness, progress_channel=progress)
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "failed")
+        self.assertIn("repository changed during review", saved["reason"])
+        decisions = read_json(self.runtime / "review-decisions.json", {}).get("decisions", {})
+        self.assertNotIn(review_id, decisions)
+        self.assertIn("REVIEW_FAILED", [c[0][1] for c in progress.emit.call_args_list])
+
+    def test_coordinator_daemon_restart_fails_closed_without_anchor_evidence(self):
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_rec_noanchor"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(
+            review_id, source_id, truth, branch=None, head=None, review_status_hash=None,
+        )
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness)
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "failed")
+        self.assertIn("anchor evidence missing", saved["reason"])
+        decisions = read_json(self.runtime / "review-decisions.json", {}).get("decisions", {})
+        self.assertNotIn(review_id, decisions)
+
+    def test_coordinator_daemon_restart_recovery_is_idempotent(self):
+        # A second recovery pass must not write a duplicate decision or event.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_rec_idem"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth)
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness)
+        first = read_json(self.runtime / "review-decisions.json", {})["decisions"][review_id]
+
+        # Force the record active again, as a crash mid-recovery would leave it.
+        state = read_json(self.runtime / "ai-reviewer.json", {})
+        state["reviews"][review_id]["state"] = "running"
+        write_json(self.runtime / "ai-reviewer.json", state, indent=2)
+
+        progress = MagicMock()
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness, progress_channel=progress)
+
+        second = read_json(self.runtime / "review-decisions.json", {})["decisions"][review_id]
+        self.assertEqual(first, second)
+        self.assertNotIn("REVIEW_ACCEPTED", [c[0][1] for c in progress.emit.call_args_list])
+
+    def test_coordinator_daemon_restart_failed_session_is_retry_eligible(self):
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_rec_failed"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth)
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(
+            review_id, source_id, truth, state="failed",
+        )
+        progress = MagicMock()
+
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness, progress_channel=progress)
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "failed")
+        self.assertIn("REVIEW_FAILED", [c[0][1] for c in progress.emit.call_args_list])
+
+    def test_coordinator_daemon_restart_resumes_in_flight_session(self):
+        # A session still running after restart must be resumed, not abandoned.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_rec_inflight"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth)
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(
+            review_id, source_id, truth, state="running",
+        )
+        mock_harness.status.return_value = self._reconciled_session(
+            review_id, source_id, truth, state="completed",
+        )
+        mock_harness.result.return_value = self._review_result(review_id)
+
+        coordinator = AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness)
+        thread = coordinator._threads.get(review_id)
+        self.assertIsNotNone(thread)
+        thread.join(timeout=30)
+        self.assertFalse(thread.is_alive())
+
+        decisions = read_json(self.runtime / "review-decisions.json", {}).get("decisions", {})
+        self.assertIn(review_id, decisions)
+        self.assertEqual(decisions[review_id]["decision"], "next")
 
     def test_control_api_review_endpoints(self):
         import http.client
