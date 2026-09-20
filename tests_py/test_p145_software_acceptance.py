@@ -589,6 +589,281 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
         event_names = [c[1] for c in calls]
         self.assertIn("REVIEW_FAILED", event_names)
 
+    def test_coordinator_propagates_worker_resource_context_and_independence_to_harness_request(self):
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_prop"
+        worker_record = {
+            "engine": "aibroker",
+            "state": "completed",
+            "project_id": "labdemo",
+            "task_id": "task_lab_prop",
+            "repo_path": str(self.repo),
+            "completed_at": utc_now_iso(),
+            "independent_gates": {"tests": "passed"},
+            "resource_context": {
+                "resource_id": "worker_res_test",
+                "provider": "anthropic",
+                "account": "default",
+                "model": "claude-3-opus",
+            },
+        }
+        texec_path = self.runtime / "transition-executor.json"
+        write_json(texec_path, {"version": 1, "executions": {source_id: worker_record}}, indent=2)
+
+        mock_harness = MagicMock()
+        mock_session = ReviewSession(
+            session_id="ai_review:" + source_id,
+            request=ReviewRequest(
+                request_id="ai_review:" + source_id,
+                project_id="labdemo",
+                task_id="task_lab_prop",
+                source_request_id=source_id,
+                branch=truth.branch,
+                head=truth.head,
+                status_hash=truth.status_hash,
+            ),
+            state="completed",
+            job_id="job_lab_prop",
+        )
+        mock_harness.submit.return_value = mock_session
+        mock_harness.status.return_value = mock_session
+        mock_result = ReviewResult(
+            session_id=mock_session.session_id,
+            job_id="job_lab_prop",
+            disposition="next",
+            completeness="complete",
+            findings=[],
+            coverage=ReviewCoverage(completeness="complete", selected_count=1, reviewed_count=1),
+            reason="Clean review",
+        )
+        mock_harness.result.return_value = mock_result
+
+        coordinator = AIReviewerCoordinator(
+            self.runtime,
+            port=None,
+            harness=mock_harness,
+        )
+        launched = coordinator.advance(self.config_path)
+        self.assertEqual(launched, ["ai_review:" + source_id])
+        for t in list(coordinator._threads.values()):
+            t.join(timeout=3)
+
+        self.assertEqual(mock_harness.submit.call_count, 1)
+        submitted_req: ReviewRequest = mock_harness.submit.call_args[0][0]
+        self.assertEqual(submitted_req.metadata.get("independence"), "resource")
+        self.assertEqual(
+            submitted_req.metadata.get("worker_resource_context"),
+            {"resource_id": "worker_res_test", "provider": "anthropic", "account": "default", "model": "claude-3-opus"},
+        )
+        self.assertEqual(
+            submitted_req.metadata.get("previous_resource_context"),
+            {"resource_id": "worker_res_test", "provider": "anthropic", "account": "default", "model": "claude-3-opus"},
+        )
+
+    def test_coordinator_missing_worker_resource_context_fails_closed_without_harness_launch(self):
+        source_id = "worker_req_no_res"
+        worker_record = {
+            "engine": "aibroker",
+            "state": "completed",
+            "project_id": "labdemo",
+            "task_id": "task_lab_no_res",
+            "repo_path": str(self.repo),
+            "completed_at": utc_now_iso(),
+            "independent_gates": {"tests": "passed"},
+            # resource_context missing!
+        }
+        texec_path = self.runtime / "transition-executor.json"
+        write_json(texec_path, {"version": 1, "executions": {source_id: worker_record}}, indent=2)
+
+        mock_harness = MagicMock()
+        coordinator = AIReviewerCoordinator(
+            self.runtime,
+            port=None,
+            harness=mock_harness,
+        )
+        launched = coordinator.advance(self.config_path)
+        self.assertEqual(launched, [])
+        mock_harness.submit.assert_not_called()
+
+        rec = coordinator.state()["reviews"].get("ai_review:" + source_id)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["state"], "failed")
+        self.assertIn("worker resource context missing", rec["reason"])
+
+    def test_coordinator_repository_truth_drift_fails_closed(self):
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_drift_head"
+        worker_record = {
+            "engine": "aibroker",
+            "state": "completed",
+            "project_id": "labdemo",
+            "task_id": "task_lab_drift_head",
+            "repo_path": str(self.repo),
+            "completed_at": utc_now_iso(),
+            "independent_gates": {"tests": "passed"},
+            "resource_context": {"resource_id": "res_1", "provider": "p", "account": "a", "model": "m"},
+        }
+        texec_path = self.runtime / "transition-executor.json"
+        write_json(texec_path, {"version": 1, "executions": {source_id: worker_record}}, indent=2)
+
+        mock_harness = MagicMock()
+        mock_session = ReviewSession(
+            session_id="ai_review:" + source_id,
+            request=ReviewRequest(
+                request_id="ai_review:" + source_id,
+                project_id="labdemo",
+                task_id="task_lab_drift_head",
+                source_request_id=source_id,
+                branch=truth.branch,
+                head=truth.head,
+                status_hash=truth.status_hash,
+            ),
+            state="running",
+            job_id="job_lab_drift_head",
+        )
+        mock_harness.submit.return_value = mock_session
+
+        completed_session = ReviewSession(
+            session_id="ai_review:" + source_id,
+            request=mock_session.request,
+            state="completed",
+            job_id="job_lab_drift_head",
+        )
+
+        def fake_status_drift_head(sess_id):
+            # Mutate repo by committing a new file, advancing HEAD
+            (self.repo / "src" / "drift_head.py").write_text("# drift head commit\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=str(self.repo), capture_output=True, check=True)
+            subprocess.run(["git", "commit", "-m", "drift commit"], cwd=str(self.repo), capture_output=True, check=True)
+            return completed_session
+
+        mock_harness.status.side_effect = fake_status_drift_head
+        mock_result = ReviewResult(
+            session_id=mock_session.session_id,
+            job_id="job_lab_drift_head",
+            disposition="next",
+            completeness="complete",
+            findings=[],
+            coverage=ReviewCoverage(completeness="complete", selected_count=1, reviewed_count=1),
+            reason="Clean review",
+        )
+        mock_harness.result.return_value = mock_result
+
+        progress_mock = MagicMock()
+        coordinator = AIReviewerCoordinator(
+            self.runtime,
+            port=None,
+            progress_channel=progress_mock,
+            harness=mock_harness,
+        )
+
+        launched = coordinator.advance(self.config_path)
+        self.assertEqual(launched, ["ai_review:" + source_id])
+
+        for t in list(coordinator._threads.values()):
+            t.join(timeout=3)
+
+        # Assert no decision in review-decisions.json
+        decisions_file = self.runtime / "review-decisions.json"
+        decisions_data = read_json(decisions_file, {}) if decisions_file.is_file() else {}
+        self.assertNotIn("ai_review:" + source_id, decisions_data.get("decisions", {}))
+
+        # Assert review record is failed with "repository changed during review"
+        rec = coordinator.state()["reviews"]["ai_review:" + source_id]
+        self.assertEqual(rec["state"], "failed")
+        self.assertIn("repository changed during review", rec["reason"])
+
+        # Assert REVIEW_FAILED event emitted
+        calls = [c[0] for c in progress_mock.emit.call_args_list]
+        event_names = [c[1] for c in calls]
+        self.assertIn("REVIEW_FAILED", event_names)
+
+    def test_coordinator_repository_status_hash_drift_fails_closed(self):
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_drift_stat"
+        worker_record = {
+            "engine": "aibroker",
+            "state": "completed",
+            "project_id": "labdemo",
+            "task_id": "task_lab_drift_stat",
+            "repo_path": str(self.repo),
+            "completed_at": utc_now_iso(),
+            "independent_gates": {"tests": "passed"},
+            "resource_context": {"resource_id": "res_1", "provider": "p", "account": "a", "model": "m"},
+        }
+        texec_path = self.runtime / "transition-executor.json"
+        write_json(texec_path, {"version": 1, "executions": {source_id: worker_record}}, indent=2)
+
+        mock_harness = MagicMock()
+        mock_session = ReviewSession(
+            session_id="ai_review:" + source_id,
+            request=ReviewRequest(
+                request_id="ai_review:" + source_id,
+                project_id="labdemo",
+                task_id="task_lab_drift_stat",
+                source_request_id=source_id,
+                branch=truth.branch,
+                head=truth.head,
+                status_hash=truth.status_hash,
+            ),
+            state="running",
+            job_id="job_lab_drift_stat",
+        )
+        mock_harness.submit.return_value = mock_session
+
+        completed_session = ReviewSession(
+            session_id="ai_review:" + source_id,
+            request=mock_session.request,
+            state="completed",
+            job_id="job_lab_drift_stat",
+        )
+
+        def fake_status_drift_dirty(sess_id):
+            # Write uncommitted dirty file to drift status_hash without changing HEAD
+            (self.repo / "dirty_uncommitted_file.txt").write_text("dirty content\n", encoding="utf-8")
+            return completed_session
+
+        mock_harness.status.side_effect = fake_status_drift_dirty
+        mock_result = ReviewResult(
+            session_id=mock_session.session_id,
+            job_id="job_lab_drift_stat",
+            disposition="next",
+            completeness="complete",
+            findings=[],
+            coverage=ReviewCoverage(completeness="complete", selected_count=1, reviewed_count=1),
+            reason="Clean review",
+        )
+        mock_harness.result.return_value = mock_result
+
+        progress_mock = MagicMock()
+        coordinator = AIReviewerCoordinator(
+            self.runtime,
+            port=None,
+            progress_channel=progress_mock,
+            harness=mock_harness,
+        )
+
+        launched = coordinator.advance(self.config_path)
+        self.assertEqual(launched, ["ai_review:" + source_id])
+
+        for t in list(coordinator._threads.values()):
+            t.join(timeout=3)
+
+        # Assert no decision in review-decisions.json
+        decisions_file = self.runtime / "review-decisions.json"
+        decisions_data = read_json(decisions_file, {}) if decisions_file.is_file() else {}
+        self.assertNotIn("ai_review:" + source_id, decisions_data.get("decisions", {}))
+
+        # Assert review record is failed with "repository changed during review"
+        rec = coordinator.state()["reviews"]["ai_review:" + source_id]
+        self.assertEqual(rec["state"], "failed")
+        self.assertIn("repository changed during review", rec["reason"])
+
+        # Assert REVIEW_FAILED event emitted
+        calls = [c[0] for c in progress_mock.emit.call_args_list]
+        event_names = [c[1] for c in calls]
+        self.assertIn("REVIEW_FAILED", event_names)
+
     def test_coordinator_daemon_restart_reconciliation(self):
         truth = read_repository_truth(str(self.repo))
         source_id = "worker_req_rec"

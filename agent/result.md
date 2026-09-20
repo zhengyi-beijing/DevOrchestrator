@@ -920,3 +920,29 @@ P14.5 Remediation result:
   - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
   - Knowledge graph updated with `graphify update .` (4071 nodes, 11525 edges, 189 communities).
 - Canonical worktree clean, all technical review findings remediated and verified. Committed locally without push.
+
+## P14.5 Round 3 Technical Review Remediation (2026-09-20)
+
+- Remediated Technical Review findings from `ai_review:manual-p145-final-abd0865`:
+  1. Worker Resource Context and Reviewer Independence Propagation (`ai_reviewer.py`, `runner.py`):
+     - Enforced fail-closed validation of `worker.get("resource_context")` in `AIReviewerCoordinator.advance()` before launching harness reviews, recording terminal failure `worker resource context missing` and skipping launch if absent or invalid.
+     - Enforced `worker.get("resource_context")` validation in `_run_harness_review()`, failing closed with `worker resource context missing`.
+     - Propagated `independence`, `quality`, `timeout_seconds`, `previous_resource_context`, and `worker_resource_context` to `ReviewRequest.metadata`.
+     - Updated `ReviewRunner.run()` to resolve `previous_resource_context` from either `ResourceContext` instance or mapping, derive `independence="resource"`, and dispatch `AIRoleRequest` with `independence="resource"` and `previous_resource_context`.
+  2. Repository Truth Drift Fail-Closed Enforcement (`ai_reviewer.py`):
+     - Verified existing post-execution repository truth verification (`current_truth.head != rec["head"]`, `current_truth.branch != rec["branch"]`, or `current_truth.status_hash != rec["review_status_hash"]`).
+     - Added software acceptance regression tests verifying that committed changes (HEAD drift) or uncommitted changes (status_hash drift) during review trigger `_fail_review("repository changed during review")`, set state to `failed`, write no decisions to `review-decisions.json`, and emit `REVIEW_FAILED`.
+  3. Acceptance and Regression Test Coverage (`test_p145_reviewer_harness.py`, `test_p145_software_acceptance.py`):
+     - Added `test_review_runner_dispatches_packet_with_resource_independence_and_previous_context` in `tests_py/test_p145_reviewer_harness.py`.
+     - Added `test_coordinator_propagates_worker_resource_context_and_independence_to_harness_request` in `tests_py/test_p145_software_acceptance.py`.
+     - Added `test_coordinator_missing_worker_resource_context_fails_closed_without_harness_launch` in `tests_py/test_p145_software_acceptance.py`.
+     - Added `test_coordinator_repository_truth_drift_fails_closed` in `tests_py/test_p145_software_acceptance.py`.
+     - Added `test_coordinator_repository_status_hash_drift_fails_closed` in `tests_py/test_p145_software_acceptance.py`.
+  4. Verification:
+     - Focused P14.5 test suites: 47 passed in 17.85s (`test_p145_reviewer_harness.py`, `test_p145_job_recovery.py`, `test_p145_software_acceptance.py`).
+     - Adjacent P14 durable jobs suites: 48 passed in 12.29s (`test_ai_reviewer.py`, `test_p14_durable_jobs.py`, `test_p14_job_recovery.py`, `test_p14_job_retry_identity.py`, `test_p14_job_transport.py`, `test_p14_software_acceptance.py`).
+     - Adjacent control and watchdog suites: 103 passed, 11 subtests passed in 30.36s.
+     - Full repository regression: 846 passed, 48 subtests passed in 295.64s (`python -m pytest tests_py -q`).
+     - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
+     - Knowledge graph updated with `graphify update .` (4115 nodes, 11667 edges, 174 communities).
+- Canonical worktree clean, ready for technical review. Committed locally without push.

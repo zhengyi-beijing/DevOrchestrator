@@ -357,7 +357,9 @@ class ReviewRunner:
 
         prev_res = request.metadata.get("previous_resource_context") or request.metadata.get("worker_resource_context")
         prev_ctx = None
-        if isinstance(prev_res, dict) and prev_res.get("resource_id"):
+        if isinstance(prev_res, ResourceContext):
+            prev_ctx = prev_res
+        elif isinstance(prev_res, dict) and prev_res.get("resource_id"):
             prev_ctx = ResourceContext(
                 resource_id=prev_res.get("resource_id"),
                 provider=prev_res.get("provider"),

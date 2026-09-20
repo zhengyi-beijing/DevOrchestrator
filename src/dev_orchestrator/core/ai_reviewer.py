@@ -212,7 +212,15 @@ class AIReviewerCoordinator:
             proj_dict = projects[project_id]
             harness_cfg = proj_dict.get("reviewer_harness")
             if isinstance(harness_cfg, dict) and harness_cfg.get("enabled") is True:
-                policy = {"quality": "high", "independence": "resource", "timeout_seconds": 600.0, "harness": True}
+                base_policy, _ = _review_policy(proj_dict)
+                policy = dict(base_policy) if base_policy else {
+                    "quality": "high",
+                    "independence": "resource",
+                    "timeout_seconds": 600.0,
+                }
+                policy["harness"] = True
+                if harness_cfg.get("timeout_seconds"):
+                    policy["timeout_seconds"] = float(harness_cfg["timeout_seconds"])
             else:
                 if self.port is None:
                     continue
@@ -246,6 +254,11 @@ class AIReviewerCoordinator:
             if binding is None and isinstance(worker.get("conversation_binding"), dict):
                 binding = worker.get("conversation_binding")
 
+            resource = worker.get("resource_context")
+            if not isinstance(resource, dict):
+                self._record_terminal(review_id, project_id, source_request_id, "failed", "worker resource context missing")
+                continue
+
             harness_cfg = proj_dict.get("reviewer_harness")
             if isinstance(harness_cfg, dict) and harness_cfg.get("enabled") is True:
                 self._launch_harness_review(
@@ -263,10 +276,6 @@ class AIReviewerCoordinator:
                 launched.append(review_id)
                 continue
 
-            resource = worker.get("resource_context")
-            if not isinstance(resource, dict):
-                self._record_terminal(review_id, project_id, source_request_id, "failed", "worker resource context missing")
-                continue
             previous = ResourceContext(
                 resource.get("resource_id"), resource.get("provider"),
                 resource.get("account"), resource.get("model"),
@@ -693,6 +702,11 @@ class AIReviewerCoordinator:
             )
 
         try:
+            worker_resource = worker.get("resource_context")
+            if not isinstance(worker_resource, dict):
+                _fail_review("worker resource context missing")
+                return
+
             from dev_orchestrator.review.models import ReviewRequest
             harness = self._get_harness()
 
@@ -713,6 +727,11 @@ class AIReviewerCoordinator:
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 "command_ref": harness_cfg.get("command_ref", "review-runner"),
                 "ocr_executable": harness_cfg.get("ocr_executable"),
+                "independence": policy.get("independence", "resource"),
+                "quality": policy.get("quality", "high"),
+                "timeout_seconds": float(policy.get("timeout_seconds", 600.0)),
+                "previous_resource_context": copy.deepcopy(worker_resource),
+                "worker_resource_context": copy.deepcopy(worker_resource),
             }
 
             req = ReviewRequest(

@@ -612,6 +612,72 @@ class DefaultReviewerHarnessTests(unittest.TestCase):
         sess_data = sess_art["content"]
         self.assertEqual(sess_data["result"]["disposition"], "next")
 
+    def test_review_runner_dispatches_packet_with_resource_independence_and_previous_context(self):
+        from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
+        job_cfg = JobsConfig(
+            runtime_root=self.runtime,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo,
+                    commands={"review-runner": JobCommandConfig(argv=["python", "-c", "import sys; sys.exit(0)"], cwd=".")},
+                )
+            },
+        )
+        job_service = JobService(self.runtime, config=job_cfg)
+        harness = DefaultReviewerHarness(self.runtime, job_service=job_service)
+        req = ReviewRequest(
+            request_id="runner_indep_sess",
+            project_id="p1",
+            task_id="t1",
+            source_request_id="src_1",
+            branch="main",
+            head="abc",
+            status_hash="def",
+            mode="scan",
+            scan_roots=["."],
+            metadata={
+                "repo_path": str(self.repo),
+                "independence": "resource",
+                "previous_resource_context": {
+                    "resource_id": "worker_res_1",
+                    "provider": "anthropic",
+                    "account": "default",
+                    "model": "claude-3-opus",
+                },
+            },
+        )
+        session = harness.submit(req)
+        store = ExecutionJobStore(self.runtime)
+        jdir = store._job_dir(session.job_id)
+
+        mock_port = MagicMock()
+        mock_port.execute.return_value = AIRoleResult(
+            request_id="ocr_review:runner_indep_sess:0",
+            role_run_id="reviewer",
+            status="succeeded",
+            output=json.dumps({
+                "reviewed_files": ["test.py"],
+                "skipped_files": [],
+                "findings": [],
+            }),
+            resource_context=ResourceContext("reviewer_res_2", "anthropic", "default", "claude-3-5-sonnet"),
+        )
+
+        runner = ReviewRunner(jdir, port=mock_port)
+        ret = runner.run()
+        self.assertEqual(ret, 0)
+
+        self.assertEqual(mock_port.execute.call_count, 1)
+        dispatched_req = mock_port.execute.call_args[0][0]
+        self.assertEqual(dispatched_req.role, "reviewer")
+        self.assertEqual(dispatched_req.independence, "resource")
+        self.assertIsNotNone(dispatched_req.previous_resource_context)
+        self.assertEqual(dispatched_req.previous_resource_context.resource_id, "worker_res_1")
+        self.assertEqual(dispatched_req.previous_resource_context.provider, "anthropic")
+        self.assertEqual(dispatched_req.previous_resource_context.account, "default")
+        self.assertEqual(dispatched_req.previous_resource_context.model, "claude-3-opus")
+
     def test_review_runner_run_empty_scope_fails_closed(self):
         job_cfg = JobsConfig(
             runtime_root=self.runtime,
