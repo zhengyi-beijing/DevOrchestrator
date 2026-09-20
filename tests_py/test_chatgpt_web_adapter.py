@@ -37,6 +37,26 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "abc-123|xyz-789||true|false")
 
+    def test_userscript_recovers_markerless_exact_turn_without_cross_turn_attribution(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "let turns=[];"
+            "globalThis.document={querySelectorAll:(q)=>q===\"[data-message-author-role='assistant']\"?"
+            "turns.filter(x=>x.role==='assistant'):turns};"
+            "require(\"" + script + "\");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const node=(role,text)=>({innerText:text,getAttribute:(n)=>n==='data-message-author-role'?role:null,role});"
+            "turns=[node('user','[DEVORCH_WEB_SOL_REQUEST req-7] do review'),node('assistant','{\\\"decision\\\":\\\"NEXT\\\"}')];"
+            "const recovered=a.findResponseText('req-7');"
+            "turns=[node('user','[DEVORCH_WEB_SOL_REQUEST req-8] do review'),node('user','later user'),node('assistant','later answer')];"
+            "const rejected=a.findResponseText('req-8');"
+            "console.log(recovered.replace(/\\n/g,'<NL>')+'|'+rejected);"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '[DEVORCH_WEB_SOL_RESPONSE req-7]<NL>{"decision":"NEXT"}|')
+
     def test_userscript_remote_sync_reload_is_throttled(self):
         script = SCRIPT.as_posix()
         code = (
@@ -126,7 +146,7 @@ class ChatGptWebAdapterTests(unittest.TestCase):
 
     def test_userscript_raises_transport_alert_from_server_attention_metadata(self):
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('// @version      0.1.12', source)
+        self.assertIn('// @version      0.1.13', source)
         self.assertIn('// @grant        GM_notification', source)
         self.assertIn('notification.attention !== "urgent"', source)
         self.assertIn('GM_notification({', source)

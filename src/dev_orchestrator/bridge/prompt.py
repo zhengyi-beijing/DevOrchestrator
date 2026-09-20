@@ -24,6 +24,26 @@ _DECISION_VALUES = [decision.value for decision in WebSolDecision]
 _NEXT_ACTION_VALUES = [action.value for action in NextAction]
 
 
+def ensure_websol_response_contract(request: WebSolRequest, prompt: str) -> str:
+    """Ensure a tagged Web Sol prompt carries the matching response marker contract."""
+    if not isinstance(prompt, str):
+        raise TypeError("prompt must be a string")
+    request_marker = "{0}{1}]".format(_REQUEST_HEAD, request.request_id)
+    if request_marker not in prompt:
+        return prompt
+    response_marker = "{0}{1}]".format(_RESPONSE_HEAD, request.request_id)
+    if response_marker in prompt:
+        return prompt
+    suffix = (
+        "\n\nTransport response contract (mandatory):\n"
+        "Your final answer MUST begin with this exact marker line:\n"
+        + response_marker
+        + "\nPlace the requested payload on the following lines. "
+        "This transport marker is required even if the task text asks for JSON only.\n"
+    )
+    return prompt.rstrip() + suffix
+
+
 def render_websol_prompt(request: WebSolRequest, context: str) -> str:
     """Render one Web Sol request into the exact bridge prompt contract.
 

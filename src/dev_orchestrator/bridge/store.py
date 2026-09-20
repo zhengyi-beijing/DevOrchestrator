@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
+from dev_orchestrator.bridge.prompt import ensure_websol_response_contract
 from dev_orchestrator.core.websol import WebSolRequest
 from dev_orchestrator.storage.json_store import append_jsonl, read_json, write_json
 
@@ -398,6 +399,8 @@ class BrowserBridgeStore:
             raise TypeError("request must be a WebSolRequest")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt must be a non-blank string")
+        if adapter == "chatgpt_web":
+            prompt = ensure_websol_response_contract(request, prompt)
         moment = _as_utc(now)
         with self._lock:
             queue = self._load_queue(adapter, binding_id)

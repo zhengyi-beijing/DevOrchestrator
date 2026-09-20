@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.12
+// @version      0.1.13
 // @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge plus paired 8770 conversation-presence heartbeat.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
@@ -356,6 +356,7 @@
     conversationIdFromUrl: conversationIdFromUrl,
     currentBindingId: currentBindingId,
     responseMatches: responseMatches,
+    findResponseText: findResponseText,
     advanceResponseStability: advanceResponseStability,
     classifyRenewResult: classifyRenewResult,
     requestAlreadySubmitted: requestAlreadySubmitted,
@@ -674,14 +675,25 @@
   }
 
   function findResponseText(requestId) {
-    if (typeof document === "undefined") {
-      return "";
+    if (typeof document === "undefined") { return ""; }
+    var assistants = document.querySelectorAll("[data-message-author-role='assistant']");
+    for (var i = assistants.length - 1; i >= 0; i--) {
+      var messageText = assistants[i].innerText || "";
+      if (responseMatches(messageText, requestId)) { return messageText; }
     }
-    var messages = document.querySelectorAll("[data-message-author-role='assistant']");
-    for (var i = messages.length - 1; i >= 0; i--) {
-      var messageText = messages[i].innerText || "";
-      if (responseMatches(messageText, requestId)) {
-        return messageText;
+    var marker = REQUEST_HEAD + requestId + "]";
+    var turns = document.querySelectorAll("[data-message-author-role]");
+    var seenExactRequest = false;
+    for (var j = 0; j < turns.length; j++) {
+      var turn = turns[j];
+      var role = turn.getAttribute ? turn.getAttribute("data-message-author-role") : "";
+      var text = turn.innerText || "";
+      if (role === "user") {
+        if (text.indexOf(marker) !== -1) { seenExactRequest = true; continue; }
+        if (seenExactRequest) { return ""; }
+      }
+      if (seenExactRequest && role === "assistant" && text.trim()) {
+        return RESPONSE_HEAD + requestId + "]\n" + text;
       }
     }
     return "";

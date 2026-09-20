@@ -26,6 +26,16 @@ class BrowserBridgeStoreTests(unittest.TestCase):
             self.assertEqual(b.project_id, "beta")
             self.assertEqual(b.prompt, "prompt B")
 
+    def test_tagged_chatgpt_prompt_gets_missing_response_contract_at_submit_boundary(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = BrowserBridgeStore(Path(td))
+            request = req("alpha", "r-contract", "n-contract")
+            prompt = "[DEVORCH_WEB_SOL_REQUEST r-contract]\nReturn EXACTLY ONE JSON object."
+            store.submit("chatgpt_web", "conv-A", request, prompt)
+            claim = store.claim("chatgpt_web", "conv-A")
+            self.assertIn("[DEVORCH_WEB_SOL_RESPONSE r-contract]", claim.prompt)
+            self.assertIn("required even if the task text asks for JSON only", claim.prompt)
+
     def test_submit_is_idempotent_but_request_id_nonce_conflict_fails(self):
         with tempfile.TemporaryDirectory() as td:
             store = BrowserBridgeStore(Path(td))
