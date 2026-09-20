@@ -1385,6 +1385,49 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
                 self.assertNotIn("REVIEW_ACCEPTED", events)
                 self.assertIn(review_id, ledger.get("quarantined_decisions", {}))
 
+    def test_anchorless_reviewer_record_cannot_be_settled_by_any_ledger_entry(self):
+        # Treating an absent record field as "no constraint" would let a ledger
+        # entry naming a foreign branch/HEAD settle an anchorless legacy
+        # record. The record must carry the identity being verified.
+        truth = read_repository_truth(str(self.repo))
+        for label, ledger_override in (
+            ("foreign_anchor", {"branch": "other-branch", "head": "0" * 40,
+                                "review_status_hash": "deadbeef"}),
+            ("matching_anchor", {}),
+        ):
+            with self.subTest(ledger=label):
+                source_id = f"worker_req_anchorless_{label}"
+                review_id = "ai_review:" + source_id
+                self._restart_reviewer_state(
+                    review_id, source_id, truth,
+                    branch=None, head=None, review_status_hash=None,
+                )
+                write_json(
+                    self.runtime / "review-decisions.json",
+                    {"version": 1, "decisions": {
+                        review_id: self._valid_ledger_record(
+                            review_id, truth, **ledger_override),
+                    }},
+                    indent=2,
+                )
+                mock_harness = MagicMock()
+                mock_harness.reconcile.return_value = self._reconciled_session(
+                    review_id, source_id, truth,
+                )
+                mock_harness.result.return_value = self._review_result(review_id)
+                progress = MagicMock()
+                AIReviewerCoordinator(
+                    self.runtime, port=None, harness=mock_harness,
+                    progress_channel=progress,
+                )
+
+                saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+                ledger = read_json(self.runtime / "review-decisions.json", {})
+                self.assertEqual(saved["state"], "failed")
+                self.assertIsNone(saved.get("decision"))
+                self.assertNotIn("REVIEW_ACCEPTED", [c[0][1] for c in progress.emit.call_args_list])
+                self.assertIn(review_id, ledger.get("quarantined_decisions", {}))
+
     def test_valid_durable_decision_is_still_projected(self):
         # Guard against the validation being so strict that legitimate
         # convergence stops working.

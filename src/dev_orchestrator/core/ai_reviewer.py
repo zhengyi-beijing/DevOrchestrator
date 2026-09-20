@@ -285,16 +285,18 @@ class AIReviewerCoordinator:
             return "decision/next_action pair is not allowed"
         # The reviewer record is the local identity authority; a ledger entry
         # that disagrees with it belongs to a different review or a stale
-        # schema and must not settle this one.
-        for name, rec_name in (
-            ("project_id", "project_id"),
-            ("task_id", "task_id"),
-            ("branch", "branch"),
-            ("head", "head"),
-            ("review_status_hash", "review_status_hash"),
+        # schema and must not settle this one. The record must actually carry
+        # the identity to compare against: treating an absent field as "no
+        # constraint" would let a ledger entry naming a foreign branch/HEAD
+        # settle an anchorless legacy record, which is the same fail-open this
+        # validation exists to prevent.
+        for name in (
+            "project_id", "task_id", "branch", "head", "review_status_hash",
         ):
-            expected = _nonblank(rec.get(rec_name))
-            if expected is not None and _nonblank(durable.get(name)) != expected:
+            expected = _nonblank(rec.get(name))
+            if expected is None:
+                return f"reviewer record lacks {name}; cannot verify decision identity"
+            if _nonblank(durable.get(name)) != expected:
                 return f"decision {name} does not match the reviewer record"
         return ""
 
