@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -1037,7 +1038,243 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
 
         second = read_json(self.runtime / "review-decisions.json", {})["decisions"][review_id]
         self.assertEqual(first, second)
-        self.assertNotIn("REVIEW_ACCEPTED", [c[0][1] for c in progress.emit.call_args_list])
+        self.assertEqual(second["consumed_at"], first["consumed_at"])
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "completed")
+        self.assertEqual(saved["decision"], "next")
+        # The replay re-offers the terminal event rather than dropping it; the
+        # progress channel is responsible for exactly-once delivery (asserted
+        # against the real channel in the dedup test below).
+        self.assertNotIn("REVIEW_FAILED", [c[0][1] for c in progress.emit.call_args_list])
+
+    def test_recovery_replay_delivers_lifecycle_event_exactly_once(self):
+        # Replay is only safe because the progress channel deduplicates on
+        # occurrence key and persists that ledger across processes. Assert the
+        # guarantee against the real channel, not a mock.
+        from dev_orchestrator.core.progress import ProgressChannel
+
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_exactly_once"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth)
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+
+        def emitted_accepted():
+            raw = read_json(self.runtime / "progress-channel.json", {})
+            return [
+                key for key in (raw.get("emitted") or {})
+                if "REVIEW_ACCEPTED" in key and review_id in key
+            ]
+
+        AIReviewerCoordinator(
+            self.runtime, port=None, harness=mock_harness,
+            progress_channel=ProgressChannel(self.runtime),
+        )
+        self.assertEqual(len(emitted_accepted()), 1)
+        original = read_json(self.runtime / "review-decisions.json", {})["decisions"][review_id]
+
+        # Replay the crash window repeatedly; delivery must stay exactly once.
+        for _ in range(3):
+            state = read_json(self.runtime / "ai-reviewer.json", {})
+            rec = state["reviews"][review_id]
+            rec["state"] = "running"
+            for key in ("decision", "next_action", "completed_at", "lifecycle_event_pending"):
+                rec.pop(key, None)
+            write_json(self.runtime / "ai-reviewer.json", state, indent=2)
+            AIReviewerCoordinator(
+                self.runtime, port=None, harness=mock_harness,
+                progress_channel=ProgressChannel(self.runtime),
+            )
+
+        self.assertEqual(len(emitted_accepted()), 1)
+        final = read_json(self.runtime / "review-decisions.json", {})["decisions"][review_id]
+        self.assertEqual(final, original)
+
+    def test_recovery_converges_after_crash_between_decision_and_state(self):
+        # The decision ledger is written before the reviewer-state terminal
+        # write. A replay landing between them must converge on the durable
+        # decision, not re-derive one: re-deriving raised a replay conflict and
+        # settled the review as failed while a real NEXT decision existed.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_crash_decision"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth)
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness)
+        first = read_json(self.runtime / "review-decisions.json", {})["decisions"][review_id]
+
+        # Simulate the crash window: ledger durable, reviewer state unfinished.
+        state = read_json(self.runtime / "ai-reviewer.json", {})
+        rec = state["reviews"][review_id]
+        rec["state"] = "running"
+        for key in ("decision", "next_action", "completed_at", "lifecycle_event_pending"):
+            rec.pop(key, None)
+        write_json(self.runtime / "ai-reviewer.json", state, indent=2)
+
+        progress = MagicMock()
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness, progress_channel=progress)
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        second = read_json(self.runtime / "review-decisions.json", {})["decisions"][review_id]
+        self.assertEqual(saved["state"], "completed")
+        self.assertEqual(saved["decision"], "next")
+        self.assertEqual(second["decision"], "next")
+        # The original ordering key must survive the replay.
+        self.assertEqual(second["consumed_at"], first["consumed_at"])
+        self.assertEqual(second, first)
+        events = [c[0][1] for c in progress.emit.call_args_list]
+        self.assertIn("REVIEW_ACCEPTED", events)
+        self.assertNotIn("REVIEW_FAILED", events)
+
+    def test_recovery_replays_lifecycle_event_owed_from_previous_process(self):
+        # A crash between the terminal state write and the event emit must not
+        # lose the event: terminal records are not otherwise replayed.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_crash_event"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth)
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness)
+
+        # Simulate the crash window: terminal state written, event never sent.
+        state = read_json(self.runtime / "ai-reviewer.json", {})
+        state["reviews"][review_id]["lifecycle_event_pending"] = "REVIEW_ACCEPTED"
+        write_json(self.runtime / "ai-reviewer.json", state, indent=2)
+
+        progress = MagicMock()
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness, progress_channel=progress)
+
+        events = [c[0][1] for c in progress.emit.call_args_list]
+        self.assertIn("REVIEW_ACCEPTED", events)
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertNotIn("lifecycle_event_pending", saved)
+
+    def test_terminal_write_marks_then_clears_pending_lifecycle_event(self):
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_pending_marker"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth)
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+
+        AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness, progress_channel=MagicMock())
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "completed")
+        self.assertNotIn("lifecycle_event_pending", saved)
+
+    def test_recovered_completed_session_without_repo_path_fails_closed(self):
+        # Legacy records predate repo_path. read_repository_truth("") resolves
+        # to the daemon cwd, so an unresolved path must never reach it.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_legacy_completed"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth, repo_path=None, worker={})
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+
+        cwd = os.getcwd()
+        os.chdir(str(self.repo))
+        try:
+            AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness)
+        finally:
+            os.chdir(cwd)
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "failed")
+        self.assertIn("repository path evidence", saved["reason"])
+        decisions = read_json(self.runtime / "review-decisions.json", {}).get("decisions", {})
+        self.assertNotIn(review_id, decisions)
+
+    def test_recovered_in_flight_session_without_repo_path_fails_closed(self):
+        # Same guard on the resumed path, where it was previously missing: the
+        # daemon cwd deliberately matches the stored Git anchors here, so an
+        # unguarded run would produce a NEXT decision against the wrong source.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_legacy_inflight"
+        review_id = "ai_review:" + source_id
+        self._restart_reviewer_state(review_id, source_id, truth, repo_path=None, worker={})
+
+        mock_harness = MagicMock()
+        mock_harness.reconcile.return_value = self._reconciled_session(
+            review_id, source_id, truth, state="running",
+        )
+        mock_harness.status.return_value = self._reconciled_session(review_id, source_id, truth)
+        mock_harness.result.return_value = self._review_result(review_id)
+
+        cwd = os.getcwd()
+        os.chdir(str(self.repo))
+        try:
+            coordinator = AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness)
+            thread = coordinator._threads.get(review_id)
+            if thread is not None:
+                thread.join(timeout=30)
+        finally:
+            os.chdir(cwd)
+
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["state"], "failed")
+        self.assertIn("repository path evidence", saved["reason"])
+        decisions = read_json(self.runtime / "review-decisions.json", {}).get("decisions", {})
+        self.assertNotIn(review_id, decisions)
+
+    def test_legacy_repo_path_recovered_only_from_matching_source_record(self):
+        # A legacy record may borrow repo_path from its exact source transition
+        # record, but only when project/task/source/branch/HEAD all agree.
+        truth = read_repository_truth(str(self.repo))
+        source_id = "worker_req_legacy_borrow"
+        review_id = "ai_review:" + source_id
+
+        def run_with_source(source_record):
+            write_json(
+                self.runtime / "transition-executor.json",
+                {"version": 1, "executions": {source_id: source_record}},
+                indent=2,
+            )
+            self._restart_reviewer_state(review_id, source_id, truth, repo_path=None, worker={})
+            for path in ("review-decisions.json",):
+                if (self.runtime / path).exists():
+                    (self.runtime / path).unlink()
+            mock_harness = MagicMock()
+            mock_harness.reconcile.return_value = self._reconciled_session(review_id, source_id, truth)
+            mock_harness.result.return_value = self._review_result(review_id)
+            AIReviewerCoordinator(self.runtime, port=None, harness=mock_harness)
+            return read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+
+        matching = {
+            "project_id": "labdemo", "task_id": "task_lab_rec",
+            "source_request_id": source_id, "branch": truth.branch,
+            "head": truth.head, "repo_path": str(self.repo),
+            "resource_context": {"resource_id": "w/res/1"},
+        }
+        self.assertEqual(run_with_source(matching)["state"], "completed")
+
+        for field, bad in (
+            ("head", "0" * 40),
+            ("branch", "other-branch"),
+            ("task_id", "different_task"),
+            ("project_id", "other_project"),
+        ):
+            with self.subTest(mismatched=field):
+                mismatched = dict(matching)
+                mismatched[field] = bad
+                saved = run_with_source(mismatched)
+                self.assertEqual(saved["state"], "failed")
+                self.assertIn("repository path evidence", saved["reason"])
 
     def test_coordinator_daemon_restart_failed_session_is_retry_eligible(self):
         truth = read_repository_truth(str(self.repo))

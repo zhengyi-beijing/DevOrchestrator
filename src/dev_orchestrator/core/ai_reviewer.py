@@ -38,6 +38,36 @@ _ALLOWED_DECISIONS = {
     ("stop", "stop"),
 }
 
+#: Decision-ledger fields that define a decision's identity. `consumed_at` is
+#: deliberately excluded: it is regenerated on every write, so including it
+#: would make an idempotent replay indistinguishable from a real conflict.
+_DECISION_IDENTITY_FIELDS = (
+    "project_id", "request_id", "disposition", "next_action", "decision",
+    "reason", "review_status_hash", "task_id", "stage_id", "branch", "head",
+    "role", "event", "source",
+)
+
+
+def _terminal_milestone(state_name: str, decision: Optional[str]) -> str:
+    """Map a terminal review state to the lifecycle milestone it owes, if any."""
+    if state_name == "completed":
+        if decision == "next":
+            return "REVIEW_ACCEPTED"
+        if decision == "remediate":
+            return "REMEDIATE"
+        return ""
+    if state_name == "failed":
+        return "REVIEW_FAILED"
+    return ""
+
+
+def _decision_identity(record: Any) -> tuple:
+    """Return the conflict-relevant identity of one decision-ledger record."""
+    if not isinstance(record, dict):
+        return ()
+    return tuple(record.get(name) for name in _DECISION_IDENTITY_FIELDS)
+
+
 def _nonblank(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -202,6 +232,10 @@ class AIReviewerCoordinator:
             if changed:
                 self._save_state(state)
 
+        # Re-emit any lifecycle event owed from a previous process before
+        # handling this scan's own side effects.
+        self._replay_pending_lifecycle_events()
+
         # Side effects run outside the state write so a slow disposition never
         # holds the interrupted-review scan open.
         for record, reason in failed:
@@ -210,6 +244,45 @@ class AIReviewerCoordinator:
             self._finalize_recovered_harness_review(record, session)
         for record, session_id in resume:
             self._resume_harness_polling(record, session_id)
+
+    def _durable_decision(self, review_id: str) -> Optional[dict[str, Any]]:
+        """Return the durable decision-ledger record for ``review_id``, if any."""
+        raw = read_json(self.decisions_path, None)
+        decisions = raw.get("decisions") if isinstance(raw, dict) else None
+        if not isinstance(decisions, dict):
+            return None
+        record = decisions.get(review_id)
+        return record if isinstance(record, dict) else None
+
+    def _project_durable_decision(
+        self,
+        review_id: str,
+        durable: dict[str, Any],
+        binding: Optional[dict[str, Any]],
+    ) -> None:
+        """Project an already-durable decision onto reviewer state and lifecycle.
+
+        Used when a crash left the decision ledger written but the reviewer
+        record unfinished. Converges the two stores without re-deriving or
+        re-persisting the decision. The lifecycle event is re-emitted with the
+        same occurrence key, which the progress channel deduplicates, so a
+        replay never produces a second event.
+        """
+        decision = str(durable.get("decision") or "")
+        next_action = str(durable.get("next_action") or "")
+        reason = str(durable.get("reason") or "")
+        self._finish_harness_terminal(
+            review_id,
+            str(durable.get("project_id") or ""),
+            str(durable.get("task_id") or ""),
+            "",
+            "completed",
+            reason,
+            decision=decision or None,
+            next_action=next_action or None,
+            binding=binding,
+            extra={"disposition": durable.get("disposition"), "recovered_decision": True},
+        )
 
     def _emit_review_failed(self, record: dict[str, Any], reason: str) -> None:
         if self.progress_channel is None:
@@ -225,11 +298,45 @@ class AIReviewerCoordinator:
             details={"reason": reason},
         )
 
+    def _recovery_repo_path(self, record: dict[str, Any], source: dict[str, Any]) -> Optional[str]:
+        """Resolve a trusted repository path for a recovered review record.
+
+        Records written before ``repo_path`` was persisted carry no path of
+        their own. Such a record may only borrow the path from its exact source
+        transition record, and only when that record agrees on project, task,
+        source request and the reviewed branch/HEAD. Anything else returns
+        ``None`` so the caller fails closed: an unresolved path would otherwise
+        be passed to ``read_repository_truth`` as ``""``, which resolves to the
+        daemon's working directory and could verify the wrong repository.
+        """
+        own = _nonblank(record.get("repo_path"))
+        if own is not None:
+            return own
+        if not isinstance(source, dict):
+            return None
+        candidate = _nonblank(source.get("repo_path"))
+        if candidate is None:
+            return None
+        for field in ("project_id", "task_id", "branch", "head"):
+            expected = _nonblank(record.get(field))
+            actual = _nonblank(source.get(field))
+            if expected is None or actual is None or expected != actual:
+                return None
+        if _nonblank(source.get("source_request_id")) != _nonblank(record.get("source_request_id")):
+            return None
+        return candidate
+
     def _recovery_context(self, record: dict[str, Any]) -> dict[str, Any]:
-        """Rebuild the disposition inputs for a recovered review record."""
+        """Rebuild the disposition inputs for a recovered review record.
+
+        ``repo_path`` is ``None`` when no trusted path could be established;
+        every caller must fail closed on that rather than substituting a
+        default.
+        """
+        source = self._transition_records().get(record.get("source_request_id") or "") or {}
         worker = record.get("worker")
         if not isinstance(worker, dict) or not worker:
-            worker = self._transition_records().get(record.get("source_request_id") or "") or {}
+            worker = source
         harness_cfg = record.get("harness_cfg")
         if not isinstance(harness_cfg, dict):
             harness_cfg = {}
@@ -239,37 +346,49 @@ class AIReviewerCoordinator:
             "project_id": record.get("project_id") or "",
             "task_id": record.get("task_id") or "",
             "source_request_id": record.get("source_request_id") or "",
-            "repo_path": record.get("repo_path") or "",
+            "repo_path": self._recovery_repo_path(record, source),
             "harness_cfg": harness_cfg,
             "worker": worker,
             "binding": binding if isinstance(binding, dict) and binding else None,
         }
 
+    def _fail_recovered_review(self, ctx: dict[str, Any], reason: str) -> None:
+        """Settle a recovered review as failed (and therefore retry-eligible)."""
+        self._finish_harness_terminal(
+            ctx["review_id"], ctx["project_id"], ctx["task_id"],
+            ctx["source_request_id"], "failed", reason, binding=ctx["binding"],
+        )
+
     def _finalize_recovered_harness_review(self, record: dict[str, Any], session: Any) -> None:
         """Disposition a harness session that completed while the daemon was down."""
         ctx = self._recovery_context(record)
-        if not ctx["repo_path"]:
-            reason = "recovered review lacks repository path evidence"
-            self._finish_harness_terminal(
-                ctx["review_id"], ctx["project_id"], ctx["task_id"],
-                ctx["source_request_id"], "failed", reason, binding=ctx["binding"],
+        if ctx["repo_path"] is None:
+            self._fail_recovered_review(
+                ctx, "recovered review lacks trusted repository path evidence",
             )
             return
         try:
             harness = self._get_harness()
             review_result = harness.result(session.session_id)
         except Exception as exc:
-            reason = f"recovered harness result unavailable: {exc}"
-            self._finish_harness_terminal(
-                ctx["review_id"], ctx["project_id"], ctx["task_id"],
-                ctx["source_request_id"], "failed", reason, binding=ctx["binding"],
-            )
+            self._fail_recovered_review(ctx, f"recovered harness result unavailable: {exc}")
             return
         self._finalize_harness_review(review_result=review_result, **ctx)
 
     def _resume_harness_polling(self, record: dict[str, Any], session_id: str) -> None:
-        """Resume polling a harness session still in flight after a restart."""
+        """Resume polling a harness session still in flight after a restart.
+
+        Refuses to resume without trusted repository evidence, so a session can
+        never be polled to completion and then verified against an unrelated
+        directory.
+        """
         review_id = record.get("review_id") or session_id
+        ctx = self._recovery_context(record)
+        if ctx["repo_path"] is None:
+            self._fail_recovered_review(
+                ctx, "recovered review lacks trusted repository path evidence",
+            )
+            return
         thread = threading.Thread(
             target=self._run_resumed_harness_poll,
             args=(copy.deepcopy(record), session_id),
@@ -282,6 +401,11 @@ class AIReviewerCoordinator:
 
     def _run_resumed_harness_poll(self, record: dict[str, Any], session_id: str) -> None:
         ctx = self._recovery_context(record)
+        if ctx["repo_path"] is None:
+            self._fail_recovered_review(
+                ctx, "recovered review lacks trusted repository path evidence",
+            )
+            return
         harness_cfg = ctx["harness_cfg"]
         policy = record.get("policy") if isinstance(record.get("policy"), dict) else {}
         timeout = float(
@@ -1002,7 +1126,7 @@ class AIReviewerCoordinator:
         project_id: str,
         task_id: str,
         source_request_id: str,
-        repo_path: str,
+        repo_path: Optional[str],
         harness_cfg: dict[str, Any],
         worker: dict[str, Any],
         binding: Optional[dict[str, Any]],
@@ -1022,10 +1146,21 @@ class AIReviewerCoordinator:
         """
         with self._lock:
             rec = self._load_state()["reviews"].get(review_id) or {}
-            if rec.get("decision"):
-                # Already dispositioned (e.g. duplicate recovery pass).
-                return
             role_run_id = rec.get("role_run_id") or f"reviewer-{review_id}"
+            durable = self._durable_decision(review_id)
+
+        if durable is not None:
+            # The decision ledger is the source of truth, and it is written
+            # before the reviewer-state terminal write. A replay that lands
+            # between those two writes must converge on the durable decision
+            # rather than re-deriving one: re-deriving would raise a spurious
+            # replay conflict and settle the review as failed while a real
+            # decision already exists. Re-emitting the terminal state is safe
+            # because the progress channel deduplicates on occurrence key.
+            if rec.get("decision") and rec.get("state") in _TERMINAL_STATES:
+                return
+            self._project_durable_decision(review_id, durable, binding)
+            return
 
         def _fail(err_msg: str) -> None:
             if self.accounting is not None:
@@ -1057,9 +1192,15 @@ class AIReviewerCoordinator:
                 binding=binding,
             )
 
-        # 1. Repository truth check. The reviewed anchor must be present and
-        #    must still match; a record without a recorded anchor cannot be
-        #    verified and therefore fails closed rather than being accepted.
+        # 1. Repository truth check. The reviewed anchor and the repository it
+        #    refers to must both be present and must still match; missing
+        #    evidence fails closed rather than being accepted. The repository
+        #    path is re-checked here as well as at each caller, because a blank
+        #    path would otherwise resolve to the daemon's working directory and
+        #    silently verify the wrong repository.
+        if _nonblank(repo_path) is None:
+            _fail("review repository path evidence missing; cannot verify repository truth")
+            return
         branch = _nonblank(rec.get("branch"))
         head = _nonblank(rec.get("head"))
         status_hash = _nonblank(rec.get("review_status_hash"))
@@ -1193,6 +1334,7 @@ class AIReviewerCoordinator:
         binding: Optional[dict[str, Any]] = None,
         extra: Optional[dict[str, Any]] = None,
     ) -> None:
+        milestone = _terminal_milestone(state_name, decision)
         with self._lock:
             state = self._load_state()
             record = state["reviews"].get(review_id)
@@ -1208,31 +1350,80 @@ class AIReviewerCoordinator:
                     record["next_action"] = next_action
                 if extra:
                     record.update(extra)
+                # Mark the lifecycle event as owed before emitting it. A crash
+                # between this write and the emit below would otherwise lose the
+                # event permanently, because terminal records are not replayed
+                # by interrupted-review recovery.
+                if milestone:
+                    record["lifecycle_event_pending"] = milestone
+                else:
+                    record.pop("lifecycle_event_pending", None)
                 self._save_state(state)
 
+        if milestone:
+            self._emit_terminal_milestone(
+                review_id, project_id, task_id, milestone, reason,
+                decision=decision, binding=binding,
+            )
+
+    def _emit_terminal_milestone(
+        self,
+        review_id: str,
+        project_id: str,
+        task_id: str,
+        milestone: str,
+        reason: str,
+        *,
+        decision: Optional[str] = None,
+        binding: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Emit one terminal lifecycle event and clear its pending marker.
+
+        The progress channel deduplicates on occurrence key, so replaying an
+        already-delivered event is a no-op.
+        """
         if self.progress_channel is not None:
             proj_payload = {"project_id": project_id}
             if binding:
                 proj_payload["conversation_binding"] = binding
-            if state_name == "completed":
-                if decision == "next":
-                    self.progress_channel.emit(
-                        proj_payload, "REVIEW_ACCEPTED",
-                        task_id=task_id, occurrence_key=review_id,
-                        details={"decision": decision, "reason": reason},
-                    )
-                elif decision == "remediate":
-                    self.progress_channel.emit(
-                        proj_payload, "REMEDIATE",
-                        task_id=task_id, occurrence_key=review_id,
-                        details={"decision": decision, "reason": reason},
-                    )
-            elif state_name == "failed":
-                self.progress_channel.emit(
-                    proj_payload, "REVIEW_FAILED",
-                    task_id=task_id, occurrence_key=review_id,
-                    details={"reason": reason},
-                )
+            details = {"reason": reason}
+            if decision:
+                details["decision"] = decision
+            self.progress_channel.emit(
+                proj_payload, milestone,
+                task_id=task_id, occurrence_key=review_id,
+                details=details,
+            )
+        with self._lock:
+            state = self._load_state()
+            record = state["reviews"].get(review_id)
+            if isinstance(record, dict) and record.pop("lifecycle_event_pending", None) is not None:
+                self._save_state(state)
+
+    def _replay_pending_lifecycle_events(self) -> None:
+        """Re-emit terminal lifecycle events owed from a previous process.
+
+        Covers a crash between the terminal state write and the event emit.
+        Deduplication makes an unnecessary replay harmless.
+        """
+        with self._lock:
+            state = self._load_state()
+            owed = [
+                (rid, copy.deepcopy(rec))
+                for rid, rec in state["reviews"].items()
+                if isinstance(rec, dict) and _nonblank(rec.get("lifecycle_event_pending"))
+            ]
+        for review_id, rec in owed:
+            binding = rec.get("conversation_binding")
+            self._emit_terminal_milestone(
+                review_id,
+                str(rec.get("project_id") or ""),
+                str(rec.get("task_id") or ""),
+                str(rec.get("lifecycle_event_pending")),
+                str(rec.get("reason") or ""),
+                decision=rec.get("decision"),
+                binding=binding if isinstance(binding, dict) and binding else None,
+            )
 
     def reconcile_session(self, session_id: str) -> Any:
         """Reconcile a review session via the harness."""
@@ -1557,8 +1748,19 @@ class AIReviewerCoordinator:
                 "source": "aibroker",
                 "consumed_at": utc_now_iso(),
             }
-            if existing is not None and existing != record:
-                raise RuntimeError("conflicting direct reviewer decision replay")
+            if existing is not None:
+                # A replay after a crash between decision persistence and the
+                # reviewer-state write must converge, not conflict. Compare on
+                # decision semantics only: `consumed_at` is regenerated on every
+                # call, so including it would make every replay look like a
+                # conflict and turn an already-durable decision into a spurious
+                # failure. The original `consumed_at` is preserved so downstream
+                # consumers keep a stable ordering key.
+                if _decision_identity(existing) != _decision_identity(record):
+                    raise RuntimeError("conflicting direct reviewer decision replay")
+                record["consumed_at"] = existing.get("consumed_at") or record["consumed_at"]
+                if existing == record:
+                    return
             decisions[review_id] = record
             write_json(
                 self.decisions_path,
