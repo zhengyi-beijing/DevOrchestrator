@@ -35,6 +35,20 @@ class ExplodingWatchdog:
         self.recorded.append(str(exc))
 
 
+class CapturingWatchdog:
+    def __init__(self):
+        self.summary = None
+        self.executor = None
+
+    def advance(self, _config, summary, *, executor=None):
+        self.summary = summary
+        self.executor = executor
+        return []
+
+    def record_tick_error(self, _exc):
+        raise AssertionError("watchdog should not fail")
+
+
 class DaemonTransitionIntegrationTests(unittest.TestCase):
     def test_tick_uses_projected_truth_for_decisions_but_keeps_raw_owner_gates(self):
         raw = {"projects": [{"project_id": "p1", "repo_path": "repo", "view": "raw"}]}
@@ -108,6 +122,33 @@ class DaemonTransitionIntegrationTests(unittest.TestCase):
         self.assertEqual(watchdog.recorded, ["watchdog boom"])
         self.assertEqual(result["projects"][0]["view"], "overlay")
         self.assertEqual(result["_watchdog_tick_error"], "watchdog boom")
+
+    def test_watchdog_uses_raw_ready_state_not_terminal_execution_projection(self):
+        """A prior failed Worker cannot hide a current READY_TO_RUN launch gap."""
+        raw = {"projects": [{
+            "project_id": "p1", "repo_path": "repo", "state": "READY_TO_RUN",
+            "lifecycle_state": "READY_TO_RUN", "view": "raw",
+        }]}
+        executor = FakeExecutor()
+        executor.overlay_managed_runs = lambda summary: {"projects": [{
+            **summary["projects"][0], "state": "WORKER_FAILED",
+            "lifecycle_state": "WORKER_FAILED", "view": "terminal-overlay",
+        }]}
+        watchdog = CapturingWatchdog()
+
+        with tempfile.TemporaryDirectory() as td, \
+             patch("dev_orchestrator.daemon.run_monitor_once", return_value=raw), \
+             patch("dev_orchestrator.daemon.write_project_statuses", return_value=[]), \
+             patch("dev_orchestrator.daemon.dispatch_worker_done_events", return_value=None), \
+             patch("dev_orchestrator.daemon.consume_websol_responses", return_value=None):
+            result = _run_orchestration_tick(
+                "config.json", Path(td), object(), executor, watchdog=watchdog, pid=123
+            )
+
+        self.assertIs(watchdog.summary, raw)
+        self.assertIs(watchdog.executor, executor)
+        self.assertEqual(watchdog.summary["projects"][0]["lifecycle_state"], "READY_TO_RUN")
+        self.assertEqual(result["projects"][0]["lifecycle_state"], "WORKER_FAILED")
 
 
 

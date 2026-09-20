@@ -142,7 +142,13 @@ def _run_orchestration_tick(
     )
     if watchdog is not None:
         try:
-            watchdog.advance(config, projected, executor=executor)
+            # The watchdog's READY_TO_RUN launch-gap detector must see the
+            # monitor's current lifecycle truth.  ``projected`` is a UI and
+            # dispatch view: it deliberately overlays the most recent
+            # terminal managed execution, which can relabel a newly ready
+            # task as WORKER_FAILED.  Active executions remain guarded by the
+            # executor state supplied to WatchdogCoordinator.
+            watchdog.advance(config, raw_summary, executor=executor)
         except Exception as _wd_exc:
             watchdog.record_tick_error(_wd_exc)
             watchdog_error = str(_wd_exc)
