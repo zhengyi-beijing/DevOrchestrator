@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import json
 import threading
 import time
@@ -36,6 +37,12 @@ _ALLOWED_DECISIONS = {
     ("remediate", "continue_current_stage"),
     ("owner_gate", "stop"),
     ("stop", "stop"),
+}
+_DECISION_DISPOSITIONS = {
+    ("next", "next_task"): "apply",
+    ("remediate", "continue_current_stage"): "remediate",
+    ("owner_gate", "stop"): "owner_gate",
+    ("stop", "stop"): "stop",
 }
 
 #: Decision-ledger fields that define a decision's identity. `consumed_at` is
@@ -73,6 +80,18 @@ def _nonblank(value: Any) -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def _is_utc_timestamp(value: Any) -> bool:
+    """Return whether ``value`` is an aware ISO-8601 timestamp in UTC."""
+    text = _nonblank(value)
+    if text is None:
+        return False
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == dt.timedelta(0)
 
 
 def _review_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
@@ -170,9 +189,9 @@ class AIReviewerCoordinator:
         A reconciled harness session that already finished is dispositioned
         through the normal deterministic path so its durable evidence yields a
         real decision; a session still in flight is resumed; anything else is
-        marked ``failed`` so ``resolve_retry_candidate`` can retry it. No
-        interrupted review is left in a state that neither carries a decision
-        nor is retry-eligible.
+        marked ``failed``. Records with authoritative source evidence remain
+        retry candidates; records without it receive an explicit terminal
+        recovery classification. No interrupted review is left active.
 
         Terminal transitions are never written inline here. Every one of them
         goes through :meth:`_finish_harness_terminal`, which persists the
@@ -181,18 +200,75 @@ class AIReviewerCoordinator:
         leaves the owed event replayable. Records whose terminal write has not
         happened yet simply stay active and are rescanned on the next restart.
         """
-        pending_finalize: list[tuple[dict[str, Any], Any]] = []
-        resume: list[tuple[dict[str, Any], str]] = []
-        failed: list[tuple[dict[str, Any], str]] = []
+        pending_finalize: list[tuple[str, dict[str, Any], Any]] = []
+        resume: list[tuple[str, dict[str, Any], str]] = []
+        failed: list[tuple[str, dict[str, Any], str, str | None]] = []
 
         with self._lock:
             state = self._load_state()
+            transitions = self._transition_records()
             changed = False
-            for record in state["reviews"].values():
+            blocked: dict[str, tuple[str, str]] = {}
+
+            # Normalize durable identities before touching a harness or emitting
+            # any lifecycle event. The map key is the canonical review id.
+            for review_id, record in state["reviews"].items():
                 if record.get("state") not in _RECOVERABLE_STATES:
                     continue
-                review_id = record.get("review_id") or ""
-                session_id = record.get("session_id") or review_id
+                embedded_id = _nonblank(record.get("review_id"))
+                prior_error = _nonblank(record.get("recovery_identity_error"))
+                if prior_error is not None:
+                    record["review_id"] = review_id
+                    blocked[review_id] = (prior_error, "terminal_identity_conflict")
+                    changed = True
+                    continue
+                if embedded_id is not None and embedded_id != review_id:
+                    reason = (
+                        "recovered review identity mismatch: embedded review_id "
+                        f"{embedded_id!r} disagrees with canonical key {review_id!r}"
+                    )
+                    record["recovery_identity_error"] = reason
+                    record["recovery_embedded_review_id"] = embedded_id
+                    record["review_id"] = review_id
+                    blocked[review_id] = (reason, "terminal_identity_conflict")
+                    changed = True
+                    continue
+                if embedded_id is None:
+                    record["review_id"] = review_id
+                    changed = True
+
+                source_request_id = _nonblank(record.get("source_request_id"))
+                if source_request_id is None:
+                    source_request_id = self._recover_source_request_id(
+                        review_id, record, transitions,
+                    )
+                    if source_request_id is None:
+                        reason = (
+                            "recovered review lacks authoritative source_request_id evidence; "
+                            "automatic retry is unavailable"
+                        )
+                        record["recovery_source_error"] = reason
+                        blocked[review_id] = (reason, "terminal_source_unrecoverable")
+                        changed = True
+                        continue
+                    record["source_request_id"] = source_request_id
+                    record.pop("recovery_source_error", None)
+                    changed = True
+
+            if changed:
+                self._save_state(state)
+
+            changed = False
+            for review_id, record in state["reviews"].items():
+                if record.get("state") not in _RECOVERABLE_STATES:
+                    continue
+                if review_id in blocked:
+                    reason, classification = blocked[review_id]
+                    record["recovered_at"] = utc_now_iso()
+                    changed = True
+                    failed.append((review_id, copy.deepcopy(record), reason, classification))
+                    continue
+                session_id = _nonblank(record.get("session_id")) or review_id
                 if record.get("harness") and session_id:
                     try:
                         harness = self._get_harness()
@@ -206,16 +282,16 @@ class AIReviewerCoordinator:
                             # so a crash here is retried rather than silently
                             # settled as complete-without-decision.
                             record["state"] = "running"
-                            pending_finalize.append((record, session))
+                            pending_finalize.append((review_id, copy.deepcopy(record), session))
                         elif session.state in ("queued", "running", "launching"):
                             record["state"] = "running"
-                            resume.append((record, session.session_id))
+                            resume.append((review_id, copy.deepcopy(record), session.session_id))
                         else:
                             reason = session.failure_reason or (
                                 "daemon restarted during reviewer execution; "
                                 f"job state {session.state}"
                             )
-                            failed.append((copy.deepcopy(record), reason))
+                            failed.append((review_id, copy.deepcopy(record), reason, None))
                         continue
                     except Exception as exc:
                         reason = (
@@ -224,12 +300,12 @@ class AIReviewerCoordinator:
                         )
                         record["recovered_at"] = utc_now_iso()
                         changed = True
-                        failed.append((copy.deepcopy(record), reason))
+                        failed.append((review_id, copy.deepcopy(record), reason, None))
                         continue
                 reason = "daemon restarted during reviewer execution; automatic replay forbidden"
                 record["recovered_at"] = utc_now_iso()
                 changed = True
-                failed.append((copy.deepcopy(record), reason))
+                failed.append((review_id, copy.deepcopy(record), reason, None))
             if changed:
                 self._save_state(state)
 
@@ -239,12 +315,15 @@ class AIReviewerCoordinator:
 
         # Side effects run outside the state write so a slow disposition never
         # holds the interrupted-review scan open.
-        for record, reason in failed:
-            self._fail_recovered_review(self._recovery_context(record), reason)
-        for record, session in pending_finalize:
-            self._finalize_recovered_harness_review(record, session)
-        for record, session_id in resume:
-            self._resume_harness_polling(record, session_id)
+        for review_id, record, reason, classification in failed:
+            self._fail_recovered_review(
+                self._recovery_context(review_id, record), reason,
+                classification=classification,
+            )
+        for review_id, record, session in pending_finalize:
+            self._finalize_recovered_harness_review(review_id, record, session)
+        for review_id, record, session_id in resume:
+            self._resume_harness_polling(review_id, record, session_id)
 
     def _durable_decision(self, review_id: str) -> Optional[dict[str, Any]]:
         """Return the durable decision-ledger record for ``review_id``, if any."""
@@ -272,17 +351,22 @@ class AIReviewerCoordinator:
         ]
         if missing:
             return f"incomplete decision record; missing {', '.join(sorted(missing))}"
-        if _nonblank(durable.get("consumed_at")) is None:
-            return "incomplete decision record; missing consumed_at"
+        if not _is_utc_timestamp(durable.get("consumed_at")):
+            return "decision consumed_at is not a timezone-aware ISO-8601 UTC timestamp"
         if _nonblank(durable.get("request_id")) != review_id:
             return "decision request_id does not match review id"
         if durable.get("role") != "reviewer" or durable.get("event") != "worker_done":
             return "decision role/event identity is not a reviewer worker_done record"
         if durable.get("stage_id") != "review":
             return "decision stage identity is not review"
+        if durable.get("source") != "aibroker":
+            return "decision source is not the authoritative aibroker writer"
         pair = (durable.get("decision"), durable.get("next_action"))
         if pair not in _ALLOWED_DECISIONS:
             return "decision/next_action pair is not allowed"
+        expected_disposition = _DECISION_DISPOSITIONS.get(pair)
+        if durable.get("disposition") != expected_disposition:
+            return "decision disposition does not match decision/next_action"
         # The reviewer record is the local identity authority; a ledger entry
         # that disagrees with it belongs to a different review or a stale
         # schema and must not settle this one. The record must actually carry
@@ -390,14 +474,88 @@ class AIReviewerCoordinator:
             return None
         return candidate
 
-    def _recovery_context(self, record: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _transition_matches_recovery_record(
+        source_request_id: str,
+        source: dict[str, Any],
+        record: dict[str, Any],
+    ) -> bool:
+        """Return whether one transition is authoritative for ``record``."""
+        if (
+            _nonblank(source.get("source_request_id")) != source_request_id
+            or source.get("engine") != "aibroker"
+            or source.get("state") != "completed"
+        ):
+            return False
+        for field in ("project_id", "task_id", "branch", "head"):
+            expected = _nonblank(record.get(field))
+            if expected is None or _nonblank(source.get(field)) != expected:
+                return False
+        repo_path = _nonblank(record.get("repo_path"))
+        if repo_path is not None and _nonblank(source.get("repo_path")) != repo_path:
+            return False
+        return True
+
+    @classmethod
+    def _transition_supports_recovery_retry(
+        cls,
+        source_request_id: str,
+        source: dict[str, Any],
+        record: dict[str, Any],
+    ) -> bool:
+        """Return whether the source carries the evidence retry resolution needs."""
+        if not cls._transition_matches_recovery_record(
+            source_request_id, source, record,
+        ):
+            return False
+        if source.get("source_kind") not in {
+            "owner_start", "control", "decision", "remediation",
+        }:
+            return False
+        if any(
+            _nonblank(source.get(field)) is None
+            for field in ("dispatch_id", "decision_id", "execution_id")
+        ):
+            return False
+        resource = source.get("resource_context")
+        return isinstance(resource, dict) and all(
+            _nonblank(resource.get(field)) is not None
+            for field in ("resource_id", "provider", "account", "model")
+        )
+
+    def _recover_source_request_id(
+        self,
+        review_id: str,
+        record: dict[str, Any],
+        transitions: dict[str, dict[str, Any]],
+    ) -> str | None:
+        """Recover a missing source id only from matching transition evidence."""
+        candidates = [
+            source_request_id
+            for source_request_id, source in transitions.items()
+            if self._transition_matches_recovery_record(source_request_id, source, record)
+        ]
+        direct = review_id.removeprefix("ai_review:")
+        if review_id.startswith("ai_review:") and direct in candidates:
+            return direct
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _recovery_context(self, review_id: str, record: dict[str, Any]) -> dict[str, Any]:
         """Rebuild the disposition inputs for a recovered review record.
 
         ``repo_path`` is ``None`` when no trusted path could be established;
         every caller must fail closed on that rather than substituting a
         default.
         """
-        source = self._transition_records().get(record.get("source_request_id") or "") or {}
+        source_request_id = _nonblank(record.get("source_request_id"))
+        source = self._transition_records().get(source_request_id) if source_request_id else None
+        if not isinstance(source, dict):
+            source = {}
+        failure_classification = None
+        if source_request_id is not None and not self._transition_supports_recovery_retry(
+            source_request_id, source, record,
+        ):
+            failure_classification = "terminal_source_unreachable"
         worker = record.get("worker")
         if not isinstance(worker, dict) or not worker:
             worker = source
@@ -406,26 +564,37 @@ class AIReviewerCoordinator:
             harness_cfg = {}
         binding = record.get("conversation_binding")
         return {
-            "review_id": record.get("review_id") or "",
+            "review_id": review_id,
             "project_id": record.get("project_id") or "",
             "task_id": record.get("task_id") or "",
-            "source_request_id": record.get("source_request_id") or "",
+            "source_request_id": source_request_id,
             "repo_path": self._recovery_repo_path(record, source),
             "harness_cfg": harness_cfg,
             "worker": worker,
             "binding": binding if isinstance(binding, dict) and binding else None,
+            "recovery_failure_classification": failure_classification,
         }
 
-    def _fail_recovered_review(self, ctx: dict[str, Any], reason: str) -> None:
-        """Settle a recovered review as failed (and therefore retry-eligible)."""
+    def _fail_recovered_review(
+        self,
+        ctx: dict[str, Any],
+        reason: str,
+        *,
+        classification: str | None = None,
+    ) -> None:
+        """Settle a recovered review as failed, with a classification if terminal."""
+        classification = classification or ctx.get("recovery_failure_classification")
         self._finish_harness_terminal(
             ctx["review_id"], ctx["project_id"], ctx["task_id"],
             ctx["source_request_id"], "failed", reason, binding=ctx["binding"],
+            extra={"recovery_classification": classification} if classification else None,
         )
 
-    def _finalize_recovered_harness_review(self, record: dict[str, Any], session: Any) -> None:
+    def _finalize_recovered_harness_review(
+        self, review_id: str, record: dict[str, Any], session: Any,
+    ) -> None:
         """Disposition a harness session that completed while the daemon was down."""
-        ctx = self._recovery_context(record)
+        ctx = self._recovery_context(review_id, record)
         if ctx["repo_path"] is None:
             self._fail_recovered_review(
                 ctx, "recovered review lacks trusted repository path evidence",
@@ -439,15 +608,16 @@ class AIReviewerCoordinator:
             return
         self._finalize_harness_review(review_result=review_result, **ctx)
 
-    def _resume_harness_polling(self, record: dict[str, Any], session_id: str) -> None:
+    def _resume_harness_polling(
+        self, review_id: str, record: dict[str, Any], session_id: str,
+    ) -> None:
         """Resume polling a harness session still in flight after a restart.
 
         Refuses to resume without trusted repository evidence, so a session can
         never be polled to completion and then verified against an unrelated
         directory.
         """
-        review_id = record.get("review_id") or session_id
-        ctx = self._recovery_context(record)
+        ctx = self._recovery_context(review_id, record)
         if ctx["repo_path"] is None:
             self._fail_recovered_review(
                 ctx, "recovered review lacks trusted repository path evidence",
@@ -455,7 +625,7 @@ class AIReviewerCoordinator:
             return
         thread = threading.Thread(
             target=self._run_resumed_harness_poll,
-            args=(copy.deepcopy(record), session_id),
+            args=(review_id, copy.deepcopy(record), session_id),
             name=f"devorch-review-resume-{review_id}",
             daemon=True,
         )
@@ -463,8 +633,10 @@ class AIReviewerCoordinator:
             self._threads[review_id] = thread
         thread.start()
 
-    def _run_resumed_harness_poll(self, record: dict[str, Any], session_id: str) -> None:
-        ctx = self._recovery_context(record)
+    def _run_resumed_harness_poll(
+        self, review_id: str, record: dict[str, Any], session_id: str,
+    ) -> None:
+        ctx = self._recovery_context(review_id, record)
         if ctx["repo_path"] is None:
             self._fail_recovered_review(
                 ctx, "recovered review lacks trusted repository path evidence",
@@ -1195,6 +1367,7 @@ class AIReviewerCoordinator:
         worker: dict[str, Any],
         binding: Optional[dict[str, Any]],
         review_result: Any,
+        recovery_failure_classification: str | None = None,
     ) -> None:
         """Run the deterministic post-harness disposition for one review.
 
@@ -1241,6 +1414,8 @@ class AIReviewerCoordinator:
             self._finish_harness_terminal(
                 review_id, project_id, task_id, source_request_id, "failed", err_msg,
                 binding=binding,
+                extra={"recovery_classification": recovery_failure_classification}
+                if recovery_failure_classification else None,
             )
 
         if durable is not None:
@@ -1398,7 +1573,7 @@ class AIReviewerCoordinator:
         review_id: str,
         project_id: str,
         task_id: str,
-        source_request_id: str,
+        source_request_id: str | None,
         state_name: str,
         reason: str,
         *,
@@ -1690,7 +1865,7 @@ class AIReviewerCoordinator:
         ):
             self._finish_result(review_id, result, "failed", "repository changed during review")
             return
-        disposition = "apply" if decision in ("next", "remediate") else decision
+        disposition = _DECISION_DISPOSITIONS[(decision, next_action)]
         try:
             self._write_decision(
                 review_id=review_id,
@@ -1807,9 +1982,13 @@ class AIReviewerCoordinator:
     ) -> None:
         with self._lock:
             raw = read_json(self.decisions_path, None)
-            decisions = raw.get("decisions") if isinstance(raw, dict) else None
+            payload = raw if isinstance(raw, dict) else {}
+            decisions = payload.get("decisions")
             if not isinstance(decisions, dict):
                 decisions = {}
+            quarantined = payload.get("quarantined_decisions")
+            if not isinstance(quarantined, dict):
+                quarantined = {}
             existing = decisions.get(review_id)
             record = {
                 "project_id": project_id,
@@ -1844,6 +2023,10 @@ class AIReviewerCoordinator:
             decisions[review_id] = record
             write_json(
                 self.decisions_path,
-                {"version": _DECISION_VERSION, "decisions": decisions},
+                {
+                    "version": _DECISION_VERSION,
+                    "decisions": decisions,
+                    "quarantined_decisions": quarantined,
+                },
                 indent=2,
             )

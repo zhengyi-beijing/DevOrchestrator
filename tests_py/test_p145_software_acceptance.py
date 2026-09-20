@@ -1385,6 +1385,193 @@ class P145SoftwareAcceptanceTests(unittest.TestCase):
                 self.assertNotIn("REVIEW_ACCEPTED", events)
                 self.assertIn(review_id, ledger.get("quarantined_decisions", {}))
 
+    def test_durable_decision_semantics_fail_closed(self):
+        truth = read_repository_truth(str(self.repo))
+        cases = {
+            "malformed_timestamp": {"consumed_at": "not-a-timestamp"},
+            "naive_timestamp": {"consumed_at": "2026-09-20T10:00:00"},
+            "non_utc_timestamp": {"consumed_at": "2026-09-20T10:00:00+08:00"},
+            "foreign_source": {"source": "foreign-authority"},
+            "next_wrong_disposition": {"disposition": "remediate"},
+            "remediate_wrong_disposition": {
+                "decision": "remediate",
+                "next_action": "continue_current_stage",
+                "disposition": "apply",
+            },
+        }
+        for label, override in cases.items():
+            with self.subTest(case=label):
+                source_id = f"worker_req_semantic_{label}"
+                review_id = "ai_review:" + source_id
+                saved, ledger, events = self._run_with_ledger(
+                    review_id,
+                    source_id,
+                    truth,
+                    self._valid_ledger_record(review_id, truth, **override),
+                )
+                self.assertEqual(saved["state"], "failed")
+                self.assertIsNone(saved.get("decision"))
+                self.assertNotIn("REVIEW_ACCEPTED", events)
+                self.assertNotIn(review_id, ledger.get("decisions", {}))
+                self.assertIn(review_id, ledger.get("quarantined_decisions", {}))
+
+    def test_recovery_uses_canonical_key_and_settles_missing_identity_once(self):
+        truth = read_repository_truth(str(self.repo))
+
+        # Missing embedded review_id is repaired from the canonical map key and
+        # the terminal failure is not reconciled or emitted again on restart.
+        source_id = "worker_req_key_only"
+        review_id = "ai_review:" + source_id
+        key_only = self._restart_reviewer_state(review_id, source_id, truth)
+        key_only.pop("review_id")
+        write_json(
+            self.runtime / "ai-reviewer.json",
+            {"version": 1, "reviews": {review_id: key_only}},
+            indent=2,
+        )
+        harness = MagicMock()
+        harness.reconcile.return_value = self._reconciled_session(
+            review_id, source_id, truth, state="failed",
+        )
+        first_progress = MagicMock()
+        AIReviewerCoordinator(
+            self.runtime, port=None, harness=harness, progress_channel=first_progress,
+        )
+        second_progress = MagicMock()
+        AIReviewerCoordinator(
+            self.runtime, port=None, harness=harness, progress_channel=second_progress,
+        )
+        saved = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][review_id]
+        self.assertEqual(saved["review_id"], review_id)
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["recovery_classification"], "terminal_source_unreachable")
+        self.assertEqual(harness.reconcile.call_count, 1)
+        self.assertEqual(
+            [c[0][1] for c in first_progress.emit.call_args_list], ["REVIEW_FAILED"],
+        )
+        self.assertEqual(second_progress.emit.call_count, 0)
+
+        # A conflicting embedded id is classified terminally under the key
+        # without contacting the harness under either identity.
+        conflict_id = "ai_review:canonical_conflict"
+        conflict_record = self._restart_reviewer_state(
+            conflict_id, "worker_req_conflict", truth,
+        )
+        conflict_record["review_id"] = "ai_review:foreign_conflict"
+        write_json(
+            self.runtime / "ai-reviewer.json",
+            {"version": 1, "reviews": {conflict_id: conflict_record}},
+            indent=2,
+        )
+        conflict_harness = MagicMock()
+        AIReviewerCoordinator(self.runtime, port=None, harness=conflict_harness)
+        conflict = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][conflict_id]
+        self.assertEqual(conflict["review_id"], conflict_id)
+        self.assertEqual(conflict["state"], "failed")
+        self.assertEqual(conflict["recovery_classification"], "terminal_identity_conflict")
+        self.assertIn("identity mismatch", conflict["reason"])
+        conflict_harness.reconcile.assert_not_called()
+
+        # A missing source id is repaired only from an identity-matching,
+        # completed AIBroker transition record.
+        recovered_source = "worker_req_source_evidence"
+        recovered_id = "ai_review:" + recovered_source
+        self._restart_reviewer_state(
+            recovered_id, recovered_source, truth, source_request_id=None,
+        )
+        write_json(
+            self.runtime / "transition-executor.json",
+            {"version": 1, "executions": {recovered_source: {
+                "source_request_id": recovered_source,
+                "project_id": "labdemo",
+                "task_id": "task_lab_rec",
+                "branch": truth.branch,
+                "head": truth.head,
+                "repo_path": str(self.repo),
+                "engine": "aibroker",
+                "state": "completed",
+                "source_kind": "remediation",
+                "dispatch_id": "dispatch_source_evidence",
+                "decision_id": "decision_source_evidence",
+                "execution_id": "execution_source_evidence",
+                "resource_context": {
+                    "resource_id": "worker/source-evidence",
+                    "provider": "provider",
+                    "account": "account",
+                    "model": "model",
+                },
+            }}},
+            indent=2,
+        )
+        recovered_harness = MagicMock()
+        recovered_harness.reconcile.return_value = self._reconciled_session(
+            recovered_id, recovered_source, truth, state="failed",
+        )
+        AIReviewerCoordinator(self.runtime, port=None, harness=recovered_harness)
+        recovered = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][recovered_id]
+        self.assertEqual(recovered["source_request_id"], recovered_source)
+        self.assertEqual(recovered["state"], "failed")
+        self.assertNotIn("recovery_classification", recovered)
+        recovered_harness.reconcile.assert_called_once_with(recovered_id)
+
+        # With no authoritative source evidence, recovery still terminates once
+        # with an explicit non-retryable classification.
+        unknown_id = "ai_review:source_unknown"
+        self._restart_reviewer_state(
+            unknown_id, "worker_req_source_unknown", truth, source_request_id=None,
+        )
+        write_json(
+            self.runtime / "transition-executor.json",
+            {"version": 1, "executions": {}},
+            indent=2,
+        )
+        unknown_harness = MagicMock()
+        unknown_progress = MagicMock()
+        AIReviewerCoordinator(
+            self.runtime, port=None, harness=unknown_harness,
+            progress_channel=unknown_progress,
+        )
+        AIReviewerCoordinator(
+            self.runtime, port=None, harness=unknown_harness,
+            progress_channel=MagicMock(),
+        )
+        unknown = read_json(self.runtime / "ai-reviewer.json", {})["reviews"][unknown_id]
+        self.assertEqual(unknown["state"], "failed")
+        self.assertEqual(unknown["recovery_classification"], "terminal_source_unrecoverable")
+        self.assertIn("automatic retry is unavailable", unknown["reason"])
+        unknown_harness.reconcile.assert_not_called()
+        self.assertEqual(
+            [c[0][1] for c in unknown_progress.emit.call_args_list], ["REVIEW_FAILED"],
+        )
+
+    def test_decision_write_retains_quarantined_forensic_record(self):
+        truth = read_repository_truth(str(self.repo))
+        bad_source = "worker_req_quarantine_retained"
+        bad_id = "ai_review:" + bad_source
+        _, before, _ = self._run_with_ledger(
+            bad_id, bad_source, truth, {"decision": "next"},
+        )
+        quarantined_before = before["quarantined_decisions"][bad_id]
+
+        good_id = "ai_review:unrelated_good"
+        coordinator = AIReviewerCoordinator(self.runtime, port=None)
+        coordinator._write_decision(
+            review_id=good_id,
+            project_id="labdemo",
+            task_id="task_lab_rec",
+            branch=truth.branch,
+            head=truth.head,
+            status_hash=truth.status_hash,
+            decision="next",
+            next_action="next_task",
+            disposition="apply",
+            reason="unrelated valid decision",
+        )
+
+        after = read_json(self.runtime / "review-decisions.json", {})
+        self.assertEqual(after["quarantined_decisions"][bad_id], quarantined_before)
+        self.assertEqual(after["decisions"][good_id]["decision"], "next")
+
     def test_anchorless_reviewer_record_cannot_be_settled_by_any_ledger_entry(self):
         # Treating an absent record field as "no constraint" would let a ledger
         # entry naming a foreign branch/HEAD settle an anchorless legacy
