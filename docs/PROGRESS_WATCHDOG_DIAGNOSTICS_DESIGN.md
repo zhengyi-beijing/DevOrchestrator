@@ -15,6 +15,7 @@ This specification establishes an active-project progress watchdog and determini
 4. **Deterministic Single-Flight Diagnostic Attempts**: Exactly one diagnostic attempt per durable stall event, bounded by monotonic deadlines and generation-based fencing.
 5. **Fail-Closed State Persistence**: Quarantining corrupt or future-version state files rather than silently erasing execution history.
 6. **Crash-Atomic Safe Recovery**: A two-phase reserve/enqueue/reconcile protocol using deterministic `wd-<attempt_key>` command identifiers, restricted exclusively to the existing non-destructive `continue` control action behind explicit opt-in.
+7. **Ready-Launch Gap Detection**: A stale `READY_TO_RUN` task with no active managed execution is diagnosed separately.  Scratch or unrelated dirty-worktree writes do not count as launch progress; complete current control identity, owner-gate, pause, repository-safety, and normal launch guards remain mandatory.
 
 ---
 
@@ -138,9 +139,19 @@ ACTIVE_LIFECYCLE_STATES = frozenset({
     "EXECUTING",
     "REVIEWING",
     "REMEDIATING",
+    "READY_TO_RUN",  # only when no active managed execution exists
 })
 ```
-All other states (`IDLE`, `READY_TO_RUN`, `WAITING_REVIEW`, `WAITING_PHASE_GATE`, `BLOCKED`, `WORKER_LOST`, `WORKER_FAILED`, `MONITOR_ERROR`, `UNAVAILABLE`) are ignored.
+`READY_TO_RUN` is monitored only for the dedicated no-execution launch gap. Its
+activity clock excludes raw Git-worktree and stale worker-runtime writes, since
+neither can prove that an unlaunched task progressed. It retains the immutable
+HEAD plus agent, role, progress-channel, and job evidence. A recovery is
+eligible only when the current control identity is complete and still
+`READY_TO_RUN`, has no owner gate, is not paused, and has a clean valid
+repository; the existing control consumer then repeats its normal guards.
+
+All other states (`IDLE`, `WAITING_REVIEW`, `WAITING_PHASE_GATE`, `BLOCKED`,
+`WORKER_LOST`, `WORKER_FAILED`, `MONITOR_ERROR`, `UNAVAILABLE`) are ignored.
 
 ### 5.2 Lifecycle Override Normalization and Family Fallback
 Configuration allows overriding the stall threshold per state:

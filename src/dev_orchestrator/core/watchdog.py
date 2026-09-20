@@ -675,6 +675,77 @@ def collect_progress_signals(
     return last_progress_at, progress_fingerprint, signal_sources
 
 
+def _ready_launch_gap_signals(
+    signals: tuple[str | None, str, dict[str, Any]],
+) -> tuple[str | None, str, dict[str, Any]]:
+    """Return progress signals relevant to an unlaunched READY_TO_RUN task.
+
+    A ready task has no managed Worker whose repository writes can establish
+    progress.  In that state an unrelated dirty/untracked file (a copied
+    prompt, editor scratch file, or diagnostic artifact) must not indefinitely
+    refresh the launch timer.  Such a write remains visible to the normal
+    repository-safety guard and can still block a launch; it is simply not
+    evidence that the ready task made progress.
+    """
+    _last_progress_at, _fingerprint, signal_sources = signals
+    sources = signal_sources.get("sources") if isinstance(signal_sources.get("sources"), dict) else {}
+    agent = sources.get("agent_file") if isinstance(sources.get("agent_file"), dict) else {}
+    payload = signal_sources.get("fingerprint_inputs") if isinstance(signal_sources.get("fingerprint_inputs"), dict) else {}
+    if not payload:
+        return signals
+    # Older or reduced adapters may not publish per-source activity.  Their
+    # aggregate is still the only available evidence, so retain it rather than
+    # silently declaring a ready gap immediately.  The selective behavior is
+    # only possible once the adapter explicitly identifies a Git or worker
+    # runtime source to exclude.
+    source_breakdown_available = any(
+        isinstance(sources.get(kind), dict)
+        for kind in ("git_changed", "worker_runtime", "agent_file")
+    )
+    agent_activity_at = agent.get("last_activity_at") if source_breakdown_available else payload.get("last_activity_at")
+    role_records = payload.get("role_records") if isinstance(payload.get("role_records"), dict) else {}
+    role_timestamps = [
+        record.get("timestamp")
+        for record in role_records.values()
+        if isinstance(record, dict)
+    ]
+    progress_entry = payload.get("progress_entry") if isinstance(payload.get("progress_entry"), dict) else {}
+    job_records = payload.get("job_records") if isinstance(payload.get("job_records"), dict) else {}
+    last_progress_at = _latest_timestamp_value((
+        agent_activity_at,
+        *role_timestamps,
+        progress_entry.get("timestamp"),
+        job_records.get("timestamp"),
+    ))
+
+    # Keep the immutable HEAD and all durable role/progress records, but omit
+    # raw worktree and old worker-runtime activity.  Neither can prove progress
+    # for a task that has no current managed execution.
+    ready_sources = {
+        "agent_file": {
+            "last_activity_at": agent_activity_at,
+            "path": agent.get("path"),
+        },
+        "git_changed": {"last_activity_at": None, "path": None},
+        "worker_runtime": {"last_activity_at": None, "path": None},
+    }
+    ready_payload = {
+        "git_head": payload.get("git_head"),
+        "last_activity_at": agent_activity_at,
+        "newest_kind": "ready_launch_activity",
+        "newest_path": agent.get("path"),
+        "sources": ready_sources,
+        "changed_entries_considered": 0,
+        "role_records": copy.deepcopy(role_records),
+        "progress_entry": copy.deepcopy(progress_entry) if progress_entry else None,
+        "job_records": copy.deepcopy(job_records) if job_records else None,
+    }
+    ready_signal_sources = copy.deepcopy(signal_sources)
+    ready_signal_sources["ready_launch_gap_activity"] = True
+    ready_signal_sources["fingerprint_inputs"] = ready_payload
+    return last_progress_at, build_progress_fingerprint(ready_payload), ready_signal_sources
+
+
 @dataclass(frozen=True)
 class StallAssessment:
     monitored: bool
@@ -689,6 +760,7 @@ class StallAssessment:
     activity_evidence: str
     active_execution: bool
     recovery_epoch: dict[str, Any] | None
+    last_progress_at: str | None
 
 
 def evaluate_stall(
@@ -707,6 +779,8 @@ def evaluate_stall(
     task_id = telemetry.get("task_id") or snapshot.get("task_id")
 
     active_execution = _has_active_execution(snapshot, executor_state)
+    if lifecycle_state == "READY_TO_RUN" and not active_execution:
+        last_progress_at, progress_fingerprint, signal_sources = _ready_launch_gap_signals(signals)
     monitored = lifecycle_state in ACTIVE_LIFECYCLE_STATES and not (
         lifecycle_state == "READY_TO_RUN" and active_execution
     )
@@ -739,6 +813,7 @@ def evaluate_stall(
         activity_evidence=evidence_state,
         active_execution=active_execution,
         recovery_epoch=resolve_recovery_epoch(snapshot, executor_state),
+        last_progress_at=last_progress_at,
     )
 
 
@@ -1372,13 +1447,7 @@ class WatchdogCoordinator:
                     continue
 
                 signals = collect_progress_signals(snapshot, self.runtime_root)
-                last_progress_at, progress_fingerprint, signal_sources = signals
-
-                prow["last_progress_at"] = last_progress_at
-                prow["progress_fingerprint"] = progress_fingerprint
-                prow["signal_sources"] = signal_sources
-                prow["activity_evidence"] = signal_sources.get("activity_evidence", "available")
-                prow["activity_evidence_reason"] = signal_sources.get("activity_evidence_reason")
+                _last_progress_at, _progress_fingerprint, signal_sources = signals
 
                 if signal_sources.get("activity_evidence") != "available":
                     prow["last_error"] = "activity-evidence-unavailable"
@@ -1394,6 +1463,14 @@ class WatchdogCoordinator:
                     now=tick_now,
                     executor_state=executor_state,
                 )
+                # READY_TO_RUN without an execution deliberately uses the
+                # launch-gap subset of activity; persist that same evidence
+                # rather than reporting a scratch worktree write as progress.
+                prow["last_progress_at"] = assessment.last_progress_at
+                prow["progress_fingerprint"] = assessment.progress_fingerprint
+                prow["signal_sources"] = signal_sources
+                prow["activity_evidence"] = assessment.activity_evidence
+                prow["activity_evidence_reason"] = signal_sources.get("activity_evidence_reason")
                 epoch_advanced = self._reconcile_recovery_epoch(prow, assessment)
 
                 if not assessment.breached:
@@ -1704,6 +1781,25 @@ class WatchdogCoordinator:
         recovery_action = "continue"
         recovery_target: dict[str, Any] = {}
         if diag_code == "ready_to_run_unlaunched":
+            # Bind a launch-gap recovery to the same complete, current control
+            # identity that the consumer will validate.  READY_TO_RUN alone is
+            # insufficient: a current owner gate or pause must remain a hard
+            # stop even if a stale projection still advertises READY_TO_RUN.
+            from dev_orchestrator.control.surface import project_identity
+            identity = project_identity(snapshot, self.runtime_root)
+            required_identity = ("project_id", "repo_path", "branch", "head", "task_id")
+            if any(not str(identity.get(field) or "").strip() for field in required_identity):
+                self._emit_owner_gate_once(pid, attempt_record, "ready_to_run_identity_incomplete")
+                return
+            if identity.get("gate_id") is not None:
+                self._emit_owner_gate_once(pid, attempt_record, "ready_to_run_owner_gate_present")
+                return
+            if identity.get("paused"):
+                self._emit_owner_gate_once(pid, attempt_record, "ready_to_run_project_paused")
+                return
+            if str(identity.get("lifecycle_state") or "").upper() != "READY_TO_RUN":
+                self._emit_owner_gate_once(pid, attempt_record, "ready_to_run_identity_lifecycle_changed")
+                return
             if current_lifecycle != "READY_TO_RUN":
                 self._emit_owner_gate_once(pid, attempt_record, "ready_to_run_lifecycle_changed")
                 return
@@ -1872,6 +1968,9 @@ class WatchdogCoordinator:
         truth = read_repository_truth(repo_path)
         if not truth.valid:
             self._emit_owner_gate_once(pid, attempt_record, f"repository_invalid: {truth.error}")
+            return
+        if truth.dirty:
+            self._emit_owner_gate_once(pid, attempt_record, "repository_dirty")
             return
 
         # Check one-recovery-per-run-scope

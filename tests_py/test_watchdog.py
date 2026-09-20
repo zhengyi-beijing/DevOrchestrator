@@ -232,6 +232,40 @@ class WatchdogPolicyAndLifecycleTests(unittest.TestCase):
         self.assertFalse(active.monitored)
         self.assertFalse(active.breached)
 
+    def test_ready_launch_gap_ignores_unrelated_worktree_activity(self):
+        """A scratch/untracked write cannot hide an unlaunched ready task."""
+        now = datetime.now(timezone.utc)
+        old_time = (now - timedelta(hours=2)).isoformat()
+        scratch_time = (now - timedelta(seconds=5)).isoformat()
+        policy = resolve_watchdog_policy({"watchdog": {"enabled": True}})
+        signals = (
+            scratch_time,
+            "ordinary-worktree-fingerprint",
+            {
+                "activity_evidence": "available",
+                "sources": {
+                    "agent_file": {"last_activity_at": old_time, "path": "agent/next.md"},
+                    "git_changed": {"last_activity_at": scratch_time, "path": "tmp/prompt.txt"},
+                    "worker_runtime": {"last_activity_at": None, "path": None},
+                },
+                "fingerprint_inputs": {
+                    "git_head": "abc123",
+                    "last_activity_at": scratch_time,
+                    "newest_kind": "git_changed",
+                    "newest_path": "tmp/prompt.txt",
+                    "sources": {}, "changed_entries_considered": 1,
+                    "role_records": {}, "progress_entry": None, "job_records": None,
+                },
+            },
+        )
+        assessment = evaluate_stall(
+            snapshot={"project_id": "p1", "state": "READY_TO_RUN", "task_id": "T1"},
+            policy=policy, signals=signals, now=now,
+        )
+        self.assertTrue(assessment.breached)
+        self.assertEqual(assessment.last_progress_at, old_time)
+        self.assertNotEqual(assessment.progress_fingerprint, "ordinary-worktree-fingerprint")
+
 
 if __name__ == "__main__":
     unittest.main()

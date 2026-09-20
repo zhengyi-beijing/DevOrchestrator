@@ -2503,15 +2503,102 @@ class WatchdogRecoveryTests(unittest.TestCase):
         self.assertEqual(command["expected"]["task_id"], "P14.5")
         self.assertEqual(command["expected"]["head"], head)
 
-        # Restart/replay retains the same epoch-bound reservation and does not
-        # reset its budget or enqueue a duplicate command.
+        # The existing guarded-control consumer launches exactly once.  This
+        # proves the diagnostic does more than write a watchdog record.
+        from types import SimpleNamespace
+        from dev_orchestrator.core.control_commands import ControlCommandCoordinator
+
+        class RecordingExecutor:
+            def __init__(self):
+                self.calls = []
+
+            def start_control(self, project, observed, command_id):
+                self.calls.append((project["project_id"], observed["state"], command_id))
+                return SimpleNamespace(task_id="P14.5", backend_id="recording")
+
+            def state(self):
+                return {"executions": {}}
+
+        executor = RecordingExecutor()
+        control_result = ControlCommandCoordinator(self.runtime_dir).advance(
+            config_path, {"projects": [snapshot]}, executor,
+        )
+        self.assertEqual(control_result[0]["state"], "accepted")
+        self.assertEqual(executor.calls, [("p1", "READY_TO_RUN", attempt["recovery"]["command_id"])])
+
+        # Reconcile the consumer result before restart.  A still-stale snapshot
+        # must not launch another Worker or enqueue another recovery command.
+        coordinator.advance(config_path, {"projects": [snapshot]}, now=now)
+        reconciled_attempt = next(iter(coordinator.project_state("p1")["attempts"].values()))
+        self.assertEqual(reconciled_attempt["recovery"]["state"], "completed")
+
+        # Restart/replay retains the same epoch-bound consumed slot and does
+        # not reset its budget or enqueue a duplicate command.
         restarted = WatchdogCoordinator(self.runtime_dir, progress_channel=channel)
         replay = restarted.advance(config_path, {"projects": [snapshot]}, now=now)
         self.assertEqual(replay[0]["status"], "deduplicated")
         replay_row = restarted.project_state("p1")
         self.assertEqual(replay_row["recovery_epoch"], row["recovery_epoch"])
         self.assertEqual(len(replay_row["attempts"]), 1)
-        self.assertEqual(len(list((self.runtime_dir / "control" / "inbox").glob("wd-*.json"))), 1)
+        self.assertEqual(len(list((self.runtime_dir / "control" / "inbox").glob("wd-*.json"))), 0)
+
+    def test_ready_gap_recovery_respects_current_owner_pause_and_dirty_guards(self):
+        """The launch-gap diagnostic cannot cross present owner or repo barriers."""
+        from dev_orchestrator.control.owner_store import OwnerControlStore
+        from dev_orchestrator.core.diagnostics import evidence_hash as compute_ev_hash
+        from dev_orchestrator.core.watchdog import compute_record_integrity_hash
+
+        head = subprocess.check_output(
+            ["git", "-C", str(self.repo_dir), "rev-parse", "HEAD"], text=True
+        ).strip()
+        base_snapshot = {
+            "project_id": "p1", "repo_path": str(self.repo_dir),
+            "state": "READY_TO_RUN", "lifecycle_state": "READY_TO_RUN",
+            "telemetry": {"task_id": "P14.5"},
+            "git": {"branch": "master", "head": head, "dirty": False},
+        }
+
+        for name in ("owner_gate", "paused", "dirty"):
+            with self.subTest(barrier=name):
+                runtime = self.root / ("runtime-" + name)
+                runtime.mkdir()
+                channel = DummyProgressChannel()
+                coordinator = WatchdogCoordinator(runtime, progress_channel=channel)
+                snapshot = dict(base_snapshot)
+                if name == "owner_gate":
+                    (runtime / "ai-planner.json").write_text(json.dumps({"plans": {
+                        "gate": {"project_id": "p1", "plan_id": "gate", "state": "owner_gate"}
+                    }}), encoding="utf-8")
+                elif name == "paused":
+                    OwnerControlStore(runtime).set_paused("p1", True, command_id="pause", action="pause")
+                else:
+                    (self.repo_dir / "README.md").write_text("dirty\n", encoding="utf-8")
+                    snapshot["git"] = {"branch": "master", "head": head, "dirty": True}
+
+                evidence = {"process_liveness": {"process_alive": False, "pid": None}}
+                attempt = {
+                    "attempt_key": "ready-" + name, "run_scope_key": "scope-" + name,
+                    "task_id": "P14.5", "state": "completed",
+                    "diagnosis": "ready_to_run_unlaunched", "owner_gate_required": False,
+                    "completed_at": _recent_completed_at(), "evidence": evidence,
+                    "evidence_hash": compute_ev_hash(evidence),
+                }
+                attempt["record_integrity_hash"] = compute_record_integrity_hash(attempt)
+                row = {"attempts": {attempt["attempt_key"]: attempt}}
+                coordinator._cached_state["projects"]["p1"] = row
+                coordinator._check_and_trigger_recovery(
+                    {"project_id": "p1", "repo_path": str(self.repo_dir),
+                     "watchdog": {"enabled": True, "auto_recovery": True}},
+                    snapshot, row, attempt["attempt_key"], attempt,
+                )
+                self.assertIsNone(attempt.get("recovery"))
+                self.assertEqual(list((runtime / "control" / "inbox").glob("wd-*.json")), [])
+                gates = [event for event in channel.events if event[1] == "OWNER_GATE"]
+                self.assertEqual(len(gates), 1)
+
+                # Restore the shared repository before the next subtest.
+                if name == "dirty":
+                    (self.repo_dir / "README.md").write_text("# Test", encoding="utf-8")
 
     def test_current_owner_gate_is_never_cleared_by_epoch_reconciliation(self):
         """A current OWNER_GATE remains a hard stop even if old watchdog data differs."""

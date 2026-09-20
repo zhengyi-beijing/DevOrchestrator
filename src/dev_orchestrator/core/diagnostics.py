@@ -298,7 +298,7 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
     if (
         lifecycle == "READY_TO_RUN"
         and not bool(getattr(assessment, "active_execution", False))
-        and pid is None
+        and is_alive is not True
     ):
         return Diagnosis(
             code="ready_to_run_unlaunched",
