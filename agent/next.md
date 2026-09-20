@@ -1,78 +1,61 @@
-# P14.5 Reviewer Harness & OpenCodeReview Adapter
+# NEXT — Watchdog recovery-epoch / stale OWNER_GATE cleanup
 
-Status: **READY_TO_RUN**
+Status: **NEXT AFTER P14.5** (P14.5 closed at `e2fce11` on 2026-09-20)
 
-Goal: standardize code-review preparation, project rule enforcement, model delegation and structured findings without making any review engine or model the DevO lifecycle authority.
+Sequence per `docs/backlog.md`:
+`P14.5 (closed) -> Watchdog recovery-epoch cleanup -> P14.6 Unattended Execution Stabilization Gate -> P15`
+
+Goal: prevent a historical watchdog-generated OWNER_GATE/recovery budget from
+contaminating a newer valid execution epoch, while preserving genuine
+owner-decision gates.
 
 Scope:
-- Introduce a provider-neutral ReviewerHarness boundary owned by DevO; OpenCodeReview is the first adapter/backend, not a hard architectural dependency.
-- Use OpenCodeReview for deterministic diff/full-scan preparation, file selection, rule packs, review sessions, coverage and structured finding localization.
-- Keep reviewer model selection in AIBroker by role/quota/cost policy.
-- Support delegated semantic review while preserving independent build/test/static-analysis gates.
-- Normalize findings into a durable DevO finding contract and run review as a P14 durable job.
+- Define a durable recovery-epoch identity from current task/plan/control command/HEAD/execution evidence.
+- When newer valid execution evidence supersedes the evidence that created a watchdog-generated OWNER_GATE, invalidate the stale watchdog gate, attempts, diagnosis and evidence hash automatically.
+- Never auto-clear an explicit owner-decision OWNER_GATE; only watchdog/recovery-generated stale gates are eligible.
+- Project health/watchdog projection must not report historical owner_gate/unknown while a newer authoritative execution is healthy.
+- Reset attempts_this_run and recovery budget only on a proven epoch transition, not merely because a worker process appeared.
+- Add regression coverage for stale historical gate cleanup, genuine owner gate preservation, restart/replay, and new Worker/Reviewer epochs.
 
 Acceptance:
-- A representative repository can run diff review and bounded full scan without RDC as the normal transport.
-- Review can delegate to an AIBroker-selected model, persist structured findings/coverage and recover across transport interruption.
-- ReviewerHarness supplies evidence only; DevO remains the sole lifecycle authority.
+- Reproduce the P14.5-era case (new WORKER_RUNNING/EXECUTING while the watchdog retains an old owner_gate with attempts=20), advance to a newer epoch, and prove automatic cleanup without a manual watchdog-clear or user continue.
 
-Design note: detailed executable design must be independently reviewed before implementation.
+## Carried forward from P14.5 — residual NON_BLOCKING items
 
-## Approved executable design
+None of these blocked P14.5 closure. They are recorded here so they are not
+lost; schedule them against the task where each fits rather than treating them
+as a single unit.
 
-Add a provider-neutral, evidence-only ReviewerHarness backed initially by OpenCodeReview’s deterministic preparation capabilities and AIBroker-selected semantic reviewers. Reviews run as recoverable P14 jobs, persist versioned findings and coverage as JSON/SARIF, and feed the existing AIReviewerCoordinator without granting OpenCodeReview, its model, or the job runtime lifecycle authority.
+| id | Item | Suggested home |
+| --- | --- | --- |
+| NB-1 | `timeout_seconds` serves as both the whole-review coordinator budget (`ai_reviewer.py`) and a fresh per-packet `AIRoleRequest` timeout (`review/runner.py`); multi-packet reviews can outlive the coordinator budget. Separate the two, or propagate a bounded remaining budget. | P14.6 |
+| NB-2 | Accounting idempotency: a crash after decision persistence but before `end_interval`/`record_attempt_outcome` leaves a right-censored interval. Replaying the current APIs is unsafe because accounting events lack deterministic ids. Add idempotent accounting identities or a repair projection. | P14.6 |
+| NB-3 | `quarantined_decisions` has no consumer, operator surface or retention bound. | Watchdog/operator surface work |
+| NB-4 | `recovery_identity_error` durably blocks a review with a conflicting embedded id and no operator exit path. | This task (operator visibility) |
+| NB-5 | `_emit_terminal_milestone` swallows all emit exceptions without diagnostics; persistent transport failure is invisible. | This task (operator visibility) |
+| NB-6 | `_transition_supports_recovery_retry` is stricter than `resolve_retry_candidate`, so some genuinely retryable records may be classified `terminal_source_unreachable`. Fail-closed, but worth aligning. | This task |
+| NB-7 | `advance()`-level test coverage for degenerate worker resource contexts; the implementation validates, only the test exercises the helper directly. | P14.6 |
+| NB-8 | `AIRoleRequest.previous_resource_context` accepts a plain `Mapping` despite its `ResourceContext` annotation. Cosmetic type-contract alignment. | P14.6 |
+| NB-9 | Web Sol bridge lease duration: the `chatgpt_web` adapter claims a request then stops renewing its 30s lease, so a multi-minute review cannot return through the bridge. Transport defect, outside P14.5. | Separate bridge task |
+| NB-10 | The reviewer-remediation convergence policy developed during P14.5 is not yet encoded in `docs/development-workflow.md` (frozen contract artifact, blocking-finding admission rules, per-set and per-task remediation budgets, multi-reviewer disagreement policy). | Process work, before the next long review cycle |
+| NB-11 | `review/runner.py:195` forbids the delegated model from emitting lifecycle tokens, but `review/runner.py:505-514` has the runner itself emit a field named `disposition` with values `next`/`remediate`. The only consumer is the reporting field at `review/store.py:115`; DevO does not read it, and AC-3 independence was proven by discriminating test. Still a contract smell inviting future misuse — rename to something like `evidence_summary`. | P14.6 |
+| NB-12 | `reviewer_harness` remains absent from `config/projects.json`. The harness is demonstrated but not enabled in production; enabling it is a deliberate future decision, not P14.5 scope. | Owner decision before P14.6 |
 
-### Implementation steps
-- Define the executable contract in docs/P14_5_REVIEWER_HARNESS_CONTRACT.md: authority boundaries, diff and bounded-full-scan modes, repository identity anchors, session/job state, structured findings, complete-versus-partial coverage, artifact retention, deterministic disposition policy, and recovery behavior. Document that OpenCodeReview and AIBroker return evidence only while AIReviewerCoordinator remains responsible for review-decisions.json and lifecycle events.
-- Create a review package under src/dev_orchestrator/review with versioned ReviewRequest, ReviewSession, ReviewManifest, ReviewCoverage, ReviewFinding, ReviewResult, and artifact-reference models plus a ReviewerHarness protocol exposing submit, status, reconcile, and result operations. Validate closed enums, repository-relative paths, line ranges, bounds, correlation IDs, and immutable branch/HEAD/status-hash anchors.
-- Implement an OpenCodeReview adapter behind the provider-neutral boundary. Invoke a pinned, capability-checked OCR executable with shell disabled: use machine-readable review/delegation preview for workspace/range/commit diffs, scan preview for full scans, and rule resolution for selected files. Capture OCR version, resolved refs, selected/excluded files and reasons, rule provenance, and input digests; fail closed on unsupported or malformed JSON instead of parsing human text or allowing OCR to select a provider/model.
-- Extend the P14 job substrate narrowly with content-addressed immutable input and bounded output artifacts for allowlisted job commands. Include the input digest in JobSpec identity/conflict checks, preserve it across deterministic retry successors, pass only the supervisor’s canonical job directory to a fixed reviewer runner, and add digest-verified local/SSH artifact retrieval. Keep wire-supplied review refs and paths as validated data only; they must never become commands, environment overrides, or unrestricted filesystem paths.
-- Implement the durable reviewer runner and session store. Persist the review request and prepared manifest before dispatch; divide selected files into deterministic bounded packets; record each packet and stable AIBroker request ID before execution; call AIExecutionPort with role=reviewer and the project’s existing quality, quota/cost, and independence policy; and reconcile persisted AIBroker status before any replay. Do not introduce RDC or browser fallback.
-- Require delegated reviewers to return a strict evidence schema containing per-file reviewed/skipped outcomes and localized findings, with no decision or next_action field. Normalize and validate findings against the prepared manifest and repository snapshot, attach AIBroker resource identity to each finding, reject out-of-scope paths or invalid spans, compute stable fingerprints, and atomically retain canonical findings.json, coverage.json, session metadata, and deterministic SARIF 2.1.0 artifacts under the P14 job retention boundary.
-- Integrate the harness into AIReviewerCoordinator behind explicit reviewer-harness configuration while preserving the existing direct path for projects not opted in. Replace the opted-in background review thread with submission/observation of the durable review job, project job/session/resource/artifact references into ai-reviewer.json, and write review-decisions.json only after unchanged repository identity, complete required coverage, valid findings, and independently successful required build/test/static-analysis evidence. Derive next versus remediate from DevO policy; partial, malformed, ambiguous, or stale evidence must fail/recover without advancing lifecycle.
-- Add configuration validation and operator surfaces: keep the OCR executable and job command in host-local trusted configuration; add project-level backend, mode, repo-relative rule path, scan roots, file/byte/batch limits, transport, and blocking-severity policy; add CLI commands for review submit/status/reconcile/findings; and expose authenticated, bounded, redacted read endpoints for review sessions, coverage, findings, and artifact metadata for later P15 consumption.
-- Add a representative LabDemo rule pack and fixture covering Service-only hardware authority, fail-safe X-ray OFF convergence, manual-versus-transactional scan separation, state-machine reachability, and preservation of compatibility paths such as scan.run. Update examples and contracts, then run graphify update . after implementation.
+## P14.5 closure references
 
-### Interfaces / contracts
-- ReviewerHarness: submit(ReviewRequest) -> ReviewSession reference, status(session_id), reconcile(session_id), and result(session_id), with no lifecycle mutation methods.
-- OpenCodeReviewAdapter: deterministic prepare and rule-resolution operations for diff and full-scan requests; it records OCR capability/version evidence and never receives provider credentials or chooses a model.
-- ReviewRequest: project/task/source correlation, review mode, immutable repository identity, optional diff refs or scan roots, rule-pack reference, explicit file/byte/batch bounds, transport, idempotency key, and independent-gate evidence references.
-- ReviewFinding: schema version, stable fingerprint, repository identity, file, start/end line, severity, category, rule identifier/provenance, evidence, reviewer resource identity, status, and originating session/packet IDs.
-- ReviewCoverage: selected, reviewed, reused, skipped, failed, and excluded file identities with reasons, counts, coverage rate, and terminal completeness state of complete, partial, failed, or cancelled; zero findings is acceptable only with complete required coverage.
-- P14 artifact extension: immutable input digest plus allowlisted, size-bounded artifact descriptors and digest-verified local/SSH retrieval, preserved by retry and reconcile without weakening the existing command/path trust boundary.
-- AIBroker integration: stable AIRoleRequest IDs per session packet, semantic reviewer quality/independence requirements, previous Worker resource context, and persisted dispatch/execution/session/resource facts; provider, account, and model selection remain exclusively AIBroker-owned.
-- Lifecycle integration: AIReviewerCoordinator alone translates validated review evidence into existing next/remediate decisions and progress events; OpenCodeReview, the delegated model, ReviewerHarness, and ExecutionTransport cannot write lifecycle decisions.
-- Operator surfaces: review-submit, review-status, review-reconcile, and review-findings CLI commands plus authenticated read-only /api/v1/control/reviews and per-session coverage/findings/artifact views.
+- Decision packet: `.devorch/forensics/p145-closure-decision-packet-e2fce11-v2.md`
+- Reproduction oracles (all closed at `e2fce11`):
+  `p145-repro-cad7cf5-findings.py`, `p145-repro-bb2a7a4-findings.py`,
+  `p145-repro-6b5d5ba-findings.py`
+- Live demonstration outputs: `smoke-a-output.txt`, `smoke-b-output.txt`,
+  `smoke-c-output.txt`
+- Review verdicts: `p145-websol-final-verdict-a74ed3f.json`,
+  `p145-review-verdict-cad7cf5.md`, `p145-review-verdict-bb2a7a4.md`,
+  `p145-audit-verdict-9922480.md`
 
-### Validation plan
-- Unit-test all review schemas, closed enums, finding fingerprints, SARIF conversion, coverage completeness, path containment, line validation, artifact size/digest checks, and rejection of lifecycle tokens in delegated model output.
-- Use a fake OCR executable to test diff workspace/range/commit preparation, bounded scan preparation, rule grouping, excluded-file reasons, unsupported-version behavior, malformed JSON, non-zero exit, and shell-metacharacter inputs without executing them.
-- Use fake AIExecutionPort results to prove AIBroker controls resource selection, packet request IDs are stable, Worker independence constraints propagate, findings retain exact reviewer identity, and no OCR provider/model option or credential is supplied.
-- Exercise P14 recovery across daemon restart and simulated local/SSH transport interruption: the same job/session and packet request IDs must be reconciled, completed artifacts must be recovered by digest, and retries must not create duplicate OCR work or AIBroker dispatches.
-- Test lifecycle authority explicitly: complete clean coverage may produce next only when required independent gates pass; blocking open findings produce remediate; partial coverage, stale repository identity, malformed findings, failed gates, or ambiguous recovery produce no advancing decision; harness artifacts alone cannot mutate task state.
-- Run representative LabDemo diff and bounded full-scan acceptance fixtures, asserting every selected file is reviewed or explicitly skipped, all five project rules are applied, scan.run is not falsely classified as dead code, findings have valid locations, and JSON/SARIF agree.
-- Run focused suites such as python -m unittest tests_py.test_p145_reviewer_harness tests_py.test_p145_job_recovery tests_py.test_p145_software_acceptance, followed by the existing AI reviewer, P14 job/recovery/transport, control API, CLI, configuration, watchdog, and full Python regression suites. Execute commands separately with PowerShell-safe sequencing and explicit exit-code checks; do not use && or || in Windows PowerShell 5.1.
-- Verify documentation examples and host-local configuration on Windows, run git diff --check, run graphify update ., and confirm the knowledge graph records the ReviewerHarness-to-P14/AIBroker/AIReviewerCoordinator boundaries.
+## Operational state at handoff
 
-### Risks / failure modes
-- OpenCodeReview’s CLI and JSON schemas are evolving; an unpinned or capability-mismatched executable could silently change selection or coverage. Record the exact version, require tested machine-readable capabilities, and fail closed on unknown schemas.
-- Delegation mode may not expose every native OCR session/localization feature. DevO must persist its own authoritative session and coverage manifest while recording OCR provenance, and must not depend on undocumented OCR internals.
-- A partial review can otherwise appear as a clean review. Selected-versus-reviewed accounting must be exhaustive, and any failed, omitted, or over-limit packet must remain partial and unable to advance lifecycle.
-- Dynamic refs, scan roots, and rule paths create command-injection and containment risks. Resolve refs without shell interpolation, require repository-contained paths, use fixed argv construction, and retain the P14 host-local executable allowlist.
-- Transport loss can leave either the P14 job or an AIBroker packet running. Persist identities before dispatch, reconcile status before replay, and preserve unknown/recovery-required states until exact durable evidence resolves the ambiguity.
-- Large full scans can exceed model, artifact, log, or daemon-tick budgets. Enforce deterministic file/byte/packet limits, bounded artifacts and pagination, and mark overflow as partial rather than truncating into a false success.
-- Automatically converting model findings into lifecycle actions can overreach. Keep a deterministic DevO disposition policy, preserve repository and gate guards, and never accept a model- or adapter-supplied next_action.
-- Remote artifact transfer could expose source snippets or secrets. Limit retained evidence, apply existing redaction, enforce artifact names/types/sizes and digests, and expose only authenticated bounded reads.
-
-### Out of scope
-- Making OpenCodeReview, AIBroker, a reviewer model, or ExecutionTransport a lifecycle authority or allowing any of them to advance tasks directly.
-- Allowing OpenCodeReview to choose providers, accounts, models, credentials, quotas, or costs when invoked through DevO.
-- Replacing independent compiler, build, test, lint, clang-tidy, cppcheck, or other static-analysis gates with semantic review findings.
-- Removing the existing direct reviewer or legacy Browser Bridge paths for projects that have not opted into ReviewerHarness.
-- Adding RDC as an automatic review, retry, or transport fallback.
-- Automatic remediation, source edits, commits, pushes, pull-request comments, SARIF uploads, or publication to external services.
-- Unbounded whole-repository scans, arbitrary commands, arbitrary remote paths, unrestricted artifact downloads, or generic expansion of the P14 execution trust boundary.
-- Building the P15 mobile UI or a full finding-triage workflow; P14.5 supplies stable read models and initial finding status only.
-
-### Independent plan review
-- Approved: Verified against the repo (src/dev_orchestrator/jobs/{models,config,supervisor}.py, ai/{contracts,execution_port}.py, core/ai_reviewer.py, docs/P14_DURABLE_JOBS_CONTRACT.md, docs/development-workflow.md) and the P14.5 staged task. The plan matches the task's three acceptance clauses and the repo's real seams: a provider-neutral review package with a ReviewerHarness protocol (submit/status/reconcile/result, no lifecycle mutation), OpenCodeReview only as a pinned, capability-probed adapter behind that boundary, reviewer model choice left entirely to AIBroker via AIExecutionPort/AIRoleRequest(role=reviewer) with stable per-packet request IDs and reconcile-before-replay, review executed as a P14 durable job with content-addressed immutable input and digest-verified bounded artifacts, and AIReviewerCoordinator retained as the sole writer of review-decisions.json behind explicit opt-in with the existing direct path preserved. Security and durability boundaries are respected rather than widened: host-local execution-jobs.json remains the argv/path source of truth, wire refs/paths stay validated data with shell=False and realpath containment, no RDC or browser fallback is added, and partial/stale/malformed evidence must fail or recover without advancing lifecycle. Independent build/test/static-analysis gates are explicitly preserved and listed out of scope for replacement. A concrete verification path exists: schema/fingerprint/SARIF/containment unit tests, fake OCR executable and fake AIExecutionPort tests, daemon-restart and local/SSH interruption recovery tests, explicit lifecycle-authority tests, a LabDemo diff and bounded full-scan acceptance fixture, plus named existing regression suites, with PowerShell 5.1-safe sequencing and no && or || (failure memory seed:p11b:rdc-powershell-5.1 correctly applied). No BLOCKING finding. NON_BLOCKING notes to carry into Worker work and Technical Review, none of which should delay implementation: (1) step 4 says the input digest enters JobSpec identity/conflict checks — make this strictly additive so existing spec_hash/job_id values and retry_successor_id stay byte-identical when no input payload is present, and assert that with a test, otherwise in-flight jobs could conflict on recovery; (2) the exact OCR invocation contract (verbs, stdin/stdout JSON schema, exit-code map) is left to the adapter — the Worker should define and pin it explicitly, since fail-closed capability probing plus a fake-adapter fixture makes this safely testable and reversible behind the boundary; (3) the provenance of the 'required independent gate evidence' that must pass before review-decisions.json is written should be tied to an existing evidence source rather than invented; (4) docs/P14_DURABLE_JOBS_CONTRACT.md should be updated alongside the additive input/artifact channel so the canonical P14 contract does not drift; (5) prefer the repo's established pytest invocation (tests_py has conftest.py) over python -m unittest for the focused suites. Approved for implementation.
+- Anchor `e2fce11`, worktree clean, **not pushed**.
+- DevOrchestrator is **owner-paused** (`p145-freeze-a74ed3f-extreview-20260920`).
+  Resuming it is a separate owner decision and is not implied by P14.5 closure.
+- No successor task has been started.
