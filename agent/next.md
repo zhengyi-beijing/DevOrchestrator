@@ -41,6 +41,28 @@ as a single unit.
 | NB-11 | `review/runner.py:195` forbids the delegated model from emitting lifecycle tokens, but `review/runner.py:505-514` has the runner itself emit a field named `disposition` with values `next`/`remediate`. The only consumer is the reporting field at `review/store.py:115`; DevO does not read it, and AC-3 independence was proven by discriminating test. Still a contract smell inviting future misuse — rename to something like `evidence_summary`. | P14.6 |
 | NB-12 | `reviewer_harness` remains absent from `config/projects.json`. The harness is demonstrated but not enabled in production; enabling it is a deliberate future decision, not P14.5 scope. | Owner decision before P14.6 |
 
+## Available from P14.5 — review rule pack
+
+`config/devorch_rules.json` (version `0.1.0-draft`, added in `5d39787`) holds
+ten review rules derived from the blocking defects confirmed during P14.5. Each
+carries a "Defect precedent" clause naming the concrete case.
+
+Not yet usable for real review. Three prerequisites, all listed above:
+- NB-1 — per-packet timeout semantics. This repository's implementation commits
+  routinely touch 13-23 files, so multi-packet reviews are the normal case, not
+  an edge case.
+- NB-12 — `reviewer_harness` is absent from `config/projects.json`.
+- `file_limits` tuning for realistic commit sizes.
+
+The single P14.5 smoke run executed with `rule_pack_path: None` and therefore
+reported zero findings; that result demonstrates the pipeline, not review
+quality. Suggested first use is a parallel trial on this task: run the harness
+for structured findings while independent deep review proceeds as normal, then
+compare what each caught. Note that packet-scoped per-file review structurally
+cannot find the F1/G1/H2 class of defect, which required fault injection and
+cross-module reasoning; the rule pack raises the floor rather than replacing
+adversarial review.
+
 ## P14.5 closure references
 
 - Decision packet: `.devorch/forensics/p145-closure-decision-packet-e2fce11-v2.md`

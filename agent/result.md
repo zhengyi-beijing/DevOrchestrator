@@ -946,3 +946,88 @@ P14.5 Remediation result:
      - Static checks: `python -m compileall -q src ops tests_py`, `node --check web/app.js`, `node --check browser/chatgpt-web-adapter.user.js`, and `git diff --check` passed cleanly with 0 defects.
      - Knowledge graph updated with `graphify update .` (4115 nodes, 11667 edges, 174 communities).
 - Canonical worktree clean, ready for technical review. Committed locally without push.
+
+## P14.5 Rounds 4-7, External Review Cycle and Closure (2026-09-20)
+
+Externally coordinated. DevOrchestrator was owner-paused throughout
+(`p145-freeze-a74ed3f-extreview-20260920`); no automatic lifecycle advance ran.
+
+- Runtime reconciliation before review: a live remediation worker
+  (`ai_review:wd-f096782be9cd0526`, OS pid 21128, accept-edits) was found
+  editing the worktree at the intended review anchor. It was not stale; it was
+  the downstream remediation of an Opus reviewer that had already rejected
+  `a74ed3f`. DevO was owner-paused, the worker terminated, and DevO settled the
+  execution itself (broker `failed`, transition-executor `failed`). Its 559-line
+  uncommitted diff was preserved at
+  `.devorch/forensics/p145-inflight-remediation-406d1a17.patch`.
+- Review rounds. Each anchor was independently reviewed; every blocking finding
+  was independently reproduced locally by fault injection before remediation.
+
+  | Anchor | Findings | Origin |
+  | --- | --- | --- |
+  | `a74ed3f` | B1, B2 | original contract defects |
+  | `cad7cf5` | F1, F2 | introduced by remediation |
+  | `bb2a7a4` | G1, G2 | introduced by remediation |
+  | `6b5d5ba` | H1, H2, H3 | introduced by remediation |
+  | `9922480` | J1 | introduced by an incorrect specification |
+  | `e2fce11` | none | clean |
+
+- Substantive fixes across the cycle: crash-idempotent recovery disposition
+  shared by normal completion and restart; a durable `lifecycle_event_pending`
+  outbox covering every terminal transition; closed-schema validation and
+  quarantine of decision-ledger records; canonical review identity taken from
+  the reviews-map key; trusted-repository-path resolution with fail-closed
+  behavior on absent evidence; and a single shared independence invariant
+  (`missing_independence_fields`) used by both the direct and harness paths.
+- J1 was a live actuation regression: direct-path remediate decisions were
+  written with `disposition="remediate"`, which fails the `disposition ==
+  "apply"` gates in `transition_executor.py` (lines 1633, 1715, 1787) and
+  `control/reconcile.py` (lines 154, 303), so remediation workers would never
+  have launched. Root cause was an incorrect contract statement in the
+  remediation specification, not the implementation. Fixed at `e2fce11`; both
+  writers now share one corrected disposition table.
+- Live acceptance demonstration (the harness had never executed before this;
+  `reviewer_harness` was absent from config and zero durable jobs had ever run,
+  so all prior P14.5 evidence was mock-based):
+  - AC-1: a real diff review of `e2fce11` ran as durable P14 job
+    `job-ed3f5145819dd8ac`, `exit_code=0`, transport `local`, no RDC. Coverage
+    selected and reviewed exactly the three files changed in that commit;
+    `coverage_rate=1.0`, `completeness=complete`, `skipped=0`, `failed=0`.
+  - AC-2: delegation via three AIBroker dispatches
+    `ocr_review:p145-smoke-a:0..2`, all `succeeded`, `role=reviewer`;
+    `findings.json`, `coverage.json`, `review.sarif`, `session.json` persisted;
+    restart recovery settled the review with exactly one durable decision and
+    exactly one `REVIEW_ACCEPTED`, and a second restart emitted nothing and left
+    the decision byte-identical.
+  - AC-3, discriminating: with one `blocking` finding injected into the job's
+    authoritative `session.json` artifact while the harness still reported
+    `disposition='next'`, DevO independently returned `decision='remediate'`,
+    `next_action='continue_current_stage'` and emitted `REMEDIATE`.
+  - INV-2: worker resource `agy/agy-1/gemini-3.8-flash-high`; reviewer
+    allocated `claude/default/opus` with `independence='resource'`.
+  - The smoke ran with zero rules (`rule_pack_path: None`), so its zero-findings
+    result demonstrates the pipeline, not review quality.
+- Verification at closure: full regression 878 passed with 87 subtests; focused
+  P14.5 plus transition 100 passed with 43 subtests; adjacent P14/reviewer 49
+  passed; live decision ledger validates 31/31 (7/31 before J1); `compileall`,
+  both `node --check` runs and `git diff --check` pass. All seven historical
+  defects have executable reproduction oracles under `.devorch/forensics/`; all
+  report closed.
+- Process outcome: four of six remediation rounds introduced new blocking
+  defects, and every one was caught by independent review rather than by the
+  regression suite, which was green throughout. Three guard tests were written
+  that asserted implementation rather than guarantee and could not fail. The
+  two mechanisms that did work were executable reproduction oracles and
+  mandatory mutation verification of new guard tests.
+- Closure: remediation budget exhausted (6 anchors against a limit of 3; 5
+  rounds on the original frozen blocking set against a limit of 2), so P14.5 was
+  closed as an explicit owner decision at OWNER_GATE rather than an automatic
+  advance. Decision packet:
+  `.devorch/forensics/p145-closure-decision-packet-e2fce11-v2.md`.
+- Follow-on commits: `b91d0e7` closure handoff, `83333a7` root `NEXT.md`
+  baseline refresh (it had been five tasks stale), `5d39787`
+  `config/devorch_rules.json` — a ten-rule review rule pack derived from the
+  defect shapes above, version `0.1.0-draft`, not yet exercised against a real
+  review.
+- Canonical worktree clean at `5d39787`. Committed locally without push.
+  DevOrchestrator remains owner-paused and no successor task was started.
