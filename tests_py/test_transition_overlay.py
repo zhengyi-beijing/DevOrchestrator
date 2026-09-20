@@ -37,6 +37,56 @@ class TransitionOverlayTests(unittest.TestCase):
             self.assertEqual(snap["state"], "WAITING_REVIEW")
 
 
+    def test_newer_advertised_task_suppresses_older_failed_worker_overlay(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td) / "runtime"; runtime.mkdir()
+            (runtime / "transition-executor.json").write_text(json.dumps({
+                "version": 1,
+                "executions": {"old-p145": {
+                    "project_id": "p1", "source_request_id": "old-p145",
+                    "source_kind": "remediation", "task_id": "P14.5",
+                    "backend_id": "aibroker", "engine": "aibroker",
+                    "state": "failed",
+                    "started_at": "2026-09-20T02:14:42+00:00",
+                    "completed_at": "2026-09-20T02:38:27+00:00",
+                }},
+            }), encoding="utf-8")
+            raw = {"projects": [{
+                "project_id": "p1", "state": "IDLE",
+                "worker": {"kind": "none", "state": "not_started", "process_alive": False},
+                "telemetry": {"task_id": "P14.6", "run_id": None},
+                "next_updated_at": "2026-09-20T11:56:38+00:00",
+            }]}
+            snap = TransitionExecutor(runtime).overlay_managed_runs(raw)["projects"][0]
+            self.assertEqual(snap["state"], "IDLE")
+            self.assertEqual(snap["telemetry"]["task_id"], "P14.6")
+            self.assertEqual(snap["worker"]["state"], "not_started")
+
+    def test_failed_worker_overlay_is_preserved_when_successor_was_pre_staged(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = Path(td) / "runtime"; runtime.mkdir()
+            (runtime / "transition-executor.json").write_text(json.dumps({
+                "version": 1,
+                "executions": {"failed-p145": {
+                    "project_id": "p1", "source_request_id": "failed-p145",
+                    "source_kind": "remediation", "task_id": "P14.5",
+                    "backend_id": "aibroker", "engine": "aibroker",
+                    "state": "failed",
+                    "started_at": "2026-09-20T02:14:42+00:00",
+                    "completed_at": "2026-09-20T02:38:27+00:00",
+                }},
+            }), encoding="utf-8")
+            raw = {"projects": [{
+                "project_id": "p1", "state": "IDLE",
+                "worker": {"kind": "none", "state": "not_started", "process_alive": False},
+                "telemetry": {"task_id": "P14.6", "run_id": None},
+                "next_updated_at": "2026-09-20T02:00:00+00:00",
+            }]}
+            snap = TransitionExecutor(runtime).overlay_managed_runs(raw)["projects"][0]
+            self.assertEqual(snap["state"], "WORKER_FAILED")
+            self.assertEqual(snap["telemetry"]["task_id"], "P14.5")
+            self.assertEqual(snap["worker"]["state"], "failed")
+
     def test_settled_newer_task_suppresses_older_completed_worker_overlay(self):
         with tempfile.TemporaryDirectory() as td:
             runtime = Path(td) / "runtime"; runtime.mkdir()

@@ -566,6 +566,28 @@ class TransitionExecutor:
             if record is None:
                 continue
             state = str(record.get("state") or "")
+            telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+            advertised_task_id = _non_blank_config(telemetry.get("task_id"))
+            record_task_id = _non_blank_config(record.get("task_id"))
+            if (
+                state in {"failed", "cancelled"}
+                and advertised_task_id is not None
+                and record_task_id is not None
+                and advertised_task_id != record_task_id
+            ):
+                next_updated = parse_utc(snapshot.get("next_updated_at"))
+                record_completed = parse_utc(
+                    record.get("completed_at") or record.get("recorded_at") or record.get("started_at")
+                )
+                if (
+                    next_updated is not None
+                    and record_completed is not None
+                    and next_updated > record_completed
+                ):
+                    # The repository's task authority advanced after this terminal
+                    # failure. Keep the historical execution in the ledger, but do
+                    # not let it relabel the newer task as WORKER_FAILED.
+                    continue
             worker_state = "starting" if state == "launching" else state
             snapshot["worker"] = {"kind":"task","state":worker_state,"process_alive":state in _ACTIVE_STATES,"pid":record.get("pid"),"started_at":record.get("started_at"),"updated_at":record.get("completed_at") or record.get("started_at"),"exit_code":record.get("exit_code"),"command":"managed {0}".format(record.get("backend_id") or "worker")}
             telemetry = snapshot.get("telemetry")
