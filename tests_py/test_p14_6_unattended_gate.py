@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -513,13 +514,14 @@ class TestP146UnattendedGate(unittest.TestCase):
 
             self.assertEqual(port.calls, 2)
             self.assertEqual(port.requests[0].request_id, "ai-worker:worker-launch-1")
-            self.assertEqual(port.requests[1].request_id, "worker-launch-1:failover-1")
+            self.assertEqual(port.requests[1].request_id, "ai-worker:worker-launch-1:failover-1")
             self.assertIn("worker-res-1", port.requests[1].excluded_resource_ids)
 
             ledger = executor.state()["executions"]
             exec_row = ledger["worker-launch-1"]
             self.assertEqual(exec_row["state"], "completed")
             self.assertEqual(exec_row.get("failover_from_resource_ids"), ["worker-res-1"])
+            self.assertEqual(exec_row.get("broker_request_id"), "ai-worker:worker-launch-1:failover-1")
 
     def test_worker_quota_failover_refused_on_dirty_repo(self):
         with tempfile.TemporaryDirectory() as td:
@@ -893,6 +895,28 @@ class TestP146UnattendedGate(unittest.TestCase):
             auto_handoffs = [k for k in ledger if k.startswith("auto-handoff:")]
             self.assertEqual(len(auto_handoffs), 0, "Predecessor promotion must NOT bypass mandatory review")
 
+            # 1b. Failed worker state: Worker previously failed on task; repo advertises COMPLETE
+            write_json(runtime / "transition-executor.json", {
+                "version": 1,
+                "executions": {
+                    "worker-run-failed": {
+                        "project_id": "p1",
+                        "source_request_id": "worker-run-failed",
+                        "engine": "aibroker",
+                        "state": "failed",
+                        "task_id": "P14.5",
+                        "branch": "master",
+                        "head": init_head,
+                        "repo_path": str(repo),
+                        "completed_at": "2026-09-20T01:00:00+00:00",
+                    }
+                },
+            })
+            executor.advance(summary, config_path)
+            ledger = executor.state()["executions"]
+            auto_handoffs = [k for k in ledger if k.startswith("auto-handoff:")]
+            self.assertEqual(len(auto_handoffs), 0, "Predecessor promotion must NOT occur when worker previously failed without accepted review")
+
             # 2. In-flight review state: review is currently running
             write_json(runtime / "ai-reviewer.json", {
                 "version": 1,
@@ -1116,3 +1140,117 @@ class TestP146UnattendedGate(unittest.TestCase):
             executor._threads[succ_id].join(timeout=10.0)
             self.assertEqual(executor.state()["executions"][succ_id]["state"], "completed")
             self.assertTrue((repo / "p14_6.txt").is_file())
+
+    def test_worker_failover_crash_recovery_reconciliation(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "repo"
+            head = make_git_repo(repo, "P14.5")
+            truth = read_repository_truth(repo)
+            runtime = base / "runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+
+            config_path = base / "projects.json"
+            config_data = {
+                "projects": [{
+                    "project_id": "p1",
+                    "repo_path": str(repo),
+                    "execution": {
+                        "enabled": True,
+                        "engine": "aibroker",
+                        "owner_authorized": True,
+                        "allowed_next_actions": ["next_task"],
+                    },
+                }]
+            }
+            config_path.write_text(json.dumps(config_data), encoding="utf-8")
+
+            attempt_2_dispatched = threading.Event()
+            can_finish_attempt_2 = threading.Event()
+
+            class CrashFailoverPort:
+                def __init__(self):
+                    self.calls = 0
+                    self.requests: list[AIRoleRequest] = []
+                    self.status_queries: list[str] = []
+
+                def execute(self, request: AIRoleRequest) -> AIRoleResult:
+                    self.calls += 1
+                    self.requests.append(request)
+                    if self.calls == 1:
+                        return AIRoleResult(
+                            request_id=request.request_id,
+                            role_run_id=request.role_run_id,
+                            status="failed",
+                            failure_classification="quota_exhausted",
+                            error="Quota limit reached for model-a",
+                            resource_context=ResourceContext("res-a", "prov-a", "acc-a", "mod-a"),
+                        )
+                    attempt_2_dispatched.set()
+                    can_finish_attempt_2.wait(timeout=10.0)
+                    return AIRoleResult(
+                        request_id=request.request_id,
+                        role_run_id=request.role_run_id,
+                        status="succeeded",
+                        output="WORKER_FAILOVER_SUCCESS",
+                        dispatch_id="disp-f2",
+                        execution_id="exec-f2",
+                        resource_context=ResourceContext("res-b", "prov-b", "acc-b", "mod-b"),
+                    )
+
+                def status(self, broker_request_id: str) -> dict[str, Any]:
+                    self.status_queries.append(broker_request_id)
+                    if broker_request_id == "ai-worker:worker-failover-run:failover-1":
+                        return {
+                            "request_id": broker_request_id,
+                            "status": "running",
+                            "dispatch_id": "disp-f2",
+                            "execution_id": "exec-f2",
+                        }
+                    return {
+                        "request_id": broker_request_id,
+                        "status": "failed",
+                        "execution_error": "Quota limit reached for model-a",
+                    }
+
+            port = CrashFailoverPort()
+            executor = TransitionExecutor(runtime, ai_execution_port=port)
+
+            launch = executor._launch(
+                config_data["projects"][0],
+                source_request_id="worker-failover-run",
+                source_kind="ready",
+                task_id="P14.5",
+                source_task_id=None,
+                branch=truth.branch,
+                head=head,
+                worker_prompt="do task",
+                policy=config_data["projects"][0]["execution"],
+            )
+            self.assertIsNotNone(launch)
+
+            self.assertTrue(attempt_2_dispatched.wait(timeout=10.0))
+
+            ledger_on_disk = executor.state()["executions"]["worker-failover-run"]
+            self.assertEqual(
+                ledger_on_disk["broker_request_id"],
+                "ai-worker:worker-failover-run:failover-1",
+            )
+            self.assertEqual(ledger_on_disk["state"], "running")
+
+            recovery_port = CrashFailoverPort()
+            recovery_executor = TransitionExecutor(runtime, ai_execution_port=recovery_port)
+
+            self.assertIn("ai-worker:worker-failover-run:failover-1", recovery_port.status_queries)
+            self.assertNotIn("ai-worker:worker-failover-run", recovery_port.status_queries)
+
+            recovered_ledger = recovery_executor.state()["executions"]["worker-failover-run"]
+            self.assertNotEqual(recovered_ledger["state"], "failed")
+            self.assertEqual(recovered_ledger["state"], "recovery_required")
+            self.assertFalse(recovered_ledger.get("recovery_safe_retry"))
+            self.assertIn("forbidden", recovered_ledger.get("reason", ""))
+
+            can_finish_attempt_2.set()
+            thread = executor._threads.get("worker-failover-run")
+            if thread is not None:
+                thread.join(timeout=10.0)

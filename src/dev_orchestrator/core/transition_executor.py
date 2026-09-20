@@ -1103,7 +1103,7 @@ class TransitionExecutor:
                     task_run_id=request.task_run_id,
                     stage_run_id=request.stage_run_id,
                     role_run_id=request.role_run_id,
-                    request_id=f"{source_request_id}:failover-{attempt - 1}",
+                    request_id=f"ai-worker:{source_request_id}:failover-{attempt - 1}",
                     role=request.role,
                     prompt=request.prompt,
                     working_directory=request.working_directory,
@@ -1114,6 +1114,7 @@ class TransitionExecutor:
                     timeout_seconds=request.timeout_seconds,
                     metadata=meta,
                 )
+            self._update_record(source_request_id, broker_request_id=current_request.request_id)
 
             if self.accounting is not None:
                 self.accounting.start_interval(
@@ -2433,47 +2434,10 @@ class TransitionExecutor:
                     and roles["reviewer"].get("enabled") is True
                 )
                 if reviewer_enabled:
-                    worker_completed = any(
-                        rec.get("project_id") == project_id
-                        and (rec.get("task_id") == current_task or rec.get("source_task_id") == current_task)
-                        and rec.get("state") == "completed"
-                        for rec in ledger["executions"].values()
-                        if isinstance(rec, dict)
-                    )
-                    reviews_raw = read_json(self.runtime_root / "ai-reviewer.json", {})
-                    reviews_dict = reviews_raw.get("reviews") if isinstance(reviews_raw, dict) else None
-                    reviews = reviews_dict if isinstance(reviews_dict, dict) else {}
-                    task_completed_workers = {
-                        str(rec.get("source_request_id") or rec.get("request_id") or "")
-                        for rec in ledger["executions"].values()
-                        if isinstance(rec, dict)
-                        and rec.get("project_id") == project_id
-                        and (rec.get("task_id") == current_task or rec.get("source_task_id") == current_task)
-                    } - {""}
-                    review_in_flight_or_pending = any(
-                        isinstance(r, dict)
-                        and str(r.get("project_id") or "") == project_id
-                        and (
-                            str(r.get("task_id") or "") == current_task
-                            or str(r.get("source_request_id") or "") in task_completed_workers
-                            or (
-                                str(r.get("review_id") or "").startswith("ai_review:")
-                                and str(r.get("review_id") or "")[len("ai_review:"):] in task_completed_workers
-                            )
-                        )
-                        and (
-                            r.get("state") in ("launching", "running")
-                            or (r.get("state") == "completed" and not r.get("decision"))
-                        )
-                        for r in reviews.values()
-                    )
-                    if (
-                        worker_completed
-                        or review_in_flight_or_pending
-                        or snapshot.get("state") in ("WAITING_REVIEW", "REVIEWING")
-                        or snapshot.get("lifecycle_state") in ("WAITING_REVIEW", "REVIEWING")
-                    ):
-                        continue
+                    # When reviewer is enabled, promotion of completed predecessor tasks
+                    # is strictly governed by accepted technical review decisions via
+                    # _advance_decisions; auto-handoff must never bypass mandatory review.
+                    continue
             if rm_res.kind == "successor":
                 request_id = f"auto-handoff:{current_task}:{truth.head[:12]}"
                 with self._lock:

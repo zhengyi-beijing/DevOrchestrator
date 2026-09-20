@@ -1063,14 +1063,17 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - In `TransitionExecutor`: added `_advance_completed_predecessor_handoffs` creating automatic handoff or settled records when predecessor task is marked complete in the repository, guarded against duplicate executions, active decisions, and pending reviews.
   - Added `_advance_unlaunched_ready` automatically launching unlaunched `READY_TO_RUN` tasks without human intervention.
   - Hardened `overlay_managed_runs` so historical terminal worker failures do not relabel newly ready tasks as `WORKER_FAILED`.
-- Technical Review Remediation (ai_review:p146-owner-continue-20260920):
-  - Blocker closed: Hardened `TransitionExecutor._advance_completed_predecessor_handoffs` to match completed workers by task ID and check `runtime/ai-reviewer.json` for active or pending reviews, plus checking snapshot `lifecycle_state` against `WAITING_REVIEW`/`REVIEWING`, preventing worker commits from bypassing mandatory technical review. Added `test_unattended_successor_promotion_does_not_bypass_review`.
+- Technical Review Remediation Round 1 (ai_review:p146-owner-continue-20260920):
+  - Blocker closed: Hardened `TransitionExecutor._advance_completed_predecessor_handoffs` against premature predecessor promotion bypassing technical review. Added `test_unattended_successor_promotion_does_not_bypass_review`.
   - AC-2 demonstrated: Replaced empty-runtime baseline with discriminating fixture in `test_recovery_epoch_cross_component_agreement` verifying all 5 components (`resolve_recovery_epoch`, `_watchdog_view`, `project_runtime_status`, `build_project_status`, `project_control_view`) produce identical epoch IDs and non-trivial evidence dictionaries when plan, review, execution, and control records are active, plus sensitivity to mutation.
   - AC-1 / AC-5 demonstrated: Added `test_end_to_end_unattended_multi_task_with_failure_injection_and_failover` qualifying end-to-end multi-task unattended lifecycle with Worker quota failover, Reviewer rate-limit failover, remediation loop, re-review acceptance, auto-handoff, and successor unlaunched ready launch.
   - Non-blocking closed: Fixed reviewer failover exhaustion exception path in `src/dev_orchestrator/core/ai_reviewer.py` to record `failover_from_resource_ids`.
+- Technical Review Remediation Round 2 (ai_review:ai_review:p146-owner-continue-20260920):
+  - Blocker closed (durability/crash recovery in worker failover loop): Aligned worker failover request ID naming to `ai-worker:{source_request_id}:failover-{attempt - 1}` and persisted `broker_request_id` via `_update_record(source_request_id, broker_request_id=current_request.request_id)` immediately before `self._ai_execution_port.execute(current_request)` on every attempt. During crash recovery (`_recover_interrupted_runs`), in-flight failover executions reconcile strictly against the active failover ID, matching `fact['request_id']`, setting `state='recovery_required'` with `recovery_safe_retry=False` rather than querying the failed attempt 1 ID and mistakenly setting terminal `failed` state (which would have permitted concurrent actuation). Added comprehensive reproduction oracle and regression in `test_worker_failover_crash_recovery_reconciliation`.
+  - Secondary review bypass closed: In `_advance_completed_predecessor_handoffs`, when `reviewer_enabled` is True on a project, auto-handoff is strictly skipped; predecessor promotion is exclusively driven by accepted technical review decisions (`next` / `next_task`) via `_advance_decisions`. Verified that previously failed worker tasks never permit auto-handoff when reviewer is enabled.
 - Verification:
-  - Acceptance test suite `tests_py/test_p14_6_unattended_gate.py`: 8 passed in 10.44s.
-  - Adjacent suites: `test_watchdog_recovery.py`, `test_transition_overlay.py`, `test_staged_roadmap.py`, `test_staged_handoff.py` (106 passed, 5 subtests passed).
-  - Full repository regression: 897 passed, 87 subtests passed in 310.28s.
+  - Acceptance test suite `tests_py/test_p14_6_unattended_gate.py`: 9 passed in 11.64s.
+  - Focused/adjacent suites: 205 passed in ~84s.
+  - Full repository regression: 898 passed, 87 subtests passed in 310.90s.
   - `compileall -q src tests_py`, `git diff --check`, and `graphify update .` all passed cleanly.
 - P14.6 remediated and closed. Preserved handoff: P15 Mobile Observability & Guarded Control (`agent/staged/P15.md`).
