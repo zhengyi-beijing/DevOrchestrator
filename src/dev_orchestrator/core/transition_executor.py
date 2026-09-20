@@ -17,9 +17,9 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
-from dev_orchestrator.ai.contracts import AIRoleRequest
+from dev_orchestrator.ai.contracts import AIRoleRequest, ROLE_RESOURCE_FAILURES, ResourceContext
 from dev_orchestrator.ai.execution_port import AIExecutionPort, MANAGED_INTERRUPT_REASON
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.agents.base import AgentBackend
@@ -566,8 +566,7 @@ class TransitionExecutor:
             if record is None:
                 continue
             state = str(record.get("state") or "")
-            telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
-            advertised_task_id = _non_blank_config(telemetry.get("task_id"))
+            advertised_task_id = _advertised_task_id(snapshot)
             record_task_id = _non_blank_config(record.get("task_id"))
             if (
                 state in {"failed", "cancelled"}
@@ -575,14 +574,19 @@ class TransitionExecutor:
                 and record_task_id is not None
                 and advertised_task_id != record_task_id
             ):
+                is_ready = _next_task_ready(snapshot) or snapshot.get("state") == "READY_TO_RUN"
                 next_updated = parse_utc(snapshot.get("next_updated_at"))
                 record_completed = parse_utc(
                     record.get("completed_at") or record.get("recorded_at") or record.get("started_at")
                 )
                 if (
-                    next_updated is not None
-                    and record_completed is not None
-                    and next_updated > record_completed
+                    is_ready
+                    or _task_marked_complete(snapshot)
+                    or (
+                        next_updated is not None
+                        and record_completed is not None
+                        and next_updated > record_completed
+                    )
                 ):
                     # The repository's task authority advanced after this terminal
                     # failure. Keep the historical execution in the ledger, but do
@@ -1077,125 +1081,279 @@ class TransitionExecutor:
     def _run_broker_worker_thread(self, source_request_id: str, request: AIRoleRequest) -> None:
         accounting_started = time.monotonic()
         worker_role = "remediation_worker" if request.stage_run_id == "remediation" else "worker"
-        if self.accounting is not None:
-            self.accounting.start_interval(
-                "ai_execution",
-                request.request_id,
-                project_id=request.project_id,
-                task_id=request.task_run_id,
-                role=worker_role,
-                request_id=request.request_id,
-                stage_run_id=request.stage_run_id,
-                role_run_id=request.role_run_id,
-                source_request_id=source_request_id,
-                attempt_id=source_request_id,
-            )
+        failed_resource_ids: set[str] = set(request.excluded_resource_ids)
+        max_resource_failovers = 2
+        if isinstance(request.metadata, Mapping):
+            max_failovers_meta = request.metadata.get("max_resource_failovers")
+            if isinstance(max_failovers_meta, int) and 0 <= max_failovers_meta <= 5:
+                max_resource_failovers = max_failovers_meta
+        max_attempts = 1 + max_resource_failovers
+
         result = None
-        try:
-            self._update_record(source_request_id, state="running")
-            result = self._ai_execution_port.execute(request) if self._ai_execution_port else None
-            if result is None:
-                raise RuntimeError("AIBroker execution port became unavailable")
-        except Exception as exc:
+        current_request = request
+        self._update_record(source_request_id, state="running")
+
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                meta = dict(request.metadata) if isinstance(request.metadata, Mapping) else {}
+                meta["worker_attempt"] = attempt
+                meta["worker_failover_from_resource_ids"] = sorted(failed_resource_ids)
+                current_request = AIRoleRequest(
+                    project_id=request.project_id,
+                    task_run_id=request.task_run_id,
+                    stage_run_id=request.stage_run_id,
+                    role_run_id=request.role_run_id,
+                    request_id=f"{source_request_id}:failover-{attempt - 1}",
+                    role=request.role,
+                    prompt=request.prompt,
+                    working_directory=request.working_directory,
+                    quality=request.quality,
+                    independence=request.independence,
+                    previous_resource_context=request.previous_resource_context,
+                    excluded_resource_ids=tuple(sorted(failed_resource_ids)),
+                    timeout_seconds=request.timeout_seconds,
+                    metadata=meta,
+                )
+
             if self.accounting is not None:
-                self.accounting.end_interval(
+                self.accounting.start_interval(
                     "ai_execution",
-                    request.request_id,
-                    outcome="failed",
+                    current_request.request_id,
                     project_id=request.project_id,
                     task_id=request.task_run_id,
                     role=worker_role,
-                    request_id=request.request_id,
+                    request_id=current_request.request_id,
                     stage_run_id=request.stage_run_id,
                     role_run_id=request.role_run_id,
                     source_request_id=source_request_id,
                     attempt_id=source_request_id,
                 )
-            if self.failure_memory is not None:
-                self.failure_memory.record_matching_recurrences(
-                    request.metadata.get("failure_environment", {}),
-                    str(exc),
-                    time.monotonic() - accounting_started,
+            result = None
+            try:
+                result = self._ai_execution_port.execute(current_request) if self._ai_execution_port else None
+                if result is None:
+                    raise RuntimeError("AIBroker execution port became unavailable")
+            except Exception as exc:
+                if self.accounting is not None:
+                    self.accounting.end_interval(
+                        "ai_execution",
+                        current_request.request_id,
+                        outcome="failed",
+                        project_id=request.project_id,
+                        task_id=request.task_run_id,
+                        role=worker_role,
+                        request_id=current_request.request_id,
+                        stage_run_id=request.stage_run_id,
+                        role_run_id=request.role_run_id,
+                        source_request_id=source_request_id,
+                        attempt_id=source_request_id,
+                    )
+                reconciled = None
+                if self._ai_execution_port is not None:
+                    try:
+                        reconciled = self._ai_execution_port.status(current_request.request_id)
+                    except Exception:
+                        reconciled = None
+                classification = None
+                resource = None
+                if isinstance(reconciled, dict) and str(reconciled.get("status") or "") == "failed":
+                    from dev_orchestrator.core.ai_planner import _classify_reconciled_dispatch_failure
+                    terminal_error = _non_blank_config(reconciled.get("execution_error")) or str(exc)
+                    classification = _classify_reconciled_dispatch_failure(terminal_error)
+                    resource_id = _non_blank_config(reconciled.get("resource_id"))
+                    if resource_id is not None:
+                        resource = ResourceContext(
+                            resource_id,
+                            _non_blank_config(reconciled.get("provider")),
+                            _non_blank_config(reconciled.get("account")),
+                            _non_blank_config(reconciled.get("model")),
+                        )
+                can_failover = (
+                    classification in ROLE_RESOURCE_FAILURES
+                    and resource is not None
+                    and resource.resource_id is not None
+                )
+                if can_failover:
+                    with self._lock:
+                        rec = copy.deepcopy(
+                            self._load_ledger()["executions"].get(source_request_id, {})
+                        )
+                    truth = read_repository_truth(request.working_directory)
+                    unchanged = (
+                        truth.valid
+                        and truth.branch == rec.get("branch")
+                        and truth.head == rec.get("head")
+                        and truth.status_hash == rec.get("launch_status_hash")
+                    )
+                    if unchanged and attempt < max_attempts:
+                        failed_resource_ids.add(resource.resource_id)
+                        continue
+
+                if self.failure_memory is not None:
+                    self.failure_memory.record_matching_recurrences(
+                        request.metadata.get("failure_environment", {}),
+                        str(exc),
+                        time.monotonic() - accounting_started,
+                        project_id=request.project_id,
+                        task_id=request.task_run_id,
+                        role=worker_role,
+                        request_id=current_request.request_id,
+                        source_request_id=source_request_id,
+                    )
+                fail_reason = (
+                    f"AIBroker worker lifecycle error [{type(exc).__name__}]: {exc}"
+                )
+                extra_record: dict[str, Any] = {}
+                if failed_resource_ids:
+                    extra_record["failover_from_resource_ids"] = sorted(failed_resource_ids)
+                self._update_record(
+                    source_request_id, state="failed",
+                    reason=fail_reason,
+                    broker_status="launch_error",
+                    broker_request_id=current_request.request_id,
+                    session_id=None,
+                    provider_output_observed=False,
+                    first_output_at=None,
+                    completed_at=utc_now_iso(),
+                    **extra_record,
+                )
+                if self._progress_channel is not None:
+                    self._progress_channel.emit(
+                        {"project_id": request.project_id}, "WORKER_FAILED",
+                        task_id=request.task_run_id, occurrence_key=source_request_id,
+                        details={"error": str(exc)},
+                    )
+                return
+
+            resource = getattr(result, "resource_context", None) if result else None
+            resource_payload = None
+            if resource is not None:
+                resource_payload = {
+                    "resource_id": resource.resource_id,
+                    "provider": resource.provider,
+                    "account": resource.account,
+                    "model": resource.model,
+                }
+            if result.status == "succeeded":
+                state = "completed"
+            elif result.status == "cancelled":
+                state = "cancelled"
+            else:
+                state = "failed"
+
+            if self.accounting is not None:
+                self.accounting.end_interval(
+                    "ai_execution",
+                    current_request.request_id,
+                    outcome={"completed": "accepted", "cancelled": "cancelled"}.get(state, "failed"),
                     project_id=request.project_id,
                     task_id=request.task_run_id,
                     role=worker_role,
-                    request_id=request.request_id,
+                    request_id=current_request.request_id,
+                    stage_run_id=request.stage_run_id,
+                    role_run_id=request.role_run_id,
                     source_request_id=source_request_id,
+                    attempt_id=source_request_id,
+                    dispatch_id=result.dispatch_id,
+                    decision_id=result.decision_id,
+                    execution_id=result.execution_id,
+                    session_id=result.session_id,
+                    resource_id=resource.resource_id if resource else None,
+                    provider=resource.provider if resource else None,
+                    account=resource.account if resource else None,
+                    model=resource.model if resource else None,
                 )
-            self._update_record(
-                source_request_id, state="failed",
-                reason="AIBroker worker lifecycle error [{0}]: {1}".format(
-                    type(exc).__name__, exc,
-                ),
-                broker_status="launch_error",
-                session_id=None,
-                provider_output_observed=False,
-                first_output_at=None,
-                completed_at=utc_now_iso(),
-            )
-            if self._progress_channel is not None:
-                self._progress_channel.emit(
-                    {"project_id": request.project_id}, "WORKER_FAILED",
-                    task_id=request.task_run_id, occurrence_key=source_request_id,
-                    details={"error": str(exc)},
+
+            if state == "failed":
+                classification = getattr(result, "failure_classification", None)
+                can_failover = (
+                    classification in ROLE_RESOURCE_FAILURES
+                    and resource is not None
+                    and resource.resource_id is not None
                 )
-            return
-        resource = result.resource_context
-        resource_payload = None
-        if resource is not None:
-            resource_payload = {
-                "resource_id": resource.resource_id,
-                "provider": resource.provider,
-                "account": resource.account,
-                "model": resource.model,
-            }
-        if result.status == "succeeded":
-            state = "completed"
-        elif result.status == "cancelled":
-            state = "cancelled"
-        else:
-            state = "failed"
-        if self.accounting is not None:
-            self.accounting.end_interval(
-                "ai_execution",
-                request.request_id,
-                outcome={"completed": "accepted", "cancelled": "cancelled"}.get(state, "failed"),
-                project_id=request.project_id,
-                task_id=request.task_run_id,
-                role=worker_role,
-                request_id=request.request_id,
-                stage_run_id=request.stage_run_id,
-                role_run_id=request.role_run_id,
-                source_request_id=source_request_id,
-                attempt_id=source_request_id,
-                dispatch_id=result.dispatch_id,
-                decision_id=result.decision_id,
-                execution_id=result.execution_id,
-                session_id=result.session_id,
-                resource_id=resource.resource_id if resource else None,
-                provider=resource.provider if resource else None,
-                account=resource.account if resource else None,
-                model=resource.model if resource else None,
-            )
-        if self.failure_memory is not None and state == "failed":
-            self.failure_memory.record_matching_recurrences(
-                request.metadata.get("failure_environment", {}),
-                str(result.error or ""),
-                time.monotonic() - accounting_started,
-                project_id=request.project_id,
-                task_id=request.task_run_id,
-                role=worker_role,
-                request_id=request.request_id,
-                source_request_id=source_request_id,
-            )
+                if can_failover:
+                    with self._lock:
+                        rec = copy.deepcopy(
+                            self._load_ledger()["executions"].get(source_request_id, {})
+                        )
+                    truth = read_repository_truth(request.working_directory)
+                    unchanged = (
+                        truth.valid
+                        and truth.branch == rec.get("branch")
+                        and truth.head == rec.get("head")
+                        and truth.status_hash == rec.get("launch_status_hash")
+                    )
+                    if unchanged and attempt < max_attempts:
+                        failed_resource_ids.add(resource.resource_id)
+                        continue
+
+                if self.failure_memory is not None:
+                    self.failure_memory.record_matching_recurrences(
+                        request.metadata.get("failure_environment", {}),
+                        str(result.error or ""),
+                        time.monotonic() - accounting_started,
+                        project_id=request.project_id,
+                        task_id=request.task_run_id,
+                        role=worker_role,
+                        request_id=current_request.request_id,
+                        source_request_id=source_request_id,
+                    )
+                provider_output_observed = bool(
+                    _non_blank_config(result.output) is not None or result.first_output_at is not None
+                )
+                if can_failover and not unchanged:
+                    fail_reason = (
+                        f"AIBroker worker resource failover refused because repository changed after provider failure: {result.error}"
+                    )
+                elif can_failover:
+                    fail_reason = f"AIBroker worker resource failover limit reached: {result.error}"
+                else:
+                    fail_reason = result.error
+                extra_record = {}
+                if failed_resource_ids:
+                    extra_record["failover_from_resource_ids"] = sorted(failed_resource_ids)
+                self._update_record(
+                    source_request_id,
+                    state="failed",
+                    completed_at=utc_now_iso(),
+                    broker_status=result.status,
+                    broker_request_id=current_request.request_id,
+                    dispatch_id=result.dispatch_id,
+                    decision_id=result.decision_id,
+                    execution_id=result.execution_id,
+                    session_id=result.session_id,
+                    backend_run_id=result.execution_id or result.dispatch_id,
+                    resource_context=resource_payload,
+                    usage_source=result.usage_source,
+                    provider_output_observed=provider_output_observed,
+                    first_output_at=result.first_output_at,
+                    reason=fail_reason,
+                    **extra_record,
+                )
+                if self._progress_channel is not None:
+                    is_test_fail = "test" in str(result.error or "").lower()
+                    self._progress_channel.emit(
+                        {"project_id": request.project_id},
+                        "TEST_FAILED" if is_test_fail else "WORKER_FAILED",
+                        task_id=request.task_run_id, occurrence_key=source_request_id,
+                        details={"error": fail_reason},
+                    )
+                return
+
+            break
+
         provider_output_observed = bool(
             _non_blank_config(result.output) is not None or result.first_output_at is not None
         )
+        extra_record = {}
+        if failed_resource_ids:
+            extra_record["failover_from_resource_ids"] = sorted(failed_resource_ids)
         self._update_record(
             source_request_id,
             state=state,
             completed_at=utc_now_iso(),
             broker_status=result.status,
+            broker_request_id=current_request.request_id,
             dispatch_id=result.dispatch_id,
             decision_id=result.decision_id,
             execution_id=result.execution_id,
@@ -1206,6 +1364,7 @@ class TransitionExecutor:
             provider_output_observed=provider_output_observed,
             first_output_at=result.first_output_at,
             reason=result.error,
+            **extra_record,
         )
         if self._progress_channel is not None:
             if state == "completed":
@@ -2219,6 +2378,193 @@ class TransitionExecutor:
             project, snapshot, source_request_id, exact_remediation_only=True,
         )
 
+    def _advance_completed_predecessor_handoffs(
+        self,
+        projects: dict[str, dict[str, Any]],
+        snapshots: dict[str, dict[str, Any]],
+    ) -> None:
+        for project_id, project in projects.items():
+            if self.owner_store.is_paused(project_id):
+                continue
+            snapshot = snapshots.get(project_id)
+            if snapshot is None:
+                continue
+            current_task = _advertised_task_id(snapshot)
+            if not current_task:
+                continue
+            if not _task_marked_complete(snapshot):
+                continue
+            repo_dir = project.get("repo_path") or ""
+            truth = read_repository_truth(repo_dir)
+            if not truth.valid or truth.dirty:
+                continue
+            with self._lock:
+                ledger = self._load_ledger()
+                if self._active_project(ledger, project_id):
+                    continue
+                rm_res = read_successor(repo_dir, current_task)
+                successor_id = str(rm_res.successor_task_id) if rm_res.kind == "successor" else None
+                has_handoff_or_settled = any(
+                    rec.get("project_id") == project_id
+                    and (
+                        rec.get("task_id") == current_task
+                        or rec.get("source_task_id") == current_task
+                        or (successor_id and (rec.get("staged_successor") == successor_id or rec.get("next_task_id") == successor_id))
+                    )
+                    and rec.get("state") in ("handoff", "settled", "blocked")
+                    for rec in ledger["executions"].values()
+                    if isinstance(rec, dict)
+                )
+                if has_handoff_or_settled:
+                    continue
+                decisions = self._load_decisions()
+                has_decision = any(
+                    dec.get("project_id") == project_id
+                    and dec.get("task_id") == current_task
+                    for dec in decisions.values()
+                    if isinstance(dec, dict)
+                )
+                if has_decision:
+                    continue
+                roles = project.get("ai_roles")
+                reviewer_enabled = (
+                    isinstance(roles, dict)
+                    and isinstance(roles.get("reviewer"), dict)
+                    and roles["reviewer"].get("enabled") is True
+                )
+                if reviewer_enabled:
+                    worker_completed = any(
+                        rec.get("project_id") == project_id
+                        and rec.get("task_id") == current_task
+                        and rec.get("state") == "completed"
+                        and rec.get("head") == truth.head
+                        for rec in ledger["executions"].values()
+                        if isinstance(rec, dict)
+                    )
+                    if worker_completed or snapshot.get("state") in ("WAITING_REVIEW", "REVIEWING"):
+                        continue
+            if rm_res.kind == "successor":
+                request_id = f"auto-handoff:{current_task}:{truth.head[:12]}"
+                with self._lock:
+                    if request_id in self._load_ledger()["executions"]:
+                        continue
+                self._record_handoff(
+                    request_id,
+                    project_id,
+                    current_task,
+                    str(rm_res.successor_task_id),
+                    "predecessor task marked complete; planner handoff required for successor",
+                    staged=rm_res,
+                    reviewed_branch=truth.branch,
+                    reviewed_head=truth.head,
+                    reviewed_ready=False,
+                )
+            elif rm_res.kind == "settled":
+                request_id = f"auto-settled:{current_task}:{truth.head[:12]}"
+                with self._lock:
+                    if request_id in self._load_ledger()["executions"]:
+                        continue
+                self._record_settled(
+                    request_id,
+                    project_id,
+                    "predecessor task marked complete and no next executable task is advertised",
+                    task_id=current_task,
+                    outcome="task_complete",
+                )
+            elif rm_res.kind == "invalid":
+                request_id = f"auto-handoff:{current_task}:{truth.head[:12]}"
+                with self._lock:
+                    if request_id in self._load_ledger()["executions"]:
+                        continue
+                self._record_blocked(
+                    request_id,
+                    project_id,
+                    f"staged roadmap invalid: {rm_res.reason}",
+                    task_id=current_task,
+                    source_kind="decision",
+                )
+
+    def _advance_unlaunched_ready(
+        self,
+        projects: dict[str, dict[str, Any]],
+        snapshots: dict[str, dict[str, Any]],
+    ) -> list[ActuationLaunch]:
+        launches: list[ActuationLaunch] = []
+        for project_id, project in projects.items():
+            if self.owner_store.is_paused(project_id) or self.owner_store.suppress_static_starts(project_id):
+                continue
+            policy, _ = _execution_policy(project)
+            if policy is None:
+                continue
+            snapshot = snapshots.get(project_id)
+            if snapshot is None:
+                continue
+            current_task = _advertised_task_id(snapshot)
+            if not current_task:
+                continue
+            if snapshot.get("state") != "READY_TO_RUN" or not _next_task_ready(snapshot):
+                continue
+            truth = read_repository_truth(project.get("repo_path") or "")
+            if not truth.valid or truth.dirty:
+                continue
+            with self._lock:
+                ledger = self._load_ledger()
+                if self._active_project(ledger, project_id):
+                    continue
+                if policy.get("owner_start") is not None:
+                    owner_req = str(policy["owner_start"].get("request_id") or "")
+                    if owner_req and owner_req not in ledger["executions"]:
+                        continue
+                if policy.get("bootstrap") is not None:
+                    boot_req = str(policy["bootstrap"].get("request_id") or "")
+                    if boot_req and boot_req not in ledger["executions"] and not self._project_has_execution_history(ledger, project_id):
+                        continue
+                request_id = f"auto-ready:{current_task}:{truth.head[:12]}"
+                if request_id in ledger["executions"]:
+                    continue
+                already_run = any(
+                    record.get("project_id") == project_id
+                    and record.get("task_id") == current_task
+                    and record.get("head") == truth.head
+                    for record in ledger["executions"].values()
+                    if isinstance(record, dict)
+                )
+                if already_run:
+                    continue
+            next_snapshot = copy.deepcopy(snapshot)
+            next_snapshot["state"] = "READY_TO_RUN"
+            telemetry = next_snapshot.get("telemetry") if isinstance(next_snapshot.get("telemetry"), dict) else {}
+            telemetry = copy.deepcopy(telemetry)
+            telemetry["task_id"] = current_task
+            next_snapshot["telemetry"] = telemetry
+            launch_task, error = self._fresh_guard(
+                project,
+                next_snapshot,
+                expected_branch=truth.branch,
+                expected_head=truth.head,
+                expected_task_id=current_task,
+            )
+            if launch_task is None:
+                self._record_blocked(
+                    request_id, project_id, error,
+                    task_id=current_task, source_kind="ready",
+                )
+                continue
+            launch = self._launch(
+                project,
+                source_request_id=request_id,
+                source_kind="ready",
+                task_id=launch_task,
+                source_task_id=None,
+                branch=truth.branch,
+                head=truth.head,
+                worker_prompt=str(policy["worker_prompt"]),
+                policy=policy,
+            )
+            if launch is not None:
+                launches.append(launch)
+        return launches
+
     def _advance_owner_start(
         self, projects: dict[str, dict[str, Any]], snapshots: dict[str, dict[str, Any]],
     ) -> list[ActuationLaunch]:
@@ -2324,6 +2670,8 @@ class TransitionExecutor:
             summary if decision_summary is None else decision_summary
         )
         launches = self._advance_decisions(projects, decision_snapshots)
+        self._advance_completed_predecessor_handoffs(projects, raw_snapshots)
+        launches.extend(self._advance_unlaunched_ready(projects, raw_snapshots))
         launches.extend(self._advance_owner_start(projects, raw_snapshots))
         launches.extend(self._advance_bootstrap(projects, raw_snapshots))
         return launches

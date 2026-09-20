@@ -157,9 +157,15 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
         else "unknown"
     )
 
+    prow_epoch = prow.get("recovery_epoch")
+    epoch_view = copy.deepcopy(prow_epoch) if isinstance(prow_epoch, dict) else None
+    epoch_id = epoch_view.get("id") if epoch_view else None
+
     return {
         "schema_version": 1,
         "state": wd_state,
+        "recovery_epoch": epoch_view,
+        "recovery_epoch_id": epoch_id,
         "last_progress_at": prow.get("last_progress_at"),
         "no_progress_seconds": stall.get("no_progress_seconds") if stall else None,
         "threshold_minutes": stall.get("threshold_minutes") if stall else prow.get("no_progress_threshold_minutes", 15),
@@ -328,6 +334,13 @@ def build_project_status(
     watchdog_view = _watchdog_view(runtime, project_id)
     if watchdog_view is not None:
         result["watchdog"] = watchdog_view
+    epoch = snapshot.get("recovery_epoch")
+    if epoch is None:
+        from dev_orchestrator.core.watchdog import resolve_recovery_epoch
+        epoch = resolve_recovery_epoch(snapshot, runtime_root=runtime)
+    if epoch is not None:
+        result["recovery_epoch"] = epoch
+        result["recovery_epoch_id"] = epoch["id"]
     return result
 
 
@@ -565,5 +578,11 @@ def project_runtime_status(snapshot: dict[str, Any], runtime_root: Path | str) -
                 chain = latest_plan.get("rejection_chain")
                 planner_view["rejection_chain_length"] = len(chain) if isinstance(chain, list) else 0
             projected["planner"] = planner_view
+
+    from dev_orchestrator.core.watchdog import resolve_recovery_epoch
+    epoch = resolve_recovery_epoch(projected, actuation_data, runtime_root=runtime)
+    if epoch is not None:
+        projected["recovery_epoch"] = epoch
+        projected["recovery_epoch_id"] = epoch["id"]
 
     return projected

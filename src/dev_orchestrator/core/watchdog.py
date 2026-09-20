@@ -28,6 +28,7 @@ from dev_orchestrator.core.diagnostics import (
     evidence_hash,
 )
 from dev_orchestrator.core.repository import read_repository_truth
+from dev_orchestrator.monitor.telemetry import extract_task_id
 from dev_orchestrator.platform.process import is_pid_alive
 from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
@@ -427,7 +428,9 @@ def _has_active_execution(
 
 
 def resolve_recovery_epoch(
-    snapshot: dict[str, Any], executor_state: dict[str, Any] | None = None,
+    snapshot: dict[str, Any],
+    executor_state: dict[str, Any] | None = None,
+    runtime_root: Path | str | None = None,
 ) -> dict[str, Any] | None:
     """Build a durable epoch from authoritative task/plan/control/HEAD/run facts.
 
@@ -437,23 +440,75 @@ def resolve_recovery_epoch(
     """
     project_id = str(snapshot.get("project_id") or snapshot.get("id") or "").strip()
     telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
-    task_id = str(telemetry.get("task_id") or snapshot.get("task_id") or "").strip()
+    task_id = str(
+        telemetry.get("task_id")
+        or snapshot.get("task_id")
+        or extract_task_id(snapshot.get("next_title"))
+        or ""
+    ).strip()
     git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
     head = str(git.get("head") or "").strip()
+    if not head:
+        repo_path = str(snapshot.get("repo_path") or snapshot.get("root") or "")
+        if repo_path:
+            truth = read_repository_truth(repo_path)
+            if truth.valid:
+                head = str(truth.head or "").strip()
     if not project_id or not task_id or not head:
         return None
 
     planner = snapshot.get("planner") if isinstance(snapshot.get("planner"), dict) else {}
     reviewer = snapshot.get("reviewer") if isinstance(snapshot.get("reviewer"), dict) else {}
     actuation = snapshot.get("actuation") if isinstance(snapshot.get("actuation"), dict) else {}
+
+    plan_id = str(planner.get("plan_id") or telemetry.get("plan_id") or "").strip() or None
+    if plan_id is None and runtime_root:
+        planner_file = Path(runtime_root) / "ai-planner.json"
+        if planner_file.is_file():
+            pdata = read_json(planner_file, {})
+            plans = pdata.get("plans") if isinstance(pdata, dict) else {}
+            active_plans = [
+                p for p in (plans or {}).values()
+                if isinstance(p, dict)
+                and str(p.get("project_id") or "") == project_id
+                and p.get("state") in {"planning", "reviewing", "remediating", "applying"}
+            ]
+            if active_plans:
+                latest_p = max(active_plans, key=lambda p: str(p.get("started_at") or ""))
+                plan_id = str(latest_p.get("plan_id") or "").strip() or None
+
+    review_id = str(reviewer.get("review_id") or "").strip() or None
+    if review_id is None and runtime_root:
+        reviewer_file = Path(runtime_root) / "ai-reviewer.json"
+        if reviewer_file.is_file():
+            rdata = read_json(reviewer_file, {})
+            reviews = rdata.get("reviews") if isinstance(rdata, dict) else {}
+            active_reviews = [
+                r for r in (reviews or {}).values()
+                if isinstance(r, dict)
+                and str(r.get("project_id") or "") == project_id
+                and r.get("state") in {"launching", "running"}
+            ]
+            if active_reviews:
+                latest_r = max(active_reviews, key=lambda r: str(r.get("started_at") or ""))
+                review_id = str(latest_r.get("review_id") or "").strip() or None
+
+    control_id = str(actuation.get("source_request_id") or snapshot.get("source_request_id") or "").strip() or None
+
+    exec_state = executor_state
+    if exec_state is None and runtime_root:
+        te_file = Path(runtime_root) / "transition-executor.json"
+        if te_file.is_file():
+            exec_state = read_json(te_file, {})
+
     evidence = {
         "project_id": project_id,
         "task_id": task_id,
         "head": head,
-        "plan_id": str(planner.get("plan_id") or telemetry.get("plan_id") or "").strip() or None,
-        "review_id": str(reviewer.get("review_id") or "").strip() or None,
-        "control_id": str(actuation.get("source_request_id") or snapshot.get("source_request_id") or "").strip() or None,
-        "execution_id": _active_execution_id(snapshot, executor_state),
+        "plan_id": plan_id,
+        "review_id": review_id,
+        "control_id": control_id,
+        "execution_id": _active_execution_id(snapshot, exec_state),
     }
     raw = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return {"id": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16], "evidence": evidence}
@@ -772,6 +827,7 @@ def evaluate_stall(
     *,
     now: Optional[datetime] = None,
     executor_state: dict[str, Any] | None = None,
+    runtime_root: Path | str | None = None,
 ) -> StallAssessment:
     """Sole consumer of age; evaluates threshold breach against durable signals."""
     last_progress_at, progress_fingerprint, signal_sources = signals
@@ -814,7 +870,7 @@ def evaluate_stall(
         progress_fingerprint=progress_fingerprint,
         activity_evidence=evidence_state,
         active_execution=active_execution,
-        recovery_epoch=resolve_recovery_epoch(snapshot, executor_state),
+        recovery_epoch=resolve_recovery_epoch(snapshot, executor_state, runtime_root=runtime_root),
         last_progress_at=last_progress_at,
     )
 
@@ -1464,6 +1520,7 @@ class WatchdogCoordinator:
                     signals,
                     now=tick_now,
                     executor_state=executor_state,
+                    runtime_root=self.runtime_root,
                 )
                 # READY_TO_RUN without an execution deliberately uses the
                 # launch-gap subset of activity; persist that same evidence

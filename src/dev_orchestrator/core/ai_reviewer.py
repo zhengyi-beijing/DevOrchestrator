@@ -12,6 +12,7 @@ from typing import Any, Optional
 from dev_orchestrator.ai.contracts import (
     AIRoleRequest,
     ResourceContext,
+    ROLE_RESOURCE_FAILURES,
     missing_independence_fields,
 )
 from dev_orchestrator.ai.execution_port import AIExecutionPort
@@ -1766,93 +1767,180 @@ class AIReviewerCoordinator:
             self._save_state(state)
         source_request_id = str(request.metadata.get("worker_source_request_id") or "")
         review_started = time.monotonic()
-        if self.accounting is not None:
-            self.accounting.start_interval(
-                "technical_review",
-                review_id,
-                project_id=request.project_id,
-                task_id=request.task_run_id,
-                role="reviewer",
-                request_id=review_id,
-                stage_run_id=request.stage_run_id,
-                role_run_id=request.role_run_id,
-                source_request_id=source_request_id or None,
-                attempt_id=source_request_id or None,
-            )
+
+        failed_resource_ids: set[str] = set(request.excluded_resource_ids)
+        max_resource_failovers = 2
+        if isinstance(request.metadata, dict):
+            max_failovers_meta = request.metadata.get("max_resource_failovers")
+            if isinstance(max_failovers_meta, int) and 0 <= max_failovers_meta <= 5:
+                max_resource_failovers = max_failovers_meta
+        max_attempts = 1 + max_resource_failovers
+
         result = None
-        try:
-            result = self.port.execute(request) if self.port is not None else None
-            if result is None:
-                raise RuntimeError("AIBroker reviewer port unavailable")
-        except Exception as exc:
+        current_request = request
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                meta = dict(request.metadata) if isinstance(request.metadata, dict) else {}
+                meta["reviewer_attempt"] = attempt
+                meta["reviewer_failover_from_resource_ids"] = sorted(failed_resource_ids)
+                current_request = AIRoleRequest(
+                    project_id=request.project_id,
+                    task_run_id=request.task_run_id,
+                    stage_run_id=request.stage_run_id,
+                    role_run_id=request.role_run_id,
+                    request_id=f"{review_id}:failover-{attempt - 1}",
+                    role=request.role,
+                    prompt=request.prompt,
+                    working_directory=request.working_directory,
+                    quality=request.quality,
+                    independence=request.independence,
+                    previous_resource_context=request.previous_resource_context,
+                    excluded_resource_ids=tuple(sorted(failed_resource_ids)),
+                    timeout_seconds=request.timeout_seconds,
+                    metadata=meta,
+                )
             if self.accounting is not None:
-                self.accounting.end_interval(
+                self.accounting.start_interval(
                     "technical_review",
-                    review_id,
-                    outcome="failed",
+                    current_request.request_id,
                     project_id=request.project_id,
                     task_id=request.task_run_id,
                     role="reviewer",
-                    request_id=review_id,
+                    request_id=current_request.request_id,
                     stage_run_id=request.stage_run_id,
                     role_run_id=request.role_run_id,
                     source_request_id=source_request_id or None,
                     attempt_id=source_request_id or None,
                 )
-            if self.failure_memory is not None:
-                self.failure_memory.record_matching_recurrences(
-                    request.metadata.get("failure_environment", {}),
-                    str(exc),
-                    time.monotonic() - review_started,
+            result = None
+            try:
+                result = self.port.execute(current_request) if self.port is not None else None
+                if result is None:
+                    raise RuntimeError("AIBroker reviewer port unavailable")
+            except Exception as exc:
+                if self.accounting is not None:
+                    self.accounting.end_interval(
+                        "technical_review",
+                        current_request.request_id,
+                        outcome="failed",
+                        project_id=request.project_id,
+                        task_id=request.task_run_id,
+                        role="reviewer",
+                        request_id=current_request.request_id,
+                        stage_run_id=request.stage_run_id,
+                        role_run_id=request.role_run_id,
+                        source_request_id=source_request_id or None,
+                        attempt_id=source_request_id or None,
+                    )
+                reconciled = None
+                if self.port is not None:
+                    try:
+                        reconciled = self.port.status(current_request.request_id)
+                    except Exception:
+                        reconciled = None
+                classification = None
+                resource = None
+                if isinstance(reconciled, dict) and str(reconciled.get("status") or "") == "failed":
+                    from dev_orchestrator.core.ai_planner import _classify_reconciled_dispatch_failure
+                    terminal_error = _nonblank(reconciled.get("execution_error")) or str(exc)
+                    classification = _classify_reconciled_dispatch_failure(terminal_error)
+                    resource_id = _nonblank(reconciled.get("resource_id"))
+                    if resource_id is not None:
+                        resource = ResourceContext(
+                            resource_id,
+                            _nonblank(reconciled.get("provider")),
+                            _nonblank(reconciled.get("account")),
+                            _nonblank(reconciled.get("model")),
+                        )
+                can_failover = (
+                    classification in ROLE_RESOURCE_FAILURES
+                    and resource is not None
+                    and resource.resource_id is not None
+                )
+                if can_failover and attempt < max_attempts:
+                    failed_resource_ids.add(resource.resource_id)
+                    continue
+                if self.failure_memory is not None:
+                    self.failure_memory.record_matching_recurrences(
+                        request.metadata.get("failure_environment", {}),
+                        str(exc),
+                        time.monotonic() - review_started,
+                        project_id=request.project_id,
+                        task_id=request.task_run_id,
+                        role="reviewer",
+                        request_id=current_request.request_id,
+                        source_request_id=source_request_id or None,
+                    )
+                self._record_terminal(
+                    review_id, request.project_id, source_request_id, "failed",
+                    f"reviewer lifecycle error: {exc}",
+                )
+                return
+
+            if self.accounting is not None:
+                resource = getattr(result, "resource_context", None) if result else None
+                self.accounting.end_interval(
+                    "technical_review",
+                    current_request.request_id,
+                    outcome="accepted" if result and result.status == "succeeded" else "failed",
                     project_id=request.project_id,
                     task_id=request.task_run_id,
                     role="reviewer",
-                    request_id=review_id,
+                    request_id=current_request.request_id,
+                    stage_run_id=request.stage_run_id,
+                    role_run_id=request.role_run_id,
                     source_request_id=source_request_id or None,
+                    attempt_id=source_request_id or None,
+                    dispatch_id=result.dispatch_id if result else None,
+                    decision_id=result.decision_id if result else None,
+                    execution_id=result.execution_id if result else None,
+                    session_id=result.session_id if result else None,
+                    resource_id=resource.resource_id if resource else None,
+                    provider=resource.provider if resource else None,
+                    account=resource.account if resource else None,
+                    model=resource.model if resource else None,
                 )
-            self._record_terminal(review_id, request.project_id, source_request_id, "failed", f"reviewer lifecycle error: {exc}")
-            return
-        if self.accounting is not None:
-            resource = result.resource_context
-            self.accounting.end_interval(
-                "technical_review",
-                review_id,
-                outcome="accepted" if result.status == "succeeded" else "failed",
-                project_id=request.project_id,
-                task_id=request.task_run_id,
-                role="reviewer",
-                request_id=review_id,
-                stage_run_id=request.stage_run_id,
-                role_run_id=request.role_run_id,
-                source_request_id=source_request_id or None,
-                attempt_id=source_request_id or None,
-                dispatch_id=result.dispatch_id,
-                decision_id=result.decision_id,
-                execution_id=result.execution_id,
-                session_id=result.session_id,
-                resource_id=resource.resource_id if resource else None,
-                provider=resource.provider if resource else None,
-                account=resource.account if resource else None,
-                model=resource.model if resource else None,
-            )
-        if result.status != "succeeded":
-            if self.failure_memory is not None:
-                self.failure_memory.record_matching_recurrences(
-                    request.metadata.get("failure_environment", {}),
-                    str(result.error or ""),
-                    time.monotonic() - review_started,
-                    project_id=request.project_id,
-                    task_id=request.task_run_id,
-                    role="reviewer",
-                    request_id=review_id,
-                    source_request_id=source_request_id or None,
+
+            if result.status != "succeeded":
+                classification = getattr(result, "failure_classification", None)
+                resource = getattr(result, "resource_context", None)
+                can_failover = (
+                    result.status == "failed"
+                    and classification in ROLE_RESOURCE_FAILURES
+                    and resource is not None
+                    and resource.resource_id is not None
                 )
-            self._finish_result(review_id, result, "failed", result.error or f"reviewer_{result.status}")
-            return
+                if can_failover and attempt < max_attempts:
+                    failed_resource_ids.add(resource.resource_id)
+                    continue
+                if self.failure_memory is not None:
+                    self.failure_memory.record_matching_recurrences(
+                        request.metadata.get("failure_environment", {}),
+                        str(result.error or ""),
+                        time.monotonic() - review_started,
+                        project_id=request.project_id,
+                        task_id=request.task_run_id,
+                        role="reviewer",
+                        request_id=current_request.request_id,
+                        source_request_id=source_request_id or None,
+                    )
+                fail_reason = (
+                    f"reviewer resource failover limit reached: {result.error}"
+                    if can_failover
+                    else (result.error or f"reviewer_{result.status}")
+                )
+                self._finish_result(review_id, result, "failed", fail_reason)
+                return
+
+            break
+
+        extra: dict[str, Any] = {}
+        if failed_resource_ids:
+            extra["failover_from_resource_ids"] = sorted(failed_resource_ids)
         try:
             decision, next_action, reason = _parse_review_output(result.output)
         except ValueError as exc:
-            self._finish_result(review_id, result, "failed", str(exc))
+            self._finish_result(review_id, result, "failed", str(exc), **extra)
             return
         with self._lock:
             record = self._load_state()["reviews"].get(review_id, {})
@@ -1906,7 +1994,7 @@ class AIReviewerCoordinator:
                 request_id=review_id,
                 source_request_id=source_request_id or None,
             )
-        self._finish_result(review_id, result, "completed", reason, decision=decision, next_action=next_action)
+        self._finish_result(review_id, result, "completed", reason, decision=decision, next_action=next_action, **extra)
 
     def _finish_result(self, review_id: str, result: Any, state_name: str, reason: str, **extra: Any) -> None:
         resource = result.resource_context

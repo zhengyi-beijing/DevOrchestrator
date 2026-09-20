@@ -5,7 +5,17 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P14.6 Unattended Execution Stabilization Gate** — **READY TO START**.
+Current task: **P15 Mobile Observability & Guarded Control** — **PENDING DESIGN**.
+
+P14.6 Unattended Execution Stabilization Gate closure (2026-09-20):
+- Implemented and closed all unattended execution stabilization gates:
+  1. Planner protocol normalization & schema repair pipeline: Raw Capture -> JSON Extract -> Normalize -> Schema Validate -> Semantic Validate -> Reviewer. Bounded single-cycle schema repair without consuming semantic failure budget. Ambiguous JSON objects fail closed.
+  2. Reviewer & Worker resource failover: retries on ROLE_RESOURCE_FAILURES (quota_exhausted, rate_limited, provider_temporarily_unavailable, resource_unavailable) on alternative resources (:failover-{attempt}, tracking failover_from_resource_ids). Preserves semantic remediation budget. Worker enforces clean repository check before failover, refusing failover safely on dirty repo.
+  3. Recovery epoch agreement: synchronized resolve_recovery_epoch, project_runtime_status, build_project_status, _watchdog_view, and project_control_view. Watchdog, runtime status, monitor, and control overview all compute matching recovery epoch dictionaries and SHA256 hashes.
+  4. Closed-loop unattended promotion: _advance_completed_predecessor_handoffs creates automatic handoffs for completed predecessors with roadmap successors, deduplicated against active decisions/handoffs/reviews. _advance_unlaunched_ready automatically launches unlaunched READY_TO_RUN tasks without human intervention.
+  5. Acceptance suite: tests_py/test_p14_6_unattended_gate.py (6 passed in 4.63s).
+  6. Verification: focused/adjacent suites (100 passed + 15 subtests, 73 passed + 8 subtests, 24 passed), full regression 895 passed + 87 subtests in 302.78s; compileall and git diff --check passed cleanly. Graphify updated.
+- Next task: P15 Mobile Observability & Guarded Control (Status: **PENDING DESIGN**).
 
 
 Watchdog recovery-epoch cleanup closure (2026-09-20):

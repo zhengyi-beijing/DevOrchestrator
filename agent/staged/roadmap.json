@@ -58,6 +58,11 @@
     },
     {
       "task_id": "P14.5",
+      "successor": "P14.6",
+      "successor_spec_path": "agent/staged/P14.6.md"
+    },
+    {
+      "task_id": "P14.6",
       "successor": "P15",
       "successor_spec_path": "agent/staged/P15.md"
     },

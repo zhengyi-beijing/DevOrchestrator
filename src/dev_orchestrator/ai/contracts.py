@@ -16,6 +16,7 @@ _RESOURCE_FAILURE_CLASSIFICATIONS = {
     "provider_temporarily_unavailable",
     "resource_unavailable",
 }
+ROLE_RESOURCE_FAILURES: frozenset[str] = frozenset(_RESOURCE_FAILURE_CLASSIFICATIONS)
 
 
 #: Identity fields that prior-resource evidence must carry for each
@@ -107,7 +108,7 @@ class AIRoleRequest:
     request_id: str = field(default_factory=lambda: str(uuid4()))
     quality: str = "balanced"
     independence: str = "none"
-    previous_resource_context: ResourceContext | None = None
+    previous_resource_context: ResourceContext | Mapping[str, Any] | None = None
     excluded_resource_ids: tuple[str, ...] = ()
     timeout_seconds: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)

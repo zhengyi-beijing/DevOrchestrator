@@ -1041,3 +1041,31 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
 - Existing regression continues to prove current genuine lifecycle OWNER_GATE is never auto-cleared and restart/replay remains idempotent.
 - Verification: watchdog recovery 62 passed + 5 subtests; adjacent watchdog 40 passed; full suite 882 passed + 87 subtests; compileall and git diff --check passed.
 - Cleanup task closed. P14.6 is the next active development task.
+
+## P14.6 Unattended Execution Stabilization Gate (2026-09-20)
+
+- Roadmap linkage:
+  - Created `agent/staged/P14.6.md` with status `PENDING DESIGN`.
+  - Updated `agent/staged/roadmap.json` to link `P14.5 -> P14.6 -> P15`.
+  - Updated `tests_py/test_staged_roadmap.py` with assertions for `P14.5 -> P14.6 -> P15` (all 24 passed).
+- Planner protocol normalization & schema repair pipeline:
+  - Planner follows Raw Capture -> JSON Extract -> Normalize -> Schema Validate -> Semantic Validate -> Reviewer pipeline.
+  - Bounded single-cycle schema repair allowed without consuming semantic failure budget. Ambiguous JSON objects fail closed.
+- AI Reviewer & Worker resource failover:
+  - Exported `ROLE_RESOURCE_FAILURES` in `src/dev_orchestrator/ai/contracts.py` (`quota_exhausted`, `rate_limited`, `provider_temporarily_unavailable`, `resource_unavailable`).
+  - Updated `AIRoleRequest.previous_resource_context` annotation to `ResourceContext | Mapping[str, Any] | None` (resolved NB-8).
+  - In `src/dev_orchestrator/core/ai_reviewer.py`: implemented bounded failover loop retrying resource failures with `:failover-{attempt}`, `excluded_resource_ids`, and `failover_from_resource_ids` recorded in review record and decision metadata without consuming semantic remediation budget.
+  - In `src/dev_orchestrator/core/transition_executor.py`: implemented bounded failover loop in `_run_broker_worker_thread` on resource failures with `:failover-{attempt}` and `excluded_resource_ids`. Evaluates repository truth before failover; if repository was modified/dirtied, failover is safely refused.
+- Recovery epoch agreement:
+  - Extended `resolve_recovery_epoch` in `src/dev_orchestrator/core/watchdog.py` to resolve active planner, reviewer, and worker execution identities from `runtime_root`.
+  - Attached `recovery_epoch` and `recovery_epoch_id` in `project_runtime_status`, `build_project_status`, `_watchdog_view`, and `project_control_view` ensuring Watchdog, runtime status, monitor, and control overview all compute matching recovery epoch dictionaries and SHA256 hashes.
+- Closed-loop unattended successor promotion & launch:
+  - In `TransitionExecutor`: added `_advance_completed_predecessor_handoffs` creating automatic handoff or settled records when predecessor task is marked complete in the repository, guarded against duplicate executions, active decisions, and pending reviews.
+  - Added `_advance_unlaunched_ready` automatically launching unlaunched `READY_TO_RUN` tasks without human intervention.
+  - Hardened `overlay_managed_runs` so historical terminal worker failures do not relabel newly ready tasks as `WORKER_FAILED`.
+- Verification:
+  - Created acceptance test suite `tests_py/test_p14_6_unattended_gate.py` with 6 tests covering reviewer failover success, reviewer failover exhaustion, worker clean failover, worker dirty refusal, unattended predecessor-to-successor launch, and cross-component recovery epoch agreement (all 6 passed in 4.63s).
+  - Focused/adjacent suites: `test_staged_handoff.py` (16 passed), `test_transition_overlay.py` & `test_transition_executor_aibroker.py` (27 passed, 8 subtests), `test_watchdog_recovery.py` & `test_transition_executor.py` & `test_ai_reviewer.py` (100 passed, 15 subtests), `test_staged_roadmap.py` (24 passed).
+  - Full repository regression: 895 passed, 87 subtests passed in 302.78s.
+  - `compileall -q src tests_py`, `git diff --check`, and `graphify update .` all passed cleanly.
+- P14.6 closed. Next task is P15 Mobile Observability & Guarded Control (`agent/staged/P15.md`).
