@@ -5,8 +5,15 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P14.5 Reviewer Harness & OpenCodeReview Adapter** — **CLOSED** at `e2fce11`.
+Current task: **P14.6 Unattended Execution Stabilization Gate** — **READY TO START**.
 
+
+Watchdog recovery-epoch cleanup closure (2026-09-20):
+- Existing epoch-scoping implementation from 6b1e7f3 was acceptance-reviewed and extended with explicit active Reviewer identity (review_id).
+- Exact P14.5-era stale-state regression proves a healthy newer EXECUTING Worker clears historical watchdog owner_gate/attempts=20 and projects ok / attempts_this_run=0.
+- Genuine current OWNER_GATE remains preserved; restart/replay coverage remains green.
+- Verification: 62 watchdog-recovery tests + 5 subtests, 40 adjacent watchdog tests, full 882 tests + 87 subtests, compileall and diff-check all passed.
+- Next task is P14.6; no P14.5 re-review is required.
 P14.5 closure (2026-09-20, owner-approved at OWNER_GATE):
 - Closure anchor: `e2fce11 fix(review): restore actionable remediate dispositions`. Local only; not pushed.
 - All three frozen acceptance criteria were demonstrated live, not only unit-tested:

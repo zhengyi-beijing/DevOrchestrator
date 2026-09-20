@@ -1031,3 +1031,13 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   review.
 - Canonical worktree clean at `5d39787`. Committed locally without push.
   DevOrchestrator remains owner-paused and no successor task was started.
+
+## Watchdog recovery-epoch / stale OWNER_GATE cleanup closure (2026-09-20)
+
+- Reviewed the already-landed 6b1e7f3 authoritative recovery-epoch implementation against the post-P14.5 handoff acceptance contract.
+- Closed the remaining Reviewer-epoch gap by adding active review_id to durable epoch evidence.
+- Added an exact regression for the production failure shape: historical P14.5 watchdog owner_gate plus attempts=20 is automatically invalidated when a newer healthy P14.6 Worker is WORKER_RUNNING/EXECUTING; watchdog projection becomes ok and attempts_this_run=0.
+- Added a regression proving two active reviewer identities on the same task/HEAD produce distinct recovery epochs.
+- Existing regression continues to prove current genuine lifecycle OWNER_GATE is never auto-cleared and restart/replay remains idempotent.
+- Verification: watchdog recovery 62 passed + 5 subtests; adjacent watchdog 40 passed; full suite 882 passed + 87 subtests; compileall and git diff --check passed.
+- Cleanup task closed. P14.6 is the next active development task.

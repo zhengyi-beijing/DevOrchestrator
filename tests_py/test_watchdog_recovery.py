@@ -2541,6 +2541,81 @@ class WatchdogRecoveryTests(unittest.TestCase):
         self.assertEqual(len(replay_row["attempts"]), 1)
         self.assertEqual(len(list((self.runtime_dir / "control" / "inbox").glob("wd-*.json"))), 0)
 
+    def test_new_executing_epoch_clears_historical_watchdog_gate_and_budget(self):
+        """Exact P14.5 regression: a healthy newer Worker epoch clears stale watchdog-only state."""
+        import hashlib
+        from dev_orchestrator.core.watchdog import canonical_path
+        from dev_orchestrator.core.project_status import _watchdog_view
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        head = subprocess.check_output(
+            ["git", "-C", str(self.repo_dir), "rev-parse", "HEAD"], text=True
+        ).strip()
+        repo_fp = hashlib.sha256(canonical_path(self.repo_dir).encode("utf-8")).hexdigest()[:16]
+        config_path = self.root / "projects-executing.json"
+        config_path.write_text(json.dumps({"projects": [{
+            "project_id": "p1", "repo_path": str(self.repo_dir),
+            "watchdog": {"enabled": True, "auto_recovery": True, "no_progress_threshold_minutes": 15},
+        }]}), encoding="utf-8")
+        snapshot = {
+            "project_id": "p1", "repo_path": str(self.repo_dir),
+            "lifecycle_state": "EXECUTING", "state": "WORKER_RUNNING",
+            "telemetry": {"task_id": "P14.6", "run_id": "new-worker-run"},
+            "git": {"head": head, "branch": "master", "dirty": False},
+            "worker": {"kind": "task", "state": "running", "process_alive": True},
+            "broker_execution": {"state": "running", "role_run_id": "worker-p146"},
+            "activity": {"watchdog_safe": {
+                "last_activity_at": now.isoformat(), "newest_kind": "worker_runtime",
+                "newest_path": "runtime/worker.json", "sources": {},
+                "changed_entries_considered": 0, "repo_scope": "canonical",
+                "repo_root_fingerprint": repo_fp,
+            }},
+        }
+        coordinator = WatchdogCoordinator(self.runtime_dir)
+        coordinator._cached_state["projects"]["p1"] = {
+            "recovery_epoch": {"id": "historical-p145", "evidence": {"task_id": "P14.5"}},
+            "attempts": {"old": {"attempt_key": "old", "state": "completed"}},
+            "attempt_counts": {"old-scope": 20},
+            "recovery_slots": {"old-scope": "wd-old"},
+            "cooldown_until": (now + _dt.timedelta(hours=1)).isoformat(),
+            "last_diagnosis": "unknown", "last_evidence_hash": "old",
+            "last_recovery_result": "blocked",
+            "owner_gate": {"source": "watchdog", "reason": "historical max attempts"},
+            "fence_generation": 7,
+        }
+
+        result = coordinator.advance(config_path, {"projects": [snapshot]}, now=now)
+        self.assertEqual(result[0]["status"], "ok")
+        self.assertTrue(result[0]["epoch_advanced"])
+        row = coordinator.project_state("p1")
+        self.assertEqual(row["attempts"], {})
+        self.assertEqual(row["attempt_counts"], {})
+        self.assertEqual(row["recovery_slots"], {})
+        self.assertIsNone(row["owner_gate"])
+        self.assertIsNone(row["last_diagnosis"])
+        self.assertEqual(row["recovery_epoch"]["evidence"]["task_id"], "P14.6")
+        self.assertEqual(row["recovery_epoch"]["evidence"]["execution_id"], "new-worker-run")
+        view = _watchdog_view(self.runtime_dir, "p1")
+        self.assertEqual(view["state"], "ok")
+        self.assertEqual(view["attempts_this_run"], 0)
+
+    def test_active_reviewer_identity_advances_recovery_epoch(self):
+        """A new reviewer run on the same task/HEAD is an authoritative epoch transition."""
+        from dev_orchestrator.core.watchdog import resolve_recovery_epoch
+
+        base = {
+            "project_id": "p1",
+            "telemetry": {"task_id": "P14.6"},
+            "git": {"head": "a" * 40},
+        }
+        first = dict(base, reviewer={"review_id": "review-1", "state": "running"})
+        second = dict(base, reviewer={"review_id": "review-2", "state": "running"})
+        e1 = resolve_recovery_epoch(first)
+        e2 = resolve_recovery_epoch(second)
+        self.assertEqual(e1["evidence"]["review_id"], "review-1")
+        self.assertEqual(e2["evidence"]["review_id"], "review-2")
+        self.assertNotEqual(e1["id"], e2["id"])
+
     def test_ready_gap_recovery_respects_current_owner_pause_and_dirty_guards(self):
         """The launch-gap diagnostic cannot cross present owner or repo barriers."""
         from dev_orchestrator.control.owner_store import OwnerControlStore

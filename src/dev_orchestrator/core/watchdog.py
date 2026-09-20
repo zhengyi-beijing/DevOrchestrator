@@ -444,12 +444,14 @@ def resolve_recovery_epoch(
         return None
 
     planner = snapshot.get("planner") if isinstance(snapshot.get("planner"), dict) else {}
+    reviewer = snapshot.get("reviewer") if isinstance(snapshot.get("reviewer"), dict) else {}
     actuation = snapshot.get("actuation") if isinstance(snapshot.get("actuation"), dict) else {}
     evidence = {
         "project_id": project_id,
         "task_id": task_id,
         "head": head,
         "plan_id": str(planner.get("plan_id") or telemetry.get("plan_id") or "").strip() or None,
+        "review_id": str(reviewer.get("review_id") or "").strip() or None,
         "control_id": str(actuation.get("source_request_id") or snapshot.get("source_request_id") or "").strip() or None,
         "execution_id": _active_execution_id(snapshot, executor_state),
     }

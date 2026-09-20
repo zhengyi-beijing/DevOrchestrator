@@ -1,24 +1,34 @@
-# NEXT — Watchdog recovery-epoch / stale OWNER_GATE cleanup
+# NEXT — P14.6 Unattended Execution Stabilization Gate
 
-Status: **NEXT AFTER P14.5** (P14.5 closed at `e2fce11` on 2026-09-20)
+Status: **NEXT / OWNER AUTHORIZED TO CONTINUE** (watchdog recovery-epoch cleanup closed 2026-09-20)
 
-Sequence per `docs/backlog.md`:
-`P14.5 (closed) -> Watchdog recovery-epoch cleanup -> P14.6 Unattended Execution Stabilization Gate -> P15`
+Sequence:
+P14.5 (closed) -> Watchdog recovery-epoch cleanup (closed) -> P14.6 Unattended Execution Stabilization Gate -> P15
 
-Goal: prevent a historical watchdog-generated OWNER_GATE/recovery budget from
-contaminating a newer valid execution epoch, while preserving genuine
-owner-decision gates.
+## Watchdog recovery-epoch cleanup closure
 
-Scope:
-- Define a durable recovery-epoch identity from current task/plan/control command/HEAD/execution evidence.
-- When newer valid execution evidence supersedes the evidence that created a watchdog-generated OWNER_GATE, invalidate the stale watchdog gate, attempts, diagnosis and evidence hash automatically.
-- Never auto-clear an explicit owner-decision OWNER_GATE; only watchdog/recovery-generated stale gates are eligible.
-- Project health/watchdog projection must not report historical owner_gate/unknown while a newer authoritative execution is healthy.
-- Reset attempts_this_run and recovery budget only on a proven epoch transition, not merely because a worker process appeared.
-- Add regression coverage for stale historical gate cleanup, genuine owner gate preservation, restart/replay, and new Worker/Reviewer epochs.
+Closed after validating and extending the earlier 6b1e7f3 authoritative recovery-epoch implementation.
 
-Acceptance:
-- Reproduce the P14.5-era case (new WORKER_RUNNING/EXECUTING while the watchdog retains an old owner_gate with attempts=20), advance to a newer epoch, and prove automatic cleanup without a manual watchdog-clear or user continue.
+Acceptance evidence:
+- Recovery epochs are derived from authoritative task/HEAD/plan/control/Worker execution evidence and now also include active review_id, so a new Reviewer run is an explicit epoch boundary.
+- Epoch supersession resets watchdog-only attempts, attempt counts, recovery slots, cooldown, diagnosis, evidence hash, recovery result and watchdog owner_gate while incrementing the diagnostic fence.
+- Genuine current lifecycle OWNER_GATE remains fail-closed and is not auto-cleared.
+- Exact P14.5-era regression is covered: healthy newer WORKER_RUNNING/EXECUTING with historical watchdog owner_gate and attempts=20 advances epoch, clears stale budget/gate and projects watchdog state ok with attempts_this_run=0.
+- Restart/replay and READY_TO_RUN recovery remain covered.
+- Focused verification: test_watchdog_recovery.py 62 passed + 5 subtests; adjacent watchdog suites 40 passed.
+- Full repository regression: 882 passed + 87 subtests.
+- compileall and git diff --check passed.
+
+## P14.6 goal
+
+Prove that the existing DevO control/recovery stack can sustain real unattended development before adding another client surface.
+
+Immediate implementation sequence:
+1. Consolidate Planner protocol handling into Raw Capture -> JSON Extract -> Normalize -> Schema Validate -> Semantic Validate -> Reviewer, with bounded format repair for schema-only failures.
+2. Verify provider/session/quota failures trigger resource failover without consuming semantic-remediation budget or requiring user continue.
+3. Require lifecycle/health/watchdog projections to agree on the current recovery epoch.
+4. Exercise automatic Review -> Remediation -> Re-review -> completion and automatic promotion/launch of the next eligible task.
+5. Build the unattended fault-injection acceptance harness before the long qualification run.
 
 ## Carried forward from P14.5 — residual NON_BLOCKING items
 

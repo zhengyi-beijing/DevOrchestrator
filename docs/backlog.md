@@ -143,7 +143,7 @@ Sequence: P14.5 follows P14 because review sessions must rely on durable/recover
 
 ## NEXT - Watchdog recovery-epoch / stale OWNER_GATE cleanup
 
-Status: **NEXT AFTER P14.5**
+Status: **COMPLETE 2026-09-20**
 
 Goal: prevent a historical watchdog-generated OWNER_GATE/recovery budget from contaminating a newer valid execution epoch, while preserving genuine owner-decision gates.
 
@@ -159,7 +159,7 @@ Sequence: execute immediately after P14.5 closes, before Stabilization Gate and 
 
 ## P14.6 - Unattended Execution Stabilization Gate
 
-Status: **REQUIRED BEFORE P15**
+Status: **NEXT / REQUIRED BEFORE P15**
 
 Goal: prove that the existing DevO control/recovery stack can sustain real unattended development before adding another client surface.
 
