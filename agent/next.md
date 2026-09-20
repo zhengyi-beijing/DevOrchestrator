@@ -1,6 +1,6 @@
 # NEXT — P14.6 Unattended Execution Stabilization Gate
 
-Status: **NEXT / OWNER AUTHORIZED TO CONTINUE** (watchdog recovery-epoch cleanup closed 2026-09-20)
+Status: **READY_TO_RUN** — owner-authorized 2026-09-20; P14.6 Phase 1 complete, continue remaining stabilization phases.
 
 Sequence:
 P14.5 (closed) -> Watchdog recovery-epoch cleanup (closed) -> P14.6 Unattended Execution Stabilization Gate -> P15
