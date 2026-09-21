@@ -35,7 +35,7 @@ Acceptance evidence:
    - Final Evaluated Decision: **`NO_PROMOTE`** (`reasons: ["capability_unsupported"]`).
    - Artifacts committed under `benchmark/evidence/p16_baseline_20260921/` and canonical acceptance record in `docs/P16_BENCHMARK_ACCEPTANCE.md`.
 6. **Acceptance Test Suite**:
-   - 9 dedicated P16 test suites in `tests_py/test_p16_*.py` (47 passed in 4.17s).
+   - 9 dedicated P16 test suites in `tests_py/test_p16_*.py` (58 passed in 4.07s).
 7. **Roadmap Status**:
    - `agent/staged/roadmap.json` designates `successor: null`. All staged tasks (P11x through P16) are now complete.
 

@@ -233,12 +233,17 @@ class BenchmarkRunner:
             # Shell tool calls observed from workspace shims
             shell_calls = 1 if attempt.status == "succeeded" else 0
             provider_reported = attempt.usage.get("tool_calls") if attempt.usage else None
+            # Total complete tool calls is exposed ONLY when source declares complete coverage
+            total_complete_tool_calls = None
+            if attempt.usage and isinstance(attempt.usage, dict):
+                if attempt.usage.get("complete_tool_calls_declared") is True or attempt.usage.get("tool_calls_complete") is True:
+                    total_complete_tool_calls = int(provider_reported) if provider_reported is not None else None
 
             metrics = MetricCoverage(
                 observed_shell_tool_calls=shell_calls,
                 zvec_calls=zvec_calls,
                 provider_reported_tool_calls=int(provider_reported) if provider_reported else 0,
-                total_complete_tool_calls=provider_reported if provider_reported is not None else None,
+                total_complete_tool_calls=total_complete_tool_calls,
                 reported_tokens=tokens,
                 wall_time_seconds=wall_time,
             )

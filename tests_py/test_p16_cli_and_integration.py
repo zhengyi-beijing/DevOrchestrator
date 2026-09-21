@@ -139,6 +139,99 @@ class TestP16CliAndIntegration(unittest.TestCase):
             self.assertEqual(decision_data["decision"], "NO_PROMOTE")
             self.assertIn("capability_unsupported", decision_data["reasons"])
 
+    def test_committed_evidence_consistency(self):
+        from aibench.contracts import TrialPlan, TrialRecord
+        from aibench.prompts import get_canonical_tasks
+        from aibench.report import build_run_summary
+
+        repo_root = Path(__file__).resolve().parents[1]
+        ev_dir = repo_root / "benchmark" / "evidence" / "p16_baseline_20260921"
+
+        plan_file = ev_dir / "trial_plan.json"
+        results_file = ev_dir / "results.jsonl"
+        summary_file = ev_dir / "summary.json"
+        report_file = ev_dir / "report.md"
+        decision_file = ev_dir / "promotion_decision.json"
+
+        self.assertTrue(plan_file.is_file(), f"{plan_file} must exist")
+        self.assertTrue(results_file.is_file(), f"{results_file} must exist")
+        self.assertTrue(summary_file.is_file(), f"{summary_file} must exist")
+        self.assertTrue(report_file.is_file(), f"{report_file} must exist")
+        self.assertTrue(decision_file.is_file(), f"{decision_file} must exist")
+
+        plan = TrialPlan.from_dict(json.loads(plan_file.read_text(encoding="utf-8")))
+        self.assertEqual(len(plan.cells), 24)
+
+        expected_req_totals = {
+            t.task_id: len(t.ground_truth.get("required_findings", []))
+            for t in get_canonical_tasks()
+        }
+        self.assertEqual(expected_req_totals["task_arch_ownership"], 5)
+        self.assertEqual(expected_req_totals["task_compat_review"], 6)
+        self.assertEqual(expected_req_totals["task_cache_worker"], 2)
+        self.assertEqual(expected_req_totals["task_cross_file_debug"], 6)
+
+        records: list[TrialRecord] = []
+        with open(results_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    records.append(TrialRecord.from_dict(json.loads(line.strip())))
+
+        self.assertEqual(len(records), 24)
+        plan_cell_ids = [c.trial_id for c in plan.cells]
+        record_trial_ids = [r.trial_id for r in records]
+        self.assertEqual(record_trial_ids, plan_cell_ids)
+
+        timestamps: list[str] = []
+        for r in records:
+            self.assertEqual(r.status, "completed")
+            self.assertEqual(r.broker_attempt.status, "succeeded")
+            self.assertGreater(r.score.correctness, 0.0)
+
+            # Required findings must match canonical task ground truth
+            exp_total = expected_req_totals[r.cell.task_id]
+            self.assertEqual(r.score.required_findings_total, exp_total)
+            self.assertEqual(r.score.required_findings_met, exp_total)
+            self.assertEqual(r.score.false_findings, 0)
+
+            # Details must not be empty and must include valid citation details
+            self.assertTrue(bool(r.score.details))
+            c_details = r.score.details.get("citation_details", [])
+            self.assertGreater(len(c_details), 0)
+            for cd in c_details:
+                self.assertTrue(cd.get("valid"))
+                self.assertGreater(cd.get("snippet_length", 0), 0)
+
+            # Worker role must have valid patch and test fields
+            if r.cell.role == "worker":
+                self.assertTrue(r.score.patch_valid)
+                self.assertGreaterEqual(r.score.tests_passed or 0, 3)
+                self.assertEqual(r.score.tests_failed, 0)
+                self.assertEqual(r.score.regression_rate, 0.0)
+
+            # Observed shell tool calls must be 1 on success
+            self.assertEqual(r.metrics.observed_shell_tool_calls, 1)
+
+            timestamps.append(r.finished_at)
+
+        # Timestamps must not all be identical
+        self.assertGreater(len(set(timestamps)), 1)
+
+        # Re-aggregated summary matches summary.json
+        summary = build_run_summary(records, plan)
+        saved_summary = json.loads(summary_file.read_text(encoding="utf-8"))
+        self.assertEqual(summary.total_trials, saved_summary["total_trials"])
+        self.assertEqual(summary.completed_trials, saved_summary["completed_trials"])
+        self.assertAlmostEqual(summary.track_a_summary["correctness_mean"], saved_summary["track_a_summary"]["correctness_mean"])
+        self.assertAlmostEqual(summary.track_b_summary["correctness_mean"], saved_summary["track_b_summary"]["correctness_mean"])
+
+        # Promotion decision check
+        decision_data = json.loads(decision_file.read_text(encoding="utf-8"))
+        self.assertEqual(decision_data["decision"], "NO_PROMOTE")
+        self.assertIn("capability_gate", decision_data["failed_gates"])
+        self.assertTrue(decision_data["gate_results"]["evidence_gate"]["passed"])
+        self.assertTrue(decision_data["gate_results"]["fallback_gate"]["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

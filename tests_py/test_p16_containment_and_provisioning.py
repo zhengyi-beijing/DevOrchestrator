@@ -124,6 +124,74 @@ class TestP16ContainmentAndProvisioning(unittest.TestCase):
                 provisioner.uninstall(dry_run=True)
             self.assertIn("digest mismatch", str(ctx.exception))
 
+    def test_check_directory_write_denied_non_destructive(self):
+        from aibench.containment import check_directory_write_denied
+        with tempfile.TemporaryDirectory() as td:
+            dir_path = Path(td) / "test_dir"
+            dir_path.mkdir()
+            files_before = list(dir_path.iterdir())
+            self.assertEqual(len(files_before), 0)
+
+            # In writable directory, check_directory_write_denied should return False (write NOT denied)
+            denied = check_directory_write_denied(dir_path)
+            self.assertFalse(denied)
+
+            # Crucially, NO files must be created or left behind!
+            files_after = list(dir_path.iterdir())
+            self.assertEqual(len(files_after), 0)
+
+    def test_get_current_user_sid_fail_closed_on_error(self):
+        from unittest.mock import patch
+        import subprocess
+        # Mock subprocess.run to simulate whoami /user failure
+        with patch("subprocess.run", side_effect=Exception("whoami failed")):
+            user, sid = get_current_user_sid()
+            # Must fail closed: sid is empty string, NOT a fabricated mock SID
+            self.assertEqual(sid, "")
+
+    def test_containment_audit_fails_closed_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            cfg = ContainmentConfig(
+                scratch_root=str(base / "scratch"),
+                queue_root=str(base / "queue"),
+                dedicated_sid="",
+                scheduled_task_name="WorkerTask",
+                broker_config_path=str(base / "resources.yaml"),
+                zvec_path="",
+                firewall_rule_name="TestRule",
+                protected_roots=(str(base),),
+            )
+            (base / "resources.yaml").write_text("resources: []", encoding="utf-8")
+            # Default audit with allow_mock_sid=False, allow_unrestricted_dev_roots=False must fail
+            res = audit_containment(cfg, allow_mock_sid=False, allow_unrestricted_dev_roots=False)
+            self.assertFalse(res.passed)
+
+    def test_containment_cli_defaults_fail_closed(self):
+        from aibench.cli import main
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            reg = base / "resources.yaml"
+            reg.write_text("resources: []", encoding="utf-8")
+            cfg_path = base / "config.json"
+            cfg_data = {
+                "scratch_root": str(base / "scratch"),
+                "queue_root": str(base / "queue"),
+                "dedicated_sid": "",
+                "scheduled_task_name": "TestTask",
+                "broker_config_path": str(reg),
+                "zvec_path": "",
+                "firewall_rule_name": "TestRule",
+                "protected_roots": [str(base)],
+            }
+            cfg_path.write_text(json.dumps(cfg_data), encoding="utf-8")
+
+            sys.argv = ["aibench", "containment-audit", "--config", str(cfg_path)]
+            # Since audit fails closed without --allow-mock-sid and --allow-dev-roots, should exit 1
+            with self.assertRaises(SystemExit) as ctx:
+                main()
+            self.assertEqual(ctx.exception.code, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

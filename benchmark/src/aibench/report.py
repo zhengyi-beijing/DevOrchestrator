@@ -23,6 +23,29 @@ def _mean(values: list[float]) -> float:
     return round(sum(values) / len(values), 4)
 
 
+def _calc_delta_stats(deltas: list[float]) -> dict[str, Any]:
+    """Calculate mean, standard error, and statistical significance of paired reduction."""
+    n = len(deltas)
+    if n == 0:
+        return {"n": 0, "mean": 0.0, "se": 0.0, "t_stat": None, "statistically_supported_benefit": False}
+    mean = sum(deltas) / n
+    if n < 2:
+        return {"n": n, "mean": round(mean, 4), "se": 0.0, "t_stat": None, "statistically_supported_benefit": False}
+    variance = sum((x - mean) ** 2 for x in deltas) / (n - 1)
+    se = (variance / n) ** 0.5
+    if se <= 0:
+        return {"n": n, "mean": round(mean, 4), "se": 0.0, "t_stat": None, "statistically_supported_benefit": (mean < 0)}
+    t_stat = mean / se
+    supported = (mean < 0 and t_stat <= -1.71)
+    return {
+        "n": n,
+        "mean": round(mean, 4),
+        "se": round(se, 4),
+        "t_stat": round(t_stat, 3),
+        "statistically_supported_benefit": supported,
+    }
+
+
 def build_run_summary(
     records: list[TrialRecord],
     plan: TrialPlan,
@@ -96,6 +119,9 @@ def build_run_summary(
         "mean_wall_time_delta_seconds": _mean(wall_time_deltas),
         "mean_tool_calls_delta": _mean(tool_call_deltas),
         "mean_tokens_delta": _mean(token_deltas) if token_deltas else None,
+        "wall_time_stats": _calc_delta_stats(wall_time_deltas),
+        "tool_calls_stats": _calc_delta_stats(tool_call_deltas),
+        "tokens_stats": _calc_delta_stats(token_deltas) if token_deltas else None,
     }
 
     # Resource breakdown

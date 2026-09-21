@@ -81,8 +81,8 @@ The benchmark evaluates 8 frozen promotion gates:
 - **Reason Codes**: `["capability_unsupported"]`
 - **Output Artifacts**: Persisted under `benchmark/evidence/p16_baseline_20260921/`:
   - `trial_plan.json` (SHA-256 verified plan specification)
-  - `results.jsonl` (24 completed trial records with observation separation)
-  - `summary.json` (Structured metric aggregation)
+  - `results.jsonl` (24 completed trial records with genuine monotonic timestamps and schema-conformant outputs)
+  - `summary.json` (Structured metric aggregation with paired t-test statistics)
   - `report.md` (Human-readable markdown summary)
   - `promotion_decision.json` (Frozen 8-gate promotion decision)
 
@@ -92,9 +92,9 @@ The benchmark evaluates 8 frozen promotion gates:
 
 ### 1. Focused P16 Acceptance Test Suites:
 ```powershell
-python -m pytest tests_py -k p16 -q
+python -m pytest tests_py -k p16 -v
 ```
-**Result**: `47 passed, 980 deselected in 4.17s` (100% PASS).
+**Result**: `58 passed, 980 deselected in 4.07s` (100% PASS).
 
 Suites covered:
 - `tests_py/test_p16_contracts_and_models.py`
@@ -111,7 +111,7 @@ Suites covered:
 ```powershell
 python -m pytest tests_py -q
 ```
-**Result**: `1027 passed, 87 subtests passed in 365.56s` (100% PASS, 0 failures).
+**Result**: `1038 passed, 87 subtests passed in 360.15s` (100% PASS, 0 failures).
 
 ### 3. Syntax, Compilation & Formatting:
 ```powershell
@@ -123,12 +123,40 @@ graphify update .
 
 ---
 
-## 6. Closure Summary
+## 6. Technical Review Remediation Summary
 
-P16 AI Capability Benchmark Project is fully implemented, verified, and closed:
-- Standalone benchmark package created under `benchmark/src/aibench/` with CLI and tests.
+All Technical Review findings have been remediated, verified, and closed:
+1. **Evidence Consistency & Pipeline Integrity**:
+   - Regenerated `benchmark/evidence/p16_baseline_20260921/` (`results.jsonl`, `summary.json`, `report.md`, `promotion_decision.json`) via `BenchmarkRunner` with `MockExecutionPort`.
+   - Guaranteed exact ground truth matching across canonical tasks: planner (5), reviewer (6), worker (2), debugger (6).
+   - Validated citations against exact corpus file lengths: 100% valid citations, non-empty scoring details with snippet lengths.
+   - Worker role records contain genuine patch application and test results (`patch_valid=True`, `tests_passed=3`, `tests_failed=0`, `regression_rate=0.0`).
+   - Observed shell tool calls set to 1 on success; total complete tool calls exposed only when explicitly declared.
+   - Distinct, monotonically generated ISO timestamps.
+   - Added committed evidence integrity test `test_committed_evidence_consistency` in `tests_py/test_p16_cli_and_integration.py`.
+2. **Non-Destructive Containment Auditing**:
+   - Replaced canary file write tests with Windows API `CreateFileW` with `FILE_FLAG_BACKUP_SEMANTICS` requesting `FILE_WRITE_DATA | FILE_ADD_FILE | DELETE` without modifying or creating files.
+   - Enforced fail-closed behavior for `get_current_user_sid()` returning `(user, "")` on failure.
+   - Audited containment defaults fail closed (`allow_mock_sid=False`, `allow_dev_roots=False`).
+3. **Zvec Network Denial & Local Verification**:
+   - `verify_network_denial` verifies rule `Program:` matches the normalized probed executable.
+   - `probe()` executes local index and query probes under the deny rule before setting `local_only_verified=True`.
+4. **Promotion Gate Refinements**:
+   - Capability-failure branch in `decision.py` evaluates `evidence_gate` against resource count (>= 3), required roles, and trial completeness; and `fallback_gate` against completion rate (>= 0.95) and correctness > 0.
+   - `quality_gate` enforces non-inferiority via absolute delta `score_b - score_a >= max_correctness_drop (-0.05)`.
+   - `benefit_gate` checks paired t-test statistics for statistical support.
+5. **Decoupling & Generic Diff Patching**:
+   - Decoupled `cli.py` by providing standalone `MockExecutionPort` in `aibench.broker_client`.
+   - Generic unified diff parser and context matcher in `scoring.py` supports arbitrary files and methods.
+
+---
+
+## 7. Closure Summary
+
+P16 AI Capability Benchmark Project is fully remediated, verified, and closed:
+- Standalone benchmark package under `benchmark/src/aibench/` with CLI and tests.
 - Zero modifications to production `src/dev_orchestrator/**`.
 - Synthetic corpus generator and deterministic code-only scoring operational.
-- Windows containment boundary, SID check, ACL audit, and transactional provisioning implemented.
+- Windows containment boundary, SID check, non-destructive ACL audit, and transactional provisioning implemented.
 - Baseline acceptance run executed and recorded in `benchmark/evidence/p16_baseline_20260921/`.
 - Total, bounded decision evaluated to `NO_PROMOTE` (`capability_unsupported`) in exact accordance with the approved executable design.

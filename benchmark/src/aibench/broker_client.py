@@ -13,6 +13,7 @@ import yaml
 from dev_orchestrator.ai.contracts import (
     AIRoleRequest,
     AIRoleResult,
+    ResourceContext,
     ROLE_RESOURCE_FAILURES,
 )
 from dev_orchestrator.ai.execution_port import AIExecutionPort
@@ -193,3 +194,148 @@ class BrokerBenchmarkClient:
             rate_limit_observation=dict(result.rate_limit_observation) if result.rate_limit_observation else None,
             failure_classification=result.failure_classification,
         )
+
+
+class MockExecutionPort(AIExecutionPort):
+    """Standalone mock execution port for testing and simulated execution."""
+
+    def __init__(self, available_resources: tuple[str, ...] | list[str] | None = None) -> None:
+        self.recorded_requests: list[AIRoleRequest] = []
+        self.next_result: AIRoleResult | None = None
+        self.fail_then_succeed_target: str | None = None
+        self._call_count = 0
+        self.available_resources = list(available_resources) if available_resources else None
+
+    def execute(self, request: AIRoleRequest) -> AIRoleResult:
+        self.recorded_requests.append(request)
+        self._call_count += 1
+
+        if self.fail_then_succeed_target and self._call_count == 1:
+            return AIRoleResult(
+                request_id=request.request_id,
+                role_run_id=request.role_run_id,
+                status="failed",
+                error="quota exceeded on primary resource",
+                resource_context=ResourceContext(resource_id=self.fail_then_succeed_target),
+                failure_classification="quota_exhausted",
+            )
+
+        if self.next_result is not None:
+            res = self.next_result
+            self.next_result = None
+            return res
+
+        # Default success echoing target resource if not excluded
+        if self.available_resources:
+            candidates = list(self.available_resources)
+        elif any("/" in str(ex) for ex in request.excluded_resource_ids):
+            candidates = [
+                "agy/agy-1/gemini-3.8-flash-high",
+                "copilot/default/claude-sonnet-4.6",
+                "claude/default/opus",
+            ]
+        else:
+            candidates = [
+                "res_1",
+                "res_2",
+                "res_3",
+                "res_4",
+            ]
+
+        selected_res = candidates[0]
+        for candidate in candidates:
+            if candidate not in request.excluded_resource_ids:
+                selected_res = candidate
+                break
+
+        # Generate realistic output with valid citations and findings based on role
+        if request.role == "planner":
+            output = json.dumps({
+                "summary": "Completed architecture ownership and dependency flow analysis for synth_app",
+                "ownership_matrix": [
+                    {"domain": "Security & Auth", "team": "Security Infrastructure Team", "file": "src/synth_app/core/auth.py"},
+                    {"domain": "Performance / Caching", "team": "Platform Performance Team", "file": "src/synth_app/core/cache.py"},
+                    {"domain": "Billing Logic", "team": "Core Business Logic Team", "file": "src/synth_app/services/billing.py"},
+                    {"domain": "Data Layer", "team": "Data Layer Team", "file": "src/synth_app/repository/account_repo.py"},
+                    {"domain": "API Gateway", "team": "Application API Gateway Team", "file": "src/synth_app/handlers/api.py"},
+                ],
+                "dependency_flow": "handlers/api.py -> services/billing.py -> repository/account_repo.py",
+                "citations": [
+                    {"path": "docs/architecture.md", "start_line": 1, "end_line": 17},
+                ],
+            })
+        elif request.role == "reviewer":
+            output = json.dumps({
+                "summary": "Completed legacy API compatibility and deprecation review for synth_app",
+                "parameter_mappings": [
+                    {"v1": "acc_id", "v2": "account_id"},
+                    {"v1": "val", "v2": "amount"},
+                    {"v1": "cur", "v2": "currency"},
+                ],
+                "deprecation_horizon": "v3.0 scheduled for 2027 with DeprecationWarning",
+                "findings": [
+                    "V1 parameter mappings map acc_id, val, and cur to v2 schema fields",
+                    "Emits DeprecationWarning when legacy query keys are used",
+                    "Deprecation timeline horizon targets removal in v3.0 in 2027",
+                ],
+                "citations": [
+                    {"path": "docs/compatibility.md", "start_line": 1, "end_line": 7},
+                ],
+            })
+        elif request.role == "worker":
+            patch = (
+                "--- a/src/synth_app/core/cache.py\n"
+                "+++ b/src/synth_app/core/cache.py\n"
+                "@@ -69,4 +69,9 @@\n"
+                "     # NOTE FOR BENCHMARK WORKER:\n"
+                "     # get_or_set(self, key: str, default_fn: Callable[[], Any], ttl: float | None = None) -> Any\n"
+                "     # is intentionally not implemented in this revision.\n"
+                "+    def get_or_set(self, key: str, default_fn: Any, ttl: float | None = None) -> Any:\n"
+                "+        val = self.get(key)\n"
+                "+        if val is None:\n"
+                "+            val = default_fn()\n"
+                "+            self.set(key, val, ttl)\n"
+                "+        return val\n"
+            )
+            output = json.dumps({
+                "summary": "Implemented missing get_or_set method on LRUCache using default_fn callback",
+                "patch": patch,
+                "citations": [
+                    {"path": "src/synth_app/core/cache.py", "start_line": 65, "end_line": 71},
+                ],
+            })
+        elif request.role == "debugger":
+            output = json.dumps({
+                "summary": "Diagnosed root cause: TransactionHandler reads curr instead of currency resulting in None passed to BillingService and AccountRepository",
+                "root_cause_file": "src/synth_app/handlers/api.py",
+                "root_cause_line_span": [34, 36],
+                "propagation_path": [
+                    "TransactionHandler.handle_charge reads curr from payload and passes None currency",
+                    "BillingService.process_charge receives None currency and delegates to AccountRepository",
+                    "AccountRepository.charge_account raises CurrencyConversionError for unsupported currency None",
+                ],
+                "fix_recommendation": "Change payload.get('curr') to payload.get('currency', 'USD') in TransactionHandler.handle_charge",
+                "citations": [
+                    {"path": "src/synth_app/handlers/api.py", "start_line": 20, "end_line": 40},
+                ],
+            })
+        else:
+            output = json.dumps({"summary": "mock task output", "citations": []})
+
+        return AIRoleResult(
+            request_id=request.request_id,
+            role_run_id=request.role_run_id,
+            status="succeeded",
+            output=output,
+            resource_context=ResourceContext(resource_id=selected_res, provider="mock", account="acc", model="mod"),
+            usage={"total_tokens": 120, "tool_calls": 1},
+            usage_source="reported",
+            started_at=utc_now_iso(),
+            finished_at=utc_now_iso(),
+        )
+
+    def status(self, request_id: str) -> dict[str, Any] | None:
+        return {"status": "succeeded"}
+
+    def interrupt(self, request_id: str, reason: str) -> dict[str, Any] | None:
+        return {"status": "interrupted"}

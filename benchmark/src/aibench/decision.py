@@ -58,22 +58,34 @@ def evaluate_promotion_decision(
             }
             failed_gates.append(g_name)
 
-        # Evidence and fallback gate can still be evaluated for native track
-        ev_pass = len(summary.resource_breakdown) >= thresh["min_distinct_resources"]
+        # Evidence and fallback gate evaluated for completed baseline/native track
+        res_count = len(summary.resource_breakdown)
+        roles_present = set(summary.role_breakdown.keys())
+        required_roles = set(thresh["required_roles"])
+        roles_ok = required_roles.issubset(roles_present)
+        res_ok = res_count >= thresh["min_distinct_resources"]
+        trials_complete = (summary.completed_trials == summary.total_trials) and (summary.total_trials > 0)
+        ev_pass = res_ok and roles_ok and trials_complete
+
         gate_results["evidence_gate"] = {
             "passed": ev_pass,
-            "status": "evaluated" if ev_pass else "failed",
-            "detail": f"distinct resources={len(summary.resource_breakdown)}",
+            "status": "passed" if ev_pass else "failed",
+            "detail": f"resources={res_count} (min {thresh['min_distinct_resources']}), roles={len(roles_present)} (req {len(required_roles)}), trials={summary.completed_trials}/{summary.total_trials}",
         }
         if not ev_pass:
             failed_gates.append("evidence_gate")
             reasons.append(REASON_EVIDENCE_GATE_FAILED)
 
-        fb_pass = summary.track_a_summary.get("completed_trials", 0) > 0
+        total_a = summary.track_a_summary.get("total_trials", 0)
+        completed_a = summary.track_a_summary.get("completed_trials", 0)
+        min_rate = float(thresh.get("min_completion_rate", 0.95))
+        rate_a = (completed_a / total_a) if total_a > 0 else 0.0
+        score_a = summary.track_a_summary.get("correctness_mean", 0.0)
+        fb_pass = (rate_a >= min_rate) and (completed_a > 0) and (score_a > 0.0)
         gate_results["fallback_gate"] = {
             "passed": fb_pass,
             "status": "passed" if fb_pass else "failed",
-            "detail": f"native track completed {summary.track_a_summary.get('completed_trials', 0)} trials",
+            "detail": f"native track completion rate {rate_a:.2f} ({completed_a}/{total_a}, min {min_rate}), correctness {score_a:.4f}",
         }
         if not fb_pass:
             failed_gates.append("fallback_gate")
@@ -129,7 +141,9 @@ def evaluate_promotion_decision(
     # 3. Quality Gate
     score_a = summary.track_a_summary.get("correctness_mean", 0.0)
     score_b = summary.track_b_summary.get("correctness_mean", 0.0)
-    non_inferior = score_b >= (score_a * thresh["min_correctness_retention"])
+    correctness_delta = round(score_b - score_a, 4)
+    max_drop = float(thresh.get("max_correctness_drop", -0.05))
+    non_inferior = (correctness_delta >= max_drop)
 
     false_b = summary.track_b_summary.get("false_findings_total", 0)
     req_tot = summary.track_b_summary.get("required_findings_total", 1)
@@ -140,45 +154,45 @@ def evaluate_promotion_decision(
         gate_results["quality_gate"] = {
             "passed": True,
             "status": "passed",
-            "detail": f"track B correctness {score_b:.4f} >= track A {score_a:.4f}, false ratio {false_ratio:.2f}",
+            "detail": f"track B delta {correctness_delta:+.4f} >= {max_drop:.2f}, false ratio {false_ratio:.2f}",
         }
     else:
         gate_results["quality_gate"] = {
             "passed": False,
             "status": "failed",
-            "detail": f"non_inferior={non_inferior} (B={score_b:.4f}, A={score_a:.4f}), false_ratio={false_ratio:.2f} (max {thresh['max_false_findings_ratio']})",
+            "detail": f"non_inferior={non_inferior} (delta={correctness_delta:+.4f}, min {max_drop:.2f}), false_ratio={false_ratio:.2f} (max {thresh['max_false_findings_ratio']})",
         }
         failed_gates.append("quality_gate")
         reasons.append(REASON_QUALITY_GATE_FAILED)
 
-    # 4. Benefit Gate
-    wall_delta = summary.comparison.get("mean_wall_time_delta_seconds", 0.0)
-    tool_delta = summary.comparison.get("mean_tool_calls_delta", 0.0)
-    token_delta = summary.comparison.get("mean_tokens_delta")
+    # 4. Benefit Gate (Statistically Supported)
+    wall_stats = summary.comparison.get("wall_time_stats") or {}
+    tool_stats = summary.comparison.get("tool_calls_stats") or {}
+    token_stats = summary.comparison.get("tokens_stats") or {}
 
     benefits_count = 0
     benefit_details: list[str] = []
-    if wall_delta < 0:
+    if wall_stats.get("statistically_supported_benefit"):
         benefits_count += 1
-        benefit_details.append(f"wall_time advantage ({wall_delta:+.2f}s)")
-    if tool_delta < 0:
+        benefit_details.append(f"statistically supported wall_time advantage (mean delta: {wall_stats.get('mean')}s, t={wall_stats.get('t_stat')})")
+    if tool_stats.get("statistically_supported_benefit"):
         benefits_count += 1
-        benefit_details.append(f"tool_calls advantage ({tool_delta:+.2f})")
-    if token_delta is not None and token_delta < 0:
+        benefit_details.append(f"statistically supported tool_calls advantage (mean delta: {tool_stats.get('mean')}, t={tool_stats.get('t_stat')})")
+    if token_stats.get("statistically_supported_benefit"):
         benefits_count += 1
-        benefit_details.append(f"token advantage ({token_delta:+.2f})")
+        benefit_details.append(f"statistically supported token advantage (mean delta: {token_stats.get('mean')}, t={token_stats.get('t_stat')})")
 
     if benefits_count >= thresh["min_benefit_metrics"]:
         gate_results["benefit_gate"] = {
             "passed": True,
             "status": "passed",
-            "detail": f"benefits ({benefits_count}): {', '.join(benefit_details)}",
+            "detail": f"statistically supported benefits ({benefits_count}): {', '.join(benefit_details)}",
         }
     else:
         gate_results["benefit_gate"] = {
             "passed": False,
             "status": "failed",
-            "detail": f"no statistically supported advantage in wall time, tool calls, or tokens (delta wall: {wall_delta:+.2f}s, tool: {tool_delta:+.2f})",
+            "detail": f"no statistically supported advantage in wall time, tool calls, or tokens (wall_t={wall_stats.get('t_stat')}, tool_t={tool_stats.get('t_stat')})",
         }
         failed_gates.append("benefit_gate")
         reasons.append(REASON_BENEFIT_GATE_FAILED)

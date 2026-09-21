@@ -117,6 +117,39 @@ class TestP16ScoringAndRubrics(unittest.TestCase):
         self.assertEqual(score.tests_failed, 0)
         self.assertGreater(score.correctness, 0.8)
 
+    def test_generic_diff_patch_fallback_arbitrary_files(self):
+        from aibench.scoring import _apply_simple_patch_fallback
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            f1 = ws / "pkg" / "module_a.py"
+            f1.parent.mkdir(parents=True)
+            f1.write_text("def old_func():\n    return 42\n\ndef helper():\n    pass\n", encoding="utf-8")
+
+            f2 = ws / "pkg" / "module_b.py"
+            f2.write_text("class MyService:\n    def run(self):\n        return False\n", encoding="utf-8")
+
+            patch = (
+                "--- a/pkg/module_a.py\n"
+                "+++ b/pkg/module_a.py\n"
+                "@@ -1,2 +1,2 @@\n"
+                "-def old_func():\n"
+                "-    return 42\n"
+                "+def new_func(x: int) -> int:\n"
+                "+    return x * 2\n"
+                "--- a/pkg/module_b.py\n"
+                "+++ b/pkg/module_b.py\n"
+                "@@ -2,2 +2,2 @@\n"
+                "-    def run(self):\n"
+                "-        return False\n"
+                "+    def run(self):\n"
+                "+        return True\n"
+            )
+
+            res = _apply_simple_patch_fallback(patch, ws)
+            self.assertTrue(res)
+            self.assertIn("def new_func(x: int) -> int:", f1.read_text(encoding="utf-8"))
+            self.assertIn("return True", f2.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

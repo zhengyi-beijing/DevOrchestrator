@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -116,7 +117,10 @@ class ZvecAdapter:
             self._cached_probe = res
             return res
 
-        local_only = self.verify_network_denial()
+        firewall_denied = self.verify_network_denial(executable_path=str(exe))
+        local_only = False
+        if firewall_denied:
+            local_only = self._verify_local_probes(exe)
 
         res = ZvecProbeResult(
             supported=True,
@@ -129,10 +133,10 @@ class ZvecAdapter:
         self._cached_probe = res
         return res
 
-    def verify_network_denial(self) -> bool:
-        """Verify that an outbound-deny rule is active for zvec."""
-        # Query Windows Firewall via netsh
-        cmd = ["netsh", "advfirewall", "firewall", "show", "rule", f"name={self.firewall_rule_name}"]
+    def verify_network_denial(self, rule_name: str | None = None, executable_path: str | None = None) -> bool:
+        """Verify that an outbound-deny rule is active for zvec and matches its executable."""
+        r_name = rule_name or self.firewall_rule_name
+        cmd = ["netsh", "advfirewall", "firewall", "show", "rule", f"name={r_name}"]
         try:
             proc = subprocess.run(
                 cmd,
@@ -143,13 +147,57 @@ class ZvecAdapter:
                 check=False,
                 timeout=10.0,
             )
-            if proc.returncode == 0:
-                out = proc.stdout.lower()
-                # Check for Action: Block and Direction: Out
-                return ("block" in out or "deny" in out) and "out" in out
+            if proc.returncode != 0:
+                return False
+
+            out = proc.stdout.lower()
+            # Check for Action: Block and Direction: Out
+            has_block = ("block" in out or "deny" in out)
+            has_out = "out" in out
+            if not (has_block and has_out):
+                return False
+
+            target_exe = executable_path or (str(self.executable_path) if self.executable_path else None)
+            if target_exe:
+                prog_match = re.search(r"program:\s*(.+)", proc.stdout, re.IGNORECASE)
+                if not prog_match:
+                    return False
+                rule_prog = prog_match.group(1).strip()
+                try:
+                    norm_rule = os.path.normcase(os.path.realpath(rule_prog))
+                    norm_target = os.path.normcase(os.path.realpath(target_exe))
+                    if norm_rule != norm_target:
+                        return False
+                except Exception:
+                    return False
+
+            return True
         except Exception:
             pass
         return False
+
+    def _verify_local_probes(self, exe: Path) -> bool:
+        """Verify that index and query probes succeed locally under the verified outbound-deny rule."""
+        import tempfile
+        try:
+            with tempfile.TemporaryDirectory(prefix="aibench-probe-") as td:
+                t_root = Path(td) / "probe_repo"
+                t_root.mkdir()
+                (t_root / "sample.py").write_text("def sample(): pass\n", encoding="utf-8")
+                idx_dir = Path(td) / "idx"
+                # Test index
+                cmd_idx = [str(exe), "index", "--repo", str(t_root), "--output", str(idx_dir)]
+                p_idx = subprocess.run(cmd_idx, capture_output=True, text=True, check=False, timeout=15.0)
+                if p_idx.returncode != 0:
+                    return False
+                # Test query
+                cmd_q = [str(exe), "query", "--index", str(idx_dir), "--query", "sample"]
+                p_q = subprocess.run(cmd_q, capture_output=True, text=True, check=False, timeout=15.0)
+                if p_q.returncode != 0:
+                    return False
+                return True
+        except Exception:
+            return False
 
     def build_index(self, repo_root: Path, output_dir: Path) -> dict[str, Any]:
         """Build index from pristine repo_root into output_dir."""

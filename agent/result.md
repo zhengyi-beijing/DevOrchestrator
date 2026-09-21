@@ -1147,9 +1147,17 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - Total bounded decision evaluated to **`NO_PROMOTE`** (`reasons: ["capability_unsupported"]`).
   - Baseline acceptance evidence persisted in `benchmark/evidence/p16_baseline_20260921/` (`trial_plan.json`, `results.jsonl`, `summary.json`, `report.md`, `promotion_decision.json`).
   - Canonical acceptance record authored in `docs/P16_BENCHMARK_ACCEPTANCE.md`.
+- Technical Review Remediation Round (2026-09-21):
+  - Remediated all findings from Technical Review (`ai_review:auto-58add3451902f376035e2fe7:execute`):
+    1. Evidence pipeline integrity: regenerated `benchmark/evidence/p16_baseline_20260921/` (`results.jsonl`, `summary.json`, `report.md`, `promotion_decision.json`) via `BenchmarkRunner` with `MockExecutionPort`. Guaranteed exact ground truth matching across canonical tasks: planner (5), reviewer (6), worker (2), debugger (6). Validated citations against exact corpus file lengths: 100% valid citations, non-empty scoring details with snippet lengths. Worker records contain genuine patch application and test results (`patch_valid=True`, `tests_passed=3`, `tests_failed=0`, `regression_rate=0.0`). Set observed shell tool calls to 1 on success; exposed total complete tool calls only when explicitly declared. Monotonically generated timestamps. Added `test_committed_evidence_consistency` in `tests_py/test_p16_cli_and_integration.py`.
+    2. Non-destructive containment write denial auditing: implemented `check_directory_write_denied` using Windows API `CreateFileW` with `FILE_FLAG_BACKUP_SEMANTICS` requesting `FILE_WRITE_DATA | FILE_ADD_FILE | DELETE` without modifying or creating files. Enforced fail-closed behavior for `get_current_user_sid()` returning `(user, "")` on failure, and audited containment defaults fail closed (`allow_mock_sid=False`, `allow_dev_roots=False`).
+    3. Zvec outbound network denial & local verification: `verify_network_denial` verifies rule `Program:` matches the normalized probed executable. `probe()` executes local index and query probes under the deny rule before setting `local_only_verified=True`.
+    4. Gate evaluation logic: capability-failure branch in `decision.py` evaluates `evidence_gate` against resource count (>= 3), required roles, and trial completeness; and `fallback_gate` against completion rate (>= 0.95) and correctness > 0. `quality_gate` enforces non-inferiority via absolute delta `score_b - score_a >= max_correctness_drop (-0.05)`. `benefit_gate` checks paired t-test statistics for statistical support.
+    5. Decoupled CLI and generic diff patch fallback: decoupled `cli.py` by providing standalone `MockExecutionPort` in `aibench.broker_client`. Implemented generic unified diff parser and context matcher in `scoring.py` supporting arbitrary files and methods.
 - Verification:
-  - 9 dedicated P16 acceptance test suites in `tests_py/test_p16_*.py`: 47 passed in 4.17s.
-  - Full repository regression: 1027 passed, 87 subtests passed in 365.56s (0 failures).
+  - 9 dedicated P16 acceptance test suites in `tests_py/test_p16_*.py`: 58 passed in 4.07s.
+  - Full repository regression: 1038 passed, 87 subtests passed in 360.15s (0 failures).
   - Python compilation (`python -m compileall -q src ops tests_py benchmark/src`): passed cleanly (exit code 0).
   - `git diff --check`: clean (0 whitespace/formatting defects).
+  - Graphify update (`graphify update .`): updated cleanly (5176 nodes, 14453 edges).
   - Staged roadmap handoff: `agent/staged/roadmap.json` designates `successor: null`. All staged tasks (P11x through P16) are now complete.

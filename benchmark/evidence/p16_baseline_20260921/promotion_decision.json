@@ -39,13 +39,13 @@
     },
     "evidence_gate": {
       "passed": true,
-      "status": "evaluated",
-      "detail": "distinct resources=3"
+      "status": "passed",
+      "detail": "resources=3 (min 3), roles=4 (req 4), trials=24/24"
     },
     "fallback_gate": {
       "passed": true,
       "status": "passed",
-      "detail": "native track completed 12 trials"
+      "detail": "native track completion rate 1.00 (12/12, min 0.95), correctness 1.0000"
     },
     "quality_gate": {
       "passed": false,
@@ -55,5 +55,5 @@
   },
   "run_id": "run_plan_42_299f8e08_24",
   "plan_id": "plan_42_299f8e08_24",
-  "timestamp": "2026-09-21T10:30:49.795164+00:00"
+  "timestamp": "2026-09-21T11:09:37.801294+00:00"
 }

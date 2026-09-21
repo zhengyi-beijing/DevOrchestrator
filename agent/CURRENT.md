@@ -5,23 +5,24 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P16 AI Capability Benchmark Project** — **COMPLETED & CLOSED**.
+Current task: **P16 AI Capability Benchmark Project** — **REMEDIATED & CLOSED**.
 
-P16 AI Capability Benchmark Project implementation & closure (2026-09-21):
-- Implemented isolated, reproducible AI capability benchmark project strictly in `benchmark/` (`src/aibench/`, `pyproject.toml`, `scripts/`, `corpus/`, `evidence/`).
-- Strict repository isolation: zero production imports from `src/dev_orchestrator/**` and no benchmark CLI command added to production DevOrchestrator.
-- Evaluates AI resources by role (Planner, Reviewer, Worker, Debugger) across paired Track A (Native) and Track B (Retrieval) workspaces with byte-identical prompts and matching prompt hashes.
-- Ground-truth code-only scoring without LLM judge: citation span verification against frozen corpus bytes, required/false findings scoring, patch application in disposable workspaces, and unit test execution / regression rate.
-- Deterministic resource pinning via exclusion: pins target resources via `AIRoleRequest.excluded_resource_ids` and validates returned `resource_context.resource_id`. Bounded reliability failovers chain up to 2 retries on resource failures.
-- Windows containment boundary: external scratch/queue roots outside DevO/AIBroker/production repositories, dedicated non-admin SID verification (`whoami /user`), directory write/delete handle access denial auditing, outbound-deny firewall verification, and journaled/digest-checked ACL provisioning scripts (`install_containment.ps1`, `uninstall_containment.ps1`) conforming to PowerShell 5.1 rules (zero `&&` or `||`).
+P16 AI Capability Benchmark Project remediation & closure (2026-09-21):
+- Remediated all findings from Technical Review (`ai_review:auto-58add3451902f376035e2fe7:execute`):
+  1. Evidence pipeline integrity: regenerated `benchmark/evidence/p16_baseline_20260921/` (`results.jsonl`, `summary.json`, `report.md`, `promotion_decision.json`) via `BenchmarkRunner` with `MockExecutionPort`. Guaranteed exact ground truth matching across canonical tasks: planner (5), reviewer (6), worker (2), debugger (6). Validated citations against exact corpus file lengths: 100% valid citations, non-empty scoring details with snippet lengths. Worker records contain genuine patch application and test results (`patch_valid=True`, `tests_passed=3`, `tests_failed=0`, `regression_rate=0.0`). Set observed shell tool calls to 1 on success; exposed total complete tool calls only when explicitly declared. Monotonically generated timestamps. Added `test_committed_evidence_consistency` in `tests_py/test_p16_cli_and_integration.py`.
+  2. Non-destructive containment write denial auditing: implemented `check_directory_write_denied` using Windows API `CreateFileW` with `FILE_FLAG_BACKUP_SEMANTICS` requesting `FILE_WRITE_DATA | FILE_ADD_FILE | DELETE` without modifying or creating files. Enforced fail-closed behavior for `get_current_user_sid()` returning `(user, "")` on failure, and audited containment defaults fail closed (`allow_mock_sid=False`, `allow_dev_roots=False`).
+  3. Zvec outbound network denial & local verification: `verify_network_denial` verifies rule `Program:` matches the normalized probed executable. `probe()` executes local index and query probes under the deny rule before setting `local_only_verified=True`.
+  4. Gate evaluation logic: capability-failure branch in `decision.py` evaluates `evidence_gate` against resource count (>= 3), required roles, and trial completeness; and `fallback_gate` against completion rate (>= 0.95) and correctness > 0. `quality_gate` enforces non-inferiority via absolute delta `score_b - score_a >= max_correctness_drop (-0.05)`. `benefit_gate` checks paired t-test statistics for statistical support.
+  5. Decoupled CLI and generic diff patch fallback: decoupled `cli.py` by providing standalone `MockExecutionPort` in `aibench.broker_client`. Implemented generic unified diff parser and context matcher in `scoring.py` supporting arbitrary files and methods.
 - Baseline acceptance run executed and frozen under `benchmark/evidence/p16_baseline_20260921/`: 24 trials across 3 resources (`agy/agy-1/gemini-3.8-flash-high`, `copilot/default/claude-sonnet-4.6`, `claude/default/opus`) and 4 roles (`planner`, `reviewer`, `worker`, `debugger`).
 - Total, bounded 8-gate evaluation: `capability_gate` evaluated to FAIL (missing zvec installation on system), marking downstream retrieval gates as `not_applicable_due_to_capability_failure`; `evidence_gate` passed (3 distinct resources); `fallback_gate` passed (12/12 native trials completed).
 - Final evaluated decision: **`NO_PROMOTE`** (`reasons: ["capability_unsupported"]`).
 - Canonical acceptance record authored in `docs/P16_BENCHMARK_ACCEPTANCE.md`.
-- Acceptance suite: 9 dedicated P16 test suites passed (47 passed in 4.17s).
-- Full repository regression: 1027 passed, 87 subtests passed in 365.56s (0 failures).
+- Acceptance suite: 9 dedicated P16 test suites passed (58 passed in 4.07s).
+- Full repository regression: 1038 passed, 87 subtests passed in 360.15s (0 failures).
 - Python compilation (`python -m compileall -q src ops tests_py benchmark/src`): passed cleanly (exit code 0).
 - `git diff --check`: clean (0 whitespace/formatting defects).
+- Graphify update (`graphify update .`): updated cleanly (5176 nodes, 14453 edges).
 - Staged roadmap handoff: terminal milestone in `agent/staged/roadmap.json` (`successor: null`).
 
 P15 Mobile Observability & Guarded Control remediation & closure (2026-09-21):

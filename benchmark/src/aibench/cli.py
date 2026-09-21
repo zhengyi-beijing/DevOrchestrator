@@ -126,7 +126,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Initialize execution port
     if args.mock_broker:
-        from tests_py.test_p16_broker_client import MockExecutionPort
+        from .broker_client import MockExecutionPort
         port = MockExecutionPort()
         b_client = BrokerBenchmarkClient(port, config_path=args.resources_config)
     else:
@@ -210,8 +210,8 @@ def main() -> None:
     # containment-audit
     p_ca = subparsers.add_parser("containment-audit")
     p_ca.add_argument("--config", default=None)
-    p_ca.add_argument("--allow-mock-sid", action="store_true", default=True)
-    p_ca.add_argument("--allow-dev-roots", action="store_true", default=True)
+    p_ca.add_argument("--allow-mock-sid", action="store_true", default=False)
+    p_ca.add_argument("--allow-dev-roots", action="store_true", default=False)
 
     # zvec-probe
     p_zp = subparsers.add_parser("zvec-probe")

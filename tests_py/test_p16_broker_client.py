@@ -15,59 +15,8 @@ from dev_orchestrator.ai.contracts import (
 )
 from dev_orchestrator.ai.execution_port import AIExecutionPort
 
-from aibench.broker_client import BrokerBenchmarkClient
+from aibench.broker_client import BrokerBenchmarkClient, MockExecutionPort
 from aibench.contracts import ResourceSnapshot
-
-
-class MockExecutionPort(AIExecutionPort):
-    def __init__(self) -> None:
-        self.recorded_requests: list[AIRoleRequest] = []
-        self.next_result: AIRoleResult | None = None
-        self.fail_then_succeed_target: str | None = None
-        self._call_count = 0
-
-    def execute(self, request: AIRoleRequest) -> AIRoleResult:
-        self.recorded_requests.append(request)
-        self._call_count += 1
-
-        if self.fail_then_succeed_target and self._call_count == 1:
-            return AIRoleResult(
-                request_id=request.request_id,
-                role_run_id=request.role_run_id,
-                status="failed",
-                error="quota exceeded on primary resource",
-                resource_context=ResourceContext(resource_id=self.fail_then_succeed_target),
-                failure_classification="quota_exhausted",
-            )
-
-        if self.next_result is not None:
-            res = self.next_result
-            self.next_result = None
-            return res
-
-        # Default success echoing target resource if not excluded
-        selected_res = "res_1"
-        for candidate in ("res_1", "res_2", "res_3", "res_4"):
-            if candidate not in request.excluded_resource_ids:
-                selected_res = candidate
-                break
-        return AIRoleResult(
-            request_id=request.request_id,
-            role_run_id=request.role_run_id,
-            status="succeeded",
-            output='{"summary": "mock success"}',
-            resource_context=ResourceContext(resource_id=selected_res, provider="mock", account="acc", model="mod"),
-            usage={"total_tokens": 100},
-            usage_source="reported",
-            started_at="2026-01-01T00:00:00Z",
-            finished_at="2026-01-01T00:00:01Z",
-        )
-
-    def status(self, request_id: str) -> dict[str, Any] | None:
-        return {"status": "succeeded"}
-
-    def interrupt(self, request_id: str, reason: str) -> dict[str, Any] | None:
-        return {"status": "interrupted"}
 
 
 class TestP16BrokerClient(unittest.TestCase):

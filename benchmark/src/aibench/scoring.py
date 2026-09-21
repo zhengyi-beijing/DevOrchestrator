@@ -144,46 +144,100 @@ def shutil_which(cmd: str) -> str | None:
 
 
 def _apply_simple_patch_fallback(patch_text: str, workspace_path: Path) -> bool:
-    """Simple parser for single file unified diffs when git apply is unavailable."""
+    """Generic unified diff applier for single/multi-file diffs when git apply is unavailable."""
+    if not patch_text or not patch_text.strip():
+        return False
+
     lines = patch_text.splitlines()
-    target_rel: str | None = None
-    hunk_lines: list[str] = []
+    files_to_patch: dict[str, list[tuple[list[str], list[str]]]] = {}
+    current_file: str | None = None
+    current_old_lines: list[str] = []
+    current_new_lines: list[str] = []
+    in_hunk = False
 
     for line in lines:
-        if line.startswith("+++ b/"):
-            target_rel = line[6:].strip()
-        elif line.startswith("+++ "):
-            target_rel = line[4:].strip()
+        if line.startswith("--- "):
+            if current_file and (current_old_lines or current_new_lines):
+                files_to_patch.setdefault(current_file, []).append((current_old_lines, current_new_lines))
+                current_old_lines, current_new_lines = [], []
+            in_hunk = False
+        elif line.startswith("+++ b/"):
+            if current_file and (current_old_lines or current_new_lines):
+                files_to_patch.setdefault(current_file, []).append((current_old_lines, current_new_lines))
+                current_old_lines, current_new_lines = [], []
+            current_file = line[6:].strip()
+            in_hunk = False
+        elif line.startswith("+++ ") and not line.startswith("+++ b/"):
+            if current_file and (current_old_lines or current_new_lines):
+                files_to_patch.setdefault(current_file, []).append((current_old_lines, current_new_lines))
+                current_old_lines, current_new_lines = [], []
+            current_file = line[4:].strip()
+            in_hunk = False
         elif line.startswith("@@"):
+            if current_file and in_hunk:
+                files_to_patch.setdefault(current_file, []).append((current_old_lines, current_new_lines))
+                current_old_lines, current_new_lines = [], []
+            in_hunk = True
+        elif in_hunk and current_file:
+            if line.startswith(" "):
+                current_old_lines.append(line[1:])
+                current_new_lines.append(line[1:])
+            elif line.startswith("-"):
+                current_old_lines.append(line[1:])
+            elif line.startswith("+"):
+                current_new_lines.append(line[1:])
+
+    if current_file and (current_old_lines or current_new_lines):
+        files_to_patch.setdefault(current_file, []).append((current_old_lines, current_new_lines))
+
+    if not files_to_patch:
+        return False
+
+    applied_any = False
+    for rel_path, hunks in files_to_patch.items():
+        target_file = workspace_path / rel_path
+        if not target_file.is_file():
             continue
-        elif target_rel and (line.startswith("+") or line.startswith("-") or line.startswith(" ")):
-            hunk_lines.append(line)
-
-    if not target_rel:
-        return False
-
-    target_file = workspace_path / target_rel
-    if not target_file.is_file():
-        return False
-
-    # Check if target_file is cache.py and patch defines get_or_set
-    if "def get_or_set(" in patch_text:
         try:
             content = target_file.read_text(encoding="utf-8")
-            if "def get_or_set(" not in content:
-                # Extract the method definition lines from added lines
-                method_lines: list[str] = []
-                for hl in hunk_lines:
-                    if hl.startswith("+") and not hl.startswith("+++"):
-                        method_lines.append(hl[1:])
-                if method_lines:
-                    new_code = "\n" + "\n".join(method_lines) + "\n"
-                    target_file.write_text(content + new_code, encoding="utf-8")
-                    return True
-        except Exception:
-            return False
+            file_lines = content.splitlines(keepends=False)
+            file_patched = True
 
-    return False
+            for old_hunk, new_hunk in hunks:
+                if not old_hunk:
+                    file_lines.extend(new_hunk)
+                    continue
+
+                match_idx = -1
+                hunk_len = len(old_hunk)
+                for i in range(len(file_lines) - hunk_len + 1):
+                    if file_lines[i:i + hunk_len] == old_hunk:
+                        match_idx = i
+                        break
+
+                if match_idx == -1:
+                    stripped_hunk = [s.strip() for s in old_hunk]
+                    for i in range(len(file_lines) - hunk_len + 1):
+                        if [s.strip() for s in file_lines[i:i + hunk_len]] == stripped_hunk:
+                            match_idx = i
+                            break
+
+                if match_idx != -1:
+                    file_lines = file_lines[:match_idx] + new_hunk + file_lines[match_idx + hunk_len:]
+                else:
+                    file_patched = False
+                    break
+
+            if file_patched:
+                new_content = "\n".join(file_lines)
+                if content.endswith("\n") and not new_content.endswith("\n"):
+                    new_content += "\n"
+                target_file.write_text(new_content, encoding="utf-8")
+                applied_any = True
+        except Exception:
+            pass
+
+    return applied_any
 
 
 def run_workspace_tests(workspace_path: Path, test_file: str) -> tuple[int, int]:

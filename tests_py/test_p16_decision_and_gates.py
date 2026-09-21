@@ -75,6 +75,9 @@ class TestP16DecisionAndGates(unittest.TestCase):
                 "mean_wall_time_delta_seconds": wall_delta,
                 "mean_tool_calls_delta": tool_delta,
                 "mean_tokens_delta": token_delta,
+                "wall_time_stats": {"statistically_supported_benefit": wall_delta < 0},
+                "tool_calls_stats": {"statistically_supported_benefit": tool_delta < 0},
+                "tokens_stats": {"statistically_supported_benefit": (token_delta < 0) if token_delta is not None else False},
             },
             resource_breakdown=res_breakdown,
             role_breakdown=role_breakdown,
@@ -170,6 +173,47 @@ class TestP16DecisionAndGates(unittest.TestCase):
         self.assertEqual(decision.decision, DECISION_NO_PROMOTE)
         self.assertIn(REASON_STALENESS_GATE_FAILED, decision.reasons)
         self.assertIn("staleness_gate", decision.failed_gates)
+
+    def test_quality_gate_drop_within_threshold_passes(self):
+        # Drop of 0.04 is within max_correctness_drop (-0.05) -> quality gate passes
+        summary_ok = self._make_summary(score_a=0.80, score_b=0.76)
+        probe = ZvecProbeResult(supported=True, version="1.0", executable_hash="h", local_only_verified=True)
+        decision_ok = evaluate_promotion_decision(summary_ok, probe, self.plan)
+        self.assertTrue(decision_ok.gate_results["quality_gate"]["passed"])
+
+        # Drop of 0.06 exceeds max_correctness_drop (-0.05) -> quality gate fails
+        summary_reg = self._make_summary(score_a=0.80, score_b=0.74)
+        decision_reg = evaluate_promotion_decision(summary_reg, probe, self.plan)
+        self.assertFalse(decision_reg.gate_results["quality_gate"]["passed"])
+
+    def test_benefit_gate_requires_statistical_support(self):
+        summary = self._make_summary(wall_delta=-2.0, tool_delta=-1.0, token_delta=-50.0)
+        # Manually overwrite stats so that statistically_supported_benefit is False
+        summary.comparison["wall_time_stats"]["statistically_supported_benefit"] = False
+        summary.comparison["tool_calls_stats"]["statistically_supported_benefit"] = False
+        summary.comparison["tokens_stats"]["statistically_supported_benefit"] = False
+        probe = ZvecProbeResult(supported=True, version="1.0", executable_hash="h", local_only_verified=True)
+
+        decision = evaluate_promotion_decision(summary, probe, self.plan)
+        self.assertEqual(decision.decision, DECISION_NO_PROMOTE)
+        self.assertIn("benefit_gate", decision.failed_gates)
+
+    def test_capability_failure_branch_evaluates_evidence_and_fallback_gates(self):
+        # Unsupported probe
+        probe = ZvecProbeResult(supported=False, error_message="not installed")
+
+        # Case 1: Complete 3 resources, 4 roles, 24/24 trials -> evidence and fallback gates pass
+        summary_ok = self._make_summary(resources_count=3, roles_count=4)
+        decision_ok = evaluate_promotion_decision(summary_ok, probe, self.plan)
+        self.assertTrue(decision_ok.gate_results["evidence_gate"]["passed"])
+        self.assertTrue(decision_ok.gate_results["fallback_gate"]["passed"])
+        self.assertEqual(decision_ok.gate_results["quality_gate"]["status"], "not_applicable_due_to_capability_failure")
+
+        # Case 2: Insufficient resources (2 < 3) -> evidence gate fails
+        summary_insuf = self._make_summary(resources_count=2, roles_count=4)
+        decision_insuf = evaluate_promotion_decision(summary_insuf, probe, self.plan)
+        self.assertFalse(decision_insuf.gate_results["evidence_gate"]["passed"])
+        self.assertIn("evidence_gate", decision_insuf.failed_gates)
 
 
 if __name__ == "__main__":

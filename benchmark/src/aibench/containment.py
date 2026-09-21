@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,63 @@ def get_current_user_sid() -> tuple[str, str]:
                     return parts[0], parts[-1]
     except Exception:
         pass
-    return os.environ.get("USERNAME", "unknown_user"), "S-1-5-21-0-0-0-0"
+    return os.environ.get("USERNAME", "unknown_user"), ""
+
+
+def check_directory_write_denied(dir_path: Path) -> bool:
+    """Check if write/delete access to directory is denied without creating or modifying any file.
+
+    Opens a directory handle requesting FILE_WRITE_DATA | FILE_ADD_FILE | DELETE.
+    Returns True if access was denied (PermissionError / access denied), False if granted.
+    """
+    if not dir_path.exists():
+        return True
+
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        CreateFileW = kernel32.CreateFileW
+        CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        CreateFileW.restype = wintypes.HANDLE
+        CloseHandle = kernel32.CloseHandle
+        CloseHandle.argtypes = [wintypes.HANDLE]
+        CloseHandle.restype = wintypes.BOOL
+
+        FILE_WRITE_DATA = 0x0002
+        FILE_ADD_FILE = 0x0002
+        DELETE = 0x00010000
+        desired_access = FILE_WRITE_DATA | FILE_ADD_FILE | DELETE
+        share_mode = 1 | 2 | 4  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        creation_disposition = 3  # OPEN_EXISTING
+        flags = 0x02000000  # FILE_FLAG_BACKUP_SEMANTICS (required to open directories)
+
+        handle = CreateFileW(
+            str(dir_path.resolve()),
+            desired_access,
+            share_mode,
+            None,
+            creation_disposition,
+            flags,
+            None,
+        )
+        invalid_val = wintypes.HANDLE(-1).value
+        if handle in (-1, invalid_val, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF):
+            return True
+        else:
+            CloseHandle(handle)
+            return False
+    else:
+        return not os.access(dir_path, os.W_OK)
 
 
 def _is_path_disjoint(protected_root: Path, target_dir: Path) -> bool:
@@ -66,10 +123,12 @@ def audit_containment(
     details["current_sid"] = current_sid
     details["expected_sid"] = config.dedicated_sid
 
-    if allow_mock_sid or not config.dedicated_sid:
+    if allow_mock_sid:
         sid_match = True
+    elif not config.dedicated_sid:
+        sid_match = False
     else:
-        sid_match = (current_sid.lower() == config.dedicated_sid.lower())
+        sid_match = bool(current_sid and current_sid.lower() == config.dedicated_sid.lower())
 
     # 2. Scratch and Queue Root Isolation Check
     scratch_p = Path(config.scratch_root)
@@ -86,7 +145,7 @@ def audit_containment(
 
     details["isolation_errors"] = isolation_errors
 
-    # 3. Protected Roots Write/Delete Denial Check
+    # 3. Protected Roots Write/Delete Denial Check (without creating or modifying any file)
     acl_verified = True
     acl_details: list[dict[str, Any]] = []
 
@@ -94,18 +153,7 @@ def audit_containment(
         prot_p = Path(prot_str)
         if not prot_p.exists():
             continue
-        test_file = prot_p / f"_aibench_canary_deny_{uuid4().hex[:6]}.tmp"
-        denied = False
-        try:
-            # Attempt to create file in protected root
-            with open(test_file, "w", encoding="utf-8") as f:
-                f.write("canary")
-            # If creation succeeded, write was NOT denied
-            test_file.unlink(missing_ok=True)
-            denied = False
-        except (PermissionError, OSError):
-            denied = True
-
+        denied = check_directory_write_denied(prot_p)
         acl_details.append({"root": prot_str, "write_denied": denied})
         if not denied and not allow_unrestricted_dev_roots:
             acl_verified = False

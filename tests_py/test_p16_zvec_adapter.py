@@ -72,6 +72,64 @@ class TestP16ZvecAdapter(unittest.TestCase):
         self.assertFalse(stats["exists"])
         self.assertEqual(stats["size_bytes"], 0)
 
+    def test_verify_network_denial_program_match_and_mismatch(self):
+        from unittest.mock import patch, MagicMock
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+            exe_path = Path(f.name)
+        try:
+            adapter = ZvecAdapter(executable_path=exe_path)
+
+            # 1. Program matches
+            match_output = (
+                f"Rule Name: Block-Zvec-Outbound\n"
+                f"Enabled: Yes\n"
+                f"Direction: Out\n"
+                f"Action: Block\n"
+                f"Program: {exe_path}\n"
+            )
+            mock_proc_ok = MagicMock(returncode=0, stdout=match_output)
+            with patch("subprocess.run", return_value=mock_proc_ok):
+                self.assertTrue(adapter.verify_network_denial("Block-Zvec-Outbound"))
+
+            # 2. Program mismatches
+            mismatch_output = (
+                f"Rule Name: Block-Zvec-Outbound\n"
+                f"Enabled: Yes\n"
+                f"Direction: Out\n"
+                f"Action: Block\n"
+                f"Program: C:\\different\\path\\malicious.exe\n"
+            )
+            mock_proc_mismatch = MagicMock(returncode=0, stdout=mismatch_output)
+            with patch("subprocess.run", return_value=mock_proc_mismatch):
+                self.assertFalse(adapter.verify_network_denial("Block-Zvec-Outbound"))
+        finally:
+            exe_path.unlink(missing_ok=True)
+
+    def test_probe_requires_local_probes_before_verifying_local_only(self):
+        from unittest.mock import patch, MagicMock
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+            exe_path = Path(f.name)
+        try:
+            adapter = ZvecAdapter(executable_path=exe_path)
+            # When verify_network_denial returns True, but _verify_local_probes fails
+            with patch.object(adapter, "verify_network_denial", return_value=True), \
+                 patch.object(adapter, "_verify_local_probes", return_value=False), \
+                 patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="zvec 1.0.0")):
+                probe = adapter.probe()
+                self.assertTrue(probe.supported)
+                self.assertFalse(probe.local_only_verified)
+
+            # When both return True
+            adapter2 = ZvecAdapter(executable_path=exe_path)
+            with patch.object(adapter2, "verify_network_denial", return_value=True), \
+                 patch.object(adapter2, "_verify_local_probes", return_value=True), \
+                 patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="zvec 1.0.0")):
+                probe = adapter2.probe()
+                self.assertTrue(probe.supported)
+                self.assertTrue(probe.local_only_verified)
+        finally:
+            exe_path.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

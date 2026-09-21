@@ -46,7 +46,9 @@ DEFAULT_PROMOTION_THRESHOLDS: dict[str, Any] = {
     "min_distinct_resources": 3,
     "required_roles": list(ROLE_CLASSES),
     "max_false_findings_ratio": 0.20,
-    "min_correctness_retention": 1.0,  # Track B correctness >= Track A correctness
+    "max_correctness_drop": -0.05,  # Track B delta >= -0.05 (non-inferior)
+    "min_correctness_retention": 1.0,  # Legacy multiplicative retention fallback
+    "min_completion_rate": 0.95,  # Fallback gate requires >= 0.95 completion rate
     "min_benefit_metrics": 1,  # at least 1 of (wall_time, tool_calls, tokens) has statistically supported advantage
     "max_stale_error_rate": 0.15,
     "max_index_time_seconds": 60.0,
