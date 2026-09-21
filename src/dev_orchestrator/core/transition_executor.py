@@ -229,6 +229,21 @@ def _legacy_not_advanced_block(record: Any) -> bool:
     )
 
 
+def _transient_remediation_state_block(record: Any) -> bool:
+    """A reviewer REMEDIATE blocked only by a stale lifecycle snapshot may replay.
+
+    The decision/repository identity is revalidated on every replay.  No other
+    blocked remediation reason is eligible, so repository, worktree, owner
+    pause, provider, or concurrency failures remain durable barriers.
+    """
+    return (
+        isinstance(record, dict)
+        and record.get("state") == "blocked"
+        and record.get("source_kind") == "remediation"
+        and record.get("reason") == "project state is not eligible for exact remediation"
+    )
+
+
 def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]], str]:
     raw = project.get("execution")
     if not isinstance(raw, dict):
@@ -899,8 +914,13 @@ class TransitionExecutor:
 
         with self._lock:
             ledger = self._load_ledger()
-            if source_request_id in ledger["executions"]:
-                return None
+            existing = ledger["executions"].get(source_request_id)
+            replayed_from_block = None
+            if existing is not None:
+                if _transient_remediation_state_block(existing):
+                    replayed_from_block = copy.deepcopy(existing)
+                else:
+                    return None
             project_id = str(project["project_id"])
             barrier = self._launch_barrier_reason(project_id, source_kind)
             if barrier:
@@ -1015,8 +1035,13 @@ class TransitionExecutor:
         )
         with self._lock:
             ledger = self._load_ledger()
-            if source_request_id in ledger["executions"]:
-                return None
+            existing = ledger["executions"].get(source_request_id)
+            replayed_from_block = None
+            if existing is not None:
+                if _transient_remediation_state_block(existing):
+                    replayed_from_block = copy.deepcopy(existing)
+                else:
+                    return None
             barrier = self._launch_barrier_reason(project_id, source_kind)
             if barrier:
                 ledger["executions"][source_request_id] = {
@@ -1056,6 +1081,7 @@ class TransitionExecutor:
                 "first_output_at": None,
                 "context_state": resolution.state if resolution else None,
                 "context_digest": resolution.document.digest if resolution and resolution.document else None,
+                **({"replayed_from_block": replayed_from_block} if replayed_from_block is not None else {}),
                 **(copy.deepcopy(lineage) if lineage else {}),
             }
             self._save_ledger(ledger)
@@ -1964,6 +1990,7 @@ class TransitionExecutor:
                     _legacy_not_ready_block(existing)
                     or _legacy_no_next_settle(existing)
                     or _legacy_not_advanced_block(existing)
+                    or _transient_remediation_state_block(existing)
                 ):
                     continue
             if record.get("disposition") != "apply":

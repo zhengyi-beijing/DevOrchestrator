@@ -169,6 +169,57 @@ class AIBrokerTransitionTests(unittest.TestCase):
                          "review_state": "pending"}
         }}), encoding="utf-8")
 
+    def test_transient_remediation_state_block_replays_on_next_tick(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = self.make_repo(root)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            truth = read_repository_truth(repo)
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = [
+                "next_task", "continue_current_stage",
+            ]
+            config = root / "projects.json"
+            config.write_text(
+                json.dumps({"version": 1, "projects": [project]}),
+                encoding="utf-8",
+            )
+            decision_id = self._write_remediation_decision(runtime, truth)
+            port = FakePort()
+            executor = TransitionExecutor(runtime, ai_execution_port=port)
+
+            stale = self._remediation_snapshot()
+            stale["state"] = "REVIEWING"
+            self.assertEqual(executor.advance({"projects": [stale]}, config), [])
+            blocked = executor.state()["executions"][decision_id]
+            self.assertEqual(blocked["state"], "blocked")
+            self.assertEqual(
+                blocked["reason"],
+                "project state is not eligible for exact remediation",
+            )
+            self.assertEqual(len(port.requests), 0)
+
+            fresh = self._remediation_snapshot()
+            fresh["state"] = "IDLE"
+            launches = executor.advance({"projects": [fresh]}, config)
+            self.assertEqual(len(launches), 1)
+            self.assertEqual(launches[0].source_request_id, decision_id)
+            row = executor.state()["executions"][decision_id]
+            self.assertIn(row["state"], {"launching", "running", "completed"})
+            self.assertEqual(
+                row["replayed_from_block"]["reason"],
+                "project state is not eligible for exact remediation",
+            )
+            thread = executor._threads.get(decision_id)
+            if thread is not None:
+                thread.join(timeout=3)
+            self.assertEqual(
+                executor.state()["executions"][decision_id]["state"],
+                "completed",
+            )
+            self.assertEqual(len(port.requests), 1)
+
     def test_direct_reviewer_dispositions_drive_the_real_advance_gate(self):
         cases = (
             ("next", "next_task", "apply", False),
