@@ -124,8 +124,10 @@ class P12PlannerSingleFlightTests(unittest.TestCase):
                     }
                 },
             })
+            # Raw monitor projection may still say IDLE while the durable planner
+            # gate is authoritative; control recovery must use the exact gate.
             snapshot = {
-                "project_id": "p1", "state": "OWNER_GATE", "lifecycle_state": "OWNER_GATE",
+                "project_id": "p1", "state": "IDLE", "lifecycle_state": "IDLE",
                 "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P1"},
             }
             project = {

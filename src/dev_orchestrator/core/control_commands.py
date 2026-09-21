@@ -551,20 +551,19 @@ class ControlCommandCoordinator:
             lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "")
             if self.planner is None:
                 return self._blocked(command_id, project_id, action, "planner coordinator unavailable", now, record)
-            if lifecycle == "OWNER_GATE":
-                gate_id = _nonblank(observed.get("gate_id"))
-                if gate_id is None:
-                    return self._blocked(command_id, project_id, action, "recoverable planner gate id is unavailable", now, record)
+            gate_id = _nonblank(observed.get("gate_id"))
+            if gate_id is not None:
                 resumed, resume_reason = self.planner.resume_exhausted_technical_gate(
                     projects[project_id], snapshot, gate_id
                 )
-                if not resumed:
+                if resumed:
+                    return {
+                        **record, "state": "accepted", "processed_at": now,
+                        "lifecycle_action": "plan_recovery", "plan_id": gate_id,
+                        "reason": resume_reason,
+                    }
+                if lifecycle == "OWNER_GATE":
                     return self._blocked(command_id, project_id, action, resume_reason, now, record)
-                return {
-                    **record, "state": "accepted", "processed_at": now,
-                    "lifecycle_action": "plan_recovery", "plan_id": gate_id,
-                    "reason": resume_reason,
-                }
             if lifecycle not in {"IDLE", "PLAN_FAILED"}:
                 return self._blocked(
                     command_id, project_id, action, "PENDING DESIGN continue requires IDLE or PLAN_FAILED lifecycle", now, record

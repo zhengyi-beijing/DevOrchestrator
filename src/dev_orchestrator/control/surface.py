@@ -155,8 +155,7 @@ def project_control_view(
         and gate.get("review_decision") == "reject"
     )
     recovery_continue_ready = (
-        lifecycle == "OWNER_GATE"
-        and "PENDING DESIGN" in next_status.upper()
+        "PENDING DESIGN" in next_status.upper()
         and planning_ready
         and recoverable_plan_gate
         and not bool(identity.get("dirty"))
