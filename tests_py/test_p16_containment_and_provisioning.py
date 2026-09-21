@@ -192,6 +192,11 @@ class TestP16ContainmentAndProvisioning(unittest.TestCase):
                 main()
             self.assertEqual(ctx.exception.code, 1)
 
+    def test_check_directory_write_denied_nonexistent(self):
+        from aibench.containment import check_directory_write_denied
+        non_existent = Path("C:/non_existent_dir_for_test_12345_p16")
+        self.assertFalse(check_directory_write_denied(non_existent))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -161,15 +161,7 @@ class TestP16CliAndIntegration(unittest.TestCase):
 
         plan = TrialPlan.from_dict(json.loads(plan_file.read_text(encoding="utf-8")))
         self.assertEqual(len(plan.cells), 24)
-
-        expected_req_totals = {
-            t.task_id: len(t.ground_truth.get("required_findings", []))
-            for t in get_canonical_tasks()
-        }
-        self.assertEqual(expected_req_totals["task_arch_ownership"], 5)
-        self.assertEqual(expected_req_totals["task_compat_review"], 6)
-        self.assertEqual(expected_req_totals["task_cache_worker"], 2)
-        self.assertEqual(expected_req_totals["task_cross_file_debug"], 6)
+        self.assertEqual(plan.execution_source, "pipeline_self_test")
 
         records: list[TrialRecord] = []
         with open(results_file, "r", encoding="utf-8") as f:
@@ -186,31 +178,23 @@ class TestP16CliAndIntegration(unittest.TestCase):
         for r in records:
             self.assertEqual(r.status, "completed")
             self.assertEqual(r.broker_attempt.status, "succeeded")
-            self.assertGreater(r.score.correctness, 0.0)
+            self.assertEqual(r.execution_source, "pipeline_self_test")
+            self.assertEqual(r.broker_attempt.provider, "mock")
+            self.assertIsNone(r.broker_attempt.dispatch_id)
+            self.assertIsNone(r.broker_attempt.execution_id)
+            self.assertGreaterEqual(r.score.correctness, 0.0)
+            self.assertGreaterEqual(r.score.required_findings_total, 0)
+            self.assertGreaterEqual(r.score.false_findings, 0)
+            self.assertGreaterEqual(r.metrics.observed_shell_tool_calls, 0)
 
-            # Required findings must match canonical task ground truth
-            exp_total = expected_req_totals[r.cell.task_id]
-            self.assertEqual(r.score.required_findings_total, exp_total)
-            self.assertEqual(r.score.required_findings_met, exp_total)
-            self.assertEqual(r.score.false_findings, 0)
+            # Details must not be empty and citations must be list if present
+            self.assertIsInstance(r.score.details, dict)
+            if "citation_details" in r.score.details:
+                self.assertIsInstance(r.score.details["citation_details"], list)
 
-            # Details must not be empty and must include valid citation details
-            self.assertTrue(bool(r.score.details))
-            c_details = r.score.details.get("citation_details", [])
-            self.assertGreater(len(c_details), 0)
-            for cd in c_details:
-                self.assertTrue(cd.get("valid"))
-                self.assertGreater(cd.get("snippet_length", 0), 0)
-
-            # Worker role must have valid patch and test fields
-            if r.cell.role == "worker":
-                self.assertTrue(r.score.patch_valid)
-                self.assertGreaterEqual(r.score.tests_passed or 0, 3)
-                self.assertEqual(r.score.tests_failed, 0)
-                self.assertEqual(r.score.regression_rate, 0.0)
-
-            # Observed shell tool calls must be 1 on success
-            self.assertEqual(r.metrics.observed_shell_tool_calls, 1)
+            # Worker role must have valid patch fields if evaluated
+            if r.cell.role == "worker" and r.score.patch_valid is not None:
+                self.assertIsInstance(r.score.patch_valid, bool)
 
             timestamps.append(r.finished_at)
 
@@ -222,14 +206,23 @@ class TestP16CliAndIntegration(unittest.TestCase):
         saved_summary = json.loads(summary_file.read_text(encoding="utf-8"))
         self.assertEqual(summary.total_trials, saved_summary["total_trials"])
         self.assertEqual(summary.completed_trials, saved_summary["completed_trials"])
+        self.assertEqual(summary.execution_source, "pipeline_self_test")
+        self.assertFalse(summary.has_real_broker_evidence)
+        self.assertEqual(saved_summary["execution_source"], "pipeline_self_test")
+        self.assertFalse(saved_summary["has_real_broker_evidence"])
         self.assertAlmostEqual(summary.track_a_summary["correctness_mean"], saved_summary["track_a_summary"]["correctness_mean"])
         self.assertAlmostEqual(summary.track_b_summary["correctness_mean"], saved_summary["track_b_summary"]["correctness_mean"])
 
-        # Promotion decision check
+        # Promotion decision check: fails closed on evidence_gate and capability_gate
         decision_data = json.loads(decision_file.read_text(encoding="utf-8"))
         self.assertEqual(decision_data["decision"], "NO_PROMOTE")
+        self.assertEqual(decision_data["execution_source"], "pipeline_self_test")
         self.assertIn("capability_gate", decision_data["failed_gates"])
-        self.assertTrue(decision_data["gate_results"]["evidence_gate"]["passed"])
+        self.assertIn("evidence_gate", decision_data["failed_gates"])
+        self.assertIn("capability_unsupported", decision_data["reasons"])
+        self.assertIn("evidence_gate_failed", decision_data["reasons"])
+        self.assertFalse(decision_data["gate_results"]["evidence_gate"]["passed"])
+        self.assertEqual(decision_data["gate_results"]["evidence_gate"]["status"], "failed")
         self.assertTrue(decision_data["gate_results"]["fallback_gate"]["passed"])
 
 

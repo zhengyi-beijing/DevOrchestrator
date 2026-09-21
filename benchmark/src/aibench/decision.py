@@ -65,12 +65,21 @@ def evaluate_promotion_decision(
         roles_ok = required_roles.issubset(roles_present)
         res_ok = res_count >= thresh["min_distinct_resources"]
         trials_complete = (summary.completed_trials == summary.total_trials) and (summary.total_trials > 0)
-        ev_pass = res_ok and roles_ok and trials_complete
+        has_real_evidence = (
+            getattr(summary, "execution_source", "live") == "live"
+            and getattr(summary, "has_real_broker_evidence", True)
+        )
+        ev_pass = res_ok and roles_ok and trials_complete and has_real_evidence
+
+        if not has_real_evidence:
+            ev_detail = f"lacks real broker correlation evidence (execution_source={getattr(summary, 'execution_source', 'unknown')!r}, mock/simulated execution)"
+        else:
+            ev_detail = f"resources={res_count} (min {thresh['min_distinct_resources']}), roles={len(roles_present)} (req {len(required_roles)}), trials={summary.completed_trials}/{summary.total_trials}"
 
         gate_results["evidence_gate"] = {
             "passed": ev_pass,
             "status": "passed" if ev_pass else "failed",
-            "detail": f"resources={res_count} (min {thresh['min_distinct_resources']}), roles={len(roles_present)} (req {len(required_roles)}), trials={summary.completed_trials}/{summary.total_trials}",
+            "detail": ev_detail,
         }
         if not ev_pass:
             failed_gates.append("evidence_gate")
@@ -106,6 +115,7 @@ def evaluate_promotion_decision(
             run_id=summary.run_id,
             plan_id=plan.plan_id,
             timestamp=utc_now_iso(),
+            execution_source=getattr(summary, "execution_source", "live"),
         )
 
     # If zvec is supported, evaluate all gates fully
@@ -122,18 +132,26 @@ def evaluate_promotion_decision(
     roles_ok = required_roles.issubset(roles_present)
     res_ok = res_count >= thresh["min_distinct_resources"]
     trials_complete = (summary.completed_trials == summary.total_trials) and (summary.total_trials > 0)
+    has_real_evidence = (
+        getattr(summary, "execution_source", "live") == "live"
+        and getattr(summary, "has_real_broker_evidence", True)
+    )
 
-    if res_ok and roles_ok and trials_complete:
+    if res_ok and roles_ok and trials_complete and has_real_evidence:
         gate_results["evidence_gate"] = {
             "passed": True,
             "status": "passed",
             "detail": f"resources={res_count}, roles={len(roles_present)}, trials={summary.completed_trials}/{summary.total_trials}",
         }
     else:
+        if not has_real_evidence:
+            ev_detail = f"lacks real broker correlation evidence (execution_source={getattr(summary, 'execution_source', 'unknown')!r}, mock/simulated execution)"
+        else:
+            ev_detail = f"resources={res_count} (min {thresh['min_distinct_resources']}), roles={len(roles_present)}, trials={summary.completed_trials}/{summary.total_trials}"
         gate_results["evidence_gate"] = {
             "passed": False,
             "status": "failed",
-            "detail": f"resources={res_count} (min {thresh['min_distinct_resources']}), roles={len(roles_present)}, trials={summary.completed_trials}/{summary.total_trials}",
+            "detail": ev_detail,
         }
         failed_gates.append("evidence_gate")
         reasons.append(REASON_EVIDENCE_GATE_FAILED)
@@ -283,4 +301,5 @@ def evaluate_promotion_decision(
         run_id=summary.run_id,
         plan_id=plan.plan_id,
         timestamp=utc_now_iso(),
+        execution_source=getattr(summary, "execution_source", "live"),
     )

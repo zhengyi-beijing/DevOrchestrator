@@ -48,6 +48,7 @@ def build_trial_plan(
     seed: int = 42,
     max_dispatches: int = 200,
     require_all_roles: bool = True,
+    execution_source: str = "live",
 ) -> TrialPlan:
     """Generate deterministic frozen TrialPlan with paired A/B trials and randomized within-pair order."""
     if len(selected_resources) < 3:
@@ -115,6 +116,7 @@ def build_trial_plan(
         repeats=repeats,
         seed=seed,
         max_dispatches=max_dispatches,
+        execution_source=execution_source,
     )
 
 
@@ -127,11 +129,13 @@ class BenchmarkRunner:
         zvec_adapter: ZvecAdapter,
         scratch_root: Path,
         results_file: Path,
+        execution_source: str = "live",
     ) -> None:
         self.broker_client = broker_client
         self.zvec_adapter = zvec_adapter
         self.scratch_root = scratch_root
         self.results_file = results_file
+        self.execution_source = execution_source
         self._task_map = {t.task_id: t for t in get_canonical_tasks()}
 
     def _load_completed_trials(self) -> dict[str, TrialRecord]:
@@ -258,6 +262,7 @@ class BenchmarkRunner:
                 status=status,
                 retrieval_applied=retrieval_applied,
                 finished_at=utc_now_iso(),
+                execution_source=self.execution_source,
             )
 
             self._append_record(record)

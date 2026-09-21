@@ -2,6 +2,7 @@
 
 - **Plan ID**: `plan_42_299f8e08_24`
 - **Generated At**: `2026-09-21T11:09:37.800294+00:00`
+- **Execution Source**: `pipeline_self_test` (Real Broker Evidence: `False`)
 - **Total Trials**: `24` (Completed: `24`)
 
 ## Retrieval A/B Track Comparison

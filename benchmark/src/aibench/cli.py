@@ -85,6 +85,7 @@ def cmd_plan_freeze(args: argparse.Namespace) -> int:
         corpus_manifest_hash=manifest_hash,
         repeats=args.repeats,
         seed=args.seed,
+        execution_source=getattr(args, "execution_source", "live"),
     )
 
     out_p = Path(args.output)
@@ -140,9 +141,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         port = AIBrokerExecutionPort(b_cfg)
         b_client = BrokerBenchmarkClient(port, config_path=args.resources_config, service_url=b_cfg.service_url)
 
+    execution_source = getattr(args, "execution_source", None)
+    if not execution_source:
+        execution_source = "pipeline_self_test" if args.mock_broker else getattr(plan, "execution_source", "live")
+
     snapshot = b_client.snapshot_resources()
     scratch_root = out_dir / "scratch"
-    runner = BenchmarkRunner(b_client, zvec, scratch_root, results_file)
+    runner = BenchmarkRunner(
+        b_client,
+        zvec,
+        scratch_root,
+        results_file,
+        execution_source=execution_source,
+    )
 
     print(f"Running benchmark plan {plan.plan_id} ({len(plan.cells)} cells)...")
     records = runner.run_plan(plan, corpus_p, snapshot)
@@ -224,6 +235,7 @@ def main() -> None:
     p_pf.add_argument("--seed", type=int, default=42)
     p_pf.add_argument("--resources", default="agy/agy-1/gemini-3.8-flash-high,copilot/default/claude-sonnet-4.6,claude/default/opus")
     p_pf.add_argument("--corpus-path", default="benchmark/corpus")
+    p_pf.add_argument("--execution-source", default="live")
 
     # submit
     p_sub = subparsers.add_parser("submit")
@@ -239,6 +251,7 @@ def main() -> None:
     p_run.add_argument("--resources-config", default=r"runtime\aibroker-m1\resources-m2.yaml")
     p_run.add_argument("--service-url", default="http://127.0.0.1:8875")
     p_run.add_argument("--mock-broker", action="store_true", default=False)
+    p_run.add_argument("--execution-source", default=None)
 
     # report
     p_rep = subparsers.add_parser("report")

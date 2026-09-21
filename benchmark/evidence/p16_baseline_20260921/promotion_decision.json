@@ -1,7 +1,8 @@
 {
   "decision": "NO_PROMOTE",
   "reasons": [
-    "capability_unsupported"
+    "capability_unsupported",
+    "evidence_gate_failed"
   ],
   "failed_gates": [
     "capability_gate",
@@ -9,6 +10,7 @@
     "privacy_gate",
     "staleness_gate",
     "cost_gate",
+    "evidence_gate",
     "quality_gate"
   ],
   "gate_results": {
@@ -38,9 +40,9 @@
       "detail": "zvec retrieval unsupported"
     },
     "evidence_gate": {
-      "passed": true,
-      "status": "passed",
-      "detail": "resources=3 (min 3), roles=4 (req 4), trials=24/24"
+      "passed": false,
+      "status": "failed",
+      "detail": "lacks real broker correlation evidence (execution_source='pipeline_self_test', mock/simulated execution)"
     },
     "fallback_gate": {
       "passed": true,
@@ -55,5 +57,6 @@
   },
   "run_id": "run_plan_42_299f8e08_24",
   "plan_id": "plan_42_299f8e08_24",
-  "timestamp": "2026-09-21T11:09:37.801294+00:00"
+  "timestamp": "2026-09-21T11:09:37.801294+00:00",
+  "execution_source": "pipeline_self_test"
 }

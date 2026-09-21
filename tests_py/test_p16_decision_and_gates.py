@@ -42,6 +42,8 @@ class TestP16DecisionAndGates(unittest.TestCase):
         index_size_bytes: int = 1000000,
         resources_count: int = 3,
         roles_count: int = 4,
+        execution_source: str = "live",
+        has_real_broker_evidence: bool = True,
     ) -> RunSummary:
         res_breakdown = {f"res_{i}": {"completed_trials": 8, "total_trials": 8} for i in range(1, resources_count + 1)}
         roles_list = ["planner", "reviewer", "worker", "debugger"][:roles_count]
@@ -87,6 +89,8 @@ class TestP16DecisionAndGates(unittest.TestCase):
                 "index_time_seconds": index_time,
                 "index_size_bytes": index_size_bytes,
             },
+            execution_source=execution_source,
+            has_real_broker_evidence=has_real_broker_evidence,
         )
 
     def test_unsupported_zvec_yields_no_promote_and_capability_unsupported(self):
@@ -214,6 +218,39 @@ class TestP16DecisionAndGates(unittest.TestCase):
         decision_insuf = evaluate_promotion_decision(summary_insuf, probe, self.plan)
         self.assertFalse(decision_insuf.gate_results["evidence_gate"]["passed"])
         self.assertIn("evidence_gate", decision_insuf.failed_gates)
+
+    def test_evidence_gate_fails_closed_on_synthetic_or_mock_evidence(self):
+        # When execution_source is pipeline_self_test and has_real_broker_evidence is False
+        summary_mock = self._make_summary(
+            resources_count=3,
+            roles_count=4,
+            execution_source="pipeline_self_test",
+            has_real_broker_evidence=False,
+        )
+
+        # 1. Capability failure path
+        probe_unsupported = ZvecProbeResult(supported=False, error_message="not installed")
+        dec1 = evaluate_promotion_decision(summary_mock, probe_unsupported, self.plan)
+        self.assertEqual(dec1.decision, DECISION_NO_PROMOTE)
+        self.assertEqual(dec1.execution_source, "pipeline_self_test")
+        self.assertIn("evidence_gate", dec1.failed_gates)
+        self.assertIn(REASON_EVIDENCE_GATE_FAILED, dec1.reasons)
+        self.assertFalse(dec1.gate_results["evidence_gate"]["passed"])
+        self.assertEqual(dec1.gate_results["evidence_gate"]["status"], "failed")
+        self.assertIn("lacks real broker correlation evidence", dec1.gate_results["evidence_gate"]["detail"])
+        # Fallback gate should still pass on native track
+        self.assertTrue(dec1.gate_results["fallback_gate"]["passed"])
+
+        # 2. Zvec supported path
+        probe_supported = ZvecProbeResult(supported=True, version="1.0", executable_hash="h", local_only_verified=True)
+        dec2 = evaluate_promotion_decision(summary_mock, probe_supported, self.plan)
+        self.assertEqual(dec2.decision, DECISION_NO_PROMOTE)
+        self.assertEqual(dec2.execution_source, "pipeline_self_test")
+        self.assertIn("evidence_gate", dec2.failed_gates)
+        self.assertIn(REASON_EVIDENCE_GATE_FAILED, dec2.reasons)
+        self.assertFalse(dec2.gate_results["evidence_gate"]["passed"])
+        self.assertEqual(dec2.gate_results["evidence_gate"]["status"], "failed")
+        self.assertIn("lacks real broker correlation evidence", dec2.gate_results["evidence_gate"]["detail"])
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ def check_directory_write_denied(dir_path: Path) -> bool:
     Returns True if access was denied (PermissionError / access denied), False if granted.
     """
     if not dir_path.exists():
-        return True
+        return False
 
     if sys.platform == "win32":
         import ctypes

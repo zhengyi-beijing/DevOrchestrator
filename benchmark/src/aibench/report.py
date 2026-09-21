@@ -176,6 +176,16 @@ def build_run_summary(
         "rate_limit_events": rate_limits,
     }
 
+    is_live = bool(records) and all(
+        getattr(r, "execution_source", "live") == "live"
+        and r.broker_attempt.provider != "mock"
+        and bool(r.broker_attempt.dispatch_id)
+        and bool(r.broker_attempt.execution_id)
+        for r in records
+    )
+    execution_source = "live" if is_live else "pipeline_self_test"
+    has_real_broker_evidence = is_live
+
     return RunSummary(
         run_id=f"run_{plan.plan_id}",
         plan_id=plan.plan_id,
@@ -189,6 +199,8 @@ def build_run_summary(
         role_breakdown=role_breakdown,
         quota_consumed=quota_consumed,
         staleness_metrics=staleness_result.to_dict() if staleness_result else None,
+        execution_source=execution_source,
+        has_real_broker_evidence=has_real_broker_evidence,
     )
 
 
@@ -199,6 +211,7 @@ def generate_report_markdown(summary: RunSummary, decision: PromotionDecision | 
         "",
         f"- **Plan ID**: `{summary.plan_id}`",
         f"- **Generated At**: `{summary.created_at}`",
+        f"- **Execution Source**: `{summary.execution_source}` (Real Broker Evidence: `{summary.has_real_broker_evidence}`)",
         f"- **Total Trials**: `{summary.total_trials}` (Completed: `{summary.completed_trials}`)",
         "",
     ]

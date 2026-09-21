@@ -150,10 +150,9 @@ class ZvecAdapter:
             if proc.returncode != 0:
                 return False
 
-            out = proc.stdout.lower()
             # Check for Action: Block and Direction: Out
-            has_block = ("block" in out or "deny" in out)
-            has_out = "out" in out
+            has_block = bool(re.search(r"action:\s*(?:block|deny)\b", proc.stdout, re.IGNORECASE))
+            has_out = bool(re.search(r"direction:\s*out\b", proc.stdout, re.IGNORECASE))
             if not (has_block and has_out):
                 return False
 

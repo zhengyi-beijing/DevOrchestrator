@@ -326,5 +326,6 @@
   ],
   "repeats": 1,
   "seed": 42,
-  "max_dispatches": 200
+  "max_dispatches": 200,
+  "execution_source": "pipeline_self_test"
 }

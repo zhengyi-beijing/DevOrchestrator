@@ -102,6 +102,30 @@ class TestP16ZvecAdapter(unittest.TestCase):
             mock_proc_mismatch = MagicMock(returncode=0, stdout=mismatch_output)
             with patch("subprocess.run", return_value=mock_proc_mismatch):
                 self.assertFalse(adapter.verify_network_denial("Block-Zvec-Outbound"))
+
+            # 3. Direction: In with "out" substring in name
+            in_output = (
+                f"Rule Name: Block-Zvec-Outbound-Check\n"
+                f"Enabled: Yes\n"
+                f"Direction: In\n"
+                f"Action: Block\n"
+                f"Program: {exe_path}\n"
+            )
+            mock_proc_in = MagicMock(returncode=0, stdout=in_output)
+            with patch("subprocess.run", return_value=mock_proc_in):
+                self.assertFalse(adapter.verify_network_denial("Block-Zvec-Outbound"))
+
+            # 4. Action: Allow with "block" substring in name
+            allow_output = (
+                f"Rule Name: Block-Zvec-Outbound\n"
+                f"Enabled: Yes\n"
+                f"Direction: Out\n"
+                f"Action: Allow\n"
+                f"Program: {exe_path}\n"
+            )
+            mock_proc_allow = MagicMock(returncode=0, stdout=allow_output)
+            with patch("subprocess.run", return_value=mock_proc_allow):
+                self.assertFalse(adapter.verify_network_denial("Block-Zvec-Outbound"))
         finally:
             exe_path.unlink(missing_ok=True)
 

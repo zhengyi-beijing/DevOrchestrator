@@ -425,6 +425,7 @@ class TrialRecord:
     status: str
     retrieval_applied: bool
     finished_at: str
+    execution_source: str = "live"
 
     def __post_init__(self) -> None:
         if self.status not in TRIAL_STATUSES:
@@ -441,6 +442,7 @@ class TrialRecord:
             "status": self.status,
             "retrieval_applied": self.retrieval_applied,
             "finished_at": self.finished_at,
+            "execution_source": self.execution_source,
         }
 
     @classmethod
@@ -455,6 +457,7 @@ class TrialRecord:
             status=str(data["status"]),
             retrieval_applied=bool(data["retrieval_applied"]),
             finished_at=str(data["finished_at"]),
+            execution_source=str(data.get("execution_source", "live")),
         )
 
 
@@ -471,6 +474,7 @@ class TrialPlan:
     repeats: int
     seed: int
     max_dispatches: int
+    execution_source: str = "live"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -485,6 +489,7 @@ class TrialPlan:
             "repeats": self.repeats,
             "seed": self.seed,
             "max_dispatches": self.max_dispatches,
+            "execution_source": self.execution_source,
         }
 
     @classmethod
@@ -501,6 +506,7 @@ class TrialPlan:
             repeats=int(data["repeats"]),
             seed=int(data["seed"]),
             max_dispatches=int(data["max_dispatches"]),
+            execution_source=str(data.get("execution_source", "live")),
         )
 
 
@@ -552,6 +558,8 @@ class RunSummary:
     role_breakdown: dict[str, Any]
     quota_consumed: dict[str, Any]
     staleness_metrics: dict[str, Any] | None = None
+    execution_source: str = "live"
+    has_real_broker_evidence: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -567,6 +575,8 @@ class RunSummary:
             "role_breakdown": dict(self.role_breakdown),
             "quota_consumed": dict(self.quota_consumed),
             "staleness_metrics": dict(self.staleness_metrics) if self.staleness_metrics else None,
+            "execution_source": self.execution_source,
+            "has_real_broker_evidence": self.has_real_broker_evidence,
         }
 
     @classmethod
@@ -584,6 +594,8 @@ class RunSummary:
             role_breakdown=dict(data.get("role_breakdown", {})),
             quota_consumed=dict(data.get("quota_consumed", {})),
             staleness_metrics=dict(data["staleness_metrics"]) if data.get("staleness_metrics") else None,
+            execution_source=str(data.get("execution_source", "live")),
+            has_real_broker_evidence=bool(data.get("has_real_broker_evidence", True)),
         )
 
 
@@ -596,6 +608,7 @@ class PromotionDecision:
     run_id: str
     plan_id: str
     timestamp: str
+    execution_source: str = "live"
 
     def __post_init__(self) -> None:
         if self.decision not in {DECISION_PROMOTE, DECISION_NO_PROMOTE}:
@@ -610,6 +623,7 @@ class PromotionDecision:
             "run_id": self.run_id,
             "plan_id": self.plan_id,
             "timestamp": self.timestamp,
+            "execution_source": self.execution_source,
         }
 
     @classmethod
@@ -622,6 +636,7 @@ class PromotionDecision:
             run_id=str(data["run_id"]),
             plan_id=str(data["plan_id"]),
             timestamp=str(data["timestamp"]),
+            execution_source=str(data.get("execution_source", "live")),
         )
 
 

@@ -1,13 +1,13 @@
-# NEXT — Roadmap Complete (P16 AI Capability Benchmark Project Closed)
+# NEXT — Roadmap Handoff (P16 AI Capability Benchmark Project: OWNER_GATE Raised)
 
-Status: **COMPLETED / TERMINAL ROADMAP MILESTONE**
+Status: **P16 OWNER_GATE RAISED (Pending Owner Containment Provisioning)**
 
 Sequence:
-P14.5 (closed) -> Watchdog recovery-epoch cleanup (closed) -> P14.6 Unattended Execution Stabilization Gate (closed) -> P15 Mobile Observability & Guarded Control (closed) -> P16 AI Capability Benchmark Project (closed)
+P14.5 (closed) -> Watchdog recovery-epoch cleanup (closed) -> P14.6 Unattended Execution Stabilization Gate (closed) -> P15 Mobile Observability & Guarded Control (closed) -> P16 AI Capability Benchmark Project (OWNER_GATE raised)
 
-## P16 AI Capability Benchmark Project closure
+## P16 AI Capability Benchmark Project state
 
-Closed after implementing, executing, and verifying the P16 AI Capability Benchmark Project:
+Remediated and verified under `OWNER_GATE RAISED (Pending Owner Containment Provisioning)`:
 
 Acceptance evidence:
 1. **Isolated Benchmark Project & Zero Production Contamination**:
@@ -23,21 +23,23 @@ Acceptance evidence:
 4. **Windows Containment Boundary**:
    - External scratch and queue roots outside DevO, AIResourceBroker, and production roots.
    - Dedicated non-admin SID verification via `whoami /user`.
-   - Deny write/delete directory handle access denial audit against protected roots without creating files.
-   - Program-specific Windows Firewall outbound-deny rule.
+   - Deny write/delete directory handle access denial audit against existing protected roots without creating files.
+   - Program-specific Windows Firewall outbound-deny rule verified via regex.
    - Transactional, SDDL-backed provisioning and digest-checked uninstall scripts adhering to PowerShell 5.1 rules (zero `&&` or `||`).
-5. **Total, Bounded 8-Gate Evaluation & Baseline Decision**:
-   - 24 trials executed across 3 resources (`agy/agy-1/gemini-3.8-flash-high`, `copilot/default/claude-sonnet-4.6`, `claude/default/opus`) and 4 roles.
+5. **Total, Bounded 8-Gate Evaluation & Pipeline Self-Test Baseline**:
+   - 24 trials executed and committed under `benchmark/evidence/p16_baseline_20260921/` with authentic `execution_source: "pipeline_self_test"` and mock provider provenance.
    - `capability_gate`: FAIL (zvec-grep not found on system or PATH).
    - Downstream retrieval gates marked `not_applicable_due_to_capability_failure`.
-   - `evidence_gate`: PASS (3 distinct resources).
-   - `fallback_gate`: PASS (12/12 native trials completed).
-   - Final Evaluated Decision: **`NO_PROMOTE`** (`reasons: ["capability_unsupported"]`).
+   - `evidence_gate`: FAIL (`lacks real broker correlation evidence (execution_source='pipeline_self_test', mock/simulated execution)`).
+   - `fallback_gate`: PASS (12/12 native trials completed, 1.00 completion rate, correctness 1.0000).
+   - Final Evaluated Decision: **`NO_PROMOTE`** (`reasons: ["capability_unsupported", "evidence_gate_failed"]`).
    - Artifacts committed under `benchmark/evidence/p16_baseline_20260921/` and canonical acceptance record in `docs/P16_BENCHMARK_ACCEPTANCE.md`.
-6. **Acceptance Test Suite**:
-   - 9 dedicated P16 test suites in `tests_py/test_p16_*.py` (58 passed in 4.07s).
-7. **Roadmap Status**:
-   - `agent/staged/roadmap.json` designates `successor: null`. All staged tasks (P11x through P16) are now complete.
+6. **Explicit OWNER_GATE on Host Elevation**:
+   - In accordance with the approved design ("Inability to provision the core three-resource acceptance set is an explicit OWNER_GATE"), OWNER_GATE is explicitly raised pending owner elevation to provision the dedicated Windows non-admin SID, ACL write-denials on production roots, and firewall rules. Stopped claiming live evaluation of 3 real broker resources in documentation and agent state.
+7. **Acceptance Test Suite**:
+   - 9 dedicated P16 test suites in `tests_py/test_p16_*.py` (61 passed in 4.32s).
+8. **Roadmap Status**:
+   - `agent/staged/roadmap.json` designates `successor: null`. P16 is the terminal milestone on the staged roadmap, currently paused at OWNER_GATE pending host containment provisioning.
 
 ## P15 Mobile Observability & Guarded Control closure
 

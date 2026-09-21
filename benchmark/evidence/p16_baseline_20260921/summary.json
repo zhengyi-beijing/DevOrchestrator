@@ -114,5 +114,7 @@
     "quota_buckets": {},
     "rate_limit_events": {}
   },
-  "staleness_metrics": null
+  "staleness_metrics": null,
+  "execution_source": "pipeline_self_test",
+  "has_real_broker_evidence": false
 }

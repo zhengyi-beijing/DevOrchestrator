@@ -209,9 +209,18 @@ class TestP16ContractsAndModels(unittest.TestCase):
         score = TrialScore("tr_1", 1.0, 2, 0, 2, 2, 0)
         metrics = MetricCoverage(1, 0, 0, None, 100, 5.0)
         record = TrialRecord("tr_1", "plan_1", cell, attempt, score, metrics, STATUS_COMPLETED, False, "2026-01-01T00:00:00Z")
+        self.assertEqual(record.execution_source, "live")
         d = record.to_dict()
+        self.assertEqual(d["execution_source"], "live")
         record2 = TrialRecord.from_dict(d)
         self.assertEqual(record, record2)
+
+        record_synth = TrialRecord("tr_1", "plan_1", cell, attempt, score, metrics, STATUS_COMPLETED, False, "2026-01-01T00:00:00Z", execution_source="pipeline_self_test")
+        self.assertEqual(record_synth.execution_source, "pipeline_self_test")
+        d_synth = record_synth.to_dict()
+        self.assertEqual(d_synth["execution_source"], "pipeline_self_test")
+        record_synth2 = TrialRecord.from_dict(d_synth)
+        self.assertEqual(record_synth, record_synth2)
 
     def test_trial_plan_serialization(self):
         cell = TrialCell("tr_1", "task_1", "planner", "res_1", "A", 0, "p1", 0, "hash", "rev", 100.0)
@@ -228,9 +237,74 @@ class TestP16ContractsAndModels(unittest.TestCase):
             seed=42,
             max_dispatches=100,
         )
+        self.assertEqual(plan.execution_source, "live")
         d = plan.to_dict()
+        self.assertEqual(d["execution_source"], "live")
         plan2 = TrialPlan.from_dict(d)
         self.assertEqual(plan, plan2)
+
+        plan_synth = TrialPlan(
+            plan_id="plan_1",
+            created_at="2026-01-01T00:00:00Z",
+            corpus_manifest_hash="man_hash",
+            rubric_digest="rub_digest",
+            config_hash="cfg_hash",
+            registry_digest="reg_digest",
+            selected_resources=("res_1", "res_2", "res_3"),
+            cells=(cell,),
+            repeats=1,
+            seed=42,
+            max_dispatches=100,
+            execution_source="pipeline_self_test",
+        )
+        self.assertEqual(plan_synth.execution_source, "pipeline_self_test")
+        d_synth = plan_synth.to_dict()
+        self.assertEqual(d_synth["execution_source"], "pipeline_self_test")
+        plan_synth2 = TrialPlan.from_dict(d_synth)
+        self.assertEqual(plan_synth, plan_synth2)
+
+    def test_run_summary_serialization(self):
+        summary = RunSummary(
+            run_id="run_1",
+            plan_id="plan_1",
+            created_at="2026-01-01T00:00:00Z",
+            total_trials=24,
+            completed_trials=24,
+            track_a_summary={},
+            track_b_summary={},
+            comparison={},
+            resource_breakdown={},
+            role_breakdown={},
+            quota_consumed={},
+        )
+        self.assertEqual(summary.execution_source, "live")
+        self.assertTrue(summary.has_real_broker_evidence)
+        d = summary.to_dict()
+        self.assertEqual(d["execution_source"], "live")
+        self.assertTrue(d["has_real_broker_evidence"])
+        summary2 = RunSummary.from_dict(d)
+        self.assertEqual(summary, summary2)
+
+        summary_synth = RunSummary(
+            run_id="run_1",
+            plan_id="plan_1",
+            created_at="2026-01-01T00:00:00Z",
+            total_trials=24,
+            completed_trials=24,
+            track_a_summary={},
+            track_b_summary={},
+            comparison={},
+            resource_breakdown={},
+            role_breakdown={},
+            quota_consumed={},
+            execution_source="pipeline_self_test",
+            has_real_broker_evidence=False,
+        )
+        self.assertEqual(summary_synth.execution_source, "pipeline_self_test")
+        self.assertFalse(summary_synth.has_real_broker_evidence)
+        d_synth = summary_synth.to_dict()
+        summary_synth2 = RunSummary.from_dict(d_synth)
+        self.assertEqual(summary_synth, summary_synth2)
 
     def test_promotion_decision_serialization(self):
         dec = PromotionDecision(
@@ -242,9 +316,27 @@ class TestP16ContractsAndModels(unittest.TestCase):
             plan_id="plan_1",
             timestamp="2026-01-01T00:00:00Z",
         )
+        self.assertEqual(dec.execution_source, "live")
         d = dec.to_dict()
+        self.assertEqual(d["execution_source"], "live")
         dec2 = PromotionDecision.from_dict(d)
         self.assertEqual(dec, dec2)
+
+        dec_synth = PromotionDecision(
+            decision=DECISION_NO_PROMOTE,
+            reasons=("capability_unsupported", "evidence_gate_failed"),
+            failed_gates=("capability_gate", "evidence_gate"),
+            gate_results={"capability_gate": {"passed": False}, "evidence_gate": {"passed": False}},
+            run_id="run_1",
+            plan_id="plan_1",
+            timestamp="2026-01-01T00:00:00Z",
+            execution_source="pipeline_self_test",
+        )
+        self.assertEqual(dec_synth.execution_source, "pipeline_self_test")
+        d_synth = dec_synth.to_dict()
+        self.assertEqual(d_synth["execution_source"], "pipeline_self_test")
+        dec_synth2 = PromotionDecision.from_dict(d_synth)
+        self.assertEqual(dec_synth, dec_synth2)
 
         with self.assertRaises(ValueError):
             PromotionDecision("INVALID", (), (), {}, "r", "p", "t")
