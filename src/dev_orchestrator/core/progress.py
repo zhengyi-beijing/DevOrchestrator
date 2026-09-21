@@ -125,6 +125,7 @@ class ProgressChannel:
         self._history: list[dict[str, Any]] = []
         self._project_bindings: dict[str, dict[str, Any]] = {}
         self._project_configs: dict[str, dict[str, Any]] = {}
+        self._listeners: list[Callable[[ProgressNotification], None]] = []
         self._load_state()
 
     def _load_state(self) -> None:
@@ -164,6 +165,16 @@ class ProgressChannel:
     def set_project_resolver(self, resolver: Optional[Callable[[str], Optional[dict[str, Any]]]]) -> None:
         with self._lock:
             self.project_resolver = resolver
+
+    def add_listener(self, listener: Callable[[ProgressNotification], None]) -> None:
+        with self._lock:
+            if listener not in self._listeners:
+                self._listeners.append(listener)
+
+    def remove_listener(self, listener: Callable[[ProgressNotification], None]) -> None:
+        with self._lock:
+            if listener in self._listeners:
+                self._listeners.remove(listener)
 
     def register_project(self, project: Mapping[str, Any]) -> None:
         if not isinstance(project, Mapping):
@@ -434,6 +445,15 @@ class ProgressChannel:
                 b_id = str(binding["binding_id"])
                 if self.bridge_store is not None and hasattr(self.bridge_store, "submit_progress"):
                     self.bridge_store.submit_progress(adapter, b_id, notif)
+
+            # Notify registered in-process listeners
+            with self._lock:
+                listeners = list(self._listeners)
+            for listener in listeners:
+                try:
+                    listener(notif)
+                except Exception:
+                    pass
 
             return notif
 

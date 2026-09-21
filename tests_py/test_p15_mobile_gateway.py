@@ -150,6 +150,73 @@ class TestP15MobileGateway(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertIn("unavailable", body.get("error", "").lower() + body.get("message", "").lower())
 
+    def test_alerts_endpoint_and_policy_validation(self):
+        # 1. GET /alerts returns 200
+        status, body, _ = self._request(
+            "GET", "/api/v1/mobile/v1/alerts",
+            headers={"Authorization": f"Bearer {self.device_token}"}
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("alerts", body)
+        self.assertIsInstance(body["alerts"], list)
+
+        # 2. PUT /alert-policy with invalid quiet_hours returns 400
+        bad_policy = json.dumps({"quiet_hours": "invalid_hours"}).encode("utf-8")
+        status, err_body, _ = self._request(
+            "PUT", "/api/v1/mobile/v1/alert-policy",
+            data=bad_policy,
+            headers={
+                "Authorization": f"Bearer {self.device_token}",
+                "Content-Type": "application/json",
+            }
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("quiet_hours", err_body.get("message", "").lower())
+
+    def test_gateway_evaluate_and_broadcast_alerts(self):
+        from dev_orchestrator.storage.json_store import utc_now_iso
+        now_iso = utc_now_iso()
+        watchdog_data = {
+            "schema_version": 1,
+            "projects": {
+                "proj-1": {
+                    "last_diagnosis": "agent_stalled",
+                    "reason": "heartbeat interval exceeded",
+                    "stall_detected_at": now_iso,
+                    "recovery_epoch": {"epoch_id": "epoch-101", "timestamp": now_iso},
+                    "last_checked_at": now_iso,
+                }
+            }
+        }
+        (self.runtime / "watchdog.json").write_text(json.dumps(watchdog_data), encoding="utf-8")
+
+        # Snapshot for proj-1
+        (self.runtime / "projects").mkdir(parents=True, exist_ok=True)
+        (self.runtime / "projects" / "proj-1.json").write_text(json.dumps({
+            "project_id": "proj-1",
+            "state": "EXECUTING",
+            "lifecycle_state": "EXECUTING",
+            "telemetry": {"task_id": "T1"},
+        }), encoding="utf-8")
+
+        # Evaluate and broadcast alerts on gateway
+        alerts = self.gateway.evaluate_and_broadcast_alerts()
+        self.assertTrue(len(alerts) > 0)
+        self.assertEqual(alerts[0].alert_type, "stall")
+
+        # Deduplication: calling again without new alerts returns empty list
+        alerts_dedup = self.gateway.evaluate_and_broadcast_alerts()
+        self.assertEqual(len(alerts_dedup), 0)
+
+        # GET /alerts now returns the active alert
+        status, body, _ = self._request(
+            "GET", "/api/v1/mobile/v1/alerts",
+            headers={"Authorization": f"Bearer {self.device_token}"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["alerts"]), 1)
+        self.assertEqual(body["alerts"][0]["alert_type"], "stall")
+
 
 if __name__ == "__main__":
     unittest.main()

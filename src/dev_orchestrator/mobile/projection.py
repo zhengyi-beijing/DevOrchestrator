@@ -18,10 +18,10 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from dev_orchestrator.control.surface import project_control_view
+from dev_orchestrator.control.surface import _latest_owner_gate, project_control_view
 from dev_orchestrator.mobile.authorizer import MobileDeviceAuthorizer, MobileDevicePrincipal
 from dev_orchestrator.mobile.eligibility import mobile_owner_gate_eligibility
-from dev_orchestrator.storage.json_store import read_json
+from dev_orchestrator.storage.json_store import parse_utc, read_json
 
 MOBILE_CONTROL_ACTIONS = frozenset({
     "continue",
@@ -125,21 +125,51 @@ class MobileProjectionService:
 
         if isinstance(watchdog_row, dict):
             recovery_epoch = watchdog_row.get("recovery_epoch")
-            watchdog_state = watchdog_row.get("classification") or watchdog_row.get("state")
-            watchdog_reason = watchdog_row.get("reason")
-            last_check = float(watchdog_row.get("last_check_epoch") or 0)
+            watchdog_state = (
+                watchdog_row.get("last_diagnosis")
+                or watchdog_row.get("classification")
+                or watchdog_row.get("state")
+            )
+            watchdog_reason = watchdog_row.get("reason") or watchdog_row.get("last_error")
+            if not watchdog_reason and isinstance(watchdog_row.get("attempts"), dict):
+                for att in reversed(list(watchdog_row["attempts"].values())):
+                    if isinstance(att, dict) and att.get("reason"):
+                        watchdog_reason = att.get("reason")
+                        break
+            if not watchdog_reason and isinstance(watchdog_row.get("stall"), dict):
+                watchdog_reason = watchdog_row["stall"].get("reason")
+
+            last_checked_at = watchdog_row.get("last_checked_at")
+            last_check_epoch = watchdog_row.get("last_check_epoch")
+            last_check = 0.0
+            if last_check_epoch is not None:
+                try:
+                    last_check = float(last_check_epoch)
+                except (ValueError, TypeError):
+                    pass
+            elif last_checked_at is not None:
+                dt = parse_utc(last_checked_at)
+                if dt is not None:
+                    last_check = dt.timestamp()
+
             now = time.time()
             # Stale after 120 seconds without fresh watchdog check
-            if now - last_check < 120:
+            if last_check > 0 and (now - last_check < 120):
                 progress_observation_state = "authoritative"
             else:
                 progress_observation_state = "stale"
 
         # 4. Read owner gate details
         owner_gate = None
-        for cand in [base.get("gate"), watchdog_row.get("owner_gate") if isinstance(watchdog_row, dict) else None]:
+        for cand in [
+            base.get("gate"),
+            watchdog_row.get("owner_gate") if isinstance(watchdog_row, dict) else None,
+            _latest_owner_gate(self.runtime_root, project_id),
+        ]:
             if isinstance(cand, dict):
-                owner_gate = cand
+                owner_gate = copy.deepcopy(cand)
+                if not owner_gate.get("state"):
+                    owner_gate["state"] = "owner_gate"
                 break
 
         result = {

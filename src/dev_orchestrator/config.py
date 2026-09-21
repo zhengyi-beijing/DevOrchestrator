@@ -571,6 +571,52 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
     return normalized
 
 
+_ALLOWED_MOBILE_GATEWAY_KEYS = frozenset({
+    "enabled",
+    "listen_address",
+    "port",
+})
+
+
+def _normalize_mobile_gateway(raw: Any, config_path: Path) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "config {0} mobile_gateway must be an object".format(config_path)
+        )
+    unknown = set(raw.keys()) - _ALLOWED_MOBILE_GATEWAY_KEYS
+    if unknown:
+        raise ValueError(
+            "config {0} mobile_gateway has unknown keys: {1}".format(
+                config_path, sorted(unknown)
+            )
+        )
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "config {0} mobile_gateway.enabled must be a boolean".format(config_path)
+        )
+    listen_addr = raw.get("listen_address", "")
+    if not isinstance(listen_addr, str):
+        raise ValueError(
+            "config {0} mobile_gateway.listen_address must be a string".format(config_path)
+        )
+    listen_addr = listen_addr.strip()
+    port = raw.get("port", 8780)
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise ValueError(
+            "config {0} mobile_gateway.port must be an integer".format(config_path)
+        )
+    if port < 1 or port > 65535:
+        raise ValueError(
+            "config {0} mobile_gateway.port must be between 1 and 65535".format(config_path)
+        )
+    return {
+        "enabled": enabled,
+        "listen_address": listen_addr,
+        "port": port,
+    }
+
+
 def load_projects_config(path: Path | str) -> dict[str, Any]:
     """Load, validate and canonically normalize the projects configuration.
 
@@ -606,6 +652,9 @@ def load_projects_config(path: Path | str) -> dict[str, Any]:
 
     data = dict(data)
     data["projects"] = normalized_projects
+    raw_mobile = data.get("mobile_gateway")
+    if raw_mobile is not None:
+        data["mobile_gateway"] = _normalize_mobile_gateway(raw_mobile, config_path)
     return data
 
 

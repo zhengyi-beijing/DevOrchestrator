@@ -14,18 +14,24 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.devorchestrator.mobile.data.EncryptedTokenStorage
 import com.devorchestrator.mobile.data.MobileApiClient
+import com.devorchestrator.mobile.model.AlertPolicy
+import com.devorchestrator.mobile.model.NotificationItem
 import com.devorchestrator.mobile.model.ProjectDetail
 import com.devorchestrator.mobile.model.ProjectSummary
+import com.devorchestrator.mobile.service.MobileNotificationService
+import org.json.JSONObject
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     private lateinit var tokenStorage: EncryptedTokenStorage
     private lateinit var apiClient: MobileApiClient
+    private lateinit var notificationService: MobileNotificationService
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         tokenStorage = EncryptedTokenStorage(applicationContext)
         apiClient = MobileApiClient(tokenStorage)
+        notificationService = MobileNotificationService(applicationContext)
 
         setContent {
             MaterialTheme {
@@ -33,17 +39,76 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    DevOrchestratorApp(tokenStorage, apiClient)
+                    DevOrchestratorApp(tokenStorage, apiClient, notificationService)
                 }
             }
         }
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        apiClient.stopEventStream()
+    }
 }
 
 @Composable
-fun DevOrchestratorApp(tokenStorage: EncryptedTokenStorage, apiClient: MobileApiClient) {
+fun DevOrchestratorApp(
+    tokenStorage: EncryptedTokenStorage,
+    apiClient: MobileApiClient,
+    notificationService: MobileNotificationService
+) {
     var isAuthenticated by remember { mutableStateOf(tokenStorage.hasValidCredentials()) }
     var selectedProject by remember { mutableStateOf<String?>(null) }
+    var alertPolicy by remember { mutableStateOf(AlertPolicy()) }
+
+    LaunchedEffect(isAuthenticated) {
+        if (isAuthenticated) {
+            apiClient.startEventStream(
+                onEvent = { event ->
+                    try {
+                        val json = JSONObject(event.data)
+                        if (event.event == "alert") {
+                            val alertKey = json.optString("alert_key", event.cursor)
+                            val family = json.optString("family", "progress")
+                            val title = json.optString("title", "DevOrchestrator Alert")
+                            val message = json.optString("message", "DevOrchestrator alert")
+                            val severity = json.optString("severity", "warn")
+                            val item = NotificationItem(
+                                alert_key = alertKey,
+                                family = family,
+                                title = title,
+                                message = message,
+                                severity = severity
+                            )
+                            notificationService.showNotification(item, alertPolicy)
+                        } else if (event.event == "progress") {
+                            val milestone = json.optString("milestone")
+                            if (milestone == "OWNER_GATE" || milestone == "BLOCKED") {
+                                val projId = json.optString("project_id", "project")
+                                val item = NotificationItem(
+                                    alert_key = "progress:milestone:$projId:$milestone",
+                                    family = "progress",
+                                    title = "Owner Action Required: $projId",
+                                    message = json.optString("message", "Milestone: $milestone"),
+                                    severity = if (milestone == "OWNER_GATE") "critical" else "warn"
+                                )
+                                notificationService.showNotification(item, alertPolicy)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // ignore malformed event payload
+                    }
+                },
+                onResyncRequired = {},
+                onTerminalUnauthorized = {
+                    isAuthenticated = false
+                    selectedProject = null
+                }
+            )
+        } else {
+            apiClient.stopEventStream()
+        }
+    }
 
     if (!isAuthenticated) {
         PairingScreen(

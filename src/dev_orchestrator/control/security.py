@@ -163,8 +163,11 @@ class ControlSecurity:
         }
 
     def _pairings(self) -> dict[str, Any]:
-        val = self._load_canonical_pairings(for_mutation=True)
-        return val if isinstance(val, dict) else self._empty_pairings()
+        try:
+            val = self._load_canonical_pairings(for_mutation=True)
+            return val if isinstance(val, dict) else self._empty_pairings()
+        except ValueError:
+            return self._empty_pairings()
 
     def create_pairing(self) -> dict[str, Any]:
         pairing_id, code = secrets.token_urlsafe(12), secrets.token_urlsafe(18)

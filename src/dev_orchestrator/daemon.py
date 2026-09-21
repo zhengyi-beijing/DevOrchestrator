@@ -316,6 +316,16 @@ def run_daemon(
                 daemon=True,
             )
             mobile_thread.start()
+
+            if progress_channel is not None:
+                def _on_progress_mobile(notif: Any) -> None:
+                    try:
+                        from dataclasses import asdict
+                        mobile_server.broadcast_event("progress", asdict(notif))
+                        mobile_server.evaluate_and_broadcast_alerts()
+                    except Exception:
+                        pass
+                progress_channel.add_listener(_on_progress_mobile)
         except Exception as exc:
             write_json(runtime / "mobile-gateway.json", {
                 "schema_version": 1,
@@ -381,6 +391,7 @@ def run_daemon(
             if mobile_server is not None:
                 try:
                     mobile_server.touch_health(state)
+                    mobile_server.evaluate_and_broadcast_alerts()
                 except Exception:
                     pass
             time.sleep(interval)

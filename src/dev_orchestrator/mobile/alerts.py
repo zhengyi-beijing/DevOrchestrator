@@ -11,7 +11,7 @@ Enforces strict presentation-only boundary:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone
 from pathlib import Path
 from typing import Any, List, Mapping, Optional
 
@@ -166,7 +166,11 @@ def evaluate_notification(
                 )
 
             # Owner gate alert
-            if isinstance(owner_gate, dict) and owner_gate.get("state") == "owner_gate":
+            if isinstance(owner_gate, dict) and (
+                owner_gate.get("state") == "owner_gate"
+                or owner_gate.get("gate_source") in {"planner", "watchdog"}
+                or owner_gate.get("source") == "watchdog"
+            ):
                 gate_id = owner_gate.get("gate_id") or owner_gate.get("request_id")
                 dedup = f"progress:owner_gate:{project_id}:{gate_id}"
                 items.append(
@@ -228,7 +232,99 @@ def load_alert_policy(runtime_root: Path | str) -> dict[str, Any]:
 
 
 def save_alert_policy(runtime_root: Path | str, policy: dict[str, Any]) -> None:
-    """Save mobile alert policy to runtime/mobile/alert-policy.json."""
+    """Save mobile alert policy to runtime/mobile/alert-policy.json after validation."""
+    if not isinstance(policy, dict):
+        raise ValueError("alert policy must be a JSON object")
+
+    quiet_hours = policy.get("quiet_hours")
+    if quiet_hours is not None:
+        if not isinstance(quiet_hours, dict):
+            raise ValueError("quiet_hours must be a mapping")
+        start_str = str(quiet_hours.get("start", "22:00")).strip()
+        end_str = str(quiet_hours.get("end", "08:00")).strip()
+        for ts, name in ((start_str, "start"), (end_str, "end")):
+            try:
+                parts = ts.split(":")
+                if len(parts) != 2:
+                    raise ValueError()
+                h, m = int(parts[0]), int(parts[1])
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError()
+            except Exception as exc:
+                raise ValueError(f"quiet_hours.{name} must be a valid HH:MM time string") from exc
+
+    stall_sec = policy.get("stall_threshold_seconds")
+    if stall_sec is not None:
+        try:
+            sec_val = int(stall_sec)
+            if sec_val <= 0:
+                raise ValueError()
+        except Exception as exc:
+            raise ValueError("stall_threshold_seconds must be a positive integer") from exc
+
     path = Path(runtime_root) / "mobile" / "alert-policy.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, policy, indent=2)
+
+
+def evaluate_all_mobile_alerts(
+    runtime_root: Path | str,
+    projection_service: Any,
+    config: Optional[Mapping[str, Any]] = None,
+    transport_connected: bool = True,
+    transport_degraded: bool = False,
+    now: Optional[datetime] = None,
+) -> List[NotificationItem]:
+    """Evaluate all active mobile alerts across all projects and transport."""
+    runtime = Path(runtime_root)
+    policy = load_alert_policy(runtime)
+    if not policy.get("enabled", True):
+        return []
+
+    eval_now = now or datetime.now(timezone.utc)
+    ack_state = read_json(runtime / "mobile" / "alerts-ack.json", {})
+    if not isinstance(ack_state, dict):
+        ack_state = {}
+
+    transport_obs = {
+        "connected": bool(transport_connected),
+        "degraded": bool(transport_degraded),
+    }
+
+    all_notifications: List[NotificationItem] = []
+
+    # 1. Evaluate transport alerts (once)
+    t_decision = evaluate_notification(None, transport_obs, policy, eval_now, ack_state)
+    for item in t_decision.notifications:
+        if item.family == "transport":
+            all_notifications.append(item)
+
+    # 2. Evaluate project progress alerts across all projects
+    summary = read_json(runtime / "summary.json", {})
+    projects_list = []
+    if isinstance(summary, dict) and isinstance(summary.get("projects"), list):
+        projects_list = [p for p in summary["projects"] if isinstance(p, dict) and p.get("project_id")]
+
+    # If summary had no projects, inspect runtime / "projects"
+    if not projects_list and (runtime / "projects").is_dir():
+        for f in (runtime / "projects").glob("*.json"):
+            proj_data = read_json(f, None)
+            if isinstance(proj_data, dict) and proj_data.get("project_id"):
+                projects_list.append(proj_data)
+
+    cfg_dict = dict(config) if isinstance(config, Mapping) else {}
+
+    for proj_snapshot in projects_list:
+        pid = str(proj_snapshot.get("project_id") or "")
+        if not pid:
+            continue
+        try:
+            proj_view = projection_service.project_view(proj_snapshot, project_config=cfg_dict.get(pid))
+            p_decision = evaluate_notification(proj_view, transport_obs, policy, eval_now, ack_state)
+            for item in p_decision.notifications:
+                if item.family == "progress":
+                    all_notifications.append(item)
+        except Exception:
+            pass
+
+    return all_notifications

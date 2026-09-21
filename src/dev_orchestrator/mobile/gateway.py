@@ -64,6 +64,8 @@ class MobileGatewayHTTPServer(ThreadingHTTPServer):
 
         self._streams_lock = threading.Lock()
         self._open_streams: Set[Any] = set()
+        self._state_lock = threading.Lock()
+        self._active_alert_dedup: Set[str] = set()
 
         self._events_lock = threading.Lock()
         self._events_cv = threading.Condition(self._events_lock)
@@ -114,6 +116,37 @@ class MobileGatewayHTTPServer(ThreadingHTTPServer):
                 self._events_buffer.pop(0)
             self._events_cv.notify_all()
             return cursor
+
+    def evaluate_and_broadcast_alerts(self, now: Optional[datetime] = None) -> List[Any]:
+        """Evaluate alerts and broadcast newly active items to open streams."""
+        if self.projection_service is None:
+            return []
+        try:
+            from dev_orchestrator.mobile.alerts import evaluate_all_mobile_alerts
+            from dataclasses import asdict
+            cfg = read_json(self.config_path, {}) if self.config_path else {}
+            health_path = self.runtime_root / "mobile-gateway.json"
+            health = read_json(health_path, {}) if health_path.is_file() else {}
+            is_degraded = bool(health.get("error"))
+            notifications = evaluate_all_mobile_alerts(
+                self.runtime_root,
+                self.projection_service,
+                config=cfg,
+                transport_connected=True,
+                transport_degraded=is_degraded,
+                now=now,
+            )
+            current_keys = set()
+            for item in notifications:
+                current_keys.add(item.dedup_key)
+                with self._events_lock:
+                    if item.dedup_key not in self._active_alert_dedup:
+                        self.broadcast_event("alert", asdict(item))
+            with self._events_lock:
+                self._active_alert_dedup = current_keys
+            return notifications
+        except Exception:
+            return []
 
     def get_events_since(self, cursor: Optional[str]) -> tuple[bool, List[dict[str, Any]], str]:
         """Fetch events since cursor from buffer.
@@ -227,15 +260,16 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
         try:
             telemetry_path = self.server.runtime_root / "mobile" / "devices-telemetry.json"
             telemetry_path.parent.mkdir(parents=True, exist_ok=True)
-            data = read_json(telemetry_path, {})
-            if not isinstance(data, dict):
-                data = {}
-            data[device_id] = {
-                "last_seen": utc_now_iso(),
-                "user_agent": self.headers.get("User-Agent"),
-                "app_version": self.headers.get("X-DevO-App-Version"),
-            }
-            write_json(telemetry_path, data, indent=2)
+            with self.server._state_lock:
+                data = read_json(telemetry_path, {})
+                if not isinstance(data, dict):
+                    data = {}
+                data[device_id] = {
+                    "last_seen": utc_now_iso(),
+                    "user_agent": self.headers.get("User-Agent"),
+                    "app_version": self.headers.get("X-DevO-App-Version"),
+                }
+                write_json(telemetry_path, data, indent=2)
         except Exception:
             pass
 
@@ -301,6 +335,15 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/mobile/v1/alert-policy":
             policy = load_alert_policy(self.server.runtime_root)
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(policy))
+            return
+
+        if path == "/api/v1/mobile/v1/alerts":
+            from dataclasses import asdict
+            alerts = self.server.evaluate_and_broadcast_alerts()
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes({
+                "schema_version": 1,
+                "alerts": [asdict(a) for a in alerts],
+            }))
             return
 
         if path == "/api/v1/mobile/v1/events":
@@ -394,11 +437,12 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
             alert_key = match_ack.group(1)
             ack_path = self.server.runtime_root / "mobile" / "alerts-ack.json"
             ack_path.parent.mkdir(parents=True, exist_ok=True)
-            data = read_json(ack_path, {})
-            if not isinstance(data, dict):
-                data = {}
-            data[alert_key] = {"acknowledged": True, "acknowledged_at": utc_now_iso(), "by_device": principal.device_id}
-            write_json(ack_path, data, indent=2)
+            with self.server._state_lock:
+                data = read_json(ack_path, {})
+                if not isinstance(data, dict):
+                    data = {}
+                data[alert_key] = {"acknowledged": True, "acknowledged_at": utc_now_iso(), "by_device": principal.device_id}
+                write_json(ack_path, data, indent=2)
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes({"alert_key": alert_key, "acknowledged": True}))
             return
 
@@ -412,11 +456,12 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
             snoozed_until = (datetime.now(timezone.utc) + timedelta(seconds=duration)).isoformat()
             ack_path = self.server.runtime_root / "mobile" / "alerts-ack.json"
             ack_path.parent.mkdir(parents=True, exist_ok=True)
-            data = read_json(ack_path, {})
-            if not isinstance(data, dict):
-                data = {}
-            data[alert_key] = {"snoozed_until": snoozed_until, "snoozed_at": utc_now_iso(), "by_device": principal.device_id}
-            write_json(ack_path, data, indent=2)
+            with self.server._state_lock:
+                data = read_json(ack_path, {})
+                if not isinstance(data, dict):
+                    data = {}
+                data[alert_key] = {"snoozed_until": snoozed_until, "snoozed_at": utc_now_iso(), "by_device": principal.device_id}
+                write_json(ack_path, data, indent=2)
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes({"alert_key": alert_key, "snoozed_until": snoozed_until}))
             return
 
@@ -437,7 +482,11 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
         if body is None:
             return
 
-        save_alert_policy(self.server.runtime_root, body)
+        try:
+            save_alert_policy(self.server.runtime_root, body)
+        except ValueError as exc:
+            self._error(400, "Bad Request", str(exc))
+            return
         self._send(200, "OK", "application/json; charset=utf-8", _json_bytes({"status": "saved"}))
 
     def _handle_sse_stream(self, parsed: Any, principal: MobileDevicePrincipal) -> None:

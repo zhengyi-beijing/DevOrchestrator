@@ -25,6 +25,8 @@ def _latest_owner_gate(runtime: Path, project_id: str) -> dict[str, Any] | None:
     if isinstance(gate, dict):
         result = copy.deepcopy(gate)
         result["gate_source"] = "watchdog"
+        if not result.get("state"):
+            result["state"] = "owner_gate"
         return result
     planner = read_json(runtime / "ai-planner.json", {})
     plans = planner.get("plans") if isinstance(planner, dict) else None
@@ -271,5 +273,6 @@ def project_control_view(
         },
         "active_execution": active,
         "active_roles": active_roles,
+        "gate": gate,
     })
     return result

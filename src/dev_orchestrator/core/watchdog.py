@@ -1586,6 +1586,7 @@ class WatchdogCoordinator:
                 if current_run_attempts >= policy["max_attempts_per_run"]:
                     prow["owner_gate"] = {
                         "source": "watchdog",
+                        "state": "owner_gate",
                         "recovery_epoch_id": assessment.recovery_epoch.get("id") if assessment.recovery_epoch else None,
                         "reason": f"exhausted max_attempts_per_run ({policy['max_attempts_per_run']})",
                         "triggered_at": now_iso,

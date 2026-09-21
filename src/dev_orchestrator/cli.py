@@ -544,6 +544,18 @@ def cmd_revoke_web_bridge_capability(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mobile_pair(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.control.security import ControlSecurity
+    security = ControlSecurity(runtime)
+    try:
+        res = security.create_mobile_pairing(expires_in_seconds=args.ttl)
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+    _print_json(res)
+    return 0
+
+
 
 def cmd_watchdog_status(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
@@ -1324,6 +1336,10 @@ def build_parser() -> argparse.ArgumentParser:
     revoke_cap.add_argument("capability_id", help="capability ID to revoke")
     revoke_cap.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
+    mobile_pair = sub.add_parser("mobile-pair", help="mint a mobile pairing code via ControlSecurity")
+    mobile_pair.add_argument("--ttl", type=int, default=300, help="pairing TTL in seconds (default: 300)")
+    mobile_pair.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     import_rdc = sub.add_parser(
         "import-rdc-evidence",
         help="import normalized RDC invocation evidence into the accounting ledger",
@@ -1492,6 +1508,7 @@ _COMMANDS = {
     "mcp-adapter": cmd_mcp_adapter,
     "create-web-bridge-capability": cmd_create_web_bridge_capability,
     "revoke-web-bridge-capability": cmd_revoke_web_bridge_capability,
+    "mobile-pair": cmd_mobile_pair,
     "import-rdc-evidence": cmd_import_rdc_evidence,
     "execution-report": cmd_execution_report,
     "jobs-list": cmd_jobs_list,

@@ -79,18 +79,22 @@ def mobile_owner_gate_eligibility(
             return False, f"failed reading repository truth: {exc}", gate_id
 
     # 4. Check active claimed conversation exclusion
+    binding = None
     if conversation_store is not None:
         binding = conversation_store.binding_for_project(project_id)
-        if binding is None:
-            route = snapshot.get("conversation_binding")
-            if isinstance(route, dict):
-                binding = route
-        if isinstance(binding, dict) and bridge_store is not None:
-            has_claim = getattr(bridge_store, "has_active_claim", None)
-            if callable(has_claim):
-                adapter = str(binding.get("adapter") or "")
-                binding_id = str(binding.get("binding_id") or "")
-                if adapter and binding_id and has_claim(adapter, binding_id):
-                    return False, "active claimed request blocks owner-gate approval", gate_id
+    if binding is None:
+        route = snapshot.get("conversation_binding")
+        if isinstance(route, dict):
+            binding = route
+    if isinstance(binding, dict):
+        if bridge_store is None:
+            return False, "bridge claim state is unavailable", gate_id
+        has_claim = getattr(bridge_store, "has_active_claim", None)
+        if not callable(has_claim):
+            return False, "bridge claim state is unavailable", gate_id
+        adapter = str(binding.get("adapter") or "")
+        binding_id = str(binding.get("binding_id") or "")
+        if adapter and binding_id and has_claim(adapter, binding_id):
+            return False, "active claimed request blocks owner-gate approval", gate_id
 
     return True, "exact pending planner gate can be approved via mobile", gate_id
