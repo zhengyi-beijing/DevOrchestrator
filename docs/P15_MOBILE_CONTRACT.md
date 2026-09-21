@@ -166,6 +166,7 @@ Prefix: `/api/v1/mobile/v1`
 | `GET` | `/events/poll` | Mobile Bearer | Long-poll fallback with cursor |
 | `GET` | `/alert-policy` | Mobile Bearer | Get current mobile alert policy |
 | `PUT` | `/alert-policy` | Mobile Bearer | Update mobile alert policy |
+| `GET` | `/alerts` | Mobile Bearer | Get full currently active evaluated alert set |
 | `POST` | `/alerts/{alert_key}/ack` | Mobile Bearer | Acknowledge an alert |
 | `POST` | `/alerts/{alert_key}/snooze` | Mobile Bearer | Snooze an alert for duration |
 
@@ -186,6 +187,9 @@ Prefix: `/api/v1/mobile/v1`
   1. `ProgressAlert` (`stall`, `owner_gate`): Can fire only when progress observation is authoritative; a stall alert fires only when watchdog reports `agent_stalled`.
   2. `TransportAlert` (`disconnected`, `degraded`): Evaluates connectivity to daemon/Tailscale; can fire when progress is `None` or unavailable.
 - Thresholds, quiet hours, acknowledgement, snooze, and escalation control notification dispatch only; they never modify or reclassify daemon lifecycle state.
+- **Evaluation and Deduplication Return Contract**:
+  - `evaluate_and_broadcast_alerts()` evaluates alerts and returns only newly emitted/broadcast alert items, avoiding redundant notifications while populating ring buffers and active streams.
+  - `GET /alerts` evaluates and returns the full currently active evaluated notification set.
 
 ---
 

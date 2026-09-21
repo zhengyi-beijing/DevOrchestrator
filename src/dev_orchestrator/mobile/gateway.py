@@ -117,10 +117,16 @@ class MobileGatewayHTTPServer(ThreadingHTTPServer):
             self._events_cv.notify_all()
             return cursor
 
-    def evaluate_and_broadcast_alerts(self, now: Optional[datetime] = None) -> List[Any]:
-        """Evaluate alerts and broadcast newly active items to open streams."""
+    def _evaluate_alerts_internal(
+        self, now: Optional[datetime] = None, *, broadcast_new: bool = True
+    ) -> tuple[List[Any], List[Any]]:
+        """Evaluate alerts across projects and transport.
+
+        Returns:
+            (all_active_notifications, newly_emitted_notifications)
+        """
         if self.projection_service is None:
-            return []
+            return [], []
         try:
             from dev_orchestrator.mobile.alerts import evaluate_all_mobile_alerts
             from dataclasses import asdict
@@ -136,17 +142,35 @@ class MobileGatewayHTTPServer(ThreadingHTTPServer):
                 transport_degraded=is_degraded,
                 now=now,
             )
-            current_keys = set()
-            for item in notifications:
-                current_keys.add(item.dedup_key)
-                with self._events_lock:
-                    if item.dedup_key not in self._active_alert_dedup:
-                        self.broadcast_event("alert", asdict(item))
-            with self._events_lock:
-                self._active_alert_dedup = current_keys
-            return notifications
+            newly_emitted: List[Any] = []
+            if broadcast_new:
+                current_keys = set()
+                with self._state_lock:
+                    for item in notifications:
+                        current_keys.add(item.dedup_key)
+                        if item.dedup_key not in self._active_alert_dedup:
+                            newly_emitted.append(item)
+                    self._active_alert_dedup = current_keys
+
+                for item in newly_emitted:
+                    self.broadcast_event("alert", asdict(item))
+            return notifications, newly_emitted
         except Exception:
-            return []
+            return [], []
+
+    def get_active_alerts(self, now: Optional[datetime] = None) -> List[Any]:
+        """Evaluate and return the full currently active evaluated alert set."""
+        notifications, _ = self._evaluate_alerts_internal(now=now, broadcast_new=True)
+        return notifications
+
+    def evaluate_and_broadcast_alerts(self, now: Optional[datetime] = None) -> List[Any]:
+        """Evaluate alerts and broadcast newly active items to open streams.
+
+        Returns:
+            List of newly emitted/broadcast NotificationItem instances.
+        """
+        _, newly_emitted = self._evaluate_alerts_internal(now=now, broadcast_new=True)
+        return newly_emitted
 
     def get_events_since(self, cursor: Optional[str]) -> tuple[bool, List[dict[str, Any]], str]:
         """Fetch events since cursor from buffer.
@@ -339,7 +363,7 @@ class MobileGatewayHandler(BaseHTTPRequestHandler):
 
         if path == "/api/v1/mobile/v1/alerts":
             from dataclasses import asdict
-            alerts = self.server.evaluate_and_broadcast_alerts()
+            alerts = self.server.get_active_alerts()
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes({
                 "schema_version": 1,
                 "alerts": [asdict(a) for a in alerts],

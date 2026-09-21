@@ -1104,13 +1104,18 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - Implemented reconnectable SSE and long-poll streams with bounded event history, opaque cursors, and 15-second mid-stream authorization rechecks. Revocation or expiry immediately terminates active streams with 401 unauthorized.
 - Notification-Only Alert Boundary:
   - Implemented disjoint progress-family and transport-family alert classes in `src/dev_orchestrator/mobile/alerts.py`. Stall alerts derive exclusively from authoritative watchdog `agent_stalled` classifications.
+- Remediation (2026-09-21):
+  - Resolved hard deadlock in `src/dev_orchestrator/mobile/gateway.py`: eliminated nested acquisition of `_events_lock` in `evaluate_and_broadcast_alerts`, performing deduplication state tracking under `_state_lock` and invoking `broadcast_event()` without holding locks while maintaining thread safety of event buffer/cursor/condition.
+  - Implemented alert deduplication return contract: defined explicit contract where `evaluate_and_broadcast_alerts()` returns newly emitted/broadcast alert items and `GET /api/v1/mobile/v1/alerts` returns the full currently active evaluated notification set via `get_active_alerts()`. Updated `docs/P15_MOBILE_CONTRACT.md` and added regression test.
+  - Resolved progress listener locking in `src/dev_orchestrator/core/progress.py`: snapshotted registered in-process listeners under `ProgressChannel._lock` and moved listener invocation outside the state/dedupe persistence lock, preventing slow or blocked listeners from wedging progress publication. Added concurrency test oracle.
 - Client Implementations:
   - Implemented headless Python `MobileContractClient` covering pairing, projects, controls, command polling, alert policy, and SSE event streaming.
   - Implemented Android client skeleton in `android/` with Jetpack Compose UI, EncryptedSharedPreferences token storage, OkHttp client, and foreground notification service.
 - Verification:
-  - 13 comprehensive P15 acceptance test suites in `tests_py/test_p15_*.py`: 61 passed in 34.34s.
-  - Adjacent test suites: 126 passed, 11 subtests passed.
-  - Full repository regression: 969 passed, 87 subtests passed in 356.33s (0 failures).
-  - `python -m compileall -q src tests_py`: passed cleanly (exit code 0).
+  - 13 comprehensive P15 acceptance test suites in `tests_py/test_p15_*.py`: 66 passed in 39.27s.
+  - Focused P15 + progress suites: 84 passed in 40.61s.
+  - Full repository regression: 978 passed, 87 subtests passed in 381.52s (0 failures).
+  - `python -m compileall -q src tests_py ops`: passed cleanly (exit code 0).
   - `git diff --check`: clean (0 whitespace/formatting defects).
-- P15 closed. Preserved handoff: P16 AI Capability Benchmark Project (`agent/staged/P16.md`).
+  - Knowledge graph updated via `graphify update .`: 4683 nodes, 13336 edges, 210 communities.
+- P15 remediated and closed. Preserved handoff: P16 AI Capability Benchmark Project (`agent/staged/P16.md`).

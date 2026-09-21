@@ -446,16 +446,17 @@ class ProgressChannel:
                 if self.bridge_store is not None and hasattr(self.bridge_store, "submit_progress"):
                     self.bridge_store.submit_progress(adapter, b_id, notif)
 
-            # Notify registered in-process listeners
-            with self._lock:
-                listeners = list(self._listeners)
-            for listener in listeners:
-                try:
-                    listener(notif)
-                except Exception:
-                    pass
+            # Snapshot registered in-process listeners while holding lock
+            listeners = list(self._listeners)
 
-            return notif
+        # Notify registered in-process listeners outside state/dedupe persistence lock
+        for listener in listeners:
+            try:
+                listener(notif)
+            except Exception:
+                pass
+
+        return notif
 
     def history(self, project_id: Optional[str] = None) -> list[dict[str, Any]]:
         with self._lock:

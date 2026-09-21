@@ -217,6 +217,42 @@ class TestP15MobileGateway(unittest.TestCase):
         self.assertEqual(len(body["alerts"]), 1)
         self.assertEqual(body["alerts"][0]["alert_type"], "stall")
 
+    def test_alert_broadcast_no_deadlock_and_stream_delivery(self):
+        """Prove evaluate_and_broadcast_alerts emits to ring buffer without deadlock."""
+        from dev_orchestrator.storage.json_store import utc_now_iso
+        now_iso = utc_now_iso()
+        watchdog_data = {
+            "schema_version": 1,
+            "projects": {
+                "proj-lock-test": {
+                    "last_diagnosis": "agent_stalled",
+                    "reason": "heartbeat interval exceeded",
+                    "stall_detected_at": now_iso,
+                    "recovery_epoch": {"epoch_id": "epoch-lock", "timestamp": now_iso},
+                    "last_checked_at": now_iso,
+                }
+            }
+        }
+        (self.runtime / "watchdog.json").write_text(json.dumps(watchdog_data), encoding="utf-8")
+        (self.runtime / "projects").mkdir(parents=True, exist_ok=True)
+        (self.runtime / "projects" / "proj-lock-test.json").write_text(json.dumps({
+            "project_id": "proj-lock-test",
+            "state": "EXECUTING",
+            "lifecycle_state": "EXECUTING",
+            "telemetry": {"task_id": "T1"},
+        }), encoding="utf-8")
+
+        # Evaluate and broadcast alerts
+        newly_emitted = self.gateway.evaluate_and_broadcast_alerts()
+        self.assertEqual(len(newly_emitted), 1)
+        self.assertEqual(newly_emitted[0].alert_type, "stall")
+
+        # Verify event was placed into events buffer
+        has_resync, events, cur = self.gateway.get_events_since("0")
+        alert_events = [ev for ev in self.gateway._events_buffer if ev.get("event") == "alert"]
+        self.assertTrue(len(alert_events) >= 1)
+        self.assertEqual(alert_events[-1]["data"]["project_id"], "proj-lock-test")
+
 
 if __name__ == "__main__":
     unittest.main()

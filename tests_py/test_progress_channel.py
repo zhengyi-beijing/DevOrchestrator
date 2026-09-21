@@ -204,6 +204,31 @@ class ProgressChannelTests(unittest.TestCase):
             claimed2 = bridge_store.claim_progress("chatgpt_web", "conv-42", limit=10)
             self.assertEqual(len(claimed2), 0)
 
+    def test_listeners_invoked_outside_lock(self):
+        """In-process listeners must be invoked outside ProgressChannel lock."""
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            channel = ProgressChannel(Path(td))
+            lock_free_observations = []
+
+            def observing_listener(notif):
+                # When lock is released, another thread must be able to acquire it immediately
+                acquired = threading.Event()
+                def try_lock():
+                    if channel._lock.acquire(blocking=False):
+                        channel._lock.release()
+                        acquired.set()
+                t = threading.Thread(target=try_lock)
+                t.start()
+                t.join(timeout=1.0)
+                lock_free_observations.append(acquired.is_set())
+
+            channel.add_listener(observing_listener)
+            notif = channel.emit({"project_id": "p-lock-check"}, "WORKER_STARTED", task_id="T1")
+            self.assertIsNotNone(notif)
+            self.assertEqual(len(lock_free_observations), 1)
+            self.assertTrue(lock_free_observations[0], "channel._lock must not be held during listener invocation")
+
 
 class ProgressChannelBindingPropagationTests(unittest.TestCase):
     """Regression tests for P6 review gap: binding propagation and resolution in ProgressChannel."""
