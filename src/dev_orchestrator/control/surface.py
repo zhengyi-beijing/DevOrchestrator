@@ -148,9 +148,22 @@ def project_control_view(
         planner_config = roles.get("planner") if isinstance(roles, dict) else None
         planning_ready = isinstance(planner_config, dict) and planner_config.get("enabled") is True
     planning_start_ready = lifecycle in {"IDLE", "PLAN_FAILED"} and "PENDING DESIGN" in next_status.upper() and planning_ready
-    eligible_continue = not paused and gate is None and (
-        (lifecycle == "READY_TO_RUN" and execution_ready)
-        or planning_start_ready
+    recoverable_plan_gate = (
+        isinstance(gate, dict)
+        and gate.get("gate_source") == "planner"
+        and str(gate.get("reason") or "").startswith("plan remediation hit its bound after ")
+        and gate.get("review_decision") == "reject"
+    )
+    recovery_continue_ready = (
+        lifecycle == "OWNER_GATE"
+        and "PENDING DESIGN" in next_status.upper()
+        and planning_ready
+        and recoverable_plan_gate
+        and not bool(identity.get("dirty"))
+    )
+    eligible_continue = not paused and (
+        (gate is None and ((lifecycle == "READY_TO_RUN" and execution_ready) or planning_start_ready))
+        or recovery_continue_ready
     )
     retry_target, retry_reason = resolve_retry_candidate(projected, runtime, project_config)
     safe_retry = retry_target is not None
@@ -214,7 +227,15 @@ def project_control_view(
     else:
         stop_reason = "active execution does not support managed interruption"
     controls = [
-        {"action": "continue", "available": eligible_continue, "reason": "current state can continue" if eligible_continue else "project is paused or not continuable"},
+        {
+            "action": "continue",
+            "available": eligible_continue,
+            "reason": (
+                "recover bounded technical plan review"
+                if recovery_continue_ready and eligible_continue
+                else ("current state can continue" if eligible_continue else "project is paused or not continuable")
+            ),
+        },
         {"action": "pause", "available": not paused, "reason": "prevent future launches" if not paused else "project is already paused"},
         {"action": "resume", "available": paused, "reason": "clear launch barrier" if paused else "project is not paused"},
         {"action": "stop", "available": not paused and stoppable_active, "reason": stop_reason},

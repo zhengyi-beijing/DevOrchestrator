@@ -549,12 +549,26 @@ class ControlCommandCoordinator:
         next_status = str(snapshot.get("next_status") or "").upper()
         if "PENDING DESIGN" in next_status:
             lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "")
+            if self.planner is None:
+                return self._blocked(command_id, project_id, action, "planner coordinator unavailable", now, record)
+            if lifecycle == "OWNER_GATE":
+                gate_id = _nonblank(observed.get("gate_id"))
+                if gate_id is None:
+                    return self._blocked(command_id, project_id, action, "recoverable planner gate id is unavailable", now, record)
+                resumed, resume_reason = self.planner.resume_exhausted_technical_gate(
+                    projects[project_id], snapshot, gate_id
+                )
+                if not resumed:
+                    return self._blocked(command_id, project_id, action, resume_reason, now, record)
+                return {
+                    **record, "state": "accepted", "processed_at": now,
+                    "lifecycle_action": "plan_recovery", "plan_id": gate_id,
+                    "reason": resume_reason,
+                }
             if lifecycle not in {"IDLE", "PLAN_FAILED"}:
                 return self._blocked(
                     command_id, project_id, action, "PENDING DESIGN continue requires IDLE or PLAN_FAILED lifecycle", now, record
                 )
-            if self.planner is None:
-                return self._blocked(command_id, project_id, action, "planner coordinator unavailable", now, record)
             handled, approved_plan_id, approved_reason = self.planner.continue_owner_approved(
                 projects[project_id], snapshot, command_id
             )

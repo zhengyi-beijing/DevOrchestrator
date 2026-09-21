@@ -76,6 +76,8 @@ class FakePlanner:
         self.ready.append({"plan_id":plan_id,"command_id":command_id,"project_id":project["project_id"],
                            "task_id":telemetry.get("task_id"),"ready_head":"planned-head","state":"ready"})
         return plan_id, "planning started"
+    def resume_exhausted_technical_gate(self, project, snapshot, gate_id):
+        return False, "owner gate is not a recoverable legacy remediation-exhaustion gate"
     def continue_owner_approved(self, project, snapshot, command_id):
         return False, None, "no owner-approved plan is pending"
     def continue_failed_plan_review(self, project, snapshot, command_id):

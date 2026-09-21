@@ -69,6 +69,8 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     review_timeout = raw.get("review_timeout_seconds", 600)
     max_attempts = raw.get("max_attempts", 3)
     max_plan_remediation_rounds = raw.get("max_plan_remediation_rounds", 2)
+    max_plan_recovery_cycles = raw.get("max_plan_recovery_cycles", 2)
+    hard_total_review_rejects = raw.get("hard_total_review_rejects", 5)
     max_reviewer_resource_failovers = raw.get("max_reviewer_resource_failovers", 2)
     if quality not in {"economy", "balanced", "high"}:
         return None, "planner quality invalid"
@@ -88,6 +90,18 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
     ):
         return None, "planner max_plan_remediation_rounds must be an integer from 1 to 5"
     if (
+        isinstance(max_plan_recovery_cycles, bool)
+        or not isinstance(max_plan_recovery_cycles, int)
+        or not 0 <= max_plan_recovery_cycles <= 3
+    ):
+        return None, "planner max_plan_recovery_cycles must be an integer from 0 to 3"
+    if (
+        isinstance(hard_total_review_rejects, bool)
+        or not isinstance(hard_total_review_rejects, int)
+        or not 1 <= hard_total_review_rejects <= 12
+    ):
+        return None, "planner hard_total_review_rejects must be an integer from 1 to 12"
+    if (
         isinstance(max_reviewer_resource_failovers, bool)
         or not isinstance(max_reviewer_resource_failovers, int)
         or not 0 <= max_reviewer_resource_failovers <= 2
@@ -101,6 +115,8 @@ def _planner_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str
         "review_timeout_seconds": float(review_timeout),
         "max_attempts": max_attempts,
         "max_plan_remediation_rounds": max_plan_remediation_rounds,
+        "max_plan_recovery_cycles": max_plan_recovery_cycles,
+        "hard_total_review_rejects": hard_total_review_rejects,
         "max_reviewer_resource_failovers": max_reviewer_resource_failovers,
     }, ""
 
@@ -700,6 +716,93 @@ class AIPlannerCoordinator:
         with self._lock:
             return [copy.deepcopy(row) for row in self._load_state()["plans"].values() if row.get("state") == "ready"]
 
+    def resume_exhausted_technical_gate(
+        self,
+        project: dict[str, Any],
+        snapshot: dict[str, Any],
+        gate_id: str,
+    ) -> tuple[bool, str]:
+        """Resume only a legacy remediation-exhausted technical reject gate.
+
+        Explicit reviewer OWNER_GATE decisions and hard-limit gates are never
+        resumed here.
+        """
+        policy, error = _planner_policy(project)
+        if policy is None:
+            return False, error
+        project_id = _nonblank(project.get("project_id"))
+        repo_path = _nonblank(project.get("repo_path"))
+        with self._lock:
+            state = self._load_state()
+            record = copy.deepcopy(state["plans"].get(gate_id))
+        if not isinstance(record, dict) or record.get("state") != "owner_gate":
+            return False, "owner gate is not pending"
+        if record.get("project_id") != project_id or record.get("repo_path") != repo_path:
+            return False, "owner gate project identity mismatch"
+        next_path = Path(repo_path) / "agent" / "next.md"
+        try:
+            next_text = next_path.read_text(encoding="utf-8")
+        except OSError:
+            return False, "current agent/next.md is unavailable"
+        if (
+            "Status: **PENDING DESIGN**" not in next_text
+            or str(record.get("task_id") or "") not in next_text[:1000]
+        ):
+            return False, "owner gate task does not match current pending-design task"
+        reason = str(record.get("reason") or "")
+        if not reason.startswith("plan remediation hit its bound after "):
+            return False, "owner gate is not a recoverable legacy remediation-exhaustion gate"
+        if record.get("review_decision") != "reject":
+            return False, "owner gate does not originate from a technical reject"
+        chain = record.get("rejection_chain")
+        reject_count = len(chain) if isinstance(chain, list) else 0
+        recovery_cycle = int(record.get("recovery_cycle") or 0)
+        if reject_count >= policy["hard_total_review_rejects"]:
+            return False, "plan hard reject limit already reached"
+        if recovery_cycle >= policy["max_plan_recovery_cycles"]:
+            return False, "plan recovery cycle limit already reached"
+        truth = read_repository_truth(repo_path)
+        if (
+            not truth.valid or truth.dirty
+            or truth.branch != record.get("branch")
+            or truth.head != record.get("head")
+            or truth.status_hash != record.get("status_hash")
+        ):
+            return False, "repository changed since recoverable plan gate opened"
+        planner_payload = record.get("planner_resource")
+        excluded = []
+        if isinstance(planner_payload, dict) and _nonblank(planner_payload.get("resource_id")):
+            excluded = [str(planner_payload["resource_id"])]
+        next_cycle = recovery_cycle + 1
+        with self._lock:
+            state = self._load_state()
+            current = state["plans"].get(gate_id)
+            if not isinstance(current, dict) or current.get("state") != "owner_gate":
+                return False, "owner gate is no longer pending"
+            current.update({
+                "state": "remediating",
+                "reason": None,
+                "recovery_cycle": next_cycle,
+                "remediation_round": 0,
+                "recovery_rejection": current.get("review_reason"),
+                "recovery_prior_plan": copy.deepcopy(current.get("plan")),
+                "recovery_prior_resource": copy.deepcopy(current.get("planner_resource")),
+                "recovery_excluded_planner_resource_ids": excluded,
+                "recovery_started_at": utc_now_iso(),
+                "legacy_exhausted_gate_resumed_at": utc_now_iso(),
+            })
+            self._save_state(state)
+        thread = threading.Thread(
+            target=self._run_cycle,
+            args=(gate_id, project, policy),
+            name="devorch-plan-recovery-" + str(project_id or "project"),
+            daemon=True,
+        )
+        with self._lock:
+            self._threads[gate_id] = thread
+        thread.start()
+        return True, f"technical plan gate resumed in recovery cycle {next_cycle}"
+
     def approve_owner_gate(
         self,
         project: dict[str, Any],
@@ -921,6 +1024,10 @@ class AIPlannerCoordinator:
         rejection: str | None = None,
         prior_plan: dict[str, Any] | None = None,
         prior_resource: ResourceContext | None = None,
+        *,
+        recovery_cycle: int = 0,
+        initial_excluded_resource_ids: tuple[str, ...] = (),
+        rejection_chain: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any], Any] | None:
         max_attempts = policy["max_attempts"]
         # Resource availability failures do not consume the planner's semantic/protocol
@@ -932,19 +1039,29 @@ class AIPlannerCoordinator:
         semantic_failures = 0
         format_repairs = 0
         failed_resource_ids: set[str] = set()
+        recovery_excluded_resource_ids = set(initial_excluded_resource_ids)
         planner_result = None
         plan = None
-        previous_attempt_resource = prior_resource if round_no > 0 else None
+        previous_attempt_resource = prior_resource if (round_no > 0 or recovery_cycle > 0) else None
         failure_reason = None
         remediation_data = None
-        if round_no > 0:
+        if round_no > 0 or recovery_cycle > 0:
             remediation_data = {
                 "round": round_no,
+                "recovery_cycle": recovery_cycle,
                 "rejection": rejection,
                 "prior_plan": prior_plan,
                 "prior_resource": prior_resource,
+                "rejection_chain": copy.deepcopy(rejection_chain or []),
             }
-        base_req_id = plan_id + ":planner" if round_no == 0 else f"{plan_id}:planner:remediate-{round_no}"
+        if recovery_cycle > 0:
+            base_req_id = (
+                f"{plan_id}:planner:recovery-{recovery_cycle}"
+                if round_no == 0
+                else f"{plan_id}:planner:recovery-{recovery_cycle}:remediate-{round_no}"
+            )
+        else:
+            base_req_id = plan_id + ":planner" if round_no == 0 else f"{plan_id}:planner:remediate-{round_no}"
 
         for attempt in range(1, max_dispatches + 1):
             if not self._wait_for_launch_barrier(plan_id, record["project_id"]):
@@ -959,8 +1076,14 @@ class AIPlannerCoordinator:
             }
             if failed_resource_ids:
                 metadata["planner_failover_from_resource_ids"] = sorted(failed_resource_ids)
+            if recovery_excluded_resource_ids:
+                metadata["planner_recovery_excluded_resource_ids"] = sorted(recovery_excluded_resource_ids)
             if round_no > 0:
                 metadata["remediation_round"] = round_no
+            if recovery_cycle > 0:
+                metadata["planner_recovery_cycle"] = recovery_cycle
+            if recovery_cycle > 0:
+                metadata["planner_recovery_cycle"] = recovery_cycle
 
             planner_request = AIRoleRequest(
                 project_id=record["project_id"],
@@ -979,7 +1102,7 @@ class AIPlannerCoordinator:
                 quality=policy["quality"],
                 independence="none",
                 previous_resource_context=previous_attempt_resource,
-                excluded_resource_ids=tuple(sorted(failed_resource_ids)),
+                excluded_resource_ids=tuple(sorted(failed_resource_ids | recovery_excluded_resource_ids)),
                 timeout_seconds=policy["timeout_seconds"],
                 metadata=metadata,
             )
@@ -1116,7 +1239,7 @@ class AIPlannerCoordinator:
                         stage_run_id=planner_request.stage_run_id,
                         role_run_id=planner_request.role_run_id,
                         source_request_id=record["command_id"],
-                        attempt_id=f"{plan_id}:plan-round-{round_no}",
+                        attempt_id=f"{plan_id}:recovery-{recovery_cycle}:plan-round-{round_no}",
                         dispatch_id=getattr(attempt_result, "dispatch_id", None),
                         decision_id=getattr(attempt_result, "decision_id", None),
                         execution_id=getattr(attempt_result, "execution_id", None),
@@ -1165,8 +1288,16 @@ class AIPlannerCoordinator:
         plan: dict[str, Any],
         previous: ResourceContext | None,
         round_no: int,
+        recovery_cycle: int = 0,
     ) -> tuple[str, str, Any] | None:
-        base_request_id = plan_id + ":reviewer" if round_no == 0 else f"{plan_id}:reviewer:remediate-{round_no}"
+        if recovery_cycle > 0:
+            base_request_id = (
+                f"{plan_id}:reviewer:recovery-{recovery_cycle}"
+                if round_no == 0
+                else f"{plan_id}:reviewer:recovery-{recovery_cycle}:remediate-{round_no}"
+            )
+        else:
+            base_request_id = plan_id + ":reviewer" if round_no == 0 else f"{plan_id}:reviewer:remediate-{round_no}"
         failed_resource_ids: set[str] = set()
         max_attempts = 1 + policy["max_reviewer_resource_failovers"]
 
@@ -1204,7 +1335,7 @@ class AIPlannerCoordinator:
             review_outcome = "failed"
             review_failure = None
             review_started = time.monotonic()
-            attempt_id = f"{plan_id}:plan-round-{round_no}:reviewer-attempt-{attempt}"
+            attempt_id = f"{plan_id}:recovery-{recovery_cycle}:plan-round-{round_no}:reviewer-attempt-{attempt}"
             if self.accounting is not None:
                 self.accounting.start_interval(
                     "plan_review", review_request.request_id,
@@ -1344,85 +1475,302 @@ class AIPlannerCoordinator:
             )
 
         max_remediation_rounds = policy["max_plan_remediation_rounds"]
-        rejection: str | None = None
-        prior_plan: dict[str, Any] | None = None
-        prior_resource: ResourceContext | None = None
+        max_recovery_cycles = policy["max_plan_recovery_cycles"]
+        hard_total_review_rejects = policy["hard_total_review_rejects"]
+        recovery_cycle = int(record.get("recovery_cycle") or 0)
+        rejection = _nonblank(record.get("recovery_rejection"))
+        prior_plan = copy.deepcopy(record.get("recovery_prior_plan")) if isinstance(record.get("recovery_prior_plan"), dict) else None
+        prior_resource_payload = record.get("recovery_prior_resource")
+        prior_resource = (
+            ResourceContext(
+                prior_resource_payload.get("resource_id"),
+                prior_resource_payload.get("provider"),
+                prior_resource_payload.get("account"),
+                prior_resource_payload.get("model"),
+            )
+            if isinstance(prior_resource_payload, dict) else None
+        )
+        recovery_excluded_resource_ids = set(
+            str(item) for item in (record.get("recovery_excluded_planner_resource_ids") or [])
+            if _nonblank(item) is not None
+        )
 
-        for round_no in range(max_remediation_rounds + 1):
-            seeded = round_no == 0 and isinstance(record.get("seed_plan"), dict)
-            if seeded:
-                plan = copy.deepcopy(record["seed_plan"])
-                resource = record.get("seed_planner_resource") or {}
-                previous = ResourceContext(
-                    resource_id=resource.get("resource_id"),
-                    provider=resource.get("provider"),
-                    account=resource.get("account"),
-                    model=resource.get("model"),
-                )
-                planner_result = SimpleNamespace(
-                    resource_context=previous,
-                    dispatch_id=record.get("seed_planner_dispatch_id"),
-                    execution_id=record.get("seed_planner_execution_id"),
-                )
-                planner_completed_at = str(record.get("seed_planner_completed_at") or utc_now_iso())
-            else:
-                attempts_res = self._run_planner_attempts(
-                    plan_id, record, policy, round_no,
-                    rejection=rejection,
-                    prior_plan=prior_plan,
-                    prior_resource=prior_resource,
-                )
-                if attempts_res is None:
-                    return
-                plan, planner_result = attempts_res
-                previous = planner_result.resource_context
-                if previous is None:
-                    self._finish(plan_id, "failed", "planner resource context missing")
-                    return
-                planner_completed_at = utc_now_iso()
+        while True:
+            restart_recovery_cycle = False
+            for round_no in range(max_remediation_rounds + 1):
+                with self._lock:
+                    current_state = self._load_state()["plans"].get(plan_id, {})
+                    rejection_chain = copy.deepcopy(current_state.get("rejection_chain") or [])
+                seeded = recovery_cycle == 0 and round_no == 0 and isinstance(record.get("seed_plan"), dict)
+                if seeded:
+                    plan = copy.deepcopy(record["seed_plan"])
+                    resource = record.get("seed_planner_resource") or {}
+                    previous = ResourceContext(
+                        resource.get("resource_id"),
+                        resource.get("provider"),
+                        resource.get("account"),
+                        resource.get("model"),
+                    )
+                    planner_result = SimpleNamespace(
+                        resource_context=previous,
+                        dispatch_id=record.get("seed_planner_dispatch_id"),
+                        execution_id=record.get("seed_planner_execution_id"),
+                    )
+                    planner_completed_at = str(record.get("seed_planner_completed_at") or utc_now_iso())
+                else:
+                    attempts_res = self._run_planner_attempts(
+                        plan_id, record, policy, round_no,
+                        rejection=rejection,
+                        prior_plan=prior_plan,
+                        prior_resource=prior_resource,
+                        recovery_cycle=recovery_cycle,
+                        initial_excluded_resource_ids=tuple(sorted(recovery_excluded_resource_ids if round_no == 0 else set())),
+                        rejection_chain=rejection_chain,
+                    )
+                    if attempts_res is None:
+                        return
+                    plan, planner_result = attempts_res
+                    previous = planner_result.resource_context
+                    if previous is None:
+                        self._finish(plan_id, "failed", "planner resource context missing")
+                        return
+                    planner_completed_at = utc_now_iso()
 
-            with self._lock:
-                state = self._load_state()
-                current = state["plans"].get(plan_id)
-                if not isinstance(current, dict):
+                with self._lock:
+                    state = self._load_state()
+                    current = state["plans"].get(plan_id)
+                    if not isinstance(current, dict):
+                        return
+                    current.update({
+                        "state": "reviewing",
+                        "plan": plan,
+                        "planner_dispatch_id": planner_result.dispatch_id,
+                        "planner_execution_id": planner_result.execution_id,
+                        "planner_resource": self._resource_payload(previous),
+                        "planner_completed_at": planner_completed_at,
+                        "recovery_cycle": recovery_cycle,
+                        **({"planner_reused_from": record.get("reused_plan_from")} if seeded else {}),
+                    })
+                    self._save_state(state)
+
+                review_res = self._run_plan_review(
+                    plan_id, record, policy, plan, previous, round_no, recovery_cycle,
+                )
+                if review_res is None:
                     return
-                current.update({
-                    "state": "reviewing",
-                    "plan": plan,
+                decision, reason, review_result = review_res
+                review_completed_at = utc_now_iso()
+                review_resource = review_result.resource_context
+
+                with self._lock:
+                    state = self._load_state()
+                    current = state["plans"].get(plan_id)
+                    if not isinstance(current, dict):
+                        return
+                    current.update({
+                        "review_decision": decision,
+                        "review_reason": reason,
+                        "review_dispatch_id": review_result.dispatch_id,
+                        "review_execution_id": review_result.execution_id,
+                        "review_resource": self._resource_payload(review_resource),
+                        "review_completed_at": review_completed_at,
+                    })
+                    self._save_state(state)
+
+                if decision == "owner_gate":
+                    self._finish(plan_id, "owner_gate", reason)
+                    if self.accounting is not None:
+                        self.accounting.open_owner_gate(
+                            plan_id,
+                            project_id=record["project_id"],
+                            task_id=record["task_id"],
+                            role="owner",
+                            request_id=plan_id,
+                            source_request_id=record["command_id"],
+                        )
+                    if self.progress_channel is not None:
+                        self.progress_channel.emit(
+                            self._project_payload(record, project), "OWNER_GATE",
+                            task_id=record["task_id"], occurrence_key=plan_id,
+                            details={"plan_id": plan_id, "reason": reason},
+                        )
+                    return
+
+                if decision == "approve":
+                    if self.accounting is not None:
+                        self.accounting.record_attempt_outcome(
+                            f"{plan_id}:recovery-{recovery_cycle}:plan-round-{round_no}",
+                            "accepted",
+                            project_id=record["project_id"],
+                            task_id=record["task_id"],
+                            role="plan_reviewer",
+                            request_id=review_result.request_id,
+                            metadata={
+                                "review_kind": "plan",
+                                "decision": decision,
+                                "recovery_cycle": recovery_cycle,
+                                "round": round_no,
+                            },
+                        )
+                    self._apply_plan(plan_id, record, plan, reason, project=project)
+                    return
+
+                if decision != "reject":
+                    self._finish(plan_id, "failed", f"unexpected plan review decision: {decision}")
+                    return
+
+                if self.accounting is not None:
+                    self.accounting.record_attempt_outcome(
+                        f"{plan_id}:recovery-{recovery_cycle}:plan-round-{round_no}",
+                        "rejected",
+                        project_id=record["project_id"],
+                        task_id=record["task_id"],
+                        role="plan_reviewer",
+                        request_id=review_result.request_id,
+                        metadata={
+                            "review_kind": "plan",
+                            "decision": decision,
+                            "reason": reason,
+                            "recovery_cycle": recovery_cycle,
+                            "round": round_no,
+                        },
+                    )
+                rejection_entry = {
+                    "recovery_cycle": recovery_cycle,
+                    "round": round_no,
+                    "reason": reason,
+                    "prior_plan": plan,
                     "planner_dispatch_id": planner_result.dispatch_id,
                     "planner_execution_id": planner_result.execution_id,
+                    "reviewer_dispatch_id": review_result.dispatch_id,
+                    "reviewer_execution_id": review_result.execution_id,
                     "planner_resource": self._resource_payload(previous),
+                    "reviewer_resource": self._resource_payload(review_resource),
                     "planner_completed_at": planner_completed_at,
-                    **({"planner_reused_from": record.get("reused_plan_from")} if seeded else {}),
-                })
-                self._save_state(state)
-
-            review_res = self._run_plan_review(
-                plan_id, record, policy, plan, previous, round_no,
-            )
-            if review_res is None:
-                return
-            decision, reason, review_result = review_res
-            review_completed_at = utc_now_iso()
-            review_resource = review_result.resource_context
-
-            with self._lock:
-                state = self._load_state()
-                current = state["plans"].get(plan_id)
-                if not isinstance(current, dict):
-                    return
-                current.update({
-                    "review_decision": decision,
-                    "review_reason": reason,
-                    "review_dispatch_id": review_result.dispatch_id,
-                    "review_execution_id": review_result.execution_id,
-                    "review_resource": self._resource_payload(review_resource),
                     "review_completed_at": review_completed_at,
-                })
-                self._save_state(state)
+                    "rejected_at": utc_now_iso(),
+                }
+                with self._lock:
+                    state = self._load_state()
+                    current = state["plans"].get(plan_id)
+                    if not isinstance(current, dict):
+                        return
+                    chain = current.setdefault("rejection_chain", [])
+                    chain.append(rejection_entry)
+                    chain_len = len(chain)
+                    self._save_state(state)
 
-            if decision == "owner_gate":
-                self._finish(plan_id, "owner_gate", reason)
+                if chain_len >= hard_total_review_rejects:
+                    exhaust_reason = (
+                        f"plan review hard reject limit reached ({hard_total_review_rejects}); "
+                        f"last rejection: {reason}"
+                    )
+                    self._finish(plan_id, "owner_gate", exhaust_reason)
+                    if self.accounting is not None:
+                        self.accounting.open_owner_gate(
+                            plan_id,
+                            project_id=record["project_id"],
+                            task_id=record["task_id"],
+                            role="owner",
+                            request_id=plan_id,
+                            source_request_id=record["command_id"],
+                        )
+                    if self.progress_channel is not None:
+                        self.progress_channel.emit(
+                            self._project_payload(record, project), "OWNER_GATE",
+                            task_id=record["task_id"], occurrence_key=f"{plan_id}:owner_gate:hard-reject-limit",
+                            details={
+                                "plan_id": plan_id,
+                                "reason": exhaust_reason,
+                                "rejection_chain_length": chain_len,
+                            },
+                        )
+                    return
+
+                if round_no < max_remediation_rounds:
+                    with self._lock:
+                        state = self._load_state()
+                        current = state["plans"].get(plan_id)
+                        if not isinstance(current, dict):
+                            return
+                        current.update({
+                            "state": "remediating",
+                            "remediation_round": round_no + 1,
+                            "recovery_cycle": recovery_cycle,
+                            "review_reason": reason,
+                            "remediation_started_at": utc_now_iso(),
+                        })
+                        self._save_state(state)
+                    if self.progress_channel is not None:
+                        self.progress_channel.emit(
+                            self._project_payload(record, project),
+                            "REMEDIATE",
+                            task_id=record["task_id"],
+                            occurrence_key=f"{plan_id}:recovery-{recovery_cycle}:remediate-{round_no + 1}",
+                            details={
+                                "plan_id": plan_id,
+                                "round": round_no + 1,
+                                "recovery_cycle": recovery_cycle,
+                                "reason": reason,
+                            },
+                        )
+                    rejection = reason
+                    prior_plan = plan
+                    prior_resource = previous
+                    continue
+
+                if recovery_cycle < max_recovery_cycles:
+                    recovery_cycle += 1
+                    rejection = reason
+                    prior_plan = plan
+                    prior_resource = previous
+                    recovery_excluded_resource_ids = {
+                        previous.resource_id
+                    } if previous is not None and previous.resource_id else set()
+                    with self._lock:
+                        state = self._load_state()
+                        current = state["plans"].get(plan_id)
+                        if not isinstance(current, dict):
+                            return
+                        current.update({
+                            "state": "remediating",
+                            "recovery_cycle": recovery_cycle,
+                            "remediation_round": 0,
+                            "review_reason": reason,
+                            "recovery_rejection": reason,
+                            "recovery_prior_plan": copy.deepcopy(plan),
+                            "recovery_prior_resource": self._resource_payload(previous),
+                            "recovery_excluded_planner_resource_ids": sorted(recovery_excluded_resource_ids),
+                            "recovery_started_at": utc_now_iso(),
+                        })
+                        self._save_state(state)
+                    if self.progress_channel is not None:
+                        self.progress_channel.emit(
+                            self._project_payload(record, project),
+                            "PLAN_RECOVERY",
+                            task_id=record["task_id"],
+                            occurrence_key=f"{plan_id}:recovery-{recovery_cycle}",
+                            details={
+                                "plan_id": plan_id,
+                                "recovery_cycle": recovery_cycle,
+                                "reason": reason,
+                                "rejection_chain_length": chain_len,
+                                "excluded_planner_resource_ids": sorted(recovery_excluded_resource_ids),
+                            },
+                        )
+                    restart_recovery_cycle = True
+                    break
+
+                exhaust_reason = (
+                    f"plan remediation hit its bound after {max_remediation_rounds} rounds (exhausted); "
+                    f"last rejection: {reason}"
+                    if max_recovery_cycles == 0
+                    else (
+                        f"plan recovery exhausted its bound after {max_recovery_cycles} recovery cycles; "
+                        f"last rejection: {reason}"
+                    )
+                )
+                self._finish(plan_id, "owner_gate", exhaust_reason)
                 if self.accounting is not None:
                     self.accounting.open_owner_gate(
                         plan_id,
@@ -1434,132 +1782,18 @@ class AIPlannerCoordinator:
                     )
                 if self.progress_channel is not None:
                     self.progress_channel.emit(
-                        self._project_payload(record, project), "OWNER_GATE",
-                        task_id=record["task_id"], occurrence_key=plan_id,
-                        details={"plan_id": plan_id, "reason": reason},
-                    )
-                return
-
-            if decision == "approve":
-                if self.accounting is not None:
-                    self.accounting.record_attempt_outcome(
-                        f"{plan_id}:plan-round-{round_no}",
-                        "accepted",
-                        project_id=record["project_id"],
-                        task_id=record["task_id"],
-                        role="plan_reviewer",
-                        request_id=(
-                            f"{plan_id}:reviewer"
-                            if round_no == 0
-                            else f"{plan_id}:reviewer:remediate-{round_no}"
-                        ),
-                        metadata={"review_kind": "plan", "decision": decision},
-                    )
-                self._apply_plan(plan_id, record, plan, reason, project=project)
-                return
-
-            if decision != "reject":
-                self._finish(plan_id, "failed", f"unexpected plan review decision: {decision}")
-                return
-
-            # Review decision is 'reject'
-            if self.accounting is not None:
-                self.accounting.record_attempt_outcome(
-                    f"{plan_id}:plan-round-{round_no}",
-                    "rejected",
-                    project_id=record["project_id"],
-                    task_id=record["task_id"],
-                    role="plan_reviewer",
-                    request_id=(
-                        f"{plan_id}:reviewer"
-                        if round_no == 0
-                        else f"{plan_id}:reviewer:remediate-{round_no}"
-                    ),
-                    metadata={"review_kind": "plan", "decision": decision, "reason": reason},
-                )
-            rejection_entry = {
-                "round": round_no,
-                "reason": reason,
-                "prior_plan": plan,
-                "planner_dispatch_id": planner_result.dispatch_id,
-                "planner_execution_id": planner_result.execution_id,
-                "reviewer_dispatch_id": review_result.dispatch_id,
-                "reviewer_execution_id": review_result.execution_id,
-                "planner_resource": self._resource_payload(previous),
-                "reviewer_resource": self._resource_payload(review_resource),
-                "planner_completed_at": planner_completed_at,
-                "review_completed_at": review_completed_at,
-                "rejected_at": utc_now_iso(),
-            }
-
-            if round_no < max_remediation_rounds:
-                with self._lock:
-                    state = self._load_state()
-                    current = state["plans"].get(plan_id)
-                    if not isinstance(current, dict):
-                        return
-                    chain = current.setdefault("rejection_chain", [])
-                    chain.append(rejection_entry)
-                    current.update({
-                        "state": "remediating",
-                        "remediation_round": round_no + 1,
-                        "review_reason": reason,
-                        "remediation_started_at": utc_now_iso(),
-                    })
-                    self._save_state(state)
-
-                if self.progress_channel is not None:
-                    self.progress_channel.emit(
                         self._project_payload(record, project),
-                        "REMEDIATE",
-                        task_id=record["task_id"],
-                        occurrence_key=f"{plan_id}:remediate-{round_no + 1}",
+                        "OWNER_GATE",
+                        task_id=record["task_id"], occurrence_key=f"{plan_id}:owner_gate:recovery-exhausted",
                         details={
                             "plan_id": plan_id,
-                            "round": round_no + 1,
-                            "reason": reason,
+                            "reason": exhaust_reason,
+                            "rejection_chain_length": chain_len,
                         },
                     )
-
-                rejection = reason
-                prior_plan = plan
-                prior_resource = previous
+                return
+            if restart_recovery_cycle:
                 continue
-
-            # round_no == max_remediation_rounds (bound exhausted)
-            with self._lock:
-                state = self._load_state()
-                current = state["plans"].get(plan_id)
-                if not isinstance(current, dict):
-                    return
-                chain = current.setdefault("rejection_chain", [])
-                chain.append(rejection_entry)
-                chain_len = len(chain)
-                self._save_state(state)
-
-            exhaust_reason = f"plan remediation hit its bound after {max_remediation_rounds} rounds (exhausted); last rejection: {reason}"
-            self._finish(plan_id, "owner_gate", exhaust_reason)
-            if self.accounting is not None:
-                self.accounting.open_owner_gate(
-                    plan_id,
-                    project_id=record["project_id"],
-                    task_id=record["task_id"],
-                    role="owner",
-                    request_id=plan_id,
-                    source_request_id=record["command_id"],
-                )
-            if self.progress_channel is not None:
-                self.progress_channel.emit(
-                    self._project_payload(record, project),
-                    "OWNER_GATE",
-                    task_id=record["task_id"],
-                    occurrence_key=f"{plan_id}:owner_gate:exhausted",
-                    details={
-                        "plan_id": plan_id,
-                        "reason": exhaust_reason,
-                        "rejection_chain_length": chain_len,
-                    },
-                )
             return
 
     def _apply_plan(

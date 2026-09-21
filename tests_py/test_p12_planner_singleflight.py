@@ -103,6 +103,63 @@ class P12PlannerSingleFlightTests(unittest.TestCase):
             capability = next(row for row in view["controls"] if row["action"] == "continue")
             self.assertFalse(capability["available"])
 
+    def test_legacy_exhausted_planner_gate_advertises_and_executes_continue_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; repo.mkdir()
+            runtime = base / "runtime"; config = base / "projects.json"
+            write_config(config, repo)
+            runtime.mkdir(parents=True, exist_ok=True)
+            write_json(runtime / "ai-planner.json", {
+                "version": 1,
+                "plans": {
+                    "ai_plan:legacy-gate": {
+                        "plan_id": "ai_plan:legacy-gate",
+                        "project_id": "p1",
+                        "task_id": "P1",
+                        "state": "owner_gate",
+                        "reason": "plan remediation hit its bound after 2 rounds (exhausted); last rejection: technical blocker",
+                        "review_decision": "reject",
+                        "started_at": "2026-09-21T00:00:00+00:00",
+                        "completed_at": "2026-09-21T00:01:00+00:00",
+                    }
+                },
+            })
+            snapshot = {
+                "project_id": "p1", "state": "OWNER_GATE", "lifecycle_state": "OWNER_GATE",
+                "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P1"},
+            }
+            project = {
+                "project_id": "p1",
+                "execution": {"engine": "aibroker", "enabled": True, "owner_authorized": True},
+                "ai_roles": {"planner": {"enabled": True}},
+            }
+            view = project_control_view(snapshot, runtime, project_config=project)
+            capability = next(row for row in view["controls"] if row["action"] == "continue")
+            self.assertTrue(capability["available"])
+            self.assertEqual(capability["reason"], "recover bounded technical plan review")
+
+            class RecoveringPlanner(FakePlanner):
+                def __init__(self):
+                    super().__init__()
+                    self.recovery_calls = []
+                def resume_exhausted_technical_gate(self, project, snapshot, gate_id):
+                    self.recovery_calls.append((project["project_id"], gate_id))
+                    return True, "technical plan gate resumed in recovery cycle 1"
+
+            planner = RecoveringPlanner()
+            command = submit_control_command(
+                runtime, "p1", "continue", expected=project_identity(snapshot, runtime)
+            )
+            result = ControlCommandCoordinator(runtime, planner).advance(
+                config, {"projects": [snapshot]}, FakeExecutor()
+            )[0]
+            self.assertEqual(result["command_id"], command["command_id"])
+            self.assertEqual(result["state"], "accepted")
+            self.assertEqual(result["lifecycle_action"], "plan_recovery")
+            self.assertEqual(result["plan_id"], "ai_plan:legacy-gate")
+            self.assertEqual(planner.recovery_calls, [("p1", "ai_plan:legacy-gate")])
+            self.assertEqual(planner.calls, [])
+
     def test_control_command_rejects_pending_design_from_active_lifecycle(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

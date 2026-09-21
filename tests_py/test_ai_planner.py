@@ -382,6 +382,52 @@ class AlwaysRejectReviewerPort:
         )
 
 
+class RecoveryAfterBoundPort:
+    def __init__(self):
+        self.requests = []
+        self.review_count = 0
+        self.plan_count = 0
+
+    def execute(self, request):
+        self.requests.append(request)
+        if request.role == "planner":
+            self.plan_count += 1
+            recovered = "planner-a" in request.excluded_resource_ids
+            resource_id = "planner-b" if recovered else "planner-a"
+            payload = {
+                "task_id": request.task_run_id,
+                "summary": "Recovered plan" if recovered else f"Plan {self.plan_count}",
+                "implementation_steps": ["Step 1"],
+                "interfaces": ["Interface 1"],
+                "validation": ["Validation 1"],
+                "risks": ["Risk 1"],
+                "out_of_scope": ["Scope 1"],
+            }
+            return AIRoleResult(
+                request_id=request.request_id,
+                role_run_id=request.role_run_id,
+                status="succeeded",
+                output=json.dumps(payload),
+                dispatch_id=f"dispatch-plan-{self.plan_count}",
+                decision_id=f"decision-plan-{self.plan_count}",
+                execution_id=f"execution-plan-{self.plan_count}",
+                resource_context=ResourceContext(resource_id, "planner-provider", "default", resource_id),
+            )
+        self.review_count += 1
+        decision = "approve" if self.review_count >= 3 else "reject"
+        reason = "recovery plan is acceptable" if decision == "approve" else f"technical blocker {self.review_count}"
+        return AIRoleResult(
+            request_id=request.request_id,
+            role_run_id=request.role_run_id,
+            status="succeeded",
+            output=json.dumps({"decision": decision, "reason": reason}),
+            dispatch_id=f"dispatch-review-{self.review_count}",
+            decision_id=f"decision-review-{self.review_count}",
+            execution_id=f"execution-review-{self.review_count}",
+            resource_context=ResourceContext(f"review-r-{self.review_count}", "review-provider", "default", "review"),
+        )
+
+
 class FailReviewOnRemediationPort:
     def __init__(self):
         self.requests = []
@@ -1133,6 +1179,7 @@ class AIPlannerTests(unittest.TestCase):
                 "execution": {"engine": "aibroker"},
                 "ai_roles": {"planner": {
                     "enabled": True, "max_plan_remediation_rounds": 3,
+                    "max_plan_recovery_cycles": 0, "hard_total_review_rejects": 10,
                 }},
             }
             snapshot = {
@@ -1166,6 +1213,125 @@ class AIPlannerTests(unittest.TestCase):
             owner_gate_events = [e for e in progress.emissions if e["milestone"] == "OWNER_GATE"]
             self.assertEqual(len(owner_gate_events), 1)
             self.assertEqual(owner_gate_events[0]["details"]["rejection_chain_length"], 4)
+
+    def test_plan_rejection_soft_bound_enters_recovery_cycle_and_switches_planner(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = RecoveryAfterBoundPort()
+            progress = RecordingProgressChannel()
+            coordinator = AIPlannerCoordinator(runtime, port, progress_channel=progress)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {
+                    "enabled": True,
+                    "max_plan_remediation_rounds": 1,
+                    "max_plan_recovery_cycles": 1,
+                    "hard_total_review_rejects": 4,
+                }},
+            }
+            snapshot = {
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**PENDING DESIGN**",
+                "telemetry": {"task_id": "P14"},
+            }
+            plan_id, _ = coordinator.start(project, snapshot, "command-recovery-cycle")
+            row = wait_terminal(coordinator, plan_id)
+            self.assertEqual(row["state"], "ready", row)
+            self.assertEqual(row["recovery_cycle"], 1)
+            self.assertEqual(len(row["rejection_chain"]), 2)
+            recovery_planners = [
+                req for req in port.requests
+                if req.role == "planner" and ":recovery-1" in req.request_id
+            ]
+            self.assertEqual(len(recovery_planners), 1)
+            self.assertIn("planner-a", recovery_planners[0].excluded_resource_ids)
+            self.assertEqual(row["planner_resource"]["resource_id"], "planner-b")
+            recovery_events = [e for e in progress.emissions if e["milestone"] == "PLAN_RECOVERY"]
+            self.assertEqual(len(recovery_events), 1)
+            self.assertEqual(recovery_events[0]["details"]["recovery_cycle"], 1)
+            self.assertEqual(recovery_events[0]["details"]["rejection_chain_length"], 2)
+
+    def test_legacy_exhausted_gate_can_resume_into_recovery_cycle(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = RecoveryAfterBoundPort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            initial_project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {
+                    "enabled": True,
+                    "max_plan_remediation_rounds": 1,
+                    "max_plan_recovery_cycles": 0,
+                    "hard_total_review_rejects": 10,
+                }},
+            }
+            snapshot = {
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**PENDING DESIGN**",
+                "telemetry": {"task_id": "P14"},
+            }
+            plan_id, _ = coordinator.start(initial_project, snapshot, "legacy-exhausted")
+            gated = wait_terminal(coordinator, plan_id)
+            self.assertEqual(gated["state"], "owner_gate", gated)
+            self.assertEqual(len(gated["rejection_chain"]), 2)
+
+            recovery_project = {
+                **initial_project,
+                "ai_roles": {"planner": {
+                    "enabled": True,
+                    "max_plan_remediation_rounds": 1,
+                    "max_plan_recovery_cycles": 1,
+                    "hard_total_review_rejects": 4,
+                }},
+            }
+            resumed, reason = coordinator.resume_exhausted_technical_gate(
+                recovery_project, snapshot, plan_id
+            )
+            self.assertTrue(resumed, reason)
+            self.assertIn("recovery cycle 1", reason)
+            recovered = wait_terminal(coordinator, plan_id)
+            self.assertEqual(recovered["state"], "ready", recovered)
+            self.assertEqual(recovered["recovery_cycle"], 1)
+            self.assertEqual(len(recovered["rejection_chain"]), 2)
+            recovery_planners = [
+                req for req in port.requests
+                if req.role == "planner" and ":recovery-1" in req.request_id
+            ]
+            self.assertEqual(len(recovery_planners), 1)
+            self.assertIn("planner-a", recovery_planners[0].excluded_resource_ids)
+            self.assertEqual(recovered["planner_resource"]["resource_id"], "planner-b")
+
+    def test_plan_rejection_hard_total_limit_still_owner_gates(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = AlwaysRejectReviewerPort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {
+                    "enabled": True,
+                    "max_plan_remediation_rounds": 1,
+                    "max_plan_recovery_cycles": 2,
+                    "hard_total_review_rejects": 3,
+                }},
+            }
+            snapshot = {
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**PENDING DESIGN**",
+                "telemetry": {"task_id": "P14"},
+            }
+            plan_id, _ = coordinator.start(project, snapshot, "command-hard-limit")
+            row = wait_terminal(coordinator, plan_id)
+            self.assertEqual(row["state"], "owner_gate", row)
+            self.assertIn("hard reject limit reached (3)", row["reason"])
+            self.assertEqual(len(row["rejection_chain"]), 3)
+            self.assertEqual(row["recovery_cycle"], 1)
 
     def test_remediation_prompt_and_resource_propagation(self):
         with tempfile.TemporaryDirectory() as td:
