@@ -1305,6 +1305,60 @@ class AIPlannerTests(unittest.TestCase):
             self.assertIn("planner-a", recovery_planners[0].excluded_resource_ids)
             self.assertEqual(recovered["planner_resource"]["resource_id"], "planner-b")
 
+    def test_legacy_exhausted_gate_reanchors_clean_descendant_with_unchanged_task_spec(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = RecoveryAfterBoundPort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            initial_project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {
+                    "enabled": True,
+                    "max_plan_remediation_rounds": 1,
+                    "max_plan_recovery_cycles": 0,
+                    "hard_total_review_rejects": 10,
+                }},
+            }
+            snapshot = {
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**PENDING DESIGN**",
+                "telemetry": {"task_id": "P14"},
+            }
+            plan_id, _ = coordinator.start(initial_project, snapshot, "legacy-descendant")
+            gated = wait_terminal(coordinator, plan_id)
+            self.assertEqual(gated["state"], "owner_gate", gated)
+            old_head = gated["head"]
+
+            (repo / "policy.txt").write_text("orchestrator recovery policy only\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "policy.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "policy recovery"], check=True)
+            new_head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            self.assertNotEqual(old_head, new_head)
+
+            recovery_project = {
+                **initial_project,
+                "ai_roles": {"planner": {
+                    "enabled": True,
+                    "max_plan_remediation_rounds": 1,
+                    "max_plan_recovery_cycles": 1,
+                    "hard_total_review_rejects": 4,
+                }},
+            }
+            resumed, reason = coordinator.resume_exhausted_technical_gate(
+                recovery_project, snapshot, plan_id
+            )
+            self.assertTrue(resumed, reason)
+            recovered = wait_terminal(coordinator, plan_id)
+            self.assertEqual(recovered["state"], "ready", recovered)
+            self.assertEqual(recovered["reanchored_from_head"], old_head)
+            self.assertEqual(recovered["head"], new_head)
+            self.assertIsNotNone(recovered["reanchored_at"])
+
     def test_plan_rejection_hard_total_limit_still_owner_gates(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"

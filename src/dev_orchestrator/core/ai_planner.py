@@ -762,13 +762,25 @@ class AIPlannerCoordinator:
         if recovery_cycle >= policy["max_plan_recovery_cycles"]:
             return False, "plan recovery cycle limit already reached"
         truth = read_repository_truth(repo_path)
-        if (
-            not truth.valid or truth.dirty
-            or truth.branch != record.get("branch")
-            or truth.head != record.get("head")
-            or truth.status_hash != record.get("status_hash")
-        ):
+        if not truth.valid or truth.dirty or truth.branch != record.get("branch"):
             return False, "repository changed since recoverable plan gate opened"
+        reanchored_from_head = None
+        if truth.head != record.get("head") or truth.status_hash != record.get("status_hash"):
+            original_head = _nonblank(record.get("head"))
+            original_next = record.get("next_text")
+            if (
+                original_head is None
+                or not isinstance(original_next, str)
+                or original_next != next_text
+            ):
+                return False, "repository changed since recoverable plan gate opened"
+            ancestry = subprocess.run(
+                ["git", "-C", str(repo_path), "merge-base", "--is-ancestor", original_head, truth.head],
+                capture_output=True, timeout=15, **hidden_subprocess_kwargs(),
+            )
+            if ancestry.returncode != 0:
+                return False, "repository moved to a non-descendant since recoverable plan gate opened"
+            reanchored_from_head = original_head
         planner_payload = record.get("planner_resource")
         excluded = []
         if isinstance(planner_payload, dict) and _nonblank(planner_payload.get("resource_id")):
@@ -782,6 +794,10 @@ class AIPlannerCoordinator:
             current.update({
                 "state": "remediating",
                 "reason": None,
+                "branch": truth.branch,
+                "head": truth.head,
+                "status_hash": truth.status_hash,
+                "next_text": next_text,
                 "recovery_cycle": next_cycle,
                 "remediation_round": 0,
                 "recovery_rejection": current.get("review_reason"),
@@ -790,6 +806,14 @@ class AIPlannerCoordinator:
                 "recovery_excluded_planner_resource_ids": excluded,
                 "recovery_started_at": utc_now_iso(),
                 "legacy_exhausted_gate_resumed_at": utc_now_iso(),
+                **(
+                    {
+                        "reanchored_from_head": reanchored_from_head,
+                        "reanchored_at": utc_now_iso(),
+                    }
+                    if reanchored_from_head is not None
+                    else {}
+                ),
             })
             self._save_state(state)
         thread = threading.Thread(
