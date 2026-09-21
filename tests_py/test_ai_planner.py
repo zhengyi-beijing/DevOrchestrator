@@ -106,9 +106,18 @@ class PlanReviewParserTests(unittest.TestCase):
     def test_accepts_exact_json_fence(self):
         self.assertEqual(_parse_plan_review('```json\n{"decision":"approve","reason":"ok"}\n```'), ('approve', 'ok'))
 
-    def test_rejects_prose_outside_json_fence(self):
-        with self.assertRaisesRegex(ValueError, "one JSON object"):
-            _parse_plan_review('Result:\n```json\n{"decision":"approve","reason":"ok"}\n```')
+    def test_extracts_unique_json_object_from_surrounding_prose(self):
+        self.assertEqual(
+            _parse_plan_review('Result:\n```json\n{"decision":"approve","reason":"ok"}\n```'),
+            ("approve", "ok"),
+        )
+
+    def test_multiple_json_objects_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "exactly one JSON object"):
+            _parse_plan_review(
+                '{"decision":"approve","reason":"ok"}\n'
+                '{"decision":"reject","reason":"other"}'
+            )
 
     def test_rejects_nested_or_multiple_fences(self):
         with self.assertRaisesRegex(ValueError, "one JSON object"):
@@ -331,6 +340,40 @@ class RejectOnceReviewerPort:
             decision_id=f"decision-review-{self.review_count}",
             execution_id=f"execution-review-{self.review_count}",
             resource_context=resource,
+        )
+
+
+class PlanReviewerProtocolRepairPort(FakePort):
+    def execute(self, request):
+        self.requests.append(request)
+        if request.role == "planner":
+            payload = {
+                "task_id": request.task_run_id,
+                "summary": "Protocol repair fixture",
+                "implementation_steps": ["Step 1"],
+                "interfaces": ["Interface 1"],
+                "validation": ["Validation 1"],
+                "risks": ["Risk 1"],
+                "out_of_scope": ["Scope 1"],
+            }
+            return self._result(
+                request, json.dumps(payload),
+                ResourceContext("planner-r", "planner-provider", "a1", "m1"),
+                "plan",
+            )
+        resource = ResourceContext("review-r", "review-provider", "a2", "m2")
+        if request.metadata.get("protocol_repair"):
+            return self._result(
+                request,
+                json.dumps({"decision": "approve", "reason": "same judgment, repaired format"}),
+                resource,
+                "review-repair",
+            )
+        return self._result(
+            request,
+            '{decision: "approve", reason: "same judgment, repaired format"}',
+            resource,
+            "review-invalid",
         )
 
 
@@ -1213,6 +1256,42 @@ class AIPlannerTests(unittest.TestCase):
             owner_gate_events = [e for e in progress.emissions if e["milestone"] == "OWNER_GATE"]
             self.assertEqual(len(owner_gate_events), 1)
             self.assertEqual(owner_gate_events[0]["details"]["rejection_chain_length"], 4)
+
+    def test_plan_reviewer_protocol_repair_does_not_consume_semantic_remediation(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = PlanReviewerProtocolRepairPort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {
+                    "enabled": True,
+                    "max_plan_remediation_rounds": 2,
+                    "max_plan_recovery_cycles": 1,
+                    "hard_total_review_rejects": 5,
+                }},
+            }
+            snapshot = {
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**PENDING DESIGN**",
+                "telemetry": {"task_id": "P15"},
+            }
+            plan_id, _ = coordinator.start(project, snapshot, "protocol-repair")
+            row = wait_terminal(coordinator, plan_id)
+            self.assertEqual(row["state"], "ready", row)
+            self.assertEqual(row.get("remediation_round"), 0)
+            self.assertEqual(len(row.get("rejection_chain") or []), 0)
+            repair_requests = [
+                req for req in port.requests if req.metadata.get("protocol_repair")
+            ]
+            self.assertEqual(len(repair_requests), 1)
+            captures = row.get("reviewer_raw_outputs") or []
+            self.assertEqual(len(captures), 2)
+            self.assertEqual(captures[0]["repair_index"], 0)
+            self.assertEqual(captures[1]["repair_index"], 1)
+            self.assertIn("Do not reconsider", repair_requests[0].prompt)
 
     def test_plan_rejection_soft_bound_enters_recovery_cycle_and_switches_planner(self):
         with tempfile.TemporaryDirectory() as td:

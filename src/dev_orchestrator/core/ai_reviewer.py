@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import datetime as dt
 import json
 import threading
@@ -16,6 +17,12 @@ from dev_orchestrator.ai.contracts import (
     missing_independence_fields,
 )
 from dev_orchestrator.ai.execution_port import AIExecutionPort
+from dev_orchestrator.ai.structured_output import (
+    StructuredOutputError,
+    extract_unique_json_object,
+    protocol_repair_prompt,
+    require_exact_keys,
+)
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.core.repository import read_repository_truth
@@ -118,21 +125,13 @@ def _review_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str]
 
 
 def _parse_review_output(text: str | None) -> tuple[str, str, str]:
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("reviewer output is empty")
-    try:
-        payload = json.loads(text.strip())
-    except json.JSONDecodeError as exc:
-        raise ValueError("reviewer output must be one JSON object") from exc
-    if not isinstance(payload, dict) or set(payload) != {"decision", "next_action", "reason"}:
-        raise ValueError("reviewer JSON must contain exactly decision, next_action, reason")
+    payload = extract_unique_json_object(text, label="reviewer")
+    require_exact_keys(payload, {"decision", "next_action", "reason"}, label="reviewer")
     decision = _nonblank(payload.get("decision"))
     next_action = _nonblank(payload.get("next_action"))
     reason = _nonblank(payload.get("reason"))
-    if decision is None or next_action is None or reason is None:
-        raise ValueError("reviewer decision fields must be nonblank strings")
-    if (decision, next_action) not in _ALLOWED_DECISIONS:
-        raise ValueError("reviewer decision/next_action pair is not allowed")
+    if (decision, next_action) not in _ALLOWED_DECISIONS or reason is None:
+        raise StructuredOutputError("semantic", "invalid reviewer decision")
     return decision, next_action, reason
 
 
@@ -1761,6 +1760,54 @@ class AIReviewerCoordinator:
             })
             self._save_state(state)
 
+    def _capture_reviewer_output(
+        self,
+        review_id: str,
+        request: AIRoleRequest,
+        result: Any,
+        *,
+        protocol_stage: str | None = None,
+        repair_index: int = 0,
+    ) -> None:
+        raw = getattr(result, "output", None)
+        raw_text = raw if isinstance(raw, str) else ""
+        with self._lock:
+            state = self._load_state()
+            record = state["reviews"].get(review_id)
+            if not isinstance(record, dict):
+                return
+            captures = record.setdefault("reviewer_raw_outputs", [])
+            if not isinstance(captures, list):
+                captures = []
+                record["reviewer_raw_outputs"] = captures
+            resource = getattr(result, "resource_context", None)
+            captures.append({
+                "request_id": request.request_id,
+                "resource": {
+                    "resource_id": getattr(resource, "resource_id", None),
+                    "provider": getattr(resource, "provider", None),
+                    "account": getattr(resource, "account", None),
+                    "model": getattr(resource, "model", None),
+                } if resource is not None else None,
+                "repair_index": repair_index,
+                "protocol_stage": protocol_stage,
+                "sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+                "output": raw_text,
+                "captured_at": utc_now_iso(),
+            })
+            if len(captures) > 16:
+                del captures[:-16]
+            self._save_state(state)
+
+    @staticmethod
+    def _technical_review_protocol_repair_prompt(raw_output: str, failure: str) -> str:
+        return protocol_repair_prompt(
+            raw_output=raw_output,
+            failure=failure,
+            schema_example='{"decision":"next|remediate|owner_gate|stop","next_action":"next_task|continue_current_stage|stop","reason":"..."}',
+            label="technical reviewer",
+        )
+
     def _run_review(self, review_id: str, request: AIRoleRequest) -> None:
         with self._lock:
             state = self._load_state()
@@ -1781,6 +1828,7 @@ class AIReviewerCoordinator:
         max_attempts = 1 + max_resource_failovers
 
         result = None
+        parsed_review: tuple[str, str, str] | None = None
         current_request = request
         for attempt in range(1, max_attempts + 1):
             if attempt > 1:
@@ -1943,16 +1991,73 @@ class AIReviewerCoordinator:
                 self._finish_result(review_id, result, "failed", fail_reason, **extra_failed)
                 return
 
+            raw_output = result.output if isinstance(result.output, str) else ""
+            self._capture_reviewer_output(review_id, current_request, result)
+            try:
+                parsed_review = _parse_review_output(raw_output)
+            except StructuredOutputError as protocol_exc:
+                if protocol_exc.stage not in {"extract", "schema"}:
+                    extra_semantic: dict[str, Any] = {}
+                    if failed_resource_ids:
+                        extra_semantic["failover_from_resource_ids"] = sorted(failed_resource_ids)
+                    self._finish_result(review_id, result, "failed", str(protocol_exc), **extra_semantic)
+                    return
+                repair_request = AIRoleRequest(
+                    project_id=current_request.project_id,
+                    task_run_id=current_request.task_run_id,
+                    stage_run_id=current_request.stage_run_id,
+                    role_run_id=current_request.role_run_id + "-protocol-repair",
+                    request_id=current_request.request_id + ":protocol-repair-1",
+                    role=current_request.role,
+                    prompt=self._technical_review_protocol_repair_prompt(raw_output, str(protocol_exc)),
+                    working_directory=current_request.working_directory,
+                    quality=current_request.quality,
+                    independence=current_request.independence,
+                    previous_resource_context=current_request.previous_resource_context,
+                    excluded_resource_ids=current_request.excluded_resource_ids,
+                    timeout_seconds=current_request.timeout_seconds,
+                    metadata={
+                        **dict(current_request.metadata),
+                        "protocol_repair": True,
+                        "protocol_repair_index": 1,
+                        "protocol_failure_stage": protocol_exc.stage,
+                    },
+                )
+                repair_result = self.port.execute(repair_request) if self.port is not None else None
+                if repair_result is not None:
+                    self._capture_reviewer_output(
+                        review_id, repair_request, repair_result,
+                        protocol_stage=protocol_exc.stage, repair_index=1,
+                    )
+                if repair_result is not None and repair_result.status == "succeeded":
+                    try:
+                        parsed_review = _parse_review_output(repair_result.output)
+                        result = repair_result
+                    except StructuredOutputError:
+                        parsed_review = None
+                if parsed_review is None:
+                    resource = repair_result.resource_context if repair_result is not None else result.resource_context
+                    if attempt < max_attempts and resource is not None and resource.resource_id is not None:
+                        failed_resource_ids.add(resource.resource_id)
+                        continue
+                    extra_protocol: dict[str, Any] = {}
+                    if failed_resource_ids:
+                        extra_protocol["failover_from_resource_ids"] = sorted(failed_resource_ids)
+                    self._finish_result(
+                        review_id, repair_result or result, "failed",
+                        "reviewer protocol repair failed or remained invalid",
+                        **extra_protocol,
+                    )
+                    return
             break
 
         extra: dict[str, Any] = {}
         if failed_resource_ids:
             extra["failover_from_resource_ids"] = sorted(failed_resource_ids)
-        try:
-            decision, next_action, reason = _parse_review_output(result.output)
-        except ValueError as exc:
-            self._finish_result(review_id, result, "failed", str(exc), **extra)
+        if parsed_review is None:
+            self._finish_result(review_id, result, "failed", "reviewer structured output unavailable", **extra)
             return
+        decision, next_action, reason = parsed_review
         with self._lock:
             record = self._load_state()["reviews"].get(review_id, {})
         repo = read_repository_truth(request.working_directory)

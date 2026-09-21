@@ -5,9 +5,32 @@ import unittest
 from pathlib import Path
 
 from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
-from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
+from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator, _parse_review_output
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.core.transition_executor import TransitionExecutor
+
+
+class ProtocolRepairReviewerPort:
+    def __init__(self):
+        self.requests = []
+
+    def execute(self, request):
+        self.requests.append(request)
+        resource = ResourceContext(
+            "copilot/default/reviewer", "github-copilot", "default", "reviewer"
+        )
+        if request.metadata.get("protocol_repair"):
+            output = json.dumps({
+                "decision": "next", "next_action": "next_task", "reason": "accepted"
+            })
+        else:
+            output = 'review follows: {decision: "next", next_action: "next_task", reason: "accepted"}'
+        return AIRoleResult(
+            request_id=request.request_id, role_run_id=request.role_run_id,
+            status="succeeded", output=output,
+            dispatch_id="review-dispatch", decision_id="review-resource-decision",
+            execution_id="review-execution", resource_context=resource,
+        )
 
 
 class ReviewerPort:
@@ -40,6 +63,23 @@ def init_repo(root: Path) -> Path:
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
     return repo
+
+
+class ReviewerStructuredOutputTests(unittest.TestCase):
+    def test_surrounding_prose_with_one_object_is_accepted(self):
+        self.assertEqual(
+            _parse_review_output(
+                'Review result: {"decision":"next","next_action":"next_task","reason":"ok"} end'
+            ),
+            ("next", "next_task", "ok"),
+        )
+
+    def test_multiple_objects_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "exactly one JSON object"):
+            _parse_review_output(
+                '{"decision":"next","next_action":"next_task","reason":"ok"}'
+                '{"decision":"stop","next_action":"stop","reason":"other"}'
+            )
 
 
 class DirectReviewerTests(unittest.TestCase):
@@ -92,6 +132,49 @@ class DirectReviewerTests(unittest.TestCase):
             self.assertEqual(record["source"], "aibroker")
             self.assertIn("ai_review:worker-source", TransitionExecutor(runtime)._load_decisions())
 
+
+    def test_protocol_repair_recovers_invalid_reviewer_format_without_worker_replay(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = init_repo(root)
+            runtime = root / "runtime"; runtime.mkdir()
+            config = root / "projects.json"
+            config.write_text(json.dumps({"projects": [{
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"reviewer": {
+                    "enabled": True, "quality": "high", "independence": "resource"
+                }},
+            }]}), encoding="utf-8")
+            truth = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=repo, text=True).strip()
+            (runtime / "transition-executor.json").write_text(json.dumps({
+                "version": 1, "executions": {"worker-source": {
+                    "project_id": "p1", "source_request_id": "worker-source",
+                    "task_id": "P1", "repo_path": str(repo), "branch": branch, "head": truth,
+                    "engine": "aibroker", "state": "completed",
+                    "completed_at": "2026-09-10T02:00:00+00:00",
+                    "resource_context": {
+                        "resource_id": "dsh/default/worker", "provider": "deepseek",
+                        "account": "default", "model": "worker"
+                    },
+                }}
+            }), encoding="utf-8")
+            port = ProtocolRepairReviewerPort()
+            reviewer = AIReviewerCoordinator(runtime, port)
+            launched = reviewer.advance(config)
+            self.assertEqual(launched, ["ai_review:worker-source"])
+            reviewer._threads[launched[0]].join(timeout=3)
+            self.assertFalse(reviewer._threads[launched[0]].is_alive())
+            record = reviewer.state()["reviews"][launched[0]]
+            self.assertEqual(record["state"], "completed", record)
+            self.assertEqual(len(port.requests), 2)
+            self.assertFalse(port.requests[0].metadata.get("protocol_repair", False))
+            self.assertTrue(port.requests[1].metadata.get("protocol_repair"))
+            self.assertIn("Do not reconsider", port.requests[1].prompt)
+            captures = record.get("reviewer_raw_outputs") or []
+            self.assertEqual(len(captures), 2)
+            self.assertEqual(captures[1]["repair_index"], 1)
 
     def test_reviewer_flag_without_broker_worker_engine_is_not_ready(self):
         with tempfile.TemporaryDirectory() as td:

@@ -13,6 +13,12 @@ from typing import Any
 
 from dev_orchestrator.ai.contracts import AIRoleRequest, AIRoleResult, ResourceContext
 from dev_orchestrator.ai.execution_port import AIExecutionPort
+from dev_orchestrator.ai.structured_output import (
+    StructuredOutputError,
+    extract_unique_json_object,
+    protocol_repair_prompt,
+    require_exact_keys,
+)
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.core.repository import read_repository_truth
@@ -187,27 +193,11 @@ def _top_level_object_spans(text: str) -> list[str]:
 
 
 def _extract_plan_json_object(text: str | None) -> dict[str, Any]:
-    """Raw Capture -> JSON Extract: recover exactly one unambiguous object."""
-    if not isinstance(text, str) or not text.strip():
-        raise PlannerProtocolError("extract", "planner output is empty")
-    candidate = _strip_exact_json_fence(text)
+    """Raw Capture -> JSON Extract using the shared structured-output protocol."""
     try:
-        payload = json.loads(candidate)
-    except json.JSONDecodeError:
-        decoded: list[dict[str, Any]] = []
-        for span in _top_level_object_spans(candidate):
-            try:
-                value = json.loads(span)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                decoded.append(value)
-        if len(decoded) != 1:
-            raise PlannerProtocolError("extract", "planner output must contain exactly one JSON object")
-        payload = decoded[0]
-    if not isinstance(payload, dict):
-        raise PlannerProtocolError("schema", "planner JSON root must be an object")
-    return payload
+        return extract_unique_json_object(text, label="planner")
+    except StructuredOutputError as exc:
+        raise PlannerProtocolError(exc.stage, str(exc)) from exc
 
 
 def _normalize_plan_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -270,26 +260,12 @@ def _parse_plan(text: str | None, task_id: str) -> dict[str, Any]:
 
 
 def _parse_plan_review(text: str | None) -> tuple[str, str]:
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("plan reviewer output is empty")
-    candidate = text.strip()
-    if candidate.startswith("```"):
-        lines = candidate.splitlines()
-        if len(lines) < 3 or lines[0].strip().casefold() not in {"```", "```json"} or lines[-1].strip() != "```":
-            raise ValueError("plan reviewer output must be one JSON object")
-        candidate = "\n".join(lines[1:-1]).strip()
-        if "```" in candidate:
-            raise ValueError("plan reviewer output must be one JSON object")
-    try:
-        payload = json.loads(candidate)
-    except json.JSONDecodeError as exc:
-        raise ValueError("plan reviewer output must be one JSON object") from exc
-    if not isinstance(payload, dict) or set(payload) != {"decision", "reason"}:
-        raise ValueError("plan reviewer JSON must contain exactly decision and reason")
+    payload = extract_unique_json_object(text, label="plan reviewer")
+    require_exact_keys(payload, {"decision", "reason"}, label="plan reviewer")
     decision = _nonblank(payload.get("decision"))
     reason = _nonblank(payload.get("reason"))
     if decision not in {"approve", "reject", "owner_gate"} or reason is None:
-        raise ValueError("invalid plan reviewer decision")
+        raise StructuredOutputError("semantic", "invalid plan reviewer decision")
     return decision, reason
 
 
@@ -1397,7 +1373,69 @@ class AIPlannerCoordinator:
                     else:
                         self._finish(plan_id, "failed", f"plan review failed: {review_failure}")
                     return None
-                decision, reason = _parse_plan_review(review_result.output)
+                raw_output = review_result.output if isinstance(review_result.output, str) else ""
+                self._capture_plan_reviewer_output(plan_id, review_request, review_result)
+                try:
+                    decision, reason = _parse_plan_review(raw_output)
+                except StructuredOutputError as protocol_exc:
+                    if protocol_exc.stage not in {"extract", "schema"}:
+                        raise
+                    repair_request = AIRoleRequest(
+                        project_id=review_request.project_id,
+                        task_run_id=review_request.task_run_id,
+                        stage_run_id=review_request.stage_run_id,
+                        role_run_id=review_request.role_run_id + "-protocol-repair",
+                        request_id=review_request.request_id + ":protocol-repair-1",
+                        role=review_request.role,
+                        prompt=self._plan_review_protocol_repair_prompt(raw_output, str(protocol_exc)),
+                        working_directory=review_request.working_directory,
+                        quality=review_request.quality,
+                        independence=review_request.independence,
+                        previous_resource_context=review_request.previous_resource_context,
+                        excluded_resource_ids=review_request.excluded_resource_ids,
+                        timeout_seconds=review_request.timeout_seconds,
+                        metadata={
+                            **dict(review_request.metadata),
+                            "protocol_repair": True,
+                            "protocol_repair_index": 1,
+                            "protocol_failure_stage": protocol_exc.stage,
+                        },
+                    )
+                    repair_result = self.port.execute(repair_request) if self.port is not None else None
+                    if repair_result is not None:
+                        self._capture_plan_reviewer_output(
+                            plan_id, repair_request, repair_result,
+                            protocol_stage=protocol_exc.stage, repair_index=1,
+                        )
+                    if repair_result is None or repair_result.status != "succeeded":
+                        repair_reason = getattr(repair_result, "error", None) or "plan reviewer protocol repair execution failed"
+                        repair_resource = getattr(repair_result, "resource_context", None)
+                        self._record_reviewer_attempt(
+                            plan_id, attempt, review_request, review_result,
+                            f"protocol repair failed: {repair_reason}",
+                            classification="reviewer_protocol_repair_failed", round_no=round_no,
+                        )
+                        if attempt < max_attempts and repair_resource is not None and repair_resource.resource_id is not None:
+                            failed_resource_ids.add(repair_resource.resource_id)
+                            continue
+                        self._finish(plan_id, "failed", f"plan review failed: protocol repair failed: {repair_reason}")
+                        return None
+                    repaired_raw = repair_result.output if isinstance(repair_result.output, str) else ""
+                    try:
+                        decision, reason = _parse_plan_review(repaired_raw)
+                    except StructuredOutputError as repair_exc:
+                        repair_resource = repair_result.resource_context
+                        self._record_reviewer_attempt(
+                            plan_id, attempt, review_request, review_result,
+                            f"protocol repair invalid: {repair_exc}",
+                            classification="reviewer_protocol_repair_invalid", round_no=round_no,
+                        )
+                        if attempt < max_attempts and repair_resource is not None and repair_resource.resource_id is not None:
+                            failed_resource_ids.add(repair_resource.resource_id)
+                            continue
+                        self._finish(plan_id, "failed", f"plan review failed: protocol repair invalid: {repair_exc}")
+                        return None
+                    review_result = repair_result
                 review_outcome = "accepted"
                 self._record_reviewer_attempt(
                     plan_id, attempt, review_request, review_result, None,
@@ -2045,6 +2083,48 @@ class AIPlannerCoordinator:
                 record["planner_last_failure"] = reason
                 record["planner_last_failure_at"] = utc_now_iso()
             self._save_state(state)
+
+    def _capture_plan_reviewer_output(
+        self,
+        plan_id: str,
+        request: AIRoleRequest,
+        result: Any,
+        *,
+        protocol_stage: str | None = None,
+        repair_index: int = 0,
+    ) -> None:
+        raw = getattr(result, "output", None)
+        raw_text = raw if isinstance(raw, str) else ""
+        with self._lock:
+            state = self._load_state()
+            record = state["plans"].get(plan_id)
+            if not isinstance(record, dict):
+                return
+            captures = record.setdefault("reviewer_raw_outputs", [])
+            if not isinstance(captures, list):
+                captures = []
+                record["reviewer_raw_outputs"] = captures
+            captures.append({
+                "request_id": request.request_id,
+                "resource": self._resource_payload(getattr(result, "resource_context", None)),
+                "repair_index": repair_index,
+                "protocol_stage": protocol_stage,
+                "sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+                "output": raw_text,
+                "captured_at": utc_now_iso(),
+            })
+            if len(captures) > 16:
+                del captures[:-16]
+            self._save_state(state)
+
+    @staticmethod
+    def _plan_review_protocol_repair_prompt(raw_output: str, failure: str) -> str:
+        return protocol_repair_prompt(
+            raw_output=raw_output,
+            failure=failure,
+            schema_example='{"decision":"approve|reject|owner_gate","reason":"..."}',
+            label="plan reviewer",
+        )
 
     def _record_reviewer_attempt(
         self, plan_id: str, attempt: int, request: AIRoleRequest, result: Any,
