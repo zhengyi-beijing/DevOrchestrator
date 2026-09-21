@@ -175,6 +175,8 @@ class ControlAdapterClient:
         action: str,
         expected_revision: str,
         target: dict[str, Any] | None = None,
+        *,
+        source: str | None = None,
     ) -> dict[str, Any]:
         """Submit a guarded lifecycle control with complete expected-identity derivation."""
         if not adapter_request_id or not isinstance(adapter_request_id, str):
@@ -221,7 +223,10 @@ class ControlAdapterClient:
         }
 
         # 4. Enqueue through POST /api/v1/control/commands
-        return self._request("POST", "/api/v1/control/commands", body=body)
+        headers = {}
+        if source:
+            headers["X-DevO-Control-Source"] = source.strip()
+        return self._request("POST", "/api/v1/control/commands", body=body, headers=headers or None)
 
     def command_status(self, command_id: str, project_id: str | None = None) -> dict[str, Any]:
         """Check status and outcome of a submitted lifecycle control command."""

@@ -104,6 +104,7 @@ class ControlCommandCoordinator:
         owner_store: OwnerControlStore | None = None,
         conversation_store: ConversationControlStore | None = None,
         bridge_store: Any = None,
+        mobile_device_authorizer: Any = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.inbox, self.history = _paths(runtime_root)
@@ -114,6 +115,7 @@ class ControlCommandCoordinator:
         self.owner_store = owner_store or OwnerControlStore(runtime_root)
         self.conversation_store = conversation_store or ConversationControlStore(runtime_root)
         self.bridge_store = bridge_store
+        self.mobile_device_authorizer = mobile_device_authorizer
     @staticmethod
     def _snapshot_map(summary: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(summary, dict) or not isinstance(summary.get("projects"), list):
@@ -621,24 +623,55 @@ class ControlCommandCoordinator:
             return self._blocked(command_id, project_id, "approve_owner_gate", "gate_id is required", now, record)
         if self.planner is None:
             return self._blocked(command_id, project_id, "approve_owner_gate", "planner coordinator unavailable", now, record)
-        binding = self.conversation_store.binding_for_project(project_id)
-        if binding is None:
-            route = snapshot.get("conversation_binding")
-            binding = route if isinstance(route, dict) else None
-        adapter = _nonblank(binding.get("adapter")) if isinstance(binding, dict) else None
-        binding_id = _nonblank(binding.get("binding_id")) if isinstance(binding, dict) else None
-        if adapter is None or binding_id is None:
-            return self._blocked(command_id, project_id, "approve_owner_gate", "project has no exact bound conversation", now, record)
-        if self.conversation_store.session_status(adapter, binding_id).get("state") != "live":
-            return self._blocked(command_id, project_id, "approve_owner_gate", "bound conversation is not currently live", now, record)
-        active = getattr(self.bridge_store, "has_active_claim", None)
-        if not callable(active):
-            return self._blocked(command_id, project_id, "approve_owner_gate", "bridge claim state is unavailable", now, record)
-        if active(adapter, binding_id):
-            return self._blocked(command_id, project_id, "approve_owner_gate", "active claimed Web Sol request blocks owner-gate approval", now, record)
-        approved, reason = self.planner.approve_owner_gate(
-            project, snapshot, gate_id, command_id, adapter, binding_id
-        )
+        source = str(record.get("source") or "")
+        is_mobile = source.startswith("mobile_gateway:")
+        if is_mobile:
+            prefix, _, dev_id = source.partition(":")
+            if not dev_id:
+                return self._blocked(command_id, project_id, "approve_owner_gate", "invalid mobile command source", now, record)
+            if self.mobile_device_authorizer is None:
+                return self._blocked(command_id, project_id, "approve_owner_gate", "mobile authorizer unavailable", now, record)
+            ok, auth_reason, principal = self.mobile_device_authorizer.lookup_mobile_device(dev_id)
+            if not ok or principal is None:
+                return self._blocked(command_id, project_id, "approve_owner_gate", f"mobile device unauthorized: {auth_reason}", now, record)
+            binding = self.conversation_store.binding_for_project(project_id)
+            if binding is None:
+                route = snapshot.get("conversation_binding")
+                binding = route if isinstance(route, dict) else None
+            if isinstance(binding, dict) and self.bridge_store is not None:
+                active = getattr(self.bridge_store, "has_active_claim", None)
+                if callable(active):
+                    adapter = _nonblank(binding.get("adapter"))
+                    binding_id = _nonblank(binding.get("binding_id"))
+                    if adapter and binding_id and active(adapter, binding_id):
+                        return self._blocked(
+                            command_id, project_id, "approve_owner_gate",
+                            "active claimed Web Sol request blocks owner-gate approval",
+                            now, record,
+                        )
+            approved, reason = self.planner.approve_owner_gate(
+                project, snapshot, gate_id, command_id,
+                approval_channel="mobile_device", approving_device_id=dev_id,
+            )
+        else:
+            binding = self.conversation_store.binding_for_project(project_id)
+            if binding is None:
+                route = snapshot.get("conversation_binding")
+                binding = route if isinstance(route, dict) else None
+            adapter = _nonblank(binding.get("adapter")) if isinstance(binding, dict) else None
+            binding_id = _nonblank(binding.get("binding_id")) if isinstance(binding, dict) else None
+            if adapter is None or binding_id is None:
+                return self._blocked(command_id, project_id, "approve_owner_gate", "project has no exact bound conversation", now, record)
+            if self.conversation_store.session_status(adapter, binding_id).get("state") != "live":
+                return self._blocked(command_id, project_id, "approve_owner_gate", "bound conversation is not currently live", now, record)
+            active = getattr(self.bridge_store, "has_active_claim", None)
+            if not callable(active):
+                return self._blocked(command_id, project_id, "approve_owner_gate", "bridge claim state is unavailable", now, record)
+            if active(adapter, binding_id):
+                return self._blocked(command_id, project_id, "approve_owner_gate", "active claimed Web Sol request blocks owner-gate approval", now, record)
+            approved, reason = self.planner.approve_owner_gate(
+                project, snapshot, gate_id, command_id, adapter, binding_id
+            )
         if not approved:
             return self._blocked(command_id, project_id, "approve_owner_gate", reason, now, record)
         if self.accounting is not None:

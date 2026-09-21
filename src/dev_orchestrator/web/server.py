@@ -65,6 +65,7 @@ _CONTROL_JOB_LOGS_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)/
 _CONTROL_JOB_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)$")
 _PAIRING_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/adapter-pairings/([A-Za-z0-9_-]+)/revoke$")
 _CAPABILITY_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/web-bridge-capabilities/([A-Za-z0-9_-]+)/revoke$")
+_MOBILE_DEVICE_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/mobile/devices/([A-Za-z0-9_-]+)/revoke$")
 _CONTROL_REVIEWS_PATH_RE = re.compile(r"^/api/v1/control/reviews$")
 _CONTROL_REVIEW_SESSION_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_:-]+)$")
 _CONTROL_REVIEW_FINDINGS_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_:-]+)/findings$")
@@ -655,6 +656,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             payload = _control_envelope(self.server.conversation_store.list_sessions(), sources=[{"name": "conversation_sessions", "availability": "available"}])
         elif path == "/api/v1/control/bindings":
             payload = _control_envelope(self.server.conversation_store.list_bindings(), sources=[{"name": "conversation_bindings", "availability": "available"}])
+        elif path == "/api/v1/control/mobile/devices":
+            if not self._owner_authorized():
+                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            devices = self.server.control_security.list_mobile_devices() if self.server.control_security else []
+            payload = _control_envelope(devices, sources=[{"name": "mobile_devices", "availability": "available"}])
         elif path.startswith("/api/v1/control/commands/"):
             match = _CONTROL_COMMAND_PATH_RE.fullmatch(path)
             if not match:
@@ -1061,17 +1067,50 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._error(404, "Not Found", str(exc), False); return
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(result)), False); return
+        if path == "/api/v1/control/mobile/pairings":
+            self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(security.create_mobile_pairing())), False); return
+        if path == "/api/v1/control/mobile/devices/revoke-all":
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(security.revoke_all_mobile_devices())), False); return
+        revoke_mob = _MOBILE_DEVICE_REVOKE_PATH_RE.fullmatch(path)
+        if revoke_mob:
+            try:
+                res = security.revoke_mobile_device(revoke_mob.group(1))
+            except ValueError as exc:
+                self._error(404, "Not Found", str(exc), False); return
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(res)), False); return
         if path != "/api/v1/control/commands":
             self._error(404, "Not Found", "route not found", False); return
         value = self._read_control_json()
         if value is None: return
         command_id = value.get("command_id")
+
+        source_header = self.headers.get("X-DevO-Control-Source")
+        source = "control_api"
+        if source_header:
+            claimed = source_header.strip()
+            if claimed.startswith("mobile_gateway:"):
+                if not security.bearer_authorized(self.headers.get("Authorization")):
+                    self._error(403, "Forbidden", "mobile control source requires master bearer authorization", False)
+                    return
+                prefix, _, dev_id = claimed.partition(":")
+                if not dev_id or not re.fullmatch(r"^[A-Za-z0-9_-]{1,64}$", dev_id):
+                    self._error(400, "Bad Request", f"invalid mobile source syntax: {claimed!r}", False)
+                    return
+                ok, reason, _ = security.lookup_mobile_device(dev_id)
+                if not ok:
+                    self._error(403, "Forbidden", f"mobile device unauthorized: {reason}", False)
+                    return
+                source = claimed
+            else:
+                self._error(400, "Bad Request", f"unsupported control source header: {claimed!r}", False)
+                return
+
         try:
             existing = self.server.command_store.get(command_id) if isinstance(command_id, str) else None
             record = submit_control_command(
                 self.server.runtime_root, value.get("project_id"), value.get("action"),
                 command_id=command_id, expected=value.get("expected"), target=value.get("target"),
-                source="control_api",
+                source=source,
             )
         except ControlCommandConflictError as exc:
             self._error(409, "Conflict", str(exc), False); return

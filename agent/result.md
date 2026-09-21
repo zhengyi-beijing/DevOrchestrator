@@ -1077,3 +1077,40 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - Full repository regression: 898 passed, 87 subtests passed in 310.90s.
   - `compileall -q src tests_py`, `git diff --check`, and `graphify update .` all passed cleanly.
 - P14.6 remediated and closed. Preserved handoff: P15 Mobile Observability & Guarded Control (`agent/staged/P15.md`).
+
+## P15 Mobile Observability & Guarded Control (2026-09-21)
+
+- Contract & Security Architecture:
+  - Authored and frozen canonical specification `docs/P15_MOBILE_CONTRACT.md` detailing the trust boundary, routes, credentials, durable source-locking, stream semantics, alert families, and manual acceptance procedure.
+  - Implemented `MobileDevicePrincipal` and `@runtime_checkable` `MobileDeviceAuthorizer` protocol in `src/dev_orchestrator/mobile/authorizer.py`.
+  - Extended `ControlSecurity` (`src/dev_orchestrator/control/security.py`) to manage mobile pairings, mobile devices, and monotonic `mobile_revocation_generation` in `runtime/control/adapter-capabilities.json` under `InterProcessFileLock`.
+  - Implemented single chokepoint bearer authentication: `validate_mobile_bearer` extracts non-secret principal; `lookup_mobile_device` re-reads canonical store and re-validates device identity without requiring bearer tokens. Zero token propagation into commands, audit logs, or coordinators.
+  - Added loopback administration routes: `GET /api/v1/control/mobile/devices`, `POST /api/v1/control/mobile/pairings`, `POST /api/v1/control/mobile/devices/revoke-all`, `POST /api/v1/control/mobile/devices/{id}/revoke`.
+- Durable Source-Locking & Control Dispatch:
+  - Hardened `ControlCommandStore.submit` to normalize source and enforce durable source match on replay: replaying a command ID with a mismatched source raises `ControlCommandConflictError`.
+  - Extended `ControlAdapterClient.submit_control` with internal `source` argument, propagating `X-DevO-Control-Source: mobile_gateway:<device_id>`.
+  - Hardened loopback `POST /api/v1/control/commands` to check master bearer and validate device identity via tokenless `lookup_mobile_device` for mobile sources.
+  - Mobile gateway derives command ID from authenticated `device_id` and client `device_request_id` and derive expected identity fields on the server.
+- Mobile Owner-Gate Channel & Guarded Controls:
+  - Implemented `mobile_owner_gate_eligibility` checking pending gate, project/task/repo match, clean git truth, tokenless device lookup, and active claimed conversation exclusion.
+  - Extended `AIPlannerCoordinator.approve_owner_gate` to accept `approval_channel='mobile_device'` and `approving_device_id`. For mobile approvals, conversation-binding match is bypassed while strictly verifying repository truth, pending gate, and clean worktree, persisting `approved_via` and `approving_device_id` in the plan record without launching workers.
+  - Injected `MobileDeviceAuthorizer` into `ControlCommandCoordinator`. Execution-time lookup validates device prior to approving gate and fails closed on revoked/expired devices.
+- Read-Only Mobile Projection:
+  - Implemented `MobileProjectionService` composing read-only views directly from `runtime_root` without coordinator calls or state mutation.
+  - Exposes strictly `MOBILE_CONTROL_ACTIONS` (`continue`, `pause`, `resume`, `stop`, `retry`, `reconcile`, `approve_owner_gate`).
+  - Copies watchdog status, recovery epoch, and recovery epoch ID verbatim and sets explicit `progress_observation_state` (`authoritative`, `stale`, `unavailable`).
+- Tailscale Bind Policy & Streaming Infrastructure:
+  - Implemented `verify_tailscale_bind_address` validating local assignment and Tailscale IPv4/IPv6 networks (`100.64.0.0/10` and `fd7a:115c:a1e0::/48`) while strictly rejecting wildcard, loopback, RFC1918, and public addresses.
+  - Implemented reconnectable SSE and long-poll streams with bounded event history, opaque cursors, and 15-second mid-stream authorization rechecks. Revocation or expiry immediately terminates active streams with 401 unauthorized.
+- Notification-Only Alert Boundary:
+  - Implemented disjoint progress-family and transport-family alert classes in `src/dev_orchestrator/mobile/alerts.py`. Stall alerts derive exclusively from authoritative watchdog `agent_stalled` classifications.
+- Client Implementations:
+  - Implemented headless Python `MobileContractClient` covering pairing, projects, controls, command polling, alert policy, and SSE event streaming.
+  - Implemented Android client skeleton in `android/` with Jetpack Compose UI, EncryptedSharedPreferences token storage, OkHttp client, and foreground notification service.
+- Verification:
+  - 13 comprehensive P15 acceptance test suites in `tests_py/test_p15_*.py`: 61 passed in 34.34s.
+  - Adjacent test suites: 126 passed, 11 subtests passed.
+  - Full repository regression: 969 passed, 87 subtests passed in 356.33s (0 failures).
+  - `python -m compileall -q src tests_py`: passed cleanly (exit code 0).
+  - `git diff --check`: clean (0 whitespace/formatting defects).
+- P15 closed. Preserved handoff: P16 AI Capability Benchmark Project (`agent/staged/P16.md`).

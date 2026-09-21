@@ -269,11 +269,74 @@ def run_daemon(
         failure_memory=failure_memory,
         failure_memory_max_chars=failure_memory_max_chars,
     )
+    mobile_server = None
+    mobile_thread: Optional[threading.Thread] = None
+    mobile_authorizer = server.control_security
+
     control_coordinator = ControlCommandCoordinator(
         runtime, planner_coordinator, accounting=accounting, reviewer=reviewer_coordinator,
         owner_store=owner_store, conversation_store=conversation_store,
         bridge_store=bridge_store,
+        mobile_device_authorizer=mobile_authorizer,
     )
+
+    from dev_orchestrator.config import load_projects_config
+    from dev_orchestrator.control.adapter import ControlAdapterClient
+    from dev_orchestrator.mobile.gateway import make_mobile_gateway
+    from dev_orchestrator.mobile.projection import MobileProjectionService
+
+    cfg_dict = load_projects_config(config)
+    mobile_cfg = cfg_dict.get("mobile_gateway") if isinstance(cfg_dict, dict) else None
+    if isinstance(mobile_cfg, dict) and mobile_cfg.get("enabled"):
+        m_listen = str(mobile_cfg.get("listen_address") or "")
+        m_port = int(mobile_cfg.get("port") or 8780)
+        try:
+            m_proj = MobileProjectionService(
+                runtime, config_provider=cfg_dict,
+                mobile_device_authorizer=mobile_authorizer,
+                conversation_store=conversation_store,
+                bridge_store=bridge_store,
+            )
+            m_adapter = ControlAdapterClient(
+                base_url=f"http://127.0.0.1:{port}",
+                token=mobile_authorizer.token() if mobile_authorizer else None,
+                runtime_root=runtime,
+            )
+            mobile_server = make_mobile_gateway(
+                m_listen, m_port, runtime,
+                authorizer=mobile_authorizer,
+                projection_service=m_proj,
+                control_client=m_adapter,
+                config_path=config,
+            )
+            mobile_thread = threading.Thread(
+                target=mobile_server.serve_forever,
+                kwargs={"poll_interval": 0.5},
+                name="devorchestrator-mobile",
+                daemon=True,
+            )
+            mobile_thread.start()
+        except Exception as exc:
+            write_json(runtime / "mobile-gateway.json", {
+                "schema_version": 1,
+                "state": "unavailable",
+                "pid": pid,
+                "listen_address": m_listen,
+                "port": m_port,
+                "started_at": started_at,
+                "last_tick_at": utc_now_iso(),
+                "active_streams": 0,
+                "error": str(exc),
+            })
+    else:
+        write_json(runtime / "mobile-gateway.json", {
+            "schema_version": 1,
+            "state": "disabled",
+            "pid": pid,
+            "started_at": started_at,
+            "last_tick_at": utc_now_iso(),
+            "active_streams": 0,
+        })
     watchdog_coordinator = WatchdogCoordinator(
         runtime, ai_execution_port=ai_execution_port, progress_channel=progress_channel
     )
@@ -315,10 +378,22 @@ def run_daemon(
                     started_at=started_at, last_error=last_error,
                 ),
             )
+            if mobile_server is not None:
+                try:
+                    mobile_server.touch_health(state)
+                except Exception:
+                    pass
             time.sleep(interval)
     except KeyboardInterrupt:
         pass
     finally:
+        if mobile_server is not None:
+            try:
+                mobile_server.close_all_streams()
+            except Exception:
+                pass
+            mobile_server.shutdown()
+            mobile_server.server_close()
         for runner in (server, bridge_server):
             if runner is not None:
                 runner.shutdown()
@@ -327,6 +402,8 @@ def run_daemon(
             web_thread.join(timeout=2)
         if bridge_thread is not None:
             bridge_thread.join(timeout=2)
+        if mobile_thread is not None:
+            mobile_thread.join(timeout=2)
         try:
             (runtime / "daemon.pid").unlink(missing_ok=True)
         except OSError:

@@ -133,6 +133,7 @@ class ControlCommandStore:
             return None
 
     def submit(self, value: dict[str, Any], *, source: str) -> dict[str, Any]:
+        normalized_source = _nonblank(source, "source")
         canonical = canonical_request(value)
         command_id = safe_command_id(canonical["command_id"])
         if command_id is None:
@@ -141,6 +142,11 @@ class ControlCommandStore:
         with InterProcessFileLock(self.lock_path):
             existing = self._read_existing(command_id)
             if existing is not None:
+                existing_source = str(existing.get("source") or "")
+                if existing_source != normalized_source:
+                    raise ControlCommandConflictError(
+                        f"command_id already belongs to different source: stored {existing_source!r}, submitted {normalized_source!r}"
+                    )
                 if self._existing_hash(existing) != digest:
                     raise ControlCommandConflictError("command_id already belongs to different input")
                 return existing
@@ -148,7 +154,7 @@ class ControlCommandStore:
                 "version": 1,
                 **canonical,
                 "request_hash": digest,
-                "source": _nonblank(source, "source"),
+                "source": normalized_source,
                 "state": "pending",
                 "requested_at": utc_now_iso(),
             }

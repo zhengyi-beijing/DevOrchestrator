@@ -5,14 +5,17 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import json
 import secrets
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from dev_orchestrator.accounting.events import InterProcessFileLock
+from dev_orchestrator.mobile.authorizer import MobileDeviceAuthorizer, MobileDevicePrincipal
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json, write_text
 
 
@@ -124,17 +127,44 @@ class ControlSecurity:
 
     @staticmethod
     def _empty_pairings() -> dict[str, Any]:
-        return {"version": 1, "pairings": {}, "capabilities": {}}
-
-    def _pairings(self) -> dict[str, Any]:
-        value = read_json(self.pairings_path, None)
-        if not isinstance(value, dict):
-            return self._empty_pairings()
         return {
             "version": 1,
-            "pairings": value.get("pairings") if isinstance(value.get("pairings"), dict) else {},
-            "capabilities": value.get("capabilities") if isinstance(value.get("capabilities"), dict) else {},
+            "pairings": {},
+            "capabilities": {},
+            "mobile_pairings": {},
+            "mobile_devices": {},
+            "mobile_revocation_generation": 0,
         }
+
+    def _load_canonical_pairings(self, *, for_mutation: bool = False) -> dict[str, Any] | None:
+        if not self.pairings_path.exists():
+            return self._empty_pairings() if for_mutation else None
+        try:
+            raw = self.pairings_path.read_bytes()
+        except OSError as exc:
+            if for_mutation:
+                raise ValueError(f"cannot read canonical capability state: {exc}") from exc
+            return None
+        if not raw or not raw.strip():
+            raise ValueError("canonical capability state is empty or truncated")
+        try:
+            val = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"canonical capability state is non-JSON or malformed: {exc}") from exc
+        if not isinstance(val, dict) or val.get("version") != 1:
+            raise ValueError("canonical capability state has unsupported version or schema")
+        return {
+            "version": 1,
+            "pairings": val.get("pairings") if isinstance(val.get("pairings"), dict) else {},
+            "capabilities": val.get("capabilities") if isinstance(val.get("capabilities"), dict) else {},
+            "mobile_pairings": val.get("mobile_pairings") if isinstance(val.get("mobile_pairings"), dict) else {},
+            "mobile_devices": val.get("mobile_devices") if isinstance(val.get("mobile_devices"), dict) else {},
+            "mobile_revocation_generation": int(val.get("mobile_revocation_generation", 0)),
+        }
+
+    def _pairings(self) -> dict[str, Any]:
+        val = self._load_canonical_pairings(for_mutation=True)
+        return val if isinstance(val, dict) else self._empty_pairings()
 
     def create_pairing(self) -> dict[str, Any]:
         pairing_id, code = secrets.token_urlsafe(12), secrets.token_urlsafe(18)
@@ -303,3 +333,253 @@ class ControlSecurity:
                 capability.update({"revoked": True, "revoked_at": now})
             write_json(self.pairings_path, data, indent=2)
             return {"capability_id": capability_id, "pairing_id": capability_id, "revoked": True}
+
+    def create_mobile_pairing(self, *, expires_in_seconds: int = 300) -> dict[str, Any]:
+        """Create a single-use, TTL-bounded mobile pairing code."""
+        pairing_id, code = secrets.token_urlsafe(12), secrets.token_urlsafe(18)
+        ttl = max(1, int(expires_in_seconds))
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_canonical_pairings(for_mutation=True)
+            if not isinstance(data, dict):
+                data = self._empty_pairings()
+            pairings = data.setdefault("mobile_pairings", {})
+            pairings[pairing_id] = {
+                "pairing_id": pairing_id,
+                "code_hash": _digest(code),
+                "created_at": utc_now_iso(),
+                "expires_at_epoch": time.time() + ttl,
+                "used": False,
+                "attempts": 0,
+                "max_attempts": 3,
+            }
+            write_json(self.pairings_path, data, indent=2)
+        return {"pairing_id": pairing_id, "code": code, "expires_in_seconds": ttl}
+
+    def redeem_mobile_pairing(
+        self,
+        pairing_id: Any,
+        code: Any,
+        device_label: str = "android_device",
+        *,
+        expires_in_seconds: int = 86400 * 30,
+    ) -> dict[str, Any]:
+        """Redeem a mobile pairing code for an authoritative device bearer token."""
+        if not isinstance(pairing_id, str) or not isinstance(code, str):
+            raise ValueError("pairing_id and code are required")
+        pid_clean = pairing_id.strip()
+        code_clean = code.strip()
+        if not pid_clean or not code_clean:
+            raise ValueError("pairing_id and code must be nonblank")
+
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_canonical_pairings(for_mutation=True)
+            if not isinstance(data, dict):
+                raise ValueError("cannot access canonical capability state")
+            pairings = data.setdefault("mobile_pairings", {})
+            row = pairings.get(pid_clean)
+            now = time.time()
+            if (
+                not isinstance(row, dict)
+                or row.get("used")
+                or float(row.get("expires_at_epoch", 0)) <= now
+                or int(row.get("attempts", 0)) >= int(row.get("max_attempts", 3))
+            ):
+                if isinstance(row, dict):
+                    row["attempts"] = int(row.get("attempts", 0)) + 1
+                    write_json(self.pairings_path, data, indent=2)
+                raise ValueError("pairing is missing, expired, or already used")
+
+            if not hmac.compare_digest(str(row.get("code_hash") or ""), _digest(code_clean)):
+                row["attempts"] = int(row.get("attempts", 0)) + 1
+                write_json(self.pairings_path, data, indent=2)
+                raise ValueError("pairing is missing, expired, or already used")
+
+            row["used"] = True
+            row["used_at"] = utc_now_iso()
+
+            device_id = f"dev-{secrets.token_hex(8)}"
+            token = secrets.token_urlsafe(32)
+            ttl = max(60, int(expires_in_seconds))
+            devices = data.setdefault("mobile_devices", {})
+            devices[device_id] = {
+                "device_id": device_id,
+                "token_hash": _digest(token),
+                "scope": "mobile_device",
+                "device_label": str(device_label or "android_device").strip()[:64],
+                "created_at": utc_now_iso(),
+                "expires_at_epoch": now + ttl,
+                "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat(),
+                "revoked": False,
+                "revoked_at": None,
+            }
+            write_json(self.pairings_path, data, indent=2)
+
+        return {
+            "device_id": device_id,
+            "token": token,
+            "scope": "mobile_device",
+            "expires_in_seconds": ttl,
+        }
+
+    def revoke_mobile_device(self, device_id: str) -> dict[str, Any]:
+        """Revoke an authorized mobile device by device_id."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("device_id must be a nonblank string")
+        clean_id = device_id.strip()
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_canonical_pairings(for_mutation=True)
+            if not isinstance(data, dict):
+                raise ValueError("cannot access canonical capability state")
+            devices = data.setdefault("mobile_devices", {})
+            row = devices.get(clean_id)
+            if not isinstance(row, dict):
+                raise ValueError(f"mobile device not found: {clean_id!r}")
+            now = utc_now_iso()
+            row["revoked"] = True
+            row["revoked_at"] = now
+            data["mobile_revocation_generation"] = int(data.get("mobile_revocation_generation", 0)) + 1
+            write_json(self.pairings_path, data, indent=2)
+        return {"device_id": clean_id, "revoked": True}
+
+    def revoke_all_mobile_devices(self) -> dict[str, Any]:
+        """Revoke all registered mobile devices."""
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_canonical_pairings(for_mutation=True)
+            if not isinstance(data, dict):
+                raise ValueError("cannot access canonical capability state")
+            devices = data.setdefault("mobile_devices", {})
+            now = utc_now_iso()
+            count = 0
+            for row in devices.values():
+                if isinstance(row, dict) and not row.get("revoked"):
+                    row["revoked"] = True
+                    row["revoked_at"] = now
+                    count += 1
+            data["mobile_revocation_generation"] = int(data.get("mobile_revocation_generation", 0)) + 1
+            write_json(self.pairings_path, data, indent=2)
+        return {"revoked_count": count, "revoked": True}
+
+    def list_mobile_devices(self) -> list[dict[str, Any]]:
+        """List non-secret metadata for all registered mobile devices."""
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if not isinstance(data, dict):
+                return []
+            devices = data.get("mobile_devices", {})
+            results = []
+            for row in devices.values():
+                if isinstance(row, dict):
+                    results.append({
+                        "device_id": row.get("device_id"),
+                        "device_label": row.get("device_label"),
+                        "scope": row.get("scope"),
+                        "created_at": row.get("created_at"),
+                        "expires_at": row.get("expires_at"),
+                        "revoked": bool(row.get("revoked")),
+                        "revoked_at": row.get("revoked_at"),
+                    })
+            return sorted(results, key=lambda x: str(x.get("created_at") or ""))
+        except Exception:
+            return []
+
+    def validate_mobile_bearer(
+        self, header_or_token: str | None
+    ) -> tuple[bool, str, MobileDevicePrincipal | None]:
+        """Validate an incoming mobile device bearer token."""
+        if not header_or_token or not isinstance(header_or_token, str):
+            return False, "missing bearer token", None
+        token = header_or_token
+        if token.startswith("Bearer "):
+            token = token[7:].strip()
+        if not token:
+            return False, "empty bearer token", None
+
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if data is None:
+                return False, "canonical capability state missing or device not found", None
+        except Exception as exc:
+            return False, f"canonical capability state unreadable: {exc}", None
+
+        digest = _digest(token)
+        devices = data.get("mobile_devices")
+        if not isinstance(devices, dict):
+            return False, "device not found", None
+
+        now = time.time()
+        for row in devices.values():
+            if not isinstance(row, dict):
+                continue
+            if row.get("scope") != "mobile_device":
+                continue
+            if not hmac.compare_digest(str(row.get("token_hash") or ""), digest):
+                continue
+            if row.get("revoked"):
+                return False, "device has been revoked", None
+            if float(row.get("expires_at_epoch", 0)) <= now:
+                return False, "device token expired", None
+
+            principal = MobileDevicePrincipal(
+                device_id=str(row.get("device_id")),
+                scope="mobile_device",
+                device_label=str(row.get("device_label") or ""),
+                created_at=str(row.get("created_at") or ""),
+                expires_at=row.get("expires_at"),
+                revoked=False,
+            )
+            return True, "authorized", principal
+
+        return False, "invalid or revoked mobile device token", None
+
+    def lookup_mobile_device(
+        self, device_id: str
+    ) -> tuple[bool, str, MobileDevicePrincipal | None]:
+        """Re-read canonical state and validate device_id without needing a token."""
+        if not device_id or not isinstance(device_id, str):
+            return False, "invalid device_id", None
+        clean_id = device_id.strip()
+
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if data is None:
+                return False, "canonical capability state missing or device not found", None
+        except Exception as exc:
+            return False, f"canonical capability state unreadable: {exc}", None
+
+        devices = data.get("mobile_devices")
+        if not isinstance(devices, dict):
+            return False, "device not found", None
+
+        row = devices.get(clean_id)
+        if not isinstance(row, dict):
+            return False, "device not found", None
+
+        if row.get("scope") != "mobile_device":
+            return False, "device scope mismatch", None
+
+        if row.get("revoked"):
+            return False, "device has been revoked", None
+
+        now = time.time()
+        if float(row.get("expires_at_epoch", 0)) <= now:
+            return False, "device token expired", None
+
+        principal = MobileDevicePrincipal(
+            device_id=str(row.get("device_id")),
+            scope="mobile_device",
+            device_label=str(row.get("device_label") or ""),
+            created_at=str(row.get("created_at") or ""),
+            expires_at=row.get("expires_at"),
+            revoked=False,
+        )
+        return True, "authorized", principal
+
+    def mobile_revocation_generation(self) -> int:
+        """Return monotonic mobile revocation generation counter."""
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if isinstance(data, dict):
+                return int(data.get("mobile_revocation_generation", 0))
+        except Exception:
+            pass
+        return 0

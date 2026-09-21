@@ -5,7 +5,23 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P15 Mobile Observability & Guarded Control** — **PENDING DESIGN**.
+Current task: **P15 Mobile Observability & Guarded Control** — **CLOSED**.
+
+P15 Mobile Observability & Guarded Control closure (2026-09-21):
+- Implemented and verified Android-native observation and bounded-control surface backed by daemon-owned MobileGateway without creating a second lifecycle authority.
+- Canonical contract frozen in `docs/P15_MOBILE_CONTRACT.md`.
+- Implemented single chokepoint authentication via `MobileDeviceAuthorizer` protocol backed by `ControlSecurity`, persisting canonical pairing and device state in `runtime/control/adapter-capabilities.json` with monotonic `mobile_revocation_generation`. Bearer tokens are never propagated or persisted beyond gateway ingress.
+- Hardened `ControlCommandStore.submit` with durable source-locking: replay of command ID with mismatched source raises `ControlCommandConflictError`.
+- Extended `ControlAdapterClient.submit_control` with internal `source` argument (`X-DevO-Control-Source: mobile_gateway:<device_id>`) validated against master bearer and tokenless live-device lookup.
+- Implemented `mobile_owner_gate_eligibility` and updated `AIPlannerCoordinator.approve_owner_gate` to support `approval_channel='mobile_device'` with `approving_device_id`, bypassing conversation-binding requirement while strictly preserving all repository-truth, pending-gate, and clean-worktree invariants without launching workers.
+- Implemented `MobileProjectionService` exposing `MOBILE_CONTROL_ACTIONS` (`continue`, `pause`, `resume`, `stop`, `retry`, `reconcile`, `approve_owner_gate`), copying watchdog and recovery-epoch classifications verbatim, and reporting explicit `progress_observation_state`.
+- Implemented Tailscale bind address verification (`100.64.0.0/10` and `fd7a:115c:a1e0::/48`), strictly rejecting wildcard, loopback, and RFC1918 addresses.
+- Implemented reconnectable SSE and long-poll streams with bounded cursors and 15s mid-stream revocation checks.
+- Implemented disjoint progress/transport alert evaluator in `src/dev_orchestrator/mobile/alerts.py` where stall alerts derive strictly from authoritative watchdog state.
+- Implemented headless Python `MobileContractClient` and Kotlin/Jetpack Compose Android client skeleton in `android/`.
+- Acceptance suite: 13 comprehensive P15 test suites passed (61 passed in 34.34s).
+- Verification: adjacent suites passed (126 passed, 11 subtests); full repository regression passed (969 passed, 87 subtests in 356.33s); `compileall`, `git diff --check`, and `graphify update .` all passed cleanly.
+- Preserved handoff: P16 AI Capability Benchmark Project (Status: **PENDING DESIGN**).
 
 P14.6 Technical Review Remediation Round 2 & Gate closure (2026-09-20):
 - Remediated all Technical Review findings from ai_review:ai_review:p146-owner-continue-20260920:

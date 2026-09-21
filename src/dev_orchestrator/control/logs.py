@@ -21,7 +21,7 @@ _SENSITIVE_KEYS = frozenset({
     "api_key", "secret", "password", "token", "access_token", "refresh_token",
     "bearer", "authorization", "private_key", "cookie", "token_hash", "code_hash",
     "csrf_token", "csrf-token", "x-csrf-token", "x_csrf_token", "service_token",
-    "pairing_code",
+    "pairing_code", "device_token", "mobile_token",
 })
 _BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/-]+", re.IGNORECASE)
 _PEM_RE = re.compile(r"-----BEGIN[A-Z\s]+PRIVATE KEY-----.*?-----END[A-Z\s]+PRIVATE KEY-----", re.DOTALL)

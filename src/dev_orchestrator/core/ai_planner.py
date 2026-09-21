@@ -809,8 +809,11 @@ class AIPlannerCoordinator:
         snapshot: dict[str, Any],
         gate_id: str,
         command_id: str,
-        binding_adapter: str,
-        binding_id: str,
+        binding_adapter: str | None = None,
+        binding_id: str | None = None,
+        *,
+        approval_channel: str = "conversation",
+        approving_device_id: str | None = None,
     ) -> tuple[bool, str]:
         """Approve one exact pending planner gate without applying or launching it."""
         project_id = _nonblank(project.get("project_id"))
@@ -819,6 +822,16 @@ class AIPlannerCoordinator:
         task_id = _nonblank(telemetry.get("task_id"))
         if project_id is None or repo_path is None or task_id is None:
             return False, "owner-gate project identity incomplete"
+
+        if approval_channel == "mobile_device":
+            if not approving_device_id or not isinstance(approving_device_id, str) or not approving_device_id.strip():
+                return False, "approving_device_id is required for mobile approval"
+        elif approval_channel == "conversation":
+            if not binding_adapter or not binding_id:
+                return False, "conversation approval requires binding_adapter and binding_id"
+        else:
+            return False, f"unsupported approval channel: {approval_channel!r}"
+
         with self._lock:
             state = self._load_state()
             record = state["plans"].get(gate_id)
@@ -830,13 +843,14 @@ class AIPlannerCoordinator:
                 return False, "owner gate task does not match current task"
             if record.get("repo_path") != repo_path:
                 return False, "owner gate repository does not match current project"
-            gate_binding = record.get("conversation_binding")
-            if (
-                not isinstance(gate_binding, dict)
-                or gate_binding.get("adapter") != binding_adapter
-                or gate_binding.get("binding_id") != binding_id
-            ):
-                return False, "owner gate does not belong to the exact bound conversation"
+            if approval_channel == "conversation":
+                gate_binding = record.get("conversation_binding")
+                if (
+                    not isinstance(gate_binding, dict)
+                    or gate_binding.get("adapter") != binding_adapter
+                    or gate_binding.get("binding_id") != binding_id
+                ):
+                    return False, "owner gate does not belong to the exact bound conversation"
             plan = record.get("plan")
             if not isinstance(plan, dict):
                 return False, "owner gate has no bounded plan to approve"
@@ -860,6 +874,8 @@ class AIPlannerCoordinator:
                 "state": "owner_approved",
                 "approval_command_id": command_id,
                 "approved_at": utc_now_iso(),
+                "approved_via": approval_channel,
+                "approving_device_id": approving_device_id.strip() if approval_channel == "mobile_device" and approving_device_id else None,
             })
             self._save_state(state)
         return True, "exact pending owner gate approved; explicit continue is required"

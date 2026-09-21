@@ -337,6 +337,12 @@ class TestStagedRoadmap(unittest.TestCase):
         self.assertEqual(res_146.spec_path, "agent/staged/P15.md")
         self.assertIn("Status: **PENDING DESIGN**", res_146.spec_text or "")
 
+        res_15 = read_successor(checkout_root, "P15")
+        self.assertEqual(res_15.kind, "successor")
+        self.assertEqual(res_15.successor_task_id, "P16")
+        self.assertEqual(res_15.spec_path, "agent/staged/P16.md")
+        self.assertIn("Status: **PENDING DESIGN**", res_15.spec_text or "")
+
     def test_real_repo_p126_to_p127_staged_contract(self):
         checkout_root = Path(__file__).resolve().parent.parent
         res = read_successor(checkout_root, "P12.6")
@@ -354,6 +360,17 @@ class TestStagedRoadmap(unittest.TestCase):
         self.assertEqual(res.kind, "successor")
         self.assertEqual(res.successor_task_id, "P15")
         self.assertEqual(res.spec_path, "agent/staged/P15.md")
+        self.assertIsNotNone(res.spec_sha256)
+        self.assertIn("Status: **PENDING DESIGN**", res.spec_text or "")
+        self.assertNotIn("Status: **READY_TO_RUN**", res.spec_text or "")
+        self.assertNotIn("## Approved executable design", res.spec_text or "")
+
+    def test_real_repo_p15_to_p16_staged_contract(self):
+        checkout_root = Path(__file__).resolve().parent.parent
+        res = read_successor(checkout_root, "P15")
+        self.assertEqual(res.kind, "successor")
+        self.assertEqual(res.successor_task_id, "P16")
+        self.assertEqual(res.spec_path, "agent/staged/P16.md")
         self.assertIsNotNone(res.spec_sha256)
         self.assertIn("Status: **PENDING DESIGN**", res.spec_text or "")
         self.assertNotIn("Status: **READY_TO_RUN**", res.spec_text or "")
