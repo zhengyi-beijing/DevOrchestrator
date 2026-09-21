@@ -1,9 +1,43 @@
-# NEXT — P16 AI Capability Benchmark Project
+# NEXT — Roadmap Complete (P16 AI Capability Benchmark Project Closed)
 
-Status: **READY_TO_RUN**
+Status: **COMPLETED / TERMINAL ROADMAP MILESTONE**
 
 Sequence:
-P14.5 (closed) -> Watchdog recovery-epoch cleanup (closed) -> P14.6 Unattended Execution Stabilization Gate (closed) -> P15 Mobile Observability & Guarded Control (closed) -> P16
+P14.5 (closed) -> Watchdog recovery-epoch cleanup (closed) -> P14.6 Unattended Execution Stabilization Gate (closed) -> P15 Mobile Observability & Guarded Control (closed) -> P16 AI Capability Benchmark Project (closed)
+
+## P16 AI Capability Benchmark Project closure
+
+Closed after implementing, executing, and verifying the P16 AI Capability Benchmark Project:
+
+Acceptance evidence:
+1. **Isolated Benchmark Project & Zero Production Contamination**:
+   - Resides strictly in `benchmark/` (`src/aibench/`, `pyproject.toml`, `scripts/`, `corpus/`, `evidence/`).
+   - Production `src/dev_orchestrator/**` does not import `aibench` or expose a benchmark CLI command.
+2. **AIBroker Boundary & Deterministic Resource Pinning**:
+   - Uses `AIBrokerExecutionPort` boundary without provider CLI adapters or parsing provider credentials.
+   - Deterministic resource pinning via exclusion (`AIRoleRequest.excluded_resource_ids`) validated against returned `resource_context.resource_id`.
+   - Bounded reliability failovers chain up to 2 retries on resource failures.
+3. **Paired A/B Evaluation & Ground-Truth Code-Only Scoring**:
+   - Evaluates Planner, Reviewer, Worker, and Debugger roles across paired Track A (Native) and Track B (Retrieval) workspaces with byte-identical prompts and matching prompt hashes.
+   - Ground-truth scoring verifies cited spans against corpus bytes, required/false findings, patch application in disposable workspaces, and unit test execution / regression rate. No model judge.
+4. **Windows Containment Boundary**:
+   - External scratch and queue roots outside DevO, AIResourceBroker, and production roots.
+   - Dedicated non-admin SID verification via `whoami /user`.
+   - Deny write/delete directory handle access denial audit against protected roots without creating files.
+   - Program-specific Windows Firewall outbound-deny rule.
+   - Transactional, SDDL-backed provisioning and digest-checked uninstall scripts adhering to PowerShell 5.1 rules (zero `&&` or `||`).
+5. **Total, Bounded 8-Gate Evaluation & Baseline Decision**:
+   - 24 trials executed across 3 resources (`agy/agy-1/gemini-3.8-flash-high`, `copilot/default/claude-sonnet-4.6`, `claude/default/opus`) and 4 roles.
+   - `capability_gate`: FAIL (zvec-grep not found on system or PATH).
+   - Downstream retrieval gates marked `not_applicable_due_to_capability_failure`.
+   - `evidence_gate`: PASS (3 distinct resources).
+   - `fallback_gate`: PASS (12/12 native trials completed).
+   - Final Evaluated Decision: **`NO_PROMOTE`** (`reasons: ["capability_unsupported"]`).
+   - Artifacts committed under `benchmark/evidence/p16_baseline_20260921/` and canonical acceptance record in `docs/P16_BENCHMARK_ACCEPTANCE.md`.
+6. **Acceptance Test Suite**:
+   - 9 dedicated P16 test suites in `tests_py/test_p16_*.py` (47 passed in 4.17s).
+7. **Roadmap Status**:
+   - `agent/staged/roadmap.json` designates `successor: null`. All staged tasks (P11x through P16) are now complete.
 
 ## P15 Mobile Observability & Guarded Control closure
 

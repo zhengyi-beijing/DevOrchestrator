@@ -5,7 +5,24 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P15 Mobile Observability & Guarded Control** — **REMEDIATED & CLOSED**.
+Current task: **P16 AI Capability Benchmark Project** — **COMPLETED & CLOSED**.
+
+P16 AI Capability Benchmark Project implementation & closure (2026-09-21):
+- Implemented isolated, reproducible AI capability benchmark project strictly in `benchmark/` (`src/aibench/`, `pyproject.toml`, `scripts/`, `corpus/`, `evidence/`).
+- Strict repository isolation: zero production imports from `src/dev_orchestrator/**` and no benchmark CLI command added to production DevOrchestrator.
+- Evaluates AI resources by role (Planner, Reviewer, Worker, Debugger) across paired Track A (Native) and Track B (Retrieval) workspaces with byte-identical prompts and matching prompt hashes.
+- Ground-truth code-only scoring without LLM judge: citation span verification against frozen corpus bytes, required/false findings scoring, patch application in disposable workspaces, and unit test execution / regression rate.
+- Deterministic resource pinning via exclusion: pins target resources via `AIRoleRequest.excluded_resource_ids` and validates returned `resource_context.resource_id`. Bounded reliability failovers chain up to 2 retries on resource failures.
+- Windows containment boundary: external scratch/queue roots outside DevO/AIBroker/production repositories, dedicated non-admin SID verification (`whoami /user`), directory write/delete handle access denial auditing, outbound-deny firewall verification, and journaled/digest-checked ACL provisioning scripts (`install_containment.ps1`, `uninstall_containment.ps1`) conforming to PowerShell 5.1 rules (zero `&&` or `||`).
+- Baseline acceptance run executed and frozen under `benchmark/evidence/p16_baseline_20260921/`: 24 trials across 3 resources (`agy/agy-1/gemini-3.8-flash-high`, `copilot/default/claude-sonnet-4.6`, `claude/default/opus`) and 4 roles (`planner`, `reviewer`, `worker`, `debugger`).
+- Total, bounded 8-gate evaluation: `capability_gate` evaluated to FAIL (missing zvec installation on system), marking downstream retrieval gates as `not_applicable_due_to_capability_failure`; `evidence_gate` passed (3 distinct resources); `fallback_gate` passed (12/12 native trials completed).
+- Final evaluated decision: **`NO_PROMOTE`** (`reasons: ["capability_unsupported"]`).
+- Canonical acceptance record authored in `docs/P16_BENCHMARK_ACCEPTANCE.md`.
+- Acceptance suite: 9 dedicated P16 test suites passed (47 passed in 4.17s).
+- Full repository regression: 1027 passed, 87 subtests passed in 365.56s (0 failures).
+- Python compilation (`python -m compileall -q src ops tests_py benchmark/src`): passed cleanly (exit code 0).
+- `git diff --check`: clean (0 whitespace/formatting defects).
+- Staged roadmap handoff: terminal milestone in `agent/staged/roadmap.json` (`successor: null`).
 
 P15 Mobile Observability & Guarded Control remediation & closure (2026-09-21):
 - Remediated bounded P15 defects from independent review:

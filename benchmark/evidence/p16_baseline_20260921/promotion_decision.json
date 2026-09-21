@@ -1,0 +1,59 @@
+{
+  "decision": "NO_PROMOTE",
+  "reasons": [
+    "capability_unsupported"
+  ],
+  "failed_gates": [
+    "capability_gate",
+    "benefit_gate",
+    "privacy_gate",
+    "staleness_gate",
+    "cost_gate",
+    "quality_gate"
+  ],
+  "gate_results": {
+    "capability_gate": {
+      "passed": false,
+      "status": "failed",
+      "detail": "zvec installation unsupported: zvec executable not found on system or PATH"
+    },
+    "benefit_gate": {
+      "passed": false,
+      "status": "not_applicable_due_to_capability_failure",
+      "detail": "zvec retrieval unsupported"
+    },
+    "privacy_gate": {
+      "passed": false,
+      "status": "not_applicable_due_to_capability_failure",
+      "detail": "zvec retrieval unsupported"
+    },
+    "staleness_gate": {
+      "passed": false,
+      "status": "not_applicable_due_to_capability_failure",
+      "detail": "zvec retrieval unsupported"
+    },
+    "cost_gate": {
+      "passed": false,
+      "status": "not_applicable_due_to_capability_failure",
+      "detail": "zvec retrieval unsupported"
+    },
+    "evidence_gate": {
+      "passed": true,
+      "status": "evaluated",
+      "detail": "distinct resources=3"
+    },
+    "fallback_gate": {
+      "passed": true,
+      "status": "passed",
+      "detail": "native track completed 12 trials"
+    },
+    "quality_gate": {
+      "passed": false,
+      "status": "not_applicable_due_to_capability_failure",
+      "detail": "retrieval track not executed due to capability failure"
+    }
+  },
+  "run_id": "run_plan_42_299f8e08_24",
+  "plan_id": "plan_42_299f8e08_24",
+  "timestamp": "2026-09-21T10:30:49.795164+00:00"
+}

@@ -1119,3 +1119,37 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - `git diff --check`: clean (0 whitespace/formatting defects).
   - Knowledge graph updated via `graphify update .`: 4683 nodes, 13336 edges, 210 communities.
 - P15 remediated and closed. Preserved handoff: P16 AI Capability Benchmark Project (`agent/staged/P16.md`).
+
+## P16 AI Capability Benchmark Project (2026-09-21)
+
+- Scope & Standalone Architecture:
+  - Created standalone benchmark Python project strictly under `benchmark/` (`benchmark/src/aibench/`, `benchmark/pyproject.toml`, `benchmark/scripts/`, `benchmark/corpus/`, `benchmark/evidence/`).
+  - Production `src/dev_orchestrator/**` does not import `aibench` or gain a benchmark command; DevOrchestrator core lifecycles and control authority remain completely untouched.
+  - Implemented `python -m aibench` CLI dispatcher supporting 8 subcommands: `corpus-verify`, `containment-audit`, `zvec-probe`, `plan-freeze`, `submit`, `run`, `report`, and `decide`.
+- Synthetic Corpus & Code-Only Ground Truth:
+  - Implemented deterministic synthetic corpus generator (`synth_app` with auth, cache, billing, repo, api, legacy_api, tests, docs) and normalized SHA-256 manifests.
+  - Defined 4 canonical role tasks (`planner`, `reviewer`, `worker`, `debugger`) with byte-level prompt hashing (`render_task_prompt`), common conditional retrieval directives, and zero ground-truth leakage into prompts.
+  - Implemented deterministic code-only scoring without LLM judges: cited span verification against frozen corpus bytes, required/false findings scoring, patch application in disposable workspaces, and unit test execution / regression rate.
+- Retrieval Treatment & Adapter:
+  - Implemented `ZvecAdapter` wrapping `zvec-grep` with capability probe, index building, query execution with path traversal containment, stats collection, and firewall verification.
+  - Implemented disposable workspace isolation: Track A receives pristine corpus revision; Track B receives untracked retrieval material if capability is supported.
+- AIBroker Integration & Resource Pinning:
+  - Implemented `BrokerBenchmarkClient` dispatching all provider work through `AIBrokerExecutionPort`. Discovers resources from live broker API or YAML, sanitizes credentials from snapshots, and pins exact target resources via `AIRoleRequest.excluded_resource_ids`.
+  - Implemented bounded reliability failover chain (up to 2 retries) on explicit provider resource failures.
+- Windows Containment Boundary:
+  - External scratch and queue roots strictly outside DevO, AIResourceBroker, and production repositories.
+  - Preflight audit verifies dedicated non-admin SID (`whoami /user`), checks directory write/delete handle access denial on protected roots without creating files, and validates scratch canary.
+  - Program-specific Windows Firewall outbound-deny rule for zvec.
+  - Provisioned transactional, SDDL-backed install and uninstall scripts (`install_containment.ps1`, `uninstall_containment.ps1`) adhering strictly to PowerShell 5.1 rules (zero `&&` or `||`).
+- Baseline Acceptance Run & 8-Gate Total Decision:
+  - Executed 24 trials across 3 distinct resources (`agy/agy-1/gemini-3.8-flash-high`, `copilot/default/claude-sonnet-4.6`, `claude/default/opus`) and 4 roles (`planner`, `reviewer`, `worker`, `debugger`).
+  - Evaluated 8 promotion gates: `capability_gate` evaluated to FAIL due to absent zvec installation, marking downstream retrieval gates as `not_applicable_due_to_capability_failure`; `evidence_gate` PASS (3 distinct resources); `fallback_gate` PASS (12/12 native trials completed).
+  - Total bounded decision evaluated to **`NO_PROMOTE`** (`reasons: ["capability_unsupported"]`).
+  - Baseline acceptance evidence persisted in `benchmark/evidence/p16_baseline_20260921/` (`trial_plan.json`, `results.jsonl`, `summary.json`, `report.md`, `promotion_decision.json`).
+  - Canonical acceptance record authored in `docs/P16_BENCHMARK_ACCEPTANCE.md`.
+- Verification:
+  - 9 dedicated P16 acceptance test suites in `tests_py/test_p16_*.py`: 47 passed in 4.17s.
+  - Full repository regression: 1027 passed, 87 subtests passed in 365.56s (0 failures).
+  - Python compilation (`python -m compileall -q src ops tests_py benchmark/src`): passed cleanly (exit code 0).
+  - `git diff --check`: clean (0 whitespace/formatting defects).
+  - Staged roadmap handoff: `agent/staged/roadmap.json` designates `successor: null`. All staged tasks (P11x through P16) are now complete.

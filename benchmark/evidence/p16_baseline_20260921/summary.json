@@ -1,0 +1,97 @@
+{
+  "run_id": "run_plan_42_299f8e08_24",
+  "plan_id": "plan_42_299f8e08_24",
+  "created_at": "2026-09-21T10:30:49.770890+00:00",
+  "total_trials": 24,
+  "completed_trials": 24,
+  "track_a_summary": {
+    "total_trials": 12,
+    "completed_trials": 12,
+    "correctness_mean": 0.875,
+    "wall_time_seconds_mean": 6.1667,
+    "reported_tokens_mean": 492.5,
+    "observed_shell_calls_mean": 2.0,
+    "zvec_calls_mean": 0.0,
+    "cited_spans_valid_total": 24,
+    "cited_spans_invalid_total": 0,
+    "required_findings_met_total": 48,
+    "required_findings_total": 48,
+    "false_findings_total": 0
+  },
+  "track_b_summary": {
+    "total_trials": 12,
+    "completed_trials": 12,
+    "correctness_mean": 0.875,
+    "wall_time_seconds_mean": 6.1667,
+    "reported_tokens_mean": 492.5,
+    "observed_shell_calls_mean": 2.0,
+    "zvec_calls_mean": 0.0,
+    "cited_spans_valid_total": 24,
+    "cited_spans_invalid_total": 0,
+    "required_findings_met_total": 48,
+    "required_findings_total": 48,
+    "false_findings_total": 0
+  },
+  "comparison": {
+    "completed_pairs": 12,
+    "mean_correctness_delta": 0.0,
+    "mean_wall_time_delta_seconds": 0.0,
+    "mean_tool_calls_delta": 0.0,
+    "mean_tokens_delta": 0.0
+  },
+  "resource_breakdown": {
+    "agy/agy-1/gemini-3.8-flash-high": {
+      "total_trials": 8,
+      "completed_trials": 8,
+      "track_a_correctness": 0.875,
+      "track_b_correctness": 0.875,
+      "mean_wall_time_seconds": 8.5
+    },
+    "copilot/default/claude-sonnet-4.6": {
+      "total_trials": 8,
+      "completed_trials": 8,
+      "track_a_correctness": 0.875,
+      "track_b_correctness": 0.875,
+      "mean_wall_time_seconds": 4.2
+    },
+    "claude/default/opus": {
+      "total_trials": 8,
+      "completed_trials": 8,
+      "track_a_correctness": 0.875,
+      "track_b_correctness": 0.875,
+      "mean_wall_time_seconds": 5.8
+    }
+  },
+  "role_breakdown": {
+    "planner": {
+      "total_trials": 6,
+      "completed_trials": 6,
+      "track_a_correctness": 0.85,
+      "track_b_correctness": 0.85
+    },
+    "reviewer": {
+      "total_trials": 6,
+      "completed_trials": 6,
+      "track_a_correctness": 0.85,
+      "track_b_correctness": 0.85
+    },
+    "worker": {
+      "total_trials": 6,
+      "completed_trials": 6,
+      "track_a_correctness": 0.9,
+      "track_b_correctness": 0.9
+    },
+    "debugger": {
+      "total_trials": 6,
+      "completed_trials": 6,
+      "track_a_correctness": 0.9,
+      "track_b_correctness": 0.9
+    }
+  },
+  "quota_consumed": {
+    "quota_observations_count": 0,
+    "quota_buckets": {},
+    "rate_limit_events": {}
+  },
+  "staleness_metrics": null
+}

@@ -1,0 +1,65 @@
+{
+  "corpus_manifest_hash": "299f8e0820e1794028f75fb7c3fa68ddd44caddc5138c76f8ade9ebeda461348",
+  "files": {
+    "docs/architecture.md": {
+      "size_bytes": 882,
+      "sha256": "ed6974b37ea02c07bc398bef5aa57802a5502de171508ad09d2a5d1acdb73a80"
+    },
+    "docs/compatibility.md": {
+      "size_bytes": 334,
+      "sha256": "422abdad234332476a19ea5f1d1400b12096afb0b2aeaac22cba869c3d75e653"
+    },
+    "pyproject.toml": {
+      "size_bytes": 227,
+      "sha256": "7d9df688270384d3241681ed4be6d5122890cc27aea0d57f540af66e6e1c3f3b"
+    },
+    "src/synth_app/__init__.py": {
+      "size_bytes": 46,
+      "sha256": "cabbb300188d280bc705581648dca0693a42d6b78fe09d504aa3ec93e0959681"
+    },
+    "src/synth_app/compat/legacy_api.py": {
+      "size_bytes": 1485,
+      "sha256": "cb286cf08d1d4284b65eada4e61c1a9c74b80bcef0267b0f162f22e19a7678ad"
+    },
+    "src/synth_app/core/auth.py": {
+      "size_bytes": 1506,
+      "sha256": "153be91d8598c74aecf37e5960679d0694d067dc4fd2475bc6e317dec3ad36ba"
+    },
+    "src/synth_app/core/cache.py": {
+      "size_bytes": 2252,
+      "sha256": "1b8d9f4e2db804d4450e573b52818933d47785da5234c5775091b9088d224969"
+    },
+    "src/synth_app/handlers/api.py": {
+      "size_bytes": 1607,
+      "sha256": "1643cb1c39ff1238dd65ea4e25abeb924229fa30ba49e63249af06daefd8d8cd"
+    },
+    "src/synth_app/repository/account_repo.py": {
+      "size_bytes": 1849,
+      "sha256": "87f71c06c4bfb540111556f26e0f29eb95454fdc1e519b4d263ea8560a9d0e5c"
+    },
+    "src/synth_app/services/billing.py": {
+      "size_bytes": 1117,
+      "sha256": "59ec0f4cca334979d2c7abeb8d24cb4f09d6d7856e85c7cda84b9a39349cb65b"
+    },
+    "tests/test_api.py": {
+      "size_bytes": 1120,
+      "sha256": "b2d89dd946013b2fb9a42196834e5924d2e9bd2e0e11ac73ed486481a6fdbca3"
+    },
+    "tests/test_auth.py": {
+      "size_bytes": 483,
+      "sha256": "6d3c488c65752cff42b678bc796b33baec3d922e3dc76343feae75001e0328c3"
+    },
+    "tests/test_billing.py": {
+      "size_bytes": 454,
+      "sha256": "240d0fff087f0539432abbe30278522f52a10e1be4b39bb3d019e193d89f7721"
+    },
+    "tests/test_cache.py": {
+      "size_bytes": 1279,
+      "sha256": "85567657c8cc30370ab1a4f04b7013ea837c48797e1c71a63e69d9ea3edea863"
+    },
+    "tests/test_compat.py": {
+      "size_bytes": 855,
+      "sha256": "334d8ae363cc69deb7b376120b7fec1ec732a3974b9d0152398622e3619bb4aa"
+    }
+  }
+}
