@@ -1851,7 +1851,7 @@ class AIPlannerCoordinator:
             "Inspect the repository and the supplied agent/next.md task. Convert the pending design into a bounded executable implementation plan. "
             "Return exactly one JSON object and no markdown or extra text with exactly these keys: "
             '{"task_id":"...","summary":"...","implementation_steps":["..."],"interfaces":["..."],"validation":["..."],"risks":["..."],"out_of_scope":["..."]}. '
-            "Every list must be non-empty. Keep the implementation bounded to the current task and preserve existing acceptance intent.\n\n"
+            "Every list must contain 1-24 string items, and every list item must be at most 1000 characters. Keep the implementation bounded to the current task and preserve existing acceptance intent.\n\n"
             f"{workflow_policy_prompt('planner')}\n\n"
             f"Project: {record['project_id']}\nTask: {record['task_id']}\n"
             f"Planning branch: {record['branch']}\nPlanning HEAD: {record['head']}\n\n"

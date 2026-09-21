@@ -9,6 +9,32 @@ from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator, PlannerProtocolError, _parse_plan, _parse_plan_review
 
 
+class PlannerPromptContractTests(unittest.TestCase):
+    def test_planner_prompt_declares_exact_sequence_bounds(self):
+        record = {
+            "project_id": "p1",
+            "task_id": "P15",
+            "branch": "main",
+            "head": "abc123",
+            "next_text": "# NEXT\nStatus: **PENDING DESIGN**",
+        }
+        prompt = AIPlannerCoordinator._planner_prompt(
+            record,
+            retry_reason="planner implementation_steps must be a non-empty bounded list",
+            attempt=2,
+            remediation={
+                "round": 1,
+                "rejection": "preserve the two review blockers",
+                "prior_plan": {"task_id": "P15"},
+                "prior_resource": None,
+            },
+        )
+        self.assertIn("1-24 string items", prompt)
+        self.assertIn("at most 1000 characters", prompt)
+        self.assertIn("[PLAN_REMEDIATION]", prompt)
+        self.assertIn("[PLANNER_RETRY]", prompt)
+
+
 class PlanParserCompatibilityTests(unittest.TestCase):
     def test_named_sequence_object_is_canonicalized(self):
         payload = {
