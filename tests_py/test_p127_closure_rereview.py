@@ -14,16 +14,43 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
+from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.control.reconcile import resolve_rereview_candidate
 from dev_orchestrator.control.surface import project_control_view
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.control_commands import ControlCommandCoordinator, submit_control_command
 from dev_orchestrator.core.repository import read_repository_truth
-from tests_py.test_control_commands import FakeExecutor
+from dev_orchestrator.core.transition_executor import TransitionExecutor
+from tests_py.test_control_commands import FakeExecutor, FakePlanner
 from tests_py.test_p125_reconcile import P125ReconcileTests, ReviewerPort
 
 
 ACCEPTED_NEXT_REVIEW = "ai_review:ai_review:older-worker-source"
+
+
+class NextReviewerPort:
+    def __init__(self):
+        self.requests = []
+
+    def execute(self, request):
+        self.requests.append(request)
+        return AIRoleResult(
+            request_id=request.request_id,
+            role_run_id=request.role_run_id,
+            status="succeeded",
+            output=json.dumps({
+                "decision": "next",
+                "next_action": "next_task",
+                "reason": "current descendant remediation is accepted",
+            }),
+            dispatch_id="review-dispatch-next",
+            decision_id="review-decision-next",
+            execution_id="review-execution-next",
+            resource_context=ResourceContext(
+                "reviewer/independent", "review-provider", "review-account", "review-model"
+            ),
+        )
 
 
 class P127ClosureRereviewTests(unittest.TestCase):
@@ -37,6 +64,86 @@ class P127ClosureRereviewTests(unittest.TestCase):
         reviews["reviews"][ACCEPTED_NEXT_REVIEW]["review_dirty"] = False
         reviews_path.write_text(json.dumps(reviews), encoding="utf-8")
         return repo, runtime, config, project, snapshot
+
+    def predecessor_fixture(self, root: Path):
+        repo, runtime, config, project, snapshot, remediate_review = P125ReconcileTests().fixture(root)
+
+        # Keep one completed REMEDIATE lineage backed by its completed worker.
+        reviews_path = runtime / "ai-reviewer.json"
+        reviews = json.loads(reviews_path.read_text(encoding="utf-8"))
+        reviews["reviews"] = {remediate_review: reviews["reviews"][remediate_review]}
+        reviews["reviews"][remediate_review]["review_dirty"] = False
+        reviews_path.write_text(json.dumps(reviews), encoding="utf-8")
+
+        decisions_path = runtime / "review-decisions.json"
+        decisions = json.loads(decisions_path.read_text(encoding="utf-8"))
+        decisions["decisions"] = {remediate_review: decisions["decisions"][remediate_review]}
+        decisions_path.write_text(json.dumps(decisions), encoding="utf-8")
+
+        transitions_path = runtime / "transition-executor.json"
+        transitions = json.loads(transitions_path.read_text(encoding="utf-8"))
+        transitions["executions"] = {
+            key: value for key, value in transitions["executions"].items()
+            if key in {"worker-source", remediate_review}
+        }
+        transitions_path.write_text(json.dumps(transitions), encoding="utf-8")
+
+        staged = repo / "agent" / "staged"
+        staged.mkdir(parents=True, exist_ok=True)
+        (staged / "P2.md").write_text(
+            "# P2 Pending Successor\n\nStatus: **PENDING DESIGN**\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (staged / "roadmap.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "tasks": [
+                    {
+                        "task_id": "P1",
+                        "successor": "P2",
+                        "successor_spec_path": "agent/staged/P2.md",
+                    },
+                    {
+                        "task_id": "P2",
+                        "successor": None,
+                        "successor_spec_path": None,
+                    },
+                ],
+            }),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "stage P2 successor"],
+            cwd=repo,
+            check=True,
+        )
+        current = read_repository_truth(repo)
+
+        snapshot = {
+            **snapshot,
+            "state": "IDLE",
+            "lifecycle_state": "IDLE",
+            "next_status": "**PENDING DESIGN**",
+            "telemetry": {"task_id": "P2"},
+            "git": {
+                "branch": current.branch,
+                "head": current.head,
+                "dirty": False,
+                "status_hash": current.status_hash,
+            },
+        }
+        project["execution"] = {
+            "enabled": True,
+            "owner_authorized": True,
+            "engine": "aibroker",
+            "allowed_next_actions": ["continue_current_stage", "next_task"],
+            "worker_prompt": "worker prompt",
+            "remediation_prompt": "remediation prompt",
+        }
+        config.write_text(json.dumps({"projects": [project]}), encoding="utf-8")
+        return repo, runtime, config, project, snapshot, remediate_review
 
     def test_accepted_stale_next_rereviews_clean_descendant_without_worker(self):
         with tempfile.TemporaryDirectory() as td:
@@ -159,6 +266,102 @@ class P127ClosureRereviewTests(unittest.TestCase):
             self.assertEqual(result["review_id"], review_id)
             self.assertIn("already launched", result["reason"])
             self.assertEqual(len(port.requests), 1)
+
+    def test_remediate_predecessor_matches_exact_pending_successor(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, runtime, _, project, snapshot, remediate_review = self.predecessor_fixture(Path(td))
+            candidate, reason = resolve_rereview_candidate(snapshot, runtime, project)
+            self.assertEqual(reason, "")
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate["target_id"], remediate_review)
+            self.assertEqual(candidate["kind"], "remediate")
+            self.assertEqual(candidate["task_id"], "P1")
+
+            view = project_control_view(snapshot, runtime, project)
+            control = next(row for row in view["controls"] if row["action"] == "rereview")
+            self.assertTrue(control["available"], control)
+            self.assertEqual(control["target_id"], remediate_review)
+
+    def test_cross_task_rereview_rejects_non_successor_or_non_pending_current_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, runtime, _, project, snapshot, _ = self.predecessor_fixture(Path(td))
+
+            unrelated = {
+                **snapshot,
+                "telemetry": {"task_id": "P3"},
+            }
+            candidate, reason = resolve_rereview_candidate(unrelated, runtime, project)
+            self.assertIsNone(candidate)
+            self.assertIn("no safe stale-review", reason)
+
+            executable = {
+                **snapshot,
+                "next_status": "**READY_TO_RUN**",
+            }
+            candidate, reason = resolve_rereview_candidate(executable, runtime, project)
+            self.assertIsNone(candidate)
+            self.assertIn("no safe stale-review", reason)
+
+    def test_remediate_predecessor_rereview_flows_to_handoff_and_planner(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, runtime, config, project, snapshot, remediate_review = self.predecessor_fixture(Path(td))
+            candidate, reason = resolve_rereview_candidate(snapshot, runtime, project)
+            self.assertEqual(reason, "")
+            self.assertEqual(candidate["target_id"], remediate_review)
+
+            port = NextReviewerPort()
+            reviewer = AIReviewerCoordinator(runtime, port)
+            review_id, launch_reason = reviewer.rereview_descendant(
+                project, snapshot, candidate, "p15-style-rereview"
+            )
+            self.assertIsNotNone(review_id, launch_reason)
+            reviewer._threads[review_id].join(timeout=3)
+            self.assertEqual(len(port.requests), 1)
+            self.assertIn("[REMEDIATED_DESCENDANT_REREVIEW]", port.requests[0].prompt)
+            self.assertEqual(port.requests[0].task_run_id, "P1")
+
+            decisions = json.loads(
+                (runtime / "review-decisions.json").read_text(encoding="utf-8")
+            )["decisions"]
+            accepted = decisions[review_id]
+            self.assertEqual(accepted["decision"], "next")
+            self.assertEqual(accepted["next_action"], "next_task")
+            self.assertEqual(accepted["task_id"], "P1")
+            self.assertEqual(accepted["head"], snapshot["git"]["head"])
+
+            # Legacy static-start suppression must not gate a durable review
+            # decision or the subsequent PENDING DESIGN planner handoff.
+            owner = OwnerControlStore(runtime)
+            owner.set_paused(
+                "p1", False, command_id="resume-after-stop", action="resume"
+            )
+            self.assertFalse(owner.is_paused("p1"))
+            self.assertTrue(owner.suppress_static_starts("p1"))
+
+            executor = TransitionExecutor(runtime)
+            executor.advance({"projects": [snapshot]}, config)
+            handoff = executor.state()["executions"][review_id]
+            self.assertEqual(handoff["state"], "handoff")
+            self.assertEqual(handoff["outcome"], "planning_required")
+            self.assertEqual(handoff["task_id"], "P1")
+            self.assertEqual(handoff["next_task_id"], "P2")
+
+            planner = FakePlanner()
+            outcomes = ControlCommandCoordinator(runtime, planner=planner).advance(
+                config, {"projects": [snapshot]}, executor
+            )
+            auto = [
+                row for row in outcomes
+                if row.get("source") == "automatic_review_handoff"
+            ]
+            self.assertEqual(len(auto), 1, outcomes)
+            self.assertEqual(auto[0]["state"], "accepted", auto[0])
+            self.assertEqual(auto[0]["lifecycle_action"], "plan")
+            self.assertEqual(len(planner.calls), 1)
+            self.assertEqual(planner.calls[0][0], "p1")
+            self.assertTrue(
+                executor.state()["executions"][review_id].get("handoff_consumed")
+            )
 
 
 if __name__ == "__main__":

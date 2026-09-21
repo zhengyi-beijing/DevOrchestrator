@@ -989,6 +989,12 @@ class AIReviewerCoordinator:
                         "That acceptance anchor is now stale because the current clean HEAD is a descendant. "
                         "Independently review the CURRENT HEAD from repository evidence; do not inherit or import the prior accepted verdict.\n"
                         "[/ACCEPTED_NEXT_DESCENDANT_REREVIEW]").format(target.get("reviewed_head"), target.get("prior_reason"))
+        elif target.get("kind") == "remediate":
+            reanchor = ("[REMEDIATED_DESCENDANT_REREVIEW]\n"
+                        "A prior technical review requested REMEDIATE at HEAD {0}: {1}\n"
+                        "The current clean HEAD is a descendant containing subsequent bounded remediation. "
+                        "Independently review the CURRENT HEAD from repository evidence; do not assume the remediation succeeded and do not inherit the prior verdict.\n"
+                        "[/REMEDIATED_DESCENDANT_REREVIEW]").format(target.get("reviewed_head"), target.get("prior_reason"))
         else:
             reanchor = ("[FAILED_REVIEW_DESCENDANT_REREVIEW]\nPrior reviewer infrastructure failed at HEAD {0}: {1}\n"
                         "The current clean HEAD is a descendant containing bounded recovery fixes. Independently review CURRENT HEAD; do not inherit a verdict.\n"
@@ -1002,6 +1008,8 @@ class AIReviewerCoordinator:
         self._launch_review(review_id, source_id, request, truth, conversation_binding=binding, resolution=resolution)
         if target.get("kind") == "next":
             return review_id, "stale accepted NEXT re-reviewed at current clean descendant HEAD"
+        if target.get("kind") == "remediate":
+            return review_id, "stale REMEDIATE re-reviewed at current clean descendant HEAD"
         return review_id, "failed reviewer lineage re-anchored at current clean descendant HEAD"
 
     def retry_failed(

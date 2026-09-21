@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from dev_orchestrator.core.repository import is_git_ancestor, read_repository_truth
+from dev_orchestrator.core.staged_roadmap import read_successor
 from dev_orchestrator.core.transition_executor import is_pre_provider_worktree_unsafe_failure
 from dev_orchestrator.storage.json_store import read_json
 
@@ -237,28 +238,59 @@ def _git_distance(repo_path: str, ancestor: str, descendant: str) -> int | None:
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
+
+def _rereview_task_matches_current_or_pending_successor(
+    repo_path: str,
+    reviewed_task_id: str,
+    current_task_id: str,
+    snapshot: dict[str, Any],
+) -> bool:
+    """Allow re-review of the current task or its exact staged predecessor only.
+
+    Cross-task recovery is intentionally narrow: the monitor must already
+    advertise the reviewed task's canonical staged successor, and that
+    successor must still be IDLE/PENDING DESIGN.  This lets a bounded
+    predecessor remediation be independently re-reviewed after next.md has
+    advanced without making older unrelated task reviews eligible.
+    """
+    if reviewed_task_id == current_task_id:
+        return True
+    lifecycle = str(snapshot.get("lifecycle_state") or snapshot.get("state") or "")
+    if snapshot.get("state") != "IDLE" or lifecycle != "IDLE":
+        return False
+    if "PENDING DESIGN" not in str(snapshot.get("next_status") or "").upper():
+        return False
+    roadmap = read_successor(repo_path, reviewed_task_id)
+    return (
+        roadmap.kind == "successor"
+        and _text(roadmap.successor_task_id) == current_task_id
+    )
+
+
 def resolve_rereview_candidate(
     snapshot: dict[str, Any], runtime_root: Path | str, project_config: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, str]:
     """Resolve one stale reviewer lineage that may be re-reviewed at a clean descendant HEAD.
 
-    Two immutable lineages qualify:
+    Three immutable lineages qualify:
 
-    - a failed reviewer attempt that produced no durable decision, and
+    - a failed reviewer attempt that produced no durable decision,
     - an accepted NEXT decision whose reviewed HEAD is now an ancestor of the
-      current clean descendant HEAD (a stale accepted NEXT for the same
-      completed current task).
+      current clean descendant HEAD, and
+    - a REMEDIATE decision whose reviewed HEAD is now an ancestor of a clean
+      descendant containing the bounded remediation.
 
-    Either way the re-review launches one independent reviewer at the current
-    clean descendant HEAD; it never launches a Worker and never imports the
-    prior verdict.
+    The reviewed task may be the monitor's current task, or the exact staged
+    predecessor of a still-IDLE/PENDING-DESIGN current task.  In every case the
+    re-review launches one independent reviewer at the current clean descendant
+    HEAD; it never launches a Worker and never imports the prior verdict.
     """
     if not isinstance(snapshot, dict):
         return None, "project snapshot is unavailable"
     project_id = _text(snapshot.get("project_id") or snapshot.get("id"))
     telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
-    task_id = _text(telemetry.get("task_id"))
-    if project_id is None or task_id is None or not _reviewer_ready(project_config):
+    current_task_id = _text(telemetry.get("task_id"))
+    if project_id is None or current_task_id is None or not _reviewer_ready(project_config):
         return None, "current project/task/reviewer identity is incomplete"
     repo_path = _text(project_config.get("repo_path")) or _text(snapshot.get("repo_path"))
     truth = read_repository_truth(repo_path or "")
@@ -280,9 +312,14 @@ def resolve_rereview_candidate(
     for review_id, review in sorted(reviews.items()):
         if review_id in consumed:
             continue
+        reviewed_task_id = _text(review.get("task_id"))
         old_head = _text(review.get("head"))
         if not (
-            review.get("project_id") == project_id and review.get("task_id") == task_id
+            review.get("project_id") == project_id
+            and reviewed_task_id is not None
+            and _rereview_task_matches_current_or_pending_successor(
+                repo_path or "", reviewed_task_id, current_task_id, snapshot
+            )
             and review.get("branch") == truth.branch
             and old_head and old_head != truth.head and review.get("review_dirty") is False
             and is_git_ancestor(repo_path or "", old_head, truth.head)
@@ -290,16 +327,15 @@ def resolve_rereview_candidate(
             continue
         decision = decisions.get(review_id)
         if isinstance(decision, dict):
-            # Accepted NEXT lineage: a durable next/next_task decision whose
-            # reviewed HEAD is now stale relative to the current descendant HEAD.
+            # A completed durable NEXT or REMEDIATE decision may be re-reviewed
+            # only after its anchor becomes a clean ancestor.  The prior verdict
+            # is context, never imported as the current verdict.
             decision_hash = _text(decision.get("review_status_hash"))
             if not (
                 review.get("state") == "completed"
                 and decision.get("request_id") == review_id
                 and decision.get("project_id") == project_id
-                and decision.get("task_id") == task_id
-                and decision.get("decision") == "next"
-                and decision.get("next_action") == "next_task"
+                and decision.get("task_id") == reviewed_task_id
                 and decision.get("disposition") == "apply"
                 and decision.get("role") == "reviewer"
                 and decision.get("event") == "worker_done"
@@ -309,8 +345,23 @@ def resolve_rereview_candidate(
                 and review.get("review_status_hash") == decision_hash
             ):
                 continue
-            kind = "next"
-            prior_reason = _text(review.get("reason")) or _text(decision.get("reason")) or "stale accepted NEXT review"
+            pair = (decision.get("decision"), decision.get("next_action"))
+            if pair == ("next", "next_task"):
+                kind = "next"
+                prior_reason = (
+                    _text(review.get("reason"))
+                    or _text(decision.get("reason"))
+                    or "stale accepted NEXT review"
+                )
+            elif pair == ("remediate", "continue_current_stage"):
+                kind = "remediate"
+                prior_reason = (
+                    _text(review.get("reason"))
+                    or _text(decision.get("reason"))
+                    or "stale REMEDIATE review"
+                )
+            else:
+                continue
         else:
             if review.get("state") != "failed":
                 continue
@@ -318,14 +369,26 @@ def resolve_rereview_candidate(
             prior_reason = _text(review.get("reason")) or "review infrastructure failure"
         source_id = _text(review.get("source_request_id")); source = executions.get(source_id or "")
         resource = source.get("resource_context") if isinstance(source, dict) else None
-        if not (isinstance(source, dict) and source.get("state") == "completed" and source.get("engine") == "aibroker"
-                and source.get("project_id") == project_id and source.get("task_id") == task_id
-                and isinstance(resource, dict)):
+        if not (
+            isinstance(source, dict)
+            and source.get("state") == "completed"
+            and source.get("engine") == "aibroker"
+            and source.get("project_id") == project_id
+            and source.get("task_id") == reviewed_task_id
+            and isinstance(resource, dict)
+        ):
             continue
-        matches.append({"target_id": review_id, "source_request_id": source_id, "task_id": task_id,
-                        "branch": truth.branch, "reviewed_head": old_head, "current_head": truth.head,
-                        "prior_reason": prior_reason, "resource_context": copy.deepcopy(resource),
-                        "kind": kind})
+        matches.append({
+            "target_id": review_id,
+            "source_request_id": source_id,
+            "task_id": reviewed_task_id,
+            "branch": truth.branch,
+            "reviewed_head": old_head,
+            "current_head": truth.head,
+            "prior_reason": prior_reason,
+            "resource_context": copy.deepcopy(resource),
+            "kind": kind,
+        })
     if matches:
         # Reviews and decisions are immutable audit history.  For descendant
         # re-review, select the nearest stale ancestor deterministically; older
