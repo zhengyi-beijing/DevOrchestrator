@@ -292,6 +292,11 @@ def resolve_rereview_candidate(
     current_task_id = _text(telemetry.get("task_id"))
     if project_id is None or current_task_id is None or not _reviewer_ready(project_config):
         return None, "current project/task/reviewer identity is incomplete"
+    # A terminal task has no pending implementation whose technical verdict can
+    # affect lifecycle progression.  Historical stale review lineages remain in
+    # the immutable audit stores, but must not surface as actionable controls.
+    if str(snapshot.get("state") or "").upper() == "IDLE" and "DONE" in str(snapshot.get("next_status") or "").upper():
+        return None, "current task is terminal; stale review is audit history only"
     repo_path = _text(project_config.get("repo_path")) or _text(snapshot.get("repo_path"))
     truth = read_repository_truth(repo_path or "")
     if not truth.valid or truth.dirty:

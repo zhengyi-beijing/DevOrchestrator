@@ -183,6 +183,17 @@ class P127ClosureRereviewTests(unittest.TestCase):
             self.assertEqual(state["rereview_of"], ACCEPTED_NEXT_REVIEW)
             self.assertEqual(state["head"], snapshot["git"]["head"])
 
+    def test_done_task_hides_stale_descendant_rereview_as_audit_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, runtime, _, project, snapshot = self.fixture(Path(td))
+            terminal = {**snapshot, "state": "IDLE", "lifecycle_state": "IDLE", "next_status": "**DONE**"}
+            candidate, reason = resolve_rereview_candidate(terminal, runtime, project)
+            self.assertIsNone(candidate)
+            self.assertIn("terminal", reason)
+            view = project_control_view(terminal, runtime, project)
+            control = next(row for row in view["controls"] if row["action"] == "rereview")
+            self.assertFalse(control["available"], control)
+
     def test_dirty_rejects_accepted_next_rereview(self):
         with tempfile.TemporaryDirectory() as td:
             repo, runtime, _, project, snapshot = self.fixture(Path(td))
