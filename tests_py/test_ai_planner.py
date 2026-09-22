@@ -83,6 +83,16 @@ class PlanParserCompatibilityTests(unittest.TestCase):
             _parse_plan(json.dumps(payload) + "\n" + json.dumps({"extra": True}), "P14.6")
         self.assertEqual(ctx.exception.stage, "extract")
 
+    def test_oversized_sequence_reports_exact_count_and_correction(self):
+        payload = {
+            "task_id": "P15", "summary": "bounded",
+            "implementation_steps": [f"step {i}" for i in range(25)],
+            "interfaces": ["stable"], "validation": ["tests"],
+            "risks": ["bounded"], "out_of_scope": ["unrelated"],
+        }
+        with self.assertRaisesRegex(PlannerProtocolError, r"at most 24 items; got 25; combine or remove 1 item"):
+            _parse_plan(json.dumps(payload), "P15")
+
     def test_schema_and_semantic_failures_are_distinct(self):
         base = {
             "task_id": "P14.6", "summary": "bounded",

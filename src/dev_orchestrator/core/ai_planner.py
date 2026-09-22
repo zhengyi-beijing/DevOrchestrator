@@ -234,8 +234,12 @@ def _validate_plan_schema(payload: dict[str, Any]) -> None:
         raise PlannerProtocolError("schema", "planner summary must be a string")
     for key in _PLAN_SEQUENCE_KEYS:
         value = payload.get(key)
-        if not isinstance(value, list) or not value or len(value) > 24:
-            raise PlannerProtocolError("schema", f"planner {key} must be a non-empty bounded list")
+        if not isinstance(value, list):
+            raise PlannerProtocolError("schema", f"planner {key} must be a list; got {type(value).__name__}")
+        if not value:
+            raise PlannerProtocolError("schema", f"planner {key} must contain at least 1 item; got 0")
+        if len(value) > 24:
+            raise PlannerProtocolError("schema", f"planner {key} must contain at most 24 items; got {len(value)}; combine or remove {len(value) - 24} item(s)")
         if any(not isinstance(item, str) or len(item) > 1000 for item in value):
             raise PlannerProtocolError("schema", f"planner {key} entries must be bounded strings")
 
