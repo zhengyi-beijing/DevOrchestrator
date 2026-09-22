@@ -148,7 +148,18 @@ def _run_orchestration_tick(
             # terminal managed execution, which can relabel a newly ready
             # task as WORKER_FAILED.  Active executions remain guarded by the
             # executor state supplied to WatchdogCoordinator.
-            watchdog.advance(config, raw_summary, executor=executor)
+            # Watchdog needs monitor truth plus current orchestration-role truth.
+            # Feeding raw_summary alone hides an active Planner/Reviewer behind
+            # a stale prior-task lifecycle (for example OWNER_GATE), making
+            # ACTIVE_LIFECYCLE_STATES monitoring silently inapplicable.
+            # Do not feed the managed-run projection here: a terminal run from
+            # the previous task can still relabel a newly active task.
+            watchdog_summary = overlay_orchestration_lifecycle(
+                raw_summary,
+                planner_state=planner_state_fn() if callable(planner_state_fn) else None,
+                reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
+            )
+            watchdog.advance(config, watchdog_summary, executor=executor)
         except Exception as _wd_exc:
             watchdog.record_tick_error(_wd_exc)
             watchdog_error = str(_wd_exc)
