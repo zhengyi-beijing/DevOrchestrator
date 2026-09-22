@@ -32,8 +32,11 @@ def load_containment_config(config_path: Path | None = None) -> ContainmentConfi
     return ContainmentConfig(
         scratch_root=r"C:\work\aibench_scratch",
         queue_root=r"C:\work\aibench_queue",
+        # Current-user live benchmark is the default. A dedicated SID /
+        # scheduled-task identity is an optional hardening mode, not an
+        # acceptance requirement.
         dedicated_sid="",
-        scheduled_task_name="DevOrchestrator-AIBench-Worker",
+        scheduled_task_name="",
         broker_config_path=r"runtime\aibroker-m1\resources-m2.yaml",
         zvec_path="",
         firewall_rule_name="DevOrchestrator-AIBench-OutboundDeny",

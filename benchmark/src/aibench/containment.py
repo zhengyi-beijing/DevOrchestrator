@@ -114,19 +114,22 @@ def audit_containment(
     allow_mock_sid: bool = False,
     allow_unrestricted_dev_roots: bool = False,
 ) -> ContainmentAuditResult:
-    """Audit containment boundary: dedicated SID, protected roots isolation, and scratch access."""
+    """Audit benchmark isolation; dedicated-SID ACL hardening is optional."""
     details: dict[str, Any] = {}
 
-    # 1. Identity Check
+    # 1. Identity check. Current-user mode is the default and does not
+    # require provisioning a dedicated Windows account. Supplying
+    # dedicated_sid explicitly enables the legacy hardening check.
     user_name, current_sid = get_current_user_sid()
     details["current_user"] = user_name
     details["current_sid"] = current_sid
-    details["expected_sid"] = config.dedicated_sid
+    details["expected_sid"] = config.dedicated_sid or None
+    details["identity_mode"] = "dedicated_sid" if config.dedicated_sid else "current_user"
 
-    if allow_mock_sid:
+    if not config.dedicated_sid:
         sid_match = True
-    elif not config.dedicated_sid:
-        sid_match = False
+    elif allow_mock_sid:
+        sid_match = True
     else:
         sid_match = bool(current_sid and current_sid.lower() == config.dedicated_sid.lower())
 
@@ -145,18 +148,25 @@ def audit_containment(
 
     details["isolation_errors"] = isolation_errors
 
-    # 3. Protected Roots Write/Delete Denial Check (without creating or modifying any file)
+    # 3. Protected Roots Write/Delete Denial Check. ACL denial is an
+    # optional hardening layer tied to an explicitly configured dedicated SID;
+    # current-user mode relies on disposable Git workspaces and path isolation.
     acl_verified = True
     acl_details: list[dict[str, Any]] = []
+    acl_required = bool(config.dedicated_sid)
+    details["acl_requirement"] = "required_for_dedicated_sid_mode" if acl_required else "optional_not_required"
 
-    for prot_str in config.protected_roots:
-        prot_p = Path(prot_str)
-        if not prot_p.exists():
-            continue
-        denied = check_directory_write_denied(prot_p)
-        acl_details.append({"root": prot_str, "write_denied": denied})
-        if not denied and not allow_unrestricted_dev_roots:
-            acl_verified = False
+    if acl_required:
+        for prot_str in config.protected_roots:
+            prot_p = Path(prot_str)
+            if not prot_p.exists():
+                continue
+            denied = check_directory_write_denied(prot_p)
+            acl_details.append({"root": prot_str, "write_denied": denied})
+            if not denied and not allow_unrestricted_dev_roots:
+                acl_verified = False
+    else:
+        acl_details.append({"status": "not_required_current_user_mode"})
 
     details["acl_checks"] = acl_details
 

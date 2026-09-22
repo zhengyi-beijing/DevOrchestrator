@@ -1,13 +1,13 @@
-# NEXT — Roadmap Handoff (P16 AI Capability Benchmark Project: OWNER_GATE Raised)
+# NEXT — Roadmap Handoff (P16 AI Capability Benchmark Project: Current-User Live Benchmark)
 
-Status: **P16 OWNER_GATE RAISED (Pending Owner Containment Provisioning)**
+Status: **P16 LIVE BENCHMARK ENABLED — no dedicated Windows account or host provisioning required**
 
 Sequence:
-P14.5 (closed) -> Watchdog recovery-epoch cleanup (closed) -> P14.6 Unattended Execution Stabilization Gate (closed) -> P15 Mobile Observability & Guarded Control (closed) -> P16 AI Capability Benchmark Project (OWNER_GATE raised)
+P14.5 (closed) -> Watchdog recovery-epoch cleanup (closed) -> P14.6 Unattended Execution Stabilization Gate (closed) -> P15 Mobile Observability & Guarded Control (closed) -> P16 AI Capability Benchmark Project (live benchmark enabled)
 
 ## P16 AI Capability Benchmark Project state
 
-Remediated and verified under `OWNER_GATE RAISED (Pending Owner Containment Provisioning)`:
+Remediated and verified for current-user live benchmark execution:
 
 Acceptance evidence:
 1. **Isolated Benchmark Project & Zero Production Contamination**:
@@ -20,12 +20,10 @@ Acceptance evidence:
 3. **Paired A/B Evaluation & Ground-Truth Code-Only Scoring**:
    - Evaluates Planner, Reviewer, Worker, and Debugger roles across paired Track A (Native) and Track B (Retrieval) workspaces with byte-identical prompts and matching prompt hashes.
    - Ground-truth scoring verifies cited spans against corpus bytes, required/false findings, patch application in disposable workspaces, and unit test execution / regression rate. No model judge.
-4. **Windows Containment Boundary**:
-   - External scratch and queue roots outside DevO, AIResourceBroker, and production roots.
-   - Dedicated non-admin SID verification via `whoami /user`.
-   - Deny write/delete directory handle access denial audit against existing protected roots without creating files.
-   - Program-specific Windows Firewall outbound-deny rule verified via regex.
-   - Transactional, SDDL-backed provisioning and digest-checked uninstall scripts adhering to PowerShell 5.1 rules (zero `&&` or `||`).
+4. **Isolation Boundary & Optional Hardening**:
+   - Current-user live benchmark is the default; no dedicated Windows account, SID, password, or Task Scheduler credential is required.
+   - Disposable Git workspaces and external scratch/queue roots keep Worker mutations outside production repositories.
+   - Dedicated-SID ACL deny and outbound-firewall provisioning remain optional hardening tools only and do not block live capability benchmarking.
 5. **Total, Bounded 8-Gate Evaluation & Pipeline Self-Test Baseline**:
    - 24 trials executed and committed under `benchmark/evidence/p16_baseline_20260921/` with authentic `execution_source: "pipeline_self_test"` and mock provider provenance.
    - `capability_gate`: FAIL (zvec-grep not found on system or PATH).
@@ -34,12 +32,14 @@ Acceptance evidence:
    - `fallback_gate`: PASS (12/12 native trials completed, 1.00 completion rate, correctness 1.0000).
    - Final Evaluated Decision: **`NO_PROMOTE`** (`reasons: ["capability_unsupported", "evidence_gate_failed"]`).
    - Artifacts committed under `benchmark/evidence/p16_baseline_20260921/` and canonical acceptance record in `docs/P16_BENCHMARK_ACCEPTANCE.md`.
-6. **Explicit OWNER_GATE on Host Elevation**:
-   - In accordance with the approved design ("Inability to provision the core three-resource acceptance set is an explicit OWNER_GATE"), OWNER_GATE is explicitly raised pending owner elevation to provision the dedicated Windows non-admin SID, ACL write-denials on production roots, and firewall rules. Stopped claiming live evaluation of 3 real broker resources in documentation and agent state.
+6. **No Account-Provisioning OWNER_GATE**:
+   - Owner policy updated 2026-09-22: current-user live benchmark is authorized.
+   - Missing dedicated SID, ACL deny rules, Task Scheduler identity, or host elevation is not a blocker and must not raise `OWNER_GATE`.
+   - Mock/self-test evidence still fails the evidence gate until replaced by sufficient real broker evidence.
 7. **Acceptance Test Suite**:
-   - 9 dedicated P16 test suites in `tests_py/test_p16_*.py` (61 passed in 4.32s).
+   - 9 dedicated P16 test suites in `tests_py/test_p16_*.py` (63 passed after current-user mode update).
 8. **Roadmap Status**:
-   - `agent/staged/roadmap.json` designates `successor: null`. P16 is the terminal milestone on the staged roadmap, currently paused at OWNER_GATE pending host containment provisioning.
+   - `agent/staged/roadmap.json` designates `successor: null`. P16 remains the terminal milestone; live benchmark work may continue without host account provisioning.
 
 ## P15 Mobile Observability & Guarded Control closure
 
@@ -81,7 +81,7 @@ Refer to `agent/staged/P16.md` for initial scope and acceptance criteria.
 
 ## Approved executable design
 
-Create an isolated benchmark project under `benchmark/` that invokes every AI trial through the existing AIBroker execution boundary, freezes deterministic corpora and scoring, compares identical-prompt native and zvec-enabled workspaces, and emits a bounded PROMOTE or NO_PROMOTE decision. Exact-resource cells use AIBroker’s supported exclusion contract against a frozen resource snapshot, while separate bounded retry chains measure Broker decisions, executions, sessions, quota observations and failover. A dedicated non-admin Windows scheduled-task runner, external scratch root, transactional ACL provisioning and static zvec network denial provide an executable containment boundary. Unsupported zvec is a terminal capability-gate failure producing NO_PROMOTE rather than missing-evidence escalation.
+Create an isolated benchmark project under `benchmark/` that invokes every AI trial through the existing AIBroker execution boundary, freezes deterministic corpora and scoring, compares identical-prompt native and zvec-enabled workspaces, and emits a bounded PROMOTE or NO_PROMOTE decision. Exact-resource cells use AIBroker’s supported exclusion contract against a frozen resource snapshot, while separate bounded retry chains measure Broker decisions, executions, sessions, quota observations and failover. Current-user execution in disposable Git workspaces is the default isolation boundary; dedicated-SID ACL and firewall provisioning are optional hardening only. Unsupported zvec is a terminal capability-gate failure producing NO_PROMOTE rather than missing-evidence escalation.
 
 ### Implementation steps
 - Create the standalone `benchmark/` Python project with `src/aibench/`, frozen configuration, README and CLI entry point; add only test import plumbing outside that tree. Production `src/dev_orchestrator/**` must not import aibench or gain a benchmark command.
@@ -99,23 +99,23 @@ Create an isolated benchmark project under `benchmark/` that invokes every AI tr
 - Capture zvec wrapper calls and same-policy shell-command observations from workspace-scoped shims, plus correlated AIBroker harness tool events where the backend reports them. Publish `observed_shell_tool_calls`, `zvec_calls` and `provider_reported_tool_calls` separately; expose an aggregate tool-call metric only when its source declares complete coverage, so native/internal reads are never presented as fully observed.
 - Implement code-only scoring for grounded answers and patches: verify cited paths/spans against frozen bytes, score required and false findings, apply Worker output only in its disposable workspace, and execute the frozen relevant-test subset for patch validity and regression rate. No model judge or undocumented subjective ranking is permitted.
 - Implement staleness and operating-cost probes by adding, renaming and deleting known symbols after indexing without refresh, then measuring false stale hits, misses, retrieval latency, index time/size and availability. Run the adapter under the preprovisioned outbound-deny rule; only successful index/query probes under that verified rule may set `local_only=true`.
-- Implement the Windows containment protocol. A fixed scheduled task named in machine-local configuration runs `python -m aibench.scheduled_worker` under one dedicated non-admin SID with stored Scheduler credentials, least privilege and a fixed external queue. The coordinator validates the exported task definition, submits a hashed plan request, starts it with `schtasks.exe`, and accepts output only after the worker records the expected SID from `whoami /user`.
-- Place scratch and queue roots outside DevO, AIResourceBroker and every configured production project root. The scheduled worker validates deny-write/delete ACLs for its SID on all protected roots, opens directory handles requesting write/delete access and requires access denial without creating files, then performs create/write/rename/delete tests in scratch. It aborts before starting Broker if identity, ACL, scratch or registry checks fail.
-- Provide elevated install/uninstall scripts for the static containment boundary. The installer validates resolved roots, stores original SDDL and firewall state in `%ProgramData%\DevOrchestrator\P16`, journals each mutation before applying the dedicated-SID deny ACEs and unique program-specific outbound-deny rule, and rolls back an incomplete transaction on the next invocation. Uninstall restores only state whose installed digest still matches, otherwise stops for owner review. Live runs never change ACLs or firewall rules.
+- Support optional out-of-process queue execution through `python -m aibench.scheduled_worker`, but do not require a dedicated Windows account, stored Scheduler credentials, SID match, or `schtasks.exe` for live benchmark acceptance. Current-user execution is the default path.
+- Place scratch and queue roots outside DevO, AIResourceBroker and every configured production project root. Current-user mode requires path isolation, disposable managed Git workspaces, scratch mutation checks, and readable Broker registry. Dedicated-SID write/delete ACL denial checks run only when optional hardening is explicitly configured.
+- Retain install/uninstall scripts only as optional hardening utilities. When no dedicated SID is configured they must not mutate production ACLs. Live current-user runs never require account creation, ACL changes, firewall changes, or administrator elevation.
 - Implement resumable append-only run records, deterministic aggregation and reports. Versioned thresholds require correctness/evidence non-inferiority, bounded false findings, at least one statistically supported wall-time, complete-tool-call or reported-token benefit, and passing capability, privacy, staleness, latency, availability, index-cost and native-fallback gates.
 - Make the final decision total and bounded: all promotion and evidence gates pass yields PROMOTE; every other completed run yields NO_PROMOTE with enumerated failed gates. A missing or incompatible zvec installation yields `NO_PROMOTE` with `capability_unsupported`; downstream zvec metrics become `not_applicable_due_to_capability_failure`, not `not_measured`. If zvec is supported, missing required measurements or coverage fails the evidence gate and also yields NO_PROMOTE after the frozen budget.
-- Execute and commit sanitized acceptance evidence under `benchmark/evidence/<run_id>/` plus `docs/P16_BENCHMARK_ACCEPTANCE.md`. A supported adapter must include applied native-versus-zvec pairs; an unsupported adapter must include its capability proof, a native-fallback pair with `retrieval_applied=false`, and NO_PROMOTE. Raise OWNER_GATE only when the dedicated boundary or three real Broker resources cannot be provisioned, not merely because zvec is unsupported.
+- Execute and commit sanitized acceptance evidence under `benchmark/evidence/<run_id>/` plus `docs/P16_BENCHMARK_ACCEPTANCE.md`. A supported adapter must include applied native-versus-zvec pairs; an unsupported adapter must include its capability proof, a native-fallback pair with `retrieval_applied=false`, and NO_PROMOTE. Lack of a dedicated Windows identity or host hardening must never raise OWNER_GATE; only an independent, genuinely owner-only decision may do so.
 - Add focused unit, integration, containment-fixture and evidence-schema tests, run the full Python regression and compile checks, scan new PowerShell/code for unsafe shell usage, run `git diff --check`, and finish with `graphify update .` as required by repository policy.
 
 ### Interfaces / contracts
-- `benchmark/src/aibench/` and `python -m aibench {corpus-verify,containment-audit,zvec-probe,plan-freeze,submit,run,report,decide}`; live execution is delegated to `python -m aibench.scheduled_worker`.
+- `benchmark/src/aibench/` and `python -m aibench {corpus-verify,containment-audit,zvec-probe,plan-freeze,submit,run,report,decide}`; live execution may run directly under the current user, with `python -m aibench.scheduled_worker` retained as an optional queue worker.
 - Existing `dev_orchestrator.ai.execution_port.AIExecutionPort` and `AIBrokerExecutionPort.execute(AIRoleRequest) -> AIRoleResult`; no new provider-facing adapter or production execution contract is introduced.
 - `BrokerBenchmarkClient.snapshot_resources() -> ResourceSnapshot`, `execute_exact(target_resource_id, request) -> BrokerAttempt`, and `execute_reliability_chain(request, max_attempts=3) -> tuple[BrokerAttempt,...]`; exact dispatch is implemented by excluding all other frozen Broker resources.
 - `ResourceSnapshot` records sanitized resource_id/provider/account/model/capabilities plus Broker registry digest; raw registry credentials, environment values and service tokens are never copied into evidence.
 - `BenchmarkTask` and `FrozenPrompt` carry task_id, role, prompt bytes/hash, timeout, response schema, rubric reference and retrieval-sensitive flag; the same prompt object is used for both tracks.
 - `ZvecAdapter.probe`, `build_index`, `query`, `stats` and `verify_network_denial`; `RetrievalHit(path,start_line,end_line,score,mode)` is accepted only after exact workspace validation.
-- `ContainmentConfig` in ignored `runtime/benchmark.json` contains absolute external scratch/queue roots, dedicated SID, scheduled-task name, Broker runtime paths, zvec path and expected firewall-rule identity; it contains no Scheduler password, provider token or service token.
-- Scheduled-task queue protocol: atomically written request JSON with plan path/hash and nonce, worker-owned result JSON with nonce, SID, timestamps and exit classification, and coordinator timeout/cancellation. The fixed task action accepts no user-supplied command line.
+- `ContainmentConfig` in ignored `runtime/benchmark.json` contains absolute external scratch/queue roots and Broker runtime paths. Dedicated SID, scheduled-task name, zvec path and firewall-rule identity are optional hardening fields; no Scheduler password, provider token or service token is stored.
+- Optional queue protocol: atomically written request JSON with plan path/hash and nonce, worker-owned result JSON with nonce, observed user/SID, timestamps and exit classification, and coordinator timeout/cancellation. No dedicated task identity is required.
 - Containment state under `%ProgramData%\DevOrchestrator\P16` stores the transaction journal, original and installed ACL digests, protected absolute paths, zvec executable hash and firewall-rule ownership needed for recovery and uninstall.
 - `TrialPlan`, `TrialRecord`, `BrokerAttempt`, `TrialScore`, `MetricCoverage`, `RunSummary` and `PromotionDecision`; records are schema-versioned and retain raw correlation IDs and metric provenance.
 - Artifacts: frozen corpus manifests and rubrics, `promotion-thresholds.json`, `trial_plan.json`, append-only `results.jsonl`, `summary.json`, `report.md`, `promotion_decision.json` and sanitized acceptance evidence.

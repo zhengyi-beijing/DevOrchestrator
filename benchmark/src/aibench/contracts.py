@@ -668,8 +668,8 @@ class ContainmentConfig:
         return cls(
             scratch_root=str(data["scratch_root"]),
             queue_root=str(data["queue_root"]),
-            dedicated_sid=str(data["dedicated_sid"]),
-            scheduled_task_name=str(data["scheduled_task_name"]),
+            dedicated_sid=str(data.get("dedicated_sid", "")),
+            scheduled_task_name=str(data.get("scheduled_task_name", "")),
             broker_config_path=str(data["broker_config_path"]),
             zvec_path=str(data["zvec_path"]),
             firewall_rule_name=str(data["firewall_rule_name"]),

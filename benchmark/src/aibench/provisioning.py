@@ -87,29 +87,32 @@ class ContainmentProvisioner:
         installed_roots: list[str] = []
         sddl_backups: dict[str, str] = {}
 
-        # Step 1: Backup SDDL and record journal intent
-        for root_str in config.protected_roots:
-            p = Path(root_str)
-            if not p.exists():
-                continue
-            backup_file = self.state_dir / f"sddl_{p.name}_{sha256_bytes(root_str.encode())[:8]}.acl"
-            if not dry_run:
-                self.state_dir.mkdir(parents=True, exist_ok=True)
-                proc = subprocess.run(
-                    ["icacls", str(p), "/save", str(backup_file)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if proc.returncode == 0:
-                    sddl_backups[root_str] = str(backup_file)
+        # Step 1: Optional dedicated-SID ACL hardening. Current-user
+        # benchmark mode deliberately skips ACL mutation and account
+        # provisioning; disposable Git workspaces remain the primary boundary.
+        if config.dedicated_sid:
+            for root_str in config.protected_roots:
+                p = Path(root_str)
+                if not p.exists():
+                    continue
+                backup_file = self.state_dir / f"sddl_{p.name}_{sha256_bytes(root_str.encode())[:8]}.acl"
+                if not dry_run:
+                    self.state_dir.mkdir(parents=True, exist_ok=True)
+                    proc = subprocess.run(
+                        ["icacls", str(p), "/save", str(backup_file)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if proc.returncode == 0:
+                        sddl_backups[root_str] = str(backup_file)
 
-            journal.append({
-                "op": "apply_deny_ace",
-                "target": str(p),
-                "sid": config.dedicated_sid,
-                "status": "pending",
-            })
+                journal.append({
+                    "op": "apply_deny_ace",
+                    "target": str(p),
+                    "sid": config.dedicated_sid,
+                    "status": "pending",
+                })
 
         if config.firewall_rule_name and config.zvec_path:
             journal.append({

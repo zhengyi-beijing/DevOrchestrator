@@ -5,7 +5,7 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P16 AI Capability Benchmark Project** — **OWNER_GATE RAISED (Pending Owner Containment Provisioning)**.
+Current task: **P16 AI Capability Benchmark Project** — **LIVE BENCHMARK ENABLED (Current-User Mode; No Dedicated Account Required)**.
 
 P16 AI Capability Benchmark Project remediation & state (2026-09-21):
 - Remediated all findings from Technical Review (`ai_review:auto-58add3451902f376035e2fe7:execute`):
@@ -15,11 +15,11 @@ P16 AI Capability Benchmark Project remediation & state (2026-09-21):
   4. Network denial regex matching: `verify_network_denial` in `zvec.py` uses `re.search(r"action:\s*(?:block|deny)\b", ...)` and `re.search(r"direction:\s*out\b", ...)`, preventing false positives when `"out"` is present elsewhere in the rule output.
   5. Committed baseline evidence alignment: Updated `benchmark/evidence/p16_baseline_20260921/` (`trial_plan.json`, `results.jsonl`, `summary.json`, `promotion_decision.json`, `report.md`) to record `execution_source: "pipeline_self_test"`, `has_real_broker_evidence: false`, `decision: NO_PROMOTE`, and `evidence_gate: FAIL`.
   6. Integrity test modernization: Rewrote `test_committed_evidence_consistency` in `tests_py/test_p16_cli_and_integration.py` to assert schema, monotonic timestamps, and `pipeline_self_test` provenance (`evidence_gate: FAIL`, `fallback_gate: PASS`) rather than hard-asserting artificial 100% scores.
-  7. Explicit OWNER_GATE on host elevation: In accordance with the approved design ("Inability to provision the core three-resource acceptance set is an explicit OWNER_GATE"), OWNER_GATE is explicitly raised pending owner elevation to provision the dedicated Windows non-admin SID, ACL write-denials on production roots, and firewall rules. Stopped claiming live evaluation of 3 real broker resources in documentation and agent state.
+  7. Account-provisioning requirement removed (owner policy update 2026-09-22): current-user live benchmark is authorized. Dedicated Windows account/SID, ACL deny provisioning, Task Scheduler identity, and host elevation are optional hardening only and must not raise OWNER_GATE. Evidence authenticity remains fail-closed for mock/self-test runs.
 - Final evaluated decision: **`NO_PROMOTE`** (`reasons: ["capability_unsupported", "evidence_gate_failed"]`).
 - Canonical acceptance record updated in `docs/P16_BENCHMARK_ACCEPTANCE.md`.
-- Acceptance suite: 9 dedicated P16 test suites passed (61 passed in 4.32s).
-- Full repository regression: 1041 passed, 87 subtests passed in 351.44s (0 failures).
+- Acceptance suite: 9 dedicated P16 test suites passed (63 passed after current-user mode update).
+- Full repository regression: 1044 passed, 87 subtests passed in 365.77s (0 failures).
 - Python compilation (`python -m compileall -q src ops tests_py benchmark/src`): passed cleanly (exit code 0).
 - `git diff --check`: clean (0 whitespace/formatting defects).
 - Graphify update (`graphify update .`): updated cleanly.

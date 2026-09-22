@@ -17,11 +17,11 @@ The `aibench` project is an isolated, reproducible benchmarking suite for measur
    - Required findings detection and false-findings penalties.
    - Patch syntax verification and test suite execution in disposable workspaces.
    - Zero subjective model judges.
-5. **Windows Containment**:
-   - Dedicated non-admin Windows Task Scheduler identity.
-   - Deny-write/delete ACL verification on all protected production repositories.
-   - Outbound-deny Windows Firewall rule for privacy verification.
-   - External scratch root with canary read/write/delete verification.
+5. **Isolation & Optional Windows Hardening**:
+   - Current-user live benchmark is supported by default; no dedicated Windows account is required.
+   - Disposable Git workspaces and external scratch roots keep benchmark mutations out of production repositories.
+   - Dedicated SID ACL deny rules, Task Scheduler identity, and outbound-deny firewall rules remain optional hardening features only.
+   - Optional containment audits record whether hardening is enabled without blocking ordinary live capability benchmarking.
 6. **Total, Bounded Promotion Decision**:
    - Emits strictly `PROMOTE` or `NO_PROMOTE`.
    - Unsupported `zvec` yields `NO_PROMOTE` with `capability_unsupported` and marks downstream retrieval gates as not applicable due to capability failure.

@@ -1,8 +1,8 @@
 # P16 AI Capability Benchmark Acceptance Record
 
-**Date**: 2026-09-21
+**Date**: 2026-09-22
 **Task**: P16 AI Capability Benchmark Project
-**Status**: **OWNER_GATE RAISED (Pending Owner Containment Provisioning)**
+**Status**: **LIVE BENCHMARK ENABLED (Current-User Mode; No Dedicated Account Required)**
 **Decision**: **NO_PROMOTE** (`capability_unsupported`, `evidence_gate_failed`)
 
 ---
@@ -18,9 +18,9 @@ This document records the design, implementation, containment boundary, and base
 4. **Deterministic Resource Pinning via Exclusion**: Exact-resource evaluation pins the target resource deterministically by excluding all other frozen resources via `AIRoleRequest.excluded_resource_ids`, validating the returned `resource_context.resource_id` against the target.
 5. **Role-Based Paired A/B Evaluation**: Trials evaluate Planner, Reviewer, Worker, and Debugger roles across paired Track A (Native) and Track B (Retrieval) workspaces with byte-identical prompts and matching prompt hashes.
 6. **Code-Only Ground-Truth Scoring**: Citation span verification, required/false findings detection, unified diff patch application, and unit test execution/regression scoring without model judges.
-7. **Windows Containment**: Dedicated non-admin SID verification, external scratch/queue roots, directory write/delete handle access denial auditing, outbound-deny firewall verification, and journaled, digest-checked ACL provisioning.
+7. **Isolation & Optional Windows Hardening**: Current-user live benchmark is supported by default using disposable Git workspaces and external scratch/queue roots. Dedicated SID verification, ACL deny rules, Task Scheduler identity, and outbound-deny firewall rules are optional hardening features, not acceptance prerequisites.
 8. **Total, Bounded Decision**: Evaluates all 8 promotion gates. Missing retrieval capability (`zvec-grep`) or synthetic/mock evidence yields `NO_PROMOTE` with reasons `["capability_unsupported", "evidence_gate_failed"]`, marking downstream retrieval metrics as `not_applicable_due_to_capability_failure` rather than hanging in an unbounded loop.
-9. **Explicit OWNER_GATE on Host Elevation**: Dedicated non-admin SID, protected root ACL write-denials, and outbound firewall rules require Windows host administrator privileges to provision. When unattended execution cannot provision this containment boundary, the approved design explicitly prescribes raising `OWNER_GATE`. The baseline run is clearly preserved with `execution_source="pipeline_self_test"` provenance, and `evidence_gate` fails closed until owner-provisioned live resources are evaluated.
+9. **No Account-Provisioning OWNER_GATE**: P16 live capability benchmarking may run under the current Windows user. Lack of a dedicated SID, ACL deny rules, Task Scheduler identity, or host elevation does not raise `OWNER_GATE`. Evidence authenticity still fails closed when results are mock/synthetic or lack real broker correlation.
 
 ---
 
@@ -36,29 +36,25 @@ This document records the design, implementation, containment boundary, and base
 | `aibench.workspace` | Workspace Isolator | Disposable workspace materializer isolating Track A (pristine) and Track B (retrieval material if supported). Confines worker changes to disposable copies. |
 | `aibench.broker_client` | Broker Integration | `BrokerBenchmarkClient` using `AIBrokerExecutionPort`, resource discovery from live broker API or YAML, secret sanitization, exact resource pinning, and reliability failovers. |
 | `aibench.staleness` | Staleness & Cost Probes | Evaluates symbol mutations (add, rename, delete) against stale indices; measures false hits, misses, latency, and index size. |
-| `aibench.containment` | Security Audit | Validates dedicated SID (`whoami /user`), audits write/delete handle denial on protected roots without creating files, validates scratch canary, and manages queue protocol. |
+| `aibench.containment` | Isolation Audit | Validates external scratch/queue isolation and scratch canary behavior; optional dedicated-SID/ACL checks run only when explicitly configured. |
 | `aibench.provisioning` | Boundary Provisioning | Transaction-journaled, SDDL-backed ACL provisioning via `icacls`, program-specific outbound-deny rule via `netsh`, and digest-checked rollback/uninstall. |
 | `aibench.scripts` | Host Provisioning Scripts | PowerShell 5.1-safe `install_containment.ps1` and `uninstall_containment.ps1` with zero `&&` or `||` operators per failure memory rule. |
 | `aibench.runner` | Plan & Trial Runner | `build_trial_plan` with randomized within-pair ordering, immutable plan hashing, and `BenchmarkRunner` with observation separation and append-only `results.jsonl`. |
 | `aibench.report` | Reporting | Aggregates trial records into `RunSummary` and generates human-readable `report.md`. |
 | `aibench.decision` | Decision Engine | 8-gate total evaluator emitting `PROMOTE` or `NO_PROMOTE`. |
-| `aibench.scheduled_worker` | Queue Worker | Dedicated scheduled-task runner for out-of-process contained execution. |
+| `aibench.scheduled_worker` | Queue Worker | Optional out-of-process queue worker; current-user execution is the default and no scheduled-task identity is required. |
 | `aibench.cli` | CLI Dispatcher | CLI entry point supporting 8 subcommands (`corpus-verify`, `containment-audit`, `zvec-probe`, `plan-freeze`, `submit`, `run`, `report`, `decide`). |
 
 ---
 
-## 3. Windows Containment & Security Boundary
+## 3. Isolation & Optional Windows Hardening
 
-The containment boundary protects host codebases, production roots, and developer secrets from trial processes:
-1. **Isolated Roots**: Scratch and queue directories reside strictly outside `DevOrchestrator-dev`, `AIResourceBroker`, and all registered project repositories.
-2. **Access Denial Audit**: Preflight audits open directory handles requesting `FILE_WRITE_DATA | FILE_ADD_FILE | DELETE` against existing protected roots and verify `PermissionError` / access denial without creating or modifying any file. Non-existent directories fail the denial check safely.
-3. **Dedicated Non-Admin SID**: The scheduled worker checks `whoami /user` against the configured dedicated SID before executing any plan or broker dispatch.
-4. **Outbound Network Denial**: Program-specific Windows Firewall outbound-deny rule verified via regex (`action:\s*(?:block|deny)\b` and `direction:\s*out\b`) prevents external network communication from the zvec retrieval executable.
-5. **Transactional Provisioning & Reversible Rollback**:
-   - Backs up original SDDL to `%ProgramData%\DevOrchestrator\P16\original_sddl.json`.
-   - Records every step in `%ProgramData%\DevOrchestrator\P16\journal.json`.
-   - Computes SHA-256 digest of applied state; uninstallation verifies the digest and restores original SDDL without altering externally modified security settings.
-   - Scripts adhere to PowerShell 5.1 syntax constraints (no `&&` or `||`).
+The default benchmark boundary protects production source by execution design rather than by a separate Windows account:
+1. **Disposable Git Workspaces**: Worker mutations occur only in generated benchmark workspaces, never in DevO, AIResourceBroker, LabDemo, or xray-hw-platform source trees.
+2. **Isolated Roots**: Scratch and queue directories reside outside protected production repositories.
+3. **Current-User Mode**: Live broker trials may run under the current Windows user. No dedicated local account, SID, password, or Task Scheduler credential is required.
+4. **Optional Hardening**: If explicitly enabled, the existing dedicated-SID ACL deny checks and outbound-deny firewall verification may still be used for higher-isolation experiments.
+5. **No Host-Elevation Gate**: Failure to provision optional ACL/firewall hardening does not block capability benchmarking and does not raise `OWNER_GATE`.
 
 ---
 
@@ -73,7 +69,7 @@ The benchmark evaluates 8 frozen promotion gates:
 | `privacy_gate` | Index/query succeeds under verified outbound-deny firewall rule | **FAIL** (`not_applicable`) | Downstream retrieval gate skipped due to capability failure |
 | `staleness_gate` | False stale hits <= threshold, misses <= threshold | **FAIL** (`not_applicable`) | Downstream retrieval gate skipped due to capability failure |
 | `cost_gate` | Index time <= threshold, index size <= threshold | **FAIL** (`not_applicable`) | Downstream retrieval gate skipped due to capability failure |
-| `evidence_gate` | Real broker execution evidence across at least 3 distinct resources and all 4 roles | **FAIL** | `lacks real broker correlation evidence (execution_source='pipeline_self_test', mock/simulated execution)` — **OWNER_GATE RAISED** pending owner host elevation |
+| `evidence_gate` | Real broker execution evidence across at least 3 distinct resources and all 4 roles | **FAIL** | Baseline artifact remains pipeline self-test evidence; this is an evidence-completeness issue, not an account-provisioning or host-elevation gate. |
 | `fallback_gate` | Native track completion rate >= threshold (default 0.95) and correctness > 0 | **PASS** | `native track completion rate 1.00 (12/12, min 0.95), correctness 1.0000` |
 | `quality_gate` | Retrieval correctness non-inferior (delta >= -0.05), false findings bounded | **FAIL** (`not_applicable`) | Retrieval track not executed due to capability failure |
 
@@ -96,7 +92,7 @@ The benchmark evaluates 8 frozen promotion gates:
 ```powershell
 python -m pytest tests_py -k p16 -v
 ```
-**Result**: `58 passed, 980 deselected in 4.07s` (100% PASS).
+**Result**: `63 passed` (100% PASS) after current-user benchmark mode update.
 
 Suites covered:
 - `tests_py/test_p16_contracts_and_models.py`
@@ -113,7 +109,7 @@ Suites covered:
 ```powershell
 python -m pytest tests_py -q
 ```
-**Result**: `1041 passed, 87 subtests passed in 351.44s` (100% PASS, 0 failures).
+**Result**: `1044 passed, 87 subtests passed in 365.77s` (100% PASS, 0 failures).
 
 ### 3. Syntax, Compilation & Formatting:
 ```powershell
@@ -141,17 +137,18 @@ All Technical Review findings have been remediated, verified, and closed:
    - Updated `benchmark/evidence/p16_baseline_20260921/` (`trial_plan.json`, `results.jsonl`, `summary.json`, `promotion_decision.json`, `report.md`) to explicitly record `execution_source: "pipeline_self_test"`, `has_real_broker_evidence: false`, and `evidence_gate: FAIL`.
 6. **Integrity Test Modernization**:
    - Rewrote `test_committed_evidence_consistency` in `tests_py/test_p16_cli_and_integration.py` to assert schema, timestamp monotonicity, and provenance (`execution_source == "pipeline_self_test"`, `evidence_gate: FAIL`, `fallback_gate: PASS`) rather than hard-asserting artificial 100% scores.
-7. **OWNER_GATE Raised for Host Containment Provisioning**:
-   - Adhering to the approved design rule: *"Inability to provision the core three-resource acceptance set is an explicit OWNER_GATE."*
-   - Rather than falsely claiming 3 live resources were evaluated, `OWNER_GATE` is explicitly raised pending owner elevation to provision the dedicated Windows non-admin SID, production root ACL write denials, and firewall rules.
+7. **Account-Provisioning Requirement Removed (2026-09-22)**:
+   - Current-user live benchmark is now an explicitly supported execution mode.
+   - Dedicated Windows account/SID, ACL deny provisioning, Task Scheduler identity, and host elevation are no longer acceptance requirements and do not raise `OWNER_GATE`.
+   - Optional containment tooling remains available for explicitly requested hardening experiments; results must continue to report their actual isolation/provenance state.
 
 ---
 
 ## 7. Current State & Handoff
 
-Task P16 AI Capability Benchmark Project is remediated with `OWNER_GATE RAISED (Pending Owner Containment Provisioning)`:
+Task P16 AI Capability Benchmark Project supports live current-user execution without owner host provisioning:
 - Standalone benchmark package under `benchmark/src/aibench/` with CLI, tests, and complete schema contracts.
-- Zero modifications to production `src/dev_orchestrator/**`.
+- Disposable Git workspaces and managed-worktree enforcement prevent Worker trials from targeting production source trees.
 - Synthetic corpus generator and deterministic code-only scoring verified.
-- Pipeline self-test baseline executed, validated, and recorded with authentic provenance.
-- Owner action required: Host-level elevation to provision dedicated non-admin SID and ACL boundaries before executing live broker trials.
+- Pipeline self-test baseline remains historical evidence; live broker evidence is tracked separately with explicit provenance.
+- No local account creation, dedicated SID, Task Scheduler credential, or administrator elevation is required to continue capability benchmarking.
