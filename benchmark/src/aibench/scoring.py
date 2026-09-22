@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -296,6 +298,8 @@ def score_trial(
     attempt: BrokerAttempt,
     workspace_path: Path,
     trial_id: str,
+    *,
+    baseline_workspace_path: Path | None = None,
 ) -> TrialScore:
     """Deterministic, code-only scoring of a trial result."""
     if attempt.status != "succeeded" or not attempt.output:
@@ -347,49 +351,81 @@ def score_trial(
             details={"error": "json_output_not_object"},
         )
 
-    # 1. Verify citations
-    citations = parsed_output.get("citations", [])
-    if isinstance(citations, list):
-        valid_citations, invalid_citations, citation_details = verify_citations(citations, workspace_path)
-    else:
-        valid_citations, invalid_citations, citation_details = 0, 1, [{"reason": "citations must be a list"}]
-
-    # 2. Evaluate required and prohibited findings
+    # 1. Evaluate required and prohibited findings.
     output_text_dump = json.dumps(parsed_output)
     req_findings = task.ground_truth.get("required_findings", [])
     pro_findings = task.ground_truth.get("prohibited_findings", [])
     req_met, req_total, false_count = evaluate_findings(output_text_dump, req_findings, pro_findings)
 
-    # 3. Role-specific evaluation
+    # 2. Role-specific evaluation. Worker patches are always validated against
+    # the frozen corpus baseline when one is supplied. This prevents
+    # accept-edits providers from being penalized because they already modified
+    # the live disposable workspace before returning the same unified diff.
+    citations = parsed_output.get("citations", [])
     patch_valid: bool | None = None
     tests_passed: int | None = None
     tests_failed: int | None = None
     regression_rate: float | None = None
+
+    if task.role == "worker":
+        patch_text = str(parsed_output.get("patch", "")).strip()
+        test_file = str(task.ground_truth.get("test_file", "tests/test_cache.py"))
+        temporary: tempfile.TemporaryDirectory[str] | None = None
+        evaluation_workspace = workspace_path
+        if baseline_workspace_path is not None:
+            temporary = tempfile.TemporaryDirectory(prefix="aibench-worker-score-")
+            evaluation_workspace = Path(temporary.name) / "workspace"
+            shutil.copytree(
+                baseline_workspace_path,
+                evaluation_workspace,
+                ignore=shutil.ignore_patterns(".git", ".aibench", "__pycache__", ".pytest_cache", "*.pyc", "*.pyo"),
+            )
+        try:
+            patch_applied = _apply_unified_diff(patch_text, evaluation_workspace)
+            patch_valid = patch_applied
+
+            # Worker citations describe the submitted implementation, so check
+            # them against the post-patch source tree rather than the pre-patch
+            # baseline.
+            if isinstance(citations, list):
+                valid_citations, invalid_citations, citation_details = verify_citations(
+                    citations, evaluation_workspace
+                )
+            else:
+                valid_citations, invalid_citations, citation_details = 0, 1, [
+                    {"reason": "citations must be a list"}
+                ]
+
+            if patch_applied:
+                tests_passed, tests_failed = run_workspace_tests(evaluation_workspace, test_file)
+                total_tests = tests_passed + tests_failed
+                regression_rate = (tests_failed / total_tests) if total_tests > 0 else 1.0
+            else:
+                tests_passed = 0
+                tests_failed = 1
+                regression_rate = 1.0
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+    else:
+        if isinstance(citations, list):
+            valid_citations, invalid_citations, citation_details = verify_citations(citations, workspace_path)
+        else:
+            valid_citations, invalid_citations, citation_details = 0, 1, [
+                {"reason": "citations must be a list"}
+            ]
+
     score_details: dict[str, Any] = {
         "citation_details": citation_details,
         "req_met": req_met,
         "req_total": req_total,
         "false_count": false_count,
     }
-
     if task.role == "worker":
-        patch_text = str(parsed_output.get("patch", "")).strip()
-        test_file = str(task.ground_truth.get("test_file", "tests/test_cache.py"))
-        patch_applied = _apply_unified_diff(patch_text, workspace_path)
-        patch_valid = patch_applied
-        if patch_applied:
-            t_pass, t_fail = run_workspace_tests(workspace_path, test_file)
-            tests_passed = t_pass
-            tests_failed = t_fail
-            total_tests = t_pass + t_fail
-            regression_rate = (t_fail / total_tests) if total_tests > 0 else 1.0
-        else:
-            tests_passed = 0
-            tests_failed = 1
-            regression_rate = 1.0
-        score_details["patch_applied"] = patch_applied
+        score_details["patch_applied"] = bool(patch_valid)
         score_details["tests_passed"] = tests_passed
         score_details["tests_failed"] = tests_failed
+        score_details["isolated_from_provider_edits"] = baseline_workspace_path is not None
 
     # 4. Calculate normalized correctness (0.0 to 1.0)
     # Citation precision

@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from aibench.corpus import generate_synthetic_corpus
 from aibench.prompts import get_canonical_tasks
 from aibench.report import build_run_summary, generate_report_markdown
 from aibench.runner import BenchmarkRunner, build_trial_plan
+from aibench.workspace import cleanup_workspace, materialize_workspace
 from aibench.zvec import ZvecAdapter
 from tests_py.test_p16_broker_client import MockExecutionPort
 
@@ -42,6 +44,47 @@ class TestP16RunnerAndSummary(unittest.TestCase):
         # Pair order is randomized (contains both A-first and B-first pairs)
         order_0_tracks = {c.track for c in plan.cells if c.pair_order == 0}
         self.assertEqual(order_0_tracks, {TRACK_A, TRACK_B})
+
+    def test_materialized_workspace_is_clean_git_baseline(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            corpus_dir = base / "corpus"
+            generate_synthetic_corpus(corpus_dir)
+            resources = ["res_1", "res_2", "res_3"]
+            plan = build_trial_plan(
+                selected_resources=resources,
+                tasks=(get_canonical_tasks()[0],),
+                repeats=1,
+                seed=42,
+                require_all_roles=False,
+            )
+            cell = next(c for c in plan.cells if c.track == TRACK_A)
+            workspace, retrieval_applied = materialize_workspace(
+                base / "scratch",
+                cell,
+                corpus_dir,
+                ZvecAdapter(),
+            )
+            try:
+                self.assertFalse(retrieval_applied)
+                top = subprocess.run(
+                    ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+                self.assertEqual(Path(top).resolve(), workspace.resolve())
+                status = subprocess.run(
+                    ["git", "-C", str(workspace), "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
+                self.assertEqual(status, "")
+                exclude = (workspace / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+                self.assertIn(".aibench/", exclude)
+            finally:
+                cleanup_workspace(workspace)
 
     def test_runner_execution_and_resumption(self):
         with tempfile.TemporaryDirectory() as td:
@@ -68,6 +111,10 @@ class TestP16RunnerAndSummary(unittest.TestCase):
             records1 = runner.run_plan(small_plan, corpus_dir, snapshot)
             self.assertEqual(len(records1), 6)
             self.assertTrue(results_file.is_file())
+            self.assertTrue(port.recorded_requests)
+            self.assertTrue(
+                all(req.metadata.get("managed_worktree") is True for req in port.recorded_requests)
+            )
 
             # Second execution of same plan should resume and not re-dispatch
             initial_dispatches = len(port.recorded_requests)

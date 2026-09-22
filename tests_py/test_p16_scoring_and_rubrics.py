@@ -12,6 +12,7 @@ from aibench.contracts import BenchmarkTask, BrokerAttempt
 from aibench.corpus import generate_synthetic_corpus
 from aibench.prompts import get_canonical_tasks
 from aibench.scoring import (
+    _apply_unified_diff,
     evaluate_findings,
     score_trial,
     verify_citations,
@@ -116,6 +117,59 @@ class TestP16ScoringAndRubrics(unittest.TestCase):
         self.assertGreaterEqual(score.tests_passed or 0, 3)
         self.assertEqual(score.tests_failed, 0)
         self.assertGreater(score.correctness, 0.8)
+
+    def test_worker_scoring_uses_pristine_baseline_and_post_patch_citations(self):
+        task = self.tasks["task_cache_worker"]
+        baseline = Path(self.td.name) / "baseline"
+        generate_synthetic_corpus(baseline)
+        patch = """diff --git a/src/synth_app/core/cache.py b/src/synth_app/core/cache.py
+--- a/src/synth_app/core/cache.py
++++ b/src/synth_app/core/cache.py
+@@ -66,6 +66,15 @@ class LRUCache:
+         self._store.clear()
+         self._access_order.clear()
+\x20
+-    # NOTE FOR BENCHMARK WORKER:
+-    # get_or_set(self, key: str, default_fn: Callable[[], Any], ttl: float | None = None) -> Any
+-    # is intentionally not implemented in this revision.
++    def get_or_set(self, key: str, default_fn: Callable[[], Any], ttl: float | None = None) -> Any:
++        entry = self._store.get(key)
++        if entry is not None:
++            if not entry.is_expired():
++                if key in self._access_order:
++                    self._access_order.remove(key)
++                self._access_order.append(key)
++                return entry.value
++            self.delete(key)
++        value = default_fn()
++        self.set(key, value, ttl)
++        return value
+"""
+        # Simulate an accept-edits provider that has already applied its patch
+        # to the live disposable workspace before returning the same diff.
+        self.assertTrue(_apply_unified_diff(patch, self.workspace))
+        payload = {
+            "summary": "Implemented LRUCache.get_or_set",
+            "patch": patch,
+            "citations": [
+                {"path": "src/synth_app/core/cache.py", "start_line": 69, "end_line": 80},
+            ],
+        }
+        attempt = BrokerAttempt(request_id="r1", status="succeeded", output=json.dumps(payload))
+        score = score_trial(
+            task,
+            attempt,
+            self.workspace,
+            "trial_worker_accept_edits",
+            baseline_workspace_path=baseline,
+        )
+        self.assertTrue(score.patch_valid)
+        self.assertEqual(score.tests_passed, 3)
+        self.assertEqual(score.tests_failed, 0)
+        self.assertEqual(score.cited_spans_valid, 1)
+        self.assertEqual(score.cited_spans_invalid, 0)
+        self.assertEqual(score.correctness, 1.0)
+        self.assertTrue(score.details.get("isolated_from_provider_edits"))
 
     def test_generic_diff_patch_fallback_arbitrary_files(self):
         from aibench.scoring import _apply_simple_patch_fallback

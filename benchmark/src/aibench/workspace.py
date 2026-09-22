@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,8 @@ def materialize_workspace(
             dest_file = dest_dir / f
             shutil.copy2(src_file, dest_file)
 
+    _initialize_git_baseline(workspace_path)
+
     retrieval_applied = False
 
     # Track A receives pristine files only.
@@ -77,3 +80,37 @@ def cleanup_workspace(workspace_path: Path) -> None:
     """Remove disposable workspace directory safely."""
     if workspace_path.exists() and workspace_path.is_dir():
         shutil.rmtree(workspace_path, ignore_errors=True)
+
+
+def _initialize_git_baseline(workspace_path: Path) -> None:
+    """Create a clean standalone Git baseline for broker worktree safety.
+
+    Benchmark workspaces are disposable copies, not linked worktrees.  The
+    persistent harness still requires a real Git worktree for writable roles.
+    Track-B retrieval artifacts live under .aibench/ and are ignored via the
+    repository-local info/exclude file so they do not dirty the baseline.
+    """
+    commands = (
+        ["git", "init"],
+        ["git", "config", "user.email", "aibench@local"],
+        ["git", "config", "user.name", "AIBench"],
+        ["git", "add", "-A"],
+        ["git", "commit", "-m", "benchmark baseline"],
+    )
+    for argv in commands:
+        completed = subprocess.run(
+            argv,
+            cwd=str(workspace_path),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"failed to initialize benchmark Git baseline: {detail}")
+
+    exclude = workspace_path / ".git" / "info" / "exclude"
+    with exclude.open("a", encoding="utf-8") as handle:
+        handle.write("\n.aibench/\n")

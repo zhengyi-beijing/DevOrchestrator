@@ -198,6 +198,7 @@ class BenchmarkRunner:
                 working_directory=workspace_path,
                 task_run_id=cell.trial_id,
                 timeout_seconds=cell.timeout_seconds,
+                metadata={"managed_worktree": True},
             )
 
             # Execute trial with exact resource pinning
@@ -213,8 +214,17 @@ class BenchmarkRunner:
                 )
             wall_time = round(time.monotonic() - start_wall, 3)
 
-            # Score result
-            score = score_trial(task, attempt, workspace_path, cell.trial_id)
+            # Score against the frozen corpus baseline.  Some live worker
+            # providers edit the disposable workspace before returning their
+            # unified diff; replaying that diff against the already-mutated
+            # checkout would produce a false patch failure.
+            score = score_trial(
+                task,
+                attempt,
+                workspace_path,
+                cell.trial_id,
+                baseline_workspace_path=corpus_dir,
+            )
 
             # Determine trial status
             if attempt.status == "succeeded":
