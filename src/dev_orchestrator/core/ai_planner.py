@@ -2025,10 +2025,17 @@ class AIPlannerCoordinator:
         marker = "## Approved executable design"
         if marker in original:
             raise RuntimeError("approved design marker already exists")
-        pending = "Status: **PENDING DESIGN**"
-        if pending not in original:
-            raise RuntimeError("PENDING DESIGN status marker missing")
-        text = original.replace(pending, "Status: **READY_TO_RUN**", 1).rstrip() + "\n\n"
+        lines = original.splitlines()
+        pending_indexes = [
+            index for index, line in enumerate(lines)
+            if line.lstrip().startswith("Status:") and "PENDING DESIGN" in line.upper()
+        ]
+        if len(pending_indexes) != 1:
+            raise RuntimeError(
+                f"expected exactly one PENDING DESIGN status line; found {len(pending_indexes)}"
+            )
+        lines[pending_indexes[0]] = "Status: **READY_TO_RUN**"
+        text = "\n".join(lines).rstrip() + "\n\n"
         text += marker + "\n\n"
         text += str(plan["summary"]).strip() + "\n\n"
         for title, key in (("Implementation steps", "implementation_steps"), ("Interfaces / contracts", "interfaces"), ("Validation plan", "validation"), ("Risks / failure modes", "risks"), ("Out of scope", "out_of_scope")):

@@ -649,6 +649,17 @@ def wait_terminal(coordinator: AIPlannerCoordinator, plan_id: str) -> dict:
 
 
 class AIPlannerTests(unittest.TestCase):
+    def test_render_next_accepts_pending_design_status_with_readiness_suffix(self):
+        plan = {
+            "summary": "bounded", "implementation_steps": ["step"],
+            "interfaces": ["interface"], "validation": ["test"],
+            "risks": ["risk"], "out_of_scope": ["other"],
+        }
+        original = "# P15\n\nStatus: **PENDING DESIGN — READY FOR PLAN/EXECUTION**\n\nGoal.\n"
+        rendered = AIPlannerCoordinator._render_next(original, plan, "approved")
+        self.assertIn("Status: **READY_TO_RUN**", rendered)
+        self.assertNotIn("PENDING DESIGN", rendered)
+
     def test_plan_review_freezes_ready_to_run_commit(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"
