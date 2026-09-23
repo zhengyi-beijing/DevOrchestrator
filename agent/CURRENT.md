@@ -40,13 +40,29 @@ P16.7 Self-Healing Project Activation & Readiness completion (2026-09-23):
   - Hardened genuine owner gate and owner pause precedence in `src/dev_orchestrator/core/blockers.py` and `activation_supervisor.py`: updated `_SEVERITY_ORDER` to rank `OWNER_GATE_PRESENT` and `OWNER_PAUSED` at priority 0 (highest severity), ensuring genuine owner gates sort ahead of `TRANSIENT_*` (1), `INSPECTION_FAILED` (2), `ORPHANED_PROJECT_STATE` (3), and `READINESS_*` (7-10). Supervisor evaluates genuine owner gates (`b.code in {"OWNER_GATE_PRESENT", "OWNER_PAUSED"} or b.failure_class == "owner_gate"`) across all blockers, terminating intent as `owner_gate` without burning recovery budgets or attempting spurious readiness migration.
   - Removed unused import `submit_control_command` from line 17 of `activation_supervisor.py`.
   - Added dedicated regression test class `TestP167ReviewRemediation` with 7 test cases in `tests_py/test_p167_self_healing_activation.py` covering stale task ID migration, rollback on commit failure, supervisor migration forward dispatch, elapsed time and action budget exhaustion, worker launch intent satisfaction, and owner pause precedence over readiness mismatches.
+- Technical Review Remediation Round 3 (`ai_review:ai_review:ai_review:bc404b1b-5fd9-4ed8-b11f-729b6fdff6bc:execute`):
+  - Fixed TransitionExecutor decision actuation during post-worker handoff in `src/dev_orchestrator/core/transition_executor.py`:
+    - Extended `_readiness_allows_launch`, `_next_task_ready`, and `_fresh_guard` with `anchor_task_id` and `predecessor_task_id` keyword arguments.
+    - Exact remediation (`decision == "remediate"`) anchors to `anchor_task_id=task_id`; when `agent/execution-state.json` matches the reviewed task identity (`file_task == anchor_task_id`), `READINESS_TASK_ID_MISMATCH` is recognized as a valid anchor and does not block remediation execution.
+    - Accepted successor actuation (`decision == "next"`) passes `predecessor_task_id=task_id`; when `agent/execution-state.json` was bound to the accepted predecessor task and the successor in `next.md` is `ready_to_run`, launch proceeds without false readiness blocks.
+    - Non-permanent decision row consumption: if `launch_task is None` due to a readiness block (`"readiness" in (guard_error or "").lower()`), `_record_blocked` is bypassed so the decision row remains unconsumed in `ledger["executions"]`, enabling subsequent supervisor migration to actuate it.
+  - Hardened lifecycle vs terminal blocker handling in `src/dev_orchestrator/core/blockers.py` and `activation_supervisor.py`:
+    - Updated `READINESS_NOT_READY_TO_RUN` `failure_class` from `"terminal"` to `"lifecycle"`.
+    - In `ActivationSupervisor._advance_intent`, handled lifecycle blockers (`top_blocker.failure_class == "lifecycle"` or `top_blocker.code == "READINESS_NOT_READY_TO_RUN"`) before terminal blocker evaluation. Terminates active intent as `state="stopped"` (emitting `status="lifecycle_hold"`), preserving recovery budgets and preventing phantom `RECOVERY_BUDGET_EXHAUSTED` blockers in `explain_block`.
+  - Normalized legacy token parsing in `src/dev_orchestrator/core/readiness.py`: stripped optional leading `"Status:"` prefix before component splitting in `_resolve_legacy_markdown`.
+  - Added 4 dedicated regression test cases in `tests_py/test_p167_self_healing_activation.py` under `TestP167ReviewRemediation`:
+    - `test_remediate_after_handoff_with_committed_execution_state_and_readiness_projection`: verifies remediate actuation succeeds when `next.md` points to successor while `execution-state.json` is anchored to predecessor.
+    - `test_accepted_next_task_with_committed_predecessor_execution_state_and_readiness_projection`: verifies next task actuation succeeds when `execution-state.json` is anchored to accepted predecessor and `next.md` is ready to run.
+    - `test_readiness_caused_block_does_not_permanently_consume_decision_row`: verifies unlaunchable readiness failures preserve the decision row for subsequent supervisor migration.
+    - `test_readiness_not_ready_to_run_lifecycle_hold_terminates_intent_without_false_exhaustion`: verifies `READINESS_NOT_READY_TO_RUN` stops the intent as `lifecycle_hold` without burning attempts or generating false `RECOVERY_BUDGET_EXHAUSTED`.
 - Acceptance & Verification:
   - Canonical contract authored in `docs/P16_7_SELF_HEALING_ACTIVATION_CONTRACT.md`.
-  - Focused activation & control suites passed: 92 passed (`tests_py/test_p167_self_healing_activation.py`, `tests_py/test_transition_executor.py`, `tests_py/test_control_commands.py`, `tests_py/test_p12_control_actions.py`).
-  - Full test suite regression: 1079 passed, 87 subtests passed in 387.11s (0 failures).
+  - Focused activation suite: 36 passed in `tests_py/test_p167_self_healing_activation.py`.
+  - Adjacent transition & control suites: 69 passed, 16 subtests passed across `test_transition_executor.py`, `test_remediation_flow.py`, `test_control_commands.py`, `test_p12_control_actions.py`.
+  - Full test suite regression: 1083 passed, 87 subtests passed in 389.99s (0 failures).
   - Python compilation (`python -m compileall -q src ops tests_py benchmark/src`): passed cleanly (exit 0).
   - `git diff --check`: passed cleanly (0 whitespace/formatting defects).
-  - Knowledge graph updated via `graphify update .`: 5399 nodes, 15070 edges, 246 communities.
+  - Knowledge graph updated via `graphify update .`: 5403 nodes, 15102 edges, 248 communities.
 - Preserved handoff: P16.8 DevO Golden-Path Lifecycle Hardening (`agent/staged/P16.8.md`, Status: **PENDING DESIGN**).
 
 P16 AI Capability Benchmark Project remediation & state (2026-09-21):

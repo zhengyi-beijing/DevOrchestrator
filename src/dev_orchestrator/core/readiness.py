@@ -190,6 +190,8 @@ def _resolve_legacy_markdown(
         )
 
     raw_token = next_status
+    if raw_token is not None and re.match(r"^status\s*:\s*", raw_token, re.IGNORECASE):
+        raw_token = re.sub(r"^status\s*:\s*", "", raw_token, flags=re.IGNORECASE).strip()
     if raw_token is None and status_matches:
         raw_token = status_matches[0].group(1).strip()
 

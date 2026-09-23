@@ -65,8 +65,8 @@ from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_js
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.control.surface import project_control_view, project_identity
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
-from dev_orchestrator.core.repository import classify_porcelain_entries
-from tests_py.test_transition_executor import make_repo
+from dev_orchestrator.core.repository import classify_porcelain_entries, read_repository_truth
+from tests_py.test_transition_executor import FakeBackend, TransitionExecutor, make_repo
 from tests_py.test_control_commands import FakeExecutor
 
 
@@ -1328,6 +1328,368 @@ class TestP167ReviewRemediation(unittest.TestCase):
             state_file = repo / "agent" / "execution-state.json"
             content = json.loads(state_file.read_text(encoding="utf-8"))
             self.assertEqual(content.get("task_id"), "P1")
+
+    def test_remediate_after_handoff_with_committed_execution_state_and_readiness_projection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+
+            # Structured file committed for P1
+            write_structured_readiness(repo, "ready_to_run", "P1")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "commit P1 readiness"], check=True)
+
+            # Completed worker advanced next.md to P2 before review
+            next_md = repo / "agent" / "next.md"
+            next_md.write_text("# Task P2: Next Feature\n\nStatus: **READY_TO_RUN**\n\nDescription\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/next.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "advance next.md to P2"], check=True)
+
+            truth = read_repository_truth(repo)
+            readiness_res = resolve_readiness(repo, current_task_id="P2", next_status="Status: **READY_TO_RUN**")
+            self.assertEqual(readiness_res.code, "READINESS_TASK_ID_MISMATCH")
+            self.assertEqual(readiness_res.task_id, "P1")
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "p1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage", "next_task"],
+                                "preferred_backends": ["agy"],
+                                "backends": {"agy": {"executable": "agy.cmd"}},
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            req_id = "ai_review:p1:remediate_1"
+            decision_record = {
+                "project_id": "p1",
+                "request_id": req_id,
+                "disposition": "apply",
+                "decision": "remediate",
+                "next_action": "continue_current_stage",
+                "task_id": "P1",
+                "stage_id": None,
+                "branch": truth.branch,
+                "head": truth.head,
+                "role": "reviewer",
+                "event": "worker_done",
+                "review_status_hash": truth.status_hash,
+                "consumed_at": "2026-09-23T12:00:00Z",
+            }
+            (runtime / "review-decisions.json").write_text(
+                json.dumps({"version": 1, "decisions": {req_id: decision_record}}),
+                encoding="utf-8",
+            )
+
+            snapshot = {
+                "project_id": "p1",
+                "repo_path": str(repo),
+                "state": "WAITING_REVIEW",
+                "next_title": "# Task P2: Next Feature",
+                "next_status": "Status: **READY_TO_RUN**",
+                "telemetry": {"task_id": "P2"},
+                "readiness": readiness_res.to_dict(),
+            }
+
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            launches = executor.advance({"projects": [snapshot]}, cfg_path)
+            self.assertEqual(len(launches), 1)
+            self.assertEqual(launches[0].task_id, "P1")
+
+            ledger = executor._load_ledger()
+            exec_rec = ledger["executions"].get(req_id)
+            self.assertIsNotNone(exec_rec)
+            self.assertEqual(exec_rec.get("task_id"), "P1")
+            self.assertEqual(exec_rec.get("source_kind"), "remediation")
+            self.assertNotEqual(exec_rec.get("state"), "blocked")
+
+    def test_accepted_next_task_with_committed_predecessor_execution_state_and_readiness_projection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+
+            write_structured_readiness(repo, "ready_to_run", "P1")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "commit P1 readiness"], check=True)
+
+            next_md = repo / "agent" / "next.md"
+            next_md.write_text("# Task P2: Next Feature\n\nStatus: **READY_TO_RUN**\n\nDescription\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/next.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "advance next.md to P2"], check=True)
+
+            truth = read_repository_truth(repo)
+            readiness_res = resolve_readiness(repo, current_task_id="P2", next_status="Status: **READY_TO_RUN**")
+            self.assertEqual(readiness_res.code, "READINESS_TASK_ID_MISMATCH")
+            self.assertEqual(readiness_res.task_id, "P1")
+            self.assertEqual(readiness_res.migration_candidate, "ready_to_run")
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "p1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage", "next_task"],
+                                "preferred_backends": ["agy"],
+                                "backends": {"agy": {"executable": "agy.cmd"}},
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            req_id = "ai_review:p1:next_1"
+            decision_record = {
+                "project_id": "p1",
+                "request_id": req_id,
+                "disposition": "apply",
+                "decision": "next",
+                "next_action": "next_task",
+                "task_id": "P1",
+                "stage_id": None,
+                "branch": truth.branch,
+                "head": truth.head,
+                "role": "reviewer",
+                "event": "worker_done",
+                "review_status_hash": truth.status_hash,
+                "consumed_at": "2026-09-23T12:00:00Z",
+            }
+            (runtime / "review-decisions.json").write_text(
+                json.dumps({"version": 1, "decisions": {req_id: decision_record}}),
+                encoding="utf-8",
+            )
+
+            snapshot = {
+                "project_id": "p1",
+                "repo_path": str(repo),
+                "state": "IDLE",
+                "next_title": "# Task P2: Next Feature",
+                "next_status": "Status: **READY_TO_RUN**",
+                "telemetry": {"task_id": "P2"},
+                "readiness": readiness_res.to_dict(),
+            }
+
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            launches = executor.advance({"projects": [snapshot]}, cfg_path)
+            self.assertEqual(len(launches), 1)
+            self.assertEqual(launches[0].task_id, "P2")
+
+            ledger = executor._load_ledger()
+            exec_rec = ledger["executions"].get(req_id)
+            self.assertIsNotNone(exec_rec)
+            self.assertEqual(exec_rec.get("task_id"), "P2")
+            self.assertEqual(exec_rec.get("source_kind"), "decision")
+            self.assertNotEqual(exec_rec.get("state"), "blocked")
+
+    def test_readiness_caused_block_does_not_permanently_consume_decision_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+
+            exec_state = repo / "agent" / "execution-state.json"
+            exec_state.write_text("{\"corrupted\": true}", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "corrupted schema"], check=True)
+
+            truth = read_repository_truth(repo)
+            readiness_res = resolve_readiness(repo, current_task_id="P1", next_status="Status: **READY_TO_RUN**")
+            self.assertEqual(readiness_res.code, "READINESS_SCHEMA_INVALID")
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "p1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage", "next_task"],
+                                "preferred_backends": ["agy"],
+                                "backends": {"agy": {"executable": "agy.cmd"}},
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            req_id = "ai_review:p1:rem_schema_err"
+            decision_record = {
+                "project_id": "p1",
+                "request_id": req_id,
+                "disposition": "apply",
+                "decision": "remediate",
+                "next_action": "continue_current_stage",
+                "task_id": "P1",
+                "stage_id": None,
+                "branch": truth.branch,
+                "head": truth.head,
+                "role": "reviewer",
+                "event": "worker_done",
+                "review_status_hash": truth.status_hash,
+                "consumed_at": "2026-09-23T12:00:00Z",
+            }
+            (runtime / "review-decisions.json").write_text(
+                json.dumps({"version": 1, "decisions": {req_id: decision_record}}),
+                encoding="utf-8",
+            )
+
+            snapshot = {
+                "project_id": "p1",
+                "repo_path": str(repo),
+                "state": "WAITING_REVIEW",
+                "next_title": "# Task P1: First Feature",
+                "next_status": "Status: **READY_TO_RUN**",
+                "telemetry": {"task_id": "P1"},
+                "readiness": readiness_res.to_dict(),
+            }
+
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+            launches = executor.advance({"projects": [snapshot]}, cfg_path)
+            self.assertEqual(len(launches), 0)
+
+            # Key assertion: req_id must NOT be permanently recorded as blocked in ledger!
+            ledger = executor._load_ledger()
+            self.assertNotIn(req_id, ledger["executions"])
+
+            # Fix readiness schema and commit:
+            write_structured_readiness(repo, "ready_to_run", "P1")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "fix readiness schema"], check=True)
+
+            fixed_truth = read_repository_truth(repo)
+            decision_record["head"] = fixed_truth.head
+            decision_record["review_status_hash"] = fixed_truth.status_hash
+            (runtime / "review-decisions.json").write_text(
+                json.dumps({"version": 1, "decisions": {req_id: decision_record}}),
+                encoding="utf-8",
+            )
+
+            fixed_readiness = resolve_readiness(repo, current_task_id="P1", next_status="Status: **READY_TO_RUN**")
+            snapshot["readiness"] = fixed_readiness.to_dict()
+
+            launches2 = executor.advance({"projects": [snapshot]}, cfg_path)
+            self.assertEqual(len(launches2), 1)
+            self.assertEqual(launches2[0].task_id, "P1")
+
+    def test_readiness_not_ready_to_run_lifecycle_hold_terminates_intent_without_false_exhaustion(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+
+            next_md = repo / "agent" / "next.md"
+            next_md.write_text("# Task P1: Initial Task\n\nStatus: **PENDING DESIGN**\n\nDescription\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/next.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "set pending design"], check=True)
+
+            write_structured_readiness(repo, "pending_design", "P1")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "commit pending design execution state"], check=True)
+
+            project_def = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "execution": {
+                    "enabled": True,
+                    "owner_authorized": True,
+                    "allowed_next_actions": ["continue_current_stage"],
+                    "preferred_backends": ["agy"],
+                    "backends": {"agy": {"executable": "agy.cmd"}},
+                },
+            }
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(json.dumps({"projects": [project_def]}), encoding="utf-8")
+
+            # Verify explain_block produces failure_class="lifecycle" (not "terminal")
+            blockers = explain_block(
+                project_id="proj-1",
+                repo_path=repo,
+                runtime_root=runtime,
+                config_path=cfg_path,
+                project_config=project_def,
+                action="continue",
+            )
+            top = blockers[0]
+            self.assertEqual(top.code, "READINESS_NOT_READY_TO_RUN")
+            self.assertEqual(top.failure_class, "lifecycle")
+
+            # Active intent exists
+            record_or_refresh_intent(
+                runtime, "proj-1", task_id="P1", command_id="cmd-init-1",
+                source="test", repo_path=str(repo), state="active",
+            )
+
+            readiness_res = resolve_readiness(repo, current_task_id="P1", next_status="Status: **PENDING DESIGN**")
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "IDLE",
+                "telemetry": {"task_id": "P1"},
+                "readiness": readiness_res.to_dict(),
+            }
+            summary = {"projects": [snapshot]}
+
+            executor = FakeExecutor(launch=True)
+            supervisor = ActivationSupervisor(runtime, executor=executor)
+
+            outcomes = supervisor.advance(cfg_path, summary, executor=executor)
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["status"], "lifecycle_hold")
+            self.assertEqual(outcomes[0]["blocker_code"], "READINESS_NOT_READY_TO_RUN")
+
+            # Intent terminated as stopped (NOT exhausted)
+            all_intents = load_execution_intents(runtime).get("intents", {})
+            self.assertEqual(all_intents["proj-1"]["state"], "stopped")
+            self.assertEqual(all_intents["proj-1"]["failure_class"], "lifecycle")
+
+            # Key assertion: subsequent explain_block does NOT publish RECOVERY_BUDGET_EXHAUSTED!
+            blockers2 = explain_block(
+                project_id="proj-1",
+                repo_path=repo,
+                runtime_root=runtime,
+                config_path=cfg_path,
+                project_config=project_def,
+            )
+            codes2 = [b.code for b in blockers2]
+            self.assertNotIn("RECOVERY_BUDGET_EXHAUSTED", codes2)
+            self.assertNotIn("RECOVERY_LIVELOCK_DETECTED", codes2)
 
 
 if __name__ == "__main__":

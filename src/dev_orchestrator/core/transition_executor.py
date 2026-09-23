@@ -107,13 +107,28 @@ def _advertised_task_id(snapshot: dict[str, Any]) -> Optional[str]:
     return advertised or _current_task_id(snapshot)
 
 
-def _readiness_allows_launch(snapshot: dict[str, Any]) -> bool:
+def _readiness_allows_launch(
+    snapshot: dict[str, Any],
+    *,
+    anchor_task_id: Optional[str] = None,
+    predecessor_task_id: Optional[str] = None,
+) -> bool:
     readiness = snapshot.get("readiness")
     if isinstance(readiness, dict):
+        if readiness.get("code") == "READINESS_TASK_ID_MISMATCH":
+            file_task = readiness.get("task_id")
+            if anchor_task_id is not None and file_task == anchor_task_id:
+                return True
+            if predecessor_task_id is not None and file_task == predecessor_task_id:
+                if readiness.get("migration_candidate") == "ready_to_run":
+                    return True
+                status = str(snapshot.get("next_status") or "")
+                if re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE) is not None:
+                    return True
+            return False
         if not readiness.get("valid", True) or readiness.get("stale", False) or readiness.get("state") == "invalid":
             return False
         if readiness.get("code") in {
-            "READINESS_TASK_ID_MISMATCH",
             "READINESS_SCHEMA_INVALID",
             "READINESS_TOKEN_UNRESOLVABLE",
         }:
@@ -121,13 +136,31 @@ def _readiness_allows_launch(snapshot: dict[str, Any]) -> bool:
     return True
 
 
-def _next_task_ready(snapshot: dict[str, Any]) -> bool:
-    if not _readiness_allows_launch(snapshot):
+def _next_task_ready(
+    snapshot: dict[str, Any],
+    *,
+    anchor_task_id: Optional[str] = None,
+    predecessor_task_id: Optional[str] = None,
+) -> bool:
+    if not _readiness_allows_launch(
+        snapshot,
+        anchor_task_id=anchor_task_id,
+        predecessor_task_id=predecessor_task_id,
+    ):
         return False
     readiness = snapshot.get("readiness")
     if isinstance(readiness, dict):
         if readiness.get("state") == "ready_to_run":
             return True
+        if readiness.get("code") == "READINESS_TASK_ID_MISMATCH":
+            file_task = readiness.get("task_id")
+            if predecessor_task_id is not None and file_task == predecessor_task_id:
+                if readiness.get("migration_candidate") == "ready_to_run":
+                    return True
+                status = str(snapshot.get("next_status") or "")
+                return re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE) is not None
+            if anchor_task_id is not None and file_task == anchor_task_id:
+                return True
         if readiness.get("source") == "legacy_markdown":
             status = str(snapshot.get("next_status") or "")
             return re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE) is not None
@@ -790,14 +823,42 @@ class TransitionExecutor:
         expected_task_id: Optional[str] = None,
         must_advance_from: Optional[str] = None,
         expected_status_hash: Optional[str] = None,
+        anchor_task_id: Optional[str] = None,
+        predecessor_task_id: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
         readiness = snapshot.get("readiness")
         if isinstance(readiness, dict):
-            if not readiness.get("valid", True) or readiness.get("stale", False) or readiness.get("state") == "invalid":
+            if readiness.get("code") == "READINESS_TASK_ID_MISMATCH":
+                file_task = readiness.get("task_id")
+                effective_anchor = anchor_task_id or expected_task_id
+                effective_predecessor = predecessor_task_id or must_advance_from
+                # Distinguish structured state bound to a superseded task while a reviewed
+                # decision is anchored to that task:
+                # 1. Exact remediation anchored to effective_anchor (the reviewed task being remediated)
+                if expected_status_hash is not None and effective_anchor is not None and file_task == effective_anchor:
+                    pass
+                # 2. Next-task actuation: advanced from effective_predecessor (the accepted task) to successor
+                elif (
+                    must_advance_from is not None
+                    and effective_predecessor == must_advance_from
+                    and file_task == must_advance_from
+                    and (
+                        readiness.get("migration_candidate") == "ready_to_run"
+                        or re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", str(snapshot.get("next_status") or ""), re.IGNORECASE) is not None
+                    )
+                ):
+                    pass
+                else:
+                    return None, f"readiness task-id mismatch: {readiness.get('reason')}"
+            elif not readiness.get("valid", True) or readiness.get("stale", False) or readiness.get("state") == "invalid":
                 code = readiness.get("code") or "READINESS_INVALID"
                 return None, f"readiness is invalid ({code}): {readiness.get('reason') or code}"
-            if readiness.get("code") == "READINESS_TASK_ID_MISMATCH":
-                return None, f"readiness task-id mismatch: {readiness.get('reason')}"
+            elif readiness.get("code") in {
+                "READINESS_SCHEMA_INVALID",
+                "READINESS_TOKEN_UNRESOLVABLE",
+            }:
+                code = readiness.get("code")
+                return None, f"readiness is invalid ({code}): {readiness.get('reason') or code}"
 
         state = snapshot.get("state")
         if expected_status_hash is not None:
@@ -2087,6 +2148,7 @@ class TransitionExecutor:
                     project, snapshot,
                     expected_branch=branch, expected_head=head,
                     expected_status_hash=reviewed_hash,
+                    anchor_task_id=task_id,
                 )
                 launch_task = task_id if _guard_task is not None else None
                 source_kind = "remediation"
@@ -2111,7 +2173,7 @@ class TransitionExecutor:
             else:
                 current_task = _advertised_task_id(snapshot)
                 reviewed_current_ready = (
-                    current_task == task_id and _next_task_ready(snapshot)
+                    current_task == task_id and _next_task_ready(snapshot, predecessor_task_id=task_id)
                 )
                 if current_task == task_id and (
                     _task_marked_complete(snapshot) or reviewed_current_ready
@@ -2180,7 +2242,7 @@ class TransitionExecutor:
                         )
                     continue
                 next_snapshot = snapshot
-                if current_task is not None and current_task != task_id and _next_task_ready(snapshot):
+                if current_task is not None and current_task != task_id and _next_task_ready(snapshot, predecessor_task_id=task_id):
                     next_snapshot = copy.deepcopy(snapshot)
                     next_snapshot["state"] = "READY_TO_RUN"
                     telemetry = next_snapshot.get("telemetry") if isinstance(next_snapshot.get("telemetry"), dict) else {}
@@ -2190,10 +2252,21 @@ class TransitionExecutor:
                     project, next_snapshot,
                     expected_branch=branch, expected_head=head,
                     must_advance_from=task_id,
+                    predecessor_task_id=task_id,
                 )
                 source_kind = "decision"
                 prompt = str(policy["worker_prompt"])
             if launch_task is None:
+                if "readiness" in (guard_error or "").lower():
+                    # A readiness-caused block must not permanently consume the decision row;
+                    # allow subsequent recovery/supervisor passes or fixes to actuate it.
+                    if self._progress_channel is not None:
+                        self._progress_channel.emit(
+                            {"project_id": project_id}, "BLOCKED",
+                            task_id=task_id, occurrence_key=request_id,
+                            details={"reason": guard_error},
+                        )
+                    continue
                 self._record_blocked(
                     request_id, project_id, guard_error,
                     task_id=task_id, source_kind=source_kind,

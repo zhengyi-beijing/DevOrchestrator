@@ -279,7 +279,24 @@ class ActivationSupervisor:
 
             top_blocker = blockers[0]
 
-            # 8. Terminal failure handling
+            # 8. Lifecycle / non-executable condition handling
+            if top_blocker.failure_class == "lifecycle" or top_blocker.code == "READINESS_NOT_READY_TO_RUN":
+                terminate_intent(
+                    self.runtime_root,
+                    project_id,
+                    "stopped",
+                    failure_class="lifecycle",
+                    blocker_code=top_blocker.code,
+                    reason=f"task lifecycle state not ready to run: {top_blocker.observed}",
+                )
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "lifecycle_hold",
+                    "blocker_code": top_blocker.code,
+                })
+                continue
+
+            # 9. Terminal failure handling
             if top_blocker.failure_class == "terminal":
                 terminate_intent(
                     self.runtime_root,
@@ -296,7 +313,7 @@ class ActivationSupervisor:
                 })
                 continue
 
-            # 9. Bounded Remediation for recoverable conditions
+            # 10. Bounded Remediation for recoverable conditions
             fp = compute_recovery_fingerprint(
                 project_id=project_id,
                 task_id=intent.get("task_id") or (snapshot.get("telemetry", {}).get("task_id") if snapshot else None),

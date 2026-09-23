@@ -336,7 +336,7 @@ def explain_block(
                         resolved_repo / ("agent/execution-state.json" if readiness.source == "structured" else "agent/next.md")
                     ),
                     remediation=f"task is {readiness.state}; must be ready_to_run before execution",
-                    failure_class="terminal",
+                    failure_class="lifecycle",
                     owner_gate_required=False,
                 )
             )
