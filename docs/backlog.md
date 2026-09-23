@@ -222,3 +222,19 @@ Goal: create an isolated benchmark project that measures the real capability, ef
 Acceptance: the benchmark can reproducibly compare at least three AI resources across multiple role/task classes, produce machine-readable and human-readable results, execute at least one native-vs-zvec-grep paired experiment, and provide evidence sufficient for a documented promotion/no-promotion decision.
 
 Sequence: P16 follows P15. It is a benchmark/test-project phase rather than a production DevO feature phase.
+
+## P16.10 - Automatic Failure Harvesting & Regression Promotion
+
+Status: **STAGED AFTER P16.9**
+
+Goal: convert unattended-execution anomalies and control-only owner interventions into durable incident families and validated regression candidates automatically.
+
+- Treat continue/retry/reconcile/restart that supplies no new owner information but restores progress as an incident signal.
+- Capture authoritative before/after lifecycle, execution, review, broker, watchdog, Git/head and recovery evidence in restart-safe incident packets.
+- Fingerprint and deduplicate semantically equivalent failures so recurrence strengthens one case instead of creating noise.
+- Generate candidate deterministic fixtures/tests automatically, but keep candidates outside the permanent regression suite until reproduction, discrimination, stability, isolation, deduplication and independent-review gates pass.
+- Use ProgressObligation contracts to distinguish legal waiting from silent deadlock and to drive incident classification.
+- Track manual CONTROL_ONLY interventions as a first-class unattended-execution quality metric; representative runs should reach zero where no new owner information is required.
+- Never auto-merge production fixes, weaken owner/safety/Git gates, or run real hardware as part of candidate regression generation.
+
+Sequence: P16.7 self-healing activation -> P16.8 golden-path liveness -> P16.9 execution-loss watchdog -> P16.10 automatic failure harvesting.\n
