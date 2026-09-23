@@ -161,11 +161,15 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
     epoch_view = copy.deepcopy(prow_epoch) if isinstance(prow_epoch, dict) else None
     epoch_id = epoch_view.get("id") if epoch_view else None
 
+    recovery_handoff = prow.get("recovery_handoff")
+    handoff_view = copy.deepcopy(recovery_handoff) if isinstance(recovery_handoff, dict) else None
+
     return {
         "schema_version": 1,
         "state": wd_state,
         "recovery_epoch": epoch_view,
         "recovery_epoch_id": epoch_id,
+        "recovery_handoff": handoff_view,
         "last_progress_at": prow.get("last_progress_at"),
         "no_progress_seconds": stall.get("no_progress_seconds") if stall else None,
         "threshold_minutes": stall.get("threshold_minutes") if stall else prow.get("no_progress_threshold_minutes", 15),
@@ -334,6 +338,15 @@ def build_project_status(
     watchdog_view = _watchdog_view(runtime, project_id)
     if watchdog_view is not None:
         result["watchdog"] = watchdog_view
+        if watchdog_view.get("recovery_handoff") is not None:
+            result["recovery_handoff"] = watchdog_view["recovery_handoff"]
+    try:
+        from dev_orchestrator.core.execution_intent import get_active_intent
+        active_intent = get_active_intent(runtime, project_id)
+        if active_intent is not None:
+            result["execution_intent"] = active_intent
+    except Exception:
+        pass
     epoch = snapshot.get("recovery_epoch")
     if epoch is None:
         from dev_orchestrator.core.watchdog import resolve_recovery_epoch

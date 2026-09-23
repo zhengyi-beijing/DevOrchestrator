@@ -32,7 +32,7 @@ class WatchdogDiagnosticsTests(unittest.TestCase):
 
     def test_9_diagnostic_classifications(self):
         """Verify all diagnosis codes can be classified deterministically."""
-        self.assertEqual(len(DIAGNOSIS_CODES), 11)
+        self.assertEqual(len(DIAGNOSIS_CODES), 21)
         assessment = DummyAssessment()
 
         # 1. process_dead

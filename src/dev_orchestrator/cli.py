@@ -418,7 +418,35 @@ def cmd_project_status(args: argparse.Namespace) -> int:
     project_id = _validated_project_id(args.project_id)
     snapshot = read_json(runtime / "projects" / (project_id + ".json"), None)
     if not isinstance(snapshot, dict) or snapshot.get("project_id") != project_id:
-        _print_json({"project_id": project_id, "state": "not_found"})
+        from dev_orchestrator.core.activation import detect_orphan_state
+        from dev_orchestrator.core.blockers import explain_block, blocker_payload
+        cfg = None
+        cfg_path = getattr(args, "config", None)
+        resolved_cfg_path = resolve_config_path(cfg_path) if cfg_path else None
+        if resolved_cfg_path:
+            try:
+                cfg = load_projects_config(resolved_cfg_path)
+            except Exception:
+                pass
+        orphan = detect_orphan_state(project_id, None, cfg, runtime)
+        repo_for_block = Path(orphan["repo_path"]) if orphan and orphan.get("repo_path") else None
+        blockers = explain_block(
+            project_id=project_id,
+            project_config=None,
+            snapshot=None,
+            repo_path=repo_for_block,
+            runtime_root=runtime,
+            config_path=resolved_cfg_path,
+            action="continue",
+        )
+        not_found_payload: dict[str, Any] = {
+            "project_id": project_id,
+            "state": "not_found",
+            "blockers": blocker_payload(blockers),
+        }
+        if orphan is not None:
+            not_found_payload["orphan"] = orphan
+        _print_json(not_found_payload)
         return 1
     from dev_orchestrator.control.surface import project_control_view
     project_config = None
@@ -432,6 +460,63 @@ def cmd_project_status(args: argparse.Namespace) -> int:
     payload = dict(projected)
     payload["latest_control"] = latest_control_result(runtime, project_id)
     _print_json(payload)
+    return 0
+
+
+def cmd_project_explain_block(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    project_id = getattr(args, "project_id", None)
+    repo = getattr(args, "repo", None)
+    if not project_id and not repo:
+        _fail("either --project-id or --repo must be provided")
+    config_path = resolve_config_path(args.config) if getattr(args, "config", None) else None
+    from dev_orchestrator.core.blockers import explain_block, blocker_payload
+    snapshot = None
+    project_config = None
+    if project_id:
+        project_id = _validated_project_id(project_id)
+        snapshot = read_json(runtime / "projects" / (project_id + ".json"), None)
+        if config_path:
+            try:
+                cfg = load_projects_config(config_path)
+                project_config = next(
+                    (p for p in cfg.get("projects") or [] if p.get("project_id") == project_id),
+                    None,
+                )
+            except Exception:
+                pass
+    blockers = explain_block(
+        project_id=project_id,
+        project_config=project_config,
+        snapshot=snapshot,
+        repo_path=Path(repo).resolve(strict=False) if repo else None,
+        runtime_root=runtime,
+        config_path=config_path,
+        action="continue",
+    )
+    _print_json(blocker_payload(blockers))
+    return 0
+
+
+def cmd_project_activate(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    if not getattr(args, "repo", None):
+        _fail("--repo is required")
+    repo_path = Path(args.repo).resolve(strict=False)
+    if not repo_path.exists():
+        _fail(f"repository path does not exist: {repo_path}")
+    from dev_orchestrator.core.activation import record_activation_request
+    config_path = resolve_config_path(args.config) if getattr(args, "config", None) else None
+    request = record_activation_request(
+        runtime_root=runtime,
+        repo_path=repo_path,
+        project_id=getattr(args, "project_id", None),
+        config_path=config_path,
+        profile=getattr(args, "profile", None),
+        requested_action=getattr(args, "action", "continue") or "continue",
+        source="cli",
+    )
+    _print_json(request)
     return 0
 
 
@@ -1283,6 +1368,24 @@ def build_parser() -> argparse.ArgumentParser:
     project_status.add_argument("--runtime-root", default=None)
     project_status.add_argument("--config", default=None, help="path to projects.json for exact capabilities")
 
+    project_explain_block = sub.add_parser(
+        "project-explain-block", help="derive canonical blocker list for a project or repo"
+    )
+    project_explain_block.add_argument("--project-id", default=None, help="registered project id")
+    project_explain_block.add_argument("--repo", default=None, help="path to repository worktree")
+    project_explain_block.add_argument("--config", default=None, help="path to projects.json")
+    project_explain_block.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    project_activate = sub.add_parser(
+        "project-activate", help="record an owner activation request for a repository"
+    )
+    project_activate.add_argument("--repo", required=True, help="path to repository worktree")
+    project_activate.add_argument("--project-id", default=None, help="optional project id")
+    project_activate.add_argument("--profile", default=None, help="activation profile name")
+    project_activate.add_argument("--action", default="continue", help="requested initial action")
+    project_activate.add_argument("--config", default=None, help="path to projects.json")
+    project_activate.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     watchdog_status = sub.add_parser("watchdog-status", help="report progress watchdog status")
     watchdog_status.add_argument("--config", default=None, help="path to projects.json")
     watchdog_status.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
@@ -1500,6 +1603,8 @@ _COMMANDS = {
     "validate-config": cmd_validate_config,
     "project-context": cmd_project_context,
     "project-status": cmd_project_status,
+    "project-explain-block": cmd_project_explain_block,
+    "project-activate": cmd_project_activate,
     "watchdog-status": cmd_watchdog_status,
     "watchdog-clear-degraded": cmd_watchdog_clear_degraded,
     "project-continue": cmd_project_continue,

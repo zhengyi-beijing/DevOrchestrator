@@ -1584,6 +1584,27 @@ class WatchdogCoordinator:
 
                 # Guard 4: Max attempts per run
                 if current_run_attempts >= policy["max_attempts_per_run"]:
+                    from dev_orchestrator.core.execution_intent import get_active_intent
+                    active_intent = get_active_intent(self.runtime_root, pid)
+                    epoch_id = assessment.recovery_epoch.get("id") if assessment.recovery_epoch else None
+                    if active_intent and (not active_intent.get("recovery_epoch_id") or active_intent.get("recovery_epoch_id") == epoch_id):
+                        prow["recovery_handoff"] = {
+                            "state": "recovery_exhausted",
+                            "reason": f"exhausted max_attempts_per_run ({policy['max_attempts_per_run']})",
+                            "attempts": current_run_attempts,
+                            "recovery_epoch_id": epoch_id,
+                            "handed_off_at": now_iso,
+                        }
+                        self._emit_milestone(
+                            pid,
+                            "RECOVERY_HANDOFF",
+                            task_id=assessment.task_id,
+                            occurrence_key=f"{att_key}:max-attempts-handoff",
+                            details={"source": "watchdog", "handoff": "max_attempts_exhausted", "attempts": current_run_attempts, "recovery_epoch_id": epoch_id},
+                        )
+                        results.append({"project_id": pid, "status": "max_attempts_handed_off"})
+                        continue
+
                     prow["owner_gate"] = {
                         "source": "watchdog",
                         "state": "owner_gate",
@@ -2113,6 +2134,40 @@ class WatchdogCoordinator:
             self._emit_owner_gate_once(pid, attempt_record, f"recovery_enqueue_failed: {exc}")
 
     def _emit_owner_gate_once(self, project_id: str, attempt_record: dict[str, Any], reason: str) -> None:
+        from dev_orchestrator.core.execution_intent import get_active_intent
+        from dev_orchestrator.core.diagnostics import classify_failure_class
+        active_intent = get_active_intent(self.runtime_root, project_id)
+        if active_intent:
+            epoch_id = attempt_record.get("recovery_epoch_id")
+            intent_epoch = active_intent.get("recovery_epoch_id")
+            if not intent_epoch or intent_epoch == epoch_id:
+                fail_class = classify_failure_class("", reason)
+                if fail_class in {"transient_infrastructure", "recoverable_orchestration", "recovery_exhausted"}:
+                    att_key = attempt_record.get("attempt_key", "")
+                    reason_slug = re.sub(r"[^a-z0-9-]", "-", str(reason or "reason").lower()).strip("-")[:32] or "reason"
+                    self._emit_milestone(
+                        project_id,
+                        "RECOVERY_HANDOFF",
+                        task_id=attempt_record.get("task_id"),
+                        occurrence_key=f"{att_key}:suppressed-gate:{reason_slug}",
+                        details={
+                            "source": "watchdog",
+                            "gate_suppressed": True,
+                            "reason": reason,
+                            "failure_class": fail_class,
+                            "diagnosis": attempt_record.get("diagnosis"),
+                        },
+                    )
+                    prow = self._cached_state.setdefault("projects", {}).setdefault(project_id, {})
+                    prow["recovery_handoff"] = {
+                        "state": "recovery_exhausted",
+                        "reason": reason,
+                        "attempts": attempt_record.get("attempt_key"),
+                        "recovery_epoch_id": epoch_id,
+                        "handed_off_at": utc_now_iso(),
+                    }
+                    return
+
         att_key = attempt_record.get("attempt_key", "")
         reason_slug = re.sub(r"[^a-z0-9-]", "-", str(reason or "reason").lower()).strip("-")[:32] or "reason"
         self._emit_milestone(

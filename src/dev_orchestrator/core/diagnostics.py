@@ -31,8 +31,86 @@ DIAGNOSIS_CODES = (
     "provider_or_quota_blocked",
     "state_desync",
     "external_wait",
+    "orphaned_project_state",
+    "project_not_registered",
+    "registration_template_missing",
+    "readiness_schema_invalid",
+    "readiness_task_id_mismatch",
+    "readiness_token_unstructured",
+    "readiness_token_unresolvable",
+    "readiness_not_ready_to_run",
+    "recovery_budget_exhausted",
+    "recovery_livelock_detected",
     "unknown",
 )
+
+FAILURE_CLASSES = frozenset({
+    "transient_infrastructure",
+    "recoverable_orchestration",
+    "owner_gate",
+    "recovery_exhausted",
+    "terminal",
+})
+
+_TRANSIENT_MARKERS = (
+    "broker service invocation failed",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "status_call_timed_out",
+    "transport_unreachable",
+    "transport unavailable",
+    "rdc timeout",
+    "ssh timeout",
+    "connection reset",
+    "connection refused",
+)
+
+
+def classify_failure_class(code: str, reason: str = "") -> str:
+    """Classify a failure code or reason into one of the 5 canonical failure classes."""
+    c = str(code or "").lower().strip()
+    r = str(reason or "").lower().strip()
+
+    if c in {"recovery_budget_exhausted", "recovery_livelock_detected", "recovery_exhausted"}:
+        return "recovery_exhausted"
+
+    if any(m in r for m in _TRANSIENT_MARKERS) or any(m in c for m in ("timeout", "transient")):
+        return "transient_infrastructure"
+
+    if c in {
+        "orphaned_project_state",
+        "project_not_registered",
+        "readiness_token_unstructured",
+        "readiness_task_id_mismatch",
+        "ready_to_run_unlaunched",
+        "max_attempts_handed_off",
+        "reconcile",
+        "retry",
+    }:
+        return "recoverable_orchestration"
+
+    if c in {
+        "owner_gate",
+        "owner_gate_present",
+        "owner_paused",
+        "provider_or_quota_blocked",
+        "state_desync",
+        "external_wait",
+    } or "owner_gate" in r:
+        return "owner_gate"
+
+    if c in {
+        "registration_template_missing",
+        "readiness_schema_invalid",
+        "readiness_token_unresolvable",
+        "readiness_not_ready_to_run",
+        "dirty_worktree",
+        "execution_policy_disabled",
+    }:
+        return "terminal"
+
+    return "terminal"
 WORKER_EXPECTED_LIFECYCLE_STATES = frozenset({"EXECUTING", "REMEDIATING"})
 # Vocabulary of active worker states from the executor ledger and overlay projection.
 # "starting" is the overlay mapping for "launching" (see transition_executor.overlay_managed_runs).
@@ -139,6 +217,8 @@ def collect_evidence(
             "head": truth.head,
             "dirty": truth.dirty,
             "uncommitted_files": list(truth.dirty_entries[:20]),
+            "expected_entries": list(truth.expected_entries[:20]),
+            "unexpected_entries": list(truth.unexpected_entries[:20]),
             "error": truth.error,
         }
 

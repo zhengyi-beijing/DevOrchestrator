@@ -60,6 +60,7 @@ _STATIC = {
 }
 _PROJECT_PATH_RE = re.compile(r"^/api/projects/([A-Za-z0-9_-]+)$")
 _CONTROL_PROJECT_PATH_RE = re.compile(r"^/api/v1/control/projects/([A-Za-z0-9_-]+)$")
+_CONTROL_PROJECT_BLOCKERS_PATH_RE = re.compile(r"^/api/v1/control/projects/([A-Za-z0-9_-]+)/blockers$")
 _CONTROL_COMMAND_PATH_RE = re.compile(r"^/api/v1/control/commands/([A-Za-z0-9_-]+)$")
 _CONTROL_JOB_LOGS_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)/logs$")
 _CONTROL_JOB_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)$")
@@ -620,28 +621,55 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             overview = control_overview_payload(runtime, self.server.config_path, self.server.bridge_store)
             payload = _control_envelope(overview["data"]["projects"], warnings=overview["warnings"], sources=overview["sources"])
         elif path.startswith("/api/v1/control/projects/"):
-            match = _CONTROL_PROJECT_PATH_RE.fullmatch(path)
-            if not match:
-                self._error(404, "Not Found", "route not found", head_only); return
-            project = read_json(runtime / "projects" / f"{match.group(1)}.json", None)
-            if not isinstance(project, dict):
-                self._error(404, "Not Found", "project snapshot not found", head_only); return
-            # The per-project mirror is intentionally monitor-local and may be
-            # overwritten with raw IDLE before orchestration lifecycle overlay.
-            # Control capability must use the daemon's projected summary truth.
-            summary = read_json(runtime / "summary.json", {})
-            if isinstance(summary, dict) and isinstance(summary.get("projects"), list):
-                projected = next((
-                    item for item in summary["projects"]
-                    if isinstance(item, dict) and str(item.get("project_id") or item.get("id") or "") == match.group(1)
-                ), None)
-                if isinstance(projected, dict):
-                    project = projected
-            configs = _control_project_configs(self.server.config_path)
-            payload = _control_envelope(
-                project_control_view(project, runtime, configs.get(match.group(1)), self.server.bridge_store),
-                sources=[{"name": "project_runtime", "availability": "available"}],
-            )
+            match_blockers = _CONTROL_PROJECT_BLOCKERS_PATH_RE.fullmatch(path)
+            if match_blockers:
+                project_id = match_blockers.group(1)
+                project = read_json(runtime / "projects" / f"{project_id}.json", None)
+                summary = read_json(runtime / "summary.json", {})
+                if isinstance(summary, dict) and isinstance(summary.get("projects"), list):
+                    projected = next((
+                        item for item in summary["projects"]
+                        if isinstance(item, dict) and str(item.get("project_id") or item.get("id") or "") == project_id
+                    ), None)
+                    if isinstance(projected, dict):
+                        project = projected
+                configs = _control_project_configs(self.server.config_path)
+                from dev_orchestrator.core.blockers import explain_block, blocker_payload
+                blockers = explain_block(
+                    project_id=project_id,
+                    project_config=configs.get(project_id),
+                    snapshot=project,
+                    runtime_root=runtime,
+                    config_path=self.server.config_path,
+                    action="continue",
+                )
+                payload = _control_envelope(
+                    blocker_payload(blockers),
+                    sources=[{"name": "project_blockers", "availability": "available"}],
+                )
+            else:
+                match = _CONTROL_PROJECT_PATH_RE.fullmatch(path)
+                if not match:
+                    self._error(404, "Not Found", "route not found", head_only); return
+                project = read_json(runtime / "projects" / f"{match.group(1)}.json", None)
+                if not isinstance(project, dict):
+                    self._error(404, "Not Found", "project snapshot not found", head_only); return
+                # The per-project mirror is intentionally monitor-local and may be
+                # overwritten with raw IDLE before orchestration lifecycle overlay.
+                # Control capability must use the daemon's projected summary truth.
+                summary = read_json(runtime / "summary.json", {})
+                if isinstance(summary, dict) and isinstance(summary.get("projects"), list):
+                    projected = next((
+                        item for item in summary["projects"]
+                        if isinstance(item, dict) and str(item.get("project_id") or item.get("id") or "") == match.group(1)
+                    ), None)
+                    if isinstance(projected, dict):
+                        project = projected
+                configs = _control_project_configs(self.server.config_path)
+                payload = _control_envelope(
+                    project_control_view(project, runtime, configs.get(match.group(1)), self.server.bridge_store),
+                    sources=[{"name": "project_runtime", "availability": "available"}],
+                )
         elif path == "/api/v1/control/resources":
             data = broker_proxy_payload(runtime, "/api/resources")
             availability = _source_availability(data)
@@ -1078,6 +1106,29 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._error(404, "Not Found", str(exc), False); return
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(res)), False); return
+        if path == "/api/v1/control/projects/activate":
+            value = self._read_control_json()
+            if value is None: return
+            repo_path_raw = value.get("repo_path")
+            if not isinstance(repo_path_raw, str) or not repo_path_raw.strip():
+                self._error(400, "Bad Request", "repo_path is required", False); return
+            repo_path = Path(repo_path_raw).resolve(strict=False)
+            if not repo_path.exists():
+                self._error(400, "Bad Request", f"repository path does not exist: {repo_path}", False); return
+            from dev_orchestrator.core.activation import record_activation_request
+            try:
+                record = record_activation_request(
+                    runtime_root=runtime,
+                    repo_path=repo_path,
+                    project_id=value.get("project_id"),
+                    config_path=self.server.config_path,
+                    profile=value.get("profile"),
+                    requested_action=value.get("action") or value.get("requested_action") or "continue",
+                    source="control_api",
+                )
+            except Exception as exc:
+                self._error(400, "Bad Request", str(exc), False); return
+            self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(record, sources=[{"name": "activation_ledger", "availability": "available"}])), False); return
         if path != "/api/v1/control/commands":
             self._error(404, "Not Found", "route not found", False); return
         value = self._read_control_json()

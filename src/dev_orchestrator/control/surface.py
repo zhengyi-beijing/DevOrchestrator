@@ -83,6 +83,17 @@ def validate_expected(expected: Any, snapshot: dict[str, Any], runtime_root: Pat
     for key in EXPECTED_IDENTITY_FIELDS:
         if expected.get(key) != observed.get(key):
             return False, f"stale project identity: {key} changed", observed
+    if "recovery_epoch_id" in expected and expected.get("recovery_epoch_id") is not None:
+        obs_epoch_id = None
+        watchdog_state = read_json(Path(runtime_root) / "watchdog.json", {})
+        prow = watchdog_state.get("projects", {}).get(observed.get("project_id"), {}) if isinstance(watchdog_state, dict) else {}
+        epoch = prow.get("recovery_epoch") if isinstance(prow, dict) else None
+        if isinstance(epoch, dict):
+            obs_epoch_id = epoch.get("id")
+        if not obs_epoch_id:
+            obs_epoch_id = snapshot.get("recovery_epoch_id") or (snapshot.get("recovery_epoch", {}).get("id") if isinstance(snapshot.get("recovery_epoch"), dict) else None)
+        if expected.get("recovery_epoch_id") != obs_epoch_id:
+            return False, "stale project identity: recovery_epoch_id changed", observed
     return True, "", observed
 
 
@@ -262,10 +273,17 @@ def project_control_view(
     ]
     for item in controls:
         item["required_expected_fields"] = list(EXPECTED_IDENTITY_FIELDS)
+    from dev_orchestrator.core.blockers import explain_block, blocker_payload
+    blockers = explain_block(
+        project_config=project_config,
+        snapshot=projected,
+        runtime_root=runtime,
+    )
     result = copy.deepcopy(projected)
     result.update({
         "control_identity": identity,
         "controls": controls,
+        "blockers": blocker_payload(blockers),
         "owner_control": owner,
         "conversation": {
             "binding": binding, "live_session_ids": sorted(live_ids),

@@ -116,3 +116,9 @@ The bootstrap uses the same execution policy, fresh-truth checks, one-active-run
 7. Full `tests_py`, `node --check`, and `git diff --check` remain green.
 8. Real AGY and DSH probes remain non-prompt in automated tests.
 9. Real LineScanViewer smoke proves bootstrap -> WORKER_DONE -> Web Sol remediation -> same-task Worker -> review, before allowing `NEXT_TASK`.
+
+---
+
+## Structured Readiness & Self-Healing Activation
+
+For machine-readable readiness authority (`agent/execution-state.json`), task identity binding, idempotent NOOP control semantics, and self-healing activation supervision, see [P16.7 Self-Healing Project Activation & Readiness Contract](P16_7_SELF_HEALING_ACTIVATION_CONTRACT.md).

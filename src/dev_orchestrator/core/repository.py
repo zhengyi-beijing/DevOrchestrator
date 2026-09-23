@@ -23,6 +23,39 @@ _GIT_ENV = dict(os.environ)
 _GIT_ENV["GIT_OPTIONAL_LOCKS"] = "0"
 
 
+_EXPECTED_TASK_ARTIFACT_EXACT = frozenset({
+    "agent/next.md",
+    "agent/CURRENT.md",
+    "agent/result.md",
+    "agent/execution-state.json",
+})
+
+
+def classify_porcelain_entries(
+    dirty_entries: tuple[str, ...] | list[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Classify porcelain entries into expected task artifacts vs unexpected changes.
+
+    Expected task artifacts: agent/next.md, agent/CURRENT.md, agent/result.md,
+    agent/execution-state.json, agent/staged/*.
+    """
+    expected: list[str] = []
+    unexpected: list[str] = []
+    for entry in dirty_entries:
+        raw = entry.strip()
+        if not raw:
+            continue
+        path_part = raw[3:].strip() if len(raw) > 3 else raw
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ")[-1].strip()
+        norm = path_part.replace("\\", "/")
+        if norm in _EXPECTED_TASK_ARTIFACT_EXACT or norm.startswith("agent/staged/"):
+            expected.append(entry)
+        else:
+            unexpected.append(entry)
+    return tuple(expected), tuple(unexpected)
+
+
 @dataclass(frozen=True)
 class RepositoryTruth:
     """Fresh, immutable repository truth consumed by the decision guard.
@@ -39,6 +72,8 @@ class RepositoryTruth:
     status_hash: str = ""
     valid: bool = False
     error: str = ""
+    expected_entries: tuple[str, ...] = ()
+    unexpected_entries: tuple[str, ...] = ()
 
 
 def _invalid_truth(root: Path | str, message: str) -> RepositoryTruth:
@@ -85,6 +120,7 @@ def read_repository_truth(root: Path | str, *, timeout: float = 15.0) -> Reposit
             return _invalid_truth(root, "repository has no checked-out HEAD/branch")
 
         dirty_entries = tuple(line for line in status_proc.stdout.splitlines() if line.strip())
+        expected_entries, unexpected_entries = classify_porcelain_entries(dirty_entries)
         digest = hashlib.sha256()
         for line in sorted(dirty_entries):
             digest.update(line.encode("utf-8", errors="replace"))
@@ -97,6 +133,8 @@ def read_repository_truth(root: Path | str, *, timeout: float = 15.0) -> Reposit
             status_hash=digest.hexdigest(),
             valid=True,
             error="",
+            expected_entries=expected_entries,
+            unexpected_entries=unexpected_entries,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return _invalid_truth(root, str(exc))

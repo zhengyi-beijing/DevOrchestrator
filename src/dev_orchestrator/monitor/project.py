@@ -109,9 +109,12 @@ def git_changed_activity_utc(root: Path) -> Optional[datetime]:
 
 
 def resolve_monitor_state(
-    worker: dict, next_status: Optional[str], next_updated_at: Optional[str]
+    worker: dict,
+    next_status: Optional[str],
+    next_updated_at: Optional[str],
+    readiness: Optional[Any] = None,
 ) -> str:
-    """Derive the public monitor state from worker + next.md status text."""
+    """Derive the public monitor state from worker + readiness/next.md status text."""
     kind = worker.get("kind")
     state = worker.get("state")
     alive = bool(worker.get("process_alive"))
@@ -127,8 +130,30 @@ def resolve_monitor_state(
         return "BLOCKED"
     if re.search(r"ACCEPTED|awaiting", status_text, re.IGNORECASE):
         return "WAITING_PHASE_GATE"
+
+    # Evaluate readiness resolution if provided
+    r_state: Optional[str] = None
+    r_valid = True
+    r_stale = False
+    if readiness is not None:
+        if isinstance(readiness, dict):
+            r_state = readiness.get("state")
+            r_valid = bool(readiness.get("valid", True))
+            r_stale = bool(readiness.get("stale", False))
+        else:
+            r_state = getattr(readiness, "state", None)
+            r_valid = bool(getattr(readiness, "valid", True))
+            r_stale = bool(getattr(readiness, "stale", False))
+        if not r_valid or r_stale or r_state == "invalid":
+            r_state = "invalid"
+
     if kind == "task" and state == "completed":
-        if re.search(r"READY[_ -]?TO[_ -]?RUN|DESIGN READY|EXECUTABLE", status_text, re.IGNORECASE):
+        is_ready = False
+        if r_state == "ready_to_run":
+            is_ready = True
+        elif r_state is None and re.search(r"READY[_ -]?TO[_ -]?RUN|DESIGN READY|EXECUTABLE", status_text, re.IGNORECASE):
+            is_ready = True
+        if is_ready:
             worker_updated = parse_utc(worker.get("updated_at"))
             next_updated = parse_utc(next_updated_at)
             if (
@@ -138,6 +163,12 @@ def resolve_monitor_state(
             ):
                 return "READY_TO_RUN"
         return "WAITING_REVIEW"
+
+    if r_state == "ready_to_run":
+        return "READY_TO_RUN"
+    if r_state in ("invalid", "blocked", "pending_design", "executing", "completed"):
+        return "IDLE"
+
     if re.search(r"READY[_ -]?TO[_ -]?RUN|DESIGN READY|EXECUTABLE", status_text, re.IGNORECASE):
         return "READY_TO_RUN"
     return "IDLE"

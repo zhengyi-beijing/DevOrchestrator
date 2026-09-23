@@ -21,6 +21,7 @@ from dev_orchestrator.ai.structured_output import (
 )
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.control.owner_store import OwnerControlStore
+from dev_orchestrator.core.readiness import write_structured_readiness
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_raw, read_successor, sha256_bytes
 from dev_orchestrator.core.workflow_policy import workflow_policy_prompt
@@ -651,10 +652,12 @@ class AIPlannerCoordinator:
         truth = read_repository_truth(repo)
         if not truth.valid or truth.dirty:
             raise RuntimeError("repository changed before successor activation")
+        predecessor_exec_state = read_raw(repo, "agent/execution-state.json")
         try:
             next_path.write_bytes(successor_bytes)
+            write_structured_readiness(repo, "pending_design", successor_task_id)
             add = subprocess.run(
-                ["git", "-C", str(repo), "add", "--", "agent/next.md"],
+                ["git", "-C", str(repo), "add", "--", "agent/next.md", "agent/execution-state.json"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=20, check=False, **hidden_subprocess_kwargs(),
             )
@@ -664,7 +667,7 @@ class AIPlannerCoordinator:
                 [
                     "git", "-C", str(repo), "commit", "-m",
                     f"lifecycle({predecessor_task_id}): activate staged successor {successor_task_id}",
-                    "--", "agent/next.md",
+                    "--", "agent/next.md", "agent/execution-state.json",
                 ],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=60, check=False, **hidden_subprocess_kwargs(),
@@ -688,6 +691,18 @@ class AIPlannerCoordinator:
                         ["git", "-C", str(repo), "add", "--", "agent/next.md"],
                         capture_output=True, timeout=15, **hidden_subprocess_kwargs(),
                     )
+                    if predecessor_exec_state is not None:
+                        (repo / "agent" / "execution-state.json").write_bytes(predecessor_exec_state)
+                        subprocess.run(
+                            ["git", "-C", str(repo), "add", "--", "agent/execution-state.json"],
+                            capture_output=True, timeout=15, **hidden_subprocess_kwargs(),
+                        )
+                    else:
+                        (repo / "agent" / "execution-state.json").unlink(missing_ok=True)
+                        subprocess.run(
+                            ["git", "-C", str(repo), "rm", "--cached", "-f", "--ignore-unmatch", "--", "agent/execution-state.json"],
+                            capture_output=True, timeout=15, **hidden_subprocess_kwargs(),
+                        )
                 except Exception:
                     pass
             raise
@@ -1910,6 +1925,7 @@ class AIPlannerCoordinator:
         if original != record["next_text"]:
             self._finish(plan_id, "failed", "agent/next.md changed during planning")
             return
+        cur_exec_state = read_raw(repo, "agent/execution-state.json")
         try:
             updated = self._render_next(original, plan, review_reason)
             next_path.write_text(updated, encoding="utf-8", newline="\n")
@@ -1918,6 +1934,12 @@ class AIPlannerCoordinator:
             try:
                 next_path.write_text(original, encoding="utf-8", newline="\n")
                 subprocess.run(["git", "-C", str(repo), "reset", "--", "agent/next.md"], capture_output=True, timeout=15, **hidden_subprocess_kwargs())
+                if cur_exec_state is not None:
+                    (repo / "agent" / "execution-state.json").write_bytes(cur_exec_state)
+                    subprocess.run(["git", "-C", str(repo), "reset", "--", "agent/execution-state.json"], capture_output=True, timeout=15, **hidden_subprocess_kwargs())
+                else:
+                    (repo / "agent" / "execution-state.json").unlink(missing_ok=True)
+                    subprocess.run(["git", "-C", str(repo), "rm", "--cached", "-f", "--ignore-unmatch", "--", "agent/execution-state.json"], capture_output=True, timeout=15, **hidden_subprocess_kwargs())
             except Exception:
                 pass
             self._finish(plan_id, "failed", f"plan apply failed: {exc}")
@@ -1957,6 +1979,7 @@ class AIPlannerCoordinator:
             self._finish(plan_id, "failed", "repository changed during planning")
             return
         next_path = repo / "agent" / "next.md"
+        cur_exec_state = read_raw(repo, "agent/execution-state.json")
         try:
             next_path.write_bytes(updated.encode("utf-8"))
             commit = self._commit_plan(repo, record["task_id"])
@@ -1969,6 +1992,18 @@ class AIPlannerCoordinator:
                         ["git", "-C", str(repo), "add", "--", "agent/next.md"],
                         capture_output=True, timeout=15, **hidden_subprocess_kwargs(),
                     )
+                    if cur_exec_state is not None:
+                        (repo / "agent" / "execution-state.json").write_bytes(cur_exec_state)
+                        subprocess.run(
+                            ["git", "-C", str(repo), "add", "--", "agent/execution-state.json"],
+                            capture_output=True, timeout=15, **hidden_subprocess_kwargs(),
+                        )
+                    else:
+                        (repo / "agent" / "execution-state.json").unlink(missing_ok=True)
+                        subprocess.run(
+                            ["git", "-C", str(repo), "rm", "--cached", "-f", "--ignore-unmatch", "--", "agent/execution-state.json"],
+                            capture_output=True, timeout=15, **hidden_subprocess_kwargs(),
+                        )
                 except Exception:
                     pass
                 after_restore_truth = read_repository_truth(repo)
@@ -2045,15 +2080,16 @@ class AIPlannerCoordinator:
         return text
     @staticmethod
     def _commit_plan(repo: Path, task_id: str) -> str:
+        write_structured_readiness(repo, "ready_to_run", task_id)
         add = subprocess.run(
-            ["git", "-C", str(repo), "add", "--", "agent/next.md"],
+            ["git", "-C", str(repo), "add", "--", "agent/next.md", "agent/execution-state.json"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=20, check=False, **hidden_subprocess_kwargs(),
         )
         if add.returncode != 0:
             raise RuntimeError("git add failed: " + (add.stderr or add.stdout).strip())
         commit = subprocess.run(
-            ["git", "-C", str(repo), "commit", "-m", f"plan({task_id}): freeze executable design", "--", "agent/next.md"],
+            ["git", "-C", str(repo), "commit", "-m", f"plan({task_id}): freeze executable design", "--", "agent/next.md", "agent/execution-state.json"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=60, check=False, **hidden_subprocess_kwargs(),
         )

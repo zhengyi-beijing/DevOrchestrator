@@ -267,3 +267,9 @@ Watchdog emits notifications tagged with `details.source = "watchdog"` and stabl
 1. **Mirror File (`<repo>/.devorch/status.json`)**: Contains a `watchdog` section reflecting real-time watchdog status, diagnosis, evidence hash, and attempts.
 2. **Web API (`GET /api/watchdog`)**: Read-only JSON endpoint returning `{projects: {...}, degraded: bool}`.
 3. **CLI (`dev-orchestrator watchdog-status`)**: Read-only subcommand inspecting runtime watchdog state with optional `--project-id`.
+
+---
+
+## 11. Self-Healing Project Activation & Watchdog Handoff
+
+For watchdog coordination with daemon self-healing and recovery handoffs under active execution intents without fabricating owner gates, see [P16.7 Self-Healing Project Activation & Readiness Contract](P16_7_SELF_HEALING_ACTIVATION_CONTRACT.md).

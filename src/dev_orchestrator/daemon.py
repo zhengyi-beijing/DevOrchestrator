@@ -36,6 +36,7 @@ from dev_orchestrator.core.response_consumer import consume_websol_responses
 from dev_orchestrator.core.progress import ProgressChannel
 from dev_orchestrator.core.transition_executor import TransitionExecutor
 from dev_orchestrator.core.watchdog import WatchdogCoordinator
+from dev_orchestrator.core.activation_supervisor import ActivationSupervisor
 from dev_orchestrator.core.project_status import write_project_statuses
 from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.control.store import ConversationControlStore
@@ -83,10 +84,12 @@ def _run_orchestration_tick(
     executor: TransitionExecutor, reviewer: AIReviewerCoordinator | None = None,
     controls: ControlCommandCoordinator | None = None,
     watchdog: WatchdogCoordinator | None = None,
-    job_recovery: JobRecoveryCoordinator | None = None, *, pid: int,
+    job_recovery: JobRecoveryCoordinator | None = None,
+    supervisor: ActivationSupervisor | None = None, *, pid: int,
 ) -> dict[str, Any]:
     """Run one ordered control-plane tick and return the projected summary."""
     watchdog_error: Optional[str] = None
+    supervisor_error: Optional[str] = None
     raw_summary = run_monitor_once(config, runtime)
     write_project_statuses(raw_summary, runtime, phase="monitor", daemon_state="running", pid=pid)
     if controls is not None:
@@ -154,15 +157,35 @@ def _run_orchestration_tick(
             # ACTIVE_LIFECYCLE_STATES monitoring silently inapplicable.
             # Do not feed the managed-run projection here: a terminal run from
             # the previous task can still relabel a newly active task.
-            watchdog_summary = overlay_orchestration_lifecycle(
-                raw_summary,
-                planner_state=planner_state_fn() if callable(planner_state_fn) else None,
-                reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
-            )
+            planner_st = planner_state_fn() if callable(planner_state_fn) else None
+            reviewer_st = reviewer_state_fn() if callable(reviewer_state_fn) else None
+            if planner_st or reviewer_st:
+                watchdog_summary = overlay_orchestration_lifecycle(
+                    raw_summary,
+                    planner_state=planner_st,
+                    reviewer_state=reviewer_st,
+                )
+            else:
+                watchdog_summary = raw_summary
             watchdog.advance(config, watchdog_summary, executor=executor)
         except Exception as _wd_exc:
             watchdog.record_tick_error(_wd_exc)
             watchdog_error = str(_wd_exc)
+    if supervisor is not None:
+        try:
+            planner_st = planner_state_fn() if callable(planner_state_fn) else None
+            reviewer_st = reviewer_state_fn() if callable(reviewer_state_fn) else None
+            if planner_st or reviewer_st:
+                supervisor_summary = overlay_orchestration_lifecycle(
+                    raw_summary,
+                    planner_state=planner_st,
+                    reviewer_state=reviewer_st,
+                )
+            else:
+                supervisor_summary = raw_summary
+            supervisor.advance(config, supervisor_summary, executor=executor)
+        except Exception as _sup_exc:
+            supervisor_error = str(_sup_exc)
     if job_recovery is not None:
         try:
             job_recovery.advance()
@@ -173,6 +196,9 @@ def _run_orchestration_tick(
     if watchdog_error is not None:
         projected = dict(projected) if isinstance(projected, dict) else {"projects": [], "summary": projected}
         projected["_watchdog_tick_error"] = watchdog_error
+    if supervisor_error is not None:
+        projected = dict(projected) if isinstance(projected, dict) else {"projects": [], "summary": projected}
+        projected["_supervisor_tick_error"] = supervisor_error
     return projected
 
 
@@ -361,6 +387,10 @@ def run_daemon(
     watchdog_coordinator = WatchdogCoordinator(
         runtime, ai_execution_port=ai_execution_port, progress_channel=progress_channel
     )
+    activation_supervisor = ActivationSupervisor(
+        runtime, controls=control_coordinator, executor=transition_executor,
+        progress_channel=progress_channel,
+    )
     job_recovery_coordinator = JobRecoveryCoordinator(
         runtime, accounting=accounting
     )
@@ -375,10 +405,14 @@ def run_daemon(
                 tick_result = _run_orchestration_tick(
                     config, runtime, bridge_store, transition_executor, reviewer_coordinator,
                     control_coordinator, watchdog=watchdog_coordinator,
-                    job_recovery=job_recovery_coordinator, pid=pid
+                    job_recovery=job_recovery_coordinator,
+                    supervisor=activation_supervisor, pid=pid
                 )
-                if isinstance(tick_result, dict) and tick_result.get("_watchdog_tick_error"):
-                    last_error = str(tick_result["_watchdog_tick_error"])
+                if isinstance(tick_result, dict):
+                    if tick_result.get("_watchdog_tick_error"):
+                        last_error = str(tick_result["_watchdog_tick_error"])
+                    elif tick_result.get("_supervisor_tick_error"):
+                        last_error = str(tick_result["_supervisor_tick_error"])
             except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
                 last_error = str(exc)
             state = "degraded" if last_error else "running"

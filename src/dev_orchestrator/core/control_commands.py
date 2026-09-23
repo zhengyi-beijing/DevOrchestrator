@@ -18,7 +18,7 @@ from dev_orchestrator.control.command_store import (
 from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.control.reconcile import resolve_reconcile_candidate, resolve_retry_candidate
 from dev_orchestrator.control.store import ConversationConflictError, ConversationControlStore
-from dev_orchestrator.control.surface import validate_expected
+from dev_orchestrator.control.surface import _active_execution, validate_expected
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.project_status import project_runtime_status
@@ -334,7 +334,20 @@ class ControlCommandCoordinator:
         if action not in _SUPPORTED_ACTIONS:
             return self._blocked(command_id, project_id, action, "unsupported control action", now, record)
         if project_id is None or project_id not in projects:
-            return self._blocked(command_id, project_id, action, "project is not configured", now, record)
+            from dev_orchestrator.core.activation import load_activation_requests, _record_pending_intent_for_activation
+            from dev_orchestrator.core.blockers import explain_block
+            act_data = load_activation_requests(self.runtime_root)
+            matching_req = None
+            if isinstance(act_data.get("requests"), dict):
+                for req in act_data["requests"].values():
+                    if isinstance(req, dict) and req.get("project_id") == project_id:
+                        matching_req = req
+                        break
+            if matching_req and action in {"continue", "start"}:
+                _record_pending_intent_for_activation(self.runtime_root, matching_req)
+            repo_arg = matching_req.get("repo_path") if matching_req else None
+            blist = explain_block(runtime_root=self.runtime_root, repo_path=repo_arg, action=action)
+            return self._blocked(command_id, project_id, action, "project is not configured", now, record, blockers=blist)
         snapshot = snapshots.get(project_id)
         if snapshot is None:
             return self._blocked(command_id, project_id, action, "project snapshot is unavailable", now, record)
@@ -548,6 +561,33 @@ class ControlCommandCoordinator:
             }
         if self.owner_store.is_paused(project_id):
             return self._blocked(command_id, project_id, action, "project is paused", now, record)
+
+        if action in {"continue", "start"}:
+            active_exec = _active_execution(self.runtime_root, project_id)
+            telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+            current_task_id = _nonblank(telemetry.get("task_id"))
+            if active_exec is not None and str(active_exec.get("state") or "") in {"launching", "running"}:
+                exec_task_id = _nonblank(active_exec.get("task_id"))
+                if not exec_task_id or not current_task_id or exec_task_id == current_task_id:
+                    return {
+                        **record,
+                        "state": "accepted",
+                        "processed_at": now,
+                        "effect": "NOOP_ALREADY_EXECUTING",
+                        "execution_id": active_exec.get("source_request_id") or active_exec.get("broker_request_id"),
+                        "task_id": exec_task_id or current_task_id,
+                    }
+            worker = snapshot.get("worker") if isinstance(snapshot.get("worker"), dict) else {}
+            if worker.get("kind") == "task" and worker.get("state") in {"starting", "running"}:
+                return {
+                    **record,
+                    "state": "accepted",
+                    "processed_at": now,
+                    "effect": "NOOP_ALREADY_EXECUTING",
+                    "execution_id": (active_exec.get("source_request_id") or active_exec.get("broker_request_id")) if active_exec else worker.get("task_id"),
+                    "task_id": current_task_id,
+                }
+
         next_status = str(snapshot.get("next_status") or "").upper()
         if "PENDING DESIGN" in next_status:
             lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "")
@@ -596,8 +636,55 @@ class ControlCommandCoordinator:
             if plan_id is None:
                 return self._blocked(command_id, project_id, action, reason, now, record)
             return {**record, "state":"accepted", "processed_at":now, "lifecycle_action":"plan", "plan_id":plan_id, "reason":reason}
+
+        repo_path = projects[project_id].get("repo_path") or projects[project_id].get("root")
+        telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+        current_task_id = _nonblank(telemetry.get("task_id"))
+
+        readiness_info = snapshot.get("readiness")
+        if isinstance(readiness_info, dict):
+            if (
+                not readiness_info.get("valid", True)
+                or readiness_info.get("stale")
+                or readiness_info.get("code") in {
+                    "READINESS_TASK_ID_MISMATCH",
+                    "READINESS_SCHEMA_INVALID",
+                    "READINESS_TOKEN_UNRESOLVABLE",
+                }
+            ):
+                from dev_orchestrator.core.blockers import explain_block
+                from dev_orchestrator.core.execution_intent import record_or_refresh_intent
+                blist = explain_block(
+                    project_config=projects[project_id],
+                    snapshot=snapshot,
+                    runtime_root=self.runtime_root,
+                    action=action,
+                )
+                top_fc = blist[0].failure_class if blist else "terminal"
+                if top_fc in {"recoverable_orchestration", "transient_infrastructure"}:
+                    record_or_refresh_intent(
+                        self.runtime_root,
+                        project_id,
+                        task_id=current_task_id,
+                        command_id=command_id,
+                        source=str(record.get("source") or "control"),
+                        repo_path=str(repo_path) if repo_path else None,
+                    )
+                reason_msg = readiness_info.get("reason") or "invalid or stale project readiness"
+                return self._blocked(command_id, project_id, action, reason_msg, now, record, blockers=blist)
+
         launch = executor.start_control(projects[project_id], snapshot, command_id)
         if launch is not None:
+            from dev_orchestrator.core.execution_intent import record_or_refresh_intent
+            record_or_refresh_intent(
+                self.runtime_root,
+                project_id,
+                task_id=launch.task_id or current_task_id,
+                command_id=command_id,
+                source=str(record.get("source") or "control"),
+                repo_path=str(repo_path) if repo_path else None,
+                state="active",
+            )
             return {
                 **record,
                 "state": "accepted",
@@ -607,7 +694,25 @@ class ControlCommandCoordinator:
             }
         state = executor.state().get("executions", {}).get(command_id, {})
         reason = state.get("reason") if isinstance(state, dict) else None
-        return self._blocked(command_id, project_id, action, str(reason or "control command was not launched"), now, record)
+        from dev_orchestrator.core.blockers import explain_block
+        blist = explain_block(
+            project_config=projects[project_id],
+            snapshot=snapshot,
+            runtime_root=self.runtime_root,
+            action=action,
+        )
+        top_fc = blist[0].failure_class if blist else "terminal"
+        if top_fc in {"recoverable_orchestration", "transient_infrastructure"}:
+            from dev_orchestrator.core.execution_intent import record_or_refresh_intent
+            record_or_refresh_intent(
+                self.runtime_root,
+                project_id,
+                task_id=current_task_id,
+                command_id=command_id,
+                source=str(record.get("source") or "control"),
+                repo_path=str(repo_path) if repo_path else None,
+            )
+        return self._blocked(command_id, project_id, action, str(reason or "control command was not launched"), now, record, blockers=blist)
 
     def _approve_owner_gate(
         self,
@@ -704,6 +809,8 @@ class ControlCommandCoordinator:
             project_id, True, command_id=command_id, action="stop",
             reason="explicit owner stop",
         )
+        from dev_orchestrator.core.execution_intent import terminate_intent
+        terminate_intent(self.runtime_root, project_id, "stopped", reason="explicit owner stop")
         result: dict[str, Any] = {**record, "state": "accepted", "processed_at": now, "effect": "pause_future_launches", "owner_control": owner}
         if latest is None:
             return result
@@ -776,8 +883,9 @@ class ControlCommandCoordinator:
         reason: str,
         processed_at: str,
         original: dict[str, Any] | None = None,
+        blockers: Sequence[Any] | None = None,
     ) -> dict[str, Any]:
-        return {
+        res = {
             **(original or {}),
             "version": CONTROL_VERSION,
             "command_id": command_id,
@@ -787,3 +895,6 @@ class ControlCommandCoordinator:
             "reason": reason,
             "processed_at": processed_at,
         }
+        if blockers is not None:
+            res["blockers"] = [b.to_dict() if hasattr(b, "to_dict") else b for b in blockers]
+        return res

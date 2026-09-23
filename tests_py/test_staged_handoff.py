@@ -652,7 +652,7 @@ class TestStagedHandoffEndToEnd(unittest.TestCase):
             diff_files = subprocess.check_output(
                 ["git", "-C", str(repo), "diff", "--name-only", f"{reviewed_head}", "HEAD"], text=True
             ).strip().splitlines()
-            self.assertEqual(diff_files, ["agent/next.md"])
+            self.assertEqual(sorted(diff_files), ["agent/execution-state.json", "agent/next.md"])
 
             new_next = (repo / "agent" / "next.md").read_text(encoding="utf-8")
             self.assertTrue(new_next.startswith("# P13 Successor Task"))

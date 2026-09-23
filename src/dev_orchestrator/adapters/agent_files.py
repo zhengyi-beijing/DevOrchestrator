@@ -32,6 +32,7 @@ from dev_orchestrator.monitor.project import (
     git_info,
     resolve_monitor_state,
 )
+from dev_orchestrator.core.readiness import resolve_readiness
 from dev_orchestrator.monitor.telemetry import extract_task_id, worker_telemetry
 from dev_orchestrator.platform.process import is_pid_alive
 from dev_orchestrator.storage.json_store import parse_utc, read_text_strict, utc_now
@@ -264,8 +265,18 @@ class AgentFilesAdapter(ProjectAdapter):
             if hint_line is not None:
                 phase_hint = hint_line.strip()
 
+        task_id = extract_task_id(next_title)
+        if task_id is None:
+            task_id = extract_task_id(next_text)
+
+        readiness_res = resolve_readiness(
+            root,
+            current_task_id=task_id,
+            next_status=next_status,
+            next_updated_at=next_updated_at,
+        )
         worker = _worker_info(root, relative_runtime)
-        state = resolve_monitor_state(worker, next_status, next_updated_at)
+        state = resolve_monitor_state(worker, next_status, next_updated_at, readiness=readiness_res)
 
         # Activity collection and dual aggregation (unfiltered vs watchdog_safe)
         entries = _collect_activity_entries(root, relative_runtime)
@@ -318,9 +329,6 @@ class AgentFilesAdapter(ProjectAdapter):
             },
         }
 
-        task_id = extract_task_id(next_title)
-        if task_id is None:
-            task_id = extract_task_id(next_text)
         telemetry = worker_telemetry(
             project,
             worker,
@@ -339,6 +347,7 @@ class AgentFilesAdapter(ProjectAdapter):
             "telemetry": telemetry,
             "last_activity_at": unfiltered_last_activity,
             "activity": activity_block,
+            "readiness": readiness_res.to_dict(),
             "next_title": next_title,
             "next_status": next_status,
             "next_updated_at": next_updated_at,

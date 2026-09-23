@@ -377,6 +377,101 @@ def _normalize_project_watchdog(raw: Any, index: int, config_path: Path) -> dict
     }
 
 
+_ALLOWED_SELF_HEALING_KEYS = frozenset({
+    "enabled",
+    "max_recovery_actions",
+    "max_identical_failures",
+    "max_launch_minutes",
+    "backoff_seconds",
+})
+
+
+def _normalize_project_self_healing(raw: Any, index: int, config_path: Path) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "config {0} project #{1} self_healing must be an object".format(config_path, index)
+        )
+    unknown = set(raw.keys()) - _ALLOWED_SELF_HEALING_KEYS
+    if unknown:
+        raise ValueError(
+            "config {0} project #{1} self_healing has unknown keys: {2}".format(
+                config_path, index, sorted(unknown)
+            )
+        )
+
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "config {0} project #{1} self_healing.enabled must be a boolean".format(
+                config_path, index
+            )
+        )
+
+    max_actions = raw.get("max_recovery_actions", 20)
+    if isinstance(max_actions, bool) or not isinstance(max_actions, int):
+        raise ValueError(
+            "config {0} project #{1} self_healing.max_recovery_actions must be an integer".format(
+                config_path, index
+            )
+        )
+    if max_actions < 1 or max_actions > 100:
+        raise ValueError(
+            "config {0} project #{1} self_healing.max_recovery_actions must be between 1 and 100".format(
+                config_path, index
+            )
+        )
+
+    max_failures = raw.get("max_identical_failures", 3)
+    if isinstance(max_failures, bool) or not isinstance(max_failures, int):
+        raise ValueError(
+            "config {0} project #{1} self_healing.max_identical_failures must be an integer".format(
+                config_path, index
+            )
+        )
+    if max_failures < 1 or max_failures > 20:
+        raise ValueError(
+            "config {0} project #{1} self_healing.max_identical_failures must be between 1 and 20".format(
+                config_path, index
+            )
+        )
+
+    max_minutes = raw.get("max_launch_minutes", 30)
+    if isinstance(max_minutes, bool) or not isinstance(max_minutes, int):
+        raise ValueError(
+            "config {0} project #{1} self_healing.max_launch_minutes must be an integer".format(
+                config_path, index
+            )
+        )
+    if max_minutes < 1 or max_minutes > 1440:
+        raise ValueError(
+            "config {0} project #{1} self_healing.max_launch_minutes must be between 1 and 1440".format(
+                config_path, index
+            )
+        )
+
+    backoff = raw.get("backoff_seconds", 5)
+    if isinstance(backoff, bool) or not isinstance(backoff, int):
+        raise ValueError(
+            "config {0} project #{1} self_healing.backoff_seconds must be an integer".format(
+                config_path, index
+            )
+        )
+    if backoff < 1 or backoff > 300:
+        raise ValueError(
+            "config {0} project #{1} self_healing.backoff_seconds must be between 1 and 300".format(
+                config_path, index
+            )
+        )
+
+    return {
+        "enabled": enabled,
+        "max_recovery_actions": max_actions,
+        "max_identical_failures": max_failures,
+        "max_launch_minutes": max_minutes,
+        "backoff_seconds": backoff,
+    }
+
+
 _ALLOWED_HARNESS_KEYS = frozenset({
     "enabled",
     "backend",
@@ -559,6 +654,9 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
     raw_watchdog = project.get("watchdog")
     if raw_watchdog is not None:
         normalized["watchdog"] = _normalize_project_watchdog(raw_watchdog, index, config_path)
+    raw_self_healing = project.get("self_healing")
+    if raw_self_healing is not None:
+        normalized["self_healing"] = _normalize_project_self_healing(raw_self_healing, index, config_path)
     raw_harness = project.get("reviewer_harness")
     if raw_harness is not None:
         normalized["reviewer_harness"] = _normalize_reviewer_harness(raw_harness, index, config_path)
@@ -652,6 +750,20 @@ def load_projects_config(path: Path | str) -> dict[str, Any]:
 
     data = dict(data)
     data["projects"] = normalized_projects
+    raw_activation_profiles = data.get("activation_profiles")
+    if raw_activation_profiles is not None:
+        if not isinstance(raw_activation_profiles, dict):
+            raise ValueError(
+                "config {0} activation_profiles must be an object".format(config_path)
+            )
+        for profile_name, profile in raw_activation_profiles.items():
+            if not isinstance(profile, dict):
+                raise ValueError(
+                    "config {0} activation_profiles[{1!r}] must be an object".format(
+                        config_path, profile_name
+                    )
+                )
+        data["activation_profiles"] = dict(raw_activation_profiles)
     raw_mobile = data.get("mobile_gateway")
     if raw_mobile is not None:
         data["mobile_gateway"] = _normalize_mobile_gateway(raw_mobile, config_path)

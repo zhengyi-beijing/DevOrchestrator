@@ -191,6 +191,7 @@ class MobileProjectionService:
             "telemetry": snapshot.get("telemetry") or {},
             "git": identity.get("git") or snapshot.get("git") or {},
             "next_status": snapshot.get("next_status"),
+            "blockers": base.get("blockers") or [],
         }
         return result
 

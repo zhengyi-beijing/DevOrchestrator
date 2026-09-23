@@ -107,7 +107,31 @@ def _advertised_task_id(snapshot: dict[str, Any]) -> Optional[str]:
     return advertised or _current_task_id(snapshot)
 
 
+def _readiness_allows_launch(snapshot: dict[str, Any]) -> bool:
+    readiness = snapshot.get("readiness")
+    if isinstance(readiness, dict):
+        if not readiness.get("valid", True) or readiness.get("stale", False) or readiness.get("state") == "invalid":
+            return False
+        if readiness.get("code") in {
+            "READINESS_TASK_ID_MISMATCH",
+            "READINESS_SCHEMA_INVALID",
+            "READINESS_TOKEN_UNRESOLVABLE",
+        }:
+            return False
+    return True
+
+
 def _next_task_ready(snapshot: dict[str, Any]) -> bool:
+    if not _readiness_allows_launch(snapshot):
+        return False
+    readiness = snapshot.get("readiness")
+    if isinstance(readiness, dict):
+        if readiness.get("state") == "ready_to_run":
+            return True
+        if readiness.get("source") == "legacy_markdown":
+            status = str(snapshot.get("next_status") or "")
+            return re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE) is not None
+        return False
     status = str(snapshot.get("next_status") or "")
     return re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE) is not None
 
@@ -589,7 +613,7 @@ class TransitionExecutor:
                 and record_task_id is not None
                 and advertised_task_id != record_task_id
             ):
-                is_ready = _next_task_ready(snapshot) or snapshot.get("state") == "READY_TO_RUN"
+                is_ready = _next_task_ready(snapshot) or (snapshot.get("state") == "READY_TO_RUN" and _readiness_allows_launch(snapshot))
                 next_updated = parse_utc(snapshot.get("next_updated_at"))
                 record_completed = parse_utc(
                     record.get("completed_at") or record.get("recorded_at") or record.get("started_at")
@@ -767,6 +791,14 @@ class TransitionExecutor:
         must_advance_from: Optional[str] = None,
         expected_status_hash: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
+        readiness = snapshot.get("readiness")
+        if isinstance(readiness, dict):
+            if not readiness.get("valid", True) or readiness.get("stale", False) or readiness.get("state") == "invalid":
+                code = readiness.get("code") or "READINESS_INVALID"
+                return None, f"readiness is invalid ({code}): {readiness.get('reason') or code}"
+            if readiness.get("code") == "READINESS_TASK_ID_MISMATCH":
+                return None, f"readiness task-id mismatch: {readiness.get('reason')}"
+
         state = snapshot.get("state")
         if expected_status_hash is not None:
             if state not in ("READY_TO_RUN", "WAITING_REVIEW", "IDLE"):

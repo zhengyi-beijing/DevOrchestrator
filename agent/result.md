@@ -1161,3 +1161,33 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - `git diff --check`: clean (0 whitespace/formatting defects).
   - Graphify update (`graphify update .`): updated cleanly (5176 nodes, 14453 edges).
   - Staged roadmap handoff: `agent/staged/roadmap.json` designates `successor: null`. All staged tasks (P11x through P16) are now complete.
+
+## P16.7 Self-Healing Project Activation & Readiness (2026-09-23)
+
+- Machine-Readable Readiness Authority (`src/dev_orchestrator/core/readiness.py`):
+  - Created `agent/execution-state.json` (schema_version 1) as the machine-readable readiness authority, bound strictly to current task ID. Mismatches (`READINESS_TASK_ID_MISMATCH`), invalid schemas (`READINESS_SCHEMA_INVALID`), or stale files fail closed before lifecycle projection and executor launch.
+  - Implemented closed legacy component grammar for human-readable Markdown tokens (e.g. `READY / OWNER_GOAL_DEFINED / NOT_STARTED`), safely mapping to `ready_to_run` migration candidates without altering live regex projection.
+  - Implemented `migrate_legacy_readiness` requiring full predicate validation (registry presence, non-conflicting candidate, clean git anchor, no owner gate/pause/active execution), committing only `agent/execution-state.json`, and appending to append-only audit log `runtime/readiness-migrations.jsonl`.
+- Orphan Detection & Bootstrap Registration (`src/dev_orchestrator/core/activation.py`):
+  - Implemented `detect_orphan_state` (`ORPHANED_PROJECT_STATE`) identifying local `.devorch/status.json` or runtime mirrors for projects absent from the active daemon registry.
+  - Implemented durable activation ledger `runtime/activation-requests.json` (schema_version 1) via `load_activation_requests` and `record_activation_request` as the single bootstrap origin of candidate project identity and repo paths.
+  - Implemented `reconcile_project_registration` with atomic project appending to `config/projects.json`, profile-based worker configuration (`activation_profiles`, `REGISTRATION_TEMPLATE_MISSING`), uniqueness validation, and automatic `.git/info/exclude` registration for `.devorch/`.
+- Canonical Structured Blockers (`src/dev_orchestrator/core/blockers.py`):
+  - Created canonical `Blocker` dataclass and `explain_block` evaluating registered project IDs or unregistered repo paths across 12+ failure codes.
+  - Exposed canonical blockers across CLI (`project-explain-block`), Web Control API (`GET /api/v1/control/projects/{id}/blockers`, `project_control_view`), Mobile projection, and enriched `project-status` not_found.
+- Durable Execution Intent & Supervisor Loop (`src/dev_orchestrator/core/execution_intent.py`, `src/dev_orchestrator/core/activation_supervisor.py`):
+  - Created durable `runtime/execution-intent.json` ledger tracking active target execution intents across daemon restarts.
+  - Enforced independent recovery budgets (20 actions, 3 identical fingerprints, 30 minutes elapsed) and livelock cycle detection (A -> B -> A -> B), failing closed as `RECOVERY_BUDGET_EXHAUSTED` / `RECOVERY_LIVELOCK_DETECTED` with zero fabricated owner gates.
+  - Implemented per-tick `ActivationSupervisor` executing strictly after `watchdog.advance`, consuming watchdog handoffs, evaluating blockers, applying bounded remediations, and re-submitting forward transitions.
+- Watchdog & Control Hardening:
+  - Added intent-gated watchdog handoff (`recovery_handoff` milestone, status `max_attempts_handed_off`) suppressing non-genuine owner gates when active intent matches.
+  - Added idempotent `NOOP_ALREADY_EXECUTING` for duplicate `continue`/`start` commands on active runs.
+  - Atomic staged successor activation in `ai_planner.py` writing `pending_design` alongside `agent/next.md` and safe rollback restoring both files.
+- Deliverables & Verification:
+  - Contract specification authored in `docs/P16_7_SELF_HEALING_ACTIVATION_CONTRACT.md`.
+  - Comprehensive end-to-end acceptance regression in `tests_py/test_p167_self_healing_activation.py` (16/16 passed).
+  - Full test suite regression: 1063 passed, 87 subtests passed in 389.12s (0 failures).
+  - Python compilation (`python -m compileall -q src ops tests_py benchmark/src`): passed cleanly (exit 0).
+  - `git diff --check`: passed cleanly (0 whitespace/formatting defects).
+  - Knowledge graph updated via `graphify update .`: 5380 nodes, 14975 edges, 245 communities.
+- Staged roadmap handoff: P16.8 DevO Golden-Path Lifecycle Hardening (`agent/staged/P16.8.md`, Status: **PENDING DESIGN**).
