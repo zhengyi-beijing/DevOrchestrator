@@ -47,6 +47,7 @@ DIAGNOSIS_CODES = (
 FAILURE_CLASSES = frozenset({
     "transient_infrastructure",
     "recoverable_orchestration",
+    "lifecycle",
     "owner_gate",
     "recovery_exhausted",
     "terminal",
@@ -68,7 +69,7 @@ _TRANSIENT_MARKERS = (
 
 
 def classify_failure_class(code: str, reason: str = "") -> str:
-    """Classify a failure code or reason into one of the 5 canonical failure classes."""
+    """Classify a failure code or reason into the canonical failure classes."""
     c = str(code or "").lower().strip()
     r = str(reason or "").lower().strip()
 
@@ -100,11 +101,13 @@ def classify_failure_class(code: str, reason: str = "") -> str:
     } or "owner_gate" in r:
         return "owner_gate"
 
+    if c == "readiness_not_ready_to_run":
+        return "lifecycle"
+
     if c in {
         "registration_template_missing",
         "readiness_schema_invalid",
         "readiness_token_unresolvable",
-        "readiness_not_ready_to_run",
         "dirty_worktree",
         "execution_policy_disabled",
     }:

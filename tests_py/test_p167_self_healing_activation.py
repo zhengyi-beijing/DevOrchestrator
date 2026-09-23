@@ -214,6 +214,38 @@ class TestOrphanDetectionAndReconciliation(unittest.TestCase):
             self.assertEqual(orphan["stale_task_id"], "P4.1")
             self.assertFalse(orphan["authoritative"])
 
+    def test_explain_block_trusts_effective_registry_project_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "registered_project"
+            make_repo(repo, task_id="P1")
+            project = {
+                "project_id": "registered-project",
+                "repo_path": str(repo),
+                "execution": {
+                    "enabled": True,
+                    "owner_authorized": True,
+                    "allowed_next_actions": ["continue_current_stage", "next_task"],
+                    "engine": "aibroker",
+                },
+            }
+
+            # There is deliberately no runtime.parent/config/projects.json.
+            # project_config is already the effective-registry entry supplied
+            # by the caller and must not be reclassified as unregistered.
+            blockers = explain_block(
+                project_id="registered-project",
+                project_config=project,
+                repo_path=repo,
+                runtime_root=runtime,
+                action="continue",
+            )
+            codes = [item.code for item in blockers]
+            self.assertNotIn("PROJECT_NOT_REGISTERED", codes)
+            self.assertNotIn("ORPHANED_PROJECT_STATE", codes)
+
     def test_reconcile_project_registration_with_template(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -247,9 +279,12 @@ class TestOrphanDetectionAndReconciliation(unittest.TestCase):
                 project_id="my_project",
                 config_path=cfg_path,
                 profile="default",
-                requested_action="continue",
+                requested_action="start",
                 source="test",
             )
+            activation_intent = get_active_intent(runtime, "my_project")
+            self.assertIsNotNone(activation_intent)
+            self.assertEqual(activation_intent["requested_action"], "start")
 
             proj, err = reconcile_project_registration(req, cfg_path, runtime)
             self.assertIsNotNone(proj)
@@ -360,8 +395,11 @@ class TestExecutionIntentAndBudgets(unittest.TestCase):
     def test_intent_survives_restart_and_tracks_actions(self):
         with tempfile.TemporaryDirectory() as td:
             runtime = Path(td)
-            intent = record_or_refresh_intent(runtime, "p1", task_id="P1", command_id="cmd-1")
+            intent = record_or_refresh_intent(
+                runtime, "p1", task_id="P1", command_id="cmd-1", requested_action="start"
+            )
             self.assertEqual(intent["project_id"], "p1")
+            self.assertEqual(intent["requested_action"], "start")
             self.assertEqual(intent["actions_used"], 0)
 
             # Record action
@@ -371,6 +409,12 @@ class TestExecutionIntentAndBudgets(unittest.TestCase):
             # Reload from disk
             intents = load_execution_intents(runtime)
             self.assertEqual(intents["intents"]["p1"]["actions_used"], 1)
+            self.assertEqual(intents["intents"]["p1"]["requested_action"], "start")
+
+            refreshed = record_or_refresh_intent(
+                runtime, "p1", task_id="P1", requested_action="continue"
+            )
+            self.assertEqual(refreshed["requested_action"], "continue")
 
     def test_livelock_cycle_detection(self):
         with tempfile.TemporaryDirectory() as td:
@@ -653,6 +697,14 @@ class TestPorcelainClassification(unittest.TestCase):
         expected, unexpected = classify_porcelain_entries(entries)
         self.assertEqual(list(expected), [" M agent/next.md", "?? agent/execution-state.json"])
         self.assertEqual(list(unexpected), [" M src/dev_orchestrator/cli.py", "?? untracked.py"])
+
+
+class TestFailureClassificationVocabulary(unittest.TestCase):
+    def test_readiness_not_ready_is_lifecycle_not_terminal(self):
+        self.assertEqual(
+            classify_failure_class("readiness_not_ready_to_run", "task is pending_design"),
+            "lifecycle",
+        )
 
 
 class TestTransientInspectionAndBackoff(unittest.TestCase):

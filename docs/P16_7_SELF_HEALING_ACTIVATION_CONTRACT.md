@@ -52,7 +52,7 @@ When `agent/execution-state.json` is absent, legacy `Status:` lines in `agent/ne
 ### 2.3 Audited Readiness Migration
 
 `migrate_legacy_readiness(...)` runs exclusively within the daemon-authoritative supervisor tick and requires all 7 predicates before writing:
-1. Project is present in the effective daemon registry.
+1. The caller supplies the project entry from the effective daemon registry; the migration function validates its project identity and repository path rather than independently re-reading a guessed config location.
 2. Structured file is absent or stale for a superseded task.
 3. Exactly one non-conflicting candidate (`ready_to_run` or `pending_design`).
 4. Task contract validates (single task heading, single Status line, matching telemetry).
@@ -91,6 +91,10 @@ Stored in `runtime/activation-requests.json` (`schema_version: 1`).
 - Resolves worker/runtime configuration template from config's `activation_profiles`.
 - Atomically updates `config/projects.json` via read-modify-write without modifying existing entries.
 
+Owner-facing configuration must provide at least one usable activation profile when automatic registration is expected. The tracked `config/projects.example.json` contains a `default` AIBroker profile and the bounded `self_healing` defaults. Production deployments should define the equivalent profile in their effective `projects.json`; otherwise bootstrap reconciliation fails closed with `REGISTRATION_TEMPLATE_MISSING` rather than guessing execution policy.
+
+The activation request's `requested_action` (`continue` or `start`) is copied into the durable execution intent and is preserved across registration/readiness recovery, so the supervisor retries the original owner-authorized action rather than silently substituting `continue`.
+
 ---
 
 ## 4. Structured Blocker Diagnostics
@@ -118,9 +122,10 @@ class Blocker:
 ### Shared Failure Classification Vocabulary
 1. `transient_infrastructure`: RDC/SSH/broker timeouts, status call timed out.
 2. `recoverable_orchestration`: Orphan registration, readiness migration, task-id drift, ready_to_run_unlaunched.
-3. `owner_gate`: Genuine owner-only architectural, policy, or safety decision.
-4. `recovery_exhausted`: Terminal state when self-healing budgets are exhausted. Never fabricates an owner gate.
-5. `terminal`: Non-recoverable configuration or structural failures.
+3. `lifecycle`: Valid task state that is not currently executable (for example `pending_design` before planning completes); this is neither a terminal failure nor an owner gate.
+4. `owner_gate`: Genuine owner-only architectural, policy, or safety decision.
+5. `recovery_exhausted`: Terminal state when self-healing budgets are exhausted. Never fabricates an owner gate.
+6. `terminal`: Non-recoverable configuration or structural failures.
 
 ---
 

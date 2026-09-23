@@ -82,6 +82,7 @@ def record_or_refresh_intent(
     *,
     task_id: Optional[str] = None,
     target_state: str = "EXECUTING",
+    requested_action: str = "continue",
     command_id: Optional[str] = None,
     source: str = "control",
     control_revision: Optional[str] = None,
@@ -108,6 +109,8 @@ def record_or_refresh_intent(
                 intent["command_id"] = command_id
             if source:
                 intent["source"] = source
+            if requested_action:
+                intent["requested_action"] = requested_action
             if control_revision:
                 intent["control_revision"] = control_revision
             if recovery_epoch_id:
@@ -128,6 +131,7 @@ def record_or_refresh_intent(
                 "target_state": target_state,
                 "command_id": command_id or f"intent-{project_id}",
                 "source": source,
+                "requested_action": requested_action,
                 "control_revision": control_revision,
                 "recovery_epoch_id": recovery_epoch_id,
                 "created_at": now,

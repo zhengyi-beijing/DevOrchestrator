@@ -18,7 +18,11 @@
         "supplement_path": null,
         "require_valid": true,
         "max_chars": 6000,
-        "inject_roles": ["planner", "worker", "reviewer"]
+        "inject_roles": [
+          "planner",
+          "worker",
+          "reviewer"
+        ]
       },
       "watchdog": {
         "enabled": true,
@@ -30,12 +34,65 @@
         "auto_recovery": false
       },
       "eta": {
-        "default_worker_minutes": { "min": 30, "max": 90 },
+        "default_worker_minutes": {
+          "min": 30,
+          "max": 90
+        },
         "historical_min_samples": 3,
         "stall_warning_minutes": 15,
         "hard_timeout_minutes": 180,
         "task_overrides": []
+      },
+      "self_healing": {
+        "enabled": true,
+        "max_recovery_actions": 20,
+        "max_identical_failures": 3,
+        "max_launch_minutes": 30,
+        "backoff_seconds": 5
       }
     }
-  ]
+  ],
+  "activation_profiles": {
+    "default": {
+      "worker_runtime": ".devorch\\worker",
+      "adapter": "agent_files",
+      "execution": {
+        "enabled": true,
+        "owner_authorized": true,
+        "allowed_next_actions": [
+          "continue_current_stage",
+          "next_task"
+        ],
+        "engine": "aibroker",
+        "worker_quality": "balanced",
+        "worker_timeout_seconds": 14400
+      },
+      "ai_roles": {
+        "reviewer": {
+          "enabled": true,
+          "quality": "high",
+          "independence": "provider",
+          "timeout_seconds": 1800
+        },
+        "planner": {
+          "enabled": true,
+          "quality": "high",
+          "review_quality": "high",
+          "review_independence": "provider",
+          "timeout_seconds": 1800,
+          "review_timeout_seconds": 900,
+          "max_plan_remediation_rounds": 2,
+          "max_plan_recovery_cycles": 2,
+          "hard_total_review_rejects": 5
+        }
+      },
+      "self_healing": {
+        "enabled": true,
+        "max_recovery_actions": 20,
+        "max_identical_failures": 3,
+        "max_launch_minutes": 30,
+        "backoff_seconds": 5
+      }
+    }
+  }
 }

@@ -180,6 +180,7 @@ def _record_pending_intent_for_activation(runtime: Path, request: dict[str, Any]
         current_intent["config_path"] = request.get("config_path")
         current_intent["activation_request_id"] = request["request_id"]
         current_intent["profile"] = request.get("profile")
+        current_intent["requested_action"] = request.get("requested_action") or "continue"
         current_intent["updated_at"] = request["requested_at"]
     else:
         intents_data["intents"][project_id] = {
@@ -188,6 +189,7 @@ def _record_pending_intent_for_activation(runtime: Path, request: dict[str, Any]
             "target_state": "EXECUTING",
             "command_id": f"bootstrap-{request['request_id']}",
             "source": request.get("source") or "activation_request",
+            "requested_action": request.get("requested_action") or "continue",
             "control_revision": None,
             "recovery_epoch_id": None,
             "created_at": request["requested_at"],

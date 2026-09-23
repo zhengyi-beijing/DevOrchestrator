@@ -667,6 +667,7 @@ class ControlCommandCoordinator:
                         project_id,
                         task_id=current_task_id,
                         command_id=command_id,
+                        requested_action=action,
                         source=str(record.get("source") or "control"),
                         repo_path=str(repo_path) if repo_path else None,
                     )
@@ -681,6 +682,7 @@ class ControlCommandCoordinator:
                 project_id,
                 task_id=launch.task_id or current_task_id,
                 command_id=command_id,
+                requested_action=action,
                 source=str(record.get("source") or "control"),
                 repo_path=str(repo_path) if repo_path else None,
                 state="active",
@@ -709,6 +711,7 @@ class ControlCommandCoordinator:
                 project_id,
                 task_id=current_task_id,
                 command_id=command_id,
+                requested_action=action,
                 source=str(record.get("source") or "control"),
                 repo_path=str(repo_path) if repo_path else None,
             )

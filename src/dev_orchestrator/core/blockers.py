@@ -150,9 +150,20 @@ def explain_block(
                     )
                 )
 
-    # 1. Registration & Orphan state
+    # 1. Registration & Orphan state. A caller-supplied project_config comes
+    # from the effective daemon registry and is authoritative; do not re-label
+    # it unregistered merely because config_path is omitted or non-default.
     is_registered = False
-    if config_data and isinstance(config_data.get("projects"), list):
+    if isinstance(project_config, dict):
+        supplied_id = str(project_config.get("project_id") or project_config.get("id") or "").strip()
+        supplied_root = str(project_config.get("repo_path") or project_config.get("root") or "").strip()
+        if project_id and supplied_id == project_id:
+            is_registered = True
+        elif resolved_repo is not None and supplied_root:
+            is_registered = (
+                Path(supplied_root).resolve(strict=False) == resolved_repo.resolve(strict=False)
+            )
+    if not is_registered and config_data and isinstance(config_data.get("projects"), list):
         for p in config_data["projects"]:
             if isinstance(p, dict):
                 p_id = str(p.get("project_id") or p.get("id") or "").strip()
