@@ -35,6 +35,8 @@ _STATE_VERSION = 1
 _DECISION_VERSION = 1
 _ACTIVE_STATES = frozenset({"launching", "running"})
 _TERMINAL_STATES = frozenset({"completed", "failed", "recovery_required"})
+_DEFAULT_MAX_REMEDIATION_ROUNDS = 2
+_MAX_REMEDIATION_ROUNDS = 5
 #: States a daemon restart must resolve. ``recovery_required`` is no longer
 #: produced by this coordinator, but records written by an earlier daemon are
 #: picked up here so legacy state is migrated to a retry-eligible outcome
@@ -70,6 +72,8 @@ def _terminal_milestone(state_name: str, decision: Optional[str]) -> str:
             return "REVIEW_ACCEPTED"
         if decision == "remediate":
             return "REMEDIATE"
+        if decision == "owner_gate":
+            return "OWNER_GATE"
         return ""
     if state_name == "failed":
         return "REVIEW_FAILED"
@@ -121,7 +125,19 @@ def _review_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str]
     timeout = raw.get("timeout_seconds", 600)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         return None, "reviewer timeout_seconds must be positive"
-    return {"quality": quality, "independence": independence, "timeout_seconds": float(timeout)}, ""
+    max_rounds = raw.get("max_remediation_rounds", _DEFAULT_MAX_REMEDIATION_ROUNDS)
+    if (
+        isinstance(max_rounds, bool)
+        or not isinstance(max_rounds, int)
+        or not 1 <= max_rounds <= _MAX_REMEDIATION_ROUNDS
+    ):
+        return None, "reviewer max_remediation_rounds must be an integer from 1 to 5"
+    return {
+        "quality": quality,
+        "independence": independence,
+        "timeout_seconds": float(timeout),
+        "max_remediation_rounds": max_rounds,
+    }, ""
 
 
 def _parse_review_output(text: str | None) -> tuple[str, str, str]:
@@ -712,6 +728,87 @@ class AIReviewerCoordinator:
             if isinstance(key, str) and isinstance(value, dict)
         }
 
+    def _technical_remediation_depth(
+        self, review_id: str, project_id: str, task_id: str,
+    ) -> tuple[int, str | None]:
+        """Return completed remediation rounds in this review's exact lineage.
+
+        A review of the original Worker has depth 0.  A review of remediation
+        round N has depth N.  Missing or cyclic lineage fails closed so a
+        corrupted history can never reopen an unbounded remediation loop.
+        """
+        transitions = self._transition_records()
+        with self._lock:
+            reviews = self._load_state()["reviews"]
+        current = reviews.get(review_id)
+        if not isinstance(current, dict):
+            return 0, "current technical review record is unavailable"
+        source_id = _nonblank(current.get("source_request_id"))
+        if source_id is None:
+            return 0, "current technical review lacks source execution identity"
+        rounds = 0
+        seen: set[str] = set()
+        while source_id is not None:
+            if source_id in seen:
+                return rounds, "technical review remediation lineage contains a cycle"
+            seen.add(source_id)
+            worker = transitions.get(source_id)
+            if not isinstance(worker, dict):
+                # Older/recovered root reviews may retain reviewer state while
+                # their original Worker transition ledger is unavailable.  A
+                # source id that is not itself a known review is therefore a
+                # safe root at depth 0.  If it names a review record, however,
+                # it is a remediation descendant and the missing execution
+                # evidence must fail closed.
+                if isinstance(reviews.get(source_id), dict):
+                    return rounds, f"source remediation execution {source_id!r} is missing from the durable ledger"
+                return rounds, None
+            if worker.get("project_id") != project_id or worker.get("task_id") != task_id:
+                return rounds, "technical review remediation lineage changed project/task identity"
+            if worker.get("source_kind") != "remediation":
+                return rounds, None
+            rounds += 1
+            parent_review_id = _nonblank(worker.get("review_decision_id"))
+            if parent_review_id is None:
+                # Legacy remediation records predate explicit review lineage.
+                # Treat such a record as the root remediation round.  New
+                # remediation launches persist review_decision_id, so any
+                # subsequent round becomes fully bounded and auditable.
+                return rounds, None
+            parent = reviews.get(parent_review_id)
+            if not isinstance(parent, dict):
+                return rounds, f"parent technical review {parent_review_id!r} is missing"
+            if parent.get("project_id") != project_id or parent.get("task_id") != task_id:
+                return rounds, "parent technical review changed project/task identity"
+            source_id = _nonblank(parent.get("source_request_id"))
+            if source_id is None:
+                return rounds, "parent technical review lacks source execution identity"
+        return rounds, None
+
+    def _apply_remediation_budget(
+        self, review_id: str, project_id: str, task_id: str,
+        decision: str, next_action: str, reason: str, max_rounds: int,
+    ) -> tuple[str, str, str, int]:
+        """Fail closed to owner judgment when technical remediation is exhausted."""
+        depth, lineage_error = self._technical_remediation_depth(review_id, project_id, task_id)
+        if decision != "remediate":
+            return decision, next_action, reason, depth
+        if lineage_error is not None:
+            return (
+                "owner_gate", "stop",
+                "technical review remediation lineage is not safely recoverable: "
+                + lineage_error + "; unresolved reviewer finding: " + reason,
+                depth,
+            )
+        if depth >= max_rounds:
+            return (
+                "owner_gate", "stop",
+                f"technical review remediation budget exhausted ({depth} >= {max_rounds}); "
+                "unresolved blocking finding requires owner disposition: " + reason,
+                depth,
+            )
+        return decision, next_action, reason, depth
+
     @staticmethod
     def _project_map(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
         return {
@@ -746,6 +843,7 @@ class AIReviewerCoordinator:
                     "quality": "high",
                     "independence": "resource",
                     "timeout_seconds": 600.0,
+                    "max_remediation_rounds": _DEFAULT_MAX_REMEDIATION_ROUNDS,
                 }
                 policy["harness"] = True
                 if harness_cfg.get("timeout_seconds"):
@@ -856,6 +954,7 @@ class AIReviewerCoordinator:
                     "worker_source_request_id": source_request_id,
                     "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                     "failure_environment": environment_for_project(proj_dict),
+                    "max_remediation_rounds": policy["max_remediation_rounds"],
                 },
             )
             self._launch_review(
@@ -951,6 +1050,7 @@ class AIReviewerCoordinator:
                 "worker_source_request_id": source_id,
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 "failure_environment": environment_for_project(project),
+                "max_remediation_rounds": policy["max_remediation_rounds"],
                 "reconcile_of": target["target_id"],
             },
         )
@@ -1004,7 +1104,8 @@ class AIReviewerCoordinator:
             prompt=self._review_prompt(str(project["project_id"]), task_id, source_id, truth, context_block=context_block, reanchor_context=reanchor),
             working_directory=Path(repo_path), quality=policy["quality"], independence=policy["independence"], previous_resource_context=previous,
             timeout_seconds=policy["timeout_seconds"], metadata={"worker_source_request_id": source_id, "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
-            "failure_environment": environment_for_project(project), "rereview_of": target["target_id"]})
+            "failure_environment": environment_for_project(project), "max_remediation_rounds": policy["max_remediation_rounds"],
+            "rereview_of": target["target_id"]})
         self._launch_review(review_id, source_id, request, truth, conversation_binding=binding, resolution=resolution)
         if target.get("kind") == "next":
             return review_id, "stale accepted NEXT re-reviewed at current clean descendant HEAD"
@@ -1090,6 +1191,7 @@ class AIReviewerCoordinator:
                 "worker_source_request_id": source_id,
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 "failure_environment": environment_for_project(project),
+                "max_remediation_rounds": policy["max_remediation_rounds"],
                 "retry_of": target["target_id"],
             },
         )
@@ -1492,15 +1594,20 @@ class AIReviewerCoordinator:
         if blocking_findings:
             decision = "remediate"
             next_action = "continue_current_stage"
-            disposition = _DECISION_DISPOSITIONS[(decision, next_action)]
             reason = f"{len(blocking_findings)} blocking finding(s) detected: " + "; ".join(
                 f"{f.rule_id} at {f.file}:{f.start_line}" for f in blocking_findings[:3]
             )
         else:
             decision = "next"
             next_action = "next_task"
-            disposition = _DECISION_DISPOSITIONS[(decision, next_action)]
             reason = f"Review accepted clean ({len(review_result.findings)} non-blocking finding(s))"
+
+        policy = rec.get("policy") if isinstance(rec.get("policy"), dict) else {}
+        max_rounds = int(policy.get("max_remediation_rounds", _DEFAULT_MAX_REMEDIATION_ROUNDS))
+        decision, next_action, reason, remediation_round = self._apply_remediation_budget(
+            review_id, project_id, task_id, decision, next_action, reason, max_rounds
+        )
+        disposition = _DECISION_DISPOSITIONS[(decision, next_action)]
 
         try:
             self._write_decision(
@@ -1544,6 +1651,16 @@ class AIReviewerCoordinator:
                 metadata={"review_kind": "technical_harness", "decision": decision, "reason": reason},
             )
 
+        if self.accounting is not None and decision == "owner_gate":
+            self.accounting.open_owner_gate(
+                review_id,
+                project_id=project_id,
+                task_id=task_id,
+                role="owner",
+                request_id=review_id,
+                source_request_id=source_request_id or None,
+            )
+
         self._finish_harness_terminal(
             review_id, project_id, task_id, source_request_id, "completed", reason,
             decision=decision, next_action=next_action, binding=binding,
@@ -1552,6 +1669,8 @@ class AIReviewerCoordinator:
                 "completeness": review_result.completeness,
                 "findings_count": len(review_result.findings),
                 "blocking_count": len(blocking_findings),
+                "remediation_round": remediation_round,
+                "max_remediation_rounds": max_rounds,
             }
         )
 
@@ -2077,7 +2196,16 @@ class AIReviewerCoordinator:
         ):
             self._finish_result(review_id, result, "failed", "repository changed during review")
             return
+        max_rounds = request.metadata.get("max_remediation_rounds", _DEFAULT_MAX_REMEDIATION_ROUNDS)
+        if isinstance(max_rounds, bool) or not isinstance(max_rounds, int):
+            max_rounds = _DEFAULT_MAX_REMEDIATION_ROUNDS
+        decision, next_action, reason, remediation_round = self._apply_remediation_budget(
+            review_id, request.project_id, request.task_run_id,
+            decision, next_action, reason, max_rounds,
+        )
         disposition = _DECISION_DISPOSITIONS[(decision, next_action)]
+        extra["remediation_round"] = remediation_round
+        extra["max_remediation_rounds"] = max_rounds
         try:
             self._write_decision(
                 review_id=review_id,

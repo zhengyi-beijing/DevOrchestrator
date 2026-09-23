@@ -45,7 +45,8 @@ _ROLE_LINES: Final[dict[str, tuple[str, ...]]] = {
     "technical_reviewer": (
         "Perform deep correctness review against the implemented code, tests, behavior, and acceptance criteria.",
         "Inspect edge cases, concurrency, durability, corruption, compatibility, regressions, and failure behavior as relevant.",
-        "Send concrete fixable findings directly to bounded remediation followed by regression.",
+        "Send concrete fixable BLOCKING findings directly to bounded remediation followed by regression.",
+        "NON_BLOCKING findings must not consume another remediation round or delay closure.",
         "Do not reopen full planning for ordinary correctness findings.",
         "Escalate to design only for a genuinely new architecture-level blocker.",
     ),

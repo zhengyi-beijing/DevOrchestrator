@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
-from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator, _parse_review_output
+from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator, _parse_review_output, _review_policy
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.core.transition_executor import TransitionExecutor
 
@@ -53,6 +53,24 @@ class ReviewerPort:
         )
 
 
+class RemediateReviewerPort(ReviewerPort):
+    def execute(self, request):
+        self.requests.append(request)
+        return AIRoleResult(
+            request_id=request.request_id, role_run_id=request.role_run_id,
+            status="succeeded",
+            output=json.dumps({
+                "decision": "remediate", "next_action": "continue_current_stage",
+                "reason": "blocking correctness gap remains",
+            }),
+            dispatch_id="review-dispatch", decision_id="review-resource-decision",
+            execution_id="review-execution",
+            resource_context=ResourceContext(
+                "copilot/default/reviewer", "github-copilot", "default", "reviewer"
+            ),
+        )
+
+
 def init_repo(root: Path) -> Path:
     repo = root / "repo"
     repo.mkdir()
@@ -63,6 +81,55 @@ def init_repo(root: Path) -> Path:
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
     return repo
+
+
+def write_two_round_remediation_lineage(runtime: Path, repo: Path) -> str:
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=repo, text=True).strip()
+    first_review = "ai_review:worker-source"
+    second_review = "ai_review:" + first_review
+    resource = {
+        "resource_id": "dsh/default/worker", "provider": "deepseek",
+        "account": "default", "model": "worker",
+    }
+    executions = {
+        "worker-source": {
+            "project_id": "p1", "source_request_id": "worker-source", "task_id": "P1",
+            "repo_path": str(repo), "branch": branch, "head": head, "engine": "aibroker",
+            "state": "completed", "completed_at": "2026-09-10T01:00:00+00:00",
+            "source_kind": "decision", "resource_context": resource,
+        },
+        first_review: {
+            "project_id": "p1", "source_request_id": first_review, "task_id": "P1",
+            "repo_path": str(repo), "branch": branch, "head": head, "engine": "aibroker",
+            "state": "completed", "completed_at": "2026-09-10T02:00:00+00:00",
+            "source_kind": "remediation", "review_decision_id": first_review,
+            "resource_context": resource,
+        },
+        second_review: {
+            "project_id": "p1", "source_request_id": second_review, "task_id": "P1",
+            "repo_path": str(repo), "branch": branch, "head": head, "engine": "aibroker",
+            "state": "completed", "completed_at": "2026-09-10T03:00:00+00:00",
+            "source_kind": "remediation", "review_decision_id": second_review,
+            "resource_context": resource,
+        },
+    }
+    (runtime / "transition-executor.json").write_text(
+        json.dumps({"version": 1, "executions": executions}), encoding="utf-8"
+    )
+    (runtime / "ai-reviewer.json").write_text(json.dumps({"version": 1, "reviews": {
+        first_review: {
+            "review_id": first_review, "project_id": "p1", "task_id": "P1",
+            "source_request_id": "worker-source", "state": "completed", "decision": "remediate",
+            "completed_at": "2026-09-10T01:30:00+00:00",
+        },
+        second_review: {
+            "review_id": second_review, "project_id": "p1", "task_id": "P1",
+            "source_request_id": first_review, "state": "completed", "decision": "remediate",
+            "completed_at": "2026-09-10T02:30:00+00:00",
+        },
+    }}), encoding="utf-8")
+    return "ai_review:" + second_review
 
 
 class ReviewerStructuredOutputTests(unittest.TestCase):
@@ -80,6 +147,21 @@ class ReviewerStructuredOutputTests(unittest.TestCase):
                 '{"decision":"next","next_action":"next_task","reason":"ok"}'
                 '{"decision":"stop","next_action":"stop","reason":"other"}'
             )
+
+    def test_review_policy_remediation_budget_is_finite(self):
+        base = {
+            "execution": {"engine": "aibroker"},
+            "ai_roles": {"reviewer": {"enabled": True}},
+        }
+        policy, reason = _review_policy(base)
+        self.assertEqual(reason, "")
+        self.assertEqual(policy["max_remediation_rounds"], 2)
+        for invalid in (0, 6, True, "2"):
+            project = json.loads(json.dumps(base))
+            project["ai_roles"]["reviewer"]["max_remediation_rounds"] = invalid
+            policy, reason = _review_policy(project)
+            self.assertIsNone(policy)
+            self.assertIn("integer from 1 to 5", reason)
 
 
 class DirectReviewerTests(unittest.TestCase):
@@ -175,6 +257,70 @@ class DirectReviewerTests(unittest.TestCase):
             captures = record.get("reviewer_raw_outputs") or []
             self.assertEqual(len(captures), 2)
             self.assertEqual(captures[1]["repair_index"], 1)
+
+    def test_technical_review_remediation_budget_defaults_to_two_rounds(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = init_repo(root)
+            runtime = root / "runtime"; runtime.mkdir()
+            expected_review_id = write_two_round_remediation_lineage(runtime, repo)
+            config = root / "projects.json"
+            config.write_text(json.dumps({"projects": [{
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"reviewer": {
+                    "enabled": True, "quality": "high", "independence": "resource"
+                }},
+            }]}), encoding="utf-8")
+
+            port = RemediateReviewerPort()
+            reviewer = AIReviewerCoordinator(runtime, port)
+            launched = reviewer.advance(config)
+            self.assertEqual(launched, [expected_review_id])
+            reviewer._threads[expected_review_id].join(timeout=3)
+            self.assertFalse(reviewer._threads[expected_review_id].is_alive())
+
+            review = reviewer.state()["reviews"][expected_review_id]
+            self.assertEqual(review["state"], "completed")
+            self.assertEqual(review["decision"], "owner_gate")
+            self.assertEqual(review["next_action"], "stop")
+            self.assertEqual(review["remediation_round"], 2)
+            self.assertEqual(review["max_remediation_rounds"], 2)
+            self.assertIn("remediation budget exhausted (2 >= 2)", review["reason"])
+
+            decision = json.loads(
+                (runtime / "review-decisions.json").read_text(encoding="utf-8")
+            )["decisions"][expected_review_id]
+            self.assertEqual(decision["decision"], "owner_gate")
+            self.assertEqual(decision["disposition"], "owner_gate")
+            self.assertEqual(decision["next_action"], "stop")
+
+    def test_technical_review_remediation_budget_override_allows_third_round(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = init_repo(root)
+            runtime = root / "runtime"; runtime.mkdir()
+            expected_review_id = write_two_round_remediation_lineage(runtime, repo)
+            config = root / "projects.json"
+            config.write_text(json.dumps({"projects": [{
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"reviewer": {
+                    "enabled": True, "quality": "high", "independence": "resource",
+                    "max_remediation_rounds": 3,
+                }},
+            }]}), encoding="utf-8")
+
+            port = RemediateReviewerPort()
+            reviewer = AIReviewerCoordinator(runtime, port)
+            launched = reviewer.advance(config)
+            self.assertEqual(launched, [expected_review_id])
+            reviewer._threads[expected_review_id].join(timeout=3)
+            review = reviewer.state()["reviews"][expected_review_id]
+            self.assertEqual(review["decision"], "remediate")
+            self.assertEqual(review["next_action"], "continue_current_stage")
+            self.assertEqual(review["remediation_round"], 2)
+            self.assertEqual(review["max_remediation_rounds"], 3)
 
     def test_reviewer_flag_without_broker_worker_engine_is_not_ready(self):
         with tempfile.TemporaryDirectory() as td:
