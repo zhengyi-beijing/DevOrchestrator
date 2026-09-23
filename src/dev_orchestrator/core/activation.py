@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
+from dev_orchestrator.core.execution_intent import _intent_lock
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 ACTIVATION_REQUESTS_SCHEMA_VERSION = 1
@@ -169,41 +170,42 @@ def record_activation_request(
 def _record_pending_intent_for_activation(runtime: Path, request: dict[str, Any]) -> None:
     """Create or update execution intent for an unregistered project activation."""
     intent_file = runtime / "execution-intent.json"
-    intents_data = read_json(intent_file, None)
-    if not isinstance(intents_data, dict) or intents_data.get("schema_version") != 1 or not isinstance(intents_data.get("intents"), dict):
-        intents_data = {"schema_version": 1, "intents": {}}
+    with _intent_lock(runtime):
+        intents_data = read_json(intent_file, None)
+        if not isinstance(intents_data, dict) or intents_data.get("schema_version") != 1 or not isinstance(intents_data.get("intents"), dict):
+            intents_data = {"schema_version": 1, "intents": {}}
 
-    project_id = request["project_id"]
-    current_intent = intents_data["intents"].get(project_id)
-    if isinstance(current_intent, dict) and current_intent.get("state") in {"pending", "active"}:
-        current_intent["repo_path"] = request["repo_path"]
-        current_intent["config_path"] = request.get("config_path")
-        current_intent["activation_request_id"] = request["request_id"]
-        current_intent["profile"] = request.get("profile")
-        current_intent["requested_action"] = request.get("requested_action") or "continue"
-        current_intent["updated_at"] = request["requested_at"]
-    else:
-        intents_data["intents"][project_id] = {
-            "project_id": project_id,
-            "task_id": None,
-            "target_state": "EXECUTING",
-            "command_id": f"bootstrap-{request['request_id']}",
-            "source": request.get("source") or "activation_request",
-            "requested_action": request.get("requested_action") or "continue",
-            "control_revision": None,
-            "recovery_epoch_id": None,
-            "created_at": request["requested_at"],
-            "updated_at": request["requested_at"],
-            "actions_used": 0,
-            "repeats_by_fingerprint": {},
-            "fingerprints": [],
-            "repo_path": request["repo_path"],
-            "config_path": request.get("config_path"),
-            "activation_request_id": request["request_id"],
-            "profile": request.get("profile"),
-            "state": "pending",
-        }
-    write_json(intent_file, intents_data, indent=2)
+        project_id = request["project_id"]
+        current_intent = intents_data["intents"].get(project_id)
+        if isinstance(current_intent, dict) and current_intent.get("state") in {"pending", "active"}:
+            current_intent["repo_path"] = request["repo_path"]
+            current_intent["config_path"] = request.get("config_path")
+            current_intent["activation_request_id"] = request["request_id"]
+            current_intent["profile"] = request.get("profile")
+            current_intent["requested_action"] = request.get("requested_action") or "continue"
+            current_intent["updated_at"] = request["requested_at"]
+        else:
+            intents_data["intents"][project_id] = {
+                "project_id": project_id,
+                "task_id": None,
+                "target_state": "EXECUTING",
+                "command_id": f"bootstrap-{request['request_id']}",
+                "source": request.get("source") or "activation_request",
+                "requested_action": request.get("requested_action") or "continue",
+                "control_revision": None,
+                "recovery_epoch_id": None,
+                "created_at": request["requested_at"],
+                "updated_at": request["requested_at"],
+                "actions_used": 0,
+                "repeats_by_fingerprint": {},
+                "fingerprints": [],
+                "repo_path": request["repo_path"],
+                "config_path": request.get("config_path"),
+                "activation_request_id": request["request_id"],
+                "profile": request.get("profile"),
+                "state": "pending",
+            }
+        write_json(intent_file, intents_data, indent=2)
 
 
 def reconcile_project_registration(

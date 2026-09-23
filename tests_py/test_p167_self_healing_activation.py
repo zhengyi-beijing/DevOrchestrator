@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,7 @@ from dev_orchestrator.core.blockers import (
     explain_block,
 )
 from dev_orchestrator.core.execution_intent import (
+    _intent_lock,
     check_intent_budgets,
     compute_recovery_fingerprint,
     get_active_intent,
@@ -67,7 +69,7 @@ from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.control.surface import project_control_view, project_identity
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.repository import classify_porcelain_entries, read_repository_truth
-from tests_py.test_transition_executor import FakeBackend, TransitionExecutor, make_repo
+from tests_py.test_transition_executor import FakeBackend, TransitionExecutor, make_repo, wait_terminal
 from tests_py.test_control_commands import FakeExecutor
 
 
@@ -415,6 +417,58 @@ class TestExecutionIntentAndBudgets(unittest.TestCase):
                 runtime, "p1", task_id="P1", requested_action="continue"
             )
             self.assertEqual(refreshed["requested_action"], "continue")
+
+    def test_activation_bootstrap_serializes_with_intent_writers(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "bootstrap_repo"
+            repo.mkdir()
+            record_or_refresh_intent(runtime, "existing", task_id="P1")
+
+            started = threading.Event()
+            finished = threading.Event()
+            errors = []
+
+            def activate() -> None:
+                started.set()
+                try:
+                    record_activation_request(
+                        runtime_root=runtime,
+                        repo_path=repo,
+                        project_id="bootstrap",
+                        requested_action="start",
+                        source="test",
+                    )
+                except Exception as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+                finally:
+                    finished.set()
+
+            with _intent_lock(runtime):
+                worker = threading.Thread(target=activate, daemon=True)
+                worker.start()
+                self.assertTrue(started.wait(timeout=1.0))
+                time.sleep(0.1)
+                self.assertFalse(
+                    finished.is_set(),
+                    "activation bootstrap must wait for the shared execution-intent lock",
+                )
+
+                data = load_execution_intents(runtime)
+                data["intents"]["existing"]["actions_used"] = 7
+                write_json(runtime / "execution-intent.json", data, indent=2)
+
+            worker.join(timeout=3.0)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+
+            final = load_execution_intents(runtime)
+            self.assertEqual(final["intents"]["existing"]["actions_used"], 7)
+            bootstrap = final["intents"]["bootstrap"]
+            self.assertEqual(bootstrap["state"], "pending")
+            self.assertEqual(bootstrap["requested_action"], "start")
 
     def test_livelock_cycle_detection(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1669,6 +1723,11 @@ class TestP167ReviewRemediation(unittest.TestCase):
             launches2 = executor.advance({"projects": [snapshot]}, cfg_path)
             self.assertEqual(len(launches2), 1)
             self.assertEqual(launches2[0].task_id, "P1")
+            # The executor owns a background Worker thread.  Wait for its
+            # terminal record before TemporaryDirectory cleanup so Windows
+            # cannot race an in-flight atomic runtime JSON write.
+            terminal = wait_terminal(executor, req_id)
+            self.assertIn(terminal["state"], {"completed", "failed"})
 
     def test_readiness_not_ready_to_run_lifecycle_hold_terminates_intent_without_false_exhaustion(self):
         with tempfile.TemporaryDirectory() as td:

@@ -1245,3 +1245,20 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - `git diff --check`: passed cleanly (0 whitespace/formatting defects).
   - Knowledge graph updated via `graphify update .`: 5415 nodes, 15160 edges, 253 communities.
 - Staged roadmap handoff: P16.8 DevO Golden-Path Lifecycle Hardening (`agent/staged/P16.8.md`, Status: **PENDING DESIGN**).
+
+## P16.7 Final Closure Remediation (2026-09-24)
+
+- Closed the final bounded P16.7 concurrency finding from `ai_review:rereview:p167-final-rereview-3f2aeca`:
+  - `activation._record_pending_intent_for_activation` now acquires the same `runtime/execution-intent.lock` used by `record_or_refresh_intent`, `record_intent_action`, backoff writers, and `terminate_intent`.
+  - The complete bootstrap intent read-modify-write is inside the shared inter-process lock, preventing concurrent activation from dropping another project's action/fingerprint update or resurrecting a terminated intent.
+  - Added deterministic concurrent-writer regression `test_activation_bootstrap_serializes_with_intent_writers`: activation is proven blocked while the shared lock is held, then preserves an independently updated `actions_used=7` while adding the bootstrap intent.
+- Stabilized an existing P16.7 asynchronous test on Windows:
+  - `test_readiness_caused_block_does_not_permanently_consume_decision_row` now waits for the TransitionExecutor Worker to reach terminal state before its `TemporaryDirectory` is removed.
+  - This closes a test-only `WinError 32` cleanup race; the affected test passed 5/5 repeated runs after the change.
+- Final verification on the resulting production/test tree:
+  - P16.7 focused activation suite: 42 passed, 5 subtests passed.
+  - Reviewer + activation + transition/control/watchdog focused/adjacent suites: 110 passed, 15 subtests passed.
+  - Full repository regression: 1092 passed, 92 subtests passed in 418.17s (0 failures).
+  - `python -m compileall -q src ops tests_py benchmark/src`: passed.
+  - `git diff --check`: passed.
+- DevOrchestrator remained owner-paused throughout remediation and verification; no P16.8 Worker was launched.
