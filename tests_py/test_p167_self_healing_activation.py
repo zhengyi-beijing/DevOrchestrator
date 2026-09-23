@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -39,6 +39,7 @@ from dev_orchestrator.core.activation import (
     load_activation_requests,
     reconcile_project_registration,
     record_activation_request,
+    validate_project_id,
 )
 from dev_orchestrator.core.blockers import (
     Blocker,
@@ -732,12 +733,25 @@ class TestTransientInspectionAndBackoff(unittest.TestCase):
             coordinator = ControlCommandCoordinator(runtime, None)
             supervisor = ActivationSupervisor(runtime, controls=coordinator, executor=executor)
 
-            outcomes = supervisor.advance(cfg_path, summary, executor=executor)
-            # Case C should trigger
+            t0 = datetime.now(timezone.utc)
+            outcomes = supervisor.advance(cfg_path, summary, executor=executor, now=t0)
+            # Case C: tick 1 schedules backoff
             self.assertEqual(len(outcomes), 1)
-            self.assertEqual(outcomes[0]["status"], "remediated")
-            self.assertEqual(outcomes[0]["action"], "transient_backoff")
-            self.assertEqual(outcomes[0]["remediation"], "transient_backoff")
+            self.assertEqual(outcomes[0]["status"], "transient_backoff_scheduled")
+
+            # Tick 1.5: within backoff window, waiting without consuming action budget
+            t_mid = t0 + timedelta(seconds=2)
+            outcomes_mid = supervisor.advance(cfg_path, summary, executor=executor, now=t_mid)
+            self.assertEqual(len(outcomes_mid), 1)
+            self.assertEqual(outcomes_mid[0]["status"], "transient_backoff_waiting")
+
+            # Tick 2: after backoff expires, retries forward transition under budget
+            t_after = t0 + timedelta(seconds=6)
+            outcomes_after = supervisor.advance(cfg_path, summary, executor=executor, now=t_after)
+            self.assertEqual(len(outcomes_after), 1)
+            self.assertEqual(outcomes_after[0]["status"], "remediated")
+            self.assertEqual(outcomes_after[0]["action"], "transient_backoff")
+            self.assertEqual(outcomes_after[0]["remediation"], "transient_backoff")
 
             # Forward transition retry should be submitted to control inbox/history
             cmd_files = list((runtime / "control" / "inbox").glob("cmd-rec-proj-1-P1-*.json")) + list(
@@ -748,7 +762,7 @@ class TestTransientInspectionAndBackoff(unittest.TestCase):
             self.assertEqual(cmd_data["action"], "continue")
             self.assertEqual(cmd_data["source"], "activation_supervisor")
 
-            # Intent actions should be incremented
+            # Intent actions should be incremented to 1
             intent = get_active_intent(runtime, "proj-1")
             self.assertEqual(intent["actions_used"], 1)
 
@@ -1690,6 +1704,152 @@ class TestP167ReviewRemediation(unittest.TestCase):
             codes2 = [b.code for b in blockers2]
             self.assertNotIn("RECOVERY_BUDGET_EXHAUSTED", codes2)
             self.assertNotIn("RECOVERY_LIVELOCK_DETECTED", codes2)
+
+    def test_two_tick_watchdog_handoff_consumption(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "proj"
+            make_repo(repo, task_id="P1")
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "proj-1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage"],
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            # Record active intent
+            record_or_refresh_intent(runtime, "proj-1", task_id="P1", command_id="cmd-1")
+
+            watchdog = WatchdogCoordinator(runtime)
+            # Seed watchdog state with recovery_handoff
+            watchdog._cached_state = {
+                "projects": {
+                    "proj-1": {
+                        "recovery_handoff": {
+                            "state": "recovery_exhausted",
+                            "epoch_id": "epoch-42",
+                            "created_at": utc_now_iso(),
+                        }
+                    }
+                }
+            }
+            watchdog._save_state(watchdog._cached_state)
+
+            executor = FakeExecutor(launch=True)
+            coordinator = ControlCommandCoordinator(runtime, None)
+            supervisor = ActivationSupervisor(runtime, controls=coordinator, executor=executor, watchdog=watchdog)
+
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "IDLE",
+                "telemetry": {"task_id": "P1"},
+            }
+            summary = {"projects": [snapshot]}
+
+            # Tick 1: supervisor advances and consumes handoff
+            outcomes1 = supervisor.advance(cfg_path, summary, executor=executor, watchdog=watchdog)
+            # The handoff should have been consumed from watchdog coordinator
+            prow = watchdog._cached_state.get("projects", {}).get("proj-1", {})
+            self.assertNotIn("recovery_handoff", prow)
+
+            # Tick 2: watchdog handoff remains absent; supervisor does not restore it or double-consume
+            outcomes2 = supervisor.advance(cfg_path, summary, executor=executor, watchdog=watchdog)
+            prow2 = watchdog._cached_state.get("projects", {}).get("proj-1", {})
+            self.assertNotIn("recovery_handoff", prow2)
+
+    def test_supervisor_terminates_intent_when_self_healing_disabled(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "proj"
+            make_repo(repo, task_id="P1")
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "proj-1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage"],
+                            },
+                            "self_healing": {
+                                "enabled": False,
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            # Record active intent
+            record_or_refresh_intent(runtime, "proj-1", task_id="P1", command_id="cmd-1")
+
+            executor = FakeExecutor(launch=True)
+            supervisor = ActivationSupervisor(runtime, executor=executor)
+
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "IDLE",
+                "telemetry": {"task_id": "P1"},
+            }
+            summary = {"projects": [snapshot]}
+
+            outcomes = supervisor.advance(cfg_path, summary, executor=executor)
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["status"], "self_healing_disabled")
+
+            # Intent terminated as stopped with self_healing_disabled
+            intent = get_active_intent(runtime, "proj-1")
+            self.assertIsNone(intent)
+            all_intents = load_execution_intents(runtime).get("intents", {})
+            self.assertEqual(all_intents["proj-1"]["state"], "stopped")
+            self.assertEqual(all_intents["proj-1"]["failure_class"], "lifecycle")
+            self.assertIn("self-healing disabled", all_intents["proj-1"]["reason"])
+
+    def test_project_id_validation_and_rejection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+
+            # Valid project ids
+            self.assertEqual(validate_project_id("valid_project-123"), "valid_project-123")
+            self.assertEqual(validate_project_id("PROJ"), "PROJ")
+
+            # Invalid project ids
+            for invalid in ["../escape", "proj/sub", "proj with spaces", "proj$bad", ""]:
+                with self.subTest(invalid=invalid):
+                    with self.assertRaises(ValueError):
+                        validate_project_id(invalid)
+                    with self.assertRaises(ValueError):
+                        record_activation_request(
+                            runtime,
+                            project_id=invalid,
+                            repo_path=str(root / "repo"),
+                        )
 
 
 if __name__ == "__main__":

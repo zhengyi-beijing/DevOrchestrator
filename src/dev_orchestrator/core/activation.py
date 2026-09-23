@@ -12,6 +12,7 @@ Provides:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -19,6 +20,16 @@ from uuid import uuid4
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 ACTIVATION_REQUESTS_SCHEMA_VERSION = 1
+
+VALID_PROJECT_ID_REGEX = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def validate_project_id(value: Any) -> str:
+    """Validate project ID against standard allowed characters [A-Za-z0-9_-]."""
+    text = str(value or "").strip()
+    if not text or not VALID_PROJECT_ID_REGEX.fullmatch(text):
+        raise ValueError("project_id must contain only letters, digits, underscore, or hyphen")
+    return text
 
 
 def detect_orphan_state(
@@ -122,7 +133,10 @@ def record_activation_request(
     """
     runtime = Path(runtime_root)
     resolved_repo = Path(repo_path).resolve(strict=False)
-    resolved_id = str(project_id or "").strip() or resolved_repo.name
+    if project_id is not None:
+        resolved_id = validate_project_id(project_id)
+    else:
+        resolved_id = validate_project_id(resolved_repo.name)
     resolved_config = str(Path(config_path).resolve(strict=False)) if config_path else None
 
     req_id = f"act-{uuid4().hex[:12]}"

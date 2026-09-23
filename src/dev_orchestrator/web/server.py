@@ -1115,12 +1115,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             repo_path = Path(repo_path_raw).resolve(strict=False)
             if not repo_path.exists():
                 self._error(400, "Bad Request", f"repository path does not exist: {repo_path}", False); return
+            pid_raw = value.get("project_id")
+            if pid_raw is not None:
+                if not isinstance(pid_raw, str) or not re.fullmatch(r"^[A-Za-z0-9_-]+$", pid_raw.strip()):
+                    self._error(400, "Bad Request", "project_id must contain only letters, digits, underscore, or hyphen", False); return
             from dev_orchestrator.core.activation import record_activation_request
             try:
                 record = record_activation_request(
                     runtime_root=runtime,
                     repo_path=repo_path,
-                    project_id=value.get("project_id"),
+                    project_id=pid_raw,
                     config_path=self.server.config_path,
                     profile=value.get("profile"),
                     requested_action=value.get("action") or value.get("requested_action") or "continue",

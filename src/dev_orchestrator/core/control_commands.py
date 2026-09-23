@@ -346,7 +346,7 @@ class ControlCommandCoordinator:
             if matching_req and action in {"continue", "start"}:
                 _record_pending_intent_for_activation(self.runtime_root, matching_req)
             repo_arg = matching_req.get("repo_path") if matching_req else None
-            blist = explain_block(runtime_root=self.runtime_root, repo_path=repo_arg, action=action)
+            blist = explain_block(runtime_root=self.runtime_root, repo_path=repo_arg, action=action, project_id=project_id)
             return self._blocked(command_id, project_id, action, "project is not configured", now, record, blockers=blist)
         snapshot = snapshots.get(project_id)
         if snapshot is None:

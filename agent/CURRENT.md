@@ -55,14 +55,40 @@ P16.7 Self-Healing Project Activation & Readiness completion (2026-09-23):
     - `test_accepted_next_task_with_committed_predecessor_execution_state_and_readiness_projection`: verifies next task actuation succeeds when `execution-state.json` is anchored to accepted predecessor and `next.md` is ready to run.
     - `test_readiness_caused_block_does_not_permanently_consume_decision_row`: verifies unlaunchable readiness failures preserve the decision row for subsequent supervisor migration.
     - `test_readiness_not_ready_to_run_lifecycle_hold_terminates_intent_without_false_exhaustion`: verifies `READINESS_NOT_READY_TO_RUN` stops the intent as `lifecycle_hold` without burning attempts or generating false `RECOVERY_BUDGET_EXHAUSTED`.
+- Technical Review Remediation Round 4 (`ai_review:ai_review:ai_review:ai_review:bc404b1b-5fd9-4ed8-b11f-729b6fdff6bc:execute` on commit `7adf2cb`):
+  - Watchdog recovery handoff persistence & thread-safe consumption (`src/dev_orchestrator/core/watchdog.py`):
+    - Added `consume_recovery_handoff(project_id, *, epoch_id=None)` under `self._lock` in `WatchdogCoordinator` to atomically pop `recovery_handoff` and persist via `_save_state(self._cached_state)`.
+    - In `_emit_owner_gate_once`, called `self._save_state(self._cached_state)` after writing `recovery_handoff`.
+    - Evaluated `self_healing.enabled` configuration in both `max_attempts_per_run` handoff check and `_emit_owner_gate_once`.
+  - Inter-process file locking on execution intent (`src/dev_orchestrator/core/execution_intent.py`):
+    - Wrapped `record_or_refresh_intent`, `record_intent_action`, `set_intent_backoff`, `clear_intent_backoff`, and `terminate_intent` in `InterProcessFileLock(runtime / "execution-intent.lock")`.
+    - Extended `check_intent_budgets` to check `self_healing.enabled is False`, returning `(True, "self-healing disabled by project configuration", "SELF_HEALING_DISABLED")`.
+  - Strict project ID validation across ingress surfaces (`src/dev_orchestrator/core/activation.py`, `src/dev_orchestrator/cli.py`, `src/dev_orchestrator/web/server.py`):
+    - Added `VALID_PROJECT_ID_REGEX` (`^[A-Za-z0-9_-]+$`) and `validate_project_id(value)`.
+    - Validated project ID in `record_activation_request`, `cmd_project_activate`, and `POST /api/v1/control/projects/activate` (returning HTTP 400 on invalid input).
+    - Fixed project ID defaulting in `record_activation_request` to validate explicit strings (even empty ones) before defaulting to `resolved_repo.name`.
+  - Context propagation in blocker derivation (`src/dev_orchestrator/core/control_commands.py`):
+    - Passed `project_id=project_id` to `explain_block` at line 349 so unregistered projects correctly emit `PROJECT_NOT_REGISTERED`.
+  - Closed legacy component grammar and token normalization (`src/dev_orchestrator/core/readiness.py`):
+    - Reused `parse_legacy_status_components` uniformly in `_resolve_legacy_markdown`, ensuring consistent parsing, conflict handling, and candidate derivation.
+    - Set `code = "READINESS_TOKEN_UNSTRUCTURED" if candidate else "OK"` and `migration_required = bool(candidate)` so unmigrated legacy tokens are properly migrated by the supervisor.
+  - Supervisor watchdog integration & transient backoff (`src/dev_orchestrator/daemon.py`, `src/dev_orchestrator/core/activation_supervisor.py`):
+    - Passed `watchdog` to `ActivationSupervisor` in `daemon.py`.
+    - Handled transient infrastructure errors via scheduled backoffs and non-action-consuming waiting before executing the retry under budget.
+    - Evaluated `self_healing.enabled: false` in `ActivationSupervisor`, stopping intents cleanly as `lifecycle` without spurious remediation loops.
+  - Added dedicated regression test cases in `tests_py/test_p167_self_healing_activation.py`:
+    - `test_two_tick_watchdog_handoff_consumption`: verifies watchdog handoff consumption clears `_cached_state` and does not restore or double-consume on tick 2.
+    - `test_supervisor_terminates_intent_when_self_healing_disabled`: verifies supervisor terminates intent as `stopped` with `lifecycle` when self-healing is disabled.
+    - `test_project_id_validation_and_rejection`: verifies valid/invalid project ID validation across `validate_project_id` and `record_activation_request`.
+    - Updated `test_supervisor_transient_backoff_and_forward_retry` to verify scheduled backoff, waiting, and subsequent retry phases across timestamps.
 - Acceptance & Verification:
   - Canonical contract authored in `docs/P16_7_SELF_HEALING_ACTIVATION_CONTRACT.md`.
-  - Focused activation suite: 36 passed in `tests_py/test_p167_self_healing_activation.py`.
-  - Adjacent transition & control suites: 69 passed, 16 subtests passed across `test_transition_executor.py`, `test_remediation_flow.py`, `test_control_commands.py`, `test_p12_control_actions.py`.
-  - Full test suite regression: 1083 passed, 87 subtests passed in 389.99s (0 failures).
+  - Focused activation suite: 39 passed, 5 subtests passed in `tests_py/test_p167_self_healing_activation.py`.
+  - Adjacent transition & control suites: 72 passed, 10 subtests passed across `test_transition_executor.py`, `test_watchdog.py`, `test_control_commands.py`, `test_cli.py`, `test_p16_cli_and_integration.py`.
+  - Full test suite regression: 1086 passed, 92 subtests passed in 391.06s (0 failures).
   - Python compilation (`python -m compileall -q src ops tests_py benchmark/src`): passed cleanly (exit 0).
   - `git diff --check`: passed cleanly (0 whitespace/formatting defects).
-  - Knowledge graph updated via `graphify update .`: 5403 nodes, 15102 edges, 248 communities.
+  - Knowledge graph updated via `graphify update .`: 5415 nodes, 15160 edges, 253 communities.
 - Preserved handoff: P16.8 DevO Golden-Path Lifecycle Hardening (`agent/staged/P16.8.md`, Status: **PENDING DESIGN**).
 
 P16 AI Capability Benchmark Project remediation & state (2026-09-21):

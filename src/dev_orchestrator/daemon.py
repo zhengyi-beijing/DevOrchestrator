@@ -183,7 +183,7 @@ def _run_orchestration_tick(
                 )
             else:
                 supervisor_summary = raw_summary
-            supervisor.advance(config, supervisor_summary, executor=executor)
+            supervisor.advance(config, supervisor_summary, executor=executor, watchdog=watchdog)
         except Exception as _sup_exc:
             supervisor_error = str(_sup_exc)
     if job_recovery is not None:
@@ -389,7 +389,7 @@ def run_daemon(
     )
     activation_supervisor = ActivationSupervisor(
         runtime, controls=control_coordinator, executor=transition_executor,
-        progress_channel=progress_channel,
+        progress_channel=progress_channel, watchdog=watchdog_coordinator,
     )
     job_recovery_coordinator = JobRecoveryCoordinator(
         runtime, accounting=accounting

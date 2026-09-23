@@ -1411,6 +1411,29 @@ class WatchdogCoordinator:
         except Exception:
             pass
 
+    def consume_recovery_handoff(
+        self,
+        project_id: str,
+        *,
+        epoch_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Atomically inspect, clear, and persist consumption of a recovery handoff record.
+
+        Returns the consumed recovery_handoff dict if matched and cleared, or None.
+        """
+        with self._lock:
+            prow = self._cached_state.get("projects", {}).get(project_id)
+            if not isinstance(prow, dict) or not prow.get("recovery_handoff"):
+                return None
+            handoff = prow["recovery_handoff"]
+            handoff_epoch = handoff.get("recovery_epoch_id")
+            if epoch_id and handoff_epoch and epoch_id != handoff_epoch:
+                return None
+            consumed = dict(handoff)
+            prow.pop("recovery_handoff", None)
+            self._save_state(self._cached_state)
+            return consumed
+
     def advance(
         self,
         config_path: Path | str,
@@ -1587,7 +1610,9 @@ class WatchdogCoordinator:
                     from dev_orchestrator.core.execution_intent import get_active_intent
                     active_intent = get_active_intent(self.runtime_root, pid)
                     epoch_id = assessment.recovery_epoch.get("id") if assessment.recovery_epoch else None
-                    if active_intent and (not active_intent.get("recovery_epoch_id") or active_intent.get("recovery_epoch_id") == epoch_id):
+                    sh_cfg = pcfg.get("self_healing") if isinstance(pcfg, dict) else None
+                    sh_enabled = sh_cfg.get("enabled", True) if isinstance(sh_cfg, dict) else True
+                    if sh_enabled and active_intent and (not active_intent.get("recovery_epoch_id") or active_intent.get("recovery_epoch_id") == epoch_id):
                         prow["recovery_handoff"] = {
                             "state": "recovery_exhausted",
                             "reason": f"exhausted max_attempts_per_run ({policy['max_attempts_per_run']})",
@@ -2136,8 +2161,23 @@ class WatchdogCoordinator:
     def _emit_owner_gate_once(self, project_id: str, attempt_record: dict[str, Any], reason: str) -> None:
         from dev_orchestrator.core.execution_intent import get_active_intent
         from dev_orchestrator.core.diagnostics import classify_failure_class
+        pcfg = None
+        cfg_path = self.runtime_root.parent / "config" / "projects.json"
+        if cfg_path.is_file():
+            try:
+                import json
+                pdata = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+                for p in pdata.get("projects", []):
+                    if isinstance(p, dict) and (p.get("project_id") == project_id or p.get("id") == project_id):
+                        pcfg = p
+                        break
+            except Exception:
+                pcfg = None
+        sh_cfg = pcfg.get("self_healing") if isinstance(pcfg, dict) else None
+        sh_enabled = sh_cfg.get("enabled", True) if isinstance(sh_cfg, dict) else True
+
         active_intent = get_active_intent(self.runtime_root, project_id)
-        if active_intent:
+        if sh_enabled and active_intent:
             epoch_id = attempt_record.get("recovery_epoch_id")
             intent_epoch = active_intent.get("recovery_epoch_id")
             if not intent_epoch or intent_epoch == epoch_id:
@@ -2166,6 +2206,7 @@ class WatchdogCoordinator:
                         "recovery_epoch_id": epoch_id,
                         "handed_off_at": utc_now_iso(),
                     }
+                    self._save_state(self._cached_state)
                     return
 
         att_key = attempt_record.get("attempt_key", "")

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,13 +22,15 @@ from dev_orchestrator.core.activation import (
 from dev_orchestrator.core.blockers import explain_block
 from dev_orchestrator.core.execution_intent import (
     check_intent_budgets,
+    clear_intent_backoff,
     compute_recovery_fingerprint,
     load_execution_intents,
     record_intent_action,
+    set_intent_backoff,
     terminate_intent,
 )
 from dev_orchestrator.core.readiness import migrate_legacy_readiness
-from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
+from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +45,13 @@ class ActivationSupervisor:
         controls: Any = None,
         executor: Any = None,
         progress_channel: Any = None,
+        watchdog: Any = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.controls = controls
         self.executor = executor
         self.progress_channel = progress_channel
+        self.watchdog = watchdog
 
     def _emit_milestone(
         self,
@@ -74,6 +78,7 @@ class ActivationSupervisor:
         *,
         executor: Any = None,
         now: Optional[datetime] = None,
+        watchdog: Any = None,
     ) -> list[dict[str, Any]]:
         """Advance the activation supervisor for one daemon tick."""
         exec_inst = executor or self.executor
@@ -114,6 +119,7 @@ class ActivationSupervisor:
         outcomes: list[dict[str, Any]] = []
 
         # Consume watchdog handoff records if present
+        watchdog_inst = watchdog or self.watchdog
         watchdog_file = self.runtime_root / "watchdog.json"
         watchdog_data = read_json(watchdog_file, None)
         watchdog_dirty = False
@@ -141,19 +147,7 @@ class ActivationSupervisor:
                 })
                 continue
 
-            # 2. Check and consume watchdog handoff
-            epoch_id = intent.get("recovery_epoch_id")
-            if isinstance(watchdog_data, dict):
-                prow = watchdog_data.get("projects", {}).get(project_id)
-                if isinstance(prow, dict) and prow.get("recovery_handoff"):
-                    handoff = prow["recovery_handoff"]
-                    handoff_epoch = handoff.get("recovery_epoch_id")
-                    if not epoch_id or not handoff_epoch or epoch_id == handoff_epoch:
-                        record_intent_action(self.runtime_root, project_id)
-                        prow["recovery_handoff"] = None
-                        watchdog_dirty = True
-
-            # 3. Find project configuration if registered
+            # 2. Find project configuration if registered
             project_config = None
             if isinstance(raw_config.get("projects"), list):
                 for p in raw_config["projects"]:
@@ -167,6 +161,37 @@ class ActivationSupervisor:
             if not repo_path:
                 repo_path = intent.get("repo_path")
 
+            self_healing_cfg = project_config.get("self_healing") if project_config else None
+            if isinstance(self_healing_cfg, dict) and not self_healing_cfg.get("enabled", True):
+                terminate_intent(
+                    self.runtime_root,
+                    project_id,
+                    "stopped",
+                    failure_class="lifecycle",
+                    reason="self-healing disabled by project configuration",
+                )
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "self_healing_disabled",
+                })
+                continue
+
+            # 3. Check and consume watchdog handoff
+            epoch_id = intent.get("recovery_epoch_id")
+            if watchdog_inst is not None and hasattr(watchdog_inst, "consume_recovery_handoff"):
+                handoff = watchdog_inst.consume_recovery_handoff(project_id, epoch_id=epoch_id)
+                if handoff:
+                    record_intent_action(self.runtime_root, project_id)
+            elif isinstance(watchdog_data, dict):
+                prow = watchdog_data.get("projects", {}).get(project_id)
+                if isinstance(prow, dict) and prow.get("recovery_handoff"):
+                    handoff = prow["recovery_handoff"]
+                    handoff_epoch = handoff.get("recovery_epoch_id")
+                    if not epoch_id or not handoff_epoch or epoch_id == handoff_epoch:
+                        record_intent_action(self.runtime_root, project_id)
+                        prow.pop("recovery_handoff", None)
+                        watchdog_dirty = True
+
             # 4. Derive structured blockers
             blockers = explain_block(
                 project_config=project_config,
@@ -175,6 +200,7 @@ class ActivationSupervisor:
                 runtime_root=self.runtime_root,
                 config_path=cfg_path,
                 action=intent.get("requested_action") or "continue",
+                project_id=project_id,
             )
 
             # 5. Genuine Owner Gate preservation: evaluate across ALL blockers
@@ -313,6 +339,37 @@ class ActivationSupervisor:
                 })
                 continue
 
+            # If transient infrastructure error, handle backoff scheduling and waiting before burning actions
+            if top_blocker.failure_class == "transient_infrastructure":
+                backoff_secs = int(self_healing_cfg.get("backoff_seconds") or 5) if self_healing_cfg else 5
+                backoff_until_str = intent.get("backoff_until")
+                if backoff_until_str:
+                    try:
+                        backoff_until_dt = parse_utc(backoff_until_str)
+                    except Exception:
+                        backoff_until_dt = None
+                    if backoff_until_dt and tick_now < backoff_until_dt:
+                        outcomes.append({
+                            "project_id": project_id,
+                            "status": "transient_backoff_waiting",
+                            "backoff_until": backoff_until_str,
+                            "blocker_code": top_blocker.code,
+                        })
+                        continue
+                    else:
+                        clear_intent_backoff(self.runtime_root, project_id)
+                else:
+                    backoff_until_dt = tick_now + timedelta(seconds=backoff_secs)
+                    set_intent_backoff(self.runtime_root, project_id, backoff_until_dt.isoformat())
+                    outcomes.append({
+                        "project_id": project_id,
+                        "status": "transient_backoff_scheduled",
+                        "backoff_seconds": backoff_secs,
+                        "backoff_until": backoff_until_dt.isoformat(),
+                        "blocker_code": top_blocker.code,
+                    })
+                    continue
+
             # 10. Bounded Remediation for recoverable conditions
             fp = compute_recovery_fingerprint(
                 project_id=project_id,
@@ -420,7 +477,7 @@ class ActivationSupervisor:
                 except Exception as exc:
                     logger.warning("forward transition submission failed for %s: %s", project_id, exc)
 
-        if watchdog_dirty and isinstance(watchdog_data, dict):
+        if watchdog_inst is None and watchdog_dirty and isinstance(watchdog_data, dict):
             try:
                 write_json(watchdog_file, watchdog_data, indent=2)
             except Exception:

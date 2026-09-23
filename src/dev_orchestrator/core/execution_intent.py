@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from dev_orchestrator.accounting.events import InterProcessFileLock
 from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
 EXECUTION_INTENT_SCHEMA_VERSION = 1
@@ -22,6 +23,10 @@ DEFAULT_MAX_RECOVERY_ACTIONS = 20
 DEFAULT_MAX_IDENTICAL_FAILURES = 3
 DEFAULT_MAX_LAUNCH_MINUTES = 30
 DEFAULT_BACKOFF_SECONDS = 5
+
+
+def _intent_lock(runtime_root: Path | str) -> InterProcessFileLock:
+    return InterProcessFileLock(Path(runtime_root) / "execution-intent.lock")
 
 
 def compute_recovery_fingerprint(
@@ -89,56 +94,57 @@ def record_or_refresh_intent(
 ) -> dict[str, Any]:
     """Create or refresh a durable execution intent in runtime/execution-intent.json."""
     runtime = Path(runtime_root)
-    intent_file = runtime / "execution-intent.json"
-    data = load_execution_intents(runtime)
-    now = utc_now_iso()
+    with _intent_lock(runtime):
+        intent_file = runtime / "execution-intent.json"
+        data = load_execution_intents(runtime)
+        now = utc_now_iso()
 
-    existing = data["intents"].get(project_id)
-    if isinstance(existing, dict) and existing.get("state") in {"active", "pending"}:
-        intent = existing
-        if task_id:
-            intent["task_id"] = task_id
-        if command_id:
-            intent["command_id"] = command_id
-        if source:
-            intent["source"] = source
-        if control_revision:
-            intent["control_revision"] = control_revision
-        if recovery_epoch_id:
-            intent["recovery_epoch_id"] = recovery_epoch_id
-        if repo_path:
-            intent["repo_path"] = repo_path
-        if config_path:
-            intent["config_path"] = config_path
-        if activation_request_id:
-            intent["activation_request_id"] = activation_request_id
-        if profile:
-            intent["profile"] = profile
-        intent["updated_at"] = now
-    else:
-        intent = {
-            "project_id": project_id,
-            "task_id": task_id,
-            "target_state": target_state,
-            "command_id": command_id or f"intent-{project_id}",
-            "source": source,
-            "control_revision": control_revision,
-            "recovery_epoch_id": recovery_epoch_id,
-            "created_at": now,
-            "updated_at": now,
-            "actions_used": 0,
-            "repeats_by_fingerprint": {},
-            "fingerprints": [],
-            "repo_path": repo_path,
-            "config_path": config_path,
-            "activation_request_id": activation_request_id,
-            "profile": profile,
-            "state": state,
-        }
-        data["intents"][project_id] = intent
+        existing = data["intents"].get(project_id)
+        if isinstance(existing, dict) and existing.get("state") in {"active", "pending"}:
+            intent = existing
+            if task_id:
+                intent["task_id"] = task_id
+            if command_id:
+                intent["command_id"] = command_id
+            if source:
+                intent["source"] = source
+            if control_revision:
+                intent["control_revision"] = control_revision
+            if recovery_epoch_id:
+                intent["recovery_epoch_id"] = recovery_epoch_id
+            if repo_path:
+                intent["repo_path"] = repo_path
+            if config_path:
+                intent["config_path"] = config_path
+            if activation_request_id:
+                intent["activation_request_id"] = activation_request_id
+            if profile:
+                intent["profile"] = profile
+            intent["updated_at"] = now
+        else:
+            intent = {
+                "project_id": project_id,
+                "task_id": task_id,
+                "target_state": target_state,
+                "command_id": command_id or f"intent-{project_id}",
+                "source": source,
+                "control_revision": control_revision,
+                "recovery_epoch_id": recovery_epoch_id,
+                "created_at": now,
+                "updated_at": now,
+                "actions_used": 0,
+                "repeats_by_fingerprint": {},
+                "fingerprints": [],
+                "repo_path": repo_path,
+                "config_path": config_path,
+                "activation_request_id": activation_request_id,
+                "profile": profile,
+                "state": state,
+            }
+            data["intents"][project_id] = intent
 
-    write_json(intent_file, data, indent=2)
-    return intent
+        write_json(intent_file, data, indent=2)
+        return copy.deepcopy(intent)
 
 
 def record_intent_action(
@@ -148,26 +154,27 @@ def record_intent_action(
 ) -> tuple[dict[str, Any], bool, Optional[str], Optional[str]]:
     """Increment action counter and append fingerprint."""
     runtime = Path(runtime_root)
-    intent_file = runtime / "execution-intent.json"
-    data = load_execution_intents(runtime)
-    intent = data.get("intents", {}).get(project_id)
-    if not isinstance(intent, dict):
-        return {}, False, None, None
+    with _intent_lock(runtime):
+        intent_file = runtime / "execution-intent.json"
+        data = load_execution_intents(runtime)
+        intent = data.get("intents", {}).get(project_id)
+        if not isinstance(intent, dict):
+            return {}, False, None, None
 
-    intent["actions_used"] = int(intent.get("actions_used", 0)) + 1
-    intent["updated_at"] = utc_now_iso()
+        intent["actions_used"] = int(intent.get("actions_used", 0)) + 1
+        intent["updated_at"] = utc_now_iso()
 
-    if fingerprint:
-        f_hash = fingerprint.get("fingerprint_hash") or "unknown"
-        repeats = intent.setdefault("repeats_by_fingerprint", {})
-        repeats[f_hash] = int(repeats.get(f_hash, 0)) + 1
-        fps = intent.setdefault("fingerprints", [])
-        fps.append(fingerprint)
-        if len(fps) > 20:
-            intent["fingerprints"] = fps[-20:]
+        if fingerprint:
+            f_hash = fingerprint.get("fingerprint_hash") or "unknown"
+            repeats = intent.setdefault("repeats_by_fingerprint", {})
+            repeats[f_hash] = int(repeats.get(f_hash, 0)) + 1
+            fps = intent.setdefault("fingerprints", [])
+            fps.append(fingerprint)
+            if len(fps) > 20:
+                intent["fingerprints"] = fps[-20:]
 
-    write_json(intent_file, data, indent=2)
-    return intent, False, None, None
+        write_json(intent_file, data, indent=2)
+        return copy.deepcopy(intent), False, None, None
 
 
 def check_intent_budgets(
@@ -180,6 +187,13 @@ def check_intent_budgets(
     Returns (is_exhausted, reason, blocker_code).
     """
     cfg = config_self_healing or {}
+    if cfg.get("enabled") is False:
+        return (
+            True,
+            "self-healing disabled by project configuration",
+            "SELF_HEALING_DISABLED",
+        )
+
     max_actions = int(cfg.get("max_recovery_actions") or DEFAULT_MAX_RECOVERY_ACTIONS)
     max_repeats = int(cfg.get("max_identical_failures") or DEFAULT_MAX_IDENTICAL_FAILURES)
     max_minutes = int(cfg.get("max_launch_minutes") or DEFAULT_MAX_LAUNCH_MINUTES)
@@ -233,6 +247,39 @@ def check_intent_budgets(
     return False, None, None
 
 
+def set_intent_backoff(
+    runtime_root: Path | str,
+    project_id: str,
+    backoff_until: str,
+) -> None:
+    """Record backoff_until ISO timestamp for a project's active intent."""
+    runtime = Path(runtime_root)
+    with _intent_lock(runtime):
+        intent_file = runtime / "execution-intent.json"
+        data = load_execution_intents(runtime)
+        intent = data.get("intents", {}).get(project_id)
+        if isinstance(intent, dict):
+            intent["backoff_until"] = backoff_until
+            intent["updated_at"] = utc_now_iso()
+            write_json(intent_file, data, indent=2)
+
+
+def clear_intent_backoff(
+    runtime_root: Path | str,
+    project_id: str,
+) -> None:
+    """Clear backoff_until for a project's active intent."""
+    runtime = Path(runtime_root)
+    with _intent_lock(runtime):
+        intent_file = runtime / "execution-intent.json"
+        data = load_execution_intents(runtime)
+        intent = data.get("intents", {}).get(project_id)
+        if isinstance(intent, dict) and "backoff_until" in intent:
+            intent.pop("backoff_until", None)
+            intent["updated_at"] = utc_now_iso()
+            write_json(intent_file, data, indent=2)
+
+
 def terminate_intent(
     runtime_root: Path | str,
     project_id: str,
@@ -244,18 +291,19 @@ def terminate_intent(
 ) -> Optional[dict[str, Any]]:
     """Mark intent terminal (exhausted, owner_gate, satisfied, stopped)."""
     runtime = Path(runtime_root)
-    intent_file = runtime / "execution-intent.json"
-    data = load_execution_intents(runtime)
-    intent = data.get("intents", {}).get(project_id)
-    if not isinstance(intent, dict):
-        return None
-    intent["state"] = state
-    intent["updated_at"] = utc_now_iso()
-    if failure_class:
-        intent["failure_class"] = failure_class
-    if blocker_code:
-        intent["blocker_code"] = blocker_code
-    if reason:
-        intent["reason"] = reason
-    write_json(intent_file, data, indent=2)
-    return intent
+    with _intent_lock(runtime):
+        intent_file = runtime / "execution-intent.json"
+        data = load_execution_intents(runtime)
+        intent = data.get("intents", {}).get(project_id)
+        if not isinstance(intent, dict):
+            return None
+        intent["state"] = state
+        intent["updated_at"] = utc_now_iso()
+        if failure_class:
+            intent["failure_class"] = failure_class
+        if blocker_code:
+            intent["blocker_code"] = blocker_code
+        if reason:
+            intent["reason"] = reason
+        write_json(intent_file, data, indent=2)
+        return copy.deepcopy(intent)

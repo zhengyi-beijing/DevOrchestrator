@@ -507,15 +507,19 @@ def cmd_project_activate(args: argparse.Namespace) -> int:
         _fail(f"repository path does not exist: {repo_path}")
     from dev_orchestrator.core.activation import record_activation_request
     config_path = resolve_config_path(args.config) if getattr(args, "config", None) else None
-    request = record_activation_request(
-        runtime_root=runtime,
-        repo_path=repo_path,
-        project_id=getattr(args, "project_id", None),
-        config_path=config_path,
-        profile=getattr(args, "profile", None),
-        requested_action=getattr(args, "action", "continue") or "continue",
-        source="cli",
-    )
+    proj_id = _validated_project_id(args.project_id) if getattr(args, "project_id", None) else None
+    try:
+        request = record_activation_request(
+            runtime_root=runtime,
+            repo_path=repo_path,
+            project_id=proj_id,
+            config_path=config_path,
+            profile=getattr(args, "profile", None),
+            requested_action=getattr(args, "action", "continue") or "continue",
+            source="cli",
+        )
+    except ValueError as exc:
+        _fail(str(exc))
     _print_json(request)
     return 0
 

@@ -65,6 +65,8 @@ _DIRECT_LIVE_REGEX = re.compile(
 def parse_legacy_status_components(raw_token: str) -> tuple[list[str], str, Optional[str]]:
     """Parse legacy status components and derive migration candidate."""
     cleaned = raw_token.replace("*", "").replace("`", "").strip()
+    if cleaned.lower().startswith("status:"):
+        cleaned = cleaned[7:].strip()
     parts = [p.strip().upper() for p in cleaned.split("/") if p.strip()]
     if not parts:
         return [], "EMPTY", None
@@ -77,25 +79,38 @@ def parse_legacy_status_components(raw_token: str) -> tuple[list[str], str, Opti
         mapped_components.append(mapped)
 
     comp_set = set(mapped_components)
-    conflicts = {
-        frozenset({"design_ready", "pending_design"}),
-        frozenset({"design_ready", "blocked"}),
-        frozenset({"not_started", "executing"}),
-        frozenset({"not_started", "completed"}),
-    }
-    for conf in conflicts:
+    conflicting_pairs = [
+        ({"blocked", "design_ready"}),
+        ({"completed", "design_ready"}),
+        ({"pending_design", "design_ready"}),
+        ({"executing", "design_ready"}),
+        ({"executing", "completed"}),
+        ({"executing", "blocked"}),
+        ({"completed", "blocked"}),
+        ({"not_started", "executing"}),
+        ({"not_started", "completed"}),
+    ]
+    for conf in conflicting_pairs:
         if conf.issubset(comp_set):
             return mapped_components, "CONFLICT", None
 
-    candidate = None
-    if "design_ready" in comp_set and ("not_started" in comp_set or len(comp_set) == 1):
+    candidate: Optional[str] = None
+    if "design_ready" in comp_set and "not_started" in comp_set:
         candidate = "ready_to_run"
-    elif "pending_design" in comp_set and len(comp_set) == 1:
+    elif "design_ready" in comp_set and not (
+        comp_set & {"pending_design", "blocked", "completed", "executing"}
+    ):
+        candidate = "ready_to_run"
+    elif "pending_design" in comp_set and not (
+        comp_set & {"design_ready", "blocked", "completed", "executing"}
+    ):
         candidate = "pending_design"
-    elif "blocked" in comp_set:
-        candidate = "blocked"
     elif "completed" in comp_set:
         candidate = "completed"
+    elif "blocked" in comp_set:
+        candidate = "blocked"
+    elif "executing" in comp_set:
+        candidate = "executing"
 
     return mapped_components, "OK", candidate
 
@@ -209,10 +224,8 @@ def _resolve_legacy_markdown(
             raw_token=None,
         )
 
-    # Strip markdown bold/italic asterisks or backticks
-    cleaned = raw_token.replace("*", "").replace("`", "").strip()
-    parts = [p.strip().upper() for p in cleaned.split("/") if p.strip()]
-    if not parts:
+    mapped_components, status, candidate = parse_legacy_status_components(raw_token)
+    if status == "EMPTY":
         return ReadinessResolution(
             state="invalid",
             source="legacy_markdown",
@@ -225,70 +238,34 @@ def _resolve_legacy_markdown(
             migration_required=False,
             raw_token=raw_token,
         )
-
-    mapped_components: list[str] = []
-    for part in parts:
-        mapped = LEGACY_COMPONENT_MAP.get(part)
-        if mapped is None:
-            return ReadinessResolution(
-                state="invalid",
-                source="legacy_markdown",
-                task_id=current_task_id,
-                valid=False,
-                stale=False,
-                code="READINESS_TOKEN_UNRESOLVABLE",
-                reason=f"unknown legacy readiness token component: {part!r}",
-                migration_candidate=None,
-                migration_required=False,
-                raw_token=raw_token,
-            )
-        mapped_components.append(mapped)
+    if status.startswith("UNKNOWN"):
+        return ReadinessResolution(
+            state="invalid",
+            source="legacy_markdown",
+            task_id=current_task_id,
+            valid=False,
+            stale=False,
+            code="READINESS_TOKEN_UNRESOLVABLE",
+            reason=f"unknown legacy readiness token component in agent/next.md: {raw_token!r}",
+            migration_candidate=None,
+            migration_required=False,
+            raw_token=raw_token,
+        )
+    if status == "CONFLICT":
+        return ReadinessResolution(
+            state="invalid",
+            source="legacy_markdown",
+            task_id=current_task_id,
+            valid=False,
+            stale=False,
+            code="READINESS_TOKEN_UNRESOLVABLE",
+            reason=f"conflicting lifecycle components in token: {raw_token!r}",
+            migration_candidate=None,
+            migration_required=False,
+            raw_token=raw_token,
+        )
 
     mapped_set = set(mapped_components)
-
-    # Conflict check: contradictory lifecycle families cannot coexist
-    conflicting_pairs = [
-        ({"blocked", "design_ready"}),
-        ({"completed", "design_ready"}),
-        ({"pending_design", "design_ready"}),
-        ({"executing", "design_ready"}),
-        ({"executing", "completed"}),
-        ({"executing", "blocked"}),
-        ({"completed", "blocked"}),
-    ]
-    for conf in conflicting_pairs:
-        if conf.issubset(mapped_set):
-            return ReadinessResolution(
-                state="invalid",
-                source="legacy_markdown",
-                task_id=current_task_id,
-                valid=False,
-                stale=False,
-                code="READINESS_TOKEN_UNRESOLVABLE",
-                reason=f"conflicting lifecycle components in token: {parts}",
-                migration_candidate=None,
-                migration_required=False,
-                raw_token=raw_token,
-            )
-
-    # Determine migration candidate
-    migration_candidate: Optional[str] = None
-    if "design_ready" in mapped_set and "not_started" in mapped_set:
-        migration_candidate = "ready_to_run"
-    elif "design_ready" in mapped_set and not (
-        mapped_set & {"pending_design", "blocked", "completed", "executing"}
-    ):
-        migration_candidate = "ready_to_run"
-    elif "pending_design" in mapped_set and not (
-        mapped_set & {"design_ready", "blocked", "completed", "executing"}
-    ):
-        migration_candidate = "pending_design"
-    elif "completed" in mapped_set:
-        migration_candidate = "completed"
-    elif "blocked" in mapped_set:
-        migration_candidate = "blocked"
-    elif "executing" in mapped_set:
-        migration_candidate = "executing"
 
     # Live projection rule:
     # Only tokens the legacy regex directly accepts (READY_TO_RUN | DESIGN READY | EXECUTABLE)
@@ -301,10 +278,12 @@ def _resolve_legacy_markdown(
         )
     )
 
-    code = "READINESS_TOKEN_UNSTRUCTURED" if migration_candidate else "OK"
+    code = "READINESS_TOKEN_UNSTRUCTURED" if candidate else "OK"
+    migration_required = bool(candidate)
+
     reason = (
         f"legacy markdown readiness token {raw_token!r} requires structured migration"
-        if migration_candidate
+        if migration_required
         else f"legacy token {raw_token!r}"
     )
 
@@ -316,8 +295,8 @@ def _resolve_legacy_markdown(
         stale=False,
         code=code,
         reason=reason,
-        migration_candidate=migration_candidate,
-        migration_required=bool(migration_candidate),
+        migration_candidate=candidate,
+        migration_required=migration_required,
         raw_token=raw_token,
     )
 
