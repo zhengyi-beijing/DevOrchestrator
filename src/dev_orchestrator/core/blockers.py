@@ -105,6 +105,51 @@ def explain_block(
 
     blockers: list[Blocker] = []
 
+    # 0. Check snapshot/inspection errors & transient infrastructure
+    if snapshot is not None:
+        snap_error = snapshot.get("error") or snapshot.get("inspection_error")
+        snap_state = str(snapshot.get("state") or "")
+        broker_err = ""
+        if isinstance(snapshot.get("broker"), dict):
+            broker_err = str(snapshot["broker"].get("error") or "")
+        diag_reason = ""
+        diag_code = ""
+        if isinstance(snapshot.get("diagnosis"), dict):
+            diag_reason = str(snapshot["diagnosis"].get("reason") or "")
+            diag_code = str(snapshot["diagnosis"].get("code") or "")
+
+        err_text = str(snap_error or broker_err or diag_reason or "")
+        code_text = snap_state or diag_code or ("TRANSIENT_INSPECTION_FAILURE" if err_text else "")
+
+        if err_text or snap_state in ("MONITOR_ERROR", "ERROR"):
+            fc = classify_failure_class(code_text, err_text)
+            if fc == "transient_infrastructure":
+                blockers.append(
+                    Blocker(
+                        code="TRANSIENT_INSPECTION_FAILURE",
+                        predicate="inspection_healthy",
+                        expected="successful inspection snapshot",
+                        observed=err_text or snap_state,
+                        evidence_source=str(snapshot.get("evidence_source") or "snapshot"),
+                        remediation="wait for transient backoff or retry inspection",
+                        failure_class="transient_infrastructure",
+                        owner_gate_required=False,
+                    )
+                )
+            elif snap_state in ("MONITOR_ERROR", "ERROR") or snap_error:
+                blockers.append(
+                    Blocker(
+                        code="INSPECTION_FAILED",
+                        predicate="inspection_healthy",
+                        expected="successful inspection snapshot",
+                        observed=err_text or snap_state,
+                        evidence_source=str(snapshot.get("evidence_source") or "snapshot"),
+                        remediation="resolve inspection error or check monitor diagnostics",
+                        failure_class=fc,
+                        owner_gate_required=(fc in {"owner_gate", "terminal"}),
+                    )
+                )
+
     # 1. Registration & Orphan state
     is_registered = False
     if config_data and isinstance(config_data.get("projects"), list):
@@ -167,16 +212,18 @@ def explain_block(
         else:
             truth = read_repository_truth(resolved_repo)
             if not truth.valid:
+                fc = classify_failure_class("GIT_TRUTH_INVALID", truth.error)
+                is_transient = (fc == "transient_infrastructure")
                 blockers.append(
                     Blocker(
-                        code="GIT_TRUTH_INVALID",
+                        code="TRANSIENT_GIT_TIMEOUT" if is_transient else "GIT_TRUTH_INVALID",
                         predicate="git_truth_valid",
                         expected=True,
                         observed=truth.error,
                         evidence_source=str(resolved_repo),
-                        remediation="ensure repository is a valid Git worktree with checked-out HEAD",
-                        failure_class="terminal",
-                        owner_gate_required=True,
+                        remediation="retry after transient timeout" if is_transient else "ensure repository is a valid Git worktree with checked-out HEAD",
+                        failure_class=fc,
+                        owner_gate_required=not is_transient,
                     )
                 )
             elif truth.dirty:
@@ -395,22 +442,26 @@ def explain_block(
 
     # Sort blockers: most-blocking first
     _SEVERITY_ORDER = {
-        "ORPHANED_PROJECT_STATE": 0,
-        "PROJECT_NOT_REGISTERED": 1,
-        "REPOSITORY_PATH_MISSING": 2,
-        "GIT_TRUTH_INVALID": 3,
-        "READINESS_SCHEMA_INVALID": 4,
-        "READINESS_TOKEN_UNRESOLVABLE": 5,
-        "READINESS_TASK_ID_MISMATCH": 6,
-        "READINESS_TOKEN_UNSTRUCTURED": 7,
-        "OWNER_GATE_PRESENT": 8,
-        "OWNER_PAUSED": 9,
-        "DIRTY_WORKTREE": 10,
-        "EXECUTION_POLICY_DISABLED": 11,
-        "READINESS_NOT_READY_TO_RUN": 12,
-        "ACTIVE_EXECUTION_PRESENT": 13,
-        "RECOVERY_LIVELOCK_DETECTED": 14,
-        "RECOVERY_BUDGET_EXHAUSTED": 15,
+        "TRANSIENT_INSPECTION_FAILURE": 0,
+        "TRANSIENT_INFRASTRUCTURE_FAILURE": 0,
+        "TRANSIENT_GIT_TIMEOUT": 0,
+        "INSPECTION_FAILED": 1,
+        "ORPHANED_PROJECT_STATE": 2,
+        "PROJECT_NOT_REGISTERED": 3,
+        "REPOSITORY_PATH_MISSING": 4,
+        "GIT_TRUTH_INVALID": 5,
+        "READINESS_SCHEMA_INVALID": 6,
+        "READINESS_TOKEN_UNRESOLVABLE": 7,
+        "READINESS_TASK_ID_MISMATCH": 8,
+        "READINESS_TOKEN_UNSTRUCTURED": 9,
+        "OWNER_GATE_PRESENT": 10,
+        "OWNER_PAUSED": 11,
+        "DIRTY_WORKTREE": 12,
+        "EXECUTION_POLICY_DISABLED": 13,
+        "READINESS_NOT_READY_TO_RUN": 14,
+        "ACTIVE_EXECUTION_PRESENT": 15,
+        "RECOVERY_LIVELOCK_DETECTED": 16,
+        "RECOVERY_BUDGET_EXHAUSTED": 17,
     }
     blockers.sort(key=lambda b: _SEVERITY_ORDER.get(b.code, 99))
     return blockers

@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import re
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from uuid import uuid4
 
 from dev_orchestrator.config import load_projects_config

@@ -1183,11 +1183,16 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - Added intent-gated watchdog handoff (`recovery_handoff` milestone, status `max_attempts_handed_off`) suppressing non-genuine owner gates when active intent matches.
   - Added idempotent `NOOP_ALREADY_EXECUTING` for duplicate `continue`/`start` commands on active runs.
   - Atomic staged successor activation in `ai_planner.py` writing `pending_design` alongside `agent/next.md` and safe rollback restoring both files.
+- Technical Review Remediation Round (`ai_review:bc404b1b-5fd9-4ed8-b11f-729b6fdff6bc:execute`):
+  - Fixed unbound `submit_control_command` in `src/dev_orchestrator/core/activation_supervisor.py`: imported and wired `control_commands.submit_control_command`, built safe expected identity fallback when snapshot is None, and used `-rem-` command ID distinction to avoid conflict errors when transitioning from IDLE to READY_TO_RUN during recovery.
+  - Fixed porcelain parsing in `src/dev_orchestrator/core/repository.py`: preserved leading whitespace before index 3 slice (`rstrip("\r\n")`) and added unquoting and rename parsing in `classify_porcelain_entries` so valid workspace changes (e.g. `' M agent/next.md'`) are not truncated into `'gent/next.md'` and misclassified.
+  - Added transient infrastructure classification in `src/dev_orchestrator/core/blockers.py`: wired `classify_failure_class` to inspect snapshot errors, broker status, and git timeouts, returning `TRANSIENT_INSPECTION_FAILURE` and `TRANSIENT_GIT_TIMEOUT` with backoff suggestions; added `Sequence` import in `control_commands.py`; allowed optional `recovery_epoch_id` in `command_store.py`.
+  - Added dedicated regression coverage: added 9 new tests across porcelain classification, transient backoff, and monitor auto-start racing explicit continue in `tests_py/test_p167_self_healing_activation.py` (25/25 passed).
 - Deliverables & Verification:
   - Contract specification authored in `docs/P16_7_SELF_HEALING_ACTIVATION_CONTRACT.md`.
-  - Comprehensive end-to-end acceptance regression in `tests_py/test_p167_self_healing_activation.py` (16/16 passed).
-  - Full test suite regression: 1063 passed, 87 subtests passed in 389.12s (0 failures).
+  - Comprehensive end-to-end acceptance regression in `tests_py/test_p167_self_healing_activation.py` (25/25 passed).
+  - Full test suite regression: 1072 passed, 87 subtests passed in 381.27s (0 failures).
   - Python compilation (`python -m compileall -q src ops tests_py benchmark/src`): passed cleanly (exit 0).
   - `git diff --check`: passed cleanly (0 whitespace/formatting defects).
-  - Knowledge graph updated via `graphify update .`: 5380 nodes, 14975 edges, 245 communities.
+  - Knowledge graph updated via `graphify update .`: 5389 nodes, 15014 edges, 251 communities.
 - Staged roadmap handoff: P16.8 DevO Golden-Path Lifecycle Hardening (`agent/staged/P16.8.md`, Status: **PENDING DESIGN**).

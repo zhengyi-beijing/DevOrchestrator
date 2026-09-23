@@ -23,6 +23,9 @@ EXPECTED_IDENTITY_FIELDS = (
     "status_hash", "task_id", "lifecycle_state", "gate_id", "paused",
     "binding_state", "binding_id", "binding_adapter",
 )
+EXPECTED_OPTIONAL_FIELDS = (
+    "recovery_epoch_id",
+)
 
 
 class ControlCommandConflictError(RuntimeError):
@@ -65,7 +68,7 @@ def canonical_request(value: dict[str, Any]) -> dict[str, Any]:
     action = _nonblank(value.get("action"), "action")
     if action not in CONTROL_ACTIONS:
         raise ValueError("unsupported control action")
-    expected_allowed = set(EXPECTED_IDENTITY_FIELDS)
+    expected_allowed = set(EXPECTED_IDENTITY_FIELDS) | set(EXPECTED_OPTIONAL_FIELDS)
     expected_unknown = sorted(set(expected) - expected_allowed)
     if expected_unknown:
         raise ValueError("unknown expected fields: " + ", ".join(expected_unknown))

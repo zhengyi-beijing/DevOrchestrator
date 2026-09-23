@@ -42,12 +42,17 @@ def classify_porcelain_entries(
     expected: list[str] = []
     unexpected: list[str] = []
     for entry in dirty_entries:
-        raw = entry.strip()
-        if not raw:
+        line = entry.rstrip("\r\n")
+        if not line.strip():
             continue
-        path_part = raw[3:].strip() if len(raw) > 3 else raw
+        # In git status --porcelain v1, the first two characters represent index and
+        # worktree status (e.g. ' M agent/next.md'), followed by a space separator.
+        # Do not strip leading spaces before slicing, or ' M ...' loses its first path character.
+        path_part = line[3:].strip() if len(line) > 3 else line.strip()
         if " -> " in path_part:
             path_part = path_part.split(" -> ")[-1].strip()
+        if path_part.startswith('"') and path_part.endswith('"') and len(path_part) >= 2:
+            path_part = path_part[1:-1]
         norm = path_part.replace("\\", "/")
         if norm in _EXPECTED_TASK_ARTIFACT_EXACT or norm.startswith("agent/staged/"):
             expected.append(entry)

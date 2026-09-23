@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dev_orchestrator.core import control_commands
+from dev_orchestrator.core.control_commands import submit_control_command
 from dev_orchestrator.control.surface import _active_execution, project_identity
 from dev_orchestrator.core.activation import (
     load_activation_requests,
@@ -169,10 +170,12 @@ class ActivationSupervisor:
 
             # If no blockers, drive the forward transition!
             if not blockers:
-                cmd_id = f"cmd-rec-{project_id}-{intent.get('task_id') or 'notask'}-{epoch_id or 'noepoch'}-{intent.get('actions_used', 0)}"
+                eff_task_id = intent.get("task_id") or (snapshot.get("telemetry", {}).get("task_id") if isinstance(snapshot, dict) else None) or "notask"
+                cmd_id = f"cmd-rec-{project_id}-{eff_task_id}-{epoch_id or 'noepoch'}-fwd-{intent.get('actions_used', 0)}"
                 try:
-                    exp_identity = project_identity(snapshot, self.runtime_root) if snapshot else None
-                    if exp_identity and epoch_id:
+                    eff_snapshot = snapshot or {"project_id": project_id, "repo_path": str(repo_path) if repo_path else None, "state": "IDLE"}
+                    exp_identity = project_identity(eff_snapshot, self.runtime_root)
+                    if epoch_id:
                         exp_identity["recovery_epoch_id"] = epoch_id
                     control_commands.submit_control_command(
                         self.runtime_root,
@@ -343,12 +346,14 @@ class ActivationSupervisor:
                     "remediation": remediation_name,
                 })
                 # Re-submit the forward transition
-                cmd_id = f"cmd-rec-{project_id}-{intent.get('task_id') or 'notask'}-{epoch_id or 'noepoch'}-{updated_intent.get('actions_used', 1)}"
+                eff_task_id = intent.get("task_id") or (snapshot.get("telemetry", {}).get("task_id") if isinstance(snapshot, dict) else None) or "notask"
+                cmd_id = f"cmd-rec-{project_id}-{eff_task_id}-{epoch_id or 'noepoch'}-rem-{updated_intent.get('actions_used', 1)}"
                 try:
-                    exp_identity = project_identity(snapshot, self.runtime_root) if snapshot else None
-                    if exp_identity and epoch_id:
+                    eff_snapshot = snapshot or {"project_id": project_id, "repo_path": str(repo_path) if repo_path else None, "state": "IDLE"}
+                    exp_identity = project_identity(eff_snapshot, self.runtime_root)
+                    if epoch_id:
                         exp_identity["recovery_epoch_id"] = epoch_id
-                    submit_control_command(
+                    control_commands.submit_control_command(
                         self.runtime_root,
                         project_id=project_id,
                         action=intent.get("requested_action") or "continue",
@@ -359,7 +364,7 @@ class ActivationSupervisor:
                     if self.controls is not None and cfg_path:
                         self.controls.advance(cfg_path, summary, exec_inst)
                 except Exception as exc:
-                    logger.debug("forward transition submission: %s", exc)
+                    logger.warning("forward transition submission failed for %s: %s", project_id, exc)
 
         if watchdog_dirty and isinstance(watchdog_data, dict):
             try:

@@ -65,6 +65,7 @@ from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_js
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.control.surface import project_control_view, project_identity
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
+from dev_orchestrator.core.repository import classify_porcelain_entries
 from tests_py.test_transition_executor import make_repo
 from tests_py.test_control_commands import FakeExecutor
 
@@ -563,15 +564,22 @@ class TestAcceptanceRegressionXrayHwPlatform(unittest.TestCase):
             self.assertEqual(readiness_res.state, "ready_to_run")
             self.assertTrue(readiness_res.valid)
 
-            # 7. Third supervisor tick: launches the task
+            # Assert that supervisor automatically submitted the forward transition retry into control inbox
+            remed_cmds = list((runtime / "control" / "inbox").glob("cmd-rec-xray-hw-platform-P1-*.json")) + list(
+                (runtime / "control" / "history").glob("cmd-rec-xray-hw-platform-P1-*.json")
+            )
+            self.assertTrue(len(remed_cmds) >= 1)
+            remed_cmd_data = json.loads(remed_cmds[0].read_text(encoding="utf-8"))
+            self.assertEqual(remed_cmd_data["action"], "continue")
+            self.assertEqual(remed_cmd_data["source"], "activation_supervisor")
+
+            # 7. Third supervisor tick: with readiness ready_to_run, drives forward transition
             proj_snapshot["state"] = "READY_TO_RUN"
             proj_snapshot["readiness"] = readiness_res.to_dict()
             summary = {"projects": [proj_snapshot]}
 
-            with patch("dev_orchestrator.core.control_commands.submit_control_command") as mock_submit:
-                mock_submit.return_value = {"state": "accepted", "effect": "LAUNCHED", "execution_id": "e1"}
-                outcomes = supervisor.advance(cfg_path, summary, executor=executor)
-                self.assertTrue(mock_submit.called)
+            outcomes = supervisor.advance(cfg_path, summary, executor=executor)
+            self.assertTrue(any(o.get("status") == "transition_submitted" for o in outcomes))
 
             # 8. Duplicate continue returns NOOP_ALREADY_EXECUTING
             coordinator = ControlCommandCoordinator(runtime, None)
@@ -582,14 +590,311 @@ class TestAcceptanceRegressionXrayHwPlatform(unittest.TestCase):
             )
             with patch("dev_orchestrator.core.control_commands._active_execution", return_value={"state": "running", "source_request_id": "e1"}):
                 outcomes = coordinator.advance(cfg_path, summary, executor)
-                self.assertEqual(len(outcomes), 1)
-                self.assertEqual(outcomes[0].get("effect"), "NOOP_ALREADY_EXECUTING")
+                dup_outcomes = [o for o in outcomes if o.get("command_id") == "cmd-dup-1"]
+                self.assertEqual(len(dup_outcomes), 1)
+                self.assertEqual(dup_outcomes[0].get("effect"), "NOOP_ALREADY_EXECUTING")
 
             # 9. Verify zero owner-gates fabricated during this whole sequence
             wd_file = runtime / "watchdog.json"
             if wd_file.is_file():
                 wd_data = read_json(wd_file)
                 self.assertNotIn("owner_gate", wd_data.get("projects", {}).get("xray-hw-platform", {}))
+
+
+class TestPorcelainClassification(unittest.TestCase):
+    """Unit tests for porcelain entry classification distinguishing expected task artifacts."""
+
+    def test_classify_porcelain_worktree_modified_with_leading_space(self):
+        # In git status --porcelain v1, worktree-only modified files start with a leading space ' M ...'
+        entries = [
+            " M agent/next.md",
+            " M agent/CURRENT.md",
+            " M agent/result.md",
+            " M agent/execution-state.json",
+            " M agent/staged/P16.8.md",
+        ]
+        expected, unexpected = classify_porcelain_entries(entries)
+        self.assertEqual(len(expected), 5)
+        self.assertEqual(len(unexpected), 0)
+        self.assertIn(" M agent/next.md", expected)
+
+    def test_classify_porcelain_staged_and_untracked_variants(self):
+        entries = [
+            "M  agent/next.md",
+            "MM agent/next.md",
+            "?? agent/execution-state.json",
+            "?? agent/staged/P16.8.md",
+            ' M "agent/next.md"',
+            "R  agent/old.md -> agent/next.md",
+        ]
+        expected, unexpected = classify_porcelain_entries(entries)
+        self.assertEqual(len(expected), 6)
+        self.assertEqual(len(unexpected), 0)
+
+    def test_classify_porcelain_unexpected_entries(self):
+        entries = [
+            " M src/dev_orchestrator/cli.py",
+            "?? scratch/temp.txt",
+            " M agent/other_file.py",
+            " M gent/next.md",  # Truncated path is unexpected!
+        ]
+        expected, unexpected = classify_porcelain_entries(entries)
+        self.assertEqual(len(expected), 0)
+        self.assertEqual(len(unexpected), 4)
+
+    def test_classify_porcelain_mixed_entries(self):
+        entries = [
+            " M agent/next.md",
+            " M src/dev_orchestrator/cli.py",
+            "?? agent/execution-state.json",
+            "?? untracked.py",
+        ]
+        expected, unexpected = classify_porcelain_entries(entries)
+        self.assertEqual(list(expected), [" M agent/next.md", "?? agent/execution-state.json"])
+        self.assertEqual(list(unexpected), [" M src/dev_orchestrator/cli.py", "?? untracked.py"])
+
+
+class TestTransientInspectionAndBackoff(unittest.TestCase):
+    """Unit tests for injected transient inspection failures and supervisor transient backoff."""
+
+    def test_injected_transient_inspection_failure_derived_by_explain_block(self):
+        # Verify that explain_block uses classify_failure_class to emit TRANSIENT_INSPECTION_FAILURE
+        snapshot = {
+            "project_id": "proj-1",
+            "state": "MONITOR_ERROR",
+            "error": "broker service invocation failed: status_call_timed_out",
+            "telemetry": {"task_id": "P1"},
+        }
+        blockers = explain_block(snapshot=snapshot, runtime_root="runtime")
+        self.assertTrue(len(blockers) >= 1)
+        top = blockers[0]
+        self.assertEqual(top.code, "TRANSIENT_INSPECTION_FAILURE")
+        self.assertEqual(top.failure_class, "transient_infrastructure")
+        self.assertFalse(top.owner_gate_required)
+
+    def test_injected_transient_broker_timeout_derived_by_explain_block(self):
+        snapshot = {
+            "project_id": "proj-1",
+            "state": "IDLE",
+            "broker": {"error": "status_call_timed_out"},
+            "telemetry": {"task_id": "P1"},
+        }
+        blockers = explain_block(snapshot=snapshot, runtime_root="runtime")
+        self.assertTrue(len(blockers) >= 1)
+        top = blockers[0]
+        self.assertEqual(top.code, "TRANSIENT_INSPECTION_FAILURE")
+        self.assertEqual(top.failure_class, "transient_infrastructure")
+
+    def test_supervisor_transient_backoff_and_forward_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo1"
+            make_repo(repo, task_id="P1")
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "proj-1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage"],
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            # Record active execution intent
+            record_or_refresh_intent(
+                runtime, "proj-1", task_id="P1", command_id="cmd-init-1",
+                source="test", repo_path=str(repo), state="active",
+            )
+
+            # Inject transient inspection error in snapshot
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "MONITOR_ERROR",
+                "error": "timed out reading project status",
+                "telemetry": {"task_id": "P1"},
+            }
+            summary = {"projects": [snapshot]}
+
+            executor = FakeExecutor(launch=True)
+            coordinator = ControlCommandCoordinator(runtime, None)
+            supervisor = ActivationSupervisor(runtime, controls=coordinator, executor=executor)
+
+            outcomes = supervisor.advance(cfg_path, summary, executor=executor)
+            # Case C should trigger
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["status"], "remediated")
+            self.assertEqual(outcomes[0]["action"], "transient_backoff")
+            self.assertEqual(outcomes[0]["remediation"], "transient_backoff")
+
+            # Forward transition retry should be submitted to control inbox/history
+            cmd_files = list((runtime / "control" / "inbox").glob("cmd-rec-proj-1-P1-*.json")) + list(
+                (runtime / "control" / "history").glob("cmd-rec-proj-1-P1-*.json")
+            )
+            self.assertEqual(len(cmd_files), 1)
+            cmd_data = json.loads(cmd_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(cmd_data["action"], "continue")
+            self.assertEqual(cmd_data["source"], "activation_supervisor")
+
+            # Intent actions should be incremented
+            intent = get_active_intent(runtime, "proj-1")
+            self.assertEqual(intent["actions_used"], 1)
+
+
+class TestMonitorAutoStartRaceDuplicateWorkerPrevented(unittest.TestCase):
+    """Verifies that monitor auto-start racing explicit continue cannot launch duplicate workers."""
+
+    def test_running_active_execution_prevents_duplicate_worker_launch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo1"
+            make_repo(repo, task_id="P1")
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "proj-1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage"],
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            # Record active execution from an auto-start
+            exec_file = runtime / "transition-executor.json"
+            write_json(exec_file, {
+                "executions": {
+                    "exec-autostart-1": {
+                        "project_id": "proj-1",
+                        "task_id": "P1",
+                        "state": "running",
+                        "source_request_id": "exec-autostart-1",
+                        "broker_request_id": "broker-req-1",
+                    }
+                }
+            })
+
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "WORKER_RUNNING",
+                "telemetry": {"task_id": "P1"},
+                "worker": {"kind": "task", "state": "running", "process_alive": True},
+            }
+            summary = {"projects": [snapshot]}
+
+            # Explicit continue submitted while worker is already running
+            submit_control_command(
+                runtime,
+                "proj-1",
+                "continue",
+                command_id="cmd-owner-continue-1",
+                expected=project_identity(snapshot, runtime),
+            )
+
+            launch_calls = []
+            class MockLaunchExecutor(FakeExecutor):
+                def start_control(self, *args, **kwargs):
+                    launch_calls.append(args)
+                    return super().start_control(*args, **kwargs)
+
+            executor = MockLaunchExecutor(launch=True)
+            coordinator = ControlCommandCoordinator(runtime, None)
+
+            outcomes = coordinator.advance(cfg_path, summary, executor)
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["state"], "accepted")
+            self.assertEqual(outcomes[0]["effect"], "NOOP_ALREADY_EXECUTING")
+            self.assertEqual(outcomes[0]["execution_id"], "exec-autostart-1")
+            self.assertEqual(outcomes[0]["task_id"], "P1")
+
+            # Proves no second worker was launched!
+            self.assertEqual(len(launch_calls), 0)
+
+    def test_starting_worker_in_snapshot_prevents_duplicate_worker_launch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo1"
+            make_repo(repo, task_id="P1")
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "proj-1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage"],
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            # Snapshot has starting worker (e.g. from background process launch)
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "WORKER_RUNNING",
+                "telemetry": {"task_id": "P1"},
+                "worker": {"kind": "task", "state": "starting", "task_id": "P1", "process_alive": True},
+            }
+            summary = {"projects": [snapshot]}
+
+            submit_control_command(
+                runtime,
+                "proj-1",
+                "continue",
+                command_id="cmd-owner-continue-2",
+                expected=project_identity(snapshot, runtime),
+            )
+
+            launch_calls = []
+            class MockLaunchExecutor(FakeExecutor):
+                def start_control(self, *args, **kwargs):
+                    launch_calls.append(args)
+                    return super().start_control(*args, **kwargs)
+
+            executor = MockLaunchExecutor(launch=True)
+            coordinator = ControlCommandCoordinator(runtime, None)
+
+            outcomes = coordinator.advance(cfg_path, summary, executor)
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["state"], "accepted")
+            self.assertEqual(outcomes[0]["effect"], "NOOP_ALREADY_EXECUTING")
+
+            # Zero launch calls
+            self.assertEqual(len(launch_calls), 0)
 
 
 if __name__ == "__main__":
