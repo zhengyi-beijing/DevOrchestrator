@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dev_orchestrator.core import control_commands
-from dev_orchestrator.core.control_commands import submit_control_command
 from dev_orchestrator.control.surface import _active_execution, project_identity
 from dev_orchestrator.core.activation import (
     load_activation_requests,
@@ -122,15 +121,25 @@ class ActivationSupervisor:
         for project_id, intent in list(active_intents.items()):
             # 1. Check if execution is currently active
             active_exec = _active_execution(self.runtime_root, project_id)
-            if active_exec is not None and str(active_exec.get("state") or "") in {"launching", "running"}:
-                # Worker is actively running; no remediation needed this tick
-                continue
-
             snapshot = snapshots_by_id.get(project_id)
-            if snapshot:
-                worker = snapshot.get("worker") if isinstance(snapshot.get("worker"), dict) else {}
-                if worker.get("kind") == "task" and worker.get("state") in {"starting", "running"}:
-                    continue
+            worker = snapshot.get("worker") if (snapshot and isinstance(snapshot.get("worker"), dict)) else {}
+            is_worker_active = (
+                (active_exec is not None and str(active_exec.get("state") or "") in {"launching", "running"})
+                or (worker.get("kind") == "task" and worker.get("state") in {"starting", "running"})
+            )
+            if is_worker_active:
+                terminate_intent(
+                    self.runtime_root,
+                    project_id,
+                    "satisfied",
+                    reason="target execution launched",
+                )
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "intent_satisfied",
+                    "reason": "target execution launched",
+                })
+                continue
 
             # 2. Check and consume watchdog handoff
             epoch_id = intent.get("recovery_epoch_id")
@@ -168,50 +177,28 @@ class ActivationSupervisor:
                 action=intent.get("requested_action") or "continue",
             )
 
-            # If no blockers, drive the forward transition!
-            if not blockers:
-                eff_task_id = intent.get("task_id") or (snapshot.get("telemetry", {}).get("task_id") if isinstance(snapshot, dict) else None) or "notask"
-                cmd_id = f"cmd-rec-{project_id}-{eff_task_id}-{epoch_id or 'noepoch'}-fwd-{intent.get('actions_used', 0)}"
-                try:
-                    eff_snapshot = snapshot or {"project_id": project_id, "repo_path": str(repo_path) if repo_path else None, "state": "IDLE"}
-                    exp_identity = project_identity(eff_snapshot, self.runtime_root)
-                    if epoch_id:
-                        exp_identity["recovery_epoch_id"] = epoch_id
-                    control_commands.submit_control_command(
-                        self.runtime_root,
-                        project_id=project_id,
-                        action=intent.get("requested_action") or "continue",
-                        command_id=cmd_id,
-                        expected=exp_identity,
-                        source="activation_supervisor",
-                    )
-                    if self.controls is not None and cfg_path:
-                        self.controls.advance(cfg_path, summary, exec_inst)
-                    outcomes.append({
-                        "project_id": project_id,
-                        "status": "transition_submitted",
-                        "command_id": cmd_id,
-                    })
-                except Exception as exc:
-                    outcomes.append({
-                        "project_id": project_id,
-                        "status": "transition_failed",
-                        "error": str(exc),
-                    })
+            # 5. Genuine Owner Gate preservation: evaluate across ALL blockers
+            owner_gate_blocker = next(
+                (b for b in blockers if b.code in {"OWNER_GATE_PRESENT", "OWNER_PAUSED"} or b.failure_class == "owner_gate"),
+                None,
+            )
+            if owner_gate_blocker is not None:
+                terminate_intent(
+                    self.runtime_root,
+                    project_id,
+                    "owner_gate",
+                    failure_class="owner_gate",
+                    blocker_code=owner_gate_blocker.code,
+                    reason="genuine owner gate active",
+                )
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "owner_gate_preserved",
+                    "blocker_code": owner_gate_blocker.code,
+                })
                 continue
 
-            top_blocker = blockers[0]
-
-            # 5. Check budget / livelock exhaustion
-            fp = compute_recovery_fingerprint(
-                project_id=project_id,
-                task_id=intent.get("task_id") or (snapshot.get("telemetry", {}).get("task_id") if snapshot else None),
-                lifecycle_state=str(snapshot.get("lifecycle_state") or snapshot.get("state") if snapshot else "UNREGISTERED"),
-                blocker_code=top_blocker.code,
-                git_anchor=snapshot.get("git", {}).get("head") if snapshot else None,
-                worker_state=snapshot.get("worker", {}).get("state") if snapshot else None,
-            )
-
+            # 6. Check budget / livelock exhaustion
             self_healing_cfg = project_config.get("self_healing") if project_config else None
             is_exhausted, exhaust_reason, blocker_code = check_intent_budgets(intent, self_healing_cfg, now=tick_now)
             if is_exhausted:
@@ -241,24 +228,58 @@ class ActivationSupervisor:
                 })
                 continue
 
-            # 6. Genuine Owner Gate preservation
-            if top_blocker.owner_gate_required or top_blocker.failure_class == "owner_gate":
-                terminate_intent(
-                    self.runtime_root,
-                    project_id,
-                    "owner_gate",
-                    failure_class="owner_gate",
-                    blocker_code=top_blocker.code,
-                    reason="genuine owner gate active",
+            # 7. If no blockers, drive the forward transition under budget!
+            if not blockers:
+                eff_task_id = intent.get("task_id") or (snapshot.get("telemetry", {}).get("task_id") if isinstance(snapshot, dict) else None) or "notask"
+                fp = compute_recovery_fingerprint(
+                    project_id=project_id,
+                    task_id=eff_task_id,
+                    lifecycle_state=str(snapshot.get("lifecycle_state") or snapshot.get("state") if snapshot else "IDLE"),
+                    blocker_code="NO_BLOCKER",
+                    git_anchor=snapshot.get("git", {}).get("head") if snapshot else None,
+                    worker_state=snapshot.get("worker", {}).get("state") if snapshot else None,
                 )
-                outcomes.append({
-                    "project_id": project_id,
-                    "status": "owner_gate_preserved",
-                    "blocker_code": top_blocker.code,
-                })
+                updated_intent, _, _, _ = record_intent_action(self.runtime_root, project_id, fingerprint=fp)
+                cmd_id = f"cmd-rec-{project_id}-{eff_task_id}-{epoch_id or 'noepoch'}-fwd-{updated_intent.get('actions_used', 1)}"
+                try:
+                    eff_snapshot = snapshot or {"project_id": project_id, "repo_path": str(repo_path) if repo_path else None, "state": "IDLE"}
+                    exp_identity = project_identity(eff_snapshot, self.runtime_root)
+                    if epoch_id:
+                        exp_identity["recovery_epoch_id"] = epoch_id
+                    control_commands.submit_control_command(
+                        self.runtime_root,
+                        project_id=project_id,
+                        action=intent.get("requested_action") or "continue",
+                        command_id=cmd_id,
+                        expected=exp_identity,
+                        source="activation_supervisor",
+                    )
+                    if self.controls is not None and cfg_path:
+                        self.controls.advance(cfg_path, summary, exec_inst)
+                    post_active = _active_execution(self.runtime_root, project_id)
+                    if post_active is not None and str(post_active.get("state") or "") in {"launching", "running"}:
+                        terminate_intent(
+                            self.runtime_root,
+                            project_id,
+                            "satisfied",
+                            reason="target execution launched",
+                        )
+                    outcomes.append({
+                        "project_id": project_id,
+                        "status": "transition_submitted",
+                        "command_id": cmd_id,
+                    })
+                except Exception as exc:
+                    outcomes.append({
+                        "project_id": project_id,
+                        "status": "transition_failed",
+                        "error": str(exc),
+                    })
                 continue
 
-            # 7. Terminal failure handling
+            top_blocker = blockers[0]
+
+            # 8. Terminal failure handling
             if top_blocker.failure_class == "terminal":
                 terminate_intent(
                     self.runtime_root,
@@ -275,7 +296,15 @@ class ActivationSupervisor:
                 })
                 continue
 
-            # 8. Bounded Remediation for recoverable conditions
+            # 9. Bounded Remediation for recoverable conditions
+            fp = compute_recovery_fingerprint(
+                project_id=project_id,
+                task_id=intent.get("task_id") or (snapshot.get("telemetry", {}).get("task_id") if snapshot else None),
+                lifecycle_state=str(snapshot.get("lifecycle_state") or snapshot.get("state") if snapshot else "UNREGISTERED"),
+                blocker_code=top_blocker.code,
+                git_anchor=snapshot.get("git", {}).get("head") if snapshot else None,
+                worker_state=snapshot.get("worker", {}).get("state") if snapshot else None,
+            )
             updated_intent, _, _, _ = record_intent_action(self.runtime_root, project_id, fingerprint=fp)
             remediated = False
             remediation_name = ""
@@ -363,6 +392,14 @@ class ActivationSupervisor:
                     )
                     if self.controls is not None and cfg_path:
                         self.controls.advance(cfg_path, summary, exec_inst)
+                    post_active = _active_execution(self.runtime_root, project_id)
+                    if post_active is not None and str(post_active.get("state") or "") in {"launching", "running"}:
+                        terminate_intent(
+                            self.runtime_root,
+                            project_id,
+                            "satisfied",
+                            reason="target execution launched",
+                        )
                 except Exception as exc:
                     logger.warning("forward transition submission failed for %s: %s", project_id, exc)
 

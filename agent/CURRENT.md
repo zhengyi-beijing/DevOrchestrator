@@ -28,18 +28,25 @@ P16.7 Self-Healing Project Activation & Readiness completion (2026-09-23):
   - Added intent-gated watchdog handoff (`recovery_handoff` milestone, status `max_attempts_handed_off`) suppressing non-genuine owner gates when active intent matches.
   - Added idempotent `NOOP_ALREADY_EXECUTING` for duplicate `continue`/`start` commands on active runs.
   - Atomic staged successor activation in `ai_planner.py` writing `pending_design` alongside `agent/next.md` and safe rollback restoring both files.
-- Technical Review Remediation (`ai_review:bc404b1b-5fd9-4ed8-b11f-729b6fdff6bc:execute`):
+- Technical Review Remediation Round 1 (`ai_review:bc404b1b-5fd9-4ed8-b11f-729b6fdff6bc:execute`):
   - Fixed unbound `submit_control_command` in `src/dev_orchestrator/core/activation_supervisor.py`: imported and wired `control_commands.submit_control_command`, built safe expected identity fallback when snapshot is None, and used `-rem-` command ID marker to prevent command ID collision when advancing from IDLE to READY_TO_RUN during recovery.
   - Fixed porcelain parsing in `src/dev_orchestrator/core/repository.py`: preserved leading whitespace before index 3 slice (`rstrip("\r\n")`) and added unquoting and rename parsing in `classify_porcelain_entries` so valid workspace changes (e.g. `' M agent/next.md'`) are not truncated into `'gent/next.md'` and misclassified.
   - Added transient infrastructure classification in `src/dev_orchestrator/core/blockers.py`: wired `classify_failure_class` to inspect snapshot errors, broker status, and git timeouts, returning `TRANSIENT_INSPECTION_FAILURE` and `TRANSIENT_GIT_TIMEOUT` with backoff suggestions; added `Sequence` import in `control_commands.py`; allowed optional `recovery_epoch_id` in `command_store.py`.
   - Added dedicated regression coverage: added 9 new tests across porcelain classification, transient backoff, and monitor auto-start racing explicit continue in `tests_py/test_p167_self_healing_activation.py` (25/25 passed).
+- Technical Review Remediation Round 2 (`ai_review:ai_review:bc404b1b-5fd9-4ed8-b11f-729b6fdff6bc:execute`):
+  - Repaired stale-readiness self-heal path in `src/dev_orchestrator/core/readiness.py`: `resolve_readiness()` now resolves legacy markdown tokens (`_resolve_legacy_markdown`) upon encountering `READINESS_TASK_ID_MISMATCH`, populating `migration_candidate`, `migration_required=bool(...)`, and `raw_token`. In `migrate_legacy_readiness`, predicate 3 successfully validates the candidate for superseded tasks, writes the updated state for the current task, commits to git, and records `superseded_task_id` in `runtime/readiness-migrations.jsonl`. Commit rollback checks out `before_head` for `agent/execution-state.json` when a superseded task ID was present.
+  - Applied recovery budgets and elapsed launch timeout on forward path in `src/dev_orchestrator/core/activation_supervisor.py`: no-blocker forward transitions now execute after `check_intent_budgets` and record actions via `record_intent_action`, enforcing the 20 actions budget and the 30-minute elapsed launch timeout.
+  - Terminated active execution intents upon worker launch: when worker execution is launching or running (detected via transition executor `_active_execution` or snapshot worker state in `{"starting", "running"}`), supervisor terminates the intent as `state="satisfied"`, `reason="target execution launched"`, eliminating unbounded re-submission of `continue` commands after worker completion.
+  - Hardened genuine owner gate and owner pause precedence in `src/dev_orchestrator/core/blockers.py` and `activation_supervisor.py`: updated `_SEVERITY_ORDER` to rank `OWNER_GATE_PRESENT` and `OWNER_PAUSED` at priority 0 (highest severity), ensuring genuine owner gates sort ahead of `TRANSIENT_*` (1), `INSPECTION_FAILED` (2), `ORPHANED_PROJECT_STATE` (3), and `READINESS_*` (7-10). Supervisor evaluates genuine owner gates (`b.code in {"OWNER_GATE_PRESENT", "OWNER_PAUSED"} or b.failure_class == "owner_gate"`) across all blockers, terminating intent as `owner_gate` without burning recovery budgets or attempting spurious readiness migration.
+  - Removed unused import `submit_control_command` from line 17 of `activation_supervisor.py`.
+  - Added dedicated regression test class `TestP167ReviewRemediation` with 7 test cases in `tests_py/test_p167_self_healing_activation.py` covering stale task ID migration, rollback on commit failure, supervisor migration forward dispatch, elapsed time and action budget exhaustion, worker launch intent satisfaction, and owner pause precedence over readiness mismatches.
 - Acceptance & Verification:
   - Canonical contract authored in `docs/P16_7_SELF_HEALING_ACTIVATION_CONTRACT.md`.
-  - Comprehensive end-to-end acceptance regression in `tests_py/test_p167_self_healing_activation.py` (25/25 passed).
-  - Full test suite regression: 1072 passed, 87 subtests passed in 381.27s (0 failures).
+  - Focused activation & control suites passed: 92 passed (`tests_py/test_p167_self_healing_activation.py`, `tests_py/test_transition_executor.py`, `tests_py/test_control_commands.py`, `tests_py/test_p12_control_actions.py`).
+  - Full test suite regression: 1079 passed, 87 subtests passed in 387.11s (0 failures).
   - Python compilation (`python -m compileall -q src ops tests_py benchmark/src`): passed cleanly (exit 0).
   - `git diff --check`: passed cleanly (0 whitespace/formatting defects).
-  - Knowledge graph updated via `graphify update .`: 5389 nodes, 15014 edges, 251 communities.
+  - Knowledge graph updated via `graphify update .`: 5399 nodes, 15070 edges, 246 communities.
 - Preserved handoff: P16.8 DevO Golden-Path Lifecycle Hardening (`agent/staged/P16.8.md`, Status: **PENDING DESIGN**).
 
 P16 AI Capability Benchmark Project remediation & state (2026-09-21):

@@ -431,6 +431,7 @@ def resolve_readiness(
 
         # Task ID drift check: structured state is bound to current task
         if current_task_id is not None and file_task_id != current_task_id.strip():
+            legacy_res = _resolve_legacy_markdown(repo, current_task_id, next_status)
             return ReadinessResolution(
                 state="invalid",
                 source="structured",
@@ -442,6 +443,9 @@ def resolve_readiness(
                     f"structured execution-state task_id {file_task_id!r} "
                     f"does not match current task {current_task_id!r}"
                 ),
+                migration_candidate=legacy_res.migration_candidate,
+                migration_required=bool(legacy_res.migration_candidate),
+                raw_token=legacy_res.raw_token,
             )
 
         return ReadinessResolution(
@@ -650,6 +654,13 @@ def migrate_legacy_readiness(
                         exec_state_file.unlink(missing_ok=True)
                     subprocess.run(
                         ["git", "-C", str(repo), "reset", "--", "agent/execution-state.json"],
+                        capture_output=True,
+                        timeout=15,
+                        **hidden_subprocess_kwargs(),
+                    )
+                else:
+                    subprocess.run(
+                        ["git", "-C", str(repo), "checkout", before_head, "--", "agent/execution-state.json"],
                         capture_output=True,
                         timeout=15,
                         **hidden_subprocess_kwargs(),

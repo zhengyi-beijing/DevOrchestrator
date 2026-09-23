@@ -897,5 +897,438 @@ class TestMonitorAutoStartRaceDuplicateWorkerPrevented(unittest.TestCase):
             self.assertEqual(len(launch_calls), 0)
 
 
+class TestP167ReviewRemediation(unittest.TestCase):
+    """Regression tests verifying closure of P16.7 technical review findings round 2."""
+
+    def test_readiness_task_id_mismatch_populates_migration_candidate_and_migrates(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+
+            # Structured file on disk for P1
+            write_structured_readiness(repo, "ready_to_run", "P1")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "add P1 readiness"], check=True)
+
+            # Update next.md to task P2 with Status: READY_TO_RUN
+            next_md = repo / "agent" / "next.md"
+            next_md.write_text("# Task P2: Feature Two\n\nStatus: **READY_TO_RUN**\n\nDescription here\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/next.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "advance next.md to P2"], check=True)
+
+            # resolve_readiness with current_task_id="P2"
+            res = resolve_readiness(repo, current_task_id="P2")
+            self.assertFalse(res.valid)
+            self.assertTrue(res.stale)
+            self.assertEqual(res.code, "READINESS_TASK_ID_MISMATCH")
+            self.assertEqual(res.migration_candidate, "ready_to_run")
+            self.assertTrue(res.migration_required)
+
+            # Migrate legacy readiness
+            p_entry = {"project_id": "proj-1", "repo_path": str(repo)}
+            snap_entry = {"repo_path": str(repo), "telemetry": {"task_id": "P2"}}
+            ok, msg, record = migrate_legacy_readiness(p_entry, snap_entry, runtime)
+            self.assertTrue(ok)
+            self.assertEqual(msg, "migrated")
+            self.assertIsNotNone(record)
+            self.assertEqual(record["superseded_task_id"], "P1")
+            self.assertEqual(record["task_id"], "P2")
+            self.assertEqual(record["candidate"], "ready_to_run")
+
+            # Post-migration check
+            post_res = resolve_readiness(repo, current_task_id="P2")
+            self.assertTrue(post_res.valid)
+            self.assertFalse(post_res.stale)
+            self.assertEqual(post_res.state, "ready_to_run")
+            self.assertEqual(post_res.task_id, "P2")
+
+    def test_readiness_migration_rollback_on_commit_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+
+            write_structured_readiness(repo, "ready_to_run", "P1")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "add P1 readiness"], check=True)
+
+            next_md = repo / "agent" / "next.md"
+            next_md.write_text("# Task P2: Feature Two\n\nStatus: **READY_TO_RUN**\n\nDescription here\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/next.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "advance next.md to P2"], check=True)
+
+            p_entry = {"project_id": "proj-1", "repo_path": str(repo)}
+            snap_entry = {"repo_path": str(repo), "telemetry": {"task_id": "P2"}}
+
+            # Mock git commit to fail
+            real_run = subprocess.run
+            def fake_subprocess_run(cmd, *args, **kwargs):
+                if isinstance(cmd, list) and "commit" in cmd:
+                    raise RuntimeError("simulated commit failure")
+                return real_run(cmd, *args, **kwargs)
+
+            with patch("dev_orchestrator.core.readiness.subprocess.run", side_effect=fake_subprocess_run):
+                ok, msg, record = migrate_legacy_readiness(p_entry, snap_entry, runtime)
+                self.assertFalse(ok)
+                self.assertIn("commit failed", msg)
+                self.assertIsNone(record)
+
+            # Rollback should restore P1 execution-state
+            state_file = repo / "agent" / "execution-state.json"
+            self.assertTrue(state_file.is_file())
+            content = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertEqual(content.get("task_id"), "P1")
+
+    def test_supervisor_migrates_task_id_mismatch_and_resubmits_forward(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+
+            write_structured_readiness(repo, "ready_to_run", "P1")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "add P1 readiness"], check=True)
+
+            next_md = repo / "agent" / "next.md"
+            next_md.write_text("# Task P2: Feature Two\n\nStatus: **READY_TO_RUN**\n\nDescription\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/next.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "advance next.md to P2"], check=True)
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "proj-1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage"],
+                                "preferred_backends": ["agy"],
+                                "backends": {"agy": {"executable": "agy.cmd"}},
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            record_or_refresh_intent(
+                runtime, "proj-1", task_id="P2", command_id="cmd-init-2",
+                source="test", repo_path=str(repo), state="active",
+            )
+
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "IDLE",
+                "telemetry": {"task_id": "P2"},
+            }
+            summary = {"projects": [snapshot]}
+
+            executor = FakeExecutor(launch=True)
+            coordinator = ControlCommandCoordinator(runtime, None)
+            supervisor = ActivationSupervisor(runtime, controls=coordinator, executor=executor)
+
+            outcomes = supervisor.advance(cfg_path, summary, executor=executor)
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["status"], "remediated")
+            self.assertEqual(outcomes[0]["remediation"], "migrate_readiness")
+
+            # Check forward command was queued (inbox or history)
+            remed_cmds = list((runtime / "control" / "inbox").glob("cmd-rec-proj-1-P2-*.json")) + list(
+                (runtime / "control" / "history").glob("cmd-rec-proj-1-P2-*.json")
+            )
+            self.assertTrue(len(remed_cmds) >= 1)
+
+    def test_forward_path_exhausts_elapsed_time_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+            write_structured_readiness(repo, "ready_to_run", "P1")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "add P1 readiness"], check=True)
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "proj-1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage"],
+                                "preferred_backends": ["agy"],
+                                "backends": {"agy": {"executable": "agy.cmd"}},
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            # Record intent created 35 minutes ago
+            from datetime import timedelta
+            past_time = (datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat()
+            record_or_refresh_intent(
+                runtime, "proj-1", task_id="P1", command_id="cmd-init-1",
+                source="test", repo_path=str(repo), state="active",
+            )
+            # Update created_at in storage
+            intent_file = runtime / "execution-intent.json"
+            data = read_json(intent_file)
+            data["intents"]["proj-1"]["created_at"] = past_time
+            write_json(intent_file, data)
+
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "READY_TO_RUN",
+                "telemetry": {"task_id": "P1"},
+            }
+            summary = {"projects": [snapshot]}
+
+            executor = FakeExecutor(launch=True)
+            supervisor = ActivationSupervisor(runtime, executor=executor)
+
+            outcomes = supervisor.advance(cfg_path, summary, executor=executor)
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["status"], "exhausted")
+            self.assertEqual(outcomes[0]["blocker_code"], "RECOVERY_BUDGET_EXHAUSTED")
+
+            # Intent state is exhausted
+            intent_after = get_active_intent(runtime, "proj-1")
+            self.assertIsNone(intent_after)
+            all_intents = load_execution_intents(runtime).get("intents", {})
+            self.assertEqual(all_intents["proj-1"]["state"], "exhausted")
+
+            # Zero commands submitted to inbox
+            inbox_cmds = list((runtime / "control" / "inbox").glob("*.json"))
+            self.assertEqual(len(inbox_cmds), 0)
+
+    def test_forward_path_exhausts_actions_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+            write_structured_readiness(repo, "ready_to_run", "P1")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "add P1 readiness"], check=True)
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "proj-1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage"],
+                                "preferred_backends": ["agy"],
+                                "backends": {"agy": {"executable": "agy.cmd"}},
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            # Record intent with actions_used=20 (default max is 20)
+            record_or_refresh_intent(
+                runtime, "proj-1", task_id="P1", command_id="cmd-init-1",
+                source="test", repo_path=str(repo), state="active",
+            )
+            intent_file = runtime / "execution-intent.json"
+            data = read_json(intent_file)
+            data["intents"]["proj-1"]["actions_used"] = 20
+            write_json(intent_file, data)
+
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "READY_TO_RUN",
+                "telemetry": {"task_id": "P1"},
+            }
+            summary = {"projects": [snapshot]}
+
+            executor = FakeExecutor(launch=True)
+            supervisor = ActivationSupervisor(runtime, executor=executor)
+
+            outcomes = supervisor.advance(cfg_path, summary, executor=executor)
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["status"], "exhausted")
+            self.assertEqual(outcomes[0]["blocker_code"], "RECOVERY_BUDGET_EXHAUSTED")
+
+            all_intents = load_execution_intents(runtime).get("intents", {})
+            self.assertEqual(all_intents["proj-1"]["state"], "exhausted")
+
+            inbox_cmds = list((runtime / "control" / "inbox").glob("*.json"))
+            self.assertEqual(len(inbox_cmds), 0)
+
+    def test_intent_terminates_satisfied_on_worker_launch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [
+                        {
+                            "project_id": "proj-1",
+                            "repo_path": str(repo),
+                            "execution": {
+                                "enabled": True,
+                                "owner_authorized": True,
+                                "allowed_next_actions": ["continue_current_stage"],
+                                "preferred_backends": ["agy"],
+                                "backends": {"agy": {"executable": "agy.cmd"}},
+                            },
+                        }
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            record_or_refresh_intent(
+                runtime, "proj-1", task_id="P1", command_id="cmd-init-1",
+                source="test", repo_path=str(repo), state="active",
+            )
+
+            # Snapshot has active worker
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "WORKER_RUNNING",
+                "telemetry": {"task_id": "P1"},
+                "worker": {"kind": "task", "state": "running", "task_id": "P1"},
+            }
+            summary = {"projects": [snapshot]}
+
+            executor = FakeExecutor(launch=True)
+            supervisor = ActivationSupervisor(runtime, executor=executor)
+
+            outcomes = supervisor.advance(cfg_path, summary, executor=executor)
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["status"], "intent_satisfied")
+
+            all_intents = load_execution_intents(runtime).get("intents", {})
+            self.assertEqual(all_intents["proj-1"]["state"], "satisfied")
+
+            # Next tick: no active intent, zero outcomes
+            outcomes2 = supervisor.advance(cfg_path, summary, executor=executor)
+            self.assertEqual(len(outcomes2), 0)
+
+    def test_owner_pause_or_gate_precedence_over_readiness_or_orphan(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repo = root / "repo"
+            make_repo(repo, task_id="P1")
+
+            # Structured file for P1, next.md for P2 -> task id mismatch
+            write_structured_readiness(repo, "ready_to_run", "P1")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/execution-state.json"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "add P1 readiness"], check=True)
+
+            next_md = repo / "agent" / "next.md"
+            next_md.write_text("# Task P2: Feature Two\n\nStatus: **READY_TO_RUN**\n\nDescription\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "agent/next.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "advance next.md to P2"], check=True)
+
+            # Owner pause via OwnerControlStore
+            from dev_orchestrator.control.owner_store import OwnerControlStore
+            OwnerControlStore(runtime).set_paused("proj-1", True, command_id="cmd-pause-1", action="pause")
+
+            project_def = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "execution": {
+                    "enabled": True,
+                    "owner_authorized": True,
+                    "allowed_next_actions": ["continue_current_stage"],
+                    "preferred_backends": ["agy"],
+                    "backends": {"agy": {"executable": "agy.cmd"}},
+                },
+            }
+
+            cfg_path = root / "config" / "projects.json"
+            cfg_path.parent.mkdir(parents=True)
+            cfg_path.write_text(
+                json.dumps({
+                    "projects": [project_def]
+                }),
+                encoding="utf-8",
+            )
+
+            # Explain block: OWNER_PAUSED must sort ahead of READINESS_TASK_ID_MISMATCH
+            blockers = explain_block(
+                project_id="proj-1",
+                repo_path=repo,
+                runtime_root=runtime,
+                config_path=cfg_path,
+                project_config=project_def,
+            )
+            codes = [b.code for b in blockers]
+            self.assertIn("OWNER_PAUSED", codes)
+            self.assertIn("READINESS_TASK_ID_MISMATCH", codes)
+            self.assertEqual(blockers[0].code, "OWNER_PAUSED")
+
+            record_or_refresh_intent(
+                runtime, "proj-1", task_id="P2", command_id="cmd-init-2",
+                source="test", repo_path=str(repo), state="active",
+            )
+
+            snapshot = {
+                "project_id": "proj-1",
+                "repo_path": str(repo),
+                "state": "IDLE",
+                "telemetry": {"task_id": "P2"},
+            }
+            summary = {"projects": [snapshot]}
+
+            executor = FakeExecutor(launch=True)
+            supervisor = ActivationSupervisor(runtime, executor=executor)
+
+            outcomes = supervisor.advance(cfg_path, summary, executor=executor)
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes[0]["status"], "owner_gate_preserved")
+            self.assertEqual(outcomes[0]["blocker_code"], "OWNER_PAUSED")
+
+            # Intent terminated as owner_gate
+            all_intents = load_execution_intents(runtime).get("intents", {})
+            self.assertEqual(all_intents["proj-1"]["state"], "owner_gate")
+
+            # No readiness migration was attempted; state file still P1
+            state_file = repo / "agent" / "execution-state.json"
+            content = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertEqual(content.get("task_id"), "P1")
+
+
 if __name__ == "__main__":
     unittest.main()
