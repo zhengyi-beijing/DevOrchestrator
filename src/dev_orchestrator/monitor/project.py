@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dev_orchestrator.platform.process import hidden_subprocess_kwargs
+from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.monitor.telemetry import (
     is_run_recorded,
     new_run_record,
@@ -119,6 +120,7 @@ def resolve_monitor_state(
     state = worker.get("state")
     alive = bool(worker.get("process_alive"))
     status_text = next_status or ""
+    status_parsed = parse_task_status(status_text)
 
     if kind == "task" and state in ("starting", "running") and not alive:
         return "WORKER_LOST"
@@ -126,7 +128,7 @@ def resolve_monitor_state(
         return "WORKER_RUNNING"
     if kind == "task" and state == "failed":
         return "WORKER_FAILED"
-    if re.search(r"BLOCKED", status_text, re.IGNORECASE):
+    if status_parsed.is_blocked():
         return "BLOCKED"
     if re.search(r"ACCEPTED|awaiting", status_text, re.IGNORECASE):
         return "WAITING_PHASE_GATE"
@@ -151,7 +153,7 @@ def resolve_monitor_state(
         is_ready = False
         if r_state == "ready_to_run":
             is_ready = True
-        elif r_state is None and re.search(r"READY[_ -]?TO[_ -]?RUN|DESIGN READY|EXECUTABLE", status_text, re.IGNORECASE):
+        elif r_state is None and status_parsed.is_ready_to_run():
             is_ready = True
         if is_ready:
             worker_updated = parse_utc(worker.get("updated_at"))
@@ -169,7 +171,7 @@ def resolve_monitor_state(
     if r_state in ("invalid", "blocked", "pending_design", "executing", "completed"):
         return "IDLE"
 
-    if re.search(r"READY[_ -]?TO[_ -]?RUN|DESIGN READY|EXECUTABLE", status_text, re.IGNORECASE):
+    if status_parsed.is_ready_to_run():
         return "READY_TO_RUN"
     return "IDLE"
 

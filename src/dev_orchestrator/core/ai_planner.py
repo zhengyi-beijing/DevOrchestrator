@@ -21,9 +21,15 @@ from dev_orchestrator.ai.structured_output import (
 )
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
 from dev_orchestrator.control.owner_store import OwnerControlStore
-from dev_orchestrator.core.readiness import write_structured_readiness
+from dev_orchestrator.core.readiness import resolve_task_state, write_structured_readiness
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_raw, read_successor, sha256_bytes
+from dev_orchestrator.core.task_status import (
+    parse_task_status,
+    render_status_line,
+    require_single_status_line,
+)
+
 from dev_orchestrator.core.workflow_policy import workflow_policy_prompt
 from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
@@ -140,9 +146,24 @@ _PLAN_SEQUENCE_KEYS = (
 class PlannerProtocolError(ValueError):
     """Planner protocol failure with a machine-readable pipeline stage."""
 
-    def __init__(self, stage: str, message: str) -> None:
+    def __init__(
+        self,
+        stage: str,
+        message: str,
+        *,
+        field: str | None = None,
+        expected: Any = None,
+        actual: Any = None,
+        correction: str | None = None,
+        actionable_message: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.stage = stage
+        self.field = field
+        self.expected = expected
+        self.actual = actual
+        self.correction = correction
+        self.actionable_message = actionable_message
 
 
 def _strip_exact_json_fence(text: str) -> str:
@@ -198,7 +219,15 @@ def _extract_plan_json_object(text: str | None) -> dict[str, Any]:
     try:
         return extract_unique_json_object(text, label="planner")
     except StructuredOutputError as exc:
-        raise PlannerProtocolError(exc.stage, str(exc)) from exc
+        raise PlannerProtocolError(
+            exc.stage,
+            str(exc),
+            field=getattr(exc, "field", None),
+            expected=getattr(exc, "expected", None),
+            actual=getattr(exc, "actual", None),
+            correction=getattr(exc, "correction", None),
+            actionable_message=getattr(exc, "actionable_message", None),
+        ) from exc
 
 
 def _normalize_plan_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -240,9 +269,20 @@ def _validate_plan_schema(payload: dict[str, Any]) -> None:
         if not value:
             raise PlannerProtocolError("schema", f"planner {key} must contain at least 1 item; got 0")
         if len(value) > 24:
-            raise PlannerProtocolError("schema", f"planner {key} must contain at most 24 items; got {len(value)}; combine or remove {len(value) - 24} item(s)")
+            count = len(value)
+            excess = count - 24
+            raise PlannerProtocolError(
+                "schema",
+                f"planner {key} must contain at most 24 items; got {count}; combine or remove {excess} item(s)",
+                field=key,
+                expected="at most 24 items",
+                actual=f"{count} items",
+                correction=f"combine or remove {excess} item(s)",
+                actionable_message=f"Field '{key}' has {count} items, exceeding the limit of 24. Combine or remove {excess} item(s).",
+            )
         if any(not isinstance(item, str) or len(item) > 1000 for item in value):
             raise PlannerProtocolError("schema", f"planner {key} entries must be bounded strings")
+
 
 
 def _validate_plan_semantics(payload: dict[str, Any], task_id: str) -> None:
@@ -433,7 +473,8 @@ class AIPlannerCoordinator:
         task_id = _nonblank(telemetry.get("task_id"))
         if project_id is None or repo_text is None or task_id is None:
             return None, "planner project identity incomplete"
-        if "PENDING DESIGN" not in str(snapshot.get("next_status") or "").upper():
+        task_state = resolve_task_state(project, snapshot, repo_text, current_task_id=task_id)
+        if not task_state.is_pending_design():
             return None, "current task is not PENDING DESIGN"
         truth = read_repository_truth(repo_text)
         if not truth.valid or truth.dirty:
@@ -739,11 +780,16 @@ class AIPlannerCoordinator:
             next_text = next_path.read_text(encoding="utf-8")
         except OSError:
             return False, "current agent/next.md is unavailable"
-        if (
-            "Status: **PENDING DESIGN**" not in next_text
-            or str(record.get("task_id") or "") not in next_text[:1000]
-        ):
+        try:
+            _, raw_status = require_single_status_line(next_text)
+            status_obj = parse_task_status(raw_status)
+            if not status_obj.is_pending_design():
+                return False, "owner gate task does not match current pending-design task"
+        except Exception:
             return False, "owner gate task does not match current pending-design task"
+        if str(record.get("task_id") or "") not in next_text[:1000]:
+            return False, "owner gate task does not match current pending-design task"
+
         reason = str(record.get("reason") or "")
         if not reason.startswith("plan remediation hit its bound after "):
             return False, "owner gate is not a recoverable legacy remediation-exhaustion gate"
@@ -1227,6 +1273,32 @@ class AIPlannerCoordinator:
                 classification = getattr(attempt_result, "failure_classification", None)
                 if protocol_stage is not None:
                     classification = f"planner_{protocol_stage}_error"
+                artifact_violation = None
+                if isinstance(exc, PlannerProtocolError) and (exc.field or exc.correction):
+                    artifact_violation = {
+                        "field": exc.field,
+                        "expected": str(exc.expected) if exc.expected is not None else None,
+                        "actual": str(exc.actual) if exc.actual is not None else None,
+                        "correction": exc.correction,
+                        "message": exc.actionable_message or attempt_reason,
+                    }
+                    with self._lock:
+                        state = self._load_state()
+                        current = state["plans"].get(plan_id)
+                        if isinstance(current, dict):
+                            current.setdefault("artifact_violations", []).append(artifact_violation)
+                            self._save_state(state)
+
+                artifact_block = ""
+                if artifact_violation:
+                    artifact_block = (
+                        f"\n\n[ARTIFACT_CORRECTION]\n"
+                        f"field: {artifact_violation['field']}\n"
+                        f"expected: {artifact_violation['expected']}\n"
+                        f"actual: {artifact_violation['actual']}\n"
+                        f"correction: {artifact_violation['correction']}"
+                    )
+
                 if protocol_stage in {"extract", "schema"} and format_repairs < max_format_repairs:
                     format_repairs += 1
                     self._record_planner_attempt(
@@ -1236,7 +1308,7 @@ class AIPlannerCoordinator:
                     if attempt_result is not None and attempt_result.resource_context is not None:
                         previous_attempt_resource = attempt_result.resource_context
                     failure_reason = (
-                        f"{protocol_stage} format/schema repair required: {attempt_reason}"
+                        f"{protocol_stage} format/schema repair required: {attempt_reason}{artifact_block}"
                     )
                     continue
                 self._record_planner_attempt(
@@ -1245,7 +1317,8 @@ class AIPlannerCoordinator:
                 )
                 if attempt_result is not None and attempt_result.resource_context is not None:
                     previous_attempt_resource = attempt_result.resource_context
-                failure_reason = attempt_reason
+                failure_reason = f"{attempt_reason}{artifact_block}"
+
                 semantic_failures += 1
                 if semantic_failures >= max_attempts:
                     self._finish(
@@ -2061,15 +2134,9 @@ class AIPlannerCoordinator:
         if marker in original:
             raise RuntimeError("approved design marker already exists")
         lines = original.splitlines()
-        pending_indexes = [
-            index for index, line in enumerate(lines)
-            if line.lstrip().startswith("Status:") and "PENDING DESIGN" in line.upper()
-        ]
-        if len(pending_indexes) != 1:
-            raise RuntimeError(
-                f"expected exactly one PENDING DESIGN status line; found {len(pending_indexes)}"
-            )
-        lines[pending_indexes[0]] = "Status: **READY_TO_RUN**"
+        idx, _ = require_single_status_line(original)
+        lines[idx] = render_status_line("ready_to_run")
+
         text = "\n".join(lines).rstrip() + "\n\n"
         text += marker + "\n\n"
         text += str(plan["summary"]).strip() + "\n\n"

@@ -5,7 +5,19 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P16.8 DevO Golden-Path Lifecycle Hardening** (Status: **PENDING DESIGN**).
+Current task: **P16.8 DevO Golden-Path Lifecycle Hardening** (Status: **READY_TO_RUN** / Implementation & Verification Complete).
+
+P16.8 DevO Golden-Path Lifecycle Hardening completion (2026-09-24):
+- Delivered the Golden-Path lifecycle guarantee: proved that a fresh, owner-authorized task moves from PENDING_DESIGN to DONE under a single owner continue command without manual lifecycle repair.
+- Authoritative Task State Precedence (3-rule contract in src/dev_orchestrator/core/readiness.py): valid structured readiness is authoritative, absent falls back to Markdown, invalid/stale/mismatched fails closed; Markdown disagreement is diagnostic-only.
+- Centralized canonical task status parsing, predicates, and editing in src/dev_orchestrator/core/task_status.py, eliminating raw substring/regex status checks across production modules (enforced via static scan regression).
+- Durable ExecutionContext schema version 1 in runtime/execution-context.json protected by InterProcessFileLock under execution-context.lock, with git-anchor revalidation, stale detection (EXECUTION_CONTEXT_STALE), and idle continuation faulting (CONTINUATION_FAULT) with deterministic redispatch command IDs.
+- Structured actionable artifact error payloads on schema/item violations (field, expected, actual, correction, actionable_message).
+- Terminal DONE action closure (continue, retry, rereview, reconcile disabled).
+- 9-field additive activity telemetry exposed in project_status.py and control/surface.py.
+- Registered progress milestones: CONTINUATION_DISPATCHED, CONTINUATION_FAULT, CONTINUATION_HOLD, EXECUTION_CONTEXT_STALE.
+- Contract document authored in docs/P16_8_GOLDEN_PATH_LIFECYCLE_CONTRACT.md and backlog.md updated.
+- Full verification: 18 focused tests passed across test_p168_task_status.py, test_p168_golden_path.py, and test_p168_fault_injection.py; 1111 full repository regression tests passed (0 failures).
 
 P16.7 Self-Healing Project Activation & Readiness completion (2026-09-23):
 - Implemented diagnosed and self-healing project-activation and readiness failure handling without repeated owner interventions, replaying the 2026-09-23 xray-hw-platform incident as an automated end-to-end regression.

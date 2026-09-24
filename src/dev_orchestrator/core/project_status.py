@@ -598,4 +598,10 @@ def project_runtime_status(snapshot: dict[str, Any], runtime_root: Path | str) -
         projected["recovery_epoch"] = epoch
         projected["recovery_epoch_id"] = epoch["id"]
 
+    try:
+        from dev_orchestrator.core.activity_telemetry import resolve_activity_telemetry
+        projected["activity"] = resolve_activity_telemetry(projected, runtime, project_id=project_id)
+    except Exception:
+        pass
+
     return projected

@@ -8,9 +8,24 @@ from typing import Any, Iterable
 class StructuredOutputError(ValueError):
     """Structured-output contract failure with a machine-readable stage."""
 
-    def __init__(self, stage: str, message: str) -> None:
+    def __init__(
+        self,
+        stage: str,
+        message: str,
+        *,
+        field: str | None = None,
+        expected: Any = None,
+        actual: Any = None,
+        correction: str | None = None,
+        actionable_message: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.stage = stage
+        self.field = field
+        self.expected = expected
+        self.actual = actual
+        self.correction = correction
+        self.actionable_message = actionable_message
 
 
 def _strip_exact_json_fence(text: str, *, label: str) -> str:

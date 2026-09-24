@@ -32,7 +32,9 @@ from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_successor
+from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.core.workflow_policy import inject_workflow_policy
+
 from dev_orchestrator.core.project_status import write_execution_status
 from dev_orchestrator.core.websol import NextAction, WebSolEvent, WebSolRole
 from dev_orchestrator.monitor.telemetry import extract_task_id
@@ -122,8 +124,7 @@ def _readiness_allows_launch(
             if predecessor_task_id is not None and file_task == predecessor_task_id:
                 if readiness.get("migration_candidate") == "ready_to_run":
                     return True
-                status = str(snapshot.get("next_status") or "")
-                if re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE) is not None:
+                if parse_task_status(snapshot.get("next_status")).is_ready_to_run():
                     return True
             return False
         if not readiness.get("valid", True) or readiness.get("stale", False) or readiness.get("state") == "invalid":
@@ -157,21 +158,18 @@ def _next_task_ready(
             if predecessor_task_id is not None and file_task == predecessor_task_id:
                 if readiness.get("migration_candidate") == "ready_to_run":
                     return True
-                status = str(snapshot.get("next_status") or "")
-                return re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE) is not None
+                return parse_task_status(snapshot.get("next_status")).is_ready_to_run()
             if anchor_task_id is not None and file_task == anchor_task_id:
                 return True
         if readiness.get("source") == "legacy_markdown":
-            status = str(snapshot.get("next_status") or "")
-            return re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE) is not None
+            return parse_task_status(snapshot.get("next_status")).is_ready_to_run()
         return False
-    status = str(snapshot.get("next_status") or "")
-    return re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE) is not None
+    return parse_task_status(snapshot.get("next_status")).is_ready_to_run()
 
 
 def _task_marked_complete(snapshot: dict[str, Any]) -> bool:
-    status = str(snapshot.get("next_status") or "")
-    return re.search(r"\bCOMPLETED?\b", status, re.IGNORECASE) is not None
+    return parse_task_status(snapshot.get("next_status")).is_completed()
+
 
 
 def _external_worker_active(snapshot: dict[str, Any]) -> bool:
@@ -844,8 +842,9 @@ class TransitionExecutor:
                     and file_task == must_advance_from
                     and (
                         readiness.get("migration_candidate") == "ready_to_run"
-                        or re.search(r"READY_TO_RUN|DESIGN READY|EXECUTABLE", str(snapshot.get("next_status") or ""), re.IGNORECASE) is not None
+                        or parse_task_status(snapshot.get("next_status")).is_ready_to_run()
                     )
+
                 ):
                     pass
                 else:
@@ -2222,8 +2221,9 @@ class TransitionExecutor:
                     continue
                 if (
                     current_task is not None and current_task != task_id
-                    and "PENDING DESIGN" in str(snapshot.get("next_status") or "").upper()
+                    and parse_task_status(snapshot.get("next_status")).is_pending_design()
                 ):
+
                     truth = read_repository_truth(project.get("repo_path") or "")
                     reviewed_hash = _non_blank_config(record.get("review_status_hash"))
                     if (

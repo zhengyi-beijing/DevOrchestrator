@@ -148,7 +148,13 @@ def record_or_refresh_intent(
             data["intents"][project_id] = intent
 
         write_json(intent_file, data, indent=2)
-        return copy.deepcopy(intent)
+        result = copy.deepcopy(intent)
+    try:
+        from dev_orchestrator.core.execution_context import sync_recovery_snapshot
+        sync_recovery_snapshot(runtime, project_id, result)
+    except Exception:
+        pass
+    return result
 
 
 def record_intent_action(
@@ -169,16 +175,22 @@ def record_intent_action(
         intent["updated_at"] = utc_now_iso()
 
         if fingerprint:
-            f_hash = fingerprint.get("fingerprint_hash") or "unknown"
+            f_hash = fingerprint.get("fingerprint_hash") if isinstance(fingerprint, dict) else str(fingerprint)
             repeats = intent.setdefault("repeats_by_fingerprint", {})
             repeats[f_hash] = int(repeats.get(f_hash, 0)) + 1
             fps = intent.setdefault("fingerprints", [])
-            fps.append(fingerprint)
+            fps.append(fingerprint if isinstance(fingerprint, dict) else {"fingerprint_hash": str(fingerprint)})
             if len(fps) > 20:
                 intent["fingerprints"] = fps[-20:]
 
         write_json(intent_file, data, indent=2)
-        return copy.deepcopy(intent), False, None, None
+        result = copy.deepcopy(intent)
+    try:
+        from dev_orchestrator.core.execution_context import sync_recovery_snapshot
+        sync_recovery_snapshot(runtime, project_id, result)
+    except Exception:
+        pass
+    return result, False, None, None
 
 
 def check_intent_budgets(
@@ -251,6 +263,16 @@ def check_intent_budgets(
     return False, None, None
 
 
+PERMITTED_TERMINAL_INTENT_STATES = frozenset({
+    "satisfied",
+    "stopped",
+    "exhausted",
+    "owner_gate",
+    "terminal_failure",
+    "terminal_success",
+})
+
+
 def set_intent_backoff(
     runtime_root: Path | str,
     project_id: str,
@@ -258,6 +280,7 @@ def set_intent_backoff(
 ) -> None:
     """Record backoff_until ISO timestamp for a project's active intent."""
     runtime = Path(runtime_root)
+    result = None
     with _intent_lock(runtime):
         intent_file = runtime / "execution-intent.json"
         data = load_execution_intents(runtime)
@@ -266,6 +289,13 @@ def set_intent_backoff(
             intent["backoff_until"] = backoff_until
             intent["updated_at"] = utc_now_iso()
             write_json(intent_file, data, indent=2)
+            result = copy.deepcopy(intent)
+    if result is not None:
+        try:
+            from dev_orchestrator.core.execution_context import sync_recovery_snapshot
+            sync_recovery_snapshot(runtime, project_id, result)
+        except Exception:
+            pass
 
 
 def clear_intent_backoff(
@@ -274,6 +304,7 @@ def clear_intent_backoff(
 ) -> None:
     """Clear backoff_until for a project's active intent."""
     runtime = Path(runtime_root)
+    result = None
     with _intent_lock(runtime):
         intent_file = runtime / "execution-intent.json"
         data = load_execution_intents(runtime)
@@ -282,6 +313,13 @@ def clear_intent_backoff(
             intent.pop("backoff_until", None)
             intent["updated_at"] = utc_now_iso()
             write_json(intent_file, data, indent=2)
+            result = copy.deepcopy(intent)
+    if result is not None:
+        try:
+            from dev_orchestrator.core.execution_context import sync_recovery_snapshot
+            sync_recovery_snapshot(runtime, project_id, result)
+        except Exception:
+            pass
 
 
 def terminate_intent(
@@ -293,7 +331,11 @@ def terminate_intent(
     blocker_code: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    """Mark intent terminal (exhausted, owner_gate, satisfied, stopped)."""
+    """Mark intent terminal (exhausted, owner_gate, satisfied, stopped, terminal_failure, terminal_success)."""
+    if state not in PERMITTED_TERMINAL_INTENT_STATES:
+        raise ValueError(
+            f"Invalid terminal intent state '{state}'; must be one of {sorted(PERMITTED_TERMINAL_INTENT_STATES)}"
+        )
     runtime = Path(runtime_root)
     with _intent_lock(runtime):
         intent_file = runtime / "execution-intent.json"
@@ -310,4 +352,10 @@ def terminate_intent(
         if reason:
             intent["reason"] = reason
         write_json(intent_file, data, indent=2)
-        return copy.deepcopy(intent)
+        result = copy.deepcopy(intent)
+    try:
+        from dev_orchestrator.core.execution_context import sync_recovery_snapshot
+        sync_recovery_snapshot(runtime, project_id, result)
+    except Exception:
+        pass
+    return result

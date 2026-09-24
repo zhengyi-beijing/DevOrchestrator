@@ -30,6 +30,7 @@ ATTENTION_MILESTONES = frozenset({
     "BLOCKED",
     "STALL_DETECTED",
     "RECOVERY_REQUIRED",
+    "CONTINUATION_FAULT",
 })
 
 QUIET_MILESTONES = frozenset({
@@ -37,6 +38,7 @@ QUIET_MILESTONES = frozenset({
     "BLOCKED",
     "TEST_FAILED",
     "TASK_COMPLETE",
+    "CONTINUATION_FAULT",
 })
 
 NORMAL_MILESTONES = QUIET_MILESTONES | frozenset({
@@ -51,6 +53,7 @@ NORMAL_MILESTONES = QUIET_MILESTONES | frozenset({
     "STALL_DETECTED",
     "DIAGNOSTIC_RESULT",
     "RECOVERY_STARTED",
+    "CONTINUATION_DISPATCHED",
 })
 
 VERBOSE_MILESTONES = NORMAL_MILESTONES | frozenset({
@@ -64,6 +67,8 @@ VERBOSE_MILESTONES = NORMAL_MILESTONES | frozenset({
     "IDLE",
     "HEARTBEAT",
     "DIAGNOSTIC_STARTED",
+    "CONTINUATION_HOLD",
+    "EXECUTION_CONTEXT_STALE",
 })
 
 
@@ -84,6 +89,10 @@ class ProgressMilestone(str, Enum):
     DIAGNOSTIC_STARTED = "DIAGNOSTIC_STARTED"
     DIAGNOSTIC_RESULT = "DIAGNOSTIC_RESULT"
     RECOVERY_STARTED = "RECOVERY_STARTED"
+    CONTINUATION_DISPATCHED = "CONTINUATION_DISPATCHED"
+    CONTINUATION_FAULT = "CONTINUATION_FAULT"
+    CONTINUATION_HOLD = "CONTINUATION_HOLD"
+    EXECUTION_CONTEXT_STALE = "EXECUTION_CONTEXT_STALE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,6 +495,10 @@ class ProgressChannel:
             "DIAGNOSTIC_STARTED": "Watchdog diagnostic task started",
             "DIAGNOSTIC_RESULT": "Watchdog diagnostic completed",
             "RECOVERY_STARTED": "Watchdog automatic recovery initiated",
+            "CONTINUATION_DISPATCHED": "Continuation action dispatched",
+            "CONTINUATION_FAULT": "Continuation idle fault detected",
+            "CONTINUATION_HOLD": "Continuation holding for active role",
+            "EXECUTION_CONTEXT_STALE": "Execution context stale; re-anchoring repository truth",
         }
         desc = descs.get(milestone, f"Milestone {milestone}")
         reason = details.get("reason") if isinstance(details, dict) and details.get("reason") else ""

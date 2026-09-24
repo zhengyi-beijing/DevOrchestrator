@@ -20,6 +20,14 @@ from dev_orchestrator.core.activation import (
     reconcile_project_registration,
 )
 from dev_orchestrator.core.blockers import explain_block
+from dev_orchestrator.core.execution_context import (
+    classify_continuation,
+    context_is_stale,
+    get_context,
+    load_execution_contexts,
+    set_next_action,
+    update_context,
+)
 from dev_orchestrator.core.execution_intent import (
     check_intent_budgets,
     clear_intent_backoff,
@@ -30,6 +38,8 @@ from dev_orchestrator.core.execution_intent import (
     terminate_intent,
 )
 from dev_orchestrator.core.readiness import migrate_legacy_readiness
+from dev_orchestrator.core.repository import read_repository_truth
+from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
 logger = logging.getLogger(__name__)
@@ -203,29 +213,224 @@ class ActivationSupervisor:
                 project_id=project_id,
             )
 
-            # 5. Genuine Owner Gate preservation: evaluate across ALL blockers
-            owner_gate_blocker = next(
-                (b for b in blockers if b.code in {"OWNER_GATE_PRESENT", "OWNER_PAUSED"} or b.failure_class == "owner_gate"),
-                None,
+            # Execution context continuity and git-anchor revalidation
+            context = get_context(self.runtime_root, project_id)
+            git_info = snapshot.get("git") if isinstance(snapshot, dict) else {}
+            curr_head = git_info.get("head") if isinstance(git_info, dict) else None
+            telemetry = snapshot.get("telemetry") if isinstance(snapshot, dict) else {}
+            curr_task_id = telemetry.get("task_id") if isinstance(telemetry, dict) else None
+            self_healing_cfg = project_config.get("self_healing") if project_config else None
+
+            if context and context_is_stale(context, curr_head, curr_task_id):
+                self._emit_milestone(
+                    project_id,
+                    "EXECUTION_CONTEXT_STALE",
+                    task_id=curr_task_id or context.get("task_id"),
+                    details={
+                        "old_anchor": context.get("git_anchor"),
+                        "current_head": curr_head,
+                        "old_task_id": context.get("task_id"),
+                        "current_task_id": curr_task_id,
+                    },
+                )
+                truth = read_repository_truth(repo_path or "") if repo_path else None
+                if truth and truth.valid and not truth.dirty:
+                    parsed_st = parse_task_status(snapshot.get("next_status") if isinstance(snapshot, dict) else None)
+                    next_act = "plan" if parsed_st.is_pending_design() else "execute"
+                    context = update_context(
+                        self.runtime_root,
+                        project_id,
+                        git_anchor=curr_head,
+                        task_id=curr_task_id,
+                        next_action=next_act,
+                        disposition="advance",
+                        idle_ticks=0,
+                    )
+
+            # 5. Classify continuation
+            disposition, next_action, disp_reason = classify_continuation(
+                snapshot, intent, blockers, context, project_config=project_config
             )
-            if owner_gate_blocker is not None:
+
+            # Genuine Owner Gate preservation
+            if disposition == "owner_gate":
+                owner_gate_blocker = next(
+                    (b for b in blockers if b.code in {"OWNER_GATE_PRESENT", "OWNER_PAUSED"} or b.failure_class == "owner_gate"),
+                    None,
+                )
+                b_code = owner_gate_blocker.code if owner_gate_blocker else "OWNER_GATE"
                 terminate_intent(
                     self.runtime_root,
                     project_id,
                     "owner_gate",
                     failure_class="owner_gate",
-                    blocker_code=owner_gate_blocker.code,
-                    reason="genuine owner gate active",
+                    blocker_code=b_code,
+                    reason=disp_reason,
                 )
+                update_context(self.runtime_root, project_id, disposition="owner_gate")
                 outcomes.append({
                     "project_id": project_id,
                     "status": "owner_gate_preserved",
-                    "blocker_code": owner_gate_blocker.code,
+                    "blocker_code": b_code,
                 })
                 continue
 
+            if disposition == "owner_stop":
+                terminate_intent(
+                    self.runtime_root,
+                    project_id,
+                    "stopped",
+                    failure_class="owner_stop",
+                    blocker_code="OWNER_PAUSED",
+                    reason=disp_reason,
+                )
+                update_context(self.runtime_root, project_id, disposition="owner_stop")
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "owner_stop",
+                    "reason": disp_reason,
+                })
+                continue
+
+            if disposition == "terminal_success":
+                terminate_intent(
+                    self.runtime_root,
+                    project_id,
+                    "satisfied",
+                    reason="current task is terminal",
+                )
+                update_context(self.runtime_root, project_id, disposition="terminal_success", next_action="none")
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "terminal_success",
+                    "reason": "current task is terminal",
+                })
+                continue
+
+            if disposition == "lifecycle_hold":
+                top_blocker = blockers[0]
+                terminate_intent(
+                    self.runtime_root,
+                    project_id,
+                    "stopped",
+                    failure_class="lifecycle",
+                    blocker_code=top_blocker.code,
+                    reason=f"task lifecycle state not ready to run: {getattr(top_blocker, 'observed', top_blocker.code)}",
+                )
+                update_context(self.runtime_root, project_id, disposition="hold")
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "lifecycle_hold",
+                    "blocker_code": top_blocker.code,
+                })
+                continue
+
+            if disposition == "terminal_failure":
+                code = blockers[0].code if blockers else "TERMINAL_BLOCKER"
+                terminate_intent(
+                    self.runtime_root,
+                    project_id,
+                    "exhausted",
+                    failure_class="terminal",
+                    blocker_code=code,
+                    reason=disp_reason,
+                )
+                update_context(self.runtime_root, project_id, disposition="terminal_failure")
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "terminal_blocker",
+                    "blocker_code": code,
+                    "reason": disp_reason,
+                })
+                continue
+
+            if disposition == "transient_infrastructure":
+                top_b = blockers[0]
+                backoff_secs = int(self_healing_cfg.get("backoff_seconds") or 5) if self_healing_cfg else 5
+                backoff_until_str = intent.get("backoff_until")
+                if backoff_until_str:
+                    try:
+                        backoff_until_dt = parse_utc(backoff_until_str)
+                    except Exception:
+                        backoff_until_dt = None
+                    if backoff_until_dt and tick_now < backoff_until_dt:
+                        outcomes.append({
+                            "project_id": project_id,
+                            "status": "transient_backoff_waiting",
+                            "backoff_until": backoff_until_str,
+                            "blocker_code": top_b.code,
+                        })
+                        continue
+                    else:
+                        clear_intent_backoff(self.runtime_root, project_id)
+                        disposition = "remediate"
+                else:
+                    backoff_until_dt = tick_now + timedelta(seconds=backoff_secs)
+                    set_intent_backoff(self.runtime_root, project_id, backoff_until_dt.isoformat())
+                    outcomes.append({
+                        "project_id": project_id,
+                        "status": "transient_backoff_scheduled",
+                        "backoff_seconds": backoff_secs,
+                        "backoff_until": backoff_until_dt.isoformat(),
+                        "blocker_code": top_b.code,
+                    })
+                    continue
+
+            if disposition == "hold":
+                # Active role execution: hold without burning recovery budget
+                worker = snapshot.get("worker") if isinstance(snapshot, dict) and isinstance(snapshot.get("worker"), dict) else {}
+                w_active = worker.get("kind") == "task" and worker.get("state") in {"starting", "running"}
+                planner = snapshot.get("planner") if isinstance(snapshot, dict) and isinstance(snapshot.get("planner"), dict) else {}
+                p_active = planner.get("state") in {"planning", "reviewing", "applying", "remediating"}
+                reviewer = snapshot.get("reviewer") if isinstance(snapshot, dict) and isinstance(snapshot.get("reviewer"), dict) else {}
+                r_active = reviewer.get("state") in {"launching", "running"}
+
+                if w_active or p_active or r_active:
+                    role_name = "worker" if w_active else ("planner" if p_active else "reviewer")
+                    update_context(self.runtime_root, project_id, disposition="hold", active_role=role_name, idle_ticks=0)
+                    self._emit_milestone(
+                        project_id,
+                        "CONTINUATION_HOLD",
+                        task_id=intent.get("task_id"),
+                        details={"role": role_name, "reason": disp_reason},
+                    )
+                    outcomes.append({
+                        "project_id": project_id,
+                        "status": "continuation_hold",
+                        "role": role_name,
+                        "reason": disp_reason,
+                    })
+                    continue
+
+                # Idle tick detection: at most one idle tick before emitting CONTINUATION_FAULT
+                curr_idle = int(context.get("idle_ticks", 0)) if isinstance(context, dict) else 0
+                if curr_idle >= 1:
+                    self._emit_milestone(
+                        project_id,
+                        "CONTINUATION_FAULT",
+                        task_id=intent.get("task_id"),
+                        details={"idle_ticks": curr_idle, "reason": "continuation idle fault"},
+                    )
+                    update_context(self.runtime_root, project_id, idle_ticks=0, disposition="advance")
+                    disposition = "advance"
+                    next_action = "continue"
+                else:
+                    update_context(self.runtime_root, project_id, idle_ticks=curr_idle + 1, disposition="hold")
+                    self._emit_milestone(
+                        project_id,
+                        "CONTINUATION_HOLD",
+                        task_id=intent.get("task_id"),
+                        details={"idle_ticks": curr_idle + 1, "reason": disp_reason},
+                    )
+                    outcomes.append({
+                        "project_id": project_id,
+                        "status": "continuation_hold",
+                        "idle_ticks": curr_idle + 1,
+                        "reason": disp_reason,
+                    })
+                    continue
+
             # 6. Check budget / livelock exhaustion
-            self_healing_cfg = project_config.get("self_healing") if project_config else None
             is_exhausted, exhaust_reason, blocker_code = check_intent_budgets(intent, self_healing_cfg, now=tick_now)
             if is_exhausted:
                 terminate_intent(
@@ -246,6 +451,7 @@ class ActivationSupervisor:
                         "reason": exhaust_reason,
                     },
                 )
+                update_context(self.runtime_root, project_id, disposition="exhausted")
                 outcomes.append({
                     "project_id": project_id,
                     "status": "exhausted",
@@ -254,15 +460,15 @@ class ActivationSupervisor:
                 })
                 continue
 
-            # 7. If no blockers, drive the forward transition under budget!
-            if not blockers:
+            # 7. Advance forward transition under budget
+            if disposition == "advance":
                 eff_task_id = intent.get("task_id") or (snapshot.get("telemetry", {}).get("task_id") if isinstance(snapshot, dict) else None) or "notask"
                 fp = compute_recovery_fingerprint(
                     project_id=project_id,
                     task_id=eff_task_id,
                     lifecycle_state=str(snapshot.get("lifecycle_state") or snapshot.get("state") if snapshot else "IDLE"),
                     blocker_code="NO_BLOCKER",
-                    git_anchor=snapshot.get("git", {}).get("head") if snapshot else None,
+                    git_anchor=curr_head,
                     worker_state=snapshot.get("worker", {}).get("state") if snapshot else None,
                 )
                 updated_intent, _, _, _ = record_intent_action(self.runtime_root, project_id, fingerprint=fp)
@@ -282,6 +488,20 @@ class ActivationSupervisor:
                     )
                     if self.controls is not None and cfg_path:
                         self.controls.advance(cfg_path, summary, exec_inst)
+                    self._emit_milestone(
+                        project_id,
+                        "CONTINUATION_DISPATCHED",
+                        task_id=eff_task_id,
+                        details={"command_id": cmd_id, "action": next_action},
+                    )
+                    update_context(
+                        self.runtime_root,
+                        project_id,
+                        next_action=next_action,
+                        disposition="advance",
+                        git_anchor=curr_head,
+                        idle_ticks=0,
+                    )
                     post_active = _active_execution(self.runtime_root, project_id)
                     if post_active is not None and str(post_active.get("state") or "") in {"launching", "running"}:
                         terminate_intent(
@@ -293,7 +513,9 @@ class ActivationSupervisor:
                     outcomes.append({
                         "project_id": project_id,
                         "status": "transition_submitted",
+                        "continuation": "continuation_dispatched",
                         "command_id": cmd_id,
+                        "action": next_action,
                     })
                 except Exception as exc:
                     outcomes.append({
@@ -304,79 +526,12 @@ class ActivationSupervisor:
                 continue
 
             top_blocker = blockers[0]
-
-            # 8. Lifecycle / non-executable condition handling
-            if top_blocker.failure_class == "lifecycle" or top_blocker.code == "READINESS_NOT_READY_TO_RUN":
-                terminate_intent(
-                    self.runtime_root,
-                    project_id,
-                    "stopped",
-                    failure_class="lifecycle",
-                    blocker_code=top_blocker.code,
-                    reason=f"task lifecycle state not ready to run: {top_blocker.observed}",
-                )
-                outcomes.append({
-                    "project_id": project_id,
-                    "status": "lifecycle_hold",
-                    "blocker_code": top_blocker.code,
-                })
-                continue
-
-            # 9. Terminal failure handling
-            if top_blocker.failure_class == "terminal":
-                terminate_intent(
-                    self.runtime_root,
-                    project_id,
-                    "exhausted",
-                    failure_class="terminal",
-                    blocker_code=top_blocker.code,
-                    reason=f"terminal blocker: {top_blocker.code}",
-                )
-                outcomes.append({
-                    "project_id": project_id,
-                    "status": "terminal_blocker",
-                    "blocker_code": top_blocker.code,
-                })
-                continue
-
-            # If transient infrastructure error, handle backoff scheduling and waiting before burning actions
-            if top_blocker.failure_class == "transient_infrastructure":
-                backoff_secs = int(self_healing_cfg.get("backoff_seconds") or 5) if self_healing_cfg else 5
-                backoff_until_str = intent.get("backoff_until")
-                if backoff_until_str:
-                    try:
-                        backoff_until_dt = parse_utc(backoff_until_str)
-                    except Exception:
-                        backoff_until_dt = None
-                    if backoff_until_dt and tick_now < backoff_until_dt:
-                        outcomes.append({
-                            "project_id": project_id,
-                            "status": "transient_backoff_waiting",
-                            "backoff_until": backoff_until_str,
-                            "blocker_code": top_blocker.code,
-                        })
-                        continue
-                    else:
-                        clear_intent_backoff(self.runtime_root, project_id)
-                else:
-                    backoff_until_dt = tick_now + timedelta(seconds=backoff_secs)
-                    set_intent_backoff(self.runtime_root, project_id, backoff_until_dt.isoformat())
-                    outcomes.append({
-                        "project_id": project_id,
-                        "status": "transient_backoff_scheduled",
-                        "backoff_seconds": backoff_secs,
-                        "backoff_until": backoff_until_dt.isoformat(),
-                        "blocker_code": top_blocker.code,
-                    })
-                    continue
-
-            # 10. Bounded Remediation for recoverable conditions
             fp = compute_recovery_fingerprint(
                 project_id=project_id,
                 task_id=intent.get("task_id") or (snapshot.get("telemetry", {}).get("task_id") if snapshot else None),
                 lifecycle_state=str(snapshot.get("lifecycle_state") or snapshot.get("state") if snapshot else "UNREGISTERED"),
                 blocker_code=top_blocker.code,
-                git_anchor=snapshot.get("git", {}).get("head") if snapshot else None,
+                git_anchor=curr_head,
                 worker_state=snapshot.get("worker", {}).get("state") if snapshot else None,
             )
             updated_intent, _, _, _ = record_intent_action(self.runtime_root, project_id, fingerprint=fp)

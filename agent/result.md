@@ -1278,3 +1278,41 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - The timed-out integration test then passed 5/5 consecutive isolated reruns (6.93-13.25s each), confirming an environmental/timing flake rather than an activation-ledger regression.
   - Final clean full repository regression: 1093 passed, 92 subtests passed in 402.18s (0 failures).
 - DevOrchestrator remained owner-paused throughout remediation and verification; no P16.8 Worker was launched.
+
+## P16.8 DevO Golden-Path Lifecycle Hardening (2026-09-24)
+
+- Delivered the Golden-Path lifecycle guarantee: proved that a fresh, owner-authorized task advances reliably from `PENDING_DESIGN` to `DONE` under a single owner `continue` command without manual lifecycle repair.
+- Authoritative Task State Precedence (3-rule contract in `src/dev_orchestrator/core/readiness.py`):
+  - Valid task-bound structured readiness in `agent/execution-state.json` always supplies authoritative state (`authority="structured"`).
+  - Absent structured readiness falls back to parsed Markdown (`authority="markdown"`).
+  - Invalid, corrupted, or task-mismatched structured readiness fails closed (`authority="none"`, `state="invalid"`), prohibiting Markdown bypass.
+  - Textual disagreement between structured state and Markdown is diagnostic-only (`consistency="conflict"`) and never blocks execution or launch.
+- Canonical Task Status Parsing & Editing (`src/dev_orchestrator/core/task_status.py`):
+  - Centralized task status parsing, semantic predicates (`is_pending_design()`, `is_ready_to_run()`, `is_completed()`, `is_blocked()`, `is_executing()`), and Markdown editing helpers (`find_status_lines`, `require_single_status_line`, `render_status_line`).
+  - Migrated all production callers away from ad-hoc regex and string matching: `core/transition_executor.py`, `core/control_commands.py`, `control/surface.py`, `control/reconcile.py`, `monitor/project.py`, `core/staged_roadmap.py`, `core/progress.py`, `core/activation_supervisor.py`, and `core/project_status.py`.
+  - Enforced migration via static scan regression test `test_static_scan_no_unparsed_status_checks_in_production` (0 unparsed status checks in production code).
+- Durable ExecutionContext Continuity & State Machine (`src/dev_orchestrator/core/execution_context.py`):
+  - Created `ExecutionContext` envelope with `schema_version: 1` stored at `runtime/execution-context.json` and protected against concurrency issues by `InterProcessFileLock` under `runtime/execution-context.lock`.
+  - Implemented `get_context`, `update_context`, `load_execution_contexts`, `resolve_next_action`, `classify_continuation`, `context_is_stale`.
+  - Git-anchor invalidation and re-anchoring: when repository HEAD advances or task ID diverged, detects staleness (`context_is_stale`), emits `EXECUTION_CONTEXT_STALE` milestone, re-anchors to current HEAD, sets `next_action="plan"`, and redispatches a replacement Planner.
+  - Idle tick & continuation faulting: allows at most one idle tick before emitting `CONTINUATION_FAULT` milestone and idempotently redispatching with a deterministic command ID (`cmd-rec-<project>-<task>-<epoch>-<action>-<count>`).
+  - Transient infrastructure backoff: sets `backoff_until` without burning recovery action count, reports `transient_backoff_waiting`, and resumes automatically upon expiry.
+- Additive Activity Telemetry (`src/dev_orchestrator/core/activity_telemetry.py`):
+  - Added 9-field machine-readable activity telemetry (`stage`, `active_role`, `worker_state`, `code_execution`, `orchestrator_activity`, `next_action`, `intent_state`, `disposition`, `task_state_source`).
+  - Integrated into `core/project_status.py` and `control/surface.py`.
+- Actionable Artifact Validation Errors (`src/dev_orchestrator/ai/structured_output.py`, `src/dev_orchestrator/core/ai_planner.py`):
+  - Added structured attributes to `StructuredOutputError` and `PlannerProtocolError`: `field`, `expected`, `actual`, `correction`, `actionable_message`.
+  - Tested on schema violations (e.g. 25 steps exceeding the 24-step limit), providing explicit actionable feedback on how to consolidate/prune.
+- Terminal Action Closure:
+  - When a task reaches terminal `completed` / `DONE`, `continue`, `retry`, `rereview`, and `reconcile` are disabled, and active intent terminates as `satisfied` with reason `"current task is terminal"`.
+- Registered Progress Milestones:
+  - `CONTINUATION_DISPATCHED`, `CONTINUATION_FAULT`, `CONTINUATION_HOLD`, `EXECUTION_CONTEXT_STALE`.
+- Verification & Test Coverage:
+  - Golden-Path test harness: `tests_py/golden_path_harness.py`.
+  - Focused task status suite: 9/9 passed (`tests_py/test_p168_task_status.py`).
+  - Focused golden path suite: 4/4 passed (`tests_py/test_p168_golden_path.py`).
+  - Deterministic fault injection suite: 5/5 passed (`tests_py/test_p168_fault_injection.py`).
+  - Full repository regression: 1111 passed, 92 subtests passed (0 failures) in 408.37s.
+  - Python compilation (`python -m compileall src tests_py`): passed cleanly.
+  - Whitespace and format check (`git diff --check`): passed cleanly.
+  - Knowledge graph updated via `graphify update .`: 5603 nodes, 15645 edges, 246 communities.

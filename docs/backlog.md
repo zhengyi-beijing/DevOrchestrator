@@ -223,6 +223,22 @@ Acceptance: the benchmark can reproducibly compare at least three AI resources a
 
 Sequence: P16 follows P15. It is a benchmark/test-project phase rather than a production DevO feature phase.
 
+## P16.8 - DevO Golden-Path Lifecycle Hardening
+
+Status: **DELIVERED 2026-09-24 / COMPLETE**
+
+Reference: [P16_8_GOLDEN_PATH_LIFECYCLE_CONTRACT.md](file:///C:/work/github/DevOrchestrator-dev/docs/P16_8_GOLDEN_PATH_LIFECYCLE_CONTRACT.md)
+
+Delivered:
+- Golden-Path autonomous progression from `PENDING_DESIGN` to `DONE` under a single owner `continue` command without intermediate manual repair or repeated continue invocations.
+- Three precedence rules for authoritative task state in `resolve_task_state` (valid structured readiness is authoritative, absent falls back to Markdown, invalid/stale/mismatched fails closed; Markdown disagreement is diagnostic-only).
+- Canonical task status parsing, predicates, and editing centralized in `core/task_status.py`, eliminating raw substring/regex status checks across production modules (enforced via static scan).
+- Durable `ExecutionContext` schema version 1 in `runtime/execution-context.json` protected by `InterProcessFileLock` under `execution-context.lock`, with git-anchor revalidation, stale detection (`EXECUTION_CONTEXT_STALE`), and idle continuation faulting (`CONTINUATION_FAULT`) with deterministic redispatch command IDs.
+- Structured actionable artifact error payloads on schema/item violations (`field`, `expected`, `actual`, `correction`, `actionable_message`).
+- Terminal `DONE` action closure (`continue`, `retry`, `rereview`, `reconcile` disabled).
+- 9-field additive activity telemetry exposed in `project_status.py` and `control/surface.py`.
+- Registered progress milestones: `CONTINUATION_DISPATCHED`, `CONTINUATION_FAULT`, `CONTINUATION_HOLD`, `EXECUTION_CONTEXT_STALE`.
+
 ## P16.10 - Automatic Failure Harvesting & Regression Promotion
 
 Status: **STAGED AFTER P16.9**
@@ -238,3 +254,19 @@ Goal: convert unattended-execution anomalies and control-only owner intervention
 - Never auto-merge production fixes, weaken owner/safety/Git gates, or run real hardware as part of candidate regression generation.
 
 Sequence: P16.7 self-healing activation -> P16.8 golden-path liveness -> P16.9 execution-loss watchdog -> P16.10 automatic failure harvesting.\n
+## P16.11 - AGY-First AI Resource Pool Benchmark & Routing
+
+Status: **STAGED AFTER P16.10**
+
+Goal: treat the three near-zero marginal-cost AGY accounts as a quota/time-window constrained compute pool, measure their real DevO workload coverage, and derive evidence-based routing rather than optimizing primarily for API price.
+
+- Dynamically schedule the three AGY accounts by availability/quota/cooldown instead of permanently binding accounts to roles.
+- Replay representative DevO Planner/Worker/Debugger/evidence tasks and require independent review for acceptance measurements.
+- Measure AGY coverage, first-pass acceptance, paid-model escalation, repeated-failure rate, wall time, retries and quota state.
+- Do not blindly rotate AGY accounts on the same failure signature; change strategy/context or escalate to a heterogeneous provider.
+- Preserve independent final/high-risk review and all existing owner, safety, Git and lifecycle gates.
+- Compare AGY-first routing with matched Codex/Sol, Claude, Web Sol and other available-resource baselines.
+
+Acceptance: produce reproducible AGY-pool benchmark evidence and a machine-readable routing recommendation that states which DevO roles/task classes support AGY-first execution and when heterogeneous escalation is required.
+
+Sequence: P16.7 -> P16.8 -> P16.9 -> P16.10 -> P16.11.

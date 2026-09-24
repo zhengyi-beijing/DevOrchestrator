@@ -23,7 +23,9 @@ from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.project_status import project_runtime_status
 from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lifecycle
+from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
+
 
 CONTROL_DIR = "control"
 CONTROL_VERSION = 1
@@ -201,26 +203,25 @@ class ControlCommandCoordinator:
             telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
             is_staged = staged_successor is not None
             if not is_staged:
-                if _nonblank(telemetry.get("task_id")) != next_task_id or "PENDING DESIGN" not in str(snapshot.get("next_status") or "").upper():
+                if _nonblank(telemetry.get("task_id")) != next_task_id or not parse_task_status(snapshot.get("next_status")).is_pending_design():
                     continue
             else:
-                status = str(snapshot.get("next_status") or "")
+                status_obj = parse_task_status(snapshot.get("next_status"))
                 current_task = _nonblank(telemetry.get("task_id"))
                 successor_already_current = (
                     current_task == staged_successor
-                    and "PENDING DESIGN" in status.upper()
+                    and status_obj.is_pending_design()
                 )
                 if row.get("reviewed_ready") is True:
-                    status_ok = re.search(
-                        r"READY_TO_RUN|DESIGN READY|EXECUTABLE", status, re.IGNORECASE
-                    ) is not None
+                    status_ok = status_obj.is_ready_to_run()
                 else:
-                    status_ok = re.search(r"\bCOMPLETED?\b", status, re.IGNORECASE) is not None
+                    status_ok = status_obj.is_completed()
                 if staged_successor != next_task_id or (
                     not successor_already_current
                     and (current_task != _nonblank(row.get("task_id")) or not status_ok)
                 ):
                     continue
+
             continuation_id = _continuation_id(source_id)
             history_path = self.history / (continuation_id + ".json")
             existing = read_json(history_path, None)
@@ -289,7 +290,7 @@ class ControlCommandCoordinator:
                 git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
                 approved_idle = (
                     snapshot.get("state") == "IDLE"
-                    and "READY_TO_RUN" in str(snapshot.get("next_status") or "").upper()
+                    and parse_task_status(snapshot.get("next_status")).is_ready_to_run()
                     and _nonblank(telemetry.get("task_id")) == _nonblank(plan.get("task_id"))
                     and _nonblank(git.get("head")) == _nonblank(plan.get("ready_head"))
                     and _nonblank(plan.get("ready_head")) is not None
@@ -445,6 +446,16 @@ class ControlCommandCoordinator:
             return self._approve_owner_gate(
                 record, projects[project_id], snapshot, project_id, command_id, gate_id, now
             )
+        if action in {"continue", "start", "retry", "rereview", "reconcile"}:
+            parsed_status = parse_task_status(snapshot.get("next_status"))
+            lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "").upper()
+            snap_state = str(snapshot.get("state") or "").upper()
+            if parsed_status.is_completed() and (lifecycle in {"IDLE", "COMPLETED", "TERMINAL"} or snap_state in {"IDLE", "COMPLETED", "TERMINAL"}):
+                return self._blocked(
+                    command_id, project_id, action,
+                    "current task is terminal; stale review/continue is audit history only",
+                    now, record,
+                )
         if action == "reconcile":
             target_id = _nonblank(target.get("target_id"))
             if self.reviewer is None:
@@ -588,8 +599,7 @@ class ControlCommandCoordinator:
                     "task_id": current_task_id,
                 }
 
-        next_status = str(snapshot.get("next_status") or "").upper()
-        if "PENDING DESIGN" in next_status:
+        if parse_task_status(snapshot.get("next_status")).is_pending_design():
             lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "")
             if self.planner is None:
                 return self._blocked(command_id, project_id, action, "planner coordinator unavailable", now, record)

@@ -7,6 +7,7 @@ from typing import Any
 
 from dev_orchestrator.core.repository import is_git_ancestor, read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_successor
+from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.core.transition_executor import is_pre_provider_worktree_unsafe_failure
 from dev_orchestrator.storage.json_store import read_json
 
@@ -110,6 +111,11 @@ def resolve_reconcile_candidate(
     task_id = _text(telemetry.get("task_id"))
     if project_id is None or task_id is None:
         return None, "current project/task identity is incomplete"
+    if parse_task_status(snapshot.get("next_status")).is_completed() and (
+        str(snapshot.get("state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL"}
+        or str(snapshot.get("lifecycle_state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL"}
+    ):
+        return None, "current task is terminal; stale review is audit history only"
     if not _reviewer_ready(project_config):
         return None, "technical reviewer is not configured for reconcile"
     if project_config.get("project_id") != project_id:
@@ -258,7 +264,7 @@ def _rereview_task_matches_current_or_pending_successor(
     lifecycle = str(snapshot.get("lifecycle_state") or snapshot.get("state") or "")
     if snapshot.get("state") != "IDLE" or lifecycle != "IDLE":
         return False
-    if "PENDING DESIGN" not in str(snapshot.get("next_status") or "").upper():
+    if not parse_task_status(snapshot.get("next_status")).is_pending_design():
         return False
     roadmap = read_successor(repo_path, reviewed_task_id)
     return (
@@ -295,7 +301,10 @@ def resolve_rereview_candidate(
     # A terminal task has no pending implementation whose technical verdict can
     # affect lifecycle progression.  Historical stale review lineages remain in
     # the immutable audit stores, but must not surface as actionable controls.
-    if str(snapshot.get("state") or "").upper() == "IDLE" and "DONE" in str(snapshot.get("next_status") or "").upper():
+    if parse_task_status(snapshot.get("next_status")).is_completed() and (
+        str(snapshot.get("state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL"}
+        or str(snapshot.get("lifecycle_state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL"}
+    ):
         return None, "current task is terminal; stale review is audit history only"
     repo_path = _text(project_config.get("repo_path")) or _text(snapshot.get("repo_path"))
     truth = read_repository_truth(repo_path or "")
@@ -423,6 +432,11 @@ def resolve_retry_candidate(
     task_id = _text(telemetry.get("task_id"))
     if project_id is None or task_id is None:
         return None, "current project/task identity is incomplete"
+    if parse_task_status(snapshot.get("next_status")).is_completed() and (
+        str(snapshot.get("state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL"}
+        or str(snapshot.get("lifecycle_state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL"}
+    ):
+        return None, "current task is terminal; stale review is audit history only"
     if not _reviewer_ready(project_config):
         return None, "technical reviewer is not configured for retry"
     if project_config.get("project_id") != project_id:

@@ -144,8 +144,14 @@ def read_successor(repo_path: str | Path, completed_task_id: str) -> RoadmapResu
             reason=f"successor spec title task id mismatch: expected {successor}, got {extracted_id}",
         )
 
-    if "Status: **PENDING DESIGN**" not in spec_text:
-        return RoadmapResult(kind="invalid", reason="successor spec missing Status: **PENDING DESIGN**")
+    try:
+        from dev_orchestrator.core.task_status import require_single_status_line, parse_task_status
+        _, raw_status = require_single_status_line(spec_text)
+        status = parse_task_status(raw_status)
+        if not status.is_pending_design():
+            return RoadmapResult(kind="invalid", reason="successor spec missing Status: **PENDING DESIGN** (status is not pending_design)")
+    except Exception as exc:
+        return RoadmapResult(kind="invalid", reason=f"successor spec missing Status: **PENDING DESIGN**: {exc}")
 
     if "## Approved executable design" in spec_text:
         return RoadmapResult(kind="invalid", reason="successor spec already contains approved design marker")

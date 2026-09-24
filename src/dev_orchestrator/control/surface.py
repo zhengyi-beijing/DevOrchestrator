@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from dev_orchestrator.core.project_status import project_runtime_status
+from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.storage.json_store import read_json
 
 from .command_store import EXPECTED_IDENTITY_FIELDS
@@ -151,6 +152,7 @@ def project_control_view(
         or (active.get("engine") == "aibroker" and bool(active.get("broker_request_id")))
     )
     next_status = str(projected.get("next_status") or "")
+    parsed_next_status = parse_task_status(projected.get("next_status"))
     paused = bool(owner.get("paused"))
     execution_ready = False
     planning_ready = False
@@ -160,7 +162,7 @@ def project_control_view(
         roles = project_config.get("ai_roles")
         planner_config = roles.get("planner") if isinstance(roles, dict) else None
         planning_ready = isinstance(planner_config, dict) and planner_config.get("enabled") is True
-    planning_start_ready = lifecycle in {"IDLE", "PLAN_FAILED"} and "PENDING DESIGN" in next_status.upper() and planning_ready
+    planning_start_ready = lifecycle in {"IDLE", "PLAN_FAILED"} and parsed_next_status.is_pending_design() and planning_ready
     recoverable_plan_gate = (
         isinstance(gate, dict)
         and gate.get("gate_source") == "planner"
@@ -168,18 +170,27 @@ def project_control_view(
         and gate.get("review_decision") == "reject"
     )
     recovery_continue_ready = (
-        "PENDING DESIGN" in next_status.upper()
+        parsed_next_status.is_pending_design()
         and planning_ready
         and recoverable_plan_gate
         and not bool(identity.get("dirty"))
     )
-    eligible_continue = not paused and (
+    task_terminal = parsed_next_status.is_completed() and (
+        lifecycle in {"IDLE", "COMPLETED", "TERMINAL"}
+        or str(projected.get("state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL"}
+    )
+    eligible_continue = not paused and not task_terminal and (
         (gate is None and ((lifecycle == "READY_TO_RUN" and execution_ready) or planning_start_ready))
         or recovery_continue_ready
     )
     retry_target, retry_reason = resolve_retry_candidate(projected, runtime, project_config)
-    safe_retry = retry_target is not None
+    safe_retry = retry_target is not None and not task_terminal
     rereview_target, rereview_reason = resolve_rereview_candidate(projected, runtime, project_config)
+    if task_terminal:
+        retry_target = None
+        retry_reason = "current task is terminal; stale review/continue is audit history only"
+        rereview_target = None
+        rereview_reason = "current task is terminal; stale review/continue is audit history only"
     bound = isinstance(binding, dict) and binding.get("state") == "bound"
     claim_guard_known = not bound or bridge_store is not None
     active_claim = False
@@ -230,6 +241,9 @@ def project_control_view(
     else:
         approve_reason = "exact pending planner gate can be approved"
     reconcile_target, reconcile_reason = resolve_reconcile_candidate(projected, runtime, project_config)
+    if task_terminal:
+        reconcile_target = None
+        reconcile_reason = "current task is terminal; stale review/continue is audit history only"
     if unsupported_stop_role_active:
         stop_reason = "active AI role does not support managed interruption; use pause"
     elif active and stoppable_active:
@@ -243,9 +257,13 @@ def project_control_view(
             "action": "continue",
             "available": eligible_continue,
             "reason": (
-                "recover bounded technical plan review"
-                if recovery_continue_ready and eligible_continue
-                else ("current state can continue" if eligible_continue else "project is paused or not continuable")
+                "current task is terminal; stale review/continue is audit history only"
+                if task_terminal
+                else (
+                    "recover bounded technical plan review"
+                    if recovery_continue_ready and eligible_continue
+                    else ("current state can continue" if eligible_continue else "project is paused or not continuable")
+                )
             ),
         },
         {"action": "pause", "available": not paused, "reason": "prevent future launches" if not paused else "project is already paused"},
@@ -279,6 +297,8 @@ def project_control_view(
         snapshot=projected,
         runtime_root=runtime,
     )
+    from dev_orchestrator.core.activity_telemetry import resolve_activity_telemetry
+    activity_data = resolve_activity_telemetry(projected, runtime, project_id=project_id)
     result = copy.deepcopy(projected)
     result.update({
         "control_identity": identity,
@@ -292,5 +312,6 @@ def project_control_view(
         "active_execution": active,
         "active_roles": active_roles,
         "gate": gate,
+        "activity": activity_data,
     })
     return result

@@ -18,13 +18,20 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dev_orchestrator.core.repository import read_repository_truth
+from dev_orchestrator.core.task_status import (
+    EXECUTION_STATE_VOCABULARY,
+    LEGACY_COMPONENT_MAP,
+    TaskStatus,
+    TaskStatusError,
+    find_status_lines,
+    parse_task_status,
+    render_status_line,
+    require_single_status_line,
+)
 from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 READINESS_SCHEMA_VERSION = 1
-EXECUTION_STATE_VOCABULARY = frozenset(
-    {"pending_design", "ready_to_run", "executing", "completed", "blocked"}
-)
 READINESS_VOCABULARY = EXECUTION_STATE_VOCABULARY
 _REQUIRED_STRUCTURED_KEYS = frozenset(
     {"schema_version", "execution_state", "task_id", "updated_at"}
@@ -33,30 +40,6 @@ _REQUIRED_STRUCTURED_KEYS = frozenset(
 _NEXT_TITLE_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 _NEXT_STATUS_RE = re.compile(r"^Status:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
 
-LEGACY_COMPONENT_MAP: dict[str, str] = {
-    "READY": "design_ready",
-    "READY_TO_RUN": "design_ready",
-    "READY TO RUN": "design_ready",
-    "READY-TO-RUN": "design_ready",
-    "DESIGN READY": "design_ready",
-    "EXECUTABLE": "design_ready",
-    "PENDING DESIGN": "pending_design",
-    "BLOCKED": "blocked",
-    "COMPLETE": "completed",
-    "COMPLETED": "completed",
-    "ACCEPTED": "completed",
-    "DONE": "completed",
-    "OWNER_GOAL_DEFINED": "owner_goal_defined",
-    "OWNER GOAL DEFINED": "owner_goal_defined",
-    "OWNER_APPROVED": "owner_goal_defined",
-    "OWNER APPROVED": "owner_goal_defined",
-    "NOT_STARTED": "not_started",
-    "NOT STARTED": "not_started",
-    "IN_PROGRESS": "executing",
-    "IN PROGRESS": "executing",
-    "RUNNING": "executing",
-}
-
 _DIRECT_LIVE_REGEX = re.compile(
     r"READY[_ -]?TO[_ -]?RUN|DESIGN READY|EXECUTABLE", re.IGNORECASE
 )
@@ -64,55 +47,223 @@ _DIRECT_LIVE_REGEX = re.compile(
 
 def parse_legacy_status_components(raw_token: str) -> tuple[list[str], str, Optional[str]]:
     """Parse legacy status components and derive migration candidate."""
-    cleaned = raw_token.replace("*", "").replace("`", "").strip()
-    if cleaned.lower().startswith("status:"):
-        cleaned = cleaned[7:].strip()
-    parts = [p.strip().upper() for p in cleaned.split("/") if p.strip()]
-    if not parts:
-        return [], "EMPTY", None
+    parsed = parse_task_status(raw_token)
+    return list(parsed.components), parsed.code, parsed.canonical if parsed.valid else None
 
-    mapped_components: list[str] = []
-    for part in parts:
-        mapped = LEGACY_COMPONENT_MAP.get(part)
-        if mapped is None:
-            return mapped_components, f"UNKNOWN: {part}", None
-        mapped_components.append(mapped)
 
-    comp_set = set(mapped_components)
-    conflicting_pairs = [
-        ({"blocked", "design_ready"}),
-        ({"completed", "design_ready"}),
-        ({"pending_design", "design_ready"}),
-        ({"executing", "design_ready"}),
-        ({"executing", "completed"}),
-        ({"executing", "blocked"}),
-        ({"completed", "blocked"}),
-        ({"not_started", "executing"}),
-        ({"not_started", "completed"}),
-    ]
-    for conf in conflicting_pairs:
-        if conf.issubset(comp_set):
-            return mapped_components, "CONFLICT", None
+@dataclass(frozen=True)
+class TaskStateResolution:
+    """Canonical task state resolution across structured authority and Markdown."""
 
-    candidate: Optional[str] = None
-    if "design_ready" in comp_set and "not_started" in comp_set:
-        candidate = "ready_to_run"
-    elif "design_ready" in comp_set and not (
-        comp_set & {"pending_design", "blocked", "completed", "executing"}
-    ):
-        candidate = "ready_to_run"
-    elif "pending_design" in comp_set and not (
-        comp_set & {"design_ready", "blocked", "completed", "executing"}
-    ):
-        candidate = "pending_design"
-    elif "completed" in comp_set:
-        candidate = "completed"
-    elif "blocked" in comp_set:
-        candidate = "blocked"
-    elif "executing" in comp_set:
-        candidate = "executing"
+    state: str
+    source: str
+    valid: bool
+    stale: bool
+    code: str
+    reason: str
+    markdown: Optional[TaskStatus] = None
+    consistency: str = "consistent"
+    authority: str = "structured"
+    task_id: Optional[str] = None
 
-    return mapped_components, "OK", candidate
+    def is_pending_design(self) -> bool:
+        return self.valid and self.state == "pending_design"
+
+    def is_ready_to_run(self) -> bool:
+        return self.valid and self.state == "ready_to_run"
+
+    def is_executing(self) -> bool:
+        return self.valid and self.state == "executing"
+
+    def is_completed(self) -> bool:
+        return self.valid and self.state == "completed"
+
+    def is_blocked(self) -> bool:
+        return (not self.valid) or self.state in {"blocked", "invalid"}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state,
+            "source": self.source,
+            "valid": self.valid,
+            "stale": self.stale,
+            "code": self.code,
+            "reason": self.reason,
+            "markdown": self.markdown.to_dict() if self.markdown else None,
+            "consistency": self.consistency,
+            "authority": self.authority,
+            "task_id": self.task_id,
+        }
+
+
+def resolve_task_state(
+    project: Optional[dict[str, Any]] = None,
+    snapshot: Optional[dict[str, Any]] = None,
+    repo_path: Optional[Path | str] = None,
+    *,
+    runtime_root: Optional[Path | str] = None,
+    current_task_id: Optional[str] = None,
+) -> TaskStateResolution:
+    """Resolve authoritative task state for repository gating.
+
+    Follows strictly three precedence rules:
+    1. Valid task-bound structured readiness always supplies state.
+    2. Absent structured readiness falls back to parsed Markdown.
+    3. Invalid, stale, or task-mismatched structured readiness fails closed and cannot be bypassed.
+    Valid structured/Markdown disagreement is diagnostic-only and never blocks launch.
+    """
+    resolved_repo: Optional[Path] = None
+    if repo_path:
+        resolved_repo = Path(repo_path)
+    elif project:
+        p_path = project.get("repo_path") or project.get("root")
+        if p_path:
+            resolved_repo = Path(p_path)
+    if resolved_repo is None and snapshot:
+        s_path = snapshot.get("repo_path")
+        if s_path:
+            resolved_repo = Path(s_path)
+
+    if resolved_repo is None or not resolved_repo.is_dir():
+        return TaskStateResolution(
+            state="invalid",
+            source="unknown",
+            valid=False,
+            stale=False,
+            code="REPO_PATH_MISSING",
+            reason=f"repository directory is unavailable: {resolved_repo}",
+            markdown=None,
+            consistency="error",
+            authority="none",
+            task_id=current_task_id,
+        )
+
+    eff_task_id = current_task_id
+    if not eff_task_id and snapshot:
+        telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+        eff_task_id = str(telemetry.get("task_id") or "").strip() or None
+        if not eff_task_id:
+            from dev_orchestrator.monitor.telemetry import extract_task_id
+            next_title = str(snapshot.get("next_title") or "")
+            eff_task_id = extract_task_id(next_title)
+    if not eff_task_id:
+        from dev_orchestrator.monitor.telemetry import extract_task_id
+        next_file = resolved_repo / "agent" / "next.md"
+        if next_file.is_file():
+            try:
+                eff_task_id = extract_task_id(next_file.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+
+    # Read Markdown status for diagnostic/fallback
+    md_status: Optional[TaskStatus] = None
+    next_file = resolved_repo / "agent" / "next.md"
+    next_text = ""
+    if next_file.is_file():
+        try:
+            next_text = next_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            next_text = ""
+
+    status_matches = find_status_lines(next_text) if next_text else []
+    if len(status_matches) == 1:
+        md_status = parse_task_status(status_matches[0][1])
+    elif len(status_matches) > 1:
+        md_status = TaskStatus(
+            raw=status_matches[0][1],
+            canonical=None,
+            components=(),
+            annotation=None,
+            code="MULTIPLE_STATUS_LINES",
+            valid=False,
+        )
+    else:
+        raw_s = snapshot.get("next_status") if snapshot else None
+        if raw_s:
+            md_status = parse_task_status(raw_s)
+        else:
+            md_status = TaskStatus(
+                raw="",
+                canonical=None,
+                components=(),
+                annotation=None,
+                code="EMPTY",
+                valid=False,
+            )
+
+    exec_state_file = resolved_repo / "agent" / "execution-state.json"
+    if exec_state_file.is_file():
+        readiness_res = resolve_readiness(
+            resolved_repo,
+            current_task_id=eff_task_id,
+            next_status=md_status.raw if md_status else None,
+        )
+        if not readiness_res.valid or readiness_res.stale or readiness_res.state == "invalid":
+            return TaskStateResolution(
+                state="invalid",
+                source="structured",
+                valid=False,
+                stale=readiness_res.stale,
+                code=readiness_res.code,
+                reason=readiness_res.reason,
+                markdown=md_status,
+                consistency="error",
+                authority="structured",
+                task_id=readiness_res.task_id or eff_task_id,
+            )
+
+        consistency = "consistent"
+        if md_status and md_status.valid:
+            if md_status.canonical != readiness_res.state:
+                consistency = "mismatch"
+        elif md_status:
+            consistency = f"markdown_{md_status.code.lower()}"
+        else:
+            consistency = "markdown_absent"
+
+        return TaskStateResolution(
+            state=readiness_res.state,
+            source="structured",
+            valid=True,
+            stale=False,
+            code="OK",
+            reason=readiness_res.reason,
+            markdown=md_status,
+            consistency=consistency,
+            authority="structured",
+            task_id=readiness_res.task_id or eff_task_id,
+        )
+
+    # Rule 2: Structured absent -> fallback to Markdown
+    if md_status is not None and md_status.valid and md_status.canonical is not None:
+        return TaskStateResolution(
+            state=md_status.canonical,
+            source="markdown_fallback",
+            valid=True,
+            stale=False,
+            code="OK",
+            reason=f"fallback to markdown status {md_status.raw!r}",
+            markdown=md_status,
+            consistency="structured_absent",
+            authority="markdown",
+            task_id=eff_task_id,
+        )
+
+    code = f"READINESS_TOKEN_{md_status.code}" if md_status and md_status.code != "OK" else "READINESS_NOT_FOUND"
+    reason = f"markdown status unresolvable: {md_status.code if md_status else 'absent'}"
+    return TaskStateResolution(
+        state="invalid",
+        source="markdown",
+        valid=False,
+        stale=False,
+        code=code,
+        reason=reason,
+        markdown=md_status,
+        consistency="structured_absent",
+        authority="markdown",
+        task_id=eff_task_id,
+    )
+
 
 
 @dataclass(frozen=True)
@@ -173,6 +324,24 @@ def write_structured_readiness(
     }
     write_json(target_file, data, indent=2)
     return target_file
+
+
+def write_task_execution_state(
+    repo_path: Path | str,
+    state: str,
+    task_id: str,
+    *,
+    head: Optional[str] = None,
+    source: Optional[str] = None,
+    updated_at: Optional[str] = None,
+) -> Path:
+    """Convenience helper to write schema_version 1 agent/execution-state.json."""
+    return write_structured_readiness(
+        repo_path,
+        execution_state=state,
+        task_id=task_id,
+        updated_at=updated_at,
+    )
 
 
 def _resolve_legacy_markdown(
