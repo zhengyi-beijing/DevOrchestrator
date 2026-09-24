@@ -451,6 +451,29 @@ def explain_block(
                 )
             )
 
+    # 8. Execution Loss Unresolved check
+    if project_id and action in {"continue", "start"}:
+        wd_file = runtime / "watchdog.json"
+        wd_data = read_json(wd_file, {})
+        if isinstance(wd_data, dict):
+            prow = (wd_data.get("projects") or {}).get(project_id)
+            if isinstance(prow, dict):
+                loss = prow.get("execution_loss")
+                unresolved = loss.get("unresolved_invariants") if isinstance(loss, dict) else []
+                if unresolved:
+                    blockers.append(
+                        Blocker(
+                            code="EXECUTION_LOSS_UNRESOLVED",
+                            predicate="no_unresolved_execution_loss",
+                            expected=None,
+                            observed=unresolved,
+                            evidence_source=str(wd_file),
+                            remediation="reconcile or recover unresolved vanished execution before launching new work",
+                            failure_class="execution_loss",
+                            owner_gate_required=False,
+                        )
+                    )
+
     # Sort blockers: most-blocking first
     _SEVERITY_ORDER = {
         "OWNER_GATE_PRESENT": 0,
@@ -470,9 +493,10 @@ def explain_block(
         "DIRTY_WORKTREE": 11,
         "EXECUTION_POLICY_DISABLED": 12,
         "READINESS_NOT_READY_TO_RUN": 13,
-        "ACTIVE_EXECUTION_PRESENT": 14,
-        "RECOVERY_LIVELOCK_DETECTED": 15,
-        "RECOVERY_BUDGET_EXHAUSTED": 16,
+        "EXECUTION_LOSS_UNRESOLVED": 14,
+        "ACTIVE_EXECUTION_PRESENT": 15,
+        "RECOVERY_LIVELOCK_DETECTED": 16,
+        "RECOVERY_BUDGET_EXHAUSTED": 17,
     }
     blockers.sort(key=lambda b: _SEVERITY_ORDER.get(b.code, 99))
     return blockers

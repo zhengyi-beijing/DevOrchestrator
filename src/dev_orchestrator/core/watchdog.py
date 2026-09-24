@@ -76,6 +76,10 @@ WATCHDOG_MILESTONES = frozenset({
     "DIAGNOSTIC_STARTED",
     "DIAGNOSTIC_RESULT",
     "RECOVERY_STARTED",
+    "EXECUTION_LOSS_DETECTED",
+    "EXECUTION_LOSS_RECOVERY_STARTED",
+    "EXECUTION_LOSS_ESCALATED",
+    "EXECUTION_LOSS_RESOLVED",
 })
 
 WATCHDOG_OWNED_REPO_PATHS = (
@@ -264,6 +268,14 @@ def resolve_watchdog_policy(project: dict[str, Any]) -> dict[str, Any]:
             "max_attempts_per_run": 3,
             "diagnostic_timeout_seconds": 120,
             "auto_recovery": False,
+            "execution_loss_detection": True,
+            "provider_output_grace_seconds": 60,
+            "execution_loss_confirmations": 2,
+            "execution_loss_max_recoveries": 3,
+            "execution_loss_backoff_seconds": 30,
+            "execution_loss_unknown_escalation_minutes": 15,
+            "execution_acceptance_grace_seconds": 45,
+            "live_proof_freshness_seconds": 30,
         }
     return {
         "enabled": cfg.get("enabled", True) if isinstance(cfg.get("enabled"), bool) else True,
@@ -273,6 +285,14 @@ def resolve_watchdog_policy(project: dict[str, Any]) -> dict[str, Any]:
         "max_attempts_per_run": cfg.get("max_attempts_per_run", 3),
         "diagnostic_timeout_seconds": cfg.get("diagnostic_timeout_seconds", 120),
         "auto_recovery": cfg.get("auto_recovery", False) if isinstance(cfg.get("auto_recovery"), bool) else False,
+        "execution_loss_detection": cfg.get("execution_loss_detection", True) if isinstance(cfg.get("execution_loss_detection"), bool) else True,
+        "provider_output_grace_seconds": int(cfg.get("provider_output_grace_seconds", 60)),
+        "execution_loss_confirmations": int(cfg.get("execution_loss_confirmations", 2)),
+        "execution_loss_max_recoveries": int(cfg.get("execution_loss_max_recoveries", 3)),
+        "execution_loss_backoff_seconds": int(cfg.get("execution_loss_backoff_seconds", 30)),
+        "execution_loss_unknown_escalation_minutes": int(cfg.get("execution_loss_unknown_escalation_minutes", 15)),
+        "execution_acceptance_grace_seconds": int(cfg.get("execution_acceptance_grace_seconds", 45)),
+        "live_proof_freshness_seconds": int(cfg.get("live_proof_freshness_seconds", 30)),
     }
 
 
@@ -1341,6 +1361,49 @@ class WatchdogCoordinator:
                             details={"source": "watchdog", "gate": "recovery-unresolved", "command_id": cid},
                         )
 
+            # Reconcile execution loss recovery slots
+            loss_slots = prow.get("execution_loss_slots") or {}
+            for inv_key, slot in loss_slots.items():
+                if not isinstance(slot, dict):
+                    continue
+                s_state = slot.get("state")
+                s_phase = slot.get("phase")
+                if s_state in ("completed", "blocked", "unresolved") or s_phase in ("completed", "blocked", "unresolved"):
+                    continue
+                cid = slot.get("command_id")
+                if not cid:
+                    continue
+                hist_file = history_dir / f"{cid}.json"
+                inbox_file = inbox_dir / f"{cid}.json"
+                if hist_file.is_file():
+                    hdata = read_json(hist_file, {})
+                    outcome = hdata.get("state") if isinstance(hdata, dict) else "unknown"
+                    if outcome == "accepted":
+                        slot["state"] = "completed"
+                        slot["phase"] = "completed"
+                    elif outcome in ("blocked", "owner_gate"):
+                        slot["state"] = "blocked"
+                        slot["phase"] = "blocked"
+                    else:
+                        slot["state"] = "unknown"
+                        slot["phase"] = "unknown"
+                    slot["resolved_at"] = utc_now_iso()
+                    slot["reason"] = f"reconciled from history: {outcome}"
+                elif inbox_file.is_file():
+                    slot["state"] = "requested"
+                    slot["phase"] = "requested"
+                    if not slot.get("requested_at"):
+                        slot["requested_at"] = utc_now_iso()
+                else:
+                    if s_phase == "reconciled_pending_retry":
+                        # Resumes phase with same command ID across daemon restarts / deferred ticks
+                        continue
+                    if s_state == "reserved" and s_phase == "reserved":
+                        slot["state"] = "unresolved"
+                        slot["phase"] = "unresolved"
+                        slot["resolved_at"] = utc_now_iso()
+                        slot["reason"] = "command was reserved but never enqueued before crash"
+
     @staticmethod
     def _reset_epoch_state(project_row: dict[str, Any]) -> None:
         """Discard watchdog-only state from a conclusively superseded epoch.
@@ -1522,10 +1585,46 @@ class WatchdogCoordinator:
                 })
                 prow["last_checked_at"] = now_iso
                 prow["cooldown_minutes"] = policy["cooldown_minutes"]
+                prow.setdefault("execution_loss", None)
+                prow.setdefault("execution_loss_slots", {})
 
                 if degraded or pid in quarantined or not policy["enabled"]:
                     results.append({"project_id": pid, "status": "skipped", "reason": "degraded_or_quarantined_or_disabled"})
                     continue
+
+                # Execution Loss Observation & Evaluation
+                loss_summary = None
+                if policy.get("execution_loss_detection", True):
+                    try:
+                        from dev_orchestrator.core.execution_lifecycle import observe_executions
+                        loss_summary = observe_executions(
+                            self.runtime_root,
+                            pid,
+                            snapshot,
+                            policy,
+                            executor=executor,
+                            now=tick_now,
+                            liveness_probe=self._liveness_probe,
+                            ai_execution_port=self.ai_execution_port,
+                        )
+                        prow["execution_loss"] = loss_summary
+                    except Exception as exc:
+                        prow["last_error"] = f"execution_loss_observation_failed: {exc}"
+                        loss_summary = None
+
+                # Trigger execution loss recovery for actionable findings
+                if loss_summary and loss_summary.get("actionable_findings"):
+                    for finding in loss_summary["actionable_findings"]:
+                        f_state = finding.get("state")
+                        if f_state in ("actionable_dead", "reconciled_pending_retry"):
+                            self._trigger_execution_loss_recovery(
+                                pcfg,
+                                snapshot,
+                                prow,
+                                finding,
+                                executor=executor,
+                                now=tick_now,
+                            )
 
                 signals = collect_progress_signals(snapshot, self.runtime_root)
                 _last_progress_at, _progress_fingerprint, signal_sources = signals
@@ -1535,7 +1634,8 @@ class WatchdogCoordinator:
                     results.append({"project_id": pid, "status": "evidence_unavailable", "reason": prow["activity_evidence_reason"]})
                     continue
 
-                prow["last_error"] = None
+                if prow.get("last_error") in (None, "activity-evidence-unavailable"):
+                    prow["last_error"] = None
 
                 assessment = evaluate_stall(
                     snapshot,
@@ -1558,11 +1658,18 @@ class WatchdogCoordinator:
                 if not assessment.breached:
                     # Not breached; clean stall state
                     prow.pop("stall", None)
+                    unresolved = (
+                        loss_summary.get("unresolved_invariants", [])
+                        if isinstance(loss_summary, dict)
+                        else []
+                    )
+                    status_name = "execution_loss_detected" if unresolved else "ok"
                     results.append({
                         "project_id": pid,
-                        "status": "ok",
+                        "status": status_name,
                         "breached": False,
                         "epoch_advanced": epoch_advanced,
+                        "unresolved_invariants": unresolved,
                     })
                     continue
 
@@ -2224,3 +2331,226 @@ class WatchdogCoordinator:
                 "evidence_hash": attempt_record.get("evidence_hash"),
             },
         )
+
+    def _trigger_execution_loss_recovery(
+        self,
+        project_config: dict[str, Any],
+        snapshot: dict[str, Any],
+        project_row: dict[str, Any],
+        finding: dict[str, Any],
+        *,
+        executor: Any = None,
+        now: Optional[datetime] = None,
+    ) -> None:
+        pid = str(snapshot.get("project_id") or snapshot.get("id") or "")
+        invariant_key = str(finding.get("invariant_key") or "")
+        if not pid or not invariant_key:
+            return
+
+        policy = resolve_watchdog_policy(project_config)
+        if not policy.get("auto_recovery", False):
+            return
+
+        if snapshot.get("paused") is True:
+            return
+
+        repo_path = str(project_config.get("repo_path") or snapshot.get("repo_path") or "")
+        truth = read_repository_truth(repo_path)
+        if not truth.valid or truth.dirty:
+            self._emit_milestone(
+                pid,
+                "OWNER_GATE",
+                task_id=finding.get("task_id"),
+                occurrence_key=f"{invariant_key}:dirty_or_invalid_repo",
+                details={
+                    "source": "watchdog",
+                    "gate": "recovery-blocked",
+                    "reason": "repository_dirty_or_invalid",
+                },
+            )
+            return
+
+        launch_anchor = finding.get("launch_anchor") or {}
+        expected_head = launch_anchor.get("head") or launch_anchor.get("git_head")
+        if expected_head and truth.head and truth.head != expected_head:
+            finding["state"] = "escalated"
+            self._emit_milestone(
+                pid,
+                "EXECUTION_LOSS_ESCALATED",
+                task_id=finding.get("task_id"),
+                occurrence_key=f"{invariant_key}:head-mismatch",
+                details={
+                    "source": "watchdog",
+                    "gate": "head_mismatch",
+                    "expected_head": expected_head,
+                    "observed_head": truth.head,
+                },
+            )
+            return
+
+        max_recoveries = int(policy.get("execution_loss_max_recoveries", 3))
+        backoff_seconds = float(policy.get("execution_loss_backoff_seconds", 30))
+        slots = project_row.setdefault("execution_loss_slots", {})
+        existing_slot = slots.get(invariant_key)
+
+        eval_now = now or datetime.now(timezone.utc)
+        now_iso = eval_now.isoformat()
+
+        recovery_count = int(finding.get("recovery_attempts", 0))
+        if recovery_count >= max_recoveries:
+            finding["state"] = "escalated"
+            self._emit_milestone(
+                pid,
+                "EXECUTION_LOSS_ESCALATED",
+                task_id=finding.get("task_id"),
+                occurrence_key=f"{invariant_key}:max_recoveries_exhausted",
+                details={
+                    "source": "watchdog",
+                    "gate": "max_recoveries_exhausted",
+                    "attempts": recovery_count,
+                },
+            )
+            return
+
+        if existing_slot and existing_slot.get("phase") != "reconciled_pending_retry":
+            last_req = parse_utc(existing_slot.get("requested_at") or existing_slot.get("reserved_at"))
+            if last_req is not None and (eval_now - last_req).total_seconds() < backoff_seconds:
+                return
+
+        from dev_orchestrator.core.execution_lifecycle import resolve_execution_liveness
+        liveness = resolve_execution_liveness(
+            self.runtime_root,
+            pid,
+            source_request_id=finding.get("source_request_id"),
+            execution_id=finding.get("execution_id"),
+            engine_handle=finding.get("engine_handle"),
+            worker_pid=finding.get("worker_pid"),
+            started_at=finding.get("started_at"),
+            task_id=finding.get("task_id"),
+            snapshot=snapshot,
+            executor=executor,
+            now=eval_now,
+            liveness_probe=self._liveness_probe,
+            ai_execution_port=self.ai_execution_port,
+        )
+        if liveness.get("verdict") != "dead":
+            if liveness.get("verdict") == "alive":
+                finding["state"] = "suppressed_live"
+            else:
+                finding["state"] = "unresolved_unknown"
+            return
+
+        if executor is None or not hasattr(executor, "reconcile_execution_loss"):
+            project_row["last_error"] = "execution_reconciliation_unavailable"
+            return
+
+        exec_state = executor.state() if hasattr(executor, "state") else {}
+        target_srid = finding.get("source_request_id")
+        for rec in (exec_state.get("executions") or {}).values():
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("project_id") or "") != pid:
+                continue
+            st = str(rec.get("state") or "").lower()
+            if st in {"launching", "running"}:
+                if str(rec.get("source_request_id") or "") != str(target_srid or ""):
+                    project_row["last_error"] = "duplicate_execution_present"
+                    return
+
+        cid = f"{WATCHDOG_COMMAND_PREFIX}xl-{invariant_key}"
+
+        # If already reconciled and pending retry: resume from step 3
+        if existing_slot and existing_slot.get("phase") == "reconciled_pending_retry":
+            refreshed_executor_state = executor.state() if hasattr(executor, "state") else {}
+            if _has_active_execution(snapshot, refreshed_executor_state):
+                return
+        else:
+            # 1. RESERVE
+            finding["recovery_attempts"] = recovery_count + 1
+            finding["state"] = "recovery_reserved"
+            slots[invariant_key] = {
+                "invariant_key": invariant_key,
+                "command_id": cid,
+                "lineage_key": finding.get("lineage_key"),
+                "source_request_id": target_srid,
+                "phase": "reserved",
+                "state": "reserved",
+                "reserved_at": now_iso,
+                "reconciled_at": None,
+                "requested_at": None,
+                "resolved_at": None,
+                "reason": f"execution loss recovery for {invariant_key}",
+            }
+            self._save_state(self._cached_state)
+
+            # 2. CALL executor.reconcile_execution_loss
+            reconcile_res = executor.reconcile_execution_loss(
+                target_srid,
+                project_id=pid,
+                invariant_key=invariant_key,
+                command_id=cid,
+                expected_anchor=launch_anchor,
+                evidence=liveness,
+            )
+            status = reconcile_res.get("status")
+            if status in ("reconciled", "already_reconciled"):
+                slots[invariant_key]["phase"] = "reconciled_pending_retry"
+                slots[invariant_key]["state"] = "reconciled_pending_retry"
+                slots[invariant_key]["reconciled_at"] = utc_now_iso()
+                finding["state"] = "reconciled_pending_retry"
+                self._save_state(self._cached_state)
+            elif status == "superseded_by_terminal":
+                slots[invariant_key]["state"] = "completed"
+                slots[invariant_key]["phase"] = "completed"
+                slots[invariant_key]["resolved_at"] = utc_now_iso()
+                finding["state"] = "resolved"
+                self._save_state(self._cached_state)
+                return
+            elif status == "conflict":
+                slots[invariant_key]["state"] = "blocked"
+                slots[invariant_key]["phase"] = "blocked"
+                finding["state"] = "unresolved_unknown"
+                self._save_state(self._cached_state)
+                return
+            else:
+                slots[invariant_key]["state"] = "blocked"
+                slots[invariant_key]["phase"] = "blocked"
+                self._save_state(self._cached_state)
+                return
+
+            # 3. Reload executor state and evaluate strict _has_active_execution
+            refreshed_executor_state = executor.state() if hasattr(executor, "state") else {}
+            if _has_active_execution(snapshot, refreshed_executor_state):
+                return
+
+        # 4. ENQUEUE
+        try:
+            from dev_orchestrator.control.surface import project_identity
+            from dev_orchestrator.core.control_commands import submit_control_command
+            submit_control_command(
+                self.runtime_root,
+                pid,
+                "continue",
+                command_id=cid,
+                expected=project_identity(snapshot, self.runtime_root),
+                target={},
+                source="watchdog",
+            )
+            slots[invariant_key]["phase"] = "requested"
+            slots[invariant_key]["state"] = "requested"
+            slots[invariant_key]["requested_at"] = utc_now_iso()
+            finding["state"] = "recovering"
+            self._save_state(self._cached_state)
+            self._emit_milestone(
+                pid,
+                "EXECUTION_LOSS_RECOVERY_STARTED",
+                task_id=finding.get("task_id"),
+                occurrence_key=f"{invariant_key}:recovery-start",
+                details={"source": "watchdog", "command_id": cid, "action": "continue", "invariant_key": invariant_key},
+            )
+        except Exception as exc:
+            slots[invariant_key]["state"] = "blocked"
+            slots[invariant_key]["phase"] = "blocked"
+            slots[invariant_key]["resolved_at"] = utc_now_iso()
+            slots[invariant_key]["reason"] = f"enqueue failed: {exc}"
+            self._save_state(self._cached_state)

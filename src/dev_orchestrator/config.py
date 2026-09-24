@@ -224,6 +224,14 @@ _ALLOWED_WATCHDOG_KEYS = frozenset({
     "max_attempts_per_run",
     "diagnostic_timeout_seconds",
     "auto_recovery",
+    "execution_loss_detection",
+    "provider_output_grace_seconds",
+    "execution_loss_confirmations",
+    "execution_loss_max_recoveries",
+    "execution_loss_backoff_seconds",
+    "execution_loss_unknown_escalation_minutes",
+    "execution_acceptance_grace_seconds",
+    "live_proof_freshness_seconds",
 })
 
 _ALLOWED_WATCHDOG_LIFECYCLES = frozenset({
@@ -324,6 +332,112 @@ def _normalize_project_watchdog(raw: Any, index: int, config_path: Path) -> dict
             )
         )
 
+    execution_loss_detection = raw.get("execution_loss_detection", True)
+    if not isinstance(execution_loss_detection, bool):
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_loss_detection must be a boolean".format(
+                config_path, index
+            )
+        )
+
+    provider_output_grace = raw.get("provider_output_grace_seconds", 60)
+    if isinstance(provider_output_grace, bool) or not isinstance(provider_output_grace, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.provider_output_grace_seconds must be an integer".format(
+                config_path, index
+            )
+        )
+    if provider_output_grace < 5 or provider_output_grace > 3600:
+        raise ValueError(
+            "config {0} project #{1} watchdog.provider_output_grace_seconds must be between 5 and 3600".format(
+                config_path, index
+            )
+        )
+
+    loss_confirmations = raw.get("execution_loss_confirmations", 2)
+    if isinstance(loss_confirmations, bool) or not isinstance(loss_confirmations, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_loss_confirmations must be an integer".format(
+                config_path, index
+            )
+        )
+    if loss_confirmations < 1 or loss_confirmations > 10:
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_loss_confirmations must be between 1 and 10".format(
+                config_path, index
+            )
+        )
+
+    loss_max_recoveries = raw.get("execution_loss_max_recoveries", 3)
+    if isinstance(loss_max_recoveries, bool) or not isinstance(loss_max_recoveries, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_loss_max_recoveries must be an integer".format(
+                config_path, index
+            )
+        )
+    if loss_max_recoveries < 1 or loss_max_recoveries > 20:
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_loss_max_recoveries must be between 1 and 20".format(
+                config_path, index
+            )
+        )
+
+    loss_backoff = raw.get("execution_loss_backoff_seconds", 30)
+    if isinstance(loss_backoff, bool) or not isinstance(loss_backoff, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_loss_backoff_seconds must be an integer".format(
+                config_path, index
+            )
+        )
+    if loss_backoff < 1 or loss_backoff > 3600:
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_loss_backoff_seconds must be between 1 and 3600".format(
+                config_path, index
+            )
+        )
+
+    loss_escalation = raw.get("execution_loss_unknown_escalation_minutes", 15)
+    if isinstance(loss_escalation, bool) or not isinstance(loss_escalation, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_loss_unknown_escalation_minutes must be an integer".format(
+                config_path, index
+            )
+        )
+    if loss_escalation < 1 or loss_escalation > 1440:
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_loss_unknown_escalation_minutes must be between 1 and 1440".format(
+                config_path, index
+            )
+        )
+
+    acceptance_grace = raw.get("execution_acceptance_grace_seconds", 45)
+    if isinstance(acceptance_grace, bool) or not isinstance(acceptance_grace, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_acceptance_grace_seconds must be an integer".format(
+                config_path, index
+            )
+        )
+    if acceptance_grace < 5 or acceptance_grace > 600:
+        raise ValueError(
+            "config {0} project #{1} watchdog.execution_acceptance_grace_seconds must be between 5 and 600".format(
+                config_path, index
+            )
+        )
+
+    live_proof_freshness = raw.get("live_proof_freshness_seconds", 30)
+    if isinstance(live_proof_freshness, bool) or not isinstance(live_proof_freshness, int):
+        raise ValueError(
+            "config {0} project #{1} watchdog.live_proof_freshness_seconds must be an integer".format(
+                config_path, index
+            )
+        )
+    if live_proof_freshness < 5 or live_proof_freshness > 600:
+        raise ValueError(
+            "config {0} project #{1} watchdog.live_proof_freshness_seconds must be between 5 and 600".format(
+                config_path, index
+            )
+        )
+
     raw_overrides = raw.get("lifecycle_overrides", {})
     if not isinstance(raw_overrides, dict):
         raise ValueError(
@@ -374,6 +488,14 @@ def _normalize_project_watchdog(raw: Any, index: int, config_path: Path) -> dict
         "max_attempts_per_run": max_attempts,
         "diagnostic_timeout_seconds": timeout,
         "auto_recovery": auto_recovery,
+        "execution_loss_detection": execution_loss_detection,
+        "provider_output_grace_seconds": provider_output_grace,
+        "execution_loss_confirmations": loss_confirmations,
+        "execution_loss_max_recoveries": loss_max_recoveries,
+        "execution_loss_backoff_seconds": loss_backoff,
+        "execution_loss_unknown_escalation_minutes": loss_escalation,
+        "execution_acceptance_grace_seconds": acceptance_grace,
+        "live_proof_freshness_seconds": live_proof_freshness,
     }
 
 

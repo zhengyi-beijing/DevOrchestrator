@@ -35,6 +35,13 @@ from dev_orchestrator.core.staged_roadmap import read_successor
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.core.workflow_policy import inject_workflow_policy
 
+from dev_orchestrator.core.execution_lifecycle import (
+    ObligationPersistError,
+    close_lineage_record,
+    load_execution_lineage,
+    open_execution_obligation,
+    record_execution_observation,
+)
 from dev_orchestrator.core.project_status import write_execution_status
 from dev_orchestrator.core.websol import NextAction, WebSolEvent, WebSolRole
 from dev_orchestrator.monitor.telemetry import extract_task_id
@@ -43,7 +50,7 @@ from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_is
 ACTUATION_FILE = "transition-executor.json"
 _LEDGER_VERSION = 1
 _ACTIVE_STATES = frozenset({"launching", "running"})
-_TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
+_TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "explicitly_reconciled"})
 
 _DEFAULT_WORKER_PROMPT = (
     "Execute exactly one bounded task from agent/next.md. Read repository "
@@ -555,10 +562,31 @@ class TransitionExecutor:
                         record["state"] = "completed"
                         record["completed_at"] = fact.get("finished_at") or recovered_at
                         record["reason"] = None
+                        try:
+                            close_lineage_record(
+                                self.runtime_root,
+                                str(record.get("project_id") or ""),
+                                str(record.get("source_request_id") or ""),
+                                terminal_outcome="completed",
+                                completed_at=record["completed_at"],
+                            )
+                        except Exception:
+                            pass
                     elif fact.get("status") == "failed" and fact.get("execution_error") != MANAGED_INTERRUPT_REASON:
                         record["state"] = "failed"
                         record["completed_at"] = fact.get("finished_at") or recovered_at
                         record["reason"] = fact.get("execution_error") or "Broker execution failed before daemon recovery"
+                        try:
+                            close_lineage_record(
+                                self.runtime_root,
+                                str(record.get("project_id") or ""),
+                                str(record.get("source_request_id") or ""),
+                                terminal_outcome="failed",
+                                reason=record["reason"],
+                                completed_at=record["completed_at"],
+                            )
+                        except Exception:
+                            pass
                     else:
                         truth = read_repository_truth(record.get("repo_path") or "")
                         unchanged = bool(
@@ -639,7 +667,7 @@ class TransitionExecutor:
             advertised_task_id = _advertised_task_id(snapshot)
             record_task_id = _non_blank_config(record.get("task_id"))
             if (
-                state in {"failed", "cancelled"}
+                state in {"failed", "cancelled", "explicitly_reconciled"}
                 and advertised_task_id is not None
                 and record_task_id is not None
                 and advertised_task_id != record_task_id
@@ -669,7 +697,12 @@ class TransitionExecutor:
             telemetry["run_id"] = record.get("backend_run_id")
             telemetry["task_id"] = record.get("task_id")
             snapshot["telemetry"] = telemetry
-            snapshot["state"] = ("WORKER_RUNNING" if state in _ACTIVE_STATES else ("WAITING_REVIEW" if state == "completed" else "WORKER_FAILED"))
+            snapshot["state"] = (
+                "WORKER_RUNNING" if state in _ACTIVE_STATES
+                else ("WAITING_REVIEW" if state == "completed"
+                else (snapshot.get("state") or "READY_TO_RUN" if state == "explicitly_reconciled"
+                else "WORKER_FAILED"))
+            )
             if record.get("engine") == "aibroker":
                 snapshot["worker"]["engine"] = "aibroker"
                 snapshot["broker_execution"] = {
@@ -1056,6 +1089,43 @@ class TransitionExecutor:
             }
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])
+
+        # Pre-actuation obligation verification outside self._lock
+        try:
+            open_execution_obligation(
+                self.runtime_root,
+                project_id=project_id,
+                task_id=task_id,
+                source_request_id=source_request_id,
+                branch=branch,
+                head=head,
+                launch_status_hash=launch_truth.status_hash,
+                engine="agent",
+                backend_handle=route.selected_backend_id,
+                worker_identity={"started_at": started_at},
+                recovery_of_lineage_key=lineage.get("recovery_of_lineage_key") if lineage else None,
+            )
+        except ObligationPersistError as exc:
+            with self._lock:
+                ledger = self._load_ledger()
+                if source_request_id in ledger["executions"]:
+                    ledger["executions"][source_request_id]["state"] = "blocked"
+                    ledger["executions"][source_request_id]["reason"] = f"execution_obligation_unpersisted: {exc}"
+                    self._save_ledger(ledger)
+                    blocked_record = copy.deepcopy(ledger["executions"][source_request_id])
+                else:
+                    blocked_record = {"project_id": project_id, "state": "blocked", "reason": f"execution_obligation_unpersisted: {exc}"}
+            write_execution_status(blocked_record, self.runtime_root)
+            if self._progress_channel is not None and hasattr(self._progress_channel, "emit"):
+                try:
+                    self._progress_channel.emit(
+                        project, "BLOCKED", task_id=task_id, occurrence_key=source_request_id,
+                        details={"reason": "execution_obligation_unpersisted", "error": str(exc)},
+                    )
+                except Exception:
+                    pass
+            return None
+
         write_execution_status(status_record, self.runtime_root)
         try:
             from dev_orchestrator.core.execution_context import update_context
@@ -1191,6 +1261,43 @@ class TransitionExecutor:
             }
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])
+
+        # Pre-actuation obligation verification outside self._lock
+        try:
+            open_execution_obligation(
+                self.runtime_root,
+                project_id=project_id,
+                task_id=task_id,
+                source_request_id=source_request_id,
+                branch=branch,
+                head=head,
+                launch_status_hash=launch_truth.status_hash,
+                engine="aibroker",
+                backend_handle=broker_request_id,
+                worker_identity={"started_at": status_record.get("started_at")},
+                recovery_of_lineage_key=lineage.get("recovery_of_lineage_key") if lineage else None,
+            )
+        except ObligationPersistError as exc:
+            with self._lock:
+                ledger = self._load_ledger()
+                if source_request_id in ledger["executions"]:
+                    ledger["executions"][source_request_id]["state"] = "blocked"
+                    ledger["executions"][source_request_id]["reason"] = f"execution_obligation_unpersisted: {exc}"
+                    self._save_ledger(ledger)
+                    blocked_record = copy.deepcopy(ledger["executions"][source_request_id])
+                else:
+                    blocked_record = {"project_id": project_id, "state": "blocked", "reason": f"execution_obligation_unpersisted: {exc}"}
+            write_execution_status(blocked_record, self.runtime_root)
+            if self._progress_channel is not None and hasattr(self._progress_channel, "emit"):
+                try:
+                    self._progress_channel.emit(
+                        project, "BLOCKED", task_id=task_id, occurrence_key=source_request_id,
+                        details={"reason": "execution_obligation_unpersisted", "error": str(exc)},
+                    )
+                except Exception:
+                    pass
+            return None
+
         write_execution_status(status_record, self.runtime_root)
         try:
             from dev_orchestrator.core.execution_context import update_context
@@ -1574,6 +1681,160 @@ class TransitionExecutor:
             self._save_ledger(ledger)
             status_record = copy.deepcopy(record)
         write_execution_status(status_record, self.runtime_root)
+        try:
+            record_execution_observation(
+                self.runtime_root,
+                project_id=str(status_record.get("project_id") or ""),
+                source_request_id=source_request_id,
+                changes=changes,
+            )
+        except Exception:
+            pass
+
+    def reconcile_execution_loss(
+        self,
+        source_request_id: str,
+        *,
+        project_id: str,
+        invariant_key: str,
+        command_id: str,
+        expected_anchor: Optional[dict[str, Any]] = None,
+        evidence: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Sole writer for stale executor reconciliation under execution-loss invariants.
+
+        Compare-and-set the exact active row to state='explicitly_reconciled' after validating
+        conclusive-death evidence, exact project/task/branch/HEAD identity, and absence of every
+        other active row for the project.
+        """
+        evidence_dict = dict(evidence or {})
+        verdict = evidence_dict.get("verdict")
+        if verdict != "dead":
+            return {
+                "status": "unavailable",
+                "reason": f"reconciliation requires conclusive death verdict; observed verdict={verdict!r}",
+            }
+
+        with self._lock:
+            ledger = self._load_ledger()
+            executions = ledger.get("executions", {})
+
+            # Check absence of every other launching/running row for this project
+            for other_id, other_row in executions.items():
+                if not isinstance(other_row, dict):
+                    continue
+                if str(other_row.get("project_id") or "") != project_id:
+                    continue
+                if other_id != source_request_id and str(other_row.get("state") or "").lower() in _ACTIVE_STATES:
+                    return {
+                        "status": "conflict",
+                        "reason": f"another managed execution ({other_id}) is currently active for project {project_id}",
+                    }
+
+            row = executions.get(source_request_id)
+            anchor = dict(expected_anchor or {})
+
+            # Case 1: Row disappeared from executor ledger
+            if row is None:
+                tombstone = {
+                    "project_id": project_id,
+                    "source_request_id": source_request_id,
+                    "task_id": anchor.get("task_id"),
+                    "branch": anchor.get("branch"),
+                    "head": anchor.get("head"),
+                    "launch_status_hash": anchor.get("status_hash"),
+                    "state": "explicitly_reconciled",
+                    "prior_state": "disappeared",
+                    "started_at": anchor.get("started_at"),
+                    "completed_at": utc_now_iso(),
+                    "invariant_key": invariant_key,
+                    "command_id": command_id,
+                    "evidence_hash": evidence_dict.get("evidence_hash"),
+                    "reason": "watchdog_execution_loss",
+                    "reconciliation_type": "tombstone",
+                }
+                executions[source_request_id] = tombstone
+                self._save_ledger(ledger)
+                write_execution_status(tombstone, self.runtime_root)
+                try:
+                    close_lineage_record(
+                        self.runtime_root,
+                        project_id,
+                        source_request_id,
+                        terminal_outcome="explicitly_reconciled",
+                        reason="watchdog_execution_loss",
+                    )
+                except Exception:
+                    pass
+                return {
+                    "status": "reconciled",
+                    "row": copy.deepcopy(tombstone),
+                    "reason": "created explicitly_reconciled tombstone for disappeared executor row",
+                }
+
+            # Case 2: Row already explicitly reconciled
+            current_st = str(row.get("state") or "").lower()
+            if current_st == "explicitly_reconciled":
+                return {
+                    "status": "already_reconciled",
+                    "row": copy.deepcopy(row),
+                    "reason": "execution row was already explicitly reconciled",
+                }
+
+            # Case 3: Row genuinely completed/failed/cancelled meanwhile
+            if current_st in {"completed", "failed", "cancelled"}:
+                return {
+                    "status": "superseded_by_terminal",
+                    "row": copy.deepcopy(row),
+                    "reason": f"execution genuinely finished as {current_st} before reconciliation",
+                }
+
+            # Case 4: Row is in active state (launching or running)
+            if current_st in _ACTIVE_STATES:
+                if anchor.get("task_id") and row.get("task_id") and row["task_id"] != anchor["task_id"]:
+                    return {
+                        "status": "conflict",
+                        "row": copy.deepcopy(row),
+                        "reason": f"task_id mismatch: row={row.get('task_id')!r}, anchor={anchor.get('task_id')!r}",
+                    }
+                if anchor.get("head") and row.get("head") and row["head"] != anchor["head"]:
+                    return {
+                        "status": "conflict",
+                        "row": copy.deepcopy(row),
+                        "reason": f"HEAD mismatch: row={row.get('head')!r}, anchor={anchor.get('head')!r}",
+                    }
+
+                prior_state = row.get("state")
+                row["state"] = "explicitly_reconciled"
+                row["prior_state"] = prior_state
+                row["completed_at"] = utc_now_iso()
+                row["invariant_key"] = invariant_key
+                row["command_id"] = command_id
+                row["evidence_hash"] = evidence_dict.get("evidence_hash")
+                row["reason"] = "watchdog_execution_loss"
+                self._save_ledger(ledger)
+                write_execution_status(copy.deepcopy(row), self.runtime_root)
+                try:
+                    close_lineage_record(
+                        self.runtime_root,
+                        project_id,
+                        source_request_id,
+                        terminal_outcome="explicitly_reconciled",
+                        reason="watchdog_execution_loss",
+                    )
+                except Exception:
+                    pass
+                return {
+                    "status": "reconciled",
+                    "row": copy.deepcopy(row),
+                    "reason": "explicitly reconciled active execution row",
+                }
+
+            return {
+                "status": "unavailable",
+                "row": copy.deepcopy(row),
+                "reason": f"unsupported row state {current_st!r} for reconciliation",
+            }
 
     def _run_worker_thread(
         self, source_request_id: str, request: AgentRequest, backend: AgentBackend,

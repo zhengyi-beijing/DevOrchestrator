@@ -93,6 +93,13 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
     in_cooldown = cooldown_until_dt is not None and now_dt < cooldown_until_dt
 
     owner_gate = prow.get("owner_gate")
+    execution_loss = prow.get("execution_loss")
+    execution_loss_slots = prow.get("execution_loss_slots") or {}
+    unresolved_invariants = (
+        execution_loss.get("unresolved_invariants", [])
+        if isinstance(execution_loss, dict)
+        else []
+    )
 
     if prow.get("disabled"):
         wd_state = "disabled"
@@ -104,6 +111,8 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
         wd_state = "diagnosing"
     elif in_cooldown:
         wd_state = "cooldown"
+    elif unresolved_invariants:
+        wd_state = "execution_loss_detected"
     elif stall and stall.get("no_progress_seconds") is not None:
         thresh = float(stall.get("threshold_minutes", 15)) * 60.0
         if float(stall["no_progress_seconds"]) >= thresh:
@@ -112,6 +121,13 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
             wd_state = "ok"
     else:
         wd_state = "ok"
+
+    lineage_file = runtime / "execution-lineage.json"
+    if lineage_file.is_file():
+        lineage_data = read_json(lineage_file, {})
+        if isinstance(lineage_data, dict) and lineage_data.get("degraded"):
+            if wd_state == "ok":
+                wd_state = "degraded"
 
     last_recovery = None
     recoveries = [
@@ -164,6 +180,13 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
     recovery_handoff = prow.get("recovery_handoff")
     handoff_view = copy.deepcopy(recovery_handoff) if isinstance(recovery_handoff, dict) else None
 
+    reconciliation_phase = None
+    if execution_loss_slots:
+        for s in execution_loss_slots.values():
+            if isinstance(s, dict) and s.get("phase"):
+                reconciliation_phase = s.get("phase")
+                break
+
     return {
         "schema_version": 1,
         "state": wd_state,
@@ -187,6 +210,10 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
         "cooldown_until": cooldown_until_str,
         "last_recovery": last_recovery,
         "degraded_reason": prow.get("last_error"),
+        "execution_loss": copy.deepcopy(execution_loss) if isinstance(execution_loss, dict) else None,
+        "execution_loss_slots": copy.deepcopy(execution_loss_slots) if isinstance(execution_loss_slots, dict) else {},
+        "unresolved_invariants": list(unresolved_invariants),
+        "reconciliation_phase": reconciliation_phase,
     }
 
 

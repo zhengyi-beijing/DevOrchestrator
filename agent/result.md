@@ -1379,3 +1379,36 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - `python -m compileall -q src ops tests_py benchmark/src`: passed.
   - `git diff --check`: passed (only an LF/CRLF advisory for the modified supervisor working copy; no whitespace defects).
 - This is a technical closure repair of a false-exhaustion regression; it does not change owner-gate policy, recovery action limits, or P16.8 task scope.
+
+## P16.9 Watchdog Execution-Loss Detection & Recovery (2026-09-24)
+
+- Solved the xray-hw-platform incident blind spot: an accepted execution reached WORKER_RUNNING, emitted no provider output, and vanished with the project returning to READY_TO_RUN without a terminal state, while watchdog previously reported state=ok with zero recovery.
+- Enforced core invariant: Every accepted execution that reaches launch/running must have a durable terminal outcome: `accepted -> launched/running -> {completed | failed | cancelled | explicitly_reconciled}`.
+- Durable Execution Lineage (`src/dev_orchestrator/core/execution_lifecycle.py`):
+  - Created `runtime/execution-lineage.json` (schema 1) protected under `InterProcessFileLock` on `execution-lineage.lock`.
+  - Implemented `open_execution_obligation` as a fail-closed pre-actuation barrier: atomically records launch obligation with git anchor, status hash, engine handle, and read-back integrity verification before worker thread/broker dispatch.
+  - Fail-closed quarantine on corruption/unsupported version (`execution-lineage.json.corrupt-<stamp>-<hash>`) forcing non-ok health (`LINEAGE_STORE_DEGRADED`).
+  - Implemented `record_execution_observation` and `close_lineage_record` maintaining audit history and terminal outcomes.
+- Two-Phase Compare-and-Set Reconciliation (`src/dev_orchestrator/core/transition_executor.py`):
+  - Added additive terminal state `explicitly_reconciled` to `_TERMINAL_STATES` (distinguished from successful completion).
+  - Implemented `TransitionExecutor.reconcile_execution_loss` under `self._lock`: validates fresh conclusive death evidence, exact launch anchor, absence of conflicting active executions, and compare-and-sets active/disappeared rows to `explicitly_reconciled` tombstone with full audit evidence.
+  - Handled completion races: preserves genuine completed/failed/cancelled outcomes without overwriting and suppresses retries.
+- Watchdog Execution Loss Reconciler & Recovery (`src/dev_orchestrator/core/watchdog.py`):
+  - Hooked `observe_executions` before no-progress/activity short-circuits. Adopts active rows and tracks invariants: `WORKER_VANISHED_WITHOUT_TERMINAL_STATE`, `EXECUTION_RECORD_DISAPPEARED`, `RUNNING_WITHOUT_PROVIDER_OUTPUT`, `INCONSISTENT_ACTIVE_STATE`.
+  - Multi-probe liveness resolution in `resolve_execution_liveness` (ledger claim, broker request status, PID + started_at identity, fresh output, active claims). Requires conclusive death proof with no live proof before recovery.
+  - Two-phase safe recovery: reserves slot `wd-xl-<invariant_key>`, calls `reconcile_execution_loss`, reloads executor state, re-verifies strict `_has_active_execution` (deferring enqueue as `reconciled_pending_retry` if snapshot is stale), and enqueues idempotent continue command.
+  - Crash-boundary resumption: preserves `execution_loss_slots` across restarts and resumes phase with the same command ID.
+  - Health enforcement: watchdog health remains non-ok (`status: "execution_loss_detected"`) while any unresolved invariant exists.
+  - Resolved findings upon replacement execution reaching terminal outcome or original genuine completion.
+- Diagnostics, Blockers, & Status:
+  - Added `EXECUTION_LOSS_UNRESOLVED` blocker in `src/dev_orchestrator/core/blockers.py`.
+  - Registered milestones: `EXECUTION_LOSS_DETECTED`, `EXECUTION_LOSS_RECOVERY_STARTED`, `EXECUTION_LOSS_ESCALATED`, `EXECUTION_LOSS_RESOLVED`.
+  - Exposed `execution_loss`, `execution_loss_slots`, `unresolved_invariants`, and `reconciliation_phase` in `src/dev_orchestrator/core/project_status.py`.
+- Full Verification:
+  - 18 focused tests passing 100% across `test_p169_execution_lineage.py` (6/6), `test_p169_watchdog_execution_loss.py` (6/6), and `test_p169_legitimate_cases.py` (6/6).
+  - 143 watchdog regression tests passing (`test_watchdog*.py`).
+  - 57 transition executor regression tests passing (`test_transition_executor*.py`).
+  - 68 P16.7 and P16.8 regression tests passing.
+  - Full test suite: 1136 passed, 92 subtests passed, 0 failures.
+  - Clean `compileall` and `git diff --check`.
+  - Graphify knowledge graph updated (`5714 nodes, 16021 edges, 244 communities`).
