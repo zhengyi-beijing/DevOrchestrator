@@ -29,6 +29,15 @@ CONTINUATION_DISPOSITIONS = frozenset({
     "exhausted",
 })
 
+NEXT_ACTIONS = frozenset({
+    "plan",
+    "plan_review",
+    "execute",
+    "technical_review",
+    "remediate",
+    "none",
+})
+
 
 def _context_lock(runtime_root: Path | str) -> InterProcessFileLock:
     return InterProcessFileLock(Path(runtime_root) / "execution-context.lock")
@@ -77,14 +86,20 @@ def update_context(
         ctx = contexts.get(project_id)
         now_iso = utc_now_iso()
         if not isinstance(ctx, dict):
+            disp = disposition or "hold"
+            if disp not in CONTINUATION_DISPOSITIONS:
+                raise ValueError(f"Invalid disposition {disp}; expected one of {sorted(CONTINUATION_DISPOSITIONS)}")
+            act = next_action or "none"
+            if act not in NEXT_ACTIONS:
+                raise ValueError(f"Invalid next_action {act}; expected one of {sorted(NEXT_ACTIONS)}")
             ctx = {
                 "schema_version": EXECUTION_CONTEXT_SCHEMA_VERSION,
                 "project_id": project_id,
                 "task_id": task_id,
-                "disposition": disposition or "hold",
-                "next_action": next_action or "none",
+                "disposition": disp,
+                "next_action": act,
                 "git_anchor": git_anchor,
-                "active_role": active_role,
+                "active_role": active_role if active_role != "none" else None,
                 "role_history": [],
                 "recovery_snapshot": {},
                 "idle_ticks": idle_ticks if idle_ticks is not None else 0,
@@ -99,6 +114,8 @@ def update_context(
                     raise ValueError(f"Invalid disposition {disposition}; expected one of {sorted(CONTINUATION_DISPOSITIONS)}")
                 ctx["disposition"] = disposition
             if next_action is not None:
+                if next_action not in NEXT_ACTIONS:
+                    raise ValueError(f"Invalid next_action {next_action}; expected one of {sorted(NEXT_ACTIONS)}")
                 ctx["next_action"] = next_action
             if git_anchor is not None:
                 ctx["git_anchor"] = git_anchor
@@ -230,18 +247,70 @@ def sync_recovery_snapshot(
 
 def context_is_stale(
     context: dict[str, Any],
-    current_head: Optional[str],
-    current_task_id: Optional[str],
+    current_head: Optional[str] = None,
+    current_task_id: Optional[str] = None,
+    *,
+    project_id: Optional[str] = None,
+    repo_path: Optional[str | Path] = None,
+    branch: Optional[str] = None,
+    recovery_epoch_id: Optional[str] = None,
+    intent_command_id: Optional[str] = None,
+    intent_state: Optional[str] = None,
+    fingerprint: Optional[Any] = None,
 ) -> bool:
-    """Return True if git anchor or task ID diverged from repository truth."""
+    """Return True if git anchor, task ID, or execution identities diverged from truth."""
     if not isinstance(context, dict):
         return True
+
     ctx_anchor = context.get("git_anchor")
     if ctx_anchor and current_head and ctx_anchor != current_head:
         return True
+
     ctx_task = context.get("task_id")
     if ctx_task and current_task_id and ctx_task != current_task_id:
         return True
+
+    ctx_proj = context.get("project_id")
+    if ctx_proj and project_id and ctx_proj != project_id:
+        return True
+
+    ctx_repo = context.get("repo_path")
+    if ctx_repo and repo_path:
+        try:
+            if Path(ctx_repo).resolve() != Path(repo_path).resolve():
+                return True
+        except Exception:
+            if str(ctx_repo) != str(repo_path):
+                return True
+
+    ctx_branch = context.get("branch")
+    if ctx_branch and branch and ctx_branch != branch:
+        return True
+
+    ctx_epoch = context.get("recovery_epoch_id") or (context.get("recovery_snapshot") or {}).get("recovery_epoch_id")
+    if ctx_epoch and recovery_epoch_id and ctx_epoch != recovery_epoch_id:
+        return True
+
+    ctx_cmd = context.get("intent_command_id") or (context.get("recovery_snapshot") or {}).get("intent_command_id")
+    if ctx_cmd and intent_command_id and ctx_cmd != intent_command_id:
+        return True
+
+    ctx_state = (
+        context.get("intent_state")
+        or (context.get("recovery_snapshot") or {}).get("intent_state")
+        or (context.get("recovery_snapshot") or {}).get("state")
+    )
+    if ctx_state and intent_state and ctx_state != intent_state:
+        return True
+
+    if fingerprint is not None:
+        fp_hash = fingerprint.get("fingerprint_hash") if isinstance(fingerprint, dict) else str(fingerprint)
+        rec_snap = context.get("recovery_snapshot") or {}
+        ctx_fp = rec_snap.get("current_fingerprint") or context.get("fingerprint")
+        ctx_fp_hash = ctx_fp.get("fingerprint_hash") if isinstance(ctx_fp, dict) else (str(ctx_fp) if ctx_fp else None)
+        if fp_hash and ctx_fp_hash and fp_hash != ctx_fp_hash:
+            return True
+
     return False
 
 
@@ -289,7 +358,7 @@ def resolve_next_action(
 
     lifecycle = str(snapshot.get("lifecycle_state") or snapshot.get("state") or "").upper()
     if lifecycle == "WAITING_REVIEW" or (worker.get("state") == "completed" and not reviewer.get("state")):
-        return "review", "advance"
+        return "technical_review", "advance"
 
     if parsed_status.is_pending_design():
         return "plan", "advance"
@@ -355,9 +424,9 @@ def classify_continuation(
             return "advance", "plan", "pending design task advances to planning"
 
         if f_class == "lifecycle" or code == "READINESS_NOT_READY_TO_RUN":
-            return "lifecycle_hold", "none", f"task lifecycle state not ready to run: {getattr(top, 'observed', code)}"
+            return "hold", "none", f"task lifecycle state not ready to run: {getattr(top, 'observed', code)}"
         if f_class == "transient_infrastructure":
-            return "transient_infrastructure", "none", f"transient blocker: {code}"
+            return "remediate", "remediate", f"transient blocker: {code}"
         if f_class in {"recoverable_orchestration", "readiness", "remediation", "execution_policy"} or code in {
             "PROJECT_NOT_REGISTERED", "ORPHANED_PROJECT_STATE", "READINESS_TOKEN_UNSTRUCTURED", "READINESS_TASK_ID_MISMATCH"
         }:

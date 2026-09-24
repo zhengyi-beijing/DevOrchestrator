@@ -344,8 +344,39 @@ class ActivationSupervisor:
                 })
                 continue
 
-            if disposition == "transient_infrastructure":
-                top_b = blockers[0]
+            # 6. Check budget / livelock exhaustion
+            is_exhausted, exhaust_reason, blocker_code = check_intent_budgets(intent, self_healing_cfg, now=tick_now)
+            if is_exhausted:
+                terminate_intent(
+                    self.runtime_root,
+                    project_id,
+                    "exhausted",
+                    failure_class="recovery_exhausted",
+                    blocker_code=blocker_code,
+                    reason=exhaust_reason,
+                )
+                self._emit_milestone(
+                    project_id,
+                    "RECOVERY_EXHAUSTED",
+                    task_id=intent.get("task_id"),
+                    details={
+                        "source": "activation_supervisor",
+                        "blocker_code": blocker_code,
+                        "reason": exhaust_reason,
+                    },
+                )
+                update_context(self.runtime_root, project_id, disposition="exhausted")
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "exhausted",
+                    "blocker_code": blocker_code,
+                    "reason": exhaust_reason,
+                })
+                continue
+
+            transient_b = next((b for b in blockers if getattr(b, "failure_class", "") == "transient_infrastructure"), None)
+            if transient_b is not None:
+                top_b = transient_b
                 backoff_secs = int(self_healing_cfg.get("backoff_seconds") or 5) if self_healing_cfg else 5
                 backoff_until_str = intent.get("backoff_until")
                 if backoff_until_str:
@@ -402,6 +433,23 @@ class ActivationSupervisor:
                     })
                     continue
 
+                top_blocker = blockers[0] if blockers else None
+                if top_blocker and (getattr(top_blocker, "failure_class", "") == "lifecycle" or getattr(top_blocker, "code", "") == "READINESS_NOT_READY_TO_RUN"):
+                    update_context(self.runtime_root, project_id, disposition="hold", idle_ticks=0)
+                    self._emit_milestone(
+                        project_id,
+                        "CONTINUATION_HOLD",
+                        task_id=intent.get("task_id"),
+                        details={"reason": disp_reason, "blocker_code": top_blocker.code},
+                    )
+                    outcomes.append({
+                        "project_id": project_id,
+                        "status": "continuation_hold",
+                        "blocker_code": top_blocker.code,
+                        "reason": disp_reason,
+                    })
+                    continue
+
                 # Idle tick detection: at most one idle tick before emitting CONTINUATION_FAULT
                 curr_idle = int(context.get("idle_ticks", 0)) if isinstance(context, dict) else 0
                 if curr_idle >= 1:
@@ -413,7 +461,8 @@ class ActivationSupervisor:
                     )
                     update_context(self.runtime_root, project_id, idle_ticks=0, disposition="advance")
                     disposition = "advance"
-                    next_action = "continue"
+                    parsed_next = parse_task_status(snapshot.get("next_status") if isinstance(snapshot, dict) else None)
+                    next_action = "execute" if parsed_next.is_ready_to_run() else "plan"
                 else:
                     update_context(self.runtime_root, project_id, idle_ticks=curr_idle + 1, disposition="hold")
                     self._emit_milestone(
@@ -429,36 +478,6 @@ class ActivationSupervisor:
                         "reason": disp_reason,
                     })
                     continue
-
-            # 6. Check budget / livelock exhaustion
-            is_exhausted, exhaust_reason, blocker_code = check_intent_budgets(intent, self_healing_cfg, now=tick_now)
-            if is_exhausted:
-                terminate_intent(
-                    self.runtime_root,
-                    project_id,
-                    "exhausted",
-                    failure_class="recovery_exhausted",
-                    blocker_code=blocker_code,
-                    reason=exhaust_reason,
-                )
-                self._emit_milestone(
-                    project_id,
-                    "RECOVERY_EXHAUSTED",
-                    task_id=intent.get("task_id"),
-                    details={
-                        "source": "activation_supervisor",
-                        "blocker_code": blocker_code,
-                        "reason": exhaust_reason,
-                    },
-                )
-                update_context(self.runtime_root, project_id, disposition="exhausted")
-                outcomes.append({
-                    "project_id": project_id,
-                    "status": "exhausted",
-                    "blocker_code": blocker_code,
-                    "reason": exhaust_reason,
-                })
-                continue
 
             # 7. Advance forward transition under budget
             if disposition == "advance":

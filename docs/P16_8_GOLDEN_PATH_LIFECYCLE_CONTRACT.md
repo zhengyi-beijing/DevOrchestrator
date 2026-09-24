@@ -22,7 +22,7 @@ When `<repo>/agent/execution-state.json` exists, conforms to `schema_version: 1`
 - It **always** supplies the authoritative task state.
 - `authority` is set to `"structured"`.
 - `valid` is set to `True`.
-- Any textual disagreement with Markdown `agent/next.md` is diagnostic-only (`consistency: "conflict"`) and **never** blocks execution or launch.
+- Any textual disagreement with Markdown `agent/next.md` is diagnostic-only (`consistency: "mismatch"`) and **never** blocks execution or launch.
 
 ### Rule 2: Absent Structured Readiness Fallback
 When `<repo>/agent/execution-state.json` does not exist:
@@ -74,7 +74,7 @@ ExecutionContext is maintained at `runtime/execution-context.json` and protected
   "role_history": ["planner"],
   "stage": "planning" | "plan_review" | "execution" | "technical_review" | "completed" | "idle",
   "next_action": "plan" | "plan_review" | "execute" | "technical_review" | "remediate" | "none",
-  "disposition": "advance" | "hold" | "remediate" | "transient_infrastructure" | "owner_gate" | "owner_stop" | "terminal_success" | "terminal_failure",
+  "disposition": "advance" | "hold" | "remediate" | "owner_gate" | "owner_stop" | "terminal_success" | "terminal_failure" | "exhausted",
   "idle_ticks": 0,
   "created_at": "2026-09-24T12:00:00Z",
   "updated_at": "2026-09-24T12:00:00Z",

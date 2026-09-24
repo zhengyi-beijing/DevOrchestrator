@@ -1860,13 +1860,13 @@ class TestP167ReviewRemediation(unittest.TestCase):
 
             outcomes = supervisor.advance(cfg_path, summary, executor=executor)
             self.assertEqual(len(outcomes), 1)
-            self.assertEqual(outcomes[0]["status"], "lifecycle_hold")
+            self.assertEqual(outcomes[0]["status"], "continuation_hold")
             self.assertEqual(outcomes[0]["blocker_code"], "READINESS_NOT_READY_TO_RUN")
 
-            # Intent terminated as stopped (NOT exhausted)
+            # Intent remains active under bounded hold without burning actions (NOT exhausted)
             all_intents = load_execution_intents(runtime).get("intents", {})
-            self.assertEqual(all_intents["proj-1"]["state"], "stopped")
-            self.assertEqual(all_intents["proj-1"]["failure_class"], "lifecycle")
+            self.assertEqual(all_intents["proj-1"]["state"], "active")
+            self.assertEqual(all_intents["proj-1"].get("actions_used", 0), 0)
 
             # Key assertion: subsequent explain_block does NOT publish RECOVERY_BUDGET_EXHAUSTED!
             blockers2 = explain_block(

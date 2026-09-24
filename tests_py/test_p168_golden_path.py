@@ -138,7 +138,22 @@ class TestP168GoldenPath(unittest.TestCase):
             parsed_done = parse_task_status(snap_done.get("next_status"))
             self.assertTrue(parsed_done.is_completed())
 
-            # 6. Verify Terminal Closure on Control Surface
+            # 6. Verify required DONE invariants
+            # 6a. Clean Git worktree
+            git_status = subprocess.run(["git", "status", "--porcelain"], cwd=harness.repo_path, check=True, capture_output=True, text=True).stdout.strip()
+            self.assertEqual(git_status, "", "Git worktree must be clean at DONE")
+
+            # 6b. No active role or running execution
+            ctx_done = get_context(harness.runtime_path, harness.project_id)
+            self.assertIsNone(ctx_done.get("active_role"), "No active role allowed at DONE")
+            self.assertEqual(ctx_done.get("next_action"), "none", "next_action must be 'none' at DONE")
+            self.assertFalse(any(r.get("state") == "running" for r in harness.executor.records.values()), "No active execution allowed at DONE")
+
+            # 6c. No owner gate open
+            owner_gates = read_json(harness.runtime_path / "owner-gates.json", {}).get("gates", {})
+            self.assertFalse(any(g.get("project_id") == harness.project_id and g.get("status") == "open" for g in owner_gates.values()), "No owner gate open at DONE")
+
+            # 6d. Verify Terminal Closure on Control Surface
             surface = project_control_view(
                 snap_done,
                 harness.runtime_path,

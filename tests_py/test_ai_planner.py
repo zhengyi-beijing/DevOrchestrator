@@ -643,6 +643,9 @@ def wait_terminal(coordinator: AIPlannerCoordinator, plan_id: str) -> dict:
     while time.time() < deadline:
         row = coordinator.state()["plans"].get(plan_id)
         if row and row.get("state") not in {"planning", "reviewing", "remediating", "applying"}:
+            t = coordinator._threads.get(plan_id)
+            if t is not None and t.is_alive():
+                t.join(timeout=2.0)
             return row
         time.sleep(0.02)
     raise AssertionError("planner lifecycle did not become terminal")

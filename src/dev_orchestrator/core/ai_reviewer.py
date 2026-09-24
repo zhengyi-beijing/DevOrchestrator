@@ -1852,6 +1852,20 @@ class AIReviewerCoordinator:
             if conversation_binding and isinstance(conversation_binding, dict):
                 self._project_bindings[request.project_id] = copy.deepcopy(conversation_binding)
             self._save_state(state)
+        try:
+            from dev_orchestrator.core.execution_context import update_context
+            update_context(
+                self.runtime_root,
+                request.project_id,
+                task_id=request.task_run_id,
+                git_anchor=truth.head,
+                active_role="reviewer",
+                disposition="hold",
+                next_action="technical_review",
+                branch=truth.branch,
+            )
+        except Exception:
+            pass
         thread = threading.Thread(
             target=self._run_review,
             args=(review_id, request),
@@ -1886,6 +1900,21 @@ class AIReviewerCoordinator:
                 **kwargs,
             })
             self._save_state(state)
+        try:
+            from dev_orchestrator.core.execution_context import record_role_completion, update_context
+            record_role_completion(
+                self.runtime_root,
+                project_id,
+                "reviewer",
+                {
+                    "state": state_name,
+                    "reason": reason,
+                },
+            )
+            if state_name == "failed":
+                update_context(self.runtime_root, project_id, disposition="terminal_failure", active_role=None)
+        except Exception:
+            pass
 
     def _capture_reviewer_output(
         self,
@@ -2261,19 +2290,12 @@ class AIReviewerCoordinator:
             record = state["reviews"].get(review_id)
             if not isinstance(record, dict):
                 return
-            record.update({
-                "state": state_name, "reason": reason, "completed_at": utc_now_iso(),
-                "dispatch_id": result.dispatch_id, "decision_id": result.decision_id,
-                "execution_id": result.execution_id, "session_id": result.session_id,
-                "resource_context": resource_payload, "usage_source": result.usage_source,
-                **extra,
-            })
-            self._save_state(state)
-        if self.progress_channel is not None:
-            decision = extra.get("decision")
             task_id = str(record.get("task_id") or "")
             proj_id = str(record.get("project_id") or "")
             binding = record.get("conversation_binding")
+
+        decision = extra.get("decision")
+        if self.progress_channel is not None:
             if not binding:
                 binding = self._project_bindings.get(proj_id)
             project_payload = {"project_id": proj_id}
@@ -2305,6 +2327,48 @@ class AIReviewerCoordinator:
                     task_id=task_id, occurrence_key=review_id,
                     details={"reason": reason},
                 )
+        try:
+            from dev_orchestrator.core.execution_context import (
+                record_role_completion,
+                set_next_action,
+                update_context,
+            )
+            record_role_completion(
+                self.runtime_root,
+                proj_id,
+                "reviewer",
+                {
+                    "task_id": task_id,
+                    "state": state_name,
+                    "decision": decision,
+                    "reason": reason,
+                },
+            )
+            if state_name == "completed":
+                if decision == "next":
+                    set_next_action(self.runtime_root, proj_id, "none", disposition="terminal_success")
+                elif decision == "remediate":
+                    set_next_action(self.runtime_root, proj_id, "remediate", disposition="remediate")
+                elif decision == "owner_gate":
+                    update_context(self.runtime_root, proj_id, disposition="owner_gate", active_role=None)
+            elif state_name == "failed":
+                update_context(self.runtime_root, proj_id, disposition="terminal_failure", active_role=None)
+        except Exception:
+            pass
+
+        with self._lock:
+            state = self._load_state()
+            record = state["reviews"].get(review_id)
+            if not isinstance(record, dict):
+                return
+            record.update({
+                "state": state_name, "reason": reason, "completed_at": utc_now_iso(),
+                "dispatch_id": result.dispatch_id, "decision_id": result.decision_id,
+                "execution_id": result.execution_id, "session_id": result.session_id,
+                "resource_context": resource_payload, "usage_source": result.usage_source,
+                **extra,
+            })
+            self._save_state(state)
 
     def _write_decision(
         self,

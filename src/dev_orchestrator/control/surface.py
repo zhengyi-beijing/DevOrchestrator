@@ -176,8 +176,8 @@ def project_control_view(
         and not bool(identity.get("dirty"))
     )
     task_terminal = parsed_next_status.is_completed() and (
-        lifecycle in {"IDLE", "COMPLETED", "TERMINAL"}
-        or str(projected.get("state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL"}
+        lifecycle.upper() in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}
+        or str(projected.get("state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}
     )
     eligible_continue = not paused and not task_terminal and (
         (gate is None and ((lifecycle == "READY_TO_RUN" and execution_ready) or planning_start_ready))

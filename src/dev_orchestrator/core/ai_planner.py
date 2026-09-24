@@ -448,6 +448,21 @@ class AIPlannerCoordinator:
             if binding and isinstance(binding, dict):
                 self._project_bindings[project_id] = copy.deepcopy(binding)
             self._save_state(state)
+        try:
+            from dev_orchestrator.core.execution_context import update_context
+            update_context(
+                self.runtime_root,
+                project_id,
+                task_id=task_id,
+                git_anchor=truth.head,
+                active_role="planner",
+                disposition="hold",
+                next_action="plan",
+                repo_path=repo_text,
+                branch=truth.branch,
+            )
+        except Exception:
+            pass
         if self.progress_channel is not None and hasattr(self.progress_channel, "register_project"):
             self.progress_channel.register_project(project)
         thread = threading.Thread(
@@ -1723,6 +1738,23 @@ class AIPlannerCoordinator:
                     })
                     self._save_state(state)
 
+                try:
+                    from dev_orchestrator.core.execution_context import record_role_completion, set_next_action
+                    record_role_completion(
+                        self.runtime_root,
+                        project["project_id"],
+                        "planner",
+                        {
+                            "task_id": record["task_id"],
+                            "state": "completed",
+                            "plan": plan,
+                            "git_anchor": record.get("head"),
+                        },
+                    )
+                    set_next_action(self.runtime_root, project["project_id"], "plan_review", disposition="advance")
+                except Exception:
+                    pass
+
                 review_res = self._run_plan_review(
                     plan_id, record, policy, plan, previous, round_no, recovery_cycle,
                 )
@@ -1747,8 +1779,28 @@ class AIPlannerCoordinator:
                     })
                     self._save_state(state)
 
+                try:
+                    from dev_orchestrator.core.execution_context import record_role_completion, set_next_action, update_context
+                    record_role_completion(
+                        self.runtime_root,
+                        project["project_id"],
+                        "plan_reviewer",
+                        {
+                            "task_id": record["task_id"],
+                            "decision": decision,
+                            "reason": reason,
+                        },
+                    )
+                    if decision in {"accept", "approve"}:
+                        set_next_action(self.runtime_root, project["project_id"], "execute", disposition="advance")
+                    elif decision == "remediate":
+                        set_next_action(self.runtime_root, project["project_id"], "plan", disposition="remediate")
+                    elif decision == "owner_gate":
+                        update_context(self.runtime_root, project["project_id"], disposition="owner_gate", active_role=None)
+                except Exception:
+                    pass
+
                 if decision == "owner_gate":
-                    self._finish(plan_id, "owner_gate", reason)
                     if self.accounting is not None:
                         self.accounting.open_owner_gate(
                             plan_id,
@@ -1764,6 +1816,7 @@ class AIPlannerCoordinator:
                             task_id=record["task_id"], occurrence_key=plan_id,
                             details={"plan_id": plan_id, "reason": reason},
                         )
+                    self._finish(plan_id, "owner_gate", reason)
                     return
 
                 if decision == "approve":
@@ -1835,7 +1888,6 @@ class AIPlannerCoordinator:
                         f"plan review hard reject limit reached ({hard_total_review_rejects}); "
                         f"last rejection: {reason}"
                     )
-                    self._finish(plan_id, "owner_gate", exhaust_reason)
                     if self.accounting is not None:
                         self.accounting.open_owner_gate(
                             plan_id,
@@ -1855,6 +1907,7 @@ class AIPlannerCoordinator:
                                 "rejection_chain_length": chain_len,
                             },
                         )
+                    self._finish(plan_id, "owner_gate", exhaust_reason)
                     return
 
                 if round_no < max_remediation_rounds:
@@ -1940,7 +1993,6 @@ class AIPlannerCoordinator:
                         f"last rejection: {reason}"
                     )
                 )
-                self._finish(plan_id, "owner_gate", exhaust_reason)
                 if self.accounting is not None:
                     self.accounting.open_owner_gate(
                         plan_id,
@@ -1961,6 +2013,7 @@ class AIPlannerCoordinator:
                             "rejection_chain_length": chain_len,
                         },
                     )
+                self._finish(plan_id, "owner_gate", exhaust_reason)
                 return
             if restart_recovery_cycle:
                 continue
@@ -2102,6 +2155,33 @@ class AIPlannerCoordinator:
         if not final_truth.valid or final_truth.dirty or final_truth.head == record["head"]:
             self._finish(plan_id, "failed", "plan commit did not produce a clean new HEAD")
             return
+        try:
+            from dev_orchestrator.core.execution_context import record_role_completion, set_next_action
+            record_role_completion(
+                self.runtime_root,
+                record["project_id"],
+                "plan_apply",
+                {
+                    "task_id": record["task_id"],
+                    "commit": commit,
+                    "git_anchor": final_truth.head,
+                },
+            )
+            set_next_action(self.runtime_root, record["project_id"], "execute", disposition="advance", git_anchor=final_truth.head)
+        except Exception:
+            pass
+        if self.progress_channel is not None:
+            project_payload = self._project_payload(record, project)
+            self.progress_channel.emit(
+                project_payload, "PLAN_ACCEPTED",
+                task_id=record["task_id"], occurrence_key=plan_id,
+                details={"plan_id": plan_id, "reason": review_reason},
+            )
+            self.progress_channel.emit(
+                project_payload, "NEXT_TASK",
+                task_id=record["task_id"], occurrence_key=plan_id,
+                details={"plan_id": plan_id, "state": "ready_to_run"},
+            )
         with self._lock:
             state = self._load_state()
             current = state["plans"].get(plan_id)
@@ -2115,18 +2195,6 @@ class AIPlannerCoordinator:
                 "ready_at": utc_now_iso(),
             })
             self._save_state(state)
-        if self.progress_channel is not None:
-            project_payload = self._project_payload(record, project)
-            self.progress_channel.emit(
-                project_payload, "PLAN_ACCEPTED",
-                task_id=record["task_id"], occurrence_key=plan_id,
-                details={"plan_id": plan_id, "reason": review_reason},
-            )
-            self.progress_channel.emit(
-                project_payload, "NEXT_TASK",
-                task_id=record["task_id"], occurrence_key=plan_id,
-                details={"plan_id": plan_id, "state": "ready_to_run"},
-            )
 
     @staticmethod
     def _render_next(original: str, plan: dict[str, Any], review_reason: str) -> str:
@@ -2398,6 +2466,31 @@ class AIPlannerCoordinator:
         return prompt
 
     def _finish(self, plan_id: str, state_name: str, reason: str) -> None:
+        with self._lock:
+            state = self._load_state()
+            record = state["plans"].get(plan_id)
+            if not isinstance(record, dict):
+                return
+            proj_id = str(record.get("project_id") or "")
+            t_id = record.get("task_id")
+        try:
+            from dev_orchestrator.core.execution_context import record_role_completion, update_context
+            record_role_completion(
+                self.runtime_root,
+                proj_id,
+                "planner",
+                {
+                    "task_id": t_id,
+                    "state": state_name,
+                    "reason": reason,
+                },
+            )
+            if state_name == "failed":
+                update_context(self.runtime_root, proj_id, disposition="terminal_failure", active_role=None)
+            elif state_name == "owner_gate":
+                update_context(self.runtime_root, proj_id, disposition="owner_gate", active_role=None)
+        except Exception:
+            pass
         with self._lock:
             state = self._load_state()
             record = state["plans"].get(plan_id)

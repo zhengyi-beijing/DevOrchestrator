@@ -1316,3 +1316,36 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - Python compilation (`python -m compileall src tests_py`): passed cleanly.
   - Whitespace and format check (`git diff --check`): passed cleanly.
   - Knowledge graph updated via `graphify update .`: 5603 nodes, 15645 edges, 246 communities.
+
+
+## P16.8 Review Remediation (2026-09-24)
+
+- Closed Technical Review gaps on Golden-Path harness and role continuity:
+  - Remediated `golden_path_harness.py`:
+    - Wired `AIReviewerCoordinator` and `HarnessFakePort` into test harness; distinguished plan review schema (`{"decision": "approve", "reason": ...}`) from technical review schema (`{"decision": "next", "next_action": "next_task", "reason": ...}`).
+    - Hardened `apply_approved_plan` to wait for planner `ready` and fail closed (`RuntimeError`) with no silent manual Markdown fallback.
+    - Implemented `complete_worker_run(command_id, exit_code)` to update active worker records in executor ledger (`transition-executor.json`) and record role completion in `ExecutionContext`.
+    - Implemented `apply_review_acceptance` to trigger `reviewer.advance(config_path)`, wait for approval decision (`next`), finalize task with structured readiness and git commit, and update `ExecutionContext`.
+    - Added `run_ticks(n=1)`, `restart_daemon()`, and `close()` to safely join background threads.
+  - Closed terminal-state recognition gap:
+    - Added `"DONE"` to recognized terminal lifecycle states in `src/dev_orchestrator/control/surface.py` and `src/dev_orchestrator/core/control_commands.py`.
+    - Added required DONE assertions in `tests_py/test_p168_golden_path.py`: clean Git worktree (`git status --porcelain` empty), no active role or running execution, no open owner gate, and terminal closure.
+  - Fixed unbound variable in `ai_reviewer.py`:
+    - In `_finish_result`, extracted `proj_id`, `task_id`, and `decision` outside the `if self.progress_channel is not None:` block, ensuring execution context is reliably updated even when progress channel is None.
+  - Hardened lifecycle sequencing & Windows thread safety across coordinators:
+    - In `src/dev_orchestrator/core/ai_planner.py` and `src/dev_orchestrator/core/ai_reviewer.py`, completed progress channel emissions and execution context updates before saving terminal `state` in `plans.json` and `ai-reviewer.json`, eliminating race conditions between terminal state polling and background thread file I/O.
+    - In `AIPlannerCoordinator._run_cycle`: emitted `OWNER_GATE` milestone and opened owner accounting gate prior to calling `_finish(..., "owner_gate", ...)`.
+    - In `tests_py/test_ai_planner.py`: updated `wait_terminal` to join coordinator background thread when terminal state is reached, eliminating `PermissionError: [WinError 32]` temporary file collisions during test cleanup on Windows.
+  - Aligned contract documentation:
+    - Updated `docs/P16_8_GOLDEN_PATH_LIFECYCLE_CONTRACT.md` consistency terminology (`"mismatch"` instead of `"conflict"`) and `disposition` enum alignment with `CONTINUATION_DISPOSITIONS`.
+- Verification on the remediated production and test tree:
+  - `tests_py/test_p168_golden_path.py`: 4/4 passed cleanly.
+  - `tests_py/test_p168_fault_injection.py`: 11/11 passed cleanly (re-anchoring on HEAD advance, provider failover, reviewer rejection reaching done via bounded remediation, daemon restart across handoff boundaries, execution context durability & stale detection).
+  - `tests_py/test_p168_task_status.py`: 9/9 passed cleanly.
+  - `tests_py/test_p167_self_healing_activation.py`: 43/43 passed cleanly.
+  - `tests_py/test_ai_planner.py`: 38/38 passed cleanly.
+  - `tests_py/test_ai_reviewer.py`: 12/12 passed cleanly.
+  - `python -m compileall -q src ops tests_py`: passed cleanly.
+  - `git diff --check`: passed cleanly (0 defects).
+  - Knowledge graph updated via `graphify update .`: 5628 nodes, 15743 edges, 250 communities.
+- DevOrchestrator remained owner-paused throughout remediation and verification; no P16.9 Worker was launched; `agent/next.md` handoff preserved.

@@ -1057,6 +1057,19 @@ class TransitionExecutor:
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])
         write_execution_status(status_record, self.runtime_root)
+        try:
+            from dev_orchestrator.core.execution_context import update_context
+            update_context(
+                self.runtime_root,
+                project_id,
+                task_id=task_id,
+                active_role="worker",
+                disposition="hold",
+                git_anchor=launch_truth.head,
+                next_action="execute",
+            )
+        except Exception:
+            pass
 
         thread = threading.Thread(
             target=self._run_worker_thread,
@@ -1179,6 +1192,19 @@ class TransitionExecutor:
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])
         write_execution_status(status_record, self.runtime_root)
+        try:
+            from dev_orchestrator.core.execution_context import update_context
+            update_context(
+                self.runtime_root,
+                project_id,
+                task_id=task_id,
+                active_role="worker",
+                disposition="hold",
+                git_anchor=launch_truth.head,
+                next_action="execute",
+            )
+        except Exception:
+            pass
         thread = threading.Thread(
             target=self._run_broker_worker_thread,
             args=(source_request_id, request),
@@ -1233,6 +1259,21 @@ class TransitionExecutor:
                     metadata=meta,
                 )
             self._update_record(source_request_id, broker_request_id=current_request.request_id)
+            if attempt > 1:
+                try:
+                    from dev_orchestrator.core.execution_context import record_role_completion
+                    record_role_completion(
+                        self.runtime_root,
+                        request.project_id,
+                        "worker_failover",
+                        {
+                            "task_id": request.task_run_id,
+                            "attempt": attempt,
+                            "excluded_resources": sorted(failed_resource_ids),
+                        },
+                    )
+                except Exception:
+                    pass
 
             if self.accounting is not None:
                 self.accounting.start_interval(
@@ -1500,6 +1541,28 @@ class TransitionExecutor:
                     task_id=request.task_run_id, occurrence_key=source_request_id,
                     details={"error": result.error},
                 )
+        try:
+            from dev_orchestrator.core.execution_context import (
+                record_role_completion,
+                set_next_action,
+                update_context,
+            )
+            record_role_completion(
+                self.runtime_root,
+                request.project_id,
+                worker_role,
+                {
+                    "task_id": request.task_run_id,
+                    "state": state,
+                    "reason": result.error if result else "unknown",
+                },
+            )
+            if state == "completed":
+                set_next_action(self.runtime_root, request.project_id, "technical_review", disposition="advance")
+            else:
+                update_context(self.runtime_root, request.project_id, disposition="hold", active_role=None)
+        except Exception:
+            pass
 
     def _update_record(self, source_request_id: str, **changes: Any) -> None:
         with self._lock:

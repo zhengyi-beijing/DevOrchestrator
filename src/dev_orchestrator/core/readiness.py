@@ -208,7 +208,7 @@ def resolve_task_state(
                 reason=readiness_res.reason,
                 markdown=md_status,
                 consistency="error",
-                authority="structured",
+                authority="none",
                 task_id=readiness_res.task_id or eff_task_id,
             )
 

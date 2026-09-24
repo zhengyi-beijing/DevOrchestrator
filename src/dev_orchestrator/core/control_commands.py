@@ -450,7 +450,7 @@ class ControlCommandCoordinator:
             parsed_status = parse_task_status(snapshot.get("next_status"))
             lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "").upper()
             snap_state = str(snapshot.get("state") or "").upper()
-            if parsed_status.is_completed() and (lifecycle in {"IDLE", "COMPLETED", "TERMINAL"} or snap_state in {"IDLE", "COMPLETED", "TERMINAL"}):
+            if parsed_status.is_completed() and (lifecycle in {"IDLE", "COMPLETED", "TERMINAL", "DONE"} or snap_state in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}):
                 return self._blocked(
                     command_id, project_id, action,
                     "current task is terminal; stale review/continue is audit history only",
