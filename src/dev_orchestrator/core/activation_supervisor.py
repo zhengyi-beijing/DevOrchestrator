@@ -307,23 +307,6 @@ class ActivationSupervisor:
                 })
                 continue
 
-            if disposition == "lifecycle_hold":
-                top_blocker = blockers[0]
-                terminate_intent(
-                    self.runtime_root,
-                    project_id,
-                    "stopped",
-                    failure_class="lifecycle",
-                    blocker_code=top_blocker.code,
-                    reason=f"task lifecycle state not ready to run: {getattr(top_blocker, 'observed', top_blocker.code)}",
-                )
-                update_context(self.runtime_root, project_id, disposition="hold")
-                outcomes.append({
-                    "project_id": project_id,
-                    "status": "lifecycle_hold",
-                    "blocker_code": top_blocker.code,
-                })
-                continue
 
             if disposition == "terminal_failure":
                 code = blockers[0].code if blockers else "TERMINAL_BLOCKER"
@@ -479,6 +462,19 @@ class ActivationSupervisor:
                     })
                     continue
 
+            # If disposition is remediate but there are no blockers, advance forward if actionable, else hold
+            if disposition == "remediate" and not blockers:
+                if next_action and next_action != "none":
+                    disposition = "advance"
+                else:
+                    update_context(self.runtime_root, project_id, disposition="hold", idle_ticks=0)
+                    outcomes.append({
+                        "project_id": project_id,
+                        "status": "continuation_hold",
+                        "reason": "no active blockers to remediate",
+                    })
+                    continue
+
             # 7. Advance forward transition under budget
             if disposition == "advance":
                 eff_task_id = intent.get("task_id") or (snapshot.get("telemetry", {}).get("task_id") if isinstance(snapshot, dict) else None) or "notask"
@@ -542,6 +538,15 @@ class ActivationSupervisor:
                         "status": "transition_failed",
                         "error": str(exc),
                     })
+                continue
+
+            if not blockers:
+                update_context(self.runtime_root, project_id, disposition="hold", idle_ticks=0)
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "continuation_hold",
+                    "reason": "no active blockers to remediate",
+                })
                 continue
 
             top_blocker = blockers[0]

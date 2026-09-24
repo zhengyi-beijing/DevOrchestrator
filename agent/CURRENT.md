@@ -17,7 +17,16 @@ P16.8 DevO Golden-Path Lifecycle Hardening completion (2026-09-24):
 - 9-field additive activity telemetry exposed in project_status.py and control/surface.py.
 - Registered progress milestones: CONTINUATION_DISPATCHED, CONTINUATION_FAULT, CONTINUATION_HOLD, EXECUTION_CONTEXT_STALE.
 - Contract document authored in docs/P16_8_GOLDEN_PATH_LIFECYCLE_CONTRACT.md and backlog.md updated.
-- Full verification: 18 focused tests passed across test_p168_task_status.py, test_p168_golden_path.py, and test_p168_fault_injection.py; 1111 full repository regression tests passed (0 failures).
+- Full verification: 25 focused tests passed across test_p168_task_status.py, test_p168_golden_path.py, and test_p168_fault_injection.py (including 12 fault-injection tests covering anchor invalidation, failover, bounded review remediation to DONE, empty-blockers indexing guard, and restart); 1118 full repository regression tests passed (0 failures).
+- Technical Review Remediation Round 1 (2026-09-24):
+  - Hardened golden_path_harness.py with real AIReviewerCoordinator wiring, fail-closed plan apply, complete_worker_run ledger updates, and apply_review_acceptance.
+  - Added terminal DONE closure assertions (clean worktree, no active role or running execution, no owner gate, terminal actions disabled).
+  - Resolved unbound variables and coordinator background thread joins to eliminate Windows WinError 32 cleanup collisions.
+- Technical Review Remediation Round 2 (2026-09-24, ai_review:ai_review:auto-1eac8a332382d1d9e986420f:execute):
+  - Guarded top_blocker = blockers[0] in ActivationSupervisor: when disposition is remediate with empty blockers, advances forward transition if next_action is actionable, else holds, eliminating unhandled IndexError crash.
+  - Removed unreachable lifecycle_hold branch in activation_supervisor.py.
+  - Added regression test test_remediation_disposition_with_empty_blockers_advances_forward_transition in test_p168_fault_injection.py.
+  - Full final-tree regression verified: 1118 passed, 92 subtests passed in 402.56s (0 failures); compileall and git diff --check clean.
 
 P16.7 Self-Healing Project Activation & Readiness completion (2026-09-23):
 - Implemented diagnosed and self-healing project-activation and readiness failure handling without repeated owner interventions, replaying the 2026-09-23 xray-hw-platform incident as an automated end-to-end regression.

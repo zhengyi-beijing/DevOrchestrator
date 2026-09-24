@@ -532,6 +532,42 @@ class TestP168FaultInjection(unittest.TestCase):
             self.assertEqual(ctx2["role_history"][0]["role"], "planner")
             self.assertEqual(ctx2["role_history"][0]["outcome"]["status"], "ok")
 
+    def test_remediation_disposition_with_empty_blockers_advances_forward_transition(self):
+        """Remediate disposition with empty blockers advances forward transition without IndexError."""
+        from unittest.mock import patch
+        from dev_orchestrator.core.execution_context import set_next_action
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            sup = ActivationSupervisor(runtime_root=rt)
+            record_or_refresh_intent(
+                rt, "proj-1", task_id="P1", command_id="cmd-1", requested_action="continue", source="owner", state="active"
+            )
+            set_next_action(rt, "proj-1", "remediate", disposition="remediate")
+            cfg = rt / "projects.json"
+            cfg.write_text(json.dumps({"projects": [{"project_id": "proj-1", "repo_path": str(rt)}]}), encoding="utf-8")
+            snap = {
+                "project_id": "proj-1",
+                "repo_path": str(rt),
+                "state": "IDLE",
+                "lifecycle_state": "IDLE",
+                "git": {"valid": True, "clean": True, "head": "abc"},
+                "telemetry": {"task_id": "P1"},
+            }
+
+            with patch("dev_orchestrator.core.activation_supervisor.explain_block", return_value=[]):
+                outcomes = sup.advance(cfg, {"projects": [snap]})
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0].get("status"), "transition_submitted")
+                self.assertEqual(outcomes[0].get("action"), "remediate")
+
+            # With none next_action, holds cleanly without IndexError
+            set_next_action(rt, "proj-1", "none", disposition="remediate")
+            with patch("dev_orchestrator.core.activation_supervisor.explain_block", return_value=[]):
+                outcomes_none = sup.advance(cfg, {"projects": [snap]})
+                self.assertEqual(len(outcomes_none), 1)
+                self.assertEqual(outcomes_none[0].get("status"), "continuation_hold")
+
 
 if __name__ == "__main__":
     unittest.main()

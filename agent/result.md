@@ -1349,3 +1349,19 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - `git diff --check`: passed cleanly (0 defects).
   - Knowledge graph updated via `graphify update .`: 5628 nodes, 15743 edges, 250 communities.
 - DevOrchestrator remained owner-paused throughout remediation and verification; no P16.9 Worker was launched; `agent/next.md` handoff preserved.
+
+## P16.8 Review Remediation Round 2 (2026-09-24)
+
+- Closed Technical Review findings from `ai_review:ai_review:auto-1eac8a332382d1d9e986420f:execute`:
+  1. Blocker 1 (Empty blockers indexing in supervisor): Guarded `top_blocker = blockers[0]` in `src/dev_orchestrator/core/activation_supervisor.py`. When `disposition == "remediate"` and `blockers` is empty (e.g. following review `remediate` outcome or planner remediation set in context), supervisor advances forward transition (`disposition = "advance"`) if `next_action` is actionable (`next_action != "none"`), or holds if not actionable, and explicitly guards `if not blockers: continue` before indexing `blockers[0]`. Eliminated unhandled `IndexError: list index out of range` that would have crashed the supervisor tick for all projects.
+  2. Non-blocking cleanup: Deleted unreachable `lifecycle_hold` branch in `activation_supervisor.py` (which also indexed `blockers[0]` without empty check).
+  3. Added deterministic regression test: `test_remediation_disposition_with_empty_blockers_advances_forward_transition` in `tests_py/test_p168_fault_injection.py` reproducing and verifying that empty blockers under `remediate` disposition cleanly advance forward transition without `IndexError`, and hold cleanly when `next_action` is `none`.
+  4. Blocker 2 (Full regression evidence on final production tree):
+     - High-risk focused suites: 131 passed, 31 subtests passed in 88.65s (`test_control_commands.py`, `test_p12_control_actions.py`, `test_p125_reconcile.py`, `test_p126_review_retry.py`, `test_p127_closure_rereview.py`, `test_project_status.py`, `test_transition_executor.py`, `test_monitor.py`, `test_p168_golden_path.py`, `test_p168_task_status.py`).
+     - Daemon suites: 5 passed in 2.15s (`test_daemon.py`, `test_daemon_transition_integration.py`).
+     - Fault-injection suite: 12 passed in 9.09s (`tests_py/test_p168_fault_injection.py`).
+     - Full repository regression: 1118 passed, 92 subtests passed in 402.56s (0 failures), verified clean against baseline.
+     - Python compilation: `python -m compileall -q src ops tests_py benchmark/src` passed cleanly with exit code 0.
+     - Whitespace and formatting: `git diff --check` passed cleanly with 0 defects.
+     - Knowledge graph refreshed via `graphify update .`: 5631 nodes, 15750 edges, 255 communities.
+  5. Preserved handoff: DevOrchestrator remained owner-paused throughout remediation and verification; no P16.9 Worker was launched; `agent/next.md` handoff preserved.
