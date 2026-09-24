@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import copy
 import json
 import os
@@ -23,9 +24,11 @@ from dev_orchestrator.core.execution_lifecycle import (
     observe_executions,
     open_execution_obligation,
     record_execution_observation,
+    resolve_execution_liveness,
 )
 from dev_orchestrator.core.transition_executor import TransitionExecutor
 from dev_orchestrator.core.watchdog import WatchdogCoordinator, resolve_watchdog_policy
+from tests_py.test_transition_executor_aibroker import FakePort
 
 
 class TestWatchdogExecutionLoss(unittest.TestCase):
@@ -489,7 +492,422 @@ class TestWatchdogExecutionLoss(unittest.TestCase):
             inbox_cmd = self.runtime / "control" / "inbox" / f"wd-xl-{inv_key}.json"
             self.assertTrue(inbox_cmd.is_file())
 
+    def test_real_recovery_launch_end_to_end_without_handwritten_lineage(self):
+        """End-to-end test driving real recovery-launch without hand-written lineage links,
+        verifying EXECUTION_LOSS_RESOLVED is emitted and health settles to ok."""
+        # Set up clean task in next.md
+        (self.repo / "agent" / "next.md").write_text("# Task t1\nTask: t1\nStatus: **READY_TO_RUN**\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-am", "setup t1 in next.md"], check=True, capture_output=True)
+        proc = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True)
+        head_commit = proc.stdout.strip()
+
+        port = FakePort()
+        executor = TransitionExecutor(self.runtime, ai_execution_port=port)
+        exec_file = self.runtime / "transition-executor.json"
+        exec_data = {
+            "version": 1,
+            "executions": {
+                "req-real": {
+                    "execution_id": "exec-real",
+                    "project_id": "p1",
+                    "source_request_id": "req-real",
+                    "task_id": "t1",
+                    "state": "running",
+                    "started_at": "2020-01-01T10:00:00Z",
+                    "head": head_commit,
+                    "branch": "main",
+                    "pid": 77777,
+                }
+            }
+        }
+        exec_file.write_text(json.dumps(exec_data), encoding="utf-8")
+
+        open_execution_obligation(
+            self.runtime,
+            project_id="p1",
+            source_request_id="req-real",
+            task_id="t1",
+            launch_anchor={"git_head": head_commit, "branch": "main"},
+        )
+        record_execution_observation(
+            self.runtime,
+            project_id="p1",
+            source_request_id="req-real",
+            state="running",
+            worker_pid=77777,
+            started_at="2020-01-01T10:00:00Z",
+        )
+
+        dead_probe = lambda p: False
+        watchdog = WatchdogCoordinator(self.runtime, liveness_probe=dead_probe)
+
+        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
+            # Tick 1: Watchdog detects execution loss, reconciles row, and enqueues continue command
+            snap = self._make_snapshot(state="READY_TO_RUN", worker_state="not_started", pid=None)
+            snap["git"]["head"] = head_commit
+            snap["telemetry"] = {"task_id": "t1"}
+            ticks1 = watchdog.advance(self.config_path, {"projects": [snap]}, executor=executor)
+            self.assertEqual(ticks1[0].get("status"), "execution_loss_detected")
+
+            inv_key = invariant_key_for("p1", "req-real")
+            cmd_id = f"wd-xl-{inv_key}"
+            inbox_cmd = self.runtime / "control" / "inbox" / f"{cmd_id}.json"
+            self.assertTrue(inbox_cmd.is_file())
+
+            # Row is explicitly reconciled
+            ex_st = executor.state()
+            self.assertEqual(ex_st["executions"]["req-real"]["state"], "explicitly_reconciled")
+            self.assertEqual(ex_st["executions"]["req-real"]["reconciled_by"], cmd_id)
+
+            # Actuation: launch replacement via start_control without hand-written lineage
+            project_dict = {
+                "project_id": "p1",
+                "repo_path": str(self.repo),
+                "watchdog": {"enabled": True},
+                "execution": {
+                    "enabled": True,
+                    "owner_authorized": True,
+                    "engine": "aibroker",
+                    "worker_quality": "balanced",
+                    "allowed_next_actions": ["continue_current_stage", "next_task"],
+                },
+            }
+            launch_res = executor.start_control(
+                project_dict,
+                snap,
+                source_request_id=cmd_id,
+            )
+            self.assertIsNotNone(launch_res)
+
+            # Verify that replacement obligation auto-linked recovery_of_lineage_key
+            lineage_data = load_execution_lineage(self.runtime)
+            rep_lkey = lineage_key_for("p1", cmd_id)
+            self.assertIn(rep_lkey, lineage_data["records"])
+            rep_rec = lineage_data["records"][rep_lkey]
+            orig_lkey = lineage_key_for("p1", "req-real")
+            self.assertEqual(rep_rec.get("recovery_of_lineage_key"), orig_lkey)
+
+            # Simulate replacement execution finishing with terminal completed
+            close_lineage_record(
+                self.runtime,
+                project_id="p1",
+                source_request_id=cmd_id,
+                terminal_outcome="completed",
+            )
+            ex_st = executor.state()
+            if cmd_id in ex_st["executions"]:
+                ex_st["executions"][cmd_id]["state"] = "completed"
+                (self.runtime / "transition-executor.json").write_text(json.dumps(ex_st), encoding="utf-8")
+
+            # Remove inbox command to simulate command completion
+            inbox_cmd.unlink(missing_ok=True)
+
+            # Tick 2: Watchdog observes replacement execution completed -> resolves finding
+            ticks2 = watchdog.advance(self.config_path, {"projects": [snap]}, executor=executor)
+            self.assertEqual(ticks2[0].get("status"), "ok")
+
+            # Verify finding is resolved and health is ok
+            lineage_after = load_execution_lineage(self.runtime)
+            orig_finding = lineage_after["records"][orig_lkey]["findings"][0]
+            self.assertEqual(orig_finding["state"], "resolved")
+
+            for th in list(executor._threads.values()):
+                if th.is_alive():
+                    th.join(timeout=2.0)
+
+    def test_max_recoveries_budget_and_escalation_survive_tick_boundary(self):
+        """Multi-tick test asserting recovery_attempts budget (max 2) persists across
+        tick boundaries in execution-lineage.json and escalates without runaway retries."""
+        executor = TransitionExecutor(self.runtime)
+        # Configure max 2 recoveries, 1s backoff for multi-tick testing
+        cfg = {
+            "projects": [
+                {
+                    "project_id": "p1",
+                    "repo_path": str(self.repo),
+                    "watchdog": {
+                        "enabled": True,
+                        "auto_recovery": True,
+                        "execution_loss_detection": True,
+                        "execution_loss_confirmations": 1,
+                        "execution_loss_max_recoveries": 2,
+                        "execution_loss_backoff_seconds": 1,
+                    },
+                }
+            ]
+        }
+        self.config_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        exec_file = self.runtime / "transition-executor.json"
+        exec_file.write_text(json.dumps({
+            "version": 1,
+            "executions": {
+                "req-esc": {
+                    "execution_id": "exec-esc",
+                    "project_id": "p1",
+                    "source_request_id": "req-esc",
+                    "task_id": "t1",
+                    "state": "running",
+                    "started_at": "2020-01-01T10:00:00Z",
+                    "head": self.initial_head,
+                    "branch": "main",
+                    "pid": 88888,
+                }
+            }
+        }), encoding="utf-8")
+
+        open_execution_obligation(
+            self.runtime,
+            project_id="p1",
+            source_request_id="req-esc",
+            task_id="t1",
+            launch_anchor={"git_head": self.initial_head, "branch": "main"},
+        )
+        record_execution_observation(
+            self.runtime,
+            project_id="p1",
+            source_request_id="req-esc",
+            state="running",
+            worker_pid=88888,
+            started_at="2020-01-01T10:00:00Z",
+        )
+
+        dead_probe = lambda p: False
+        watchdog1 = WatchdogCoordinator(self.runtime, liveness_probe=dead_probe)
+
+        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        inv_key = invariant_key_for("p1", "req-esc")
+        lkey = lineage_key_for("p1", "req-esc")
+
+        t0 = datetime(2026, 9, 24, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 9, 24, 12, 0, 5, tzinfo=timezone.utc)
+        t2 = datetime(2026, 9, 24, 12, 0, 10, tzinfo=timezone.utc)
+        t3 = datetime(2026, 9, 24, 12, 0, 15, tzinfo=timezone.utc)
+
+        with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
+            snap = self._make_snapshot(state="READY_TO_RUN", worker_state="not_started", pid=None)
+
+            # Tick 1: First recovery attempt
+            watchdog1.advance(self.config_path, {"projects": [snap]}, executor=executor, now=t0)
+            lineage1 = load_execution_lineage(self.runtime)
+            f1 = lineage1["records"][lkey]["findings"][0]
+            self.assertEqual(f1["recovery_attempts"], 1)
+
+            # Clear enqueued command and clear slot phase to simulate recovery failure / disappearance
+            cmd_file = self.runtime / "control" / "inbox" / f"wd-xl-{inv_key}.json"
+            if cmd_file.is_file():
+                cmd_file.unlink()
+            watchdog1._cached_state["projects"]["p1"]["execution_loss_slots"].pop(inv_key, None)
+
+            # Tick 2: Second recovery attempt
+            watchdog1.advance(self.config_path, {"projects": [snap]}, executor=executor, now=t1)
+            lineage2 = load_execution_lineage(self.runtime)
+            f2 = lineage2["records"][lkey]["findings"][0]
+            self.assertEqual(f2["recovery_attempts"], 2)
+
+            if cmd_file.is_file():
+                cmd_file.unlink()
+            watchdog1._cached_state["projects"]["p1"]["execution_loss_slots"].pop(inv_key, None)
+
+            # Tick 3: Budget exhausted (attempts 2 >= max 2) -> must ESCALATE!
+            watchdog1.advance(self.config_path, {"projects": [snap]}, executor=executor, now=t2)
+            lineage3 = load_execution_lineage(self.runtime)
+            f3 = lineage3["records"][lkey]["findings"][0]
+            self.assertEqual(f3["state"], "escalated")
+            self.assertEqual(f3["recovery_attempts"], 2)
+
+            # No command was enqueued on escalation
+            self.assertFalse(cmd_file.is_file())
+
+            # Tick 4: CRASH & RESTART fresh watchdog instance -> verifies escalation survives tick & daemon restart
+            watchdog2 = WatchdogCoordinator(self.runtime, liveness_probe=dead_probe)
+            watchdog2.advance(self.config_path, {"projects": [snap]}, executor=executor, now=t3)
+
+            lineage4 = load_execution_lineage(self.runtime)
+            f4 = lineage4["records"][lkey]["findings"][0]
+            self.assertEqual(f4["state"], "escalated")
+            self.assertEqual(f4["recovery_attempts"], 2)
+            self.assertFalse(cmd_file.is_file())
+
+    def test_broker_status_unknown_does_not_produce_liveness_dead(self):
+        """Broker status 'unknown' or None return must produce LIVENESS_UNKNOWN,
+        and must NOT treat provider silence as death proof or CAS explicitly_reconciled."""
+        executor = TransitionExecutor(self.runtime)
+        exec_file = self.runtime / "transition-executor.json"
+        exec_file.write_text(json.dumps({
+            "version": 1,
+            "executions": {
+                "req-broker": {
+                    "execution_id": "exec-broker",
+                    "project_id": "p1",
+                    "source_request_id": "req-broker",
+                    "task_id": "t1",
+                    "state": "running",
+                    "engine": "aibroker",
+                    "broker_request_id": "br-req-123",
+                    "head": self.initial_head,
+                    "branch": "main",
+                }
+            }
+        }), encoding="utf-8")
+
+        open_execution_obligation(
+            self.runtime,
+            project_id="p1",
+            source_request_id="req-broker",
+            task_id="t1",
+            engine="aibroker",
+            backend_handle="br-req-123",
+            launch_anchor={"git_head": self.initial_head, "branch": "main"},
+        )
+
+        mock_broker_port = unittest.mock.MagicMock()
+        # Return unknown status
+        mock_broker_port.status.return_value = {"status": "unknown"}
+
+        lrec = load_execution_lineage(self.runtime)["records"][lineage_key_for("p1", "req-broker")]
+        res = resolve_execution_liveness(
+            lrec,
+            executor_state=executor.state(),
+            ai_execution_port=mock_broker_port,
+        )
+        self.assertEqual(res["verdict"], "unknown")
+
+        # None return from broker status also produces unknown
+        mock_broker_port.status.return_value = None
+        res_none = resolve_execution_liveness(
+            lrec,
+            executor_state=executor.state(),
+            ai_execution_port=mock_broker_port,
+        )
+        self.assertEqual(res_none["verdict"], "unknown")
+
+        # Watchdog advance with broker returning unknown must NOT reconcile row
+        watchdog = WatchdogCoordinator(self.runtime, ai_execution_port=mock_broker_port)
+        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
+            snap = self._make_snapshot(state="READY_TO_RUN", worker_state="not_started", pid=None)
+            watchdog.advance(self.config_path, {"projects": [snap]}, executor=executor)
+
+            ex_st = executor.state()
+            self.assertEqual(ex_st["executions"]["req-broker"]["state"], "running")
+
+    def test_running_without_provider_output_remains_diagnostic_only(self):
+        """RUNNING_WITHOUT_PROVIDER_OUTPUT must remain diagnostic-only while liveness is alive
+        or unknown, and must never authorize retry."""
+        executor = TransitionExecutor(self.runtime)
+        exec_file = self.runtime / "transition-executor.json"
+        exec_file.write_text(json.dumps({
+            "version": 1,
+            "executions": {
+                "req-long": {
+                    "execution_id": "exec-long",
+                    "project_id": "p1",
+                    "source_request_id": "req-long",
+                    "task_id": "t1",
+                    "state": "running",
+                    "started_at": "2020-01-01T10:00:00Z",
+                    "provider_output_observed": False,
+                    "head": self.initial_head,
+                    "branch": "main",
+                    "pid": 33333,
+                }
+            }
+        }), encoding="utf-8")
+
+        open_execution_obligation(
+            self.runtime,
+            project_id="p1",
+            source_request_id="req-long",
+            task_id="t1",
+            launch_anchor={"git_head": self.initial_head, "branch": "main"},
+        )
+        record_execution_observation(
+            self.runtime,
+            project_id="p1",
+            source_request_id="req-long",
+            state="running",
+            worker_pid=33333,
+            started_at="2020-01-01T10:00:00Z",
+            provider_output_observed=False,
+        )
+
+        # Worker is alive with matching PID and started_at
+        alive_probe = lambda p: True
+        watchdog = WatchdogCoordinator(self.runtime, liveness_probe=alive_probe)
+
+        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
+            snap = self._make_snapshot(state="EXECUTING", worker_state="running", pid=33333)
+            snap["worker"]["started_at"] = "2020-01-01T10:00:00Z"
+            ticks = watchdog.advance(self.config_path, {"projects": [snap]}, executor=executor)
+
+            # Row remains running, no recovery command enqueued
+            ex_st = executor.state()
+            self.assertEqual(ex_st["executions"]["req-long"]["state"], "running")
+            inbox_files = list((self.runtime / "control" / "inbox").glob("*.json"))
+            self.assertEqual(len(inbox_files), 0)
+
+            # Finding is suppressed_live
+            lkey = lineage_key_for("p1", "req-long")
+            lineage = load_execution_lineage(self.runtime)
+            finding = lineage["records"][lkey]["findings"][0]
+            self.assertEqual(finding["state"], "suppressed_live")
+
+    def test_reconcile_blocked_and_recovery_required_rows(self):
+        """reconcile_execution_loss must successfully reconcile non-active non-terminal rows
+        in 'blocked' and 'recovery_required' states instead of returning unavailable."""
+        executor = TransitionExecutor(self.runtime)
+        exec_file = self.runtime / "transition-executor.json"
+        exec_file.write_text(json.dumps({
+            "version": 1,
+            "executions": {
+                "req-blk": {
+                    "execution_id": "exec-blk",
+                    "project_id": "p1",
+                    "source_request_id": "req-blk",
+                    "task_id": "t1",
+                    "state": "blocked",
+                    "head": self.initial_head,
+                    "branch": "main",
+                },
+                "req-rec": {
+                    "execution_id": "exec-rec",
+                    "project_id": "p1",
+                    "source_request_id": "req-rec",
+                    "task_id": "t1",
+                    "state": "recovery_required",
+                    "head": self.initial_head,
+                    "branch": "main",
+                },
+            }
+        }), encoding="utf-8")
+
+        res_blk = executor.reconcile_execution_loss(
+            "req-blk",
+            project_id="p1",
+            invariant_key="inv-blk",
+            command_id="wd-xl-inv-blk",
+            expected_anchor={"git_head": self.initial_head, "branch": "main"},
+            evidence={"verdict": "dead"},
+        )
+        self.assertEqual(res_blk.get("status"), "reconciled")
+        ex_st = executor.state()
+        self.assertEqual(ex_st["executions"]["req-blk"]["state"], "explicitly_reconciled")
+
+        res_rec = executor.reconcile_execution_loss(
+            "req-rec",
+            project_id="p1",
+            invariant_key="inv-rec",
+            command_id="wd-xl-inv-rec",
+            expected_anchor={"git_head": self.initial_head, "branch": "main"},
+            evidence={"verdict": "dead"},
+        )
+        self.assertEqual(res_rec.get("status"), "reconciled")
+        ex_st = executor.state()
+        self.assertEqual(ex_st["executions"]["req-rec"]["state"], "explicitly_reconciled")
+
 
 if __name__ == "__main__":
     unittest.main()
-

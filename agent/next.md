@@ -25,4 +25,4 @@ Convert unattended-execution anomalies and control-only owner interventions into
 
 ## Sequence
 
-P16.7 self-healing activation -> P16.8 golden-path liveness -> P16.9 execution-loss watchdog -> P16.10 automatic failure harvesting -> P16.11 AGY-first resource routing.
+P16.7 self-healing activation -> P16.8 golden-path liveness -> P16.9 execution-loss watchdog -> P16.10 automatic failure harvesting -> P16.11 AGY-first resource routing -> P16.12 Web Sol persistent pairing and truthful availability.

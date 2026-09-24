@@ -113,11 +113,16 @@ def _lineage_lock(runtime_root: Path | str) -> InterProcessFileLock:
 def _quarantine_corrupt_lineage(runtime: Path, reason: str, raw_bytes: bytes) -> dict[str, Any]:
     stamp = utc_now_iso().replace(":", "-")
     file_hash = hashlib.sha256(raw_bytes).hexdigest()[:16] if raw_bytes else "empty"
-    quarantine_file = runtime / f"{LINEAGE_CORRUPT_PREFIX}{stamp}-{file_hash}"
-    try:
-        quarantine_file.write_bytes(raw_bytes)
-    except OSError:
-        pass
+    already_quarantined = any(
+        q.name.endswith(f"-{file_hash}")
+        for q in runtime.glob(f"{LINEAGE_CORRUPT_PREFIX}*")
+    )
+    if not already_quarantined:
+        quarantine_file = runtime / f"{LINEAGE_CORRUPT_PREFIX}{stamp}-{file_hash}"
+        try:
+            quarantine_file.write_bytes(raw_bytes)
+        except OSError:
+            pass
     return {
         "schema_version": LIFECYCLE_SCHEMA_VERSION,
         "degraded": True,
@@ -377,6 +382,95 @@ def close_lineage_record(
         return copy.deepcopy(record)
 
 
+def update_finding_state(
+    runtime_root: Path | str,
+    *,
+    project_id: str,
+    lineage_key: str,
+    invariant_key: Optional[str] = None,
+    finding_id: Optional[str] = None,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    recovery_attempts: Optional[int] = None,
+    confirmations: Optional[int] = None,
+    details: Optional[dict[str, Any]] = None,
+    resolved_at: Optional[str] = None,
+    resolved_reason: Optional[str] = None,
+    **kwargs: Any,
+) -> Optional[dict[str, Any]]:
+    """Persist finding state and recovery metadata back to the durable lineage store."""
+    runtime = Path(runtime_root)
+    with _lineage_lock(runtime):
+        data = load_execution_lineage(runtime)
+        if data.get("degraded"):
+            return None
+        record = data.get("records", {}).get(lineage_key) if lineage_key else None
+        if not isinstance(record, dict):
+            for r in data.get("records", {}).values():
+                if not isinstance(r, dict):
+                    continue
+                if project_id and str(r.get("project_id") or "") != project_id:
+                    continue
+                if invariant_key and r.get("invariant_key") == invariant_key:
+                    record = r
+                    lineage_key = r.get("lineage_key", "")
+                    break
+                for f in r.get("findings", []):
+                    if finding_id and f.get("finding_id") == finding_id:
+                        record = r
+                        lineage_key = r.get("lineage_key", "")
+                        break
+                    if invariant_key and f.get("invariant_key") == invariant_key:
+                        record = r
+                        lineage_key = r.get("lineage_key", "")
+                        break
+                if record:
+                    break
+
+        if not isinstance(record, dict):
+            return None
+
+        matched_finding = None
+        for f in record.get("findings", []):
+            if finding_id and f.get("finding_id") == finding_id:
+                matched_finding = f
+                break
+            if invariant_key and f.get("invariant_key") == invariant_key:
+                matched_finding = f
+                break
+            if code and f.get("code") == code:
+                matched_finding = f
+                break
+
+        if matched_finding is None:
+            return None
+
+        now_iso = utc_now_iso()
+        if state is not None:
+            matched_finding["state"] = state
+        if recovery_attempts is not None:
+            matched_finding["recovery_attempts"] = recovery_attempts
+            record["recovery_attempts"] = max(int(record.get("recovery_attempts", 0)), recovery_attempts)
+        if confirmations is not None:
+            matched_finding["confirmations"] = confirmations
+        if details:
+            matched_finding.setdefault("details", {}).update(details)
+        if resolved_at is not None:
+            matched_finding["resolved_at"] = resolved_at
+        elif state == FINDING_RESOLVED and not matched_finding.get("resolved_at"):
+            matched_finding["resolved_at"] = now_iso
+        if resolved_reason is not None:
+            matched_finding["resolved_reason"] = resolved_reason
+
+        for k, v in kwargs.items():
+            matched_finding[k] = v
+
+        record["updated_at"] = now_iso
+        record["integrity_hash"] = compute_lineage_integrity_hash(record)
+        write_json(runtime / LINEAGE_STATE_FILE, data)
+        return copy.deepcopy(matched_finding)
+
+
 def resolve_execution_liveness(
     target: Any,
     *args: Any,
@@ -448,12 +542,16 @@ def resolve_execution_liveness(
     })
 
     # Probe 2: Exact broker request status
-    broker_request_id = (
-        lineage_record.get("backend_handle")
-        or kwargs.get("engine_handle")
-        or (exec_row.get("broker_request_id") if isinstance(exec_row, dict) else None)
-    )
     engine = lineage_record.get("engine") or (exec_row.get("engine") if isinstance(exec_row, dict) else None)
+    if engine == "aibroker":
+        broker_request_id = (
+            lineage_record.get("backend_handle")
+            or kwargs.get("engine_handle")
+            or (exec_row.get("broker_request_id") if isinstance(exec_row, dict) else None)
+        )
+    else:
+        broker_request_id = kwargs.get("broker_request_id") or (exec_row.get("broker_request_id") if isinstance(exec_row, dict) else None)
+
     broker_probe: dict[str, Any] = {
         "probe": "broker_status",
         "timestamp": now_iso,
@@ -462,27 +560,30 @@ def resolve_execution_liveness(
         "fact": None,
         "status": None,
     }
-    if engine == "aibroker" or broker_request_id:
-        if ai_execution_port is not None and hasattr(ai_execution_port, "status") and broker_request_id:
-            try:
-                fact = ai_execution_port.status(str(broker_request_id))
-                broker_probe["checked"] = True
-                broker_probe["fact"] = fact
-                if isinstance(fact, dict):
-                    b_status = fact.get("status")
-                    broker_probe["status"] = b_status
-                    if b_status in {"running", "starting"}:
-                        has_live_proof = True
-                        live_reasons.append(f"broker reports live status {b_status}")
-                    elif b_status in {"succeeded", "failed", "cancelled", "not_found", "unknown"}:
-                        conclusive_death_proof = True
-                        death_reasons.append(f"broker reports terminal/not_found status {b_status}")
-                elif fact is None:
-                    broker_probe["status"] = "not_found"
+    if broker_request_id and ai_execution_port is not None and hasattr(ai_execution_port, "status"):
+        try:
+            fact = ai_execution_port.status(str(broker_request_id))
+            broker_probe["checked"] = True
+            broker_probe["fact"] = fact
+            if isinstance(fact, dict):
+                b_status = fact.get("status")
+                broker_probe["status"] = b_status
+                if b_status in {"running", "starting"}:
+                    has_live_proof = True
+                    live_reasons.append(f"broker reports live status {b_status}")
+                elif b_status in {"succeeded", "failed", "cancelled"}:
+                    conclusive_death_proof = True
+                    death_reasons.append(f"broker reports terminal status {b_status}")
+                elif b_status == "not_found":
                     conclusive_death_proof = True
                     death_reasons.append("broker reports execution not_found")
-            except Exception as exc:
-                broker_probe["error"] = str(exc)
+                else:
+                    broker_probe["status"] = b_status or "unknown"
+            elif fact is None:
+                broker_probe["status"] = "unavailable"
+        except Exception as exc:
+            broker_probe["error"] = str(exc)
+            broker_probe["status"] = "unavailable"
     probes.append(broker_probe)
 
     # Probe 3: PID plus started_at identity
@@ -655,6 +756,8 @@ def observe_executions(
                 "records": {},
             }
 
+        mutated = False
+
         # Step A: Adopt active rows from executor_state or sync terminal rows
         if isinstance(executor_state, dict) and isinstance(executor_state.get("executions"), dict):
             for rec in executor_state["executions"].values():
@@ -706,6 +809,7 @@ def observe_executions(
                             "audit_entries": [{"action": "adopted_from_executor_row", "timestamp": now_iso}],
                         }
                         data["records"][lkey]["integrity_hash"] = compute_lineage_integrity_hash(data["records"][lkey])
+                        mutated = True
                 else:
                     lineage_rec = data["records"][lkey]
                     if st in TERMINAL_OUTCOMES:
@@ -719,13 +823,21 @@ def observe_executions(
                                 "outcome": st,
                             })
                             lineage_rec["integrity_hash"] = compute_lineage_integrity_hash(lineage_rec)
+                            mutated = True
 
         # Step B: Evaluate all project lineage records
         project_records = [r for r in data["records"].values() if str(r.get("project_id") or "") == project_id]
 
         for lrec in project_records:
             rep_lineage = next(
-                (r for r in project_records if r.get("recovery_of_lineage_key") == lrec["lineage_key"]),
+                (
+                    r for r in project_records
+                    if (
+                        r.get("recovery_of_lineage_key") == lrec["lineage_key"]
+                        or r.get("source_request_id") == f"wd-xl-{lrec['invariant_key']}"
+                        or r.get("control_id") == f"wd-xl-{lrec['invariant_key']}"
+                    )
+                ),
                 None
             )
             for finding in lrec.get("findings", []):
@@ -736,14 +848,18 @@ def observe_executions(
                         finding["resolved_reason"] = (
                             f"replacement execution {rep_lineage.get('source_request_id')} reached terminal outcome {rep_lineage.get('terminal_outcome')}"
                         )
+                        mutated = True
                     elif lrec.get("lifecycle_phase") == "terminal" and lrec.get("terminal_outcome") in {"completed", "failed", "cancelled"}:
                         finding["state"] = FINDING_RESOLVED
                         finding["resolved_at"] = now_iso
                         finding["resolved_reason"] = (
                             f"original execution reached authoritative terminal outcome {lrec.get('terminal_outcome')}"
                         )
+                        mutated = True
 
-            if lrec.get("lifecycle_phase") == "terminal":
+            if lrec.get("lifecycle_phase") == "terminal" and lrec.get("terminal_outcome") in {"completed", "failed", "cancelled"}:
+                continue
+            if lrec.get("lifecycle_phase") == "terminal" and all(f.get("state") == FINDING_RESOLVED for f in lrec.get("findings", [])):
                 continue
 
             src_id = lrec.get("source_request_id")
@@ -763,7 +879,6 @@ def observe_executions(
             elif (
                 str(snapshot.get("state") or snapshot.get("lifecycle_state") or "").upper() in {"READY_TO_RUN", "IDLE"}
                 and not snapshot.get("active_roles")
-                and str((snapshot.get("worker") or {}).get("state") or "").lower() not in ACTIVE_WORKER_STATES
                 and str((snapshot.get("broker_execution") or {}).get("state") or "").lower() not in {"launching", "running"}
             ):
                 detected_code = WORKER_VANISHED_WITHOUT_TERMINAL_STATE
@@ -805,6 +920,7 @@ def observe_executions(
                         "state": FINDING_CANDIDATE,
                         "detected_at": now_iso,
                         "confirmations": 0,
+                        "recovery_attempts": 0,
                         "launch_anchor": copy.deepcopy(lrec.get("launch_anchor")),
                         "details": {
                             "project_id": project_id,
@@ -819,6 +935,7 @@ def observe_executions(
                         },
                     }
                     lrec.setdefault("findings", []).append(existing_finding)
+                    mutated = True
 
                 # Probe liveness without early exit
                 liveness = resolve_execution_liveness(
@@ -835,30 +952,59 @@ def observe_executions(
                 existing_finding["details"]["liveness"] = liveness
 
                 verdict = liveness["verdict"]
-                if existing_finding["state"] in {FINDING_CANDIDATE, FINDING_OPEN, FINDING_SUPPRESSED_LIVE, FINDING_ACTIONABLE_DEAD, FINDING_UNRESOLVED_UNKNOWN}:
+                if existing_finding.get("code") == RUNNING_WITHOUT_PROVIDER_OUTPUT:
+                    # Diagnostic-only invariant: must never authorize retry / transition to ACTIONABLE_DEAD
                     if verdict == LIVENESS_ALIVE:
-                        existing_finding["state"] = FINDING_SUPPRESSED_LIVE
+                        if existing_finding.get("state") != FINDING_SUPPRESSED_LIVE:
+                            existing_finding["state"] = FINDING_SUPPRESSED_LIVE
+                            mutated = True
                         existing_finding["confirmations"] = 0
+                    else:
+                        if existing_finding.get("state") != FINDING_OPEN:
+                            existing_finding["state"] = FINDING_OPEN
+                            mutated = True
+                elif existing_finding["state"] in {
+                    FINDING_CANDIDATE,
+                    FINDING_OPEN,
+                    FINDING_SUPPRESSED_LIVE,
+                    FINDING_ACTIONABLE_DEAD,
+                    FINDING_UNRESOLVED_UNKNOWN,
+                    FINDING_RECOVERY_RESERVED,
+                    FINDING_RECOVERING,
+                }:
+                    if verdict == LIVENESS_ALIVE:
+                        if existing_finding.get("state") != FINDING_SUPPRESSED_LIVE or existing_finding.get("confirmations") != 0:
+                            existing_finding["state"] = FINDING_SUPPRESSED_LIVE
+                            existing_finding["confirmations"] = 0
+                            mutated = True
                     elif verdict == LIVENESS_DEAD:
                         existing_finding["confirmations"] = int(existing_finding.get("confirmations", 0)) + 1
                         confirm_target = int(policy.get("execution_loss_confirmations", 2)) if policy else 2
-                        if existing_finding["confirmations"] >= confirm_target:
-                            existing_finding["state"] = FINDING_ACTIONABLE_DEAD
-                        else:
-                            existing_finding["state"] = FINDING_OPEN
+                        new_state = FINDING_ACTIONABLE_DEAD if existing_finding["confirmations"] >= confirm_target else FINDING_OPEN
+                        if existing_finding.get("state") != new_state:
+                            existing_finding["state"] = new_state
+                        mutated = True
                     else:  # LIVENESS_UNKNOWN
-                        existing_finding["state"] = FINDING_UNRESOLVED_UNKNOWN
                         det_dt = parse_utc(existing_finding.get("detected_at"))
                         esc_minutes = float(policy.get("execution_loss_unknown_escalation_minutes", 15.0)) if policy else 15.0
+                        new_state = FINDING_UNRESOLVED_UNKNOWN
                         if det_dt and (now_dt - det_dt).total_seconds() > esc_minutes * 60:
-                            existing_finding["state"] = FINDING_ESCALATED
+                            new_state = FINDING_ESCALATED
+                        if existing_finding.get("state") != new_state:
+                            existing_finding["state"] = new_state
+                            mutated = True
 
                 lrec["updated_at"] = now_iso
-                lrec["integrity_hash"] = compute_lineage_integrity_hash(lrec)
+                new_hash = compute_lineage_integrity_hash(lrec)
+                if lrec.get("integrity_hash") != new_hash:
+                    lrec["integrity_hash"] = new_hash
+                    mutated = True
 
-        write_json(runtime / LINEAGE_STATE_FILE, data)
+        if mutated:
+            write_json(runtime / LINEAGE_STATE_FILE, data)
 
         active_findings: list[dict[str, Any]] = []
+        resolved_findings: list[dict[str, Any]] = []
         unresolved_invariants: list[str] = []
         for r in project_records:
             for f in r.get("findings", []):
@@ -868,10 +1014,13 @@ def observe_executions(
                         inv = f.get("invariant_key") or f.get("code")
                         if inv:
                             unresolved_invariants.append(inv)
+                else:
+                    resolved_findings.append(copy.deepcopy(f))
 
         actionable_findings = [
             f for f in active_findings
             if f.get("state") in {FINDING_ACTIONABLE_DEAD, FINDING_RECONCILED_PENDING_RETRY}
+            and f.get("code") != RUNNING_WITHOUT_PROVIDER_OUTPUT
         ]
         status = "loss_detected" if unresolved_invariants else "ok"
         findings_map: dict[str, Any] = {}
@@ -885,6 +1034,7 @@ def observe_executions(
             "degraded": False,
             "findings": findings_map,
             "active_findings": active_findings,
+            "resolved_findings": resolved_findings,
             "actionable_findings": actionable_findings,
             "unresolved_invariants": sorted(list(set(unresolved_invariants))),
             "lineage_records_count": len(project_records),
@@ -903,7 +1053,11 @@ def detect_execution_loss(lineage_data: dict[str, Any], project_id: str) -> tupl
         for f in rec.get("findings", []):
             if f.get("state") in FINDING_ACTIVE_STATES:
                 active_findings.append(f)
-                if f.get("state") in {FINDING_ACTIONABLE_DEAD, FINDING_RECONCILED_PENDING_RETRY} and top_actionable is None:
+                if (
+                    f.get("state") in {FINDING_ACTIONABLE_DEAD, FINDING_RECONCILED_PENDING_RETRY}
+                    and f.get("code") != RUNNING_WITHOUT_PROVIDER_OUTPUT
+                    and top_actionable is None
+                ):
                     top_actionable = f
 
     has_loss = any(f.get("state") != FINDING_SUPPRESSED_LIVE for f in active_findings)

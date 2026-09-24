@@ -30,14 +30,15 @@ P16.9 Watchdog Execution-Loss Detection & Recovery completion (2026-09-24):
   - Added `EXECUTION_LOSS_UNRESOLVED` blocker in `src/dev_orchestrator/core/blockers.py`.
   - Registered milestones: `EXECUTION_LOSS_DETECTED`, `EXECUTION_LOSS_RECOVERY_STARTED`, `EXECUTION_LOSS_ESCALATED`, `EXECUTION_LOSS_RESOLVED`.
   - Exposed `execution_loss`, `execution_loss_slots`, `unresolved_invariants`, and `reconciliation_phase` in `src/dev_orchestrator/core/project_status.py`.
-- Full Verification:
-  - 18 focused tests passing 100% across `test_p169_execution_lineage.py` (6/6), `test_p169_watchdog_execution_loss.py` (6/6), and `test_p169_legitimate_cases.py` (6/6).
-  - 143 watchdog regression tests passing (`test_watchdog*.py`).
-  - 57 transition executor regression tests passing (`test_transition_executor*.py`).
-  - 68 P16.7 and P16.8 regression tests passing.
-  - Full test suite: 1136 passed, 92 subtests passed, 0 failures.
+- Full Verification & Technical Review Remediation (2026-09-24):
+  - Technical Review remediation closed all 5 blockers (B1: durable finding write-back via `update_finding_state(...)`; B2: replacement execution lineage linkage via `start_control` and `observe_executions` correlation; B3: `RUNNING_WITHOUT_PROVIDER_OUTPUT` strictly diagnostic-only; B4: broker status `unknown`/unavailable reclassified as `LIVENESS_UNKNOWN` with broker queries restricted to `aibroker`; B5: handled `blocked`/`recovery_required` rows in `reconcile_execution_loss`) plus non-blocking items (a-d: milestone emission, quarantine deduplication, unmutated write avoidance, and watchdog error reset).
+  - Added 5 new regression tests in `tests_py/test_p169_watchdog_execution_loss.py`.
+  - 23 focused tests passing 100% across `test_p169_*.py`.
+  - 130 watchdog regression tests passing (`test_watchdog*.py`).
+  - 147 transition executor and P16.7–P16.9 regression tests passing.
+  - Full test suite: 1141 passed, 92 subtests passed, 0 failures.
   - Clean `compileall` and `git diff --check`.
-  - Graphify knowledge graph updated (`5714 nodes, 16021 edges, 244 communities`).
+  - Graphify knowledge graph updated (`5722 nodes, 16076 edges, 263 communities`).
 
 P16.8 DevO Golden-Path Lifecycle Hardening completion (2026-09-24):
 - Delivered the Golden-Path lifecycle guarantee: proved that a fresh, owner-authorized task moves from PENDING_DESIGN to DONE under a single owner continue command without manual lifecycle repair.

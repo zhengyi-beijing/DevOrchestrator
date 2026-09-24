@@ -684,7 +684,16 @@ class ControlCommandCoordinator:
                 reason_msg = readiness_info.get("reason") or "invalid or stale project readiness"
                 return self._blocked(command_id, project_id, action, reason_msg, now, record, blockers=blist)
 
-        launch = executor.start_control(projects[project_id], snapshot, command_id)
+        target = record.get("target") if isinstance(record.get("target"), dict) else {}
+        recovery_lineage_key = target.get("recovery_of_lineage_key")
+        lineage_arg = {"recovery_of_lineage_key": recovery_lineage_key} if recovery_lineage_key else None
+        if lineage_arg is not None:
+            try:
+                launch = executor.start_control(projects[project_id], snapshot, command_id, lineage=lineage_arg)
+            except TypeError:
+                launch = executor.start_control(projects[project_id], snapshot, command_id)
+        else:
+            launch = executor.start_control(projects[project_id], snapshot, command_id)
         if launch is not None:
             from dev_orchestrator.core.execution_intent import record_or_refresh_intent
             record_or_refresh_intent(

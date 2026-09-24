@@ -1587,6 +1587,7 @@ class WatchdogCoordinator:
                 prow["cooldown_minutes"] = policy["cooldown_minutes"]
                 prow.setdefault("execution_loss", None)
                 prow.setdefault("execution_loss_slots", {})
+                prow["last_error"] = None
 
                 if degraded or pid in quarantined or not policy["enabled"]:
                     results.append({"project_id": pid, "status": "skipped", "reason": "degraded_or_quarantined_or_disabled"})
@@ -1611,6 +1612,41 @@ class WatchdogCoordinator:
                     except Exception as exc:
                         prow["last_error"] = f"execution_loss_observation_failed: {exc}"
                         loss_summary = None
+
+                # Emit execution loss milestones and update slots
+                if loss_summary:
+                    for f in loss_summary.get("active_findings", []):
+                        if f.get("state") not in ("suppressed_live",):
+                            inv_k = f.get("invariant_key") or f.get("code")
+                            self._emit_milestone(
+                                pid,
+                                "EXECUTION_LOSS_DETECTED",
+                                task_id=f.get("task_id"),
+                                occurrence_key=f"{inv_k}:detected",
+                                details={
+                                    "invariant_key": inv_k,
+                                    "code": f.get("code"),
+                                    "source_request_id": f.get("source_request_id"),
+                                },
+                            )
+                    for f in loss_summary.get("resolved_findings", []):
+                        inv_k = f.get("invariant_key") or f.get("code")
+                        self._emit_milestone(
+                            pid,
+                            "EXECUTION_LOSS_RESOLVED",
+                            task_id=f.get("task_id"),
+                            occurrence_key=f"{inv_k}:resolved",
+                            details={
+                                "invariant_key": inv_k,
+                                "code": f.get("code"),
+                                "reason": f.get("resolved_reason"),
+                            },
+                        )
+                        slots = prow.setdefault("execution_loss_slots", {})
+                        if inv_k in slots and slots[inv_k].get("phase") != "completed":
+                            slots[inv_k]["phase"] = "completed"
+                            slots[inv_k]["state"] = "completed"
+                            slots[inv_k]["resolved_at"] = f.get("resolved_at") or utc_now_iso()
 
                 # Trigger execution loss recovery for actionable findings
                 if loss_summary and loss_summary.get("actionable_findings"):
@@ -2347,6 +2383,11 @@ class WatchdogCoordinator:
         if not pid or not invariant_key:
             return
 
+        if finding.get("code") == "RUNNING_WITHOUT_PROVIDER_OUTPUT":
+            return
+
+        from dev_orchestrator.core.execution_lifecycle import update_finding_state
+
         policy = resolve_watchdog_policy(project_config)
         if not policy.get("auto_recovery", False):
             return
@@ -2374,6 +2415,14 @@ class WatchdogCoordinator:
         expected_head = launch_anchor.get("head") or launch_anchor.get("git_head")
         if expected_head and truth.head and truth.head != expected_head:
             finding["state"] = "escalated"
+            update_finding_state(
+                self.runtime_root,
+                project_id=pid,
+                lineage_key=finding.get("lineage_key", ""),
+                invariant_key=invariant_key,
+                finding_id=finding.get("finding_id"),
+                state="escalated",
+            )
             self._emit_milestone(
                 pid,
                 "EXECUTION_LOSS_ESCALATED",
@@ -2399,6 +2448,15 @@ class WatchdogCoordinator:
         recovery_count = int(finding.get("recovery_attempts", 0))
         if recovery_count >= max_recoveries:
             finding["state"] = "escalated"
+            update_finding_state(
+                self.runtime_root,
+                project_id=pid,
+                lineage_key=finding.get("lineage_key", ""),
+                invariant_key=invariant_key,
+                finding_id=finding.get("finding_id"),
+                state="escalated",
+                recovery_attempts=recovery_count,
+            )
             self._emit_milestone(
                 pid,
                 "EXECUTION_LOSS_ESCALATED",
@@ -2438,6 +2496,14 @@ class WatchdogCoordinator:
                 finding["state"] = "suppressed_live"
             else:
                 finding["state"] = "unresolved_unknown"
+            update_finding_state(
+                self.runtime_root,
+                project_id=pid,
+                lineage_key=finding.get("lineage_key", ""),
+                invariant_key=invariant_key,
+                finding_id=finding.get("finding_id"),
+                state=finding["state"],
+            )
             return
 
         if executor is None or not hasattr(executor, "reconcile_execution_loss"):
@@ -2482,6 +2548,15 @@ class WatchdogCoordinator:
                 "reason": f"execution loss recovery for {invariant_key}",
             }
             self._save_state(self._cached_state)
+            update_finding_state(
+                self.runtime_root,
+                project_id=pid,
+                lineage_key=finding.get("lineage_key", ""),
+                invariant_key=invariant_key,
+                finding_id=finding.get("finding_id"),
+                state="recovery_reserved",
+                recovery_attempts=finding["recovery_attempts"],
+            )
 
             # 2. CALL executor.reconcile_execution_loss
             reconcile_res = executor.reconcile_execution_loss(
@@ -2499,18 +2574,51 @@ class WatchdogCoordinator:
                 slots[invariant_key]["reconciled_at"] = utc_now_iso()
                 finding["state"] = "reconciled_pending_retry"
                 self._save_state(self._cached_state)
+                update_finding_state(
+                    self.runtime_root,
+                    project_id=pid,
+                    lineage_key=finding.get("lineage_key", ""),
+                    invariant_key=invariant_key,
+                    finding_id=finding.get("finding_id"),
+                    state="reconciled_pending_retry",
+                )
             elif status == "superseded_by_terminal":
                 slots[invariant_key]["state"] = "completed"
                 slots[invariant_key]["phase"] = "completed"
                 slots[invariant_key]["resolved_at"] = utc_now_iso()
                 finding["state"] = "resolved"
                 self._save_state(self._cached_state)
+                update_finding_state(
+                    self.runtime_root,
+                    project_id=pid,
+                    lineage_key=finding.get("lineage_key", ""),
+                    invariant_key=invariant_key,
+                    finding_id=finding.get("finding_id"),
+                    state="resolved",
+                    resolved_at=utc_now_iso(),
+                    resolved_reason="superseded by terminal execution",
+                )
+                self._emit_milestone(
+                    pid,
+                    "EXECUTION_LOSS_RESOLVED",
+                    task_id=finding.get("task_id"),
+                    occurrence_key=f"{invariant_key}:resolved",
+                    details={"invariant_key": invariant_key, "reason": "superseded_by_terminal"},
+                )
                 return
             elif status == "conflict":
                 slots[invariant_key]["state"] = "blocked"
                 slots[invariant_key]["phase"] = "blocked"
                 finding["state"] = "unresolved_unknown"
                 self._save_state(self._cached_state)
+                update_finding_state(
+                    self.runtime_root,
+                    project_id=pid,
+                    lineage_key=finding.get("lineage_key", ""),
+                    invariant_key=invariant_key,
+                    finding_id=finding.get("finding_id"),
+                    state="unresolved_unknown",
+                )
                 return
             else:
                 slots[invariant_key]["state"] = "blocked"
@@ -2541,6 +2649,14 @@ class WatchdogCoordinator:
             slots[invariant_key]["requested_at"] = utc_now_iso()
             finding["state"] = "recovering"
             self._save_state(self._cached_state)
+            update_finding_state(
+                self.runtime_root,
+                project_id=pid,
+                lineage_key=finding.get("lineage_key", ""),
+                invariant_key=invariant_key,
+                finding_id=finding.get("finding_id"),
+                state="recovering",
+            )
             self._emit_milestone(
                 pid,
                 "EXECUTION_LOSS_RECOVERY_STARTED",

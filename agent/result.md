@@ -1412,3 +1412,31 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - Full test suite: 1136 passed, 92 subtests passed, 0 failures.
   - Clean `compileall` and `git diff --check`.
   - Graphify knowledge graph updated (`5714 nodes, 16021 edges, 244 communities`).
+
+## P16.9 Review Remediation (2026-09-24)
+
+- Closed Technical Review findings from `ai_review:auto-6fabf2703e0a1a110c5ecbd4:execute`:
+  1. Blocker B1 (Durable finding recovery state): Implemented `update_finding_state(...)` under `_lineage_lock` in `src/dev_orchestrator/core/execution_lifecycle.py` with fallback record lookup across project, invariant, and finding IDs, persisting updates to both finding and record. In `src/dev_orchestrator/core/watchdog.py`, persisted finding state transitions (`recovering`, `reconciled`, `escalated`) and incremented `recovery_attempts` via `update_finding_state(...)`, ensuring retry budgets and escalation bounds survive tick boundaries and restarts.
+  2. Blocker B2 (Replacement execution lineage linkage): In `src/dev_orchestrator/core/transition_executor.py`, updated `start_control` to inspect the ledger for `explicitly_reconciled` rows reconciled by the command ID (`reconciled_by == source_request_id` or `source_request_id.startswith("wd-xl-")` matching invariant key), deriving `lineage = {"recovery_of": lost_srid, "recovery_of_lineage_key": lineage_key_for(project_id, lost_srid)}` and passing to `_launch`. In `observe_executions`, matched replacement records by `recovery_of_lineage_key`, `source_request_id`, or `control_id`, and resolved findings upon replacement completion, emitting `EXECUTION_LOSS_RESOLVED` and freeing `execution_loss_slots`. In `src/dev_orchestrator/core/control_commands.py`, preserved backward compatibility for mock executors.
+  3. Blocker B3 (`RUNNING_WITHOUT_PROVIDER_OUTPUT` safety): Gated `RUNNING_WITHOUT_PROVIDER_OUTPUT` in `observe_executions` to remain strictly diagnostic-only (`FINDING_SUPPRESSED_LIVE` if liveness is alive, `FINDING_OPEN` if dead/unknown), excluded it from `actionable_findings`, and prevented watchdog `_trigger_execution_loss_recovery` from authorizing recovery on runs without output while live.
+  4. Blocker B4 (Broker status and liveness classification): In `resolve_execution_liveness` (Probe 2), restricted broker status queries strictly to `engine == "aibroker"`; classified broker statuses `succeeded`, `failed`, `cancelled`, and explicit `not_found` as `conclusive_death_proof`; and reclassified `unknown`, unavailable, and `fact is None` as `status: "unavailable"/"unknown"` without treating provider silence as proof of death.
+  5. Blocker B5 (Non-active non-terminal executor rows): In `reconcile_execution_loss`, expanded Case 4 to accept `current_st in {"blocked", "recovery_required"}` when launch anchor matches, compare-and-setting to `explicitly_reconciled` tombstone with `row["reconciled_by"] = command_id` and calling `close_lineage_record`, eliminating permanent wedging of executor health.
+  6. Non-blocking improvements:
+     - (a) Emitted `EXECUTION_LOSS_DETECTED` and `EXECUTION_LOSS_RESOLVED` milestones and completed `execution_loss_slots` upon resolution.
+     - (b) Quarantine file deduplication in `_quarantine_corrupt_lineage`.
+     - (c) Added mutated flag tracking to write `LINEAGE_STATE_FILE` only when records, findings, liveness, or integrity hashes change.
+     - (d) Reset `prow["last_error"] = None` each tick in watchdog when healthy.
+  7. Verification:
+     - Added 5 new regression tests in `tests_py/test_p169_watchdog_execution_loss.py`:
+       - `test_real_recovery_launch_end_to_end_without_handwritten_lineage` (B2)
+       - `test_max_recoveries_budget_and_escalation_survive_tick_boundary` (B1)
+       - `test_broker_status_unknown_does_not_produce_liveness_dead` (B4)
+       - `test_running_without_provider_output_remains_diagnostic_only` (B3)
+       - `test_reconcile_blocked_and_recovery_required_rows` (B5)
+     - 23 focused tests passing across `test_p169_*.py`.
+     - 130 watchdog regression tests passing (`test_watchdog*.py`).
+     - 147 executor and P16.7-P16.9 regression tests passing.
+     - Full test suite: 1141 passed, 92 subtests passed, 0 failures.
+     - Clean `compileall` and `git diff --check`.
+     - Knowledge graph refreshed via `graphify update .`: 5722 nodes, 16076 edges, 263 communities.
+- Preserved handoff: P16.10 Automatic Failure Harvesting & Regression Promotion (`agent/next.md`). DevOrchestrator remained owner-paused; no P16.10 implementation attempted.

@@ -1749,6 +1749,7 @@ class TransitionExecutor:
                     "completed_at": utc_now_iso(),
                     "invariant_key": invariant_key,
                     "command_id": command_id,
+                    "reconciled_by": command_id,
                     "evidence_hash": evidence_dict.get("evidence_hash"),
                     "reason": "watchdog_execution_loss",
                     "reconciliation_type": "tombstone",
@@ -1789,8 +1790,8 @@ class TransitionExecutor:
                     "reason": f"execution genuinely finished as {current_st} before reconciliation",
                 }
 
-            # Case 4: Row is in active state (launching or running)
-            if current_st in _ACTIVE_STATES:
+            # Case 4: Row is in active state (launching or running) or non-active non-terminal (blocked, recovery_required)
+            if current_st in _ACTIVE_STATES or current_st in {"blocked", "recovery_required"}:
                 if anchor.get("task_id") and row.get("task_id") and row["task_id"] != anchor["task_id"]:
                     return {
                         "status": "conflict",
@@ -1810,6 +1811,7 @@ class TransitionExecutor:
                 row["completed_at"] = utc_now_iso()
                 row["invariant_key"] = invariant_key
                 row["command_id"] = command_id
+                row["reconciled_by"] = command_id
                 row["evidence_hash"] = evidence_dict.get("evidence_hash")
                 row["reason"] = "watchdog_execution_loss"
                 self._save_ledger(ledger)
@@ -1827,7 +1829,7 @@ class TransitionExecutor:
                 return {
                     "status": "reconciled",
                     "row": copy.deepcopy(row),
-                    "reason": "explicitly reconciled active execution row",
+                    "reason": f"explicitly reconciled {current_st} execution row",
                 }
 
             return {
@@ -2624,7 +2626,7 @@ class TransitionExecutor:
 
     def start_control(
         self, project: dict[str, Any], snapshot: dict[str, Any], source_request_id: str,
-        *, exact_remediation_only: bool = False,
+        *, exact_remediation_only: bool = False, lineage: Optional[dict[str, Any]] = None,
     ) -> Optional[ActuationLaunch]:
         """Start the current executable task for one stateless owner continue command."""
         project_id = str(project.get("project_id") or "")
@@ -2803,10 +2805,28 @@ class TransitionExecutor:
         if launch_task is None:
             self._record_blocked(source_request_id, project_id, guard_error, task_id=task_id, source_kind="control")
             return None
+        if lineage is None:
+            with self._lock:
+                current_ledger = self._load_ledger()
+            for row in current_ledger.get("executions", {}).values():
+                if isinstance(row, dict) and str(row.get("project_id") or "") == project_id and row.get("state") == "explicitly_reconciled":
+                    if row.get("reconciled_by") == source_request_id or (
+                        source_request_id.startswith("wd-xl-") and row.get("invariant_key") == source_request_id[len("wd-xl-"):]
+                    ):
+                        lost_srid = row.get("source_request_id")
+                        if lost_srid:
+                            from dev_orchestrator.core.execution_lifecycle import lineage_key_for
+                            lineage = {
+                                "recovery_of": lost_srid,
+                                "recovery_of_lineage_key": lineage_key_for(project_id, lost_srid),
+                                "recovery_reason": "watchdog execution loss recovery",
+                            }
+                        break
         return self._launch(
             project, source_request_id=source_request_id, source_kind="control",
             task_id=launch_task, source_task_id=None, branch=truth.branch, head=truth.head,
             worker_prompt=str(policy["worker_prompt"]), policy=policy,
+            lineage=lineage,
         )
 
     def resume_exact_remediation(
