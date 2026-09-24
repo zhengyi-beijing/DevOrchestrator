@@ -17,12 +17,17 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
+from dev_orchestrator.accounting.events import InterProcessFileLock
 from dev_orchestrator.core.execution_intent import _intent_lock
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 ACTIVATION_REQUESTS_SCHEMA_VERSION = 1
 
 VALID_PROJECT_ID_REGEX = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _activation_requests_lock(runtime_root: Path | str) -> InterProcessFileLock:
+    return InterProcessFileLock(Path(runtime_root) / "activation-requests.lock")
 
 
 def validate_project_id(value: Any) -> str:
@@ -157,9 +162,10 @@ def record_activation_request(
     }
 
     requests_file = runtime / "activation-requests.json"
-    existing = load_activation_requests(runtime)
-    existing["requests"][req_id] = request_record
-    write_json(requests_file, existing, indent=2)
+    with _activation_requests_lock(runtime):
+        existing = load_activation_requests(runtime)
+        existing["requests"][req_id] = request_record
+        write_json(requests_file, existing, indent=2)
 
     # Record / refresh pending intent in runtime/execution-intent.json
     _record_pending_intent_for_activation(runtime, request_record)
@@ -316,11 +322,12 @@ def reconcile_project_registration(
     # Mark activation request as registered
     req_id = request.get("request_id")
     if req_id:
-        reqs = load_activation_requests(runtime)
-        if req_id in reqs.get("requests", {}):
-            reqs["requests"][req_id]["state"] = "registered"
-            reqs["requests"][req_id]["reason"] = "reconciled"
-            reqs["requests"][req_id]["registered_at"] = utc_now_iso()
-            write_json(runtime / "activation-requests.json", reqs, indent=2)
+        with _activation_requests_lock(runtime):
+            reqs = load_activation_requests(runtime)
+            if req_id in reqs.get("requests", {}):
+                reqs["requests"][req_id]["state"] = "registered"
+                reqs["requests"][req_id]["reason"] = "reconciled"
+                reqs["requests"][req_id]["registered_at"] = utc_now_iso()
+                write_json(runtime / "activation-requests.json", reqs, indent=2)
 
     return normalized, ""

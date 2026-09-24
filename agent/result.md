@@ -1262,3 +1262,19 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - `python -m compileall -q src ops tests_py benchmark/src`: passed.
   - `git diff --check`: passed.
 - DevOrchestrator remained owner-paused throughout remediation and verification; no P16.8 Worker was launched.
+
+## P16.7 Closure Remediation Round 2 (2026-09-24)
+
+- Closed the follow-up blocker from `ai_review:owner-closure:p167-f7f266c-retry1`:
+  - All read-modify-write mutations of `runtime/activation-requests.json` now serialize on a dedicated `runtime/activation-requests.lock` via `InterProcessFileLock`.
+  - Both initial activation request insertion and post-registration state reconciliation use the same lock, preventing concurrent HTTP/CLI activations from dropping request records.
+  - Added deterministic regression `test_concurrent_activation_requests_preserve_ledger_and_matching_intents`: two concurrent activations are proven to block on the shared ledger lock, then both request records and their matching per-project execution intents survive with the correct `activation_request_id` and `requested_action`.
+- Verification on the resulting production/test tree:
+  - New concurrent activation regression: 1 passed.
+  - Reviewer + activation + transition/control/watchdog focused/adjacent suites: 111 passed, 15 subtests passed in 34.21s.
+  - `python -m compileall -q src ops tests_py benchmark/src`: passed.
+  - `git diff --check`: passed.
+  - First full-suite attempt: 1092 passed, 92 subtests passed, with one transient socket timeout in `test_response_consumer_daemon_integration.py::ResponseConsumerDaemonIntegrationTests::test_daemon_consumes_bridge_response_into_disposition_only`.
+  - The timed-out integration test then passed 5/5 consecutive isolated reruns (6.93-13.25s each), confirming an environmental/timing flake rather than an activation-ledger regression.
+  - Final clean full repository regression: 1093 passed, 92 subtests passed in 402.18s (0 failures).
+- DevOrchestrator remained owner-paused throughout remediation and verification; no P16.8 Worker was launched.

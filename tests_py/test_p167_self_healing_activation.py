@@ -36,6 +36,7 @@ from dev_orchestrator.core.readiness import (
     write_structured_readiness,
 )
 from dev_orchestrator.core.activation import (
+    _activation_requests_lock,
     detect_orphan_state,
     load_activation_requests,
     reconcile_project_registration,
@@ -417,6 +418,69 @@ class TestExecutionIntentAndBudgets(unittest.TestCase):
                 runtime, "p1", task_id="P1", requested_action="continue"
             )
             self.assertEqual(refreshed["requested_action"], "continue")
+
+    def test_concurrent_activation_requests_preserve_ledger_and_matching_intents(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            repos = {}
+            for project_id in ("alpha", "beta"):
+                repo = root / project_id
+                repo.mkdir()
+                repos[project_id] = repo
+
+            started = {project_id: threading.Event() for project_id in repos}
+            finished = {project_id: threading.Event() for project_id in repos}
+            results = {}
+            errors = []
+
+            def activate(project_id: str) -> None:
+                started[project_id].set()
+                try:
+                    results[project_id] = record_activation_request(
+                        runtime_root=runtime,
+                        repo_path=repos[project_id],
+                        project_id=project_id,
+                        requested_action="start",
+                        source="concurrency-test",
+                    )
+                except Exception as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+                finally:
+                    finished[project_id].set()
+
+            with _activation_requests_lock(runtime):
+                workers = [
+                    threading.Thread(target=activate, args=(project_id,), daemon=True)
+                    for project_id in repos
+                ]
+                for worker in workers:
+                    worker.start()
+                for event in started.values():
+                    self.assertTrue(event.wait(timeout=1.0))
+                time.sleep(0.1)
+                self.assertTrue(
+                    all(not event.is_set() for event in finished.values()),
+                    "concurrent activation requests must wait for the shared activation-request lock",
+                )
+
+            for worker in workers:
+                worker.join(timeout=3.0)
+                self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+
+            ledger = load_activation_requests(runtime)
+            intents = load_execution_intents(runtime)
+            self.assertEqual(len(ledger["requests"]), 2)
+            for project_id, request in results.items():
+                request_id = request["request_id"]
+                self.assertIn(request_id, ledger["requests"])
+                self.assertEqual(ledger["requests"][request_id]["project_id"], project_id)
+                intent = intents["intents"][project_id]
+                self.assertEqual(intent["activation_request_id"], request_id)
+                self.assertEqual(intent["requested_action"], "start")
+                self.assertEqual(intent["state"], "pending")
 
     def test_activation_bootstrap_serializes_with_intent_writers(self):
         with tempfile.TemporaryDirectory() as td:
