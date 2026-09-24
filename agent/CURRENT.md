@@ -27,6 +27,10 @@ P16.8 DevO Golden-Path Lifecycle Hardening completion (2026-09-24):
   - Removed unreachable lifecycle_hold branch in activation_supervisor.py.
   - Added regression test test_remediation_disposition_with_empty_blockers_advances_forward_transition in test_p168_fault_injection.py.
   - Full final-tree regression verified: 1118 passed, 92 subtests passed in 402.56s (0 failures); compileall and git diff --check clean.
+- Technical Review Closure Remediation Round 3 (2026-09-24):
+  - Moved recovery budget evaluation after non-consuming hold exits so legitimate Planner/Reviewer/Worker and lifecycle holds cannot age into false `RECOVERY_BUDGET_EXHAUSTED`.
+  - Added deterministic +31 minute lifecycle-hold regression; intent remains active with zero actions used and no exhaustion/livelock blocker.
+  - Verification: 179 focused passed + 15 subtests; full repository regression 1118 passed + 92 subtests in 408.30s; compileall and git diff --check clean.
 
 P16.7 Self-Healing Project Activation & Readiness completion (2026-09-23):
 - Implemented diagnosed and self-healing project-activation and readiness failure handling without repeated owner interventions, replaying the 2026-09-23 xray-hw-platform incident as an automated end-to-end regression.

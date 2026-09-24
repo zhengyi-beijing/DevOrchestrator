@@ -1868,6 +1868,35 @@ class TestP167ReviewRemediation(unittest.TestCase):
             self.assertEqual(all_intents["proj-1"]["state"], "active")
             self.assertEqual(all_intents["proj-1"].get("actions_used", 0), 0)
 
+            # Regression: a legitimate non-consuming lifecycle hold may outlive the
+            # 30-minute recovery window.  It must remain active and must not be
+            # converted into phantom RECOVERY_BUDGET_EXHAUSTED merely due to age.
+            future = datetime.now(timezone.utc) + timedelta(minutes=31)
+            outcomes_late = supervisor.advance(cfg_path, summary, executor=executor, now=future)
+            self.assertEqual(len(outcomes_late), 1)
+            self.assertEqual(outcomes_late[0]["status"], "continuation_hold")
+            self.assertEqual(outcomes_late[0]["blocker_code"], "READINESS_NOT_READY_TO_RUN")
+            all_intents_late = load_execution_intents(runtime).get("intents", {})
+            self.assertEqual(all_intents_late["proj-1"]["state"], "active")
+            self.assertEqual(all_intents_late["proj-1"].get("actions_used", 0), 0)
+
+            # The same exemption applies to an actively running Reviewer: long AI
+            # role latency is orchestration hold time, not recovery-action time.
+            snapshot["reviewer"] = {"state": "running"}
+            outcomes_reviewer = supervisor.advance(
+                cfg_path,
+                summary,
+                executor=executor,
+                now=datetime.now(timezone.utc) + timedelta(minutes=62),
+            )
+            self.assertEqual(len(outcomes_reviewer), 1)
+            self.assertEqual(outcomes_reviewer[0]["status"], "continuation_hold")
+            self.assertEqual(outcomes_reviewer[0]["role"], "reviewer")
+            all_intents_reviewer = load_execution_intents(runtime).get("intents", {})
+            self.assertEqual(all_intents_reviewer["proj-1"]["state"], "active")
+            self.assertEqual(all_intents_reviewer["proj-1"].get("actions_used", 0), 0)
+            snapshot.pop("reviewer", None)
+
             # Key assertion: subsequent explain_block does NOT publish RECOVERY_BUDGET_EXHAUSTED!
             blockers2 = explain_block(
                 project_id="proj-1",

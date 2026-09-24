@@ -327,36 +327,6 @@ class ActivationSupervisor:
                 })
                 continue
 
-            # 6. Check budget / livelock exhaustion
-            is_exhausted, exhaust_reason, blocker_code = check_intent_budgets(intent, self_healing_cfg, now=tick_now)
-            if is_exhausted:
-                terminate_intent(
-                    self.runtime_root,
-                    project_id,
-                    "exhausted",
-                    failure_class="recovery_exhausted",
-                    blocker_code=blocker_code,
-                    reason=exhaust_reason,
-                )
-                self._emit_milestone(
-                    project_id,
-                    "RECOVERY_EXHAUSTED",
-                    task_id=intent.get("task_id"),
-                    details={
-                        "source": "activation_supervisor",
-                        "blocker_code": blocker_code,
-                        "reason": exhaust_reason,
-                    },
-                )
-                update_context(self.runtime_root, project_id, disposition="exhausted")
-                outcomes.append({
-                    "project_id": project_id,
-                    "status": "exhausted",
-                    "blocker_code": blocker_code,
-                    "reason": exhaust_reason,
-                })
-                continue
-
             transient_b = next((b for b in blockers if getattr(b, "failure_class", "") == "transient_infrastructure"), None)
             if transient_b is not None:
                 top_b = transient_b
@@ -461,6 +431,40 @@ class ActivationSupervisor:
                         "reason": disp_reason,
                     })
                     continue
+
+            # 6. Check recovery budget only after non-consuming holds have returned.
+            # Planner/reviewer/worker and lifecycle holds must not age into phantom
+            # RECOVERY_BUDGET_EXHAUSTED while no recovery action is being consumed.
+            is_exhausted, exhaust_reason, blocker_code = check_intent_budgets(
+                intent, self_healing_cfg, now=tick_now
+            )
+            if is_exhausted:
+                terminate_intent(
+                    self.runtime_root,
+                    project_id,
+                    "exhausted",
+                    failure_class="recovery_exhausted",
+                    blocker_code=blocker_code,
+                    reason=exhaust_reason,
+                )
+                self._emit_milestone(
+                    project_id,
+                    "RECOVERY_EXHAUSTED",
+                    task_id=intent.get("task_id"),
+                    details={
+                        "source": "activation_supervisor",
+                        "blocker_code": blocker_code,
+                        "reason": exhaust_reason,
+                    },
+                )
+                update_context(self.runtime_root, project_id, disposition="exhausted")
+                outcomes.append({
+                    "project_id": project_id,
+                    "status": "exhausted",
+                    "blocker_code": blocker_code,
+                    "reason": exhaust_reason,
+                })
+                continue
 
             # If disposition is remediate but there are no blockers, advance forward if actionable, else hold
             if disposition == "remediate" and not blockers:

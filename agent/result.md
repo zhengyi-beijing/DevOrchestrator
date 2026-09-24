@@ -1365,3 +1365,17 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
      - Whitespace and formatting: `git diff --check` passed cleanly with 0 defects.
      - Knowledge graph refreshed via `graphify update .`: 5631 nodes, 15750 edges, 255 communities.
   5. Preserved handoff: DevOrchestrator remained owner-paused throughout remediation and verification; no P16.9 Worker was launched; `agent/next.md` handoff preserved.
+
+## P16.8 Review Closure Remediation Round 3 (2026-09-24)
+
+- Closed the bounded hold-budget regression identified by `ai_review:ai_review:ai_review:auto-1eac8a332382d1d9e986420f:execute`:
+  - Moved `check_intent_budgets(...)` in `ActivationSupervisor.advance` after all non-consuming `hold` exits, so active Planner/Reviewer/Worker and lifecycle holds do not age into a phantom `RECOVERY_BUDGET_EXHAUSTED` solely because wall-clock time exceeds the 30-minute launch budget.
+  - Recovery budget/livelock checks still execute before actionable `advance` or `remediate` transitions, preserving the existing 20-action / 3-identical-fingerprint / elapsed-time bounds for actual recovery work.
+  - Extended `test_readiness_not_ready_to_run_lifecycle_hold_terminates_intent_without_false_exhaustion` with a deterministic +31 minute tick. The held intent remains `active`, `actions_used == 0`, and `explain_block` emits neither `RECOVERY_BUDGET_EXHAUSTED` nor `RECOVERY_LIVELOCK_DETECTED`.
+- Verification on the final remediation tree:
+  - Exact +31 minute hold regression: 1 passed.
+  - P16.7/P16.8 lifecycle/planner/reviewer/control/transition/project-status/monitor/daemon focused suites: 179 passed, 15 subtests passed in 70.10s.
+  - Full repository regression: 1118 passed, 92 subtests passed in 408.30s (0 failures).
+  - `python -m compileall -q src ops tests_py benchmark/src`: passed.
+  - `git diff --check`: passed (only an LF/CRLF advisory for the modified supervisor working copy; no whitespace defects).
+- This is a technical closure repair of a false-exhaustion regression; it does not change owner-gate policy, recovery action limits, or P16.8 task scope.
