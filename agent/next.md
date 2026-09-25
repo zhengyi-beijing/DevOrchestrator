@@ -20,6 +20,10 @@ Convert unattended-execution anomalies and control-only owner interventions into
 - Compute stable semantic failure fingerprints over normalized failure causes, lifecycle transitions, and diagnostic evidence to deduplicate recurring failures.
 - Generate candidate deterministic fixtures/tests automatically, keeping candidate tests isolated in a staging area (e.g. `tests_candidate/`) until automated reproduction, discrimination, and independent review gates approve promotion to `tests_py/`.
 - Use ProgressObligation and execution lineage contracts to distinguish legal waiting/startup grace from silent stalls or execution loss.
+- Make task-level activity evidence a watchdog input: daemon/monitor/summary heartbeat writes prove only `SYSTEM_ALIVE` and MUST NOT refresh task progress. Planner/Reviewer/Worker output growth, broker/request state transitions, execution-lineage changes, lifecycle transitions, progress milestones, and Git/HEAD changes are task evidence.
+- Track `last_task_activity_at` separately from `last_meaningful_progress_at`; repeated `STALL_DETECTED`, identical diagnostics/owner gates, watchdog self-writes, and heartbeat-only file churn MUST NOT count as meaningful progress.
+- If the daemon continues ticking but no Planner/Reviewer/Worker is alive and no task-level activity occurs within the bounded ProgressObligation window, classify `ORCHESTRATOR_ALIVE_TASK_STALLED`, capture it as a P16.10 incident, and enter bounded recovery rather than reporting the task as running.
+- Add a regression reproducing the 2026-09-25 P16.10 false-running case: daemon heartbeat remains healthy while lifecycle is `REVIEW_FAILED`/`OWNER_GATE`, worker is not alive, and task evidence is stale; watchdog must report stalled and attempt/route safe recovery.
 - Track manual `CONTROL_ONLY` interventions as an explicit metric; target zero control-only interventions for standard lifecycle paths.
 - Safety boundaries: Never auto-merge production fixes, weaken owner/safety/Git gates, or actuate real physical hardware as part of candidate regression generation.
 
