@@ -93,9 +93,12 @@ credential-free binding:
 "conversation_binding": {
   "transport": "browser_bridge",
   "adapter": "chatgpt_web",
-  "binding_id": "<chatgpt-conversation-id>"
+  "binding_id": "<chatgpt-conversation-id>",
+  "require_truthful_availability": true
 }
 ```
+
+Truthful multi-signal availability gating (`require_truthful_availability`) is enabled by default for `browser_bridge` transport, requiring fresh listener, browser presence, control heartbeat, valid capability, and successful probe before dispatch. Set to `false` only if explicitly bypassing availability gating.
 
 The Browser Bridge, response consumer and Decision Guard remain project-neutral.
 The current implementation can transport/validate reasoning results but does

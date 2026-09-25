@@ -73,13 +73,16 @@
 
 
   var STATUS_ELEMENT_ID = "devorch-web-status";
+  var lastHealthSnapshot = null;
+  var lastHeartbeatTime = 0;
 
   var STATE_RANKS = {
-    ATTENTION: 5,
-    CLAIMED: 4,
-    WAITING: 4,
-    PAIRING_REQUIRED: 3,
-    OFFLINE: 2,
+    ATTENTION: 6,
+    CLAIMED: 5,
+    WAITING: 5,
+    PAIRING_REQUIRED: 4,
+    OFFLINE: 3,
+    DEGRADED: 2,
     LIVE: 1,
     IDLE: 0
   };
@@ -105,12 +108,21 @@
       WAITING: "#2457a6",
       OFFLINE: "#a32929",
       ATTENTION: "#b42318",
-      PAIRING_REQUIRED: "#d97706"
+      PAIRING_REQUIRED: "#d97706",
+      DEGRADED: "#b25e00"
     };
     badge.textContent = "DevOrch · " + state;
     badge.style.background = colors[state] || "#555";
     badge.setAttribute("data-state", state);
     badge.title = detail || state;
+    // Supported badge states:
+    // setAdapterStatus("LIVE", detail);
+    // setAdapterStatus("IDLE", detail);
+    // setAdapterStatus("CLAIMED", detail);
+    // setAdapterStatus("WAITING", detail);
+    // setAdapterStatus("OFFLINE", detail);
+    // setAdapterStatus("DEGRADED", detail);
+    // setAdapterStatus("PAIRING_REQUIRED", detail);
   }
 
   function updateAdapterStatusDemoting(state, detail) {
@@ -344,28 +356,102 @@
     if (!input.bindingId) {
       return { state: "IDLE", detail: "Waiting for ChatGPT conversation (/c/...)" };
     }
-    if (input.healthAvailability === "pairing_required") {
-      return { state: "PAIRING_REQUIRED", detail: "Heartbeat pairing required" };
-    }
     if (input.attentionMessage) {
       return { state: "ATTENTION", detail: input.attentionMessage };
     }
+
+    var rawAvail = input.healthAvailability || (input.health && input.health.availability) || "";
+    var healthAvail = typeof rawAvail === "string" ? rawAvail.trim().toUpperCase() : "";
+
+    var now = typeof input.now === "number" ? input.now : Date.now();
+    var isExpired = false;
+    if (input.health && typeof input.health === "object" && typeof input.health.valid_until === "string") {
+      var vu = Date.parse(input.health.valid_until);
+      if (!isNaN(vu) && now > vu) {
+        isExpired = true;
+      }
+    }
+    var bindingMismatch = false;
+    if (input.health && typeof input.health === "object" && input.health.binding_id && input.bindingId) {
+      if (input.health.binding_id !== input.bindingId) {
+        bindingMismatch = true;
+      }
+    }
+
+    // 1. Authoritative pairing required
+    if (healthAvail === "PAIRING_REQUIRED") {
+      return { state: "PAIRING_REQUIRED", detail: input.healthDetail || (input.health && input.health.reason) || "Heartbeat pairing required" };
+    }
+
+    // 2. Bridge transport errors or offline health
+    if (input.bridgeError) {
+      return { state: "OFFLINE", detail: input.bridgeError };
+    }
+    if (input.bridgeConnected === false) {
+      return { state: "OFFLINE", detail: "Bridge disconnected" };
+    }
+    if (healthAvail === "OFFLINE" || healthAvail === "PROBE_FAILED") {
+      return { state: "OFFLINE", detail: input.healthDetail || (input.health && input.health.reason) || ("Web Sol " + healthAvail.toLowerCase()) };
+    }
+
+    // 3. Degradations (duplicate tabs, stale heartbeat, expired snapshot, binding mismatch, or DEGRADED health)
+    if (input.duplicateTabs) {
+      return { state: "DEGRADED", detail: "Duplicate active tabs detected" };
+    }
+    if (input.staleHeartbeat) {
+      return { state: "DEGRADED", detail: "Stale control heartbeat" };
+    }
+    if (bindingMismatch) {
+      return { state: "DEGRADED", detail: "Binding mismatch with authoritative health" };
+    }
+    if (isExpired) {
+      return { state: "DEGRADED", detail: "Authoritative health snapshot expired" };
+    }
+    if (healthAvail === "DEGRADED") {
+      return { state: "DEGRADED", detail: input.healthDetail || (input.health && input.health.reason) || "Web Sol degraded" };
+    }
+
+    // 4. Authoritative AVAILABLE required to promote LIVE
+    // Missing, wrong-key or expired health snapshots are explicitly non-LIVE.
+    if (healthAvail !== "AVAILABLE") {
+      return { state: "DEGRADED", detail: input.healthDetail || "Authoritative AVAILABLE health required" };
+    }
+
+    // 5. Activity details (CLAIMED / WAITING) or idle/live
     if (input.claimPhase === "waiting") {
       return { state: "WAITING", detail: input.claimDetail || "Waiting for ChatGPT response" };
     }
     if (input.claimPhase === "claimed") {
       return { state: "CLAIMED", detail: input.claimDetail || "Claim active" };
     }
-    if (input.bridgeError) {
-      return { state: "OFFLINE", detail: input.bridgeError };
-    }
-    if (input.healthAvailability === "offline" || input.healthAvailability === "probe_failed") {
-      return { state: "OFFLINE", detail: "Web Sol " + input.healthAvailability };
-    }
     if (input.bridgeConnected) {
       return { state: "LIVE", detail: input.bridgeDetail || "Bridge connected; listening for work" };
     }
     return { state: "IDLE", detail: "Idle" };
+  }
+
+  function applyComputedState(extra) {
+    var rec = storedCapabilityRecord();
+    var bindingId = currentBindingId();
+    var isHeartbeatFresh = lastHeartbeatTime > 0 && (Date.now() - lastHeartbeatTime) <= CONTROL_HEARTBEAT_MS * 3;
+    var input = {
+      hasCapability: !!(rec ? rec.token : storedCapability()),
+      bindingId: bindingId,
+      health: lastHealthSnapshot,
+      healthAvailability: lastHealthSnapshot ? lastHealthSnapshot.availability : null,
+      staleHeartbeat: !isHeartbeatFresh,
+      now: Date.now()
+    };
+    if (extra && typeof extra === "object") {
+      for (var k in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, k)) {
+          input[k] = extra[k];
+        }
+      }
+    }
+    var res = computeAdapterState(input);
+    setAdapterStatus(res.state, res.detail);
+    return res;
   }
 
   function responseMatches(text, requestId) {
@@ -514,6 +600,8 @@
     clearCapability: clearCapability,
     classifyHeartbeatResult: classifyHeartbeatResult,
     computeAdapterState: computeAdapterState,
+    applyComputedState: applyComputedState,
+    setAdapterStatus: setAdapterStatus,
     updateAdapterStatusDemoting: updateAdapterStatusDemoting,
     sendControlHeartbeat: sendControlHeartbeat,
     redeemControlPairing: redeemControlPairing
@@ -625,7 +713,8 @@
       var classification = classifyHeartbeatResult(result);
       if (classification.shouldClear) {
         clearCapability();
-        updateAdapterStatusDemoting("PAIRING_REQUIRED", "Capability " + classification.reason);
+        lastHealthSnapshot = null;
+        applyComputedState({ hasCapability: false, healthDetail: "Capability " + classification.reason });
         return false;
       }
       if (classification.verdict === "ok") {
@@ -633,15 +722,18 @@
           capRecord.verified_at = new Date().toISOString();
           saveCapability(capRecord);
         }
+        lastHeartbeatTime = Date.now();
         var health = classification.body && classification.body.data && classification.body.data.websol_health;
-        if (health && health.availability) {
-          if (health.availability === "pairing_required") {
-            updateAdapterStatusDemoting("PAIRING_REQUIRED", "Server reported pairing required");
-          } else if (health.availability === "offline" || health.availability === "probe_failed") {
-            updateAdapterStatusDemoting("OFFLINE", "Web Sol health: " + health.availability);
-          }
-        }
+        lastHealthSnapshot = health || null;
+        var sData = classification.body && classification.body.data;
+        var activeTabs = (sData && sData.session && sData.session.active_tab_count) || (sData && sData.active_tab_count) || 0;
+        var dupTabs = activeTabs > 1;
+        applyComputedState({ duplicateTabs: dupTabs });
         return true;
+      }
+      if (classification.verdict === "store_unavailable") {
+        applyComputedState({ healthAvailability: "DEGRADED", healthDetail: "Capability store unavailable" });
+        return false;
       }
       return false;
     });
@@ -678,16 +770,20 @@
   function claimOnce(bindingId) {
     return bridgePost(CLAIM_PATH, { adapter: ADAPTER_ID, binding_id: bindingId }).then(function (result) {
       if (result.status === 204) {
-        setAdapterStatus("LIVE", "Bridge connected; no queued request");
+        applyComputedState({ bridgeConnected: true, bridgeDetail: "Bridge connected; no queued request" });
         return null;
       }
       if (result.status !== 200 || !result.text) {
-        setAdapterStatus("OFFLINE", "Bridge claim failed: HTTP " + result.status);
+        applyComputedState({ bridgeError: "Bridge claim failed: HTTP " + result.status, bridgeConnected: false });
         return null;
       }
       try {
         var claim = JSON.parse(result.text);
-        return claim && claim.request_id ? claim : null;
+        if (claim && claim.request_id) {
+          applyComputedState({ claimPhase: "claimed", claimDetail: "Claim active: " + claim.request_id });
+          return claim;
+        }
+        return null;
       } catch (err) {
         return null;
       }
@@ -951,9 +1047,9 @@
       // acknowledge the raw text. A still-growing answer is never acked early.
       respond(bindingId, claim, responseText).then(function (result) {
         if (result && result.status === 200) {
-          setAdapterStatus("LIVE", "Response acknowledged by Bridge");
+          applyComputedState({ bridgeConnected: true, bridgeDetail: "Response acknowledged by Bridge" });
         } else {
-          setAdapterStatus("OFFLINE", "Response acknowledgement failed");
+          applyComputedState({ bridgeError: "Response acknowledgement failed", bridgeConnected: false });
         }
         schedule(runAdapter, RETRY_MS);
       });
@@ -1005,7 +1101,7 @@
       return;
     }
     if (verdict === RENEW_RETRY) {
-      setAdapterStatus("OFFLINE", "Bridge renewal failed; retrying inside lease window");
+      applyComputedState({ bridgeError: "Bridge renewal failed; retrying inside lease window", bridgeConnected: false });
       // Transient network/5xx failure: retry is allowed only inside the
       // current lease safety window; past expiry the claim authority is gone.
       if (Date.now() < renewal.leaseExpiresMs) {
@@ -1026,7 +1122,7 @@
   // claim loop. No response is posted for a stale claim; server-side lease
   // expiry lets the request be reclaimed by another adapter.
   function abandonClaim(bindingId, claim) {
-    setAdapterStatus("IDLE", "Claim abandoned; returning to idle polling");
+    applyComputedState({ bridgeConnected: true, bridgeDetail: "Claim abandoned; returning to idle polling" });
     schedule(runAdapter, RETRY_MS);
   }
 

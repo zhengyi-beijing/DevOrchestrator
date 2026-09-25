@@ -501,7 +501,6 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 "/api/v1/control/adapter-pairings/redeem",
                 "/api/v1/control/adapter-capabilities/renew",
                 "/api/v1/control/session-heartbeats",
-                "/api/v1/control/websol-health",
                 "/api/v1/control/bridge/requests",
                 "/api/v1/control/web-bridge/requests",
             }
@@ -694,6 +693,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/v1/control/bindings":
             payload = _control_envelope(self.server.conversation_store.list_bindings(), sources=[{"name": "conversation_bindings", "availability": "available"}])
         elif path == "/api/v1/control/websol-health":
+            if not self._owner_authorized():
+                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
             qs = parse_qs(parsed.query)
             proj_id = qs.get("project_id", [None])[0]
             adapter = qs.get("adapter", ["chatgpt_web"])[0]
@@ -913,16 +914,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         else:
             self._error(404, "Not Found", "route not found", head_only)
             return
-        extra_headers = None
-        if self.headers.get("Origin") == "https://chatgpt.com":
-            extra_headers = {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"}
         self._send(
             200,
             "OK",
             "application/json; charset=utf-8",
             _json_bytes(payload),
             head_only,
-            extra_headers=extra_headers,
         )
 
     def _client_is_loopback(self) -> bool:

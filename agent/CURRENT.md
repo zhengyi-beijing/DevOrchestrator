@@ -46,14 +46,37 @@ P16.12 Web Sol Persistent Pairing & Truthful Availability completion (2026-09-25
   11. CLI Commands (`src/dev_orchestrator/cli.py`):
       - `websol-status`: Outputs JSON or formatted table of 6 signals and availability for project bindings.
       - `websol-probe`: Triggers on-demand inference probe and prints result.
+- Round 1 Technical Review Remediation (2026-09-25):
+  1. Availability Evaluation & Generation Alignment (`src/dev_orchestrator/core/websol_health.py`, `src/dev_orchestrator/daemon.py`):
+     - Updated `evaluate_websol_availability` so probe parameters (`probe_passed`, `probe_generation`, `current_probe_generation`) fall back safely to details in `signals["probe"]` instead of defaulting to `False`/`1`.
+     - In `daemon.py`, passed actual probe generation, store current generation, and probe outcome from `health_store.get_probe_info` into availability evaluation.
+  2. Browser Adapter Pure State Machine (`browser/chatgpt-web-adapter.user.js`):
+     - Added `DEGRADED: 2` state rank and badge color (`#b25e00`).
+     - Fixed case-normalization in `computeAdapterState`. Missing, expired, mismatched, duplicate tabs, or stale heartbeat states demote to `DEGRADED`; `OFFLINE` or `PROBE_FAILED` demote to `OFFLINE`; `PAIRING_REQUIRED` demotes to `PAIRING_REQUIRED`.
+     - Strictly required authoritative unexpired `AVAILABLE` snapshot to promote `LIVE`; prevented `claimPhase` (`waiting`/`claimed`) from masking non-AVAILABLE states.
+     - Exported `applyComputedState` and `setAdapterStatus` on `adapterApi`, routing 204, claim errors, heartbeat responses, response acks, renew retries, and claim abandons through pure state transitions.
+  3. Web Server Serialization & Security (`src/dev_orchestrator/core/websol_health.py`, `src/dev_orchestrator/web/server.py`):
+     - Added `WebSolHealth.to_dict()` for clean serialization of health records and nested signal dataclasses, resolving `AttributeError` on `GET /api/v1/control/websol-health`.
+     - Added `_owner_authorized()` authentication gate to `GET /api/v1/control/websol-health`.
+     - Removed blanket `Access-Control-Allow-Origin: https://chatgpt.com` on GET routes and removed `/api/v1/control/websol-health` from ChatGPT OPTIONS preflight allowlist.
+  4. Capability Signal Status Disambiguation (`src/dev_orchestrator/core/websol_health.py`):
+     - Emitted `no_active_tabs` as `status="no_active_tabs"` (not `"unknown"`) so it does not falsely trigger `PAIRING_REQUIRED`.
+     - Emitted legacy unverified capability as `status="unverified"` (not `"degraded"`) so `evaluate_websol_availability` correctly classifies it as `DEGRADED` and never `AVAILABLE`.
+  5. Dispatcher Truthful Availability Gating (`src/dev_orchestrator/daemon.py`, `src/dev_orchestrator/config.py`, `docs/PORTABLE_PROJECT_INTEGRATION.md`):
+     - In `_daemon_availability_provider`, defaulted truthful availability gating to active for `browser_bridge` transport when `health_store` is present, or when `require_truthful_availability` is set. Documented and validated `require_truthful_availability` on conversation binding schema.
+  6. Durable Cancellation Nonce Verification (`src/dev_orchestrator/bridge/store.py`):
+     - Enforced request nonce verification in `BrowserBridgeStore.withdraw()`, raising `BridgeConflictError` on nonce mismatch.
+  7. CLI Probe Recording & Incident Evidence (`src/dev_orchestrator/cli.py`, `src/dev_orchestrator/daemon.py`):
+     - `cmd_websol_probe` records probe execution results directly into `health_store`.
+     - Incident evidence serialization in `daemon.py` iterates `health.signals.values()` instead of dict keys.
 - Verification:
-  - 16 dedicated unit and integration tests in `tests_py/test_p1612_websol_pairing_and_availability.py` passing 100%.
-  - 43 tests in bridge, dispatcher, and response consumer suites passing 100%.
-  - Daemon transition integration and worker done integration tests passing 100%.
-  - Userscript adapter tests (`tests_py/test_chatgpt_web_adapter.py`) passing 100%.
-  - Full repository regression: 1250 passed, 92 subtests passed in pytest.
+  - 22 dedicated unit and integration tests in `tests_py/test_p1612_websol_pairing_and_availability.py` passing 100% (added 6 remediation tests covering `to_dict`, `no_active_tabs` / `unverified` classification, probe generation evaluation and defaults, server owner authorization and CORS stripping, nonce verification in `withdraw`, and default truthful availability gating).
+  - 14 tests in `tests_py/test_chatgpt_web_adapter.py` passing 100% (covering adapter pure state computation, heartbeat classification, and split-brain demotion).
+  - 34 tests in adjacent suites (`test_web.py`, `test_p13_web_bridge_adapter.py`, `test_p13_control_logs.py`, `test_p15_acceptance.py`, `test_p15_mobile_gateway.py`) passing 100%.
+  - Full repository regression: 1260 passed, 92 subtests passed in pytest.
   - Python compilation (`compileall src ops tests_py`) and `git diff --check` clean.
-  - Knowledge graph updated via `graphify update .` (6331 nodes, 17713 edges, 258 communities).
+  - Knowledge graph updated via `graphify update .` (6349 nodes, 17762 edges, 266 communities).
+
 
 
 P16.11 AGY-First AI Resource Pool Benchmark & Routing completion (2026-09-25):

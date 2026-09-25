@@ -750,6 +750,12 @@ class BrowserBridgeStore:
                     adapter=adapter,
                     reason=reason,
                 )
+            if nonce and record.get("nonce") and record.get("nonce") != nonce:
+                raise BridgeConflictError(
+                    "nonce mismatch for request {0!r}: expected {1!r}, got {2!r}".format(
+                        request_id, record.get("nonce"), nonce
+                    )
+                )
             if record.get("state") == STATE_RESPONDED:
                 return WithdrawResult(
                     outcome="responded",

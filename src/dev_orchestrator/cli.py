@@ -1581,12 +1581,22 @@ def cmd_websol_probe(args: argparse.Namespace) -> int:
         else:
             binding_id = "default"
 
+    curr_gen = health_store.current_generation()
     timeout = float(getattr(args, "timeout", 15.0) or 15.0)
     result = run_websol_probe(
         bridge_store,
         adapter,
         binding_id,
+        generation=curr_gen,
         timeout_seconds=timeout,
+    )
+    health_store.record_probe_result(
+        project_id=project_id,
+        adapter=adapter,
+        binding_id=binding_id,
+        ok=result.success,
+        error=result.reason if not result.success else None,
+        duration_seconds=result.duration_seconds,
     )
 
     fmt = getattr(args, "format", "json") or "json"

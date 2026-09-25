@@ -157,7 +157,16 @@ def _run_orchestration_tick(
                 security=sec,
                 health_store=health_store,
             )
-            avail, reason = evaluate_websol_availability(signals)
+            p_info = health_store.get_probe_info(p_id, adp, bid) or {}
+            curr_gen = health_store.current_generation()
+            probe_gen = int(p_info.get("generation", 0))
+            probe_passed = bool(p_info.get("success") is True and probe_gen == curr_gen)
+            avail, reason = evaluate_websol_availability(
+                signals,
+                probe_generation=probe_gen,
+                current_probe_generation=curr_gen,
+                probe_passed=probe_passed,
+            )
             now_iso = utc_now_iso()
             health = WebSolHealth(
                 project_id=p_id,
@@ -179,7 +188,7 @@ def _run_orchestration_tick(
                     task_id=None,
                     classification="pairing_required",
                     semantic={"status": "pairing_required", "adapter": adp, "binding_id": bid},
-                    evidence={"availability": health.availability, "signals": [asdict(s) if hasattr(s, "__dict__") else s for s in health.signals]},
+                    evidence={"availability": health.availability, "signals": [asdict(s) if hasattr(s, "__dataclass_fields__") or hasattr(s, "__dict__") else (s if isinstance(s, dict) else str(s)) for s in health.signals.values()]},
                     occurrence_key=f"pairing_required:{p_id}:{adp}:{bid}",
                 )
             elif health.availability == WebSolAvailability.PROBE_FAILED.value:
@@ -189,7 +198,7 @@ def _run_orchestration_tick(
                     task_id=None,
                     classification="probe_failed",
                     semantic={"status": "probe_failed", "adapter": adp, "binding_id": bid},
-                    evidence={"availability": health.availability, "signals": [asdict(s) if hasattr(s, "__dict__") else s for s in health.signals]},
+                    evidence={"availability": health.availability, "signals": [asdict(s) if hasattr(s, "__dataclass_fields__") or hasattr(s, "__dict__") else (s if isinstance(s, dict) else str(s)) for s in health.signals.values()]},
                     occurrence_key=f"probe_failed:{p_id}:{adp}:{bid}",
                 )
 
@@ -228,8 +237,11 @@ def _run_orchestration_tick(
                 proj_item = itm
                 break
         cb = (proj_item.get("conversation_binding") or {}) if isinstance(proj_item, dict) else {}
-        if cb.get("require_truthful_availability") or cb.get("require_availability"):
-            return health_store.get(p, a, b) if health_store else None
+        if cb.get("require_truthful_availability") is False or cb.get("require_availability") is False:
+            return None
+        is_browser_bridge = cb.get("transport") == "browser_bridge" or a == "chatgpt_web"
+        if (is_browser_bridge or cb.get("require_truthful_availability") or cb.get("require_availability")) and health_store:
+            return health_store.get(p, a, b)
         return None
 
     active_avail_provider = _daemon_availability_provider

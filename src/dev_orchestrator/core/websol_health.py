@@ -58,6 +58,31 @@ class WebSolHealth:
     probe_generation: int = 1
     failover_summary: Optional[dict[str, Any]] = None
 
+    def to_dict(self) -> dict[str, Any]:
+        sigs: dict[str, Any] = {}
+        if isinstance(self.signals, dict):
+            for k, v in self.signals.items():
+                if hasattr(v, "__dataclass_fields__") or hasattr(v, "__dict__"):
+                    sigs[k] = asdict(v)
+                elif isinstance(v, dict):
+                    sigs[k] = dict(v)
+                else:
+                    sigs[k] = v
+        else:
+            sigs = self.signals
+        return {
+            "project_id": self.project_id,
+            "adapter": self.adapter,
+            "binding_id": self.binding_id,
+            "availability": self.availability,
+            "evaluated_at": self.evaluated_at,
+            "valid_until": self.valid_until,
+            "reason": self.reason,
+            "signals": sigs,
+            "probe_generation": self.probe_generation,
+            "failover_summary": self.failover_summary,
+        }
+
 
 def health_key(project_id: str, adapter: str, binding_id: str) -> str:
     return f"{project_id.strip()}:{adapter.strip()}:{binding_id.strip()}"
@@ -257,7 +282,7 @@ def collect_websol_signals(
         if not live_tab_records:
             signals["capability"] = WebSolSignal(
                 name="capability",
-                status="unknown",
+                status="no_active_tabs",
                 reason="no_active_tabs",
                 observed_at=observed_iso,
                 details={},
@@ -292,7 +317,7 @@ def collect_websol_signals(
                 c_status = "unavailable"
                 c_reason = "capability_store_unavailable"
             elif has_unverified:
-                c_status = "degraded"
+                c_status = "unverified"
                 c_reason = "capability_unverified"
             else:
                 c_status = "healthy"
@@ -348,9 +373,9 @@ def collect_websol_signals(
 def evaluate_websol_availability(
     signals: dict[str, WebSolSignal | dict[str, Any]],
     *,
-    probe_generation: int = 1,
-    current_probe_generation: int = 1,
-    probe_passed: bool = False,
+    probe_generation: Optional[int] = None,
+    current_probe_generation: Optional[int] = None,
+    probe_passed: Optional[bool] = None,
     now: Optional[datetime] = None,
 ) -> tuple[WebSolAvailability, str]:
     """Pure deterministic fail-closed availability evaluation.
@@ -380,8 +405,8 @@ def evaluate_websol_availability(
     bi_status, bi_reason = _sig("binding_identity")
     pr_status, pr_reason = _sig("probe")
 
-    # 1. Authoritative capability failures
-    if cap_status in ("revoked", "unknown"):
+    # 1. Authoritative capability failures (revoked or unknown credential)
+    if cap_status in ("revoked", "unknown") and cap_reason not in ("no_active_tabs", "no_active_tabs_missing"):
         return WebSolAvailability.PAIRING_REQUIRED, cap_reason or "capability_revoked_or_unknown"
 
     # 2. Bridge listener or browser claim presence offline
@@ -403,10 +428,26 @@ def evaluate_websol_availability(
         return WebSolAvailability.DEGRADED, bi_reason or "binding_mismatch"
     if cap_status == "unavailable":
         return WebSolAvailability.DEGRADED, "capability_store_unavailable"
-    if cap_status == "unverified":
+    if cap_status in ("unverified", "degraded") or cap_reason == "capability_unverified":
         return WebSolAvailability.DEGRADED, "capability_unverified"
+    if cap_status in ("no_active_tabs", "absent") or cap_status != "healthy":
+        return WebSolAvailability.DEGRADED, cap_reason or "no_active_tabs"
 
     # 5. Probe required (generation mismatch or not yet passed)
+    if probe_passed is None:
+        pr_sig = signals.get("probe")
+        pr_details = getattr(pr_sig, "details", {}) if pr_sig else {}
+        if isinstance(pr_details, dict):
+            probe_passed = bool(pr_details.get("success") is True)
+            if probe_generation is None:
+                probe_generation = int(pr_details.get("generation", 0))
+        else:
+            probe_passed = (pr_status == "healthy")
+    if probe_generation is None:
+        probe_generation = 1
+    if current_probe_generation is None:
+        current_probe_generation = 1
+
     if pr_status != "healthy" or not probe_passed or probe_generation != current_probe_generation:
         return WebSolAvailability.DEGRADED, "probe_required"
 

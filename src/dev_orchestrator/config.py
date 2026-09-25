@@ -86,6 +86,11 @@ def _binding_ready(binding: Any) -> bool:
     The binding is routing metadata only (never credentials). Every field of
     ``{ transport, adapter, binding_id }`` must be a non-empty string or the
     project is treated as monitor-only / not orchestration-ready.
+
+    Optional fields:
+    - ``require_truthful_availability`` (bool): whether truthful multi-signal
+      availability gating is enforced prior to dispatch (defaults to true for
+      browser_bridge transport).
     """
     if not isinstance(binding, dict):
         return False
@@ -782,6 +787,14 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
     raw_harness = project.get("reviewer_harness")
     if raw_harness is not None:
         normalized["reviewer_harness"] = _normalize_reviewer_harness(raw_harness, index, config_path)
+    raw_binding = normalized.get("conversation_binding")
+    if isinstance(raw_binding, dict):
+        binding_copy = dict(raw_binding)
+        if "require_truthful_availability" in binding_copy:
+            val = binding_copy["require_truthful_availability"]
+            if not isinstance(val, bool):
+                raise ValueError("config {0} project #{1} conversation_binding.require_truthful_availability must be a boolean".format(config_path, index))
+        normalized["conversation_binding"] = binding_copy
     normalized["orchestration_ready"] = (
         _binding_ready(normalized.get("conversation_binding"))
         or _direct_reviewer_ready(normalized)

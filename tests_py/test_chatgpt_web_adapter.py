@@ -212,6 +212,153 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         self.assertEqual(payload["requests"][1]["headers"]["Authorization"], "Bearer scoped-cap")
         self.assertEqual(payload["requests"][1]["data"]["binding_id"], "conv")
 
+    def test_userscript_compute_adapter_state_authoritative_contract(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const now = 1700000000000;"
+            "const validHealth = {"
+            "  availability: 'AVAILABLE',"
+            "  binding_id: 'conv-1',"
+            "  valid_until: new Date(now + 60000).toISOString()"
+            "};"
+            "const expiredHealth = {"
+            "  availability: 'AVAILABLE',"
+            "  binding_id: 'conv-1',"
+            "  valid_until: new Date(now - 1000).toISOString()"
+            "};"
+            "const wrongBindingHealth = {"
+            "  availability: 'AVAILABLE',"
+            "  binding_id: 'other-conv',"
+            "  valid_until: new Date(now + 60000).toISOString()"
+            "};"
+            "const cases = ["
+            "  // 1. Missing capability -> PAIRING_REQUIRED\n"
+            "  a.computeAdapterState({ hasCapability: false, bindingId: 'conv-1' }),"
+            "  // 2. Missing bindingId -> IDLE\n"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: '' }),"
+            "  // 3. Authoritative PAIRING_REQUIRED\n"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', healthAvailability: 'PAIRING_REQUIRED' }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', healthAvailability: 'pairing_required' }),"
+            "  // 4. Bridge error or disconnected -> OFFLINE\n"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', bridgeError: 'claim timeout' }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', bridgeConnected: false }),"
+            "  // 5. Authoritative OFFLINE or PROBE_FAILED (uppercase and lowercase) -> OFFLINE\n"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', healthAvailability: 'OFFLINE' }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', healthAvailability: 'offline' }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', healthAvailability: 'PROBE_FAILED' }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', healthAvailability: 'probe_failed' }),"
+            "  // 6. Degradations: duplicate tabs, stale heartbeat, expired snapshot, binding mismatch, DEGRADED -> DEGRADED\n"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', duplicateTabs: true, health: validHealth, now }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', staleHeartbeat: true, health: validHealth, now }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', health: wrongBindingHealth, now }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', health: expiredHealth, now }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', healthAvailability: 'DEGRADED', now }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', healthAvailability: 'degraded', now }),"
+            "  // 7. Bridge connected alone WITHOUT authoritative AVAILABLE health -> DEGRADED (never LIVE!)\n"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', bridgeConnected: true }),"
+            "  // 8. Bridge connected WITH valid unexpired AVAILABLE snapshot -> LIVE\n"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', bridgeConnected: true, health: validHealth, now }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', bridgeConnected: true, healthAvailability: 'available', now }),"
+            "  // 9. Activity states: WAITING and CLAIMED only when healthy\n"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', claimPhase: 'waiting', health: validHealth, now }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', claimPhase: 'claimed', health: validHealth, now }),"
+            "  // 10. Activity states do NOT mask non-AVAILABLE health (DEGRADED or OFFLINE takes precedence)\n"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', claimPhase: 'waiting', healthAvailability: 'OFFLINE', now }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', claimPhase: 'claimed', healthAvailability: 'DEGRADED', now }),"
+            "  a.computeAdapterState({ hasCapability: true, bindingId: 'conv-1', claimPhase: 'claimed', staleHeartbeat: true, health: validHealth, now })"
+            "];"
+            "console.log(JSON.stringify(cases.map(c => c.state)));process.exit(0);"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        states = json.loads(result.stdout)
+        expected = [
+            "PAIRING_REQUIRED",
+            "IDLE",
+            "PAIRING_REQUIRED",
+            "PAIRING_REQUIRED",
+            "OFFLINE",
+            "OFFLINE",
+            "OFFLINE",
+            "OFFLINE",
+            "OFFLINE",
+            "OFFLINE",
+            "DEGRADED",
+            "DEGRADED",
+            "DEGRADED",
+            "DEGRADED",
+            "DEGRADED",
+            "DEGRADED",
+            "DEGRADED",
+            "LIVE",
+            "LIVE",
+            "WAITING",
+            "CLAIMED",
+            "OFFLINE",
+            "DEGRADED",
+            "DEGRADED",
+        ]
+        self.assertEqual(states, expected)
+
+    def test_userscript_classify_heartbeat_result_contract(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const cases = ["
+            "  a.classifyHeartbeatResult({ status: 200, text: JSON.stringify({ data: { session: {} } }) }),"
+            "  a.classifyHeartbeatResult({ status: 401, text: JSON.stringify({ error: 'revoked_capability' }) }),"
+            "  a.classifyHeartbeatResult({ status: 401, text: JSON.stringify({ error: 'unknown_capability' }) }),"
+            "  a.classifyHeartbeatResult({ status: 503, text: JSON.stringify({ message: 'capability_store_unavailable' }) }),"
+            "  a.classifyHeartbeatResult({ status: 500, text: '' }),"
+            "  a.classifyHeartbeatResult({ status: 0, text: '' })"
+            "];"
+            "console.log(JSON.stringify(cases));process.exit(0);"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cases = json.loads(result.stdout)
+        self.assertEqual(cases[0]["verdict"], "ok")
+        self.assertFalse(cases[0]["shouldClear"])
+        self.assertEqual(cases[1]["verdict"], "unauthorized")
+        self.assertTrue(cases[1]["shouldClear"])
+        self.assertEqual(cases[1]["reason"], "revoked_capability")
+        self.assertEqual(cases[2]["verdict"], "unauthorized")
+        self.assertTrue(cases[2]["shouldClear"])
+        self.assertEqual(cases[2]["reason"], "unknown_capability")
+        self.assertEqual(cases[3]["verdict"], "store_unavailable")
+        self.assertFalse(cases[3]["shouldClear"])
+        self.assertEqual(cases[4]["verdict"], "network_error")
+        self.assertFalse(cases[4]["shouldClear"])
+        self.assertEqual(cases[5]["verdict"], "network_error")
+        self.assertFalse(cases[5]["shouldClear"])
+
+    def test_userscript_split_brain_health_demotes_live(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "// Healthy 8765 bridgeConnected=true but 8770 heartbeat is stale\n"
+            "const splitBrain = a.computeAdapterState({"
+            "  hasCapability: true,"
+            "  bindingId: 'conv-1',"
+            "  bridgeConnected: true,"
+            "  staleHeartbeat: true,"
+            "  health: { availability: 'AVAILABLE', binding_id: 'conv-1', valid_until: new Date(Date.now() + 60000).toISOString() }"
+            "});"
+            "console.log(splitBrain.state + '|' + splitBrain.detail);process.exit(0);"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state, detail = result.stdout.strip().split("|")
+        self.assertEqual(state, "DEGRADED")
+        self.assertIn("heartbeat", detail.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

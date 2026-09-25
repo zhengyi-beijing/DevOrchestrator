@@ -830,4 +830,296 @@ def test_cli_websol_status_and_probe(tmp_path: Path, capsys: pytest.CaptureFixtu
         probe_out = json.loads(capsys.readouterr().out)
         assert probe_out["status"] == "success"
         assert probe_out["request_id"] == "probe:mock"
+        # Finding (non-blocking): probe result must be recorded into health_store
+        probe_record = health_store.get_probe_info("proj-cli", "chatgpt_web", "bind-cli")
+        assert probe_record is not None
+        assert probe_record["success"] is True
+        assert probe_record["generation"] == 1
+
+
+# ============================================================================
+# 10. Remediation Tests: Findings (1) through (6)
+# ============================================================================
+
+def test_websol_health_to_dict_serialization() -> None:
+    """Finding (3): WebSolHealth must have a to_dict() method that cleanly serializes signals."""
+    sig = WebSolSignal(
+        name="capability",
+        status="healthy",
+        reason="valid",
+        observed_at="2026-09-25T12:00:00Z",
+        details={"verdicts": ["valid"]},
+    )
+    health = WebSolHealth(
+        project_id="proj-dict",
+        adapter="chatgpt_web",
+        binding_id="bind-dict",
+        availability=WebSolAvailability.AVAILABLE.value,
+        evaluated_at="2026-09-25T12:00:00Z",
+        valid_until="2026-09-25T12:01:00Z",
+        reason="all_signals_healthy",
+        signals={"capability": sig},
+        probe_generation=2,
+    )
+    d = health.to_dict()
+    assert isinstance(d, dict)
+    assert d["project_id"] == "proj-dict"
+    assert d["adapter"] == "chatgpt_web"
+    assert d["binding_id"] == "bind-dict"
+    assert d["availability"] == "AVAILABLE"
+    assert d["reason"] == "all_signals_healthy"
+    assert d["probe_generation"] == 2
+    assert "capability" in d["signals"]
+    assert d["signals"]["capability"]["status"] == "healthy"
+    assert d["signals"]["capability"]["details"] == {"verdicts": ["valid"]}
+
+
+def test_capability_signals_no_active_tabs_and_unverified() -> None:
+    """Finding (4): no_active_tabs must not map to PAIRING_REQUIRED; unverified must never evaluate to AVAILABLE."""
+    base_signals = {
+        "bridge_listener": WebSolSignal(name="bridge_listener", status="healthy", reason="ok", observed_at="2026-09-25T12:00:00Z", details={}),
+        "browser_claim_presence": WebSolSignal(name="browser_claim_presence", status="healthy", reason="ok", observed_at="2026-09-25T12:00:00Z", details={}),
+        "control_heartbeat": WebSolSignal(name="control_heartbeat", status="healthy", reason="ok", observed_at="2026-09-25T12:00:00Z", details={}),
+        "binding_identity": WebSolSignal(name="binding_identity", status="healthy", reason="ok", observed_at="2026-09-25T12:00:00Z", details={}),
+        "probe": WebSolSignal(name="probe", status="healthy", reason="ok", observed_at="2026-09-25T12:00:00Z", details={"success": True, "generation": 1}),
+    }
+
+    # Case A: no_active_tabs
+    sig_no_tabs = dict(base_signals)
+    sig_no_tabs["capability"] = WebSolSignal(
+        name="capability",
+        status="no_active_tabs",
+        reason="no_active_tabs",
+        observed_at="2026-09-25T12:00:00Z",
+        details={},
+    )
+    avail, reason = evaluate_websol_availability(sig_no_tabs, probe_passed=True, probe_generation=1, current_probe_generation=1)
+    assert avail == WebSolAvailability.DEGRADED
+    assert reason == "no_active_tabs"
+    assert avail != WebSolAvailability.PAIRING_REQUIRED
+
+    # Case B: unverified capability
+    sig_unverified = dict(base_signals)
+    sig_unverified["capability"] = WebSolSignal(
+        name="capability",
+        status="unverified",
+        reason="capability_unverified",
+        observed_at="2026-09-25T12:00:00Z",
+        details={},
+    )
+    avail_u, reason_u = evaluate_websol_availability(sig_unverified, probe_passed=True, probe_generation=1, current_probe_generation=1)
+    assert avail_u == WebSolAvailability.DEGRADED
+    assert reason_u == "capability_unverified"
+    assert avail_u != WebSolAvailability.AVAILABLE
+
+
+def test_evaluate_websol_availability_probe_generation_and_defaults() -> None:
+    """Finding (1): evaluate_websol_availability must check probe generation and handle optional defaults."""
+    healthy_signals = {
+        "bridge_listener": WebSolSignal(name="bridge_listener", status="healthy", reason="ok", observed_at="2026-09-25T12:00:00Z", details={}),
+        "browser_claim_presence": WebSolSignal(name="browser_claim_presence", status="healthy", reason="ok", observed_at="2026-09-25T12:00:00Z", details={}),
+        "control_heartbeat": WebSolSignal(name="control_heartbeat", status="healthy", reason="ok", observed_at="2026-09-25T12:00:00Z", details={}),
+        "binding_identity": WebSolSignal(name="binding_identity", status="healthy", reason="ok", observed_at="2026-09-25T12:00:00Z", details={}),
+        "capability": WebSolSignal(name="capability", status="healthy", reason="valid", observed_at="2026-09-25T12:00:00Z", details={}),
+        "probe": WebSolSignal(name="probe", status="healthy", reason="ok", observed_at="2026-09-25T12:00:00Z", details={"success": True, "generation": 1}),
+    }
+
+    # 1. Matching generation and probe passed -> AVAILABLE
+    avail, reason = evaluate_websol_availability(
+        healthy_signals,
+        probe_passed=True,
+        probe_generation=1,
+        current_probe_generation=1,
+    )
+    assert avail == WebSolAvailability.AVAILABLE
+    assert reason == "all_signals_healthy"
+
+    # 2. Generation mismatch (e.g. store generation bumped to 2) -> DEGRADED probe_required
+    avail_mismatch, reason_mismatch = evaluate_websol_availability(
+        healthy_signals,
+        probe_passed=True,
+        probe_generation=1,
+        current_probe_generation=2,
+    )
+    assert avail_mismatch == WebSolAvailability.DEGRADED
+    assert reason_mismatch == "probe_required"
+
+    # 3. Probe not passed -> DEGRADED probe_required
+    avail_fail, reason_fail = evaluate_websol_availability(
+        healthy_signals,
+        probe_passed=False,
+        probe_generation=1,
+        current_probe_generation=1,
+    )
+    assert avail_fail == WebSolAvailability.DEGRADED
+    assert reason_fail == "probe_required"
+
+    # 4. Optional defaults fall back to probe signal details
+    avail_fallback, reason_fallback = evaluate_websol_availability(healthy_signals)
+    assert avail_fallback == WebSolAvailability.AVAILABLE
+    assert reason_fallback == "all_signals_healthy"
+
+
+def test_server_websol_health_auth_and_cors(tmp_path: Path) -> None:
+    """Findings (3) & (6): websol-health endpoint requires owner auth and strips blanket CORS."""
+    import http.client
+    import threading
+    from datetime import datetime, timezone
+    from dev_orchestrator.web.server import make_server
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(parents=True)
+    web_root = Path(__file__).resolve().parents[1] / "web"
+
+    server = make_server("127.0.0.1", 0, runtime, web_root, enable_control=True)
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    port = int(server.server_address[1])
+
+    try:
+        health = WebSolHealth(
+            project_id="proj-srv",
+            adapter="chatgpt_web",
+            binding_id="bind-srv",
+            availability=WebSolAvailability.AVAILABLE.value,
+            evaluated_at="2026-09-25T12:00:00Z",
+            valid_until=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+            reason="all_signals_healthy",
+            signals={},
+            probe_generation=1,
+        )
+        server.websol_health_store.put(health)
+
+        # 1. Unauthenticated GET /api/v1/control/websol-health returns 401
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        conn.request("GET", "/api/v1/control/websol-health")
+        resp = conn.getresponse()
+        assert resp.status == 401
+        resp.read()
+        conn.close()
+
+        # 2. GET with invalid bearer returns 401
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        conn.request("GET", "/api/v1/control/websol-health", headers={"Authorization": "Bearer bad-token"})
+        resp = conn.getresponse()
+        assert resp.status == 401
+        resp.read()
+        conn.close()
+
+        # 3. GET with valid bearer returns 200 with serialized health dict
+        assert server.control_security is not None
+        valid_token = server.control_security.token()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        conn.request(
+            "GET",
+            "/api/v1/control/websol-health",
+            headers={"Authorization": f"Bearer {valid_token}"},
+        )
+        resp = conn.getresponse()
+        assert resp.status == 200
+        body = json.loads(resp.read().decode("utf-8"))
+        assert "data" in body
+        assert isinstance(body["data"], list)
+        assert len(body["data"]) == 1
+        assert body["data"][0]["project_id"] == "proj-srv"
+        resp_headers = dict(resp.getheaders())
+        assert resp_headers.get("Access-Control-Allow-Origin") is None
+        conn.close()
+
+        # 4. OPTIONS preflight for websol-health with Origin: https://chatgpt.com returns 405
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        conn.request(
+            "OPTIONS",
+            "/api/v1/control/websol-health",
+            headers={
+                "Origin": "https://chatgpt.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        resp = conn.getresponse()
+        assert resp.status == 405
+        resp.read()
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        th.join(timeout=2)
+
+
+def test_daemon_availability_provider_gating_default(tmp_path: Path) -> None:
+    """Finding (5): Truthful availability gating in daemon must default to active for browser_bridge."""
+    from dev_orchestrator.storage.json_store import utc_now
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(parents=True)
+    health_store = WebSolHealthStore(runtime)
+
+    now = utc_now()
+    health_store.put(
+        WebSolHealth(
+            project_id="proj-gate",
+            adapter="chatgpt_web",
+            binding_id="bind-gate",
+            availability=WebSolAvailability.AVAILABLE.value,
+            evaluated_at=now.isoformat(),
+            valid_until=(now + timedelta(hours=1)).isoformat(),
+            reason="all_signals_healthy",
+            signals={},
+            probe_generation=1,
+        )
+    )
+
+    browser_summary = {
+        "projects": [
+            {
+                "project_id": "proj-gate",
+                "conversation_binding": {
+                    "transport": "browser_bridge",
+                    "adapter": "chatgpt_web",
+                    "binding_id": "bind-gate",
+                },
+            }
+        ]
+    }
+
+    def _daemon_availability_provider(p: str, a: str, b: str) -> Any:
+        proj_item = None
+        for itm in browser_summary.get("projects") or []:
+            if isinstance(itm, dict) and itm.get("project_id") == p:
+                proj_item = itm
+                break
+        cb = (proj_item.get("conversation_binding") or {}) if isinstance(proj_item, dict) else {}
+        if cb.get("require_truthful_availability") is False or cb.get("require_availability") is False:
+            return None
+        is_browser_bridge = cb.get("transport") == "browser_bridge" or a == "chatgpt_web"
+        if (is_browser_bridge or cb.get("require_truthful_availability") or cb.get("require_availability")) and health_store:
+            return health_store.get(p, a, b)
+        return None
+
+    # Default is active -> returns health record
+    res = _daemon_availability_provider("proj-gate", "chatgpt_web", "bind-gate")
+    assert res is not None
+    assert res.availability == WebSolAvailability.AVAILABLE.value
+
+    # Explicitly disabled -> returns None
+    browser_summary["projects"][0]["conversation_binding"]["require_truthful_availability"] = False
+    assert _daemon_availability_provider("proj-gate", "chatgpt_web", "bind-gate") is None
+
+
+def test_bridge_store_withdraw_verifies_nonce(tmp_path: Path) -> None:
+    """Non-blocking finding: withdraw() must verify request nonce before revoking/withdrawing."""
+    from datetime import datetime, timezone
+    runtime = tmp_path / "runtime"
+    bridge = BrowserBridgeStore(runtime)
+    bridge._touch_presence("chatgpt_web", "bind-nonce", datetime.now(timezone.utc))
+
+    req = make_req("req-nonce-check", nonce="correct-nonce")
+    bridge.submit("chatgpt_web", "bind-nonce", req, "test prompt")
+
+    # Mismatched nonce raises BridgeConflictError
+    with pytest.raises(BridgeConflictError, match="nonce mismatch"):
+        bridge.withdraw("chatgpt_web", "bind-nonce", req.request_id, "wrong-nonce", "test")
+
+    # Correct nonce succeeds
+    res = bridge.withdraw("chatgpt_web", "bind-nonce", req.request_id, "correct-nonce", "test")
+    assert res.outcome == "withdrawn"
 
