@@ -5,7 +5,7 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P16.10 Automatic Failure Harvesting & Regression Promotion** (Status: **COMPLETE** / Implementation, Verification & Technical Review Remediation Complete). Next task: **P16.11 AGY-First Resource Routing**.
+Current task: **P16.11 AGY-First Resource Routing** (Status: **PENDING DESIGN**). Previous task: **P16.10 Automatic Failure Harvesting & Regression Promotion** (Status: **COMPLETE**).
 
 P16.10 Automatic Failure Harvesting & Regression Promotion completion (2026-09-25):
 - Implemented restart-safe incident packet store under `runtime/incident-packets/`:
@@ -481,12 +481,18 @@ P12.7 review remediation result (2026-09-17):
   - Knowledge graph updated with `graphify update .` (3114 nodes, 8631 edges, 157 communities).
   - Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
 
-P16.10 final owner-gate closure (2026-09-25):
+P16.10 final owner-gate closure and review acceptance (2026-09-25):
 - HEAD lineage includes 2958304 fixing the final OWNER_GATE rereview disposition mismatch.
 - Added dedicated regression coverage in test_p127_closure_rereview.py for completed reviewer OWNER_GATE -> clean descendant -> exactly one rereview candidate/control -> rereview_of gate consumption.
-- New focused regression passes (1 passed in 2.31s).
-- Full tests_py regression on the final closure tree passed: 1210 passed, 92 subtests passed in 488.55s (0 failures). Do not mark P16.10 DONE until the independent final rereview returns NEXT.
-- After final reviewer NEXT, close P16.10 and allow the normal successor chain to advance to P16.11.
+- Independent review `ai_review:rereview:2cfa3024-fa26-49a6-9770-6125ef1074b7` on HEAD `ca0807e` returned `decision: "next"`, `next_action: "next_task"` ("No concrete fixable blocking finding remains in the reviewed task, so P16.10 may close and the successor chain may advance").
+- Resolved secondary non-blocking improvements:
+  - In `src/dev_orchestrator/control/reconcile.py`, allowed `OWNER_GATE` lifecycle in `_rereview_task_matches_current_or_pending_successor` for cross-task re-review when successor is pending design.
+  - In `src/dev_orchestrator/core/transition_executor.py`, added `"review accepted current READY_TO_RUN task and no next executable task is advertised"` to `_legacy_no_next_settle`, covered by `test_legacy_no_next_settle_ready_to_run_reconciles_to_staged_handoff`.
+  - In `src/dev_orchestrator/incidents/evaluation.py`, added early-return on isolation gate failure to avoid subprocess-executing un-isolated test code, covered by `test_isolation_failure_skips_subprocess_execution`.
+  - In `src/dev_orchestrator/incidents/store.py`, simplified line 258 condition (`if live_last_txn == txn_id:`).
+  - In `src/dev_orchestrator/control/surface.py`, separated `active_lifecycles` from `terminal_lifecycles`.
+- Full tests_py regression on the final closure tree passed: 1212 passed, 92 subtests passed in 475.40s (0 failures).
+- P16.10 is marked COMPLETE and closed. Successor chain advances to P16.11.
 
 P12.7 second review remediation result (2026-09-18):
 - Remediated findings from `ai_review:ai_review:auto-cf45dc90052f1a5988604625:execute`:

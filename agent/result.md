@@ -1589,3 +1589,22 @@ Closed both concrete BLOCKING review findings from `ai_review:rereview:37165140-
    - Candidate test collection isolation verified (0 tests collected without `DEVORCH_CANDIDATE_TESTS=1`).
    - `compileall` and `git diff --check` clean.
    - Knowledge graph updated via `graphify update .` (6000 nodes, 16811 edges, 260 communities).
+
+### P16.10 Independent Review Acceptance & Task Closure (2026-09-25)
+
+- Independent technical review `ai_review:rereview:2cfa3024-fa26-49a6-9770-6125ef1074b7` on HEAD `ca0807e` returned:
+  - `decision: "next"`
+  - `next_action: "next_task"`
+  - `reason: "No concrete fixable blocking finding remains in the reviewed task, so P16.10 may close and the successor chain may advance"`
+- Secondary non-blocking cleanups implemented and verified:
+  1. `src/dev_orchestrator/control/reconcile.py`: allowed `OWNER_GATE` lifecycle in `_rereview_task_matches_current_or_pending_successor` for cross-task re-review when successor is pending design; verified by `test_owner_gate_clean_descendant_has_one_rereview_and_consumes_gate` (21/21 passed).
+  2. `src/dev_orchestrator/core/transition_executor.py`: added `"review accepted current READY_TO_RUN task and no next executable task is advertised"` to `_legacy_no_next_settle`; added unit test `test_legacy_no_next_settle_ready_to_run_reconciles_to_staged_handoff` (33/33 passed).
+  3. `src/dev_orchestrator/incidents/evaluation.py`: added early return on isolation gate failure to prevent subprocess execution of un-isolated candidate test code; added `test_isolation_failure_skips_subprocess_execution` in `tests_py/test_p1610_candidate_promotion.py` (14/14 passed).
+  4. `src/dev_orchestrator/incidents/store.py`: simplified line 258 condition (`if live_last_txn == txn_id:`), removing redundant disjunct; verified by `test_p1610_incident_store.py` (12/12 passed, 69/69 P16.10 tests passed).
+  5. `src/dev_orchestrator/control/surface.py`: separated `active_lifecycles` from `terminal_lifecycles`; verified by control and reconcile test suites (54/54 passed).
+- Final verification:
+  - 69 focused tests across 8 P16.10 test modules passing 100%.
+  - Full repository regression: 1212 passed, 92 subtests passed in 475.40s (0 failures).
+  - Compilation (`compileall`) and whitespace check (`git diff --check`) clean.
+  - Knowledge graph updated with `graphify update .` (6005 nodes, 16830 edges, 244 communities).
+- P16.10 is closed; handoff advances to P16.11 AGY-First AI Resource Pool Benchmark & Routing (`agent/staged/P16.11.md`).
