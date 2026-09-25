@@ -2448,6 +2448,36 @@ class WatchdogCoordinator:
             },
         )
 
+    @staticmethod
+    def _has_authoritative_successor_progress(
+        snapshot: dict[str, Any], executor_state: dict[str, Any], finding: dict[str, Any],
+    ) -> bool:
+        """Require a durable handoff path from the lost task to the advertised task."""
+        telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+        current_task = str(telemetry.get("task_id") or snapshot.get("task_id") or "")
+        lost_task = str(finding.get("task_id") or "")
+        if not current_task or not lost_task or current_task == lost_task:
+            return False
+        executions = executor_state.get("executions") if isinstance(executor_state, dict) else {}
+        project_id = str(snapshot.get("project_id") or snapshot.get("id") or "")
+        edges: dict[str, set[str]] = {}
+        for row in (executions or {}).values():
+            if not isinstance(row, dict) or str(row.get("project_id") or "") != project_id:
+                continue
+            src = str(row.get("task_id") or row.get("source_task_id") or "")
+            dst = str(row.get("next_task_id") or row.get("staged_successor") or "")
+            if src and dst and str(row.get("state") or "").lower() in {"handoff", "settled"}:
+                edges.setdefault(src, set()).add(dst)
+        frontier, seen = [lost_task], {lost_task}
+        while frontier:
+            for dst in edges.get(frontier.pop(), set()):
+                if dst == current_task:
+                    return True
+                if dst not in seen:
+                    seen.add(dst)
+                    frontier.append(dst)
+        return False
+
     def _trigger_execution_loss_recovery(
         self,
         project_config: dict[str, Any],
@@ -2494,6 +2524,28 @@ class WatchdogCoordinator:
         launch_anchor = finding.get("launch_anchor") or {}
         expected_head = launch_anchor.get("head") or launch_anchor.get("git_head")
         if expected_head and truth.head and truth.head != expected_head:
+            executor_state = executor.state() if executor is not None and hasattr(executor, "state") else {}
+            if self._has_authoritative_successor_progress(snapshot, executor_state, finding):
+                finding["state"] = "resolved"
+                resolved_at = utc_now_iso()
+                resolved_reason = "superseded_by_authoritative_successor_progress"
+                update_finding_state(
+                    self.runtime_root,
+                    project_id=pid,
+                    lineage_key=finding.get("lineage_key", ""),
+                    invariant_key=invariant_key,
+                    finding_id=finding.get("finding_id"),
+                    state="resolved",
+                    resolved_at=resolved_at,
+                    resolved_reason=resolved_reason,
+                )
+                self._emit_milestone(
+                    pid, "EXECUTION_LOSS_RESOLVED",
+                    task_id=finding.get("task_id"),
+                    occurrence_key=f"{invariant_key}:successor-progress",
+                    details={"invariant_key": invariant_key, "reason": resolved_reason},
+                )
+                return
             finding["state"] = "escalated"
             update_finding_state(
                 self.runtime_root,

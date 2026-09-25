@@ -910,6 +910,27 @@ class TestWatchdogExecutionLoss(unittest.TestCase):
         ex_st = executor.state()
         self.assertEqual(ex_st["executions"]["req-rec"]["state"], "explicitly_reconciled")
 
+    def test_successor_progress_requires_durable_handoff_path(self):
+        snapshot = {"project_id": "p1", "telemetry": {"task_id": "P16.12"}}
+        finding = {"task_id": "P16.10"}
+        executor_state = {"executions": {
+            "h1": {"project_id": "p1", "task_id": "P16.10", "next_task_id": "P16.11", "state": "handoff"},
+            "h2": {"project_id": "p1", "task_id": "P16.11", "next_task_id": "P16.12", "state": "handoff"},
+        }}
+        self.assertTrue(
+            WatchdogCoordinator._has_authoritative_successor_progress(snapshot, executor_state, finding)
+        )
+
+    def test_task_pointer_change_without_handoff_does_not_resolve_loss(self):
+        snapshot = {"project_id": "p1", "telemetry": {"task_id": "P16.12"}}
+        finding = {"task_id": "P16.10"}
+        executor_state = {"executions": {
+            "unrelated": {"project_id": "p1", "task_id": "P16.11", "state": "completed"},
+        }}
+        self.assertFalse(
+            WatchdogCoordinator._has_authoritative_successor_progress(snapshot, executor_state, finding)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
