@@ -751,8 +751,12 @@ class WebSolHealthStore:
                     and reset_seconds > 0
                     and (moment - last_failure).total_seconds() >= reset_seconds
                 ):
-                    b_info["consecutive_failures"] = 0
-                    write_json(self.health_path, data, indent=2)
+                    with InterProcessFileLock(self.lock_path):
+                        data = self._load_data()
+                        backoff_map = data.setdefault("probe_backoff", {})
+                        b_info = backoff_map.setdefault(key, {})
+                        b_info["consecutive_failures"] = 0
+                        write_json(self.health_path, data, indent=2)
                     return 0
                 return int(b_info.get("consecutive_failures", 0))
             return 0
