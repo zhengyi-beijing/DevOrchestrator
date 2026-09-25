@@ -2889,6 +2889,14 @@ class TransitionExecutor:
                         or (successor_id and (rec.get("staged_successor") == successor_id or rec.get("next_task_id") == successor_id))
                     )
                     and rec.get("state") in ("handoff", "settled", "blocked")
+                    # A prior terminal settlement was valid only while the roadmap
+                    # advertised no successor. If a successor is later staged, it
+                    # must not permanently suppress the newly valid handoff.
+                    and not (
+                        successor_id
+                        and rec.get("state") == "settled"
+                        and rec.get("outcome") == "task_complete"
+                    )
                     for rec in ledger["executions"].values()
                     if isinstance(rec, dict)
                 )
