@@ -5,7 +5,56 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P16.12 Web Sol Persistent Pairing & Truthful Availability** (Status: **PENDING DESIGN**). Previous task: **P16.11 AGY-First AI Resource Pool Benchmark & Routing** (Status: **COMPLETE**).
+Current task: **P16.12 Web Sol Persistent Pairing & Truthful Availability** (Status: **COMPLETE**). Previous task: **P16.11 AGY-First AI Resource Pool Benchmark & Routing** (Status: **COMPLETE**).
+
+P16.12 Web Sol Persistent Pairing & Truthful Availability completion (2026-09-25):
+- Implemented persistent pairing, truthful multi-signal availability, probe lifecycle, and failover:
+  1. Capability Security Hardening (`src/dev_orchestrator/control/security.py`):
+     - Added `CapabilityVerdict` enum (`VALID`, `REVOKED`, `UNKNOWN`, `UNAVAILABLE`) and `CapabilityStoreUnavailableError`.
+     - Hardened store loading against I/O, malformed JSON, and schema errors; mutation methods fail closed without overwriting unreadable files.
+     - Added `capability_state`, `capability_status`, `capability_identity`, and `renew_session_capability` methods on `ControlSecurity` and top-level functions.
+  2. Control Store Session Pairing (`src/dev_orchestrator/control/store.py`):
+     - Added `capability_id` and `capability_source` parameters to `heartbeat(...)`.
+     - Persists `capability_pairing_id`, `capability_source`, `verified_at` per session/tab.
+     - Extended `session_status(...)` and `list_sessions(...)` with `active_tab_count`, `stale_tab_count`, `verified` flag, and capability pairing metadata.
+  3. Browser Bridge Durable Cancellation & Maximum Claim Lifetime (`src/dev_orchestrator/bridge/store.py`):
+     - Added `_DEFAULT_MAX_CLAIM_LIFETIME_SECONDS = 900` (15 minutes) and `WithdrawResult` dataclass (`outcome`, `request_id`, `binding_id`, `adapter`, `cancel_deadline`, `reason`).
+     - Clamped claims and renewals to `claim_deadline_at`.
+     - Implemented `withdraw(...)` (tombstone for pending, atomic `cancel_requested_at` and `cancel_deadline` for active, finalized `withdrawn` after lease expiry).
+     - Implemented `discard_probe(adapter, binding_id, request_id, nonce)` accepting only exact reserved `probe:` request IDs.
+  4. Web Sol Truthful Health Evaluation & Store (`src/dev_orchestrator/core/websol_health.py`):
+     - Implemented `WebSolAvailability` enum (`AVAILABLE`, `DEGRADED`, `OFFLINE`, `PAIRING_REQUIRED`, `PROBE_FAILED`).
+     - Implemented `WebSolSignal`, `WebSolHealth`, `health_key`, `probe_bridge_listener(...)`, `collect_websol_signals(...)` covering all 6 independent signals (`bridge_listener`, `browser_claim_presence`, `control_heartbeat`, `binding_identity`, `capability`, `probe`).
+     - Implemented deterministic fail-closed `evaluate_websol_availability(...)` and `WebSolHealthStore` under atomic writes and `InterProcessFileLock`.
+  5. Deterministic End-to-End Inference Probe (`src/dev_orchestrator/core/websol_probe.py`):
+     - Implemented `run_websol_probe(...)` with timeout, failure classification, marker verification, and automatic discard.
+     - Isolated probes from workflow decisions: Response Consumer (`src/dev_orchestrator/core/response_consumer.py`) skips reserved probe requests from entering decisions ledger.
+  6. Web Sol Occurrence Failover Engine (`src/dev_orchestrator/core/websol_failover.py`):
+     - Implemented `FailoverState`, `FailoverDecision`, `FailoverRecord`, `evaluate_failover_decision(...)`, `WebSolFailoverStore`, and `FailoverEngine.reconcile(...)` with prepared work grace period and bounded attempt capping.
+  7. Direct Reviewer Failover Integration (`src/dev_orchestrator/core/ai_reviewer.py`):
+     - Implemented `submit_failover_review(project_id, run_id, failover_record_id, policy=None)` anchored to `ai_review:<run_id>` without AGY acquisition.
+  8. Dispatcher Truthful Availability Gating (`src/dev_orchestrator/core/dispatcher.py`):
+     - Added `availability_provider` parameter to `dispatch_worker_done_events` and `_dispatch_one`.
+     - Gated delivery on `WebSolAvailability.AVAILABLE.value` via `_delivery_allowed` when `availability_provider` returns non-None health (preserves backward compatibility when absent/None).
+     - Blocked bridge submission if `prepared.get("failover_state")` is set.
+  9. Control Web Server Endpoints & Userscript (`src/dev_orchestrator/web/server.py`, `browser/chatgpt-web-adapter.user.js`):
+     - Heartbeat returns `{session, websol_health}` and 401 with reason codes for revoked/unknown capability, 503 for store unavailable.
+     - Exposed `POST /v1/capability/renew` and `GET /v1/websol/health` endpoints.
+     - Userscript updated to store structured capability record, retain token on transport/503 errors, and compute badge status demoting from authoritative health snapshot.
+  10. Daemon Web Sol Coordination (`src/dev_orchestrator/daemon.py`):
+      - Wired Web Sol health evaluation, failover reconciliation, probe execution with prerequisites check, and truthful availability provider into orchestration tick.
+  11. CLI Commands (`src/dev_orchestrator/cli.py`):
+      - `websol-status`: Outputs JSON or formatted table of 6 signals and availability for project bindings.
+      - `websol-probe`: Triggers on-demand inference probe and prints result.
+- Verification:
+  - 16 dedicated unit and integration tests in `tests_py/test_p1612_websol_pairing_and_availability.py` passing 100%.
+  - 43 tests in bridge, dispatcher, and response consumer suites passing 100%.
+  - Daemon transition integration and worker done integration tests passing 100%.
+  - Userscript adapter tests (`tests_py/test_chatgpt_web_adapter.py`) passing 100%.
+  - Full repository regression: 1250 passed, 92 subtests passed in pytest.
+  - Python compilation (`compileall src ops tests_py`) and `git diff --check` clean.
+  - Knowledge graph updated via `graphify update .` (6331 nodes, 17713 edges, 258 communities).
+
 
 P16.11 AGY-First AI Resource Pool Benchmark & Routing completion (2026-09-25):
 - Delivered the AGY-first AI resource pool, real-time availability/quota telemetry, reviewer independence enforcement, same-failure heterogeneous escalation, and representative replay benchmark:

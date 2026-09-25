@@ -1,6 +1,6 @@
 # P16.12 Web Sol Persistent Pairing & Truthful Availability
 
-Status: **READY_TO_RUN**
+Status: **COMPLETE**
 
 Goal: make Web Sol a restart-safe AI resource that normally requires only one manual pairing, automatically restores service after Chrome/Tampermonkey/DevO restarts, and never reports AVAILABLE/LIVE from partial transport health.
 

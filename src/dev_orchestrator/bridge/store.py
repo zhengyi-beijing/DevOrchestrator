@@ -65,6 +65,7 @@ from dev_orchestrator.storage.json_store import append_jsonl, read_json, write_j
 
 _DEFAULT_LEASE_SECONDS = 30
 _DEFAULT_PRESENCE_SECONDS = 300
+_DEFAULT_MAX_CLAIM_LIFETIME_SECONDS = 900
 
 STATE_PENDING = "pending"
 STATE_CLAIMED = "claimed"
@@ -161,6 +162,18 @@ class StoredRenewal:
     state: str = STATE_CLAIMED
 
 
+@dataclass(frozen=True)
+class WithdrawResult:
+    """Outcome of BrowserBridgeStore.withdraw."""
+
+    outcome: str  # "withdrawn" | "revocation_pending" | "responded" | "missing"
+    request_id: str
+    binding_id: str
+    adapter: str
+    cancel_deadline: Optional[str] = None
+    reason: Optional[str] = None
+
+
 def _as_utc(value: Optional[datetime]) -> datetime:
     """Normalize a ``now`` parameter to an aware UTC datetime."""
     moment = value or datetime.now(timezone.utc)
@@ -213,6 +226,7 @@ class BrowserBridgeStore:
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         require_live_binding: bool = False,
         binding_presence_seconds: Optional[int] = None,
+        max_claim_lifetime_seconds: Optional[int] = None,
     ) -> None:
         """Open (creating when needed) the persistent transport store.
 
@@ -234,6 +248,11 @@ class BrowserBridgeStore:
         if int(binding_presence_seconds) <= 0:
             raise ValueError("binding_presence_seconds must be a positive number")
         self.binding_presence_seconds = int(binding_presence_seconds)
+        if max_claim_lifetime_seconds is None:
+            max_claim_lifetime_seconds = _DEFAULT_MAX_CLAIM_LIFETIME_SECONDS
+        if int(max_claim_lifetime_seconds) <= 0:
+            raise ValueError("max_claim_lifetime_seconds must be a positive number")
+        self.max_claim_lifetime_seconds = int(max_claim_lifetime_seconds)
         self._queue_dir = self.root / "queues"
         self._queue_dir.mkdir(parents=True, exist_ok=True)
         self._presence_dir = self.root / "presence"
@@ -481,6 +500,14 @@ class BrowserBridgeStore:
             for reclaim_expired in (False, True):
                 for request_id, record in queue.items():
                     state = record.get("state")
+                    if state == "withdrawn" or record.get("cancel_requested_at"):
+                        continue
+                    first_claimed = _parse_iso(record.get("first_claimed_at"))
+                    claim_deadline = _parse_iso(record.get("claim_deadline_at"))
+                    if first_claimed is not None and claim_deadline is not None:
+                        if moment >= claim_deadline:
+                            continue
+
                     if not reclaim_expired:
                         if state != STATE_PENDING:
                             continue
@@ -494,7 +521,15 @@ class BrowserBridgeStore:
                     record["state"] = STATE_CLAIMED
                     record["claim_token"] = claim_token
                     record["claimed_at"] = _iso(moment)
-                    record["lease_expires_at"] = _iso(moment + timedelta(seconds=self.lease_seconds))
+                    if not record.get("first_claimed_at"):
+                        record["first_claimed_at"] = _iso(moment)
+                        record["claim_deadline_at"] = _iso(moment + timedelta(seconds=self.max_claim_lifetime_seconds))
+
+                    claim_deadline = _parse_iso(record.get("claim_deadline_at"))
+                    target_lease = moment + timedelta(seconds=self.lease_seconds)
+                    if claim_deadline is not None and target_lease > claim_deadline:
+                        target_lease = claim_deadline
+                    record["lease_expires_at"] = _iso(target_lease)
                     self._save_queue(adapter, binding_id, queue)
                     return self._record_to_claim(record, claim_token)
             return None
@@ -566,6 +601,17 @@ class BrowserBridgeStore:
                     "accepted response".format(request_id)
                 )
 
+            if record.get("state") == "withdrawn":
+                raise BridgeConflictError(
+                    "request {0!r} has been withdrawn".format(request_id)
+                )
+            if record.get("cancel_requested_at"):
+                cancel_deadline_dt = _parse_iso(record.get("cancel_deadline"))
+                if cancel_deadline_dt is not None and moment >= cancel_deadline_dt:
+                    raise BridgeConflictError(
+                        "cancellation deadline expired for request {0!r}".format(request_id)
+                    )
+
             expires_at = _parse_iso(record.get("lease_expires_at"))
             valid = (
                 record.get("state") == STATE_CLAIMED
@@ -627,6 +673,19 @@ class BrowserBridgeStore:
                 raise BridgeConflictError(
                     "no request {0!r} exists in binding {1!r}".format(request_id, binding_id)
                 )
+            if record.get("state") == "withdrawn":
+                raise BridgeConflictError(
+                    "request {0!r} is withdrawn".format(request_id)
+                )
+            if record.get("cancel_requested_at"):
+                raise BridgeConflictError(
+                    "cancellation has been requested for request {0!r}".format(request_id)
+                )
+            claim_deadline = _parse_iso(record.get("claim_deadline_at"))
+            if claim_deadline is not None and moment >= claim_deadline:
+                raise BridgeConflictError(
+                    "maximum claim lifetime exceeded for request {0!r}".format(request_id)
+                )
             expires_at = _parse_iso(record.get("lease_expires_at"))
             active = (
                 record.get("state") == STATE_CLAIMED
@@ -640,7 +699,10 @@ class BrowserBridgeStore:
                     "request {0!r} is not a still-valid exact active claim "
                     "matching the binding/nonce/claim token".format(request_id)
                 )
-            renewed_lease = _iso(moment + timedelta(seconds=self.lease_seconds))
+            target_lease = moment + timedelta(seconds=self.lease_seconds)
+            if claim_deadline is not None and target_lease > claim_deadline:
+                target_lease = claim_deadline
+            renewed_lease = _iso(target_lease)
             record["lease_expires_at"] = renewed_lease
             self._save_queue(adapter, binding_id, queue)
             # A successful renew proves the adapter is alive on this binding.
@@ -653,6 +715,146 @@ class BrowserBridgeStore:
                 lease_expires_at=renewed_lease,
                 state=STATE_CLAIMED,
             )
+
+    def withdraw(
+        self,
+        adapter: str,
+        binding_id: str,
+        request_id: str,
+        nonce: str,
+        reason: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> WithdrawResult:
+        """Withdraw a pending or claimed request, or report terminal/missing status.
+
+        Under the queue lock, withdrawing pending work finalizes a durable withdrawn
+        tombstone. Withdrawing an active claim atomically sets cancel_requested_at
+        and cancel_deadline and returns revocation_pending. A cancellation-marked
+        record is never reclaimed, renew() rejects it immediately, and respond() may
+        win only until the already-issued capped lease expires. A later idempotent
+        withdrawal after the deadline finalizes the tombstone.
+        """
+        _require_route(adapter, binding_id)
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("request_id must be a non-blank string")
+        moment = _as_utc(now)
+        with self._lock:
+            queue = self._load_queue(adapter, binding_id)
+            record = queue.get(request_id)
+            if record is None:
+                return WithdrawResult(
+                    outcome="missing",
+                    request_id=request_id,
+                    binding_id=binding_id,
+                    adapter=adapter,
+                    reason=reason,
+                )
+            if record.get("state") == STATE_RESPONDED:
+                return WithdrawResult(
+                    outcome="responded",
+                    request_id=request_id,
+                    binding_id=binding_id,
+                    adapter=adapter,
+                    reason=reason,
+                )
+            if record.get("state") == "withdrawn":
+                return WithdrawResult(
+                    outcome="withdrawn",
+                    request_id=request_id,
+                    binding_id=binding_id,
+                    adapter=adapter,
+                    reason=str(record.get("withdrawn_reason") or reason),
+                )
+            if record.get("state") == STATE_PENDING:
+                record["state"] = "withdrawn"
+                record["withdrawn_at"] = _iso(moment)
+                record["withdrawn_reason"] = reason
+                self._save_queue(adapter, binding_id, queue)
+                return WithdrawResult(
+                    outcome="withdrawn",
+                    request_id=request_id,
+                    binding_id=binding_id,
+                    adapter=adapter,
+                    reason=reason,
+                )
+            if record.get("state") == STATE_CLAIMED:
+                if record.get("cancel_requested_at"):
+                    cancel_deadline_dt = _parse_iso(record.get("cancel_deadline"))
+                    if cancel_deadline_dt and moment >= cancel_deadline_dt:
+                        record["state"] = "withdrawn"
+                        record["withdrawn_at"] = _iso(moment)
+                        record["withdrawn_reason"] = reason
+                        self._save_queue(adapter, binding_id, queue)
+                        return WithdrawResult(
+                            outcome="withdrawn",
+                            request_id=request_id,
+                            binding_id=binding_id,
+                            adapter=adapter,
+                            reason=reason,
+                        )
+                    return WithdrawResult(
+                        outcome="revocation_pending",
+                        request_id=request_id,
+                        binding_id=binding_id,
+                        adapter=adapter,
+                        cancel_deadline=record.get("cancel_deadline"),
+                        reason=reason,
+                    )
+                else:
+                    lease_expires_dt = _parse_iso(record.get("lease_expires_at"))
+                    if lease_expires_dt is None or moment >= lease_expires_dt:
+                        record["state"] = "withdrawn"
+                        record["withdrawn_at"] = _iso(moment)
+                        record["withdrawn_reason"] = reason
+                        self._save_queue(adapter, binding_id, queue)
+                        return WithdrawResult(
+                            outcome="withdrawn",
+                            request_id=request_id,
+                            binding_id=binding_id,
+                            adapter=adapter,
+                            reason=reason,
+                        )
+                    cancel_deadline_str = record.get("lease_expires_at")
+                    record["cancel_requested_at"] = _iso(moment)
+                    record["cancel_deadline"] = cancel_deadline_str
+                    record["cancel_reason"] = reason
+                    self._save_queue(adapter, binding_id, queue)
+                    return WithdrawResult(
+                        outcome="revocation_pending",
+                        request_id=request_id,
+                        binding_id=binding_id,
+                        adapter=adapter,
+                        cancel_deadline=cancel_deadline_str,
+                        reason=reason,
+                    )
+            return WithdrawResult(
+                outcome="missing",
+                request_id=request_id,
+                binding_id=binding_id,
+                adapter=adapter,
+                reason=reason,
+            )
+
+    def discard_probe(
+        self,
+        adapter: str,
+        binding_id: str,
+        request_id: str,
+        nonce: str,
+    ) -> bool:
+        """Discard an exact reserved probe request from the queue. Refuses non-probe ids."""
+        _require_route(adapter, binding_id)
+        if not isinstance(request_id, str) or not request_id.startswith("probe:"):
+            raise ValueError("refusing to discard non-probe request_id {0!r}".format(request_id))
+        with self._lock:
+            queue = self._load_queue(adapter, binding_id)
+            record = queue.get(request_id)
+            if record is not None and record.get("nonce") == nonce:
+                queue.pop(request_id, None)
+                self._save_queue(adapter, binding_id, queue)
+                return True
+            return False
 
     def list_responded(self, adapter: str, binding_id: str) -> list[dict[str, Any]]:
         """Return immutable copies of RESPONDED records for the exact binding.

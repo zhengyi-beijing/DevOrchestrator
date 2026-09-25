@@ -1492,6 +1492,125 @@ def cmd_agy_route(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_websol_status(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.core.websol_health import WebSolHealthStore
+    from dev_orchestrator.core.websol_failover import WebSolFailoverStore
+    health_store = WebSolHealthStore(runtime)
+    entries = health_store.list_all()
+    project_filter = getattr(args, "project_id", None)
+    if project_filter:
+        entries = [e for e in entries if e.project_id == project_filter]
+
+    failover_store = WebSolFailoverStore(runtime)
+    failover_records = failover_store.list_all()
+    if project_filter:
+        failover_records = [r for r in failover_records if r.project_id == project_filter]
+
+    fmt = getattr(args, "format", "json") or "json"
+    if fmt == "json":
+        payload = {
+            "health": [asdict(e) for e in entries],
+            "failover": [asdict(r) for r in failover_records],
+        }
+        sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    else:
+        if not entries:
+            sys.stdout.write("No Web Sol health records recorded.\n")
+        for e in entries:
+            key = f"{e.project_id}/{e.adapter}/{e.binding_id}"
+            state = e.availability
+            reason = e.reason
+            valid_until = e.valid_until
+            generation = e.probe_generation
+            sys.stdout.write(f"[{state}] {key} (reason={reason}, generation={generation}, valid_until={valid_until})\n")
+            signals = e.signals or {}
+            for sname, sdata in signals.items():
+                if isinstance(sdata, dict):
+                    sstatus = sdata.get("status")
+                    sreason = sdata.get("reason", "")
+                elif hasattr(sdata, "status"):
+                    sstatus = sdata.status
+                    sreason = getattr(sdata, "reason", "")
+                else:
+                    sstatus = str(sdata)
+                    sreason = ""
+                sys.stdout.write(f"  - {sname}: {sstatus} ({sreason})\n")
+        if failover_records:
+            sys.stdout.write("\nFailover Records:\n")
+            for r in failover_records:
+                sys.stdout.write(f"  {r.run_id}: state={r.state} attempts={r.attempts} updated_at={r.updated_at}\n")
+    return 0
+
+
+def cmd_websol_probe(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.bridge.store import BrowserBridgeStore
+    from dev_orchestrator.core.websol_health import WebSolHealthStore
+    from dev_orchestrator.core.websol_probe import run_websol_probe
+
+    bridge_store = BrowserBridgeStore(runtime)
+    health_store = WebSolHealthStore(runtime)
+
+    project_id = getattr(args, "project_id", None)
+    adapter = getattr(args, "adapter", "chatgpt_web") or "chatgpt_web"
+    binding_id = getattr(args, "binding_id", None)
+
+    if not project_id:
+        config_path = resolve_config_path(getattr(args, "config", None))
+        try:
+            cfg = load_projects_config(config_path)
+            for p in cfg.get("projects", []):
+                cb = p.get("conversation_binding") or {}
+                if cb.get("adapter") == adapter or p.get("adapter") == adapter:
+                    project_id = p.get("project_id")
+                    if not binding_id:
+                        binding_id = cb.get("binding_id")
+                    break
+        except Exception:
+            pass
+
+    if not project_id:
+        project_id = "default"
+
+    if not binding_id:
+        bindings = bridge_store.list_bindings(adapter=adapter)
+        if bindings:
+            binding_id = bindings[0]
+        else:
+            binding_id = "default"
+
+    timeout = float(getattr(args, "timeout", 15.0) or 15.0)
+    result = run_websol_probe(
+        bridge_store,
+        adapter,
+        binding_id,
+        timeout_seconds=timeout,
+    )
+
+    fmt = getattr(args, "format", "json") or "json"
+    status_str = "success" if result.success else (result.error_class or "failed")
+    res_dict = {
+        "status": status_str,
+        "success": result.success,
+        "request_id": result.request_id,
+        "nonce": result.nonce,
+        "project_id": project_id,
+        "adapter": adapter,
+        "binding_id": binding_id,
+        "duration_seconds": round(result.duration_seconds, 3),
+        "reason": result.reason,
+    }
+    if fmt == "json":
+        sys.stdout.write(json.dumps(res_dict, indent=2, ensure_ascii=False) + "\n")
+    else:
+        sys.stdout.write(f"Probe {result.request_id} [{'SUCCESS' if result.success else 'FAILED'}]: duration={result.duration_seconds:.2f}s error={result.reason}\n")
+
+    return 0 if result.success else 1
+
+
+
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
@@ -1847,6 +1966,20 @@ def build_parser() -> argparse.ArgumentParser:
     agy_route.add_argument("--failure-signature", default=None)
     agy_route.add_argument("--strategy-changed", action="store_true")
 
+    websol_status = sub.add_parser("websol-status", help="display Web Sol health, signals, and failover state")
+    websol_status.add_argument("--project-id", default=None, help="filter by project ID")
+    websol_status.add_argument("--format", choices=("json", "text"), default="json", help="output format")
+    websol_status.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    websol_probe = sub.add_parser("websol-probe", help="run an end-to-end Web Sol probe")
+    websol_probe.add_argument("--project-id", default=None, help="project ID")
+    websol_probe.add_argument("--adapter", default="chatgpt_web", help="adapter name (default: chatgpt_web)")
+    websol_probe.add_argument("--binding-id", default=None, help="conversation binding ID")
+    websol_probe.add_argument("--timeout", type=float, default=15.0, help="probe timeout in seconds")
+    websol_probe.add_argument("--format", choices=("json", "text"), default="json", help="output format")
+    websol_probe.add_argument("--config", default=None, help="path to projects.json")
+    websol_probe.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     return parser
 
 
@@ -1888,6 +2021,8 @@ _COMMANDS = {
     "pool-status": cmd_pool_status,
     "agy-benchmark": cmd_agy_benchmark,
     "agy-route": cmd_agy_route,
+    "websol-status": cmd_websol_status,
+    "websol-probe": cmd_websol_probe,
     "monitor": cmd_monitor,
     "web": cmd_web,
     "daemon": cmd_daemon,

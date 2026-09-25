@@ -1219,6 +1219,170 @@ class AIReviewerCoordinator:
         )
         return review_id, "failed technical review retried at the same clean HEAD"
 
+    def submit_failover_review(
+        self,
+        project_id: str,
+        run_id: str,
+        failover_record_id: str,
+        policy: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> str | None:
+        """Launch an independent AIBroker technical review for a failed-over Web Sol run.
+
+        Bypasses AGY acquisition and executes the direct review path under review_id 'ai_review:<run_id>'.
+        """
+        review_id = f"ai_review:{run_id}"
+        with self._lock:
+            existing = self._load_state()["reviews"].get(review_id)
+            if isinstance(existing, dict):
+                return review_id
+
+        # 1. Resolve project config
+        proj_dict: dict[str, Any] = {}
+        try:
+            cfg_path = self.runtime_root / "projects.json"
+            if cfg_path.exists():
+                cfg = load_projects_config(cfg_path)
+                for p in cfg.get("projects") or []:
+                    if str(p.get("project_id")) == str(project_id):
+                        proj_dict = p
+                        break
+        except Exception:
+            pass
+
+        # 2. Look up worker transition record or dispatcher occurrence
+        transitions = self._transition_records()
+        worker = transitions.get(run_id) or {}
+        repo_path = _nonblank(worker.get("repo_path")) or _nonblank(proj_dict.get("repo_path"))
+        task_id = _nonblank(worker.get("task_id"))
+
+        if not task_id or not repo_path:
+            from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE
+            d_path = self.runtime_root / DISPATCHER_STATE_FILE
+            if d_path.exists():
+                try:
+                    ledger = read_json(d_path, None)
+                    if isinstance(ledger, dict):
+                        p_data = (ledger.get("worker_done") or {}).get(project_id) or {}
+                        occ = (p_data.get("occurrences") or {}).get(run_id)
+                        if isinstance(occ, dict):
+                            if not task_id:
+                                task_id = _nonblank(occ.get("task_id"))
+                            if not repo_path:
+                                repo_path = _nonblank(occ.get("repo_path"))
+                except Exception:
+                    pass
+
+        if not repo_path or not task_id:
+            return None
+
+        truth = read_repository_truth(repo_path)
+        if not truth.valid:
+            return None
+
+        binding = proj_dict.get("conversation_binding") or self._project_bindings.get(project_id)
+        if binding is None and isinstance(worker.get("conversation_binding"), dict):
+            binding = worker.get("conversation_binding")
+
+        if policy is None:
+            pol, _ = _review_policy(proj_dict)
+            if pol is not None:
+                policy = pol
+            else:
+                policy = {
+                    "quality": "high",
+                    "independence": "resource",
+                    "timeout_seconds": 600.0,
+                    "max_remediation_rounds": _DEFAULT_MAX_REMEDIATION_ROUNDS,
+                }
+
+        harness_cfg = proj_dict.get("reviewer_harness")
+        if isinstance(harness_cfg, dict) and harness_cfg.get("enabled") is True:
+            self._launch_harness_review(
+                review_id,
+                run_id,
+                project_id,
+                task_id,
+                repo_path,
+                truth,
+                harness_cfg,
+                worker=worker,
+                binding=binding,
+                policy=policy,
+            )
+            return review_id
+
+        if self.port is None:
+            return None
+
+        resource = worker.get("resource_context") if isinstance(worker.get("resource_context"), dict) else None
+        previous = None
+        if resource:
+            previous = ResourceContext(
+                resource.get("resource_id"),
+                resource.get("provider"),
+                resource.get("account"),
+                resource.get("model"),
+            )
+
+        from dev_orchestrator.core.project_context import context_prompt_block
+        context_block, resolution = context_prompt_block(proj_dict, "reviewer")
+
+        failure_memory_block = ""
+        if self.failure_memory is not None:
+            failure_memory_block = self.failure_memory.prompt_block(
+                environment_for_project(proj_dict), max_chars=self.failure_memory_max_chars
+            )
+
+        failover_context = (
+            f"[WEB_SOL_FAILOVER]\n"
+            f"Web Sol reviewer failed over for run {run_id} (failover_record: {failover_record_id}).\n"
+            f"Independently review the clean repository state at current HEAD.\n"
+            f"[/WEB_SOL_FAILOVER]"
+        )
+
+        prompt = self._review_prompt(
+            project_id,
+            task_id,
+            run_id,
+            truth,
+            context_block=context_block,
+            failure_memory_block=failure_memory_block,
+            reanchor_context=failover_context,
+        )
+
+        request = AIRoleRequest(
+            project_id=project_id,
+            task_run_id=task_id,
+            stage_run_id="review",
+            role_run_id="reviewer-failover-" + run_id.replace(":", "-"),
+            request_id=review_id,
+            role="reviewer",
+            prompt=prompt,
+            working_directory=Path(repo_path),
+            quality=policy.get("quality", "high"),
+            independence=policy.get("independence", "resource"),
+            previous_resource_context=previous,
+            timeout_seconds=policy.get("timeout_seconds", 600.0),
+            metadata={
+                "worker_source_request_id": run_id,
+                "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
+                "failure_environment": environment_for_project(proj_dict),
+                "max_remediation_rounds": policy.get("max_remediation_rounds", _DEFAULT_MAX_REMEDIATION_ROUNDS),
+                "failover_record_id": failover_record_id,
+            },
+        )
+        self._launch_review(
+            review_id,
+            run_id,
+            request,
+            truth,
+            conversation_binding=binding,
+            resolution=resolution,
+        )
+        return review_id
+
+
     @staticmethod
     def _review_prompt(
         project_id: str, task_id: str, source_request_id: str, truth: Any,

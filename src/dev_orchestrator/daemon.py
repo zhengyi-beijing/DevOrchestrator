@@ -27,7 +27,8 @@ from dev_orchestrator.bridge.server import make_bridge_server
 from dev_orchestrator.bridge.store import BrowserBridgeStore
 from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
 from dev_orchestrator.accounting.runtime import load_accounting_runtime
-from dev_orchestrator.core.dispatcher import dispatch_worker_done_events
+from dataclasses import asdict
+from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE, dispatch_worker_done_events
 from dev_orchestrator.core.control_commands import ControlCommandCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lifecycle
@@ -38,7 +39,18 @@ from dev_orchestrator.core.transition_executor import TransitionExecutor
 from dev_orchestrator.core.watchdog import WatchdogCoordinator
 from dev_orchestrator.core.activation_supervisor import ActivationSupervisor
 from dev_orchestrator.core.project_status import write_project_statuses
+from dev_orchestrator.core.websol_health import (
+    WebSolAvailability,
+    WebSolHealth,
+    WebSolHealthStore,
+    collect_websol_signals,
+    evaluate_websol_availability,
+)
+from dev_orchestrator.core.websol_failover import FailoverEngine, WebSolFailoverStore
+from dev_orchestrator.core.websol_probe import run_websol_probe
+from dev_orchestrator.incidents import capture_incident
 from dev_orchestrator.control.owner_store import OwnerControlStore
+from dev_orchestrator.control.security import ControlSecurity
 from dev_orchestrator.control.store import ConversationControlStore
 from dev_orchestrator.jobs.recovery import JobRecoveryCoordinator
 from dev_orchestrator.monitor.project import run_monitor_once
@@ -85,7 +97,9 @@ def _run_orchestration_tick(
     controls: ControlCommandCoordinator | None = None,
     watchdog: WatchdogCoordinator | None = None,
     job_recovery: JobRecoveryCoordinator | None = None,
-    supervisor: ActivationSupervisor | None = None, *, pid: int,
+    supervisor: ActivationSupervisor | None = None,
+    health_store: WebSolHealthStore | None = None,
+    failover_engine: FailoverEngine | None = None, *, pid: int,
 ) -> dict[str, Any]:
     """Run one ordered control-plane tick and return the projected summary."""
     watchdog_error: Optional[str] = None
@@ -113,21 +127,123 @@ def _run_orchestration_tick(
             item for item in browser_summary["projects"]
             if not isinstance(item, dict) or str(item.get("project_id") or "") not in direct_review_projects
         ]
+
+    if health_store is None:
+        health_store = WebSolHealthStore(runtime)
+
+    # 1. Evaluate Web Sol health for active project bindings
+    for item in browser_summary.get("projects") or []:
+        if not isinstance(item, dict):
+            continue
+        p_id = str(item.get("project_id") or "")
+        binding = item.get("conversation_binding")
+        if not isinstance(binding, dict) or binding.get("transport") != "browser_bridge":
+            continue
+        adp = str(binding.get("adapter") or "chatgpt_web")
+        bid = str(binding.get("binding_id") or "")
+        if not bid:
+            continue
+        try:
+            conv_store = getattr(controls, "conversation_store", None) or ConversationControlStore(runtime)
+            sec = getattr(controls, "control_security", None) or ControlSecurity(runtime)
+            signals = collect_websol_signals(
+                runtime,
+                p_id,
+                adp,
+                bid,
+                configured_binding=binding,
+                bridge_store=bridge_store,
+                conversation_store=conv_store,
+                security=sec,
+                health_store=health_store,
+            )
+            avail, reason = evaluate_websol_availability(signals)
+            now_iso = utc_now_iso()
+            health = WebSolHealth(
+                project_id=p_id,
+                adapter=adp,
+                binding_id=bid,
+                availability=avail.value,
+                evaluated_at=now_iso,
+                valid_until=(utc_now() + timedelta(seconds=60)).isoformat(),
+                reason=reason,
+                signals=signals,
+                probe_generation=health_store.current_generation(),
+            )
+            health_store.put(health)
+
+            if health.availability == WebSolAvailability.PAIRING_REQUIRED.value:
+                capture_incident(
+                    runtime_root=runtime,
+                    project_id=p_id,
+                    task_id=None,
+                    classification="pairing_required",
+                    semantic={"status": "pairing_required", "adapter": adp, "binding_id": bid},
+                    evidence={"availability": health.availability, "signals": [asdict(s) if hasattr(s, "__dict__") else s for s in health.signals]},
+                    occurrence_key=f"pairing_required:{p_id}:{adp}:{bid}",
+                )
+            elif health.availability == WebSolAvailability.PROBE_FAILED.value:
+                capture_incident(
+                    runtime_root=runtime,
+                    project_id=p_id,
+                    task_id=None,
+                    classification="probe_failed",
+                    semantic={"status": "probe_failed", "adapter": adp, "binding_id": bid},
+                    evidence={"availability": health.availability, "signals": [asdict(s) if hasattr(s, "__dict__") else s for s in health.signals]},
+                    occurrence_key=f"probe_failed:{p_id}:{adp}:{bid}",
+                )
+
+            if health_store.should_probe(p_id, adp, bid, interval_seconds=300, bridge_store=bridge_store):
+                def _do_probe(proj: str, a: str, b: str) -> None:
+                    try:
+                        pres = run_websol_probe(
+                            bridge_store, a, b,
+                            generation=health_store.current_generation(),
+                            timeout_seconds=10.0,
+                        )
+                        health_store.record_probe_result(
+                            project_id=proj, adapter=a, binding_id=b,
+                            ok=pres.success,
+                            error=pres.reason if not pres.success else None,
+                            duration_seconds=pres.duration_seconds,
+                        )
+                    except Exception:
+                        pass
+                threading.Thread(target=_do_probe, args=(p_id, adp, bid), daemon=True).start()
+        except Exception:
+            pass
+
+    # 2. Run failover reconciliation
+    if failover_engine is not None:
+        try:
+            failover_engine.reconcile()
+        except Exception:
+            pass
+
+    # 3. Dispatch worker_done events with availability_provider
+    def _daemon_availability_provider(p: str, a: str, b: str) -> Any:
+        proj_item = None
+        for itm in browser_summary.get("projects") or []:
+            if isinstance(itm, dict) and itm.get("project_id") == p:
+                proj_item = itm
+                break
+        cb = (proj_item.get("conversation_binding") or {}) if isinstance(proj_item, dict) else {}
+        if cb.get("require_truthful_availability") or cb.get("require_availability"):
+            return health_store.get(p, a, b) if health_store else None
+        return None
+
+    active_avail_provider = _daemon_availability_provider
     accounting = getattr(executor, "accounting", None)
     failure_memory = getattr(executor, "failure_memory", None)
-    if accounting is None and failure_memory is None:
-        dispatch_worker_done_events(browser_summary, bridge_store, runtime)
-    else:
-        dispatch_worker_done_events(
-            browser_summary,
-            bridge_store,
-            runtime,
-            accounting=accounting,
-            failure_memory=failure_memory,
-            failure_memory_max_chars=getattr(
-                executor, "failure_memory_max_chars", 2000
-            ),
-        )
+    dispatch_worker_done_events(
+        browser_summary,
+        bridge_store,
+        runtime,
+        accounting,
+        failure_memory,
+        getattr(executor, "failure_memory_max_chars", 2000),
+        active_avail_provider,
+    )
     write_project_statuses(projected, runtime, phase="dispatch", daemon_state="running", pid=pid)
     if accounting is None:
         consume_websol_responses(browser_summary, bridge_store, runtime)
@@ -414,6 +530,17 @@ def run_daemon(
     job_recovery_coordinator = JobRecoveryCoordinator(
         runtime, accounting=accounting
     )
+    health_store = WebSolHealthStore(runtime)
+    if server is not None:
+        server.websol_health_store = health_store
+    failover_store = WebSolFailoverStore(runtime)
+    failover_engine = FailoverEngine(
+        failover_store=failover_store,
+        bridge_store=bridge_store,
+        reviewer_coordinator=reviewer_coordinator,
+        dispatcher_ledger_path=runtime / DISPATCHER_STATE_FILE,
+        health_store=health_store,
+    )
     try:
         job_recovery_coordinator.recover()
     except Exception:
@@ -426,7 +553,10 @@ def run_daemon(
                     config, runtime, bridge_store, transition_executor, reviewer_coordinator,
                     control_coordinator, watchdog=watchdog_coordinator,
                     job_recovery=job_recovery_coordinator,
-                    supervisor=activation_supervisor, pid=pid
+                    supervisor=activation_supervisor,
+                    health_store=health_store,
+                    failover_engine=failover_engine,
+                    pid=pid
                 )
                 if isinstance(tick_result, dict):
                     if tick_result.get("_watchdog_tick_error"):

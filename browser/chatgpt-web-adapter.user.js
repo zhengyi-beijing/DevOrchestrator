@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.13
+// @version      0.1.14
 // @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge plus paired 8770 conversation-presence heartbeat.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
@@ -74,6 +74,16 @@
 
   var STATUS_ELEMENT_ID = "devorch-web-status";
 
+  var STATE_RANKS = {
+    ATTENTION: 5,
+    CLAIMED: 4,
+    WAITING: 4,
+    PAIRING_REQUIRED: 3,
+    OFFLINE: 2,
+    LIVE: 1,
+    IDLE: 0
+  };
+
   function ensureStatusBadge() {
     if (typeof document === "undefined" || !document.body) { return null; }
     var badge = document.getElementById(STATUS_ELEMENT_ID);
@@ -88,11 +98,30 @@
   function setAdapterStatus(state, detail) {
     var badge = ensureStatusBadge();
     if (!badge) { return; }
-    var colors = { LIVE: "#237a3b", IDLE: "#555", CLAIMED: "#8a5a00", WAITING: "#2457a6", OFFLINE: "#a32929", ATTENTION: "#b42318" };
+    var colors = {
+      LIVE: "#237a3b",
+      IDLE: "#555",
+      CLAIMED: "#8a5a00",
+      WAITING: "#2457a6",
+      OFFLINE: "#a32929",
+      ATTENTION: "#b42318",
+      PAIRING_REQUIRED: "#d97706"
+    };
     badge.textContent = "DevOrch · " + state;
     badge.style.background = colors[state] || "#555";
     badge.setAttribute("data-state", state);
     badge.title = detail || state;
+  }
+
+  function updateAdapterStatusDemoting(state, detail) {
+    var badge = ensureStatusBadge();
+    if (!badge) { return; }
+    var currentState = badge.getAttribute("data-state") || "IDLE";
+    var currentRank = STATE_RANKS[currentState] !== undefined ? STATE_RANKS[currentState] : 0;
+    var targetRank = STATE_RANKS[state] !== undefined ? STATE_RANKS[state] : 0;
+    if (targetRank >= currentRank || currentRank <= 1) {
+      setAdapterStatus(state, detail);
+    }
   }
 
   function progressAlertText(notification) {
@@ -218,17 +247,125 @@
     return newTabInstanceId();
   }
 
-  function storedCapability() {
-    try { return typeof GM_getValue === "function" ? String(GM_getValue(CAPABILITY_STORAGE_KEY, "") || "") : ""; }
-    catch (err) { return ""; }
+  function storedCapabilityRecord() {
+    try {
+      if (typeof GM_getValue !== "function") { return null; }
+      var raw = GM_getValue(CAPABILITY_STORAGE_KEY, null);
+      if (!raw) { return null; }
+      if (typeof raw === "string") {
+        try {
+          var parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && parsed.token) {
+            return parsed;
+          }
+        } catch (e) {
+          // Legacy plain string token: migrate to JSON record
+          var migrated = {
+            token: raw.trim(),
+            pairing_id: "",
+            stored_at: new Date().toISOString()
+          };
+          if (typeof GM_setValue === "function") {
+            GM_setValue(CAPABILITY_STORAGE_KEY, JSON.stringify(migrated));
+          }
+          return migrated;
+        }
+      } else if (typeof raw === "object" && raw.token) {
+        return raw;
+      }
+    } catch (err) {}
+    return null;
   }
 
-  function saveCapability(value) {
-    if (typeof GM_setValue === "function") { GM_setValue(CAPABILITY_STORAGE_KEY, value); }
+  function storedCapability() {
+    var rec = storedCapabilityRecord();
+    return rec ? rec.token : "";
+  }
+
+  function saveCapability(recordOrToken, pairingId) {
+    if (typeof GM_setValue !== "function") { return; }
+    if (typeof recordOrToken === "string") {
+      var record = {
+        token: recordOrToken.trim(),
+        pairing_id: pairingId ? String(pairingId).trim() : "",
+        stored_at: new Date().toISOString()
+      };
+      GM_setValue(CAPABILITY_STORAGE_KEY, JSON.stringify(record));
+    } else if (recordOrToken && typeof recordOrToken === "object") {
+      GM_setValue(CAPABILITY_STORAGE_KEY, JSON.stringify(recordOrToken));
+    }
   }
 
   function clearCapability() {
-    if (typeof GM_deleteValue === "function") { GM_deleteValue(CAPABILITY_STORAGE_KEY); }
+    if (typeof GM_deleteValue === "function") {
+      GM_deleteValue(CAPABILITY_STORAGE_KEY);
+    }
+  }
+
+  function classifyHeartbeatResult(result) {
+    if (!result || typeof result !== "object") {
+      return { verdict: "network_error", shouldClear: false, reason: "missing_result" };
+    }
+    var status = typeof result.status === "number" ? result.status : 0;
+    var body = null;
+    if (typeof result.text === "string" && result.text) {
+      try { body = JSON.parse(result.text); } catch (e) {}
+    } else if (result.body && typeof result.body === "object") {
+      body = result.body;
+    }
+    var errReason = (body && (body.message || body.error || "")) || "";
+
+    if (status === 200) {
+      return { verdict: "ok", shouldClear: false, body: body };
+    }
+    if (status === 503 || errReason.indexOf("capability_store_unavailable") !== -1) {
+      return { verdict: "store_unavailable", shouldClear: false, reason: "capability_store_unavailable" };
+    }
+    if (status === 0 || (status >= 500 && status <= 599)) {
+      return { verdict: "network_error", shouldClear: false, reason: "http_" + status };
+    }
+    if (status === 401) {
+      var reason = "unknown_capability";
+      if (errReason.indexOf("revoked") !== -1) {
+        reason = "revoked_capability";
+      }
+      return { verdict: "unauthorized", shouldClear: true, reason: reason };
+    }
+    return { verdict: "error", shouldClear: false, reason: "http_" + status };
+  }
+
+  function computeAdapterState(input) {
+    if (!input || typeof input !== "object") {
+      return { state: "IDLE", detail: "Idle" };
+    }
+    if (!input.hasCapability) {
+      return { state: "PAIRING_REQUIRED", detail: "Heartbeat pairing required" };
+    }
+    if (!input.bindingId) {
+      return { state: "IDLE", detail: "Waiting for ChatGPT conversation (/c/...)" };
+    }
+    if (input.healthAvailability === "pairing_required") {
+      return { state: "PAIRING_REQUIRED", detail: "Heartbeat pairing required" };
+    }
+    if (input.attentionMessage) {
+      return { state: "ATTENTION", detail: input.attentionMessage };
+    }
+    if (input.claimPhase === "waiting") {
+      return { state: "WAITING", detail: input.claimDetail || "Waiting for ChatGPT response" };
+    }
+    if (input.claimPhase === "claimed") {
+      return { state: "CLAIMED", detail: input.claimDetail || "Claim active" };
+    }
+    if (input.bridgeError) {
+      return { state: "OFFLINE", detail: input.bridgeError };
+    }
+    if (input.healthAvailability === "offline" || input.healthAvailability === "probe_failed") {
+      return { state: "OFFLINE", detail: "Web Sol " + input.healthAvailability };
+    }
+    if (input.bridgeConnected) {
+      return { state: "LIVE", detail: input.bridgeDetail || "Bridge connected; listening for work" };
+    }
+    return { state: "IDLE", detail: "Idle" };
   }
 
   function responseMatches(text, requestId) {
@@ -371,6 +508,13 @@
     pollProgress: pollProgress,
     pairingFields: pairingFields,
     tabInstanceId: tabInstanceId,
+    storedCapabilityRecord: storedCapabilityRecord,
+    storedCapability: storedCapability,
+    saveCapability: saveCapability,
+    clearCapability: clearCapability,
+    classifyHeartbeatResult: classifyHeartbeatResult,
+    computeAdapterState: computeAdapterState,
+    updateAdapterStatusDemoting: updateAdapterStatusDemoting,
     sendControlHeartbeat: sendControlHeartbeat,
     redeemControlPairing: redeemControlPairing
   };
@@ -457,23 +601,49 @@
       var body = parsedJsonText(result);
       var capability = body && body.data && body.data.capability;
       if (result.status !== 200 || typeof capability !== "string" || !capability) { return false; }
-      saveCapability(capability);
+      saveCapability(capability, fields.pairing_id);
       scheduleControlHeartbeat(0);
       return true;
     });
   }
 
   function sendControlHeartbeat() {
-    var capability = storedCapability();
+    var capRecord = storedCapabilityRecord();
+    var capability = capRecord ? capRecord.token : storedCapability();
     var bindingId = currentBindingId();
-    if (!capability || !bindingId || typeof window === "undefined") { return Promise.resolve(false); }
+    if (!capability || !bindingId || typeof window === "undefined") {
+      if (!capability) {
+        updateAdapterStatusDemoting("PAIRING_REQUIRED", "Heartbeat pairing required");
+      }
+      return Promise.resolve(false);
+    }
     return controlPost(SESSION_HEARTBEAT_PATH, {
       adapter: ADAPTER_ID, binding_id: bindingId,
       title: (typeof document.title === "string" && document.title.trim()) || ("ChatGPT conversation " + bindingId),
       url: String(window.location.href), tab_instance_id: tabInstanceId()
     }, capability).then(function (result) {
-      if (result.status === 401) { clearCapability(); }
-      return result.status === 200;
+      var classification = classifyHeartbeatResult(result);
+      if (classification.shouldClear) {
+        clearCapability();
+        updateAdapterStatusDemoting("PAIRING_REQUIRED", "Capability " + classification.reason);
+        return false;
+      }
+      if (classification.verdict === "ok") {
+        if (capRecord) {
+          capRecord.verified_at = new Date().toISOString();
+          saveCapability(capRecord);
+        }
+        var health = classification.body && classification.body.data && classification.body.data.websol_health;
+        if (health && health.availability) {
+          if (health.availability === "pairing_required") {
+            updateAdapterStatusDemoting("PAIRING_REQUIRED", "Server reported pairing required");
+          } else if (health.availability === "offline" || health.availability === "probe_failed") {
+            updateAdapterStatusDemoting("OFFLINE", "Web Sol health: " + health.availability);
+          }
+        }
+        return true;
+      }
+      return false;
     });
   }
 

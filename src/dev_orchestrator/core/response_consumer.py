@@ -394,7 +394,7 @@ def _consume_project(
     outcomes: list[WebSolConsumption] = []
     for record in store.list_responded(adapter, binding_id):
         request_id = _non_blank(record.get("request_id"))
-        if request_id is None or request_id in ledger["decisions"]:
+        if request_id is None or request_id.startswith("probe:") or request_id in ledger["decisions"]:
             continue
         reviewed_status_hash, source_request_id = _reviewed_context(
             path, str(snapshot.get("project_id") or ""), request_id

@@ -39,8 +39,14 @@ from dev_orchestrator.control.command_store import (
     ControlCommandConflictError,
     ControlCommandStore,
 )
-from dev_orchestrator.control.security import ControlSecurity, is_loopback
+from dev_orchestrator.control.security import (
+    CapabilityStoreUnavailableError,
+    CapabilityVerdict,
+    ControlSecurity,
+    is_loopback,
+)
 from dev_orchestrator.control.store import ConversationControlStore
+from dev_orchestrator.core.websol_health import WebSolHealthStore
 from dev_orchestrator.control.surface import project_control_view
 from dev_orchestrator.core.control_commands import submit_control_command
 from dev_orchestrator.platform.process import is_pid_alive
@@ -427,6 +433,7 @@ class DevOrchestratorHTTPServer(ThreadingHTTPServer):
         self.config_path = Path(config_path) if config_path is not None else None
         self.command_store = ControlCommandStore(self.runtime_root)
         self.conversation_store = ConversationControlStore(self.runtime_root)
+        self.websol_health_store = WebSolHealthStore(self.runtime_root)
         self.bridge_store: Any | None = None
         self.control_security = ControlSecurity(self.runtime_root) if self.control_enabled else None
         self._heartbeat_lock = threading.Lock()
@@ -492,7 +499,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         if (
             path not in {
                 "/api/v1/control/adapter-pairings/redeem",
+                "/api/v1/control/adapter-capabilities/renew",
                 "/api/v1/control/session-heartbeats",
+                "/api/v1/control/websol-health",
                 "/api/v1/control/bridge/requests",
                 "/api/v1/control/web-bridge/requests",
             }
@@ -504,7 +513,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             204, "No Content", "application/json; charset=utf-8", b"", False,
             {
                 "Access-Control-Allow-Origin": "https://chatgpt.com",
-                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                 "Access-Control-Allow-Headers": "Authorization, Content-Type",
                 "Access-Control-Max-Age": "300",
                 "Vary": "Origin",
@@ -684,6 +693,20 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             payload = _control_envelope(self.server.conversation_store.list_sessions(), sources=[{"name": "conversation_sessions", "availability": "available"}])
         elif path == "/api/v1/control/bindings":
             payload = _control_envelope(self.server.conversation_store.list_bindings(), sources=[{"name": "conversation_bindings", "availability": "available"}])
+        elif path == "/api/v1/control/websol-health":
+            qs = parse_qs(parsed.query)
+            proj_id = qs.get("project_id", [None])[0]
+            adapter = qs.get("adapter", ["chatgpt_web"])[0]
+            binding_id = qs.get("binding_id", [None])[0]
+            health_store = getattr(self.server, "websol_health_store", None)
+            if health_store is None:
+                health_store = WebSolHealthStore(runtime)
+            if proj_id and binding_id:
+                rec = health_store.get(proj_id, adapter, binding_id)
+                data = rec.to_dict() if rec else None
+            else:
+                data = [r.to_dict() for r in health_store.list_all()]
+            payload = _control_envelope(data, sources=[{"name": "websol_health", "availability": "available"}])
         elif path == "/api/v1/control/mobile/devices":
             if not self._owner_authorized():
                 self._error(401, "Unauthorized", "valid control authorization required", head_only); return
@@ -890,12 +913,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         else:
             self._error(404, "Not Found", "route not found", head_only)
             return
+        extra_headers = None
+        if self.headers.get("Origin") == "https://chatgpt.com":
+            extra_headers = {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"}
         self._send(
             200,
             "OK",
             "application/json; charset=utf-8",
             _json_bytes(payload),
             head_only,
+            extra_headers=extra_headers,
         )
 
     def _client_is_loopback(self) -> bool:
@@ -981,20 +1008,88 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(result)), False,
                        {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"})
             return
-        if path == "/api/v1/control/session-heartbeats":
+        if path == "/api/v1/control/adapter-capabilities/renew":
             origin = self.headers.get("Origin")
-            if origin not in (None, "https://chatgpt.com") or not (security.adapter_authorized(self.headers.get("Authorization")) or security.bearer_authorized(self.headers.get("Authorization"))):
-                self._error(401, "Unauthorized", "valid heartbeat capability required", False); return
+            if origin not in (None, "https://chatgpt.com") and not self._same_origin():
+                self._error(403, "Forbidden", "invalid origin for renewal", False); return
             value = self._read_control_json()
             if value is None: return
+            auth_header = self.headers.get("Authorization")
+            token_or_header = auth_header or (value.get("token") if isinstance(value, dict) else None)
+            grace = value.get("grace_period_seconds", 300) if isinstance(value, dict) else 300
+            try:
+                renewal = security.renew_session_capability(token_or_header, grace_period_seconds=int(grace))
+            except CapabilityStoreUnavailableError:
+                self._error(503, "Service Unavailable", "capability_store_unavailable", False,
+                            extra_headers={"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"} if origin else None)
+                return
+            except ValueError as exc:
+                self._error(400, "Bad Request", str(exc), False,
+                            extra_headers={"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"} if origin else None)
+                return
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(renewal)), False,
+                       {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"} if origin else None)
+            return
+        if path == "/api/v1/control/session-heartbeats":
+            origin = self.headers.get("Origin")
+            if origin not in (None, "https://chatgpt.com") and not self._same_origin():
+                self._error(403, "Forbidden", "invalid origin for heartbeat", False); return
+            auth_header = self.headers.get("Authorization")
+            is_bearer = security.bearer_authorized(auth_header)
+            cap_verdict, cap_reason, _ = security.capability_status(auth_header)
+
+            if cap_verdict == CapabilityVerdict.UNAVAILABLE:
+                self._error(503, "Service Unavailable", "capability_store_unavailable", False,
+                            extra_headers={"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"} if origin else None)
+                return
+            if not is_bearer and cap_verdict != CapabilityVerdict.VALID:
+                reason = "revoked_capability" if cap_verdict == CapabilityVerdict.REVOKED else "unknown_capability"
+                self._error(401, "Unauthorized", reason, False,
+                            extra_headers={"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"} if origin else None)
+                return
+
+            value = self._read_control_json()
+            if value is None: return
+
+            adapter = value.get("adapter")
+            binding_id = value.get("binding_id")
+            cap_id = security.capability_identity(auth_header) if not is_bearer else None
+            cap_source = "capability" if not is_bearer else "bearer"
+
             try:
                 session = self.server.conversation_store.heartbeat(
-                    value.get("adapter"), value.get("binding_id"), title=value.get("title"),
+                    adapter, binding_id, title=value.get("title"),
                     url=value.get("url"), tab_instance_id=value.get("tab_instance_id"),
+                    capability_id=cap_id, capability_source=cap_source,
                 )
             except ValueError as exc:
                 self._error(400, "Bad Request", str(exc), False); return
-            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(session)), False,
+
+            proj_id = value.get("project_id")
+            if not proj_id and self.server.config_path and self.server.config_path.exists():
+                try:
+                    cfg = load_projects_config(self.server.config_path)
+                    for p in cfg.get("projects") or []:
+                        b = p.get("conversation_binding") or {}
+                        if b.get("adapter") == adapter and b.get("binding_id") == binding_id:
+                            proj_id = p.get("project_id")
+                            break
+                except Exception:
+                    pass
+
+            websol_health = None
+            if hasattr(self.server, "websol_health_store") and proj_id:
+                h_rec = self.server.websol_health_store.get(proj_id, adapter, binding_id)
+                websol_health = asdict(h_rec) if h_rec else None
+
+            response_payload = {
+                **session,
+                "session": session,
+                "websol_health": websol_health,
+                "capability_id": cap_id,
+            }
+
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(response_payload)), False,
                        {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"} if origin else None)
             return
         if path in {"/api/v1/control/bridge/requests", "/api/v1/control/web-bridge/requests"}:

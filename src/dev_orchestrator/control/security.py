@@ -17,6 +17,19 @@ from urllib.parse import urlsplit
 from dev_orchestrator.accounting.events import InterProcessFileLock
 from dev_orchestrator.mobile.authorizer import MobileDeviceAuthorizer, MobileDevicePrincipal
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json, write_text
+from enum import Enum
+
+
+class CapabilityVerdict(str, Enum):
+    VALID = "valid"
+    REVOKED = "revoked"
+    UNKNOWN = "unknown"
+    UNAVAILABLE = "unavailable"
+
+
+class CapabilityStoreUnavailableError(RuntimeError, ValueError):
+    """Raised when canonical capability state cannot be accessed or is malformed."""
+    pass
 
 
 def is_loopback(value: str) -> bool:
@@ -142,17 +155,15 @@ class ControlSecurity:
         try:
             raw = self.pairings_path.read_bytes()
         except OSError as exc:
-            if for_mutation:
-                raise ValueError(f"cannot read canonical capability state: {exc}") from exc
-            return None
+            raise CapabilityStoreUnavailableError(f"cannot read canonical capability state: {exc}") from exc
         if not raw or not raw.strip():
-            raise ValueError("canonical capability state is empty or truncated")
+            raise CapabilityStoreUnavailableError("canonical capability state is empty or truncated")
         try:
             val = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"canonical capability state is non-JSON or malformed: {exc}") from exc
+            raise CapabilityStoreUnavailableError(f"canonical capability state is non-JSON or malformed: {exc}") from exc
         if not isinstance(val, dict) or val.get("version") != 1:
-            raise ValueError("canonical capability state has unsupported version or schema")
+            raise CapabilityStoreUnavailableError("canonical capability state has unsupported version or schema")
         return {
             "version": 1,
             "pairings": val.get("pairings") if isinstance(val.get("pairings"), dict) else {},
@@ -163,11 +174,151 @@ class ControlSecurity:
         }
 
     def _pairings(self) -> dict[str, Any]:
+        val = self._load_canonical_pairings(for_mutation=True)
+        return val if isinstance(val, dict) else self._empty_pairings()
+
+    def capability_state(self, pairing_id: str) -> CapabilityVerdict:
+        """Return the structured capability verdict for a pairing_id."""
+        if not pairing_id or not isinstance(pairing_id, str):
+            return CapabilityVerdict.UNKNOWN
+        clean_id = pairing_id.strip()
         try:
-            val = self._load_canonical_pairings(for_mutation=True)
-            return val if isinstance(val, dict) else self._empty_pairings()
-        except ValueError:
-            return self._empty_pairings()
+            data = self._load_canonical_pairings(for_mutation=False)
+            if data is None:
+                return CapabilityVerdict.UNKNOWN
+        except CapabilityStoreUnavailableError:
+            return CapabilityVerdict.UNAVAILABLE
+        except Exception:
+            return CapabilityVerdict.UNAVAILABLE
+
+        capabilities = data.get("capabilities") or {}
+        pairings = data.get("pairings") or {}
+        row = capabilities.get(clean_id) or pairings.get(clean_id)
+        if not isinstance(row, dict):
+            for item in capabilities.values():
+                if isinstance(item, dict) and (item.get("pairing_id") == clean_id or item.get("capability_id") == clean_id):
+                    row = item
+                    break
+        if not isinstance(row, dict):
+            return CapabilityVerdict.UNKNOWN
+        if row.get("revoked"):
+            return CapabilityVerdict.REVOKED
+        return CapabilityVerdict.VALID
+
+    def capability_status(self, header_or_token: str | None) -> tuple[CapabilityVerdict, str, dict[str, Any] | None]:
+        """Validate an adapter capability token returning verdict, reason and capability row."""
+        if not header_or_token or not isinstance(header_or_token, str):
+            return CapabilityVerdict.UNKNOWN, "missing capability token", None
+        token = header_or_token
+        if token.startswith("Bearer "):
+            token = token[7:].strip()
+        if not token:
+            return CapabilityVerdict.UNKNOWN, "empty capability token", None
+
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if data is None:
+                return CapabilityVerdict.UNKNOWN, "canonical capability state missing", None
+        except CapabilityStoreUnavailableError as exc:
+            return CapabilityVerdict.UNAVAILABLE, f"capability_store_unavailable: {exc}", None
+        except Exception as exc:
+            return CapabilityVerdict.UNAVAILABLE, f"capability_store_unavailable: {exc}", None
+
+        digest = _digest(token)
+        capabilities = data.get("capabilities")
+        if not isinstance(capabilities, dict):
+            return CapabilityVerdict.UNKNOWN, "no capabilities registered", None
+
+        now = time.time()
+        for row in capabilities.values():
+            if not isinstance(row, dict):
+                continue
+            if row.get("scope") != "session_heartbeat":
+                continue
+
+            matches_primary = hmac.compare_digest(str(row.get("token_hash") or ""), digest)
+            matches_previous = False
+            prev_hash = row.get("previous_token_hash")
+            if prev_hash and hmac.compare_digest(str(prev_hash), digest):
+                prev_expires = float(row.get("previous_token_expires_at") or 0)
+                if now < prev_expires:
+                    matches_previous = True
+
+            if not matches_primary and not matches_previous:
+                continue
+
+            if row.get("revoked"):
+                return CapabilityVerdict.REVOKED, "capability revoked", row
+
+            return CapabilityVerdict.VALID, "valid", row
+
+        return CapabilityVerdict.UNKNOWN, "unknown capability token", None
+
+    def capability_identity(self, header_or_token: str | None) -> str | None:
+        """Return the stable pairing_id if header is valid, else None."""
+        verdict, _, row = self.capability_status(header_or_token)
+        if verdict == CapabilityVerdict.VALID and isinstance(row, dict):
+            return str(row.get("pairing_id") or row.get("capability_id") or "")
+        return None
+
+    def renew_session_capability(
+        self, header_or_token: str | None, *, grace_period_seconds: int = 300
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """Rotate a valid session-heartbeat capability token under the canonical lock."""
+        if not header_or_token or not isinstance(header_or_token, str):
+            return False, "missing capability token", None
+        token = header_or_token
+        if token.startswith("Bearer "):
+            token = token[7:].strip()
+        if not token:
+            return False, "empty capability token", None
+
+        digest = _digest(token)
+        now = time.time()
+        with InterProcessFileLock(self.lock_path):
+            try:
+                data = self._load_canonical_pairings(for_mutation=True)
+                if not isinstance(data, dict):
+                    return False, "canonical capability state unavailable", None
+            except CapabilityStoreUnavailableError as exc:
+                return False, f"capability_store_unavailable: {exc}", None
+            except Exception as exc:
+                return False, f"capability_store_unavailable: {exc}", None
+
+            capabilities = data.setdefault("capabilities", {})
+            matched_key = None
+            matched_row = None
+            for key, row in capabilities.items():
+                if not isinstance(row, dict):
+                    continue
+                if row.get("scope") != "session_heartbeat":
+                    continue
+                if hmac.compare_digest(str(row.get("token_hash") or ""), digest):
+                    matched_key = key
+                    matched_row = row
+                    break
+
+            if matched_row is None:
+                return False, "cannot renew: unknown or previous token", None
+            if matched_row.get("revoked"):
+                return False, "cannot renew: capability revoked", None
+
+            new_token = secrets.token_urlsafe(32)
+            matched_row["previous_token_hash"] = matched_row.get("token_hash")
+            matched_row["previous_token_expires_at"] = now + max(10, int(grace_period_seconds))
+            matched_row["token_hash"] = _digest(new_token)
+            matched_row["renewed_at"] = utc_now_iso()
+            write_json(self.pairings_path, data, indent=2)
+
+            return True, "renewed", {
+                "pairing_id": matched_row.get("pairing_id") or matched_key,
+                "token": new_token,
+                "grace_period_seconds": grace_period_seconds,
+            }
+
+    def adapter_authorized(self, header: str | None) -> bool:
+        verdict, _, _ = self.capability_status(header)
+        return verdict == CapabilityVerdict.VALID
 
     def create_pairing(self) -> dict[str, Any]:
         pairing_id, code = secrets.token_urlsafe(12), secrets.token_urlsafe(18)
@@ -200,18 +351,6 @@ class ControlSecurity:
             }
             write_json(self.pairings_path, data, indent=2)
         return {"pairing_id": pairing_id, "capability": capability, "scope": "session_heartbeat"}
-
-    def adapter_authorized(self, header: str | None) -> bool:
-        if not isinstance(header, str) or not header.startswith("Bearer "):
-            return False
-        digest = _digest(header[7:].strip())
-        data = self._pairings()
-        return any(
-            isinstance(row, dict) and not row.get("revoked")
-            and row.get("scope") == "session_heartbeat"
-            and hmac.compare_digest(str(row.get("token_hash") or ""), digest)
-            for row in data["capabilities"].values()
-        )
 
     def revoke_pairing(self, pairing_id: str) -> dict[str, Any]:
         res = self.revoke_capability(pairing_id)
@@ -586,3 +725,30 @@ class ControlSecurity:
         except Exception:
             pass
         return 0
+
+
+def capability_state(pairing_id: str, runtime_root: Path | str | None = None) -> CapabilityVerdict:
+    return ControlSecurity(runtime_root=runtime_root).capability_state(pairing_id)
+
+
+def capability_status(
+    header_or_token: str | None, runtime_root: Path | str | None = None
+) -> tuple[CapabilityVerdict, str, dict[str, Any] | None]:
+    return ControlSecurity(runtime_root=runtime_root).capability_status(header_or_token)
+
+
+def capability_identity(
+    header_or_token: str | None, runtime_root: Path | str | None = None
+) -> str | None:
+    return ControlSecurity(runtime_root=runtime_root).capability_identity(header_or_token)
+
+
+def renew_session_capability(
+    header_or_token: str | None,
+    *,
+    grace_period_seconds: int = 300,
+    runtime_root: Path | str | None = None,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    return ControlSecurity(runtime_root=runtime_root).renew_session_capability(
+        header_or_token, grace_period_seconds=grace_period_seconds
+    )

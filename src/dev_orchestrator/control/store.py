@@ -52,7 +52,8 @@ class ConversationControlStore:
 
     def heartbeat(
         self, adapter: Any, binding_id: Any, *, title: Any, url: Any,
-        tab_instance_id: Any, now: datetime | None = None,
+        tab_instance_id: Any, capability_id: Any = None,
+        capability_source: str = "capability", now: datetime | None = None,
     ) -> dict[str, Any]:
         adapter = _text(adapter, "adapter")
         binding_id = _text(binding_id, "binding_id")
@@ -66,16 +67,27 @@ class ConversationControlStore:
         ):
             raise ValueError("url must match an https://chatgpt.com/c/<binding_id> conversation")
         observed = _moment(now).isoformat()
+        cap_clean = str(capability_id).strip() if capability_id is not None and str(capability_id).strip() else None
+        cap_source = str(capability_source).strip() if capability_source else "capability"
         key = self._key(adapter, binding_id)
         with self._lock:
             sessions = self._sessions()
             prior = sessions.get(key) if isinstance(sessions.get(key), dict) else {}
             tabs = dict(prior.get("tabs") or {})
-            tabs[tab_instance_id] = {"last_seen_at": observed}
+            tabs[tab_instance_id] = {
+                "last_seen_at": observed,
+                "capability_pairing_id": cap_clean,
+                "capability_source": cap_source,
+                "verified_at": observed if cap_clean else None,
+            }
             record = {
                 "adapter": adapter, "binding_id": binding_id, "title": title, "url": url,
                 "first_seen_at": prior.get("first_seen_at") or observed,
-                "last_seen_at": observed, "tabs": tabs,
+                "last_seen_at": observed,
+                "capability_pairing_id": cap_clean or prior.get("capability_pairing_id"),
+                "capability_source": cap_source if cap_clean else (prior.get("capability_source") or "capability"),
+                "capability_verified_at": (observed if cap_clean else prior.get("capability_verified_at")),
+                "tabs": tabs,
             }
             sessions[key] = record
             write_json(self.sessions_path, sessions, indent=2)
@@ -86,10 +98,28 @@ class ConversationControlStore:
         with self._lock:
             record = self._sessions().get(self._key(adapter, binding_id))
         if not isinstance(record, dict):
-            return {"adapter": adapter, "binding_id": binding_id, "state": "undiscovered", "last_seen_at": None}
+            return {
+                "adapter": adapter, "binding_id": binding_id, "state": "undiscovered",
+                "last_seen_at": None, "active_tab_count": 0, "stale_tab_count": 0,
+                "capability_pairing_id": None, "capability_source": None, "verified": False,
+            }
         seen = parse_utc(record.get("last_seen_at"))
         item = dict(record)
         item["state"] = "live" if seen and (observed - seen).total_seconds() < self.session_presence_seconds else "stale"
+        tabs = record.get("tabs") if isinstance(record.get("tabs"), dict) else {}
+        active_tabs = 0
+        stale_tabs = 0
+        for tab in tabs.values():
+            if not isinstance(tab, dict):
+                continue
+            tab_seen = parse_utc(tab.get("last_seen_at"))
+            if tab_seen and (observed - tab_seen).total_seconds() < self.session_presence_seconds:
+                active_tabs += 1
+            else:
+                stale_tabs += 1
+        item["active_tab_count"] = active_tabs
+        item["stale_tab_count"] = stale_tabs
+        item["verified"] = bool(record.get("capability_pairing_id") and record.get("capability_verified_at"))
         return item
 
     def list_sessions(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
@@ -101,12 +131,6 @@ class ConversationControlStore:
             if not isinstance(raw, dict):
                 continue
             item = self.session_status(str(raw.get("adapter") or ""), str(raw.get("binding_id") or ""), now=observed)
-            tabs = raw.get("tabs") if isinstance(raw.get("tabs"), dict) else {}
-            item["active_tab_count"] = sum(
-                1 for tab in tabs.values()
-                if isinstance(tab, dict) and parse_utc(tab.get("last_seen_at"))
-                and (observed - parse_utc(tab.get("last_seen_at"))).total_seconds() < self.session_presence_seconds
-            )
             rows.append(item)
         return sorted(rows, key=lambda row: (str(row.get("title") or ""), str(row.get("binding_id") or "")))
 

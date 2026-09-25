@@ -67,6 +67,7 @@ from dev_orchestrator.accounting import (
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.workflow_policy import inject_workflow_policy
 from dev_orchestrator.core.websol import WebSolEvent, WebSolRequest, WebSolRole
+from dev_orchestrator.core.websol_health import WebSolAvailability
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 DISPATCHER_STATE_FILE = "dispatcher-state.json"
@@ -286,14 +287,40 @@ def _dispatch_result(
     )
 
 
-def _delivery_allowed(store: BrowserBridgeStore, adapter: str, binding_id: str) -> bool:
+def _delivery_allowed(
+    store: BrowserBridgeStore,
+    adapter: str,
+    binding_id: str,
+    project_id: str | None = None,
+    availability_provider: Any = None,
+) -> bool:
     """Whether a submission into the exact binding may happen right now.
 
-    Ordinary stores submit directly to the configured route. Live-binding
-    stores (``require_live_binding=True``) require the exact binding to show
-    live adapter presence inside its presence window — a conversation nobody is
-    watching must not receive a request (unbound browser reliability).
+    If ``availability_provider`` is provided, requires the binding's health
+    availability to be ``WebSolAvailability.AVAILABLE`` (truthful availability gating).
+    Live-binding stores (``require_live_binding=True``) additionally require the
+    exact binding to show live adapter presence inside its presence window.
     """
+    if availability_provider is not None and project_id is not None:
+        try:
+            health = availability_provider(project_id, adapter, binding_id)
+            if health is not None:
+                avail = getattr(health, "availability", None)
+                if hasattr(avail, "value"):
+                    avail_val = avail.value
+                elif isinstance(avail, str):
+                    avail_val = avail
+                elif isinstance(health, dict):
+                    avail_val = health.get("availability")
+                elif isinstance(health, str):
+                    avail_val = health
+                else:
+                    avail_val = str(health)
+                if avail_val != WebSolAvailability.AVAILABLE.value:
+                    return False
+        except Exception:
+            return False
+
     require_live = bool(getattr(store, "require_live_binding", False))
     if not require_live:
         return True
@@ -353,6 +380,7 @@ def _dispatch_one(
     accounting: ExecutionRecorder | None = None,
     failure_memory: FailureMemory | None = None,
     failure_memory_max_chars: int = 2000,
+    availability_provider: Any = None,
 ) -> Optional[WorkerDoneDispatch]:
     """Dispatch one completed Worker occurrence, idempotently across crashes."""
     if not isinstance(snapshot, dict):
@@ -389,6 +417,8 @@ def _dispatch_one(
             raise RuntimeError(
                 "invalid dispatcher occurrence state for {0}/{1}".format(project_id, run_id)
             )
+        if prepared.get("failover_state") is not None:
+            return None
         # Resume an existing frozen occurrence. Delivery is gated on the
         # project being orchestration-ready, on a current browser-bridge
         # route, and (for live-binding stores) on live adapter presence. A
@@ -402,7 +432,9 @@ def _dispatch_one(
             _keep_unbound(prepared, path, ledger)
             return None
         _, adapter, binding_id = route
-        if not _delivery_allowed(store, adapter, binding_id):
+        if not _delivery_allowed(
+            store, adapter, binding_id, project_id=project_id, availability_provider=availability_provider
+        ):
             _keep_unbound(prepared, path, ledger)
             return None
         return _submit_prepared(project_id, run_id, prepared, adapter, binding_id, store, path, ledger)
@@ -476,7 +508,13 @@ def _dispatch_one(
         )
     _save_ledger(path, ledger)
 
-    if route is not None and ready and _delivery_allowed(store, route[1], route[2]):
+    if (
+        route is not None
+        and ready
+        and _delivery_allowed(
+            store, route[1], route[2], project_id=project_id, availability_provider=availability_provider
+        )
+    ):
         return _submit_prepared(project_id, run_id, occurrence, route[1], route[2], store, path, ledger)
     return None
 
@@ -493,6 +531,7 @@ def dispatch_worker_done_events(
     accounting: ExecutionRecorder | None = None,
     failure_memory: FailureMemory | None = None,
     failure_memory_max_chars: int = 2000,
+    availability_provider: Any = None,
 ) -> list:
     """Submit one WORKER_DONE request per newly completed Worker occurrence.
 
@@ -524,6 +563,7 @@ def dispatch_worker_done_events(
             accounting,
             failure_memory,
             failure_memory_max_chars,
+            availability_provider=availability_provider,
         )
         if outcome is not None:
             dispatched.append(outcome)

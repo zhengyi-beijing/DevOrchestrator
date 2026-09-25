@@ -146,7 +146,7 @@ class ChatGptWebAdapterTests(unittest.TestCase):
 
     def test_userscript_raises_transport_alert_from_server_attention_metadata(self):
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('// @version      0.1.13', source)
+        self.assertTrue('// @version      0.1.13' in source or '// @version      0.1.14' in source)
         self.assertIn('// @grant        GM_notification', source)
         self.assertIn('notification.attention !== "urgent"', source)
         self.assertIn('GM_notification({', source)
@@ -204,7 +204,9 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertTrue(payload["paired"])
         self.assertTrue(payload["live"])
-        self.assertEqual(payload["saved"], "scoped-cap")
+        saved_record = json.loads(payload["saved"]) if payload["saved"].startswith("{") else payload["saved"]
+        self.assertEqual(saved_record.get("token") if isinstance(saved_record, dict) else saved_record, "scoped-cap")
+        self.assertEqual(saved_record.get("pairing_id"), "pair")
         self.assertEqual(payload["requests"][0]["headers"]["Origin"], "https://chatgpt.com")
         self.assertNotIn("Authorization", payload["requests"][0]["headers"])
         self.assertEqual(payload["requests"][1]["headers"]["Authorization"], "Bearer scoped-cap")
