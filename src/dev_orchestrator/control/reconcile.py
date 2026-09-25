@@ -345,12 +345,14 @@ def resolve_rereview_candidate(
             # only after its anchor becomes a clean ancestor.  The prior verdict
             # is context, never imported as the current verdict.
             decision_hash = _text(decision.get("review_status_hash"))
+            pair = (decision.get("decision"), decision.get("next_action"))
+            expected_disposition = "owner_gate" if pair == ("owner_gate", "stop") else "apply"
             if not (
                 review.get("state") == "completed"
                 and decision.get("request_id") == review_id
                 and decision.get("project_id") == project_id
                 and decision.get("task_id") == reviewed_task_id
-                and decision.get("disposition") == "apply"
+                and decision.get("disposition") == expected_disposition
                 and decision.get("role") == "reviewer"
                 and decision.get("event") == "worker_done"
                 and decision.get("branch") == truth.branch
