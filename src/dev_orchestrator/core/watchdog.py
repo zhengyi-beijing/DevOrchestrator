@@ -2546,28 +2546,47 @@ class WatchdogCoordinator:
                     details={"invariant_key": invariant_key, "reason": resolved_reason},
                 )
                 return
-            finding["state"] = "escalated"
-            update_finding_state(
+            # HEAD drift alone must not block reconciliation when the provider
+            # authoritatively reports that the lost execution is terminal.
+            from dev_orchestrator.core.execution_lifecycle import resolve_execution_liveness
+            terminal_liveness = resolve_execution_liveness(
                 self.runtime_root,
-                project_id=pid,
-                lineage_key=finding.get("lineage_key", ""),
-                invariant_key=invariant_key,
-                finding_id=finding.get("finding_id"),
-                state="escalated",
-            )
-            self._emit_milestone(
                 pid,
-                "EXECUTION_LOSS_ESCALATED",
+                source_request_id=finding.get("source_request_id"),
+                execution_id=finding.get("execution_id"),
+                engine_handle=finding.get("engine_handle"),
+                worker_pid=finding.get("worker_pid"),
+                started_at=finding.get("started_at"),
                 task_id=finding.get("task_id"),
-                occurrence_key=f"{invariant_key}:head-mismatch",
-                details={
-                    "source": "watchdog",
-                    "gate": "head_mismatch",
-                    "expected_head": expected_head,
-                    "observed_head": truth.head,
-                },
+                snapshot=snapshot,
+                executor=executor,
+                now=now or datetime.now(timezone.utc),
+                liveness_probe=self._liveness_probe,
+                ai_execution_port=self.ai_execution_port,
             )
-            return
+            if terminal_liveness.get("verdict") != "dead":
+                finding["state"] = "escalated"
+                update_finding_state(
+                    self.runtime_root,
+                    project_id=pid,
+                    lineage_key=finding.get("lineage_key", ""),
+                    invariant_key=invariant_key,
+                    finding_id=finding.get("finding_id"),
+                    state="escalated",
+                )
+                self._emit_milestone(
+                    pid,
+                    "EXECUTION_LOSS_ESCALATED",
+                    task_id=finding.get("task_id"),
+                    occurrence_key=f"{invariant_key}:head-mismatch",
+                    details={
+                        "source": "watchdog",
+                        "gate": "head_mismatch",
+                        "expected_head": expected_head,
+                        "observed_head": truth.head,
+                    },
+                )
+                return
 
         max_recoveries = int(policy.get("execution_loss_max_recoveries", 3))
         backoff_seconds = float(policy.get("execution_loss_backoff_seconds", 30))
