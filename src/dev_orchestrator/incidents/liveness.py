@@ -17,10 +17,12 @@ def _check_worker_liveness(
     worker = snapshot.get("worker") if isinstance(snapshot.get("worker"), dict) else {}
     pid = worker.get("pid")
     w_state = str(worker.get("state") or "").lower()
+    sources_inspected = 0
 
     # Check lineage store
     lineage_file = runtime_root / "execution-lineage.json"
     if lineage_file.is_file():
+        sources_inspected += 1
         try:
             lineage_data = read_json(lineage_file, None)
             if not isinstance(lineage_data, dict):
@@ -37,6 +39,7 @@ def _check_worker_liveness(
 
     # Check executor state
     if executor is not None:
+        sources_inspected += 1
         try:
             exec_state_fn = getattr(executor, "state", None)
             if callable(exec_state_fn):
@@ -53,11 +56,16 @@ def _check_worker_liveness(
             return {"alive": None, "state": "unknown", "source": f"executor_error: {exc}", "details": {}}
 
     # Check snapshot worker process
-    if w_state in {"running", "starting"}:
-        if pid and is_pid_alive(pid):
-            return {"alive": True, "state": w_state, "source": "snapshot_pid_alive", "details": worker}
-        if pid and not is_pid_alive(pid):
-            return {"alive": False, "state": "dead", "source": "snapshot_pid_dead", "details": worker}
+    if isinstance(snapshot, dict) and snapshot.get("worker") is not None:
+        sources_inspected += 1
+        if w_state in {"running", "starting"}:
+            if pid and is_pid_alive(pid):
+                return {"alive": True, "state": w_state, "source": "snapshot_pid_alive", "details": worker}
+            if pid and not is_pid_alive(pid):
+                return {"alive": False, "state": "dead", "source": "snapshot_pid_dead", "details": worker}
+
+    if sources_inspected == 0:
+        return {"alive": None, "state": "unknown", "source": "no_readable_sources", "details": {}}
 
     return {"alive": False, "state": "idle", "source": "no_active_worker", "details": worker}
 
@@ -112,10 +120,10 @@ def _check_coordinator_role(
     active_matches = [m for m in matching if m.get("state") in active_states]
 
     if not active_matches:
-        # Every source readable and negative
-        if coordinator is None or coord_alive is False:
+        # Every source readable and negative: coordinator must be present AND report False
+        if coordinator is not None and coord_alive is False:
             return {"alive": False, "state": "idle", "source": f"{role_name}_idle_in_ledger", "details": {}}
-        return {"alive": None, "state": "unknown", "source": f"{role_name}_thread_unknown", "details": {}}
+        return {"alive": None, "state": "unknown", "source": f"{role_name}_coordinator_thread_unavailable", "details": {}}
 
     latest_active = max(
         active_matches,

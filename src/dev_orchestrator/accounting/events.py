@@ -99,6 +99,9 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+_FILE_LOCK_STATE: dict[str, tuple[int, Any]] = {}
+
+
 def _thread_lock(path: Path) -> threading.RLock:
     key = os.path.normcase(str(path.resolve(strict=False)))
     with _LOCKS_GUARD:
@@ -115,51 +118,85 @@ class InterProcessFileLock:
         self._thread_lock = _thread_lock(self.path)
 
     def __enter__(self) -> "InterProcessFileLock":
+        key = os.path.normcase(str(self.path.resolve(strict=False)))
         deadline = time.monotonic() + self.timeout_seconds
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._thread_lock.acquire()
+        handle: Any = None
         try:
-            self._handle = self.path.open("a+b")
-            self._handle.seek(0, os.SEEK_END)
-            if self._handle.tell() == 0:
-                self._handle.write(b"\0")
-                self._handle.flush()
+            with _LOCKS_GUARD:
+                if key in _FILE_LOCK_STATE:
+                    count, existing_handle = _FILE_LOCK_STATE[key]
+                    _FILE_LOCK_STATE[key] = (count + 1, existing_handle)
+                    self._handle = existing_handle
+                    return self
+
+            handle = self.path.open("a+b")
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
             while True:
                 try:
-                    self._handle.seek(0)
+                    handle.seek(0)
                     if os.name == "nt":
                         import msvcrt
 
-                        msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                     else:
                         import fcntl
 
-                        fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with _LOCKS_GUARD:
+                        _FILE_LOCK_STATE[key] = (1, handle)
+                    self._handle = handle
                     return self
                 except (OSError, BlockingIOError):
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"timed out acquiring accounting lock {self.path}")
                     time.sleep(0.01)
         except BaseException:
-            if self._handle is not None:
-                self._handle.close()
-                self._handle = None
+            if handle is not None:
+                with _LOCKS_GUARD:
+                    is_in_state = key in _FILE_LOCK_STATE
+                if not is_in_state:
+                    handle.close()
             self._thread_lock.release()
             raise
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        key = os.path.normcase(str(self.path.resolve(strict=False)))
+        handle = None
+        should_close = False
         try:
-            if self._handle is not None:
-                self._handle.seek(0)
-                if os.name == "nt":
-                    import msvcrt
-
-                    msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            with _LOCKS_GUARD:
+                if key in _FILE_LOCK_STATE:
+                    count, live_handle = _FILE_LOCK_STATE[key]
+                    if count > 1:
+                        _FILE_LOCK_STATE[key] = (count - 1, live_handle)
+                        return
+                    del _FILE_LOCK_STATE[key]
+                    handle = live_handle
+                    should_close = True
                 else:
-                    import fcntl
+                    handle = self._handle
+                    should_close = bool(handle is not None)
 
-                    fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-                self._handle.close()
+            if handle is not None and should_close:
+                try:
+                    if not getattr(handle, "closed", False):
+                        handle.seek(0)
+                        if os.name == "nt":
+                            import msvcrt
+
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    if not getattr(handle, "closed", False):
+                        handle.close()
         finally:
             self._handle = None
             self._thread_lock.release()

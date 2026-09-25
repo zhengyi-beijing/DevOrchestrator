@@ -52,15 +52,17 @@ def classify_owner_action(
     if target.get("decision") or (target_gate and before_gate and target_gate != before_gate):
         return "NEW_INFORMATION"
 
-    # Check if 'after' shows restored progress
+    # Check if 'after' proves restored progress
     if isinstance(after, dict) and after:
         after_state = str(after.get("lifecycle_state") or after.get("state") or after.get("status") or "").upper()
-        before_state = str(before.get("lifecycle_state") or before.get("state") or before.get("status") or "").upper()
+        before_state = str(before.get("lifecycle_state") or before.get("state") or before.get("status") or "").upper() if isinstance(before, dict) else ""
         # Progress restored if state changed forward, active execution launched, or progress made
-        if after.get("active_execution") or after.get("worker_running") or (after_state and after_state != before_state):
+        if after.get("active_execution") or after.get("worker_running") or after.get("task_progressing"):
+            return "CONTROL_ONLY"
+        if after_state in ("EXECUTING", "WORKER_RUNNING", "PLANNING", "REVIEWING", "APPLYING_PLAN") and after_state != before_state:
             return "CONTROL_ONLY"
         if after.get("restored_progress") or after.get("progress_restored"):
             return "CONTROL_ONLY"
 
-    # Default to CONTROL_ONLY if identical inputs were given for an unattended recovery command
-    return "CONTROL_ONLY"
+    # If later evidence does not prove restored progress, do NOT classify as CONTROL_ONLY
+    return "UNCONFIRMED_PROGRESS"

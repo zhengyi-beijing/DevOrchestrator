@@ -143,6 +143,31 @@ class TestOwnerGateAndAttribution(unittest.TestCase):
         self.assertIn("pre_command_identity", latest)
         self.assertEqual(latest["pre_command_identity"].get("project_id"), self.project_id)
 
+    def test_classify_unconfirmed_progress_when_after_is_empty_or_shows_no_progress(self):
+        before = {
+            "lifecycle_state": "REVIEW_FAILED",
+            "git": {"head": "abc1234", "branch": "main"},
+            "gate_id": "gate-1",
+        }
+        cmd_record = {
+            "action": "continue",
+            "parameters": {},
+            "expected": {"head": "abc1234", "branch": "main"},
+            "target": {"gate_id": "gate-1"},
+        }
+        # 1. Empty after
+        self.assertEqual(classify_owner_action("continue", cmd_record, before, {}), "UNCONFIRMED_PROGRESS")
+
+        # 2. None after
+        self.assertEqual(classify_owner_action("continue", cmd_record, before, None), "UNCONFIRMED_PROGRESS")
+
+        # 3. Unchanged state without proven worker/progress
+        stale_after = {
+            "lifecycle_state": "REVIEW_FAILED",
+            "worker_running": False,
+        }
+        self.assertEqual(classify_owner_action("continue", cmd_record, before, stale_after), "UNCONFIRMED_PROGRESS")
+
 
 if __name__ == "__main__":
     unittest.main()

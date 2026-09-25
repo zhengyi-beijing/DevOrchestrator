@@ -167,7 +167,10 @@ def _run_orchestration_tick(
                 )
             else:
                 watchdog_summary = raw_summary
-            watchdog.advance(config, watchdog_summary, executor=executor)
+            try:
+                watchdog.advance(config, watchdog_summary, executor=executor, planner=planner_obj, reviewer=reviewer)
+            except TypeError:
+                watchdog.advance(config, watchdog_summary, executor=executor)
         except Exception as _wd_exc:
             watchdog.record_tick_error(_wd_exc)
             watchdog_error = str(_wd_exc)
@@ -399,7 +402,8 @@ def run_daemon(
             "active_streams": 0,
         })
     watchdog_coordinator = WatchdogCoordinator(
-        runtime, ai_execution_port=ai_execution_port, progress_channel=progress_channel
+        runtime, ai_execution_port=ai_execution_port, progress_channel=progress_channel,
+        planner=planner_coordinator, reviewer=reviewer_coordinator,
     )
     activation_supervisor = ActivationSupervisor(
         runtime, controls=control_coordinator, executor=transition_executor,

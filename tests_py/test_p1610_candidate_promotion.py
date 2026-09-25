@@ -271,6 +271,74 @@ class TestCandidatePromotion(unittest.TestCase):
         self.assertFalse(res_dirty["promoted"])
         self.assertEqual(res_dirty["code"], "repository_dirty")
 
+    def test_vacuous_test_fails_reproduction_gate(self):
+        generate_candidate(
+            self.runtime_root,
+            candidate_id="cand-vacuous",
+            generated_by="alice",
+        )
+        # Overwrite with vacuous test
+        cand_test = self.runtime_root / "incident-packets" / "candidates" / "cand-vacuous" / "test_candidate_cand-vacuous.py"
+        cand_test.write_text("import unittest\nclass T(unittest.TestCase):\n    def test_pass(self):\n        self.assertTrue(True)\n", encoding="utf-8")
+        eval_res = evaluate_promotion(self.runtime_root, "cand-vacuous")
+        gates = eval_res["executable_gates"]
+        self.assertFalse(gates["reproduction"]["verdict"])
+        self.assertFalse(eval_res["promotable"])
+
+    def test_promote_rollback_failed_dirty_and_blocks_subsequent(self):
+        generate_candidate(
+            self.runtime_root,
+            candidate_id="cand-fail-dirty",
+            generated_by="alice",
+        )
+        evaluate_promotion(self.runtime_root, "cand-fail-dirty")
+        record_candidate_review(
+            self.runtime_root,
+            candidate_id="cand-fail-dirty",
+            reviewer_id="bob",
+            verdict="ACCEPTED",
+        )
+
+        def dirty_hook(target_file):
+            # Create extra dirty residue that won't be unlinked by target_path.unlink()
+            dirty_residue = target_file.parent / "dirty_residue.tmp"
+            dirty_residue.write_text("residue", encoding="utf-8")
+            raise IOError("injected write crash after dirtying repo")
+
+        res = promote_candidate(
+            self.runtime_root,
+            candidate_id="cand-fail-dirty",
+            config_path=self.config_path,
+            expected_head=self.owner_head,
+            expected_branch=self.owner_branch,
+            _post_write_hook=dirty_hook,
+        )
+        self.assertFalse(res["promoted"])
+        self.assertEqual(res["code"], "failed_dirty")
+        self.assertIn("owner_gate", res)
+        self.assertTrue(res["owner_gate"]["gate_id"].startswith("owner_gate:promotion_failed_dirty:"))
+
+        # Subsequent promotion on a clean candidate MUST be blocked!
+        generate_candidate(
+            self.runtime_root,
+            candidate_id="cand-next-blocked",
+            generated_by="charlie",
+        )
+        evaluate_promotion(self.runtime_root, "cand-next-blocked")
+        record_candidate_review(
+            self.runtime_root,
+            candidate_id="cand-next-blocked",
+            reviewer_id="bob",
+            verdict="ACCEPTED",
+        )
+        res_blocked = promote_candidate(
+            self.runtime_root,
+            candidate_id="cand-next-blocked",
+            config_path=self.config_path,
+        )
+        self.assertFalse(res_blocked["promoted"])
+        self.assertEqual(res_blocked["code"], "promotion_blocked")
+
 
 if __name__ == "__main__":
     unittest.main()

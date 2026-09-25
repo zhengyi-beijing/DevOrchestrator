@@ -858,6 +858,8 @@ def evaluate_stall(
     now: Optional[datetime] = None,
     executor_state: dict[str, Any] | None = None,
     runtime_root: Path | str | None = None,
+    planner: Any = None,
+    reviewer: Any = None,
 ) -> StallAssessment:
     """Sole consumer of age; evaluates threshold breach against durable signals."""
     last_progress_at, progress_fingerprint, signal_sources = signals
@@ -903,10 +905,16 @@ def evaluate_stall(
             from dev_orchestrator.incidents.owner_gate import resolve_owner_gate_authority
 
             progress_obligation = resolve_progress_obligation(snapshot)
-            role_liveness = resolve_role_liveness(runtime_root, project_id, snapshot, executor=executor_state)
+            role_liveness = resolve_role_liveness(runtime_root, project_id, snapshot, planner=planner, reviewer=reviewer, executor=executor_state)
             gate_auth = resolve_owner_gate_authority(runtime_root, snapshot)
 
-            if breached and role_liveness.get("all_dead") and not progress_obligation.get("legal_wait"):
+            if (
+                breached
+                and role_liveness.get("all_dead")
+                and not role_liveness.get("any_unknown")
+                and not progress_obligation.get("legal_wait")
+                and not progress_obligation.get("is_terminal")
+            ):
                 if not gate_auth.get("pending") and not gate_auth.get("paused") and gate_auth.get("resolved"):
                     stall_classification = "orchestrator_alive_task_stalled"
         except Exception:
@@ -952,11 +960,15 @@ class WatchdogCoordinator:
         ai_execution_port: Any = None,
         progress_channel: Any = None,
         liveness_probe: Optional[Callable[[Any], bool]] = None,
+        planner: Any = None,
+        reviewer: Any = None,
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.state_path = self.runtime_root / WATCHDOG_STATE_FILE
         self.ai_execution_port = ai_execution_port
         self.progress_channel = progress_channel
+        self.planner = planner
+        self.reviewer = reviewer
         # FR2B-LIVE-IDENTITY: injectable liveness probe so tests can supply deterministic stubs;
         # production code defaults to the platform is_pid_alive abstraction.
         self._liveness_probe: Callable[[Any], bool] = liveness_probe if liveness_probe is not None else is_pid_alive
@@ -1543,13 +1555,15 @@ class WatchdogCoordinator:
         *,
         executor: Any = None,
         now: Optional[datetime] = None,
+        planner: Any = None,
+        reviewer: Any = None,
     ) -> list[dict[str, Any]]:
         """Advance watchdog coordinator tick with strict non-blocking concurrency control."""
         if not self._advance_lock.acquire(blocking=False):
             return [{"skipped": "concurrent-advance"}]
 
         try:
-            return self._advance_under_lock(config_path, summary, executor=executor, now=now)
+            return self._advance_under_lock(config_path, summary, executor=executor, now=now, planner=planner, reviewer=reviewer)
         finally:
             self._advance_lock.release()
 
@@ -1560,6 +1574,8 @@ class WatchdogCoordinator:
         *,
         executor: Any = None,
         now: Optional[datetime] = None,
+        planner: Any = None,
+        reviewer: Any = None,
     ) -> list[dict[str, Any]]:
         tick_now = now or datetime.now(timezone.utc)
         now_iso = tick_now.isoformat()
@@ -1712,6 +1728,8 @@ class WatchdogCoordinator:
                 if prow.get("last_error") in (None, "activity-evidence-unavailable"):
                     prow["last_error"] = None
 
+                eff_planner = planner if planner is not None else self.planner
+                eff_reviewer = reviewer if reviewer is not None else self.reviewer
                 assessment = evaluate_stall(
                     snapshot,
                     policy,
@@ -1719,6 +1737,8 @@ class WatchdogCoordinator:
                     now=tick_now,
                     executor_state=executor_state,
                     runtime_root=self.runtime_root,
+                    planner=eff_planner,
+                    reviewer=eff_reviewer,
                 )
                 # READY_TO_RUN without an execution deliberately uses the
                 # launch-gap subset of activity; persist that same evidence

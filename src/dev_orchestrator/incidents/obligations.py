@@ -86,6 +86,36 @@ def resolve_progress_obligation(
             "legal_wait": is_legal_wait,
         }
 
+    if lifecycle in {"DONE", "COMPLETED", "TERMINAL"}:
+        return {
+            "state": lifecycle,
+            "expected_event": "none",
+            "successor_action": "none",
+            "evidence_source": "monitor_summary",
+            "deadline_at": None,
+            "tick_budget": 0,
+            "timeout_classification": "terminal",
+            "auto_recovery_allowed": False,
+            "escalation": "none",
+            "legal_wait": True,
+            "is_terminal": True,
+        }
+
+    if lifecycle in {"IDLE", "PAUSED", "WAITING"}:
+        return {
+            "state": lifecycle,
+            "expected_event": "resume_or_dispatch",
+            "successor_action": "wait",
+            "evidence_source": "monitor_summary",
+            "deadline_at": None,
+            "tick_budget": 0,
+            "timeout_classification": "idle",
+            "auto_recovery_allowed": False,
+            "escalation": "owner_gate" if not is_legal_wait else "none",
+            "legal_wait": True,
+            "is_terminal": False,
+        }
+
     # Generic/fallback state
     return {
         "state": lifecycle or "UNKNOWN",
@@ -98,4 +128,5 @@ def resolve_progress_obligation(
         "auto_recovery_allowed": False,
         "escalation": "owner_gate",
         "legal_wait": is_legal_wait,
+        "is_terminal": False,
     }

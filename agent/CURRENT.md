@@ -5,44 +5,47 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P16.10 Automatic Failure Harvesting & Regression Promotion** (Status: **COMPLETE** / Implementation & Verification Complete). Next task: **P16.11 AGY-First Resource Routing**.
+Current task: **P16.10 Automatic Failure Harvesting & Regression Promotion** (Status: **COMPLETE** / Implementation, Verification & Technical Review Remediation Complete). Next task: **P16.11 AGY-First Resource Routing**.
 
 P16.10 Automatic Failure Harvesting & Regression Promotion completion (2026-09-25):
 - Implemented restart-safe incident packet store under `runtime/incident-packets/`:
   - Atomic commit protocol via `TransactionIntent` with single-point-of-commit index mutation and automatic reconciliation on open/tick (`committed_confirmed`, `reapplied`, `superseded_txn`, `payload_unverified`).
   - Strict append-only family recurrence: duplicate fingerprints increment recurrence count and append bounded evidence references without creating duplicate packets.
   - Fail-closed corruption quarantine with degraded memory state.
+  - Store durability & locking: `_load_index_failclosed` isolates IO/OS read errors without deleting or quarantining valid `index.json`. `reconcile_journal` checks index references before moving superseded transaction side-files to `orphans/`, preserving live packets and candidates. Process-local reentrancy added to `InterProcessFileLock`.
 - Semantic incident fingerprinting (`src/dev_orchestrator/incidents/fingerprint.py`):
   - Normalized semantic failure hashing strictly over allowlisted semantic fields; volatile keys (timestamps, ages, UUIDs, PIDs, paths) rejected fail-closed.
 - Automated failure harvesting detectors in `harvest_tick` (`src/dev_orchestrator/incidents/harvesting.py`):
   - 8 named detectors: `watchdog_recovery`, `actionable_execution_loss`, `unconsumed_plan_or_review`, `launch_gap`, `restart_reconcile_outcome_change`, `recovery_cycle_exhaustion_or_livelock`, `control_only_intervention`, and `orchestrator_alive_task_stalled`.
   - Guarded invocation in daemon tick (`src/dev_orchestrator/daemon.py`).
+  - CONTROL_ONLY owner attribution strictly requires proven forward progress in `after` snapshot; falls back to `UNCONFIRMED_PROGRESS` otherwise.
 - Fail-closed owner-gate authority resolution (`src/dev_orchestrator/incidents/owner_gate.py`):
   - Surfaces `latest_owner_gate` from watchdog or planner ledgers, evaluates `OwnerControlStore` pause state, and resolves pending gate authority.
-- 3-Role liveness resolution (`src/dev_orchestrator/incidents/liveness.py`):
+- 3-Role liveness resolution and diagnosis precedence (`src/dev_orchestrator/incidents/liveness.py`, `src/dev_orchestrator/core/diagnostics.py`):
   - Resolves Worker, Planner, and Reviewer liveness independently.
-  - Classifies dead only when all required sources are readable and negative; any unreadable/missing source yields unknown.
+  - Coordinator returns `unknown` when coordinator object or heartbeat is unreadable/missing even if ledger is idle.
+  - Diagnosis precedence guarantees pre-existing P16.7–P16.9 failure modes (`worker_vanished`, `execution_record_disappeared`, `running_without_provider_output`, `inconsistent_active_state`, `agent_stalled`) take precedence over `orchestrator_alive_task_stalled`.
 - Progress obligation resolution (`src/dev_orchestrator/incidents/obligations.py`):
-  - Differentiates legal wait states (pauses, declared external waits, startup grace, pending owner gates) from silent stalls.
+  - Differentiates legal wait states (pauses, declared external waits, startup grace, pending owner gates) from silent stalls. Terminal states (`DONE`, `COMPLETED`, `TERMINAL`) marked as legal wait with no pending progress obligation.
 - Truthful task status and activity distinction (`src/dev_orchestrator/core/project_status.py`):
   - Exposes `system_alive`, `task_active`, `task_progressing`, and `incident_metrics` (`control_only_interventions`, `target_control_only_interventions: 0`, `incidents_captured`, `recurrence_count`, `candidates_generated`, `promotions_settled`).
   - Normalizes `last_task_activity_at` separately from `last_meaningful_progress_at`; daemon heartbeats and watchdog self-writes do not count as meaningful task progress.
 - Operator-invoked, destination-free staged candidate regression promotion pipeline:
   - Candidates synthesized in runtime store (`generate_candidate`), materialized strictly into git-excluded `tests_candidate/` of verified DevOrchestrator owner (`materialize_candidate`).
-  - Five executable gates: reproduction, discrimination, stability, isolation, deduplication.
+  - Real executable candidate gates (`run_executable_candidate_gates`): executes synthetic test with `DEVORCH_FIXTURE_MODE=failing` asserting `AssertionError`, executes with `DEVORCH_FIXTURE_MODE=corrected` asserting exit code 0, 3-run stability loop, AST isolation gate forbidding unauthorized imports, and store + `tests_py/` deduplication. Real deterministic unittest test code generated.
   - Immutable `pre_review_digest` computed solely over candidate content SHA256 and the 5 executable gate results.
   - Independent review gate binds to `pre_review_digest` without modifying executable snapshots.
-  - Promotion (`promote_candidate`) verifies clean tree, HEAD/branch match, 6 passed gates, writes only new files into `tests_py/` with rollback on failure.
+  - Promotion (`promote_candidate`) executes under `store.lock`, checks `promotion_blocked` flag, verifies initial status hash, and safely rolls back and unlinks targets on failure. If disk residue or status mismatch persists, sets `promotion_blocked: True` and records residue in owner-gate (`failed_dirty`).
 - New CLI commands in `src/dev_orchestrator/cli.py`:
   - `incident-list`, `incident-show`, `candidate-list`, `candidate-evaluate`, `candidate-review`, `candidate-materialize`, `candidate-promote`.
 - Repreoduced 2026-09-25 false-running incident regression:
   - Fresh heartbeats with `REVIEW_FAILED` and dead roles correctly diagnosed as `orchestrator_alive_task_stalled`, status reflects `system_alive=True`, `task_active=False`, `task_progressing=False`, and enters bounded recovery.
-- Verification:
-  - 45 focused tests across 7 P16.10 test modules passing 100%.
-  - 1186 full repository regression tests passing, 92 subtests passing, 0 failures.
+- Verification & Remediation:
+  - 57 focused tests across 8 P16.10 test modules passing 100%.
+  - 1198 full repository regression tests passing, 92 subtests passing, 0 failures.
   - Candidate test collection isolation verified (0 tests collected without `DEVORCH_CANDIDATE_TESTS=1`).
   - `compileall` and `git diff --check` clean.
-  - Knowledge graph updated via `graphify update .` (5956 nodes, 16691 edges, 260 communities).
+  - Knowledge graph updated via `graphify update .` (5984 nodes, 16759 edges, 260 communities).
 
 P16.9 Watchdog Execution-Loss Detection & Recovery completion (2026-09-24):
 - Solved the xray-hw-platform incident blind spot: an accepted execution reached WORKER_RUNNING, emitted no provider output, and vanished with the project returning to READY_TO_RUN without a terminal state, while watchdog previously reported state=ok with zero recovery.

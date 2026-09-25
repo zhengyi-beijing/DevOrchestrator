@@ -283,12 +283,20 @@ def _detect_control_only_intervention(
         if cmd.get("state") != "accepted":
             continue
 
+        pid = str(cmd.get("project_id") or "")
         before = cmd.get("pre_command_identity") or cmd.get("observed")
-        after = summary.get(cmd.get("project_id")) if isinstance(summary, dict) and isinstance(summary.get(cmd.get("project_id")), dict) else None
+        after = None
+        if isinstance(summary, dict):
+            if isinstance(summary.get(pid), dict):
+                after = summary.get(pid)
+            elif isinstance(summary.get("projects"), list):
+                for p in summary["projects"]:
+                    if isinstance(p, dict) and str(p.get("project_id") or p.get("id") or "") == pid:
+                        after = p
+                        break
 
         classification = classify_owner_action(act, cmd, before, after)
         if classification == "CONTROL_ONLY":
-            pid = str(cmd.get("project_id") or "")
             semantic = {
                 "failure_class": "control_only_intervention",
                 "diagnosis_code": "agent_stalled",
@@ -332,14 +340,18 @@ def _detect_orchestrator_alive_task_stalled(
         if gate_auth.get("pending") or gate_auth.get("paused") or not gate_auth.get("resolved"):
             continue
 
-        # Check role liveness: requires all roles dead
+        # Check role liveness: requires all roles dead and none unknown
         liveness = resolve_role_liveness(runtime_root, pid, proj, planner, reviewer, executor)
-        if not liveness.get("all_dead"):
+        if liveness.get("any_unknown") or not liveness.get("all_dead"):
             continue
 
         # Check progress obligation
         obligation = resolve_progress_obligation(proj)
-        if obligation.get("legal_wait"):
+        if obligation.get("legal_wait") or obligation.get("is_terminal"):
+            continue
+
+        lifecycle = str(proj.get("lifecycle_state") or proj.get("state") or proj.get("status") or "").upper()
+        if lifecycle in {"DONE", "COMPLETED", "TERMINAL", "IDLE"}:
             continue
 
         # Check task activity
@@ -367,10 +379,12 @@ def _detect_orchestrator_alive_task_stalled(
 
 DETECTORS: dict[str, Callable[..., list[tuple[str, str | None, str, dict[str, Any], dict[str, Any], str]]]] = {
     "watchdog_recovery": _detect_watchdog_recovery,
+    "actionable_execution_loss": _detect_execution_loss,
     "execution_loss": _detect_execution_loss,
     "unconsumed_plan_or_review": _detect_unconsumed_plan_or_review,
     "launch_gap": _detect_launch_gap,
     "restart_reconcile_outcome_change": _detect_restart_reconcile_outcome_change,
+    "recovery_cycle_exhaustion_or_livelock": _detect_recovery_exhaustion_or_livelock,
     "recovery_exhaustion_or_livelock": _detect_recovery_exhaustion_or_livelock,
     "control_only_intervention": _detect_control_only_intervention,
     "orchestrator_alive_task_stalled": _detect_orchestrator_alive_task_stalled,

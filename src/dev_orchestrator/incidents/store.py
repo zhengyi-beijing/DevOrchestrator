@@ -93,6 +93,10 @@ class IncidentStore:
         self.index: dict[str, Any] = self._load_index_failclosed()
 
     @property
+    def lock(self) -> InterProcessFileLock:
+        return InterProcessFileLock(self.lock_path)
+
+    @property
     def revision(self) -> int:
         return int(self.index.get("revision", 0))
 
@@ -110,9 +114,14 @@ class IncidentStore:
 
         try:
             raw_text = self.index_path.read_text(encoding="utf-8-sig")
+        except (OSError, IOError) as exc:
+            # Transient I/O error reading index: fail closed into degraded mode without deleting the file
+            return _empty_index(degraded=True, degraded_reason=f"unreadable index file: {exc}")
+
+        try:
             data = json.loads(raw_text)
         except Exception as exc:
-            _quarantine_index(self.index_path, raw_text if "raw_text" in locals() else "", f"unparseable json: {exc}")
+            _quarantine_index(self.index_path, raw_text, f"unparseable json: {exc}")
             return _empty_index(degraded=True, degraded_reason=f"corrupt index: {exc}")
 
         if not isinstance(data, dict):
@@ -279,17 +288,67 @@ class IncidentStore:
             # 3. Live revision != prior_revision (superseded by intervening commit)
             orphan_txn_dir = self.orphans_dir / txn_id
             orphan_txn_dir.mkdir(parents=True, exist_ok=True)
+            orphaned_any = False
             if isinstance(payload_hashes, dict):
                 for rel_str in payload_hashes:
                     side_p = self.base_dir / rel_str
                     if side_p.is_file():
                         # Only orphan if not referenced by the current live index
-                        shutil.move(str(side_p), str(orphan_txn_dir / Path(rel_str).name))
+                        if not self._is_referenced_by_index(live_index, rel_str):
+                            shutil.move(str(side_p), str(orphan_txn_dir / Path(rel_str).name))
+                            orphaned_any = True
+            if not orphaned_any:
+                try:
+                    orphan_txn_dir.rmdir()
+                except OSError:
+                    pass
             intent_file.unlink(missing_ok=True)
             results.append({"status": "superseded_txn", "txn_id": txn_id, "prior_revision": prior_rev, "live_revision": live_rev})
 
         self.index = self._load_index_failclosed()
         return results
+
+    def _is_referenced_by_index(self, live_index: dict[str, Any], rel_str: str) -> bool:
+        """Check whether a relative path under base_dir is referenced by live_index."""
+        if not isinstance(live_index, dict):
+            return False
+        norm = rel_str.replace("\\", "/").strip("/")
+        parts = norm.split("/")
+        if not parts:
+            return False
+
+        if parts[0] == "packets":
+            pkt_id = Path(parts[-1]).stem
+            for fam in live_index.get("families", {}).values():
+                if isinstance(fam, dict):
+                    if fam.get("packet_id") == pkt_id:
+                        return True
+                    if pkt_id in (fam.get("packet_ids") or []):
+                        return True
+            for cand in live_index.get("candidates", {}).values():
+                if isinstance(cand, dict) and pkt_id in (cand.get("source_incidents") or []):
+                    return True
+            return False
+
+        if parts[0] == "candidates" and len(parts) >= 2:
+            cand_id = parts[1]
+            if cand_id in live_index.get("candidates", {}):
+                return True
+            for fam in live_index.get("families", {}).values():
+                if isinstance(fam, dict) and fam.get("candidate_id") == cand_id:
+                    return True
+            return False
+
+        def _search(obj: Any) -> bool:
+            if isinstance(obj, str):
+                return norm in obj.replace("\\", "/")
+            if isinstance(obj, dict):
+                return any(_search(k) or _search(v) for k, v in obj.items())
+            if isinstance(obj, (list, tuple, set)):
+                return any(_search(item) for item in obj)
+            return False
+
+        return _search(live_index)
 
 
 def load_incident_store(runtime_root: Path | str) -> IncidentStore:

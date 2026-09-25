@@ -1478,3 +1478,44 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
   - Candidate test collection isolation verified (0 tests collected without `DEVORCH_CANDIDATE_TESTS=1`).
   - `compileall` and `git diff --check` clean.
   - Knowledge graph updated via `graphify update .` (5956 nodes, 16691 edges, 260 communities).
+
+
+### P16.10 Technical Review Remediation (2026-09-25)
+
+Closed all 5 concrete BLOCKING review findings from ai_review:8fcec80a-ca9a-4ce4-b2cc-06e2ed0a7e7e:execute plus secondary items:
+1. Finding 1 (Executable Promotion Gates):
+   - In src/dev_orchestrator/incidents/evaluation.py, implemented real gate execution in run_executable_candidate_gates:
+     - Reproduction gate: executes test in isolated temp dir with DEVORCH_FIXTURE_MODE=failing; verifies it fails with AssertionError.
+     - Discrimination gate: executes test with DEVORCH_FIXTURE_MODE=corrected; verifies it passes cleanly with exit code 0.
+     - Stability gate: executes 3 consecutive runs; verifies all 3 pass.
+     - Isolation gate: static AST analysis inspecting imports and calls; rejects forbidden modules (socket, http, urllib, requests, ctypes, subprocess, serial, etc.).
+     - Deduplication gate: verifies candidate invariant and test content are unique relative to the candidate store and permanent tests_py/ suite.
+   - In src/dev_orchestrator/incidents/candidate.py, updated _generate_synthetic_test_code to generate deterministic unittest test suites with explicit reproduction and discrimination oracles instead of vacuous self.assertTrue(True).
+2. Finding 2 (Diagnosis Precedence & Role Liveness):
+   - In src/dev_orchestrator/core/diagnostics.py, moved orchestrator_alive_task_stalled to the bottom of classify_evidence (after agent_stalled and before fallback unknown), so pre-existing P16.7-P16.9 failure diagnoses (ready_to_run_unlaunched, reviewer_failed, planner_failed, process_dead, agent_stalled) always take precedence.
+   - In src/dev_orchestrator/incidents/liveness.py, updated _check_coordinator_role to return alive: None, state: 'unknown' when coordinator is None or has_live_role is unreadable (even if ledgers exist and are idle), preventing false all_dead assertion. Updated _check_worker_liveness to return alive: None, state: 'unknown' when no sources are readable.
+   - In src/dev_orchestrator/core/watchdog.py, updated WatchdogCoordinator to accept, store, and pass planner and reviewer coordinators to evaluate_stall and resolve_role_liveness. Guarded orchestrator_alive_task_stalled on not role_liveness.get('any_unknown') and not progress_obligation.get('is_terminal').
+   - In src/dev_orchestrator/daemon.py, passed coordinators to WatchdogCoordinator initialization and watchdog.advance, with backward-compatible fallback for mock watchdogs.
+   - Disclosed fixture timestamp explanation: in tests_py/test_p169_watchdog_execution_loss.py and tests_py/test_p169_legitimate_cases.py, the hardcoded timestamp '2026-09-24T12:05:00Z' was originally in the future when authored on 2026-09-24 (commit fae685c at 09:03 UTC), so eval_now - prog_dt was <= 0 (breached=False). On 2026-09-25, that fixed timestamp aged by >22 hours, breaching the 300s stall threshold and preventing watchdog.advance from taking the not assessment.breached code branch that returns status: 'ok' or 'execution_loss_detected'. Added new dedicated test suite tests_py/test_p1610_diagnosis_precedence.py verifying that when assessment.breached = True, P16.7-P16.9 failure diagnoses take precedence.
+3. Finding 3 (CONTROL_ONLY Attribution):
+   - In src/dev_orchestrator/incidents/attribution.py, classify_owner_action requires proven forward progress in after (active_execution, worker_running, task_progressing, restored_progress, or forward lifecycle state change) to return 'CONTROL_ONLY'; returns 'UNCONFIRMED_PROGRESS' otherwise.
+   - In src/dev_orchestrator/incidents/harvesting.py, _detect_control_only_intervention extracts after from both summary.get(project_id) and daemon's summary.get('projects').
+4. Finding 4 (Promotion Rollback & Locking Contract):
+   - In src/dev_orchestrator/incidents/promotion.py, wrapped promote_candidate in with store.lock:.
+   - Checks store.index.get('promotion_blocked'): refuses immediately with code: 'promotion_blocked' if prior rollback failed dirty.
+   - Records initial_status_hash = truth.status_hash before writing.
+   - On write error, post-write hook failure, or target verification failure: unlinks target_path. If repository truth cannot be restored to initial_status_hash or residue remains, marks store index promotion_blocked: True, returns code: 'failed_dirty', and provides owner_gate naming the residue. Clean rollback returns code: 'destination_write_failed'.
+5. Finding 5 (Store Durability):
+   - In src/dev_orchestrator/incidents/store.py, _load_index_failclosed catches (OSError, IOError) on read_text separately from json.loads, returning degraded state without unlinking or quarantining index.json.
+   - Added _is_referenced_by_index method and updated reconcile_journal on superseded_txn to verify whether side files are referenced by live_index, preserving live packet and candidate files and moving only unreferenced files to orphans/. Added lock property to IncidentStore.
+   - In src/dev_orchestrator/accounting/events.py, implemented process-local reentrancy for InterProcessFileLock and guarded against operations on closed handles.
+6. Secondary items:
+   - In src/dev_orchestrator/incidents/obligations.py, handled DONE, COMPLETED, TERMINAL with is_terminal=True, legal_wait=True, and IDLE, PAUSED, WAITING with legal_wait=True.
+   - Aligned DETECTORS names with registry keys.
+7. Verification:
+   - 57 focused tests across 8 P16.10 test modules passing 100% (including test_p1610_diagnosis_precedence.py).
+   - 142 adjacent tests across P16.9 and watchdog suites passing 100%.
+   - Full repository regression: 1198 passed, 92 subtests passed, 0 failures.
+   - Candidate test collection isolation verified (0 tests collected without DEVORCH_CANDIDATE_TESTS=1).
+   - compileall and git diff --check clean.
+   - Knowledge graph updated via graphify update . (5984 nodes, 16759 edges, 260 communities).

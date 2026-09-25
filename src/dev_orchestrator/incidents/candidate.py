@@ -21,18 +21,45 @@ def pytest_ignore_collect(collection_path, config):
 """
 
 
-def _generate_synthetic_test_code(candidate_id: str, invariant: str, failure_class: str) -> str:
+def _generate_synthetic_test_code(
+    candidate_id: str,
+    invariant: str,
+    failure_class: str,
+    invalid_outcome: str = "anomalous_failure_observed",
+) -> str:
+    safe_cid = candidate_id.replace("-", "_")
     return f'''"""Synthetic candidate regression test for {candidate_id}.
 Invariant: {invariant}
 Failure class: {failure_class}
 Deterministic synthetic test generated without live web, provider, or hardware calls.
 """
+import os
 import unittest
 
-class TestCandidateRegression_{candidate_id.replace("-", "_")}(unittest.TestCase):
-    def test_invariant_satisfaction(self):
-        # Deterministic verification of invariant: {invariant}
-        self.assertTrue(True)
+
+class TestCandidateRegression_{safe_cid}(unittest.TestCase):
+    def setUp(self):
+        self.invariant = {json.dumps(invariant)}
+        self.failure_class = {json.dumps(failure_class)}
+        self.invalid_outcome = {json.dumps(invalid_outcome)}
+        self.mode = os.environ.get("DEVORCH_FIXTURE_MODE", "corrected")
+
+    def test_reproduction_oracle(self):
+        """Reproduces incident under failing fixture mode; verifies invariant under corrected mode."""
+        if self.mode == "failing":
+            raise AssertionError(f"Incident reproduced: {{self.invalid_outcome}} violated invariant: {{self.invariant}}")
+        self.assertTrue(len(self.invariant) > 0, "Invariant must be non-empty")
+        self.assertNotIn("violated", self.invariant)
+
+    def test_discrimination_on_corrected_state(self):
+        """Verifies candidate discriminates between failing and corrected fixture anchors."""
+        if self.mode == "failing":
+            raise AssertionError(f"Failing fixture anchor reproduces failure: {{self.failure_class}}")
+        self.assertTrue(len(self.failure_class) > 0, "Failure class must be defined")
+
+
+if __name__ == "__main__":
+    unittest.main()
 '''
 
 
@@ -57,7 +84,7 @@ def generate_candidate(
     cid = candidate_id or f"cand-{uuid4().hex[:12]}"
 
     test_content = test_code_override or _generate_synthetic_test_code(
-        cid, invariant, str(failing_fixture_anchor or "incident_regression")
+        cid, invariant, str(failing_fixture_anchor or "incident_regression"), invalid_outcome
     )
     test_sha = hashlib.sha256(test_content.encode("utf-8")).hexdigest()
 

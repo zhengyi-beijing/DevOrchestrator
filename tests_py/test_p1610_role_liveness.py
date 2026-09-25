@@ -166,6 +166,24 @@ class TestRoleLiveness(unittest.TestCase):
         reviewer = AIReviewerCoordinator(self.runtime_root, config_path)
         self.assertFalse(reviewer.has_live_role("non-existent"))
 
+    def test_idle_ledgers_with_none_coordinators_yields_unknown(self):
+        # Even if ledger files exist and are idle, missing coordinators must yield unknown
+        self._setup_idle_ledgers()
+        res = resolve_role_liveness(
+            runtime_root=self.runtime_root,
+            project_id=self.project_id,
+            snapshot={},
+            planner=None,
+            reviewer=None,
+        )
+
+        self.assertIsNone(res["planner"]["alive"])
+        self.assertEqual(res["planner"]["state"], "unknown")
+        self.assertIsNone(res["reviewer"]["alive"])
+        self.assertEqual(res["reviewer"]["state"], "unknown")
+        self.assertTrue(res["any_unknown"])
+        self.assertFalse(res["all_dead"])
+
 
 if __name__ == "__main__":
     unittest.main()

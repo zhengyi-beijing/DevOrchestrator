@@ -238,6 +238,66 @@ class TestIncidentStore(unittest.TestCase):
         # Packet ID must not change (append-only recurrence to family)
         self.assertEqual(fam3["packet_id"], first_packet_id)
 
+    def test_transient_read_error_leaves_index_intact_without_quarantine_or_unlinking(self):
+        store_dir = self.runtime_root / "incident-packets"
+        store_dir.mkdir(parents=True, exist_ok=True)
+        index_file = store_dir / "index.json"
+        original_content = json.dumps({"schema_version": 1, "revision": 10, "families": {}, "candidates": {}})
+        index_file.write_text(original_content, encoding="utf-8")
+
+        from unittest.mock import patch
+        with patch.object(Path, "read_text", side_effect=OSError("transient device read error")):
+            store = load_incident_store(self.runtime_root)
+            self.assertTrue(store.index.get("degraded"))
+            self.assertIn("unreadable index file", store.index.get("degraded_reason", ""))
+
+        # Crucial: index_file on disk MUST NOT have been unlinked or quarantined!
+        self.assertTrue(index_file.is_file())
+        self.assertEqual(index_file.read_text(encoding="utf-8"), original_content)
+        quarantined = list(store_dir.glob("index.corrupt.*"))
+        self.assertEqual(len(quarantined), 0)
+
+    def test_superseded_txn_preserves_live_referenced_side_files(self):
+        store = load_incident_store(self.runtime_root)
+        # Create an intent that references packet and candidate files
+        pkt_rel = "packets/pkt-live.json"
+        unref_rel = "packets/pkt-unref.json"
+        intent = begin_txn(
+            store,
+            operation="superseded_test",
+            side_files={
+                pkt_rel: json.dumps({"packet_id": "pkt-live"}),
+                unref_rel: json.dumps({"packet_id": "pkt-unref"}),
+            },
+            target_index_updater=lambda idx: idx.update({"some_key": True}),
+        )
+
+        # Commit an intervening live index with higher revision that references pkt-live but NOT pkt-unref
+        live_idx = {
+            "schema_version": 1,
+            "revision": intent.prior_revision + 5,
+            "last_txn_id": "intervening_txn",
+            "families": {
+                "fam1": {"family_id": "fam1", "packet_id": "pkt-live", "packet_ids": ["pkt-live"]},
+            },
+            "candidates": {},
+        }
+        (store.base_dir / "index.json").write_text(json.dumps(live_idx), encoding="utf-8")
+
+        # Now reconcile journal: intent is superseded
+        results = reconcile_journal(store)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "superseded_txn")
+
+        # Live referenced file MUST remain in place!
+        self.assertTrue((store.base_dir / pkt_rel).is_file())
+
+        # Unreferenced file MUST be moved to orphans!
+        self.assertFalse((store.base_dir / unref_rel).exists())
+        orphans = list((store.orphans_dir / intent.txn_id).glob("*.json"))
+        self.assertEqual(len(orphans), 1)
+        self.assertEqual(orphans[0].name, "pkt-unref.json")
+
 
 if __name__ == "__main__":
     unittest.main()

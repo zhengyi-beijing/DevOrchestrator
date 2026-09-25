@@ -1,8 +1,13 @@
 """Executable candidate evaluation and pre-review digest computation."""
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -10,6 +15,151 @@ from dev_orchestrator.incidents.store import load_incident_store
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso
 
 EVALUATOR_SCHEMA_VERSION = 1
+
+_FORBIDDEN_MODULES = {
+    "socket",
+    "requests",
+    "paramiko",
+    "telnetlib",
+    "ftplib",
+    "http.client",
+    "aiohttp",
+    "ctypes",
+}
+
+
+def _check_isolation_ast(source_code: str) -> tuple[bool, str]:
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError as exc:
+        return False, f"syntax_error: {exc}"
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                mod = alias.name.split(".")[0]
+                if mod in _FORBIDDEN_MODULES:
+                    return False, f"forbidden_import: {alias.name}"
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").split(".")[0]
+            if mod in _FORBIDDEN_MODULES:
+                return False, f"forbidden_import_from: {node.module}"
+    return True, "clean_isolated_ast"
+
+
+def _check_deduplication(
+    candidate_id: str,
+    manifest: dict[str, Any],
+    source_code: str,
+    runtime_root: Path,
+) -> tuple[bool, str]:
+    try:
+        store = load_incident_store(runtime_root)
+        cands = store.index.get("candidates", {})
+        cand_sha = hashlib.sha256(source_code.encode("utf-8")).hexdigest()
+        for cid, cdata in cands.items():
+            if cid != candidate_id:
+                if cdata.get("candidate_content_sha256") == cand_sha:
+                    return False, f"duplicate_candidate_content: {cid}"
+    except Exception:
+        pass
+    return True, "unique_candidate"
+
+
+def run_executable_candidate_gates(
+    candidate_id: str,
+    cand_dir: Path,
+    manifest: dict[str, Any],
+    source_code: str,
+    runtime_root: Path,
+) -> dict[str, Any]:
+    """Execute the five real promotion gates in a temporary directory."""
+    with tempfile.TemporaryDirectory() as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        test_file = tmp_dir / f"test_candidate_{candidate_id}.py"
+        test_file.write_text(source_code, encoding="utf-8")
+
+        # Gate 4: Isolation
+        iso_ok, iso_reason = _check_isolation_ast(source_code)
+        isolation = {
+            "verdict": iso_ok,
+            "evidence_hash": hashlib.sha256(f"isolation:{iso_reason}".encode("utf-8")).hexdigest()[:16],
+        }
+
+        # Gate 5: Deduplication
+        dedup_ok, dedup_reason = _check_deduplication(candidate_id, manifest, source_code, runtime_root)
+        deduplication = {
+            "verdict": dedup_ok,
+            "evidence_hash": hashlib.sha256(f"dedup:{dedup_reason}".encode("utf-8")).hexdigest()[:16],
+        }
+
+        # Gate 1: Reproduction (fail-before)
+        # Running the test in failing mode MUST produce a failure (exit code != 0)
+        env_failing = dict(os.environ)
+        env_failing["DEVORCH_FIXTURE_MODE"] = "failing"
+        proc_failing = subprocess.run(
+            [sys.executable, "-m", "unittest", test_file.name],
+            cwd=str(tmp_dir),
+            capture_output=True,
+            text=True,
+            env=env_failing,
+        )
+        reproduced = proc_failing.returncode != 0
+        repro_evidence = (proc_failing.stderr + proc_failing.stdout).strip()
+        reproduction = {
+            "verdict": reproduced,
+            "evidence_hash": hashlib.sha256(f"repro:{reproduced}:{repro_evidence[:200]}".encode("utf-8")).hexdigest()[:16],
+        }
+
+        # Gate 2: Discrimination (pass-after)
+        # Running the test in corrected mode MUST pass (exit code == 0)
+        env_corrected = dict(os.environ)
+        env_corrected["DEVORCH_FIXTURE_MODE"] = "corrected"
+        proc_corrected = subprocess.run(
+            [sys.executable, "-m", "unittest", test_file.name],
+            cwd=str(tmp_dir),
+            capture_output=True,
+            text=True,
+            env=env_corrected,
+        )
+        discriminated = proc_corrected.returncode == 0
+        discrim_evidence = (proc_corrected.stdout + proc_corrected.stderr).strip()
+        discrimination = {
+            "verdict": discriminated,
+            "evidence_hash": hashlib.sha256(f"discrim:{discriminated}:{discrim_evidence[:200]}".encode("utf-8")).hexdigest()[:16],
+        }
+
+        # Gate 3: Stability (repeated runs produce identical passing outcome)
+        stable = True
+        stability_outputs = []
+        if discriminated:
+            for _ in range(3):
+                proc_st = subprocess.run(
+                    [sys.executable, "-m", "unittest", test_file.name],
+                    cwd=str(tmp_dir),
+                    capture_output=True,
+                    text=True,
+                    env=env_corrected,
+                )
+                stability_outputs.append(proc_st.returncode)
+                if proc_st.returncode != 0:
+                    stable = False
+                    break
+        else:
+            stable = False
+
+        stability = {
+            "verdict": stable,
+            "evidence_hash": hashlib.sha256(f"stability:{stable}:{stability_outputs}".encode("utf-8")).hexdigest()[:16],
+        }
+
+        return {
+            "reproduction": reproduction,
+            "discrimination": discrimination,
+            "stability": stability,
+            "isolation": isolation,
+            "deduplication": deduplication,
+        }
 
 
 def compute_pre_review_digest(
@@ -63,24 +213,10 @@ def evaluate_promotion(
     content = source_file.read_text(encoding="utf-8")
     content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-    # Default five executable gates: pass deterministically unless runner or gate_overrides dictate otherwise
-    executable_gates = {
-        "reproduction": {"verdict": True, "evidence_hash": hashlib.sha256(b"reproduction_ok").hexdigest()[:16]},
-        "discrimination": {"verdict": True, "evidence_hash": hashlib.sha256(b"discrimination_ok").hexdigest()[:16]},
-        "stability": {"verdict": True, "evidence_hash": hashlib.sha256(b"stability_ok").hexdigest()[:16]},
-        "isolation": {"verdict": True, "evidence_hash": hashlib.sha256(b"isolation_ok").hexdigest()[:16]},
-        "deduplication": {"verdict": True, "evidence_hash": hashlib.sha256(b"deduplication_ok").hexdigest()[:16]},
-    }
-
     if runner is not None:
-        custom_results = runner(candidate_id, cand_dir)
-        if isinstance(custom_results, dict):
-            for k, v in custom_results.items():
-                if k in executable_gates:
-                    if isinstance(v, dict):
-                        executable_gates[k] = v
-                    else:
-                        executable_gates[k] = {"verdict": bool(v), "evidence_hash": ""}
+        executable_gates = runner(candidate_id, cand_dir)
+    else:
+        executable_gates = run_executable_candidate_gates(candidate_id, cand_dir, manifest, content, runtime)
 
     if gate_overrides:
         for k, v in gate_overrides.items():
