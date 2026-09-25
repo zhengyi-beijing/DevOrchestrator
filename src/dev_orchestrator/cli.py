@@ -580,8 +580,11 @@ def cmd_project_control(args: argparse.Namespace) -> int:
         target.update({"adapter": args.adapter, "binding_id": args.binding_id})
     if args.target_id and args.action in {"retry", "rereview", "reconcile"}:
         target["target_id"] = args.target_id
-    if args.target_id and args.action == "approve_owner_gate":
-        target["gate_id"] = args.target_id
+    if args.action == "approve_owner_gate":
+        # Use the projected exact pending gate unless the caller supplied an explicit target.
+        gate_id = args.target_id or projected["control_identity"].get("gate_id")
+        if gate_id:
+            target["gate_id"] = gate_id
     _print_json(_submit_control_api(
         runtime, project_id, args.action, projected["control_identity"],
         command_id=args.command_id, target=target,
