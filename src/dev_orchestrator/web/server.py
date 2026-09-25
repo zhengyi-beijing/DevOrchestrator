@@ -1000,6 +1000,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if value is None: return
             try:
                 result = security.redeem_pairing(value.get("pairing_id"), value.get("code"))
+                if hasattr(self.server, "websol_health_store") and self.server.websol_health_store is not None:
+                    self.server.websol_health_store.invalidate_generation(reason="pairing_redeemed")
             except ValueError as exc:
                 self._error(400, "Bad Request", str(exc), False); return
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(result)), False,

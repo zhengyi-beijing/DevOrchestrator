@@ -23,6 +23,9 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import logging
+from datetime import datetime, timedelta, timezone
+
 from dev_orchestrator.bridge.server import make_bridge_server
 from dev_orchestrator.bridge.store import BrowserBridgeStore
 from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
@@ -54,8 +57,10 @@ from dev_orchestrator.control.security import ControlSecurity
 from dev_orchestrator.control.store import ConversationControlStore
 from dev_orchestrator.jobs.recovery import JobRecoveryCoordinator
 from dev_orchestrator.monitor.project import run_monitor_once
-from dev_orchestrator.storage.json_store import utc_now_iso, write_json, write_text
+from dev_orchestrator.storage.json_store import parse_utc, utc_now, utc_now_iso, write_json, write_text
 from dev_orchestrator.web.server import make_server
+
+logger = logging.getLogger(__name__)
 
 
 def _monitor_heartbeat(
@@ -131,6 +136,22 @@ def _run_orchestration_tick(
     if health_store is None:
         health_store = WebSolHealthStore(runtime)
 
+    # Synchronize and track browser_bridge bindings across ticks
+    current_bindings: dict[str, str] = {}
+    for item in browser_summary.get("projects") or []:
+        if not isinstance(item, dict):
+            continue
+        p_id = str(item.get("project_id") or "")
+        binding = item.get("conversation_binding")
+        if isinstance(binding, dict) and binding.get("transport") == "browser_bridge":
+            if binding.get("require_truthful_availability") is False or binding.get("require_availability") is False:
+                continue
+            adp = str(binding.get("adapter") or "chatgpt_web")
+            bid = str(binding.get("binding_id") or "")
+            if bid:
+                current_bindings[p_id] = f"{adp}:{bid}"
+    health_store.sync_bindings(current_bindings)
+
     # 1. Evaluate Web Sol health for active project bindings
     for item in browser_summary.get("projects") or []:
         if not isinstance(item, dict):
@@ -138,6 +159,8 @@ def _run_orchestration_tick(
         p_id = str(item.get("project_id") or "")
         binding = item.get("conversation_binding")
         if not isinstance(binding, dict) or binding.get("transport") != "browser_bridge":
+            continue
+        if binding.get("require_truthful_availability") is False or binding.get("require_availability") is False:
             continue
         adp = str(binding.get("adapter") or "chatgpt_web")
         bid = str(binding.get("binding_id") or "")
@@ -216,18 +239,18 @@ def _run_orchestration_tick(
                             error=pres.reason if not pres.success else None,
                             duration_seconds=pres.duration_seconds,
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.exception("Web Sol background probe failed for project=%s adapter=%s binding=%s: %s", proj, a, b, exc)
                 threading.Thread(target=_do_probe, args=(p_id, adp, bid), daemon=True).start()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("Web Sol health evaluation failed for project=%s adapter=%s binding=%s: %s", p_id, adp, bid, exc)
 
     # 2. Run failover reconciliation
     if failover_engine is not None:
         try:
             failover_engine.reconcile()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("Web Sol failover engine reconcile failed: %s", exc)
 
     # 3. Dispatch worker_done events with availability_provider
     def _daemon_availability_provider(p: str, a: str, b: str) -> Any:
@@ -543,6 +566,7 @@ def run_daemon(
         runtime, accounting=accounting
     )
     health_store = WebSolHealthStore(runtime)
+    health_store.invalidate_generation(reason="daemon_startup")
     if server is not None:
         server.websol_health_store = health_store
     failover_store = WebSolFailoverStore(runtime)

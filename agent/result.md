@@ -62,13 +62,35 @@ P16.12 Web Sol Persistent Pairing & Truthful Availability (complete 2026-09-25):
   7. CLI Probe Recording & Incident Evidence (`src/dev_orchestrator/cli.py`, `src/dev_orchestrator/daemon.py`):
      - `cmd_websol_probe` records probe execution results directly into `health_store`.
      - Incident evidence serialization in `daemon.py` iterates `health.signals.values()` instead of dict keys.
+- Round 2 Technical Review Remediation (2026-09-26):
+  1. WebSol Health & Probe Daemon Import Correction (`src/dev_orchestrator/daemon.py`):
+     - Fixed `NameError` in `_run_orchestration_tick` where `utc_now()` and `timedelta` were called during `WebSolHealth` construction without being imported. Added missing imports (`logging`, `datetime`, `timedelta`, `timezone`, `parse_utc`, `utc_now`, `utc_now_iso`) and `logger = logging.getLogger(__name__)`.
+     - Replaced broad `except Exception: pass` with explicit exception logging via `logger.exception(...)` so health evaluation and probe scheduling failures are visible.
+  2. WebSol Generation Lifecycle & Invalidation (`src/dev_orchestrator/core/websol_health.py`, `src/dev_orchestrator/daemon.py`, `src/dev_orchestrator/control/store.py`, `src/dev_orchestrator/control/security.py`, `src/dev_orchestrator/web/server.py`):
+     - Wired generation invalidation on:
+       - Daemon startup (`daemon.py`).
+       - Project binding synchronizer (`health_store.sync_bindings(current_bindings)` in `daemon.py` and `websol_health.py` bumps generation on route change or removal).
+       - Static and dynamic conversation rebind/bind/unbind and heartbeat capability pairing changes (`control/store.py`).
+       - Session capability pairing redemption and revocation (`control/security.py`).
+       - Web server pairing redemption endpoint (`POST /api/v1/control/adapter-pairings/redeem`).
+     - In `WebSolHealthStore.invalidate_generation`, cleared `probe_backoff` so fresh probes can run immediately after invalidation.
+     - In `WebSolHealthStore.should_probe`, immediately trigger probe when current generation exceeds recorded probe generation.
+  3. Hard Attempt Cap & Missing Capability Availability Classification (`src/dev_orchestrator/core/websol_health.py`):
+     - Enforced `probe_consecutive_failures < DEFAULT_PROBE_MAX_ATTEMPTS` in `should_probe` so background probes cease after maximum consecutive failures.
+     - Updated `evaluate_websol_availability` so missing/unknown capability signals (`capability_missing`, `capability_unknown`) demote to `DEGRADED` rather than falsely escalating to `PAIRING_REQUIRED`.
+  4. Truthful Availability Gating Bypass & Option Preservation (`src/dev_orchestrator/daemon.py`, `src/dev_orchestrator/control/binding_resolver.py`, `tests_py/test_worker_done_daemon_integration.py`, `tests_py/test_response_consumer_daemon_integration.py`):
+     - In `binding_resolver.py`, preserved `conversation_binding` extra options (such as `require_truthful_availability` and `require_availability`) across static and runtime project resolution.
+     - In `daemon.py`, skipped Web Sol health evaluation, probe scheduling, and binding synchronization when `require_truthful_availability` or `require_availability` is explicitly `False`.
+     - Added `"require_truthful_availability": False` to P13 legacy integration test configs testing basic BrowserBridge dispatch without control plane/Tampermonkey userscripts.
 - Verification:
-  - 22 dedicated unit and integration tests in `tests_py/test_p1612_websol_pairing_and_availability.py` passing 100% (added 6 remediation tests covering `to_dict`, `no_active_tabs` / `unverified` classification, probe generation evaluation and defaults, server owner authorization and CORS stripping, nonce verification in `withdraw`, and default truthful availability gating).
-  - 14 tests in `tests_py/test_chatgpt_web_adapter.py` passing 100% (covering adapter pure state computation, heartbeat classification, and split-brain demotion).
+  - 26 dedicated unit and integration tests in `tests_py/test_p1612_websol_pairing_and_availability.py` passing 100% (added 4 remediation tests covering daemon orchestration tick integration with probe scheduling, generation invalidation lifecycle on rebinding/pairing, hard probe attempt capping, and capability missing demoting to degraded).
+  - 14 tests in `tests_py/test_chatgpt_web_adapter.py` passing 100%.
+  - 4 tests in `tests_py/test_daemon_transition_integration.py` passing 100%.
+  - Legacy daemon integration tests (`test_worker_done_daemon_integration.py`, `test_response_consumer_daemon_integration.py`) passing 100%.
   - 34 tests in adjacent suites (`test_web.py`, `test_p13_web_bridge_adapter.py`, `test_p13_control_logs.py`, `test_p15_acceptance.py`, `test_p15_mobile_gateway.py`) passing 100%.
-  - Full repository regression: 1260 passed, 92 subtests passed in pytest.
+  - Full repository regression: 1264 passed in pytest (100%).
   - Python compilation (`compileall src ops tests_py`) and `git diff --check` clean.
-  - Knowledge graph updated via `graphify update .` (6349 nodes, 17762 edges, 266 communities).
+  - Knowledge graph updated via `graphify update .` (6363 nodes, 17811 edges, 268 communities).
 
 
 P12 Unified AI Control Surface (complete 2026-09-15):

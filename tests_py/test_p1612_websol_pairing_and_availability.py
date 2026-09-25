@@ -1123,3 +1123,183 @@ def test_bridge_store_withdraw_verifies_nonce(tmp_path: Path) -> None:
     res = bridge.withdraw("chatgpt_web", "bind-nonce", req.request_id, "correct-nonce", "test")
     assert res.outcome == "withdrawn"
 
+
+def test_daemon_orchestration_tick_websol_integration(tmp_path: Path) -> None:
+    """Regression for BLOCKING-1 & BLOCKING-2: Real _run_orchestration_tick with browser_bridge.
+
+    Verifies:
+    1. WebSolHealth construction does not fail on utc_now/timedelta NameError.
+    2. websol-health.json is written by the daemon tick.
+    3. A probe is scheduled after generation bump (invalidate_generation).
+    4. _daemon_availability_provider is passed to dispatch_worker_done_events and consults health store.
+    """
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+    from dev_orchestrator.daemon import _run_orchestration_tick
+    from dev_orchestrator.storage.json_store import write_json
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(parents=True)
+    cfg_file = tmp_path / "config.json"
+    write_json(cfg_file, {"projects": []})
+
+    bridge = BrowserBridgeStore(runtime)
+    bridge._touch_presence("chatgpt_web", "bind-daemon-1", datetime.now(timezone.utc))
+
+    conv_store = ConversationControlStore(runtime)
+    conv_store.heartbeat(
+        "chatgpt_web",
+        "bind-daemon-1",
+        title="Live ChatGPT",
+        url="https://chatgpt.com/c/bind-daemon-1",
+        tab_instance_id="tab-1",
+    )
+
+    class DummyExecutor:
+        def overlay_managed_runs(self, summary: Any) -> Any:
+            return dict(summary)
+        def advance(self, summary: Any, config: Any, *, decision_summary: Any = None) -> list[Any]:
+            return []
+
+    project_data = {
+        "project_id": "proj-daemon",
+        "repo_path": str(tmp_path / "repo"),
+        "state": "READY_TO_RUN",
+        "lifecycle_state": "READY_TO_RUN",
+        "conversation_binding": {
+            "transport": "browser_bridge",
+            "adapter": "chatgpt_web",
+            "binding_id": "bind-daemon-1",
+        },
+    }
+    raw_summary = {"projects": [project_data]}
+
+    health_store = WebSolHealthStore(runtime)
+
+    provider_calls = []
+    def spy_dispatch(browser_summary: Any, b_store: Any, rt: Any, acct: Any, f_mem: Any, max_c: Any, avail_provider: Any) -> list[Any]:
+        if avail_provider is not None:
+            h = avail_provider("proj-daemon", "chatgpt_web", "bind-daemon-1")
+            provider_calls.append(h)
+        return []
+
+    probe_calls = []
+    def spy_run_probe(b_store: Any, adp: str, bid: str, **kwargs: Any) -> ProbeResult:
+        probe_calls.append((adp, bid, kwargs.get("generation")))
+        return ProbeResult(success=True, duration_seconds=0.05)
+
+    with patch("dev_orchestrator.daemon.run_monitor_once", return_value=raw_summary), \
+         patch("dev_orchestrator.daemon.write_project_statuses", return_value=[]), \
+         patch("dev_orchestrator.daemon.consume_websol_responses", return_value=None), \
+         patch("dev_orchestrator.daemon.dispatch_worker_done_events", side_effect=spy_dispatch), \
+         patch("dev_orchestrator.daemon.run_websol_probe", side_effect=spy_run_probe):
+
+        # 1. Run orchestration tick: WebSolHealth construction must succeed and write websol-health.json
+        _run_orchestration_tick(
+            cfg_file, runtime, bridge, DummyExecutor(), health_store=health_store, pid=999
+        )
+
+        assert (runtime / "websol-health.json").exists()
+        rec = health_store.get("proj-daemon", "chatgpt_web", "bind-daemon-1")
+        assert rec is not None
+        # Availability provider was consulted during dispatch
+        assert len(provider_calls) == 1
+        assert provider_calls[0] is not None
+        assert provider_calls[0].project_id == "proj-daemon"
+
+        # Wait briefly for daemon probe thread to execute spy_run_probe
+        time.sleep(0.3)
+        assert len(probe_calls) >= 1
+        assert probe_calls[0][0] == "chatgpt_web"
+        assert probe_calls[0][1] == "bind-daemon-1"
+
+        # 2. Invalidate generation (simulating daemon restart or pairing change)
+        old_gen = health_store.current_generation()
+        new_gen = health_store.invalidate_generation(reason="restart")
+        assert new_gen == old_gen + 1
+
+        # Probe calls before second tick
+        probe_count_before = len(probe_calls)
+
+        # Run tick again: should immediately detect generation mismatch and schedule new probe with new_gen
+        _run_orchestration_tick(
+            cfg_file, runtime, bridge, DummyExecutor(), health_store=health_store, pid=999
+        )
+        time.sleep(0.3)
+        assert len(probe_calls) > probe_count_before
+        assert probe_calls[-1][2] == new_gen
+
+
+def test_generation_invalidation_lifecycle(tmp_path: Path) -> None:
+    """Regression for BLOCKING-2: verify invalidate_generation is called on rebinding and pairing change."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(parents=True)
+    health_store = WebSolHealthStore(runtime)
+    gen0 = health_store.current_generation()
+
+    # 1. Rebinding via sync_bindings bumps generation
+    bindings_1 = {"p1": "chatgpt_web:conv-1"}
+    health_store.sync_bindings(bindings_1)
+    assert health_store.current_generation() == gen0  # initial set doesn't bump
+
+    bindings_2 = {"p1": "chatgpt_web:conv-2"}  # rebinding!
+    bumped = health_store.sync_bindings(bindings_2)
+    assert bumped is True
+    assert health_store.current_generation() == gen0 + 1
+
+    # 2. Rebinding via ConversationControlStore.rebind
+    conv_store = ConversationControlStore(runtime)
+    conv_store.heartbeat(
+        "chatgpt_web", "conv-3",
+        title="ChatGPT Conv 3", url="https://chatgpt.com/c/conv-3", tab_instance_id="tab-3"
+    )
+    gen_before = health_store.current_generation()
+    conv_store.rebind("p1", "chatgpt_web", "conv-3")
+    assert health_store.current_generation() == gen_before + 1
+
+    # 3. Pairing change via ControlSecurity.redeem_pairing
+    sec = ControlSecurity(runtime)
+    pairing = sec.create_pairing()
+    gen_before_redeem = health_store.current_generation()
+    sec.redeem_pairing(pairing["pairing_id"], pairing["code"])
+    assert health_store.current_generation() == gen_before_redeem + 1
+
+    # 4. Revocation via ControlSecurity.revoke_capability
+    gen_before_revoke = health_store.current_generation()
+    sec.revoke_capability(pairing["pairing_id"])
+    assert health_store.current_generation() == gen_before_revoke + 1
+
+
+def test_should_probe_hard_attempt_cap(tmp_path: Path) -> None:
+    """Non-blocking finding: should_probe must enforce DEFAULT_PROBE_MAX_ATTEMPTS."""
+    from dev_orchestrator.core.websol_health import DEFAULT_PROBE_MAX_ATTEMPTS
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(parents=True)
+    health_store = WebSolHealthStore(runtime)
+
+    # Initial should_probe is True
+    assert health_store.should_probe("p1", "chatgpt_web", "b1") is True
+
+    # Record failures up to MAX_ATTEMPTS
+    for i in range(DEFAULT_PROBE_MAX_ATTEMPTS):
+        health_store.record_probe_result("p1", "chatgpt_web", "b1", ok=False, error=f"fail-{i}")
+
+    # Now consecutive_failures == DEFAULT_PROBE_MAX_ATTEMPTS, should_probe must return False
+    assert health_store.probe_consecutive_failures("p1", "chatgpt_web", "b1") == DEFAULT_PROBE_MAX_ATTEMPTS
+    assert health_store.should_probe("p1", "chatgpt_web", "b1") is False
+
+
+def test_evaluate_websol_availability_missing_capability_demotes_to_degraded() -> None:
+    """Non-blocking finding: wholly missing capability signal demotes to DEGRADED, not PAIRING_REQUIRED."""
+    signals = {
+        "bridge_listener": WebSolSignal("bridge_listener", "healthy", "ok", "2026-09-25T00:00:00Z"),
+        "browser_claim_presence": WebSolSignal("browser_claim_presence", "healthy", "ok", "2026-09-25T00:00:00Z"),
+        "control_heartbeat": WebSolSignal("control_heartbeat", "healthy", "ok", "2026-09-25T00:00:00Z"),
+        "binding_identity": WebSolSignal("binding_identity", "healthy", "ok", "2026-09-25T00:00:00Z"),
+        "probe": WebSolSignal("probe", "healthy", "probe_passed", "2026-09-25T00:00:00Z"),
+        # "capability" key omitted completely
+    }
+    avail, reason = evaluate_websol_availability(signals, probe_passed=True)
+    assert avail == WebSolAvailability.DEGRADED
+    assert reason == "capability_missing"
+

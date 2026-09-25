@@ -28,6 +28,11 @@ def resolve_effective_project(project: dict[str, Any], store: ConversationContro
             return result
         adapter, binding_id = _text(runtime.get("adapter")), _text(runtime.get("binding_id"))
         route = {"transport": "browser_bridge", "adapter": adapter, "binding_id": binding_id} if adapter and binding_id else None
+        if route and isinstance(result.get("conversation_binding"), dict):
+            orig_binding = result["conversation_binding"]
+            for extra_key in ("require_truthful_availability", "require_availability"):
+                if extra_key in orig_binding:
+                    route[extra_key] = orig_binding[extra_key]
         result.update({"conversation_binding": route, "conversation_binding_source": "runtime" if route else "runtime_invalid", "orchestration_ready": route is not None})
         return result
     raw = result.get("conversation_binding")
@@ -35,7 +40,10 @@ def resolve_effective_project(project: dict[str, Any], store: ConversationContro
     if isinstance(raw, dict):
         transport, adapter, binding_id = (_text(raw.get(key)) for key in ("transport", "adapter", "binding_id"))
         if transport and adapter and binding_id:
-            route = {"transport": transport, "adapter": adapter, "binding_id": binding_id}
+            route = dict(raw)
+            route["transport"] = transport
+            route["adapter"] = adapter
+            route["binding_id"] = binding_id
     result.update({"conversation_binding": route, "conversation_binding_source": "static" if route else "none"})
     result["orchestration_ready"] = (
         bool(result.get("orchestration_ready", True)) if route else configured_direct_ready

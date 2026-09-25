@@ -64,6 +64,7 @@ class WorkerDoneDaemonIntegrationTests(unittest.TestCase):
                     "transport": "browser_bridge",
                     "adapter": "chatgpt_web",
                     "binding_id": "conv-p1",
+                    "require_truthful_availability": False,
                 },
             }]}), encoding="utf-8")
             web_port, bridge_port = free_port(), free_port()

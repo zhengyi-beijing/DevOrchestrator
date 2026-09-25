@@ -73,6 +73,13 @@ class ConversationControlStore:
         with self._lock:
             sessions = self._sessions()
             prior = sessions.get(key) if isinstance(sessions.get(key), dict) else {}
+            prior_cap = prior.get("capability_pairing_id")
+            if cap_clean and prior_cap and cap_clean != prior_cap:
+                try:
+                    from dev_orchestrator.core.websol_health import WebSolHealthStore
+                    WebSolHealthStore(self.runtime_root).invalidate_generation(reason="pairing_changed")
+                except Exception:
+                    pass
             tabs = dict(prior.get("tabs") or {})
             tabs[tab_instance_id] = {
                 "last_seen_at": observed,
@@ -180,6 +187,11 @@ class ConversationControlStore:
                       "updated_at": now, "provenance": "owner_control"}
             bindings[project_id] = record
             write_json(self.bindings_path, bindings, indent=2)
+            try:
+                from dev_orchestrator.core.websol_health import WebSolHealthStore
+                WebSolHealthStore(self.runtime_root).invalidate_generation(reason=f"bind:{project_id}")
+            except Exception:
+                pass
             return dict(record)
 
     def rebind(self, project_id: str, adapter: str, binding_id: str) -> dict[str, Any]:
@@ -197,6 +209,11 @@ class ConversationControlStore:
                       "updated_at": now, "provenance": "owner_control"}
             bindings[project_id] = record
             write_json(self.bindings_path, bindings, indent=2)
+            try:
+                from dev_orchestrator.core.websol_health import WebSolHealthStore
+                WebSolHealthStore(self.runtime_root).invalidate_generation(reason=f"rebind:{project_id}")
+            except Exception:
+                pass
             return dict(record)
 
     def unbind(self, project_id: str) -> dict[str, Any]:
@@ -209,4 +226,9 @@ class ConversationControlStore:
             record = {"project_id": project_id, "state": "unbound", "updated_at": utc_now().isoformat(), "provenance": "owner_control"}
             bindings[project_id] = record
             write_json(self.bindings_path, bindings, indent=2)
+            try:
+                from dev_orchestrator.core.websol_health import WebSolHealthStore
+                WebSolHealthStore(self.runtime_root).invalidate_generation(reason=f"unbind:{project_id}")
+            except Exception:
+                pass
             return dict(record)

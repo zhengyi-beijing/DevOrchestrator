@@ -55,7 +55,8 @@ class ControlSecurity:
     PAIRING_TTL_SECONDS = 5 * 60
 
     def __init__(self, runtime_root: Path | str) -> None:
-        self.root = Path(runtime_root) / "control"
+        self.runtime_root = Path(runtime_root)
+        self.root = self.runtime_root / "control"
         self.secret_path = self.root / "api-token"
         self.pairings_path = self.root / "adapter-capabilities.json"
         self.lock_path = self.root / "security.lock"
@@ -350,6 +351,11 @@ class ControlSecurity:
                 "scope": "session_heartbeat", "created_at": utc_now_iso(), "revoked": False,
             }
             write_json(self.pairings_path, data, indent=2)
+        try:
+            from dev_orchestrator.core.websol_health import WebSolHealthStore
+            WebSolHealthStore(self.runtime_root).invalidate_generation(reason="pairing_redeemed")
+        except Exception:
+            pass
         return {"pairing_id": pairing_id, "capability": capability, "scope": "session_heartbeat"}
 
     def revoke_pairing(self, pairing_id: str) -> dict[str, Any]:
@@ -474,7 +480,12 @@ class ControlSecurity:
             if isinstance(capability, dict):
                 capability.update({"revoked": True, "revoked_at": now})
             write_json(self.pairings_path, data, indent=2)
-            return {"capability_id": capability_id, "pairing_id": capability_id, "revoked": True}
+        try:
+            from dev_orchestrator.core.websol_health import WebSolHealthStore
+            WebSolHealthStore(self.runtime_root).invalidate_generation(reason="capability_revoked")
+        except Exception:
+            pass
+        return {"capability_id": capability_id, "pairing_id": capability_id, "revoked": True}
 
     def create_mobile_pairing(self, *, expires_in_seconds: int = 300) -> dict[str, Any]:
         """Create a single-use, TTL-bounded mobile pairing code."""

@@ -406,7 +406,9 @@ def evaluate_websol_availability(
     pr_status, pr_reason = _sig("probe")
 
     # 1. Authoritative capability failures (revoked or unknown credential)
-    if cap_status in ("revoked", "unknown") and cap_reason not in ("no_active_tabs", "no_active_tabs_missing"):
+    if cap_status in ("revoked", "unknown") and cap_reason not in (
+        "no_active_tabs", "no_active_tabs_missing", "capability_missing", "capability_unknown"
+    ):
         return WebSolAvailability.PAIRING_REQUIRED, cap_reason or "capability_revoked_or_unknown"
 
     # 2. Bridge listener or browser claim presence offline
@@ -502,8 +504,34 @@ class WebSolHealthStore:
             data["generation"] = new_gen
             data["generation_invalidated_at"] = utc_now_iso()
             data["generation_invalidation_reason"] = reason
+            data["probe_backoff"] = {}
             write_json(self.health_path, data, indent=2)
             return new_gen
+
+    def sync_bindings(self, current_bindings: dict[str, str]) -> bool:
+        """Track active bindings; bump generation if any project's binding changed."""
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_data()
+            known = data.setdefault("known_bindings", {})
+            changed = False
+            for p_id, b_sig in current_bindings.items():
+                if p_id in known and known[p_id] != b_sig:
+                    changed = True
+                    break
+            if not changed:
+                for p_id in list(known.keys()):
+                    if p_id not in current_bindings:
+                        changed = True
+                        break
+            if changed:
+                new_gen = int(data.get("generation", 1)) + 1
+                data["generation"] = new_gen
+                data["generation_invalidated_at"] = utc_now_iso()
+                data["generation_invalidation_reason"] = "binding_changed"
+                data["probe_backoff"] = {}
+            data["known_bindings"] = dict(current_bindings)
+            write_json(self.health_path, data, indent=2)
+            return changed
 
     def get(
         self, project_id: str, adapter: str, binding_id: str, *, now: Optional[datetime] = None
@@ -696,6 +724,8 @@ class WebSolHealthStore:
         now: Optional[datetime] = None,
     ) -> bool:
         """Return True if prerequisites permit running an inference probe."""
+        if self.probe_consecutive_failures(project_id, adapter, binding_id) >= DEFAULT_PROBE_MAX_ATTEMPTS:
+            return False
         if not self.can_probe(project_id, adapter, binding_id, now=now):
             return False
         if bridge_store is not None:
@@ -711,6 +741,8 @@ class WebSolHealthStore:
         moment = _as_utc(now)
         recorded_at = parse_utc(p_info.get("recorded_at"))
         if recorded_at is None:
+            return True
+        if int(p_info.get("generation", 0)) != self.current_generation():
             return True
         return (moment - recorded_at).total_seconds() >= interval_seconds
 
