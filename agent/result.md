@@ -1556,6 +1556,14 @@ Remediated all findings from Technical Review Round 2 against commit bd46b79:
    - Knowledge graph updated via graphify update . (5993 nodes, 16787 edges, 246 communities).
 
 
+### P16.10 Final Owner-Gate Re-review Closure (2026-09-25)
+
+- Fixed the reviewer OWNER_GATE clean-descendant escape hatch in `src/dev_orchestrator/control/reconcile.py`: `("owner_gate", "stop")` now requires its durable `disposition="owner_gate"`, while all ordinary NEXT/REMEDIATE decisions continue to require `disposition="apply"`.
+- Added `test_owner_gate_clean_descendant_has_one_rereview_and_consumes_gate` in `tests_py/test_p127_closure_rereview.py`. It proves a completed reviewer OWNER_GATE at an ancestor HEAD yields exactly one clean-descendant rereview candidate, exposes the rereview control with the correct target, persists `rereview_of`, and consumes the old reviewer gate.
+- Focused new regression: 1 passed in 2.31s.
+- Full `tests_py` regression on the final closure tree: **1210 passed, 92 subtests passed in 488.55s (0 failures)**.
+- Final independent rereview is required before P16.10 may be marked DONE.
+
 ### P16.10 Technical Review Remediation Round 3 (2026-09-25)
 
 Closed both concrete BLOCKING review findings from `ai_review:rereview:37165140-9dbb-4b85-947b-dd4be5fa0549` on HEAD `3f705fd`:

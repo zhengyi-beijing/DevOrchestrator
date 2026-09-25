@@ -293,6 +293,38 @@ class P127ClosureRereviewTests(unittest.TestCase):
             self.assertTrue(control["available"], control)
             self.assertEqual(control["target_id"], remediate_review)
 
+    def test_owner_gate_clean_descendant_has_one_rereview_and_consumes_gate(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, runtime, _, project, snapshot, review_id = self.predecessor_fixture(Path(td))
+            decisions_path = runtime / "review-decisions.json"
+            payload = json.loads(decisions_path.read_text(encoding="utf-8"))
+            decision = payload["decisions"][review_id]
+            decision["decision"] = "owner_gate"
+            decision["next_action"] = "stop"
+            decision["disposition"] = "owner_gate"
+            decisions_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            candidate, reason = resolve_rereview_candidate(snapshot, runtime, project)
+            self.assertEqual(reason, "")
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate["target_id"], review_id)
+            self.assertEqual(candidate["kind"], "remediate")
+
+            view = project_control_view(snapshot, runtime, project)
+            control = next(row for row in view["controls"] if row["action"] == "rereview")
+            self.assertTrue(control["available"], control)
+            self.assertEqual(control["target_id"], review_id)
+
+            reviewer = AIReviewerCoordinator(runtime, ReviewerPort())
+            new_review_id, launch_reason = reviewer.rereview_descendant(
+                project, snapshot, candidate, "owner-gate-descendant-rereview"
+            )
+            self.assertIsNotNone(new_review_id, launch_reason)
+            rereview = reviewer.state()["reviews"][new_review_id]
+            self.assertEqual(rereview["rereview_of"], review_id)
+            consumed = project_control_view(snapshot, runtime, project)
+            self.assertIsNone(consumed["gate"])
+
     def test_cross_task_rereview_rejects_non_successor_or_non_pending_current_task(self):
         with tempfile.TemporaryDirectory() as td:
             _, runtime, _, project, snapshot, _ = self.predecessor_fixture(Path(td))

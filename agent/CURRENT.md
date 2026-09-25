@@ -481,6 +481,13 @@ P12.7 review remediation result (2026-09-17):
   - Knowledge graph updated with `graphify update .` (3114 nodes, 8631 edges, 157 communities).
   - Canonical worktree is clean without untracked `graphify-out/` to ensure clean lifecycle transition.
 
+P16.10 final owner-gate closure (2026-09-25):
+- HEAD lineage includes 2958304 fixing the final OWNER_GATE rereview disposition mismatch.
+- Added dedicated regression coverage in test_p127_closure_rereview.py for completed reviewer OWNER_GATE -> clean descendant -> exactly one rereview candidate/control -> rereview_of gate consumption.
+- New focused regression passes (1 passed in 2.31s).
+- Full tests_py regression on the final closure tree passed: 1210 passed, 92 subtests passed in 488.55s (0 failures). Do not mark P16.10 DONE until the independent final rereview returns NEXT.
+- After final reviewer NEXT, close P16.10 and allow the normal successor chain to advance to P16.11.
+
 P12.7 second review remediation result (2026-09-18):
 - Remediated findings from `ai_review:ai_review:auto-cf45dc90052f1a5988604625:execute`:
   - Hardened `computeIncidentCount` and `computeKPIs` in `web/app.js` to treat watchdog payloads with `available === false` as missing rather than present-and-empty. When all sources (summary, control overview, watchdog) are unavailable or missing, `computeIncidentCount` and `computeKPIs` return `'unavailable'` rather than displaying `0`.
