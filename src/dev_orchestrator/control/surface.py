@@ -127,8 +127,10 @@ def project_control_view(
     runtime = Path(runtime_root)
     projected = project_runtime_status(snapshot, runtime)
     project_id = str(projected.get("project_id") or projected.get("id") or "")
-    identity = project_identity(projected, runtime)
     gate = _latest_owner_gate(runtime, project_id)
+    if isinstance(gate, dict) and str(gate.get("state") or "") in {"owner_gate", "completed"}:
+        projected["lifecycle_state"] = "OWNER_GATE"
+    identity = project_identity(projected, runtime)
     owner = OwnerControlStore(runtime).project_state(project_id)
     conversations = ConversationControlStore(runtime)
     runtime_binding = conversations.runtime_record_for_project(project_id)
