@@ -1484,3 +1484,111 @@ def test_daemon_configurable_probe_timeout_and_reset(tmp_path: Path) -> None:
         assert len(captured_timeouts) >= 1
         assert captured_timeouts[0] == 45.0
 
+
+def test_concurrent_invalidate_generation_and_should_probe_no_deadlock(tmp_path: Path) -> None:
+    """Remediation: Concurrent invalidate_generation and should_probe on shared store must not deadlock."""
+    import threading
+    from datetime import datetime, timezone
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(parents=True)
+    health_store = WebSolHealthStore(runtime)
+
+    # Prime with failures that qualify for time-based reset
+    start_time = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+    for i in range(3):
+        health_store.record_probe_result(
+            "p1", "chatgpt_web", "b1", ok=False, error=f"fail-{i}", now=start_time
+        )
+
+    # Use a timestamp past the 900s reset window to exercise reset under concurrency
+    eval_time = datetime(2026, 9, 25, 12, 20, tzinfo=timezone.utc)
+
+    errors = []
+    stop_event = threading.Event()
+
+    def worker_invalidate() -> None:
+        try:
+            for _ in range(50):
+                if stop_event.is_set():
+                    break
+                health_store.invalidate_generation(reason="test_concurrent")
+                time.sleep(0.001)
+        except Exception as exc:
+            errors.append(exc)
+
+    def worker_should_probe() -> None:
+        try:
+            for _ in range(50):
+                if stop_event.is_set():
+                    break
+                health_store.should_probe("p1", "chatgpt_web", "b1", now=eval_time)
+                time.sleep(0.001)
+        except Exception as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=worker_invalidate)
+    t2 = threading.Thread(target=worker_should_probe)
+
+    t1.start()
+    t2.start()
+
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    stop_event.set()
+    assert not t1.is_alive(), "worker_invalidate deadlocked"
+    assert not t2.is_alive(), "worker_should_probe deadlocked"
+    assert errors == []
+
+
+def test_probe_consecutive_failures_reset_clears_timestamps_single_write(tmp_path: Path) -> None:
+    """Remediation: Resetting consecutive failures clears failure timestamps and avoids repeated writes."""
+    from datetime import datetime, timezone
+    from dev_orchestrator.core.websol_health import (
+        DEFAULT_PROBE_FAILURE_RESET_SECONDS,
+        DEFAULT_PROBE_MAX_ATTEMPTS,
+        read_json,
+    )
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(parents=True)
+    health_store = WebSolHealthStore(runtime)
+
+    start_time = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+    for i in range(DEFAULT_PROBE_MAX_ATTEMPTS):
+        health_store.record_probe_result(
+            "p1", "chatgpt_web", "b1", ok=False, error=f"fail-{i}", now=start_time
+        )
+
+    # Before reset: consecutive_failures == 3, last_failure_at and next_allowed_at are set
+    raw_before = read_json(health_store.health_path, {})
+    b_before = raw_before.get("probe_backoff", {}).get("p1:chatgpt_web:b1", {})
+    assert b_before.get("consecutive_failures") == DEFAULT_PROBE_MAX_ATTEMPTS
+    assert b_before.get("last_failure_at") is not None
+    assert b_before.get("next_allowed_at") is not None
+
+    after_window = datetime(2026, 9, 25, 12, 20, tzinfo=timezone.utc)
+    # First call: triggers reset, clears timestamps
+    res1 = health_store.probe_consecutive_failures("p1", "chatgpt_web", "b1", now=after_window)
+    assert res1 == 0
+
+    raw_after = read_json(health_store.health_path, {})
+    b_after = raw_after.get("probe_backoff", {}).get("p1:chatgpt_web:b1", {})
+    assert b_after.get("consecutive_failures") == 0
+    assert b_after.get("last_failure_at") is None
+    assert b_after.get("next_allowed_at") is None
+
+    # Track mtime to verify no write amplification on subsequent calls
+    mtime_after_reset = health_store.health_path.stat().st_mtime_ns
+
+    # Subsequent calls should return 0 without rewriting the file
+    for _ in range(5):
+        res = health_store.probe_consecutive_failures("p1", "chatgpt_web", "b1", now=after_window)
+        assert res == 0
+        should = health_store.should_probe("p1", "chatgpt_web", "b1", now=after_window)
+        assert should is True
+
+    mtime_subsequent = health_store.health_path.stat().st_mtime_ns
+    assert mtime_subsequent == mtime_after_reset, "File was rewritten on subsequent should_probe calls (write amplification)"
+

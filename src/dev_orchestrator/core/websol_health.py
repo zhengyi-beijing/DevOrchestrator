@@ -740,26 +740,27 @@ class WebSolHealthStore:
     ) -> int:
         key = health_key(project_id, adapter, binding_id)
         moment = _as_utc(now)
-        with self._lock:
-            data = self._load_data()
-            backoff_map = data.get("probe_backoff") or {}
-            b_info = backoff_map.get(key)
-            if isinstance(b_info, dict):
-                last_failure = parse_utc(b_info.get("last_failure_at"))
-                if (
-                    last_failure is not None
-                    and reset_seconds > 0
-                    and (moment - last_failure).total_seconds() >= reset_seconds
-                ):
-                    with InterProcessFileLock(self.lock_path):
-                        data = self._load_data()
-                        backoff_map = data.setdefault("probe_backoff", {})
-                        b_info = backoff_map.setdefault(key, {})
+        with InterProcessFileLock(self.lock_path):
+            with self._lock:
+                data = self._load_data()
+                backoff_map = data.setdefault("probe_backoff", {})
+                b_info = backoff_map.get(key)
+                if isinstance(b_info, dict):
+                    consecutive = int(b_info.get("consecutive_failures", 0))
+                    last_failure = parse_utc(b_info.get("last_failure_at"))
+                    if (
+                        consecutive > 0
+                        and last_failure is not None
+                        and reset_seconds > 0
+                        and (moment - last_failure).total_seconds() >= reset_seconds
+                    ):
                         b_info["consecutive_failures"] = 0
+                        b_info["last_failure_at"] = None
+                        b_info["next_allowed_at"] = None
                         write_json(self.health_path, data, indent=2)
-                    return 0
-                return int(b_info.get("consecutive_failures", 0))
-            return 0
+                        return 0
+                    return consecutive
+                return 0
 
     def should_probe(
         self,

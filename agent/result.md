@@ -111,6 +111,20 @@ P16.12 Web Sol Persistent Pairing & Truthful Availability (complete 2026-09-25):
   - Verification: 32 dedicated P16.12 tests, 73 focused tests (`test_p1612_websol_pairing_and_availability.py`, `test_staged_roadmap.py`, `test_staged_handoff.py`), and full repository regression (1270 passed, 92 subtests passed in 492.85s) passing 100%.
   - Python compilation (`compileall src ops tests_py`) and `git diff --check` clean.
   - Knowledge graph updated via `graphify update .` (6376 nodes, 17860 edges, 256 communities).
+- Round 4 Technical Review Remediation (2026-09-26):
+  1. Lock-Order Inversion Resolution (`src/dev_orchestrator/core/websol_health.py`):
+     - Corrected lock acquisition hierarchy in `WebSolHealthStore.probe_consecutive_failures` from `self._lock -> InterProcessFileLock` to `InterProcessFileLock -> self._lock`, matching all other mutating operations (`invalidate_generation`, `sync_bindings`, `put`, `record_probe`) and eliminating the deadlock between the HTTP server `/redeem` thread and daemon tick probe scheduling.
+  2. Write Amplification & Stale Backoff Prevention (`src/dev_orchestrator/core/websol_health.py`):
+     - In `WebSolHealthStore.probe_consecutive_failures`, cleared `last_failure_at` and `next_allowed_at` to `None` upon consecutive failure reset, and guarded reset on `consecutive > 0`. Prevents repeated disk writes on every tick for expired failures and unblocks `can_probe`.
+  3. Verification & Regressions (`tests_py/test_p1612_websol_pairing_and_availability.py`):
+     - Added `test_concurrent_invalidate_generation_and_should_probe_no_deadlock` verifying concurrent `invalidate_generation` and `should_probe` loops on a shared store instance terminate cleanly without deadlocks.
+     - Added `test_probe_consecutive_failures_reset_clears_timestamps_single_write` verifying failure timestamps are cleared and subsequent calls to `probe_consecutive_failures` and `should_probe` do not perform duplicate disk writes.
+     - 34 dedicated P16.12 tests passing 100%.
+     - 64 adjacent suite tests passing 100%.
+     - Full repository regression: 1272 passed in pytest (100% pass, 0 failures in 460.46s).
+     - Python compilation (`compileall src ops tests_py`) and `git diff --check` clean.
+     - Knowledge graph updated via `graphify update .` (6382 nodes, 17871 edges, 277 communities).
+
 
 
 P12 Unified AI Control Surface (complete 2026-09-15):
