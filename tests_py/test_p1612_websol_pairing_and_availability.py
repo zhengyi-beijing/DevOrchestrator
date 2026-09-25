@@ -837,6 +837,32 @@ def test_cli_websol_status_and_probe(tmp_path: Path, capsys: pytest.CaptureFixtu
         assert probe_record["generation"] == 1
 
 
+def test_websol_probe_discovers_persisted_binding_when_binding_id_omitted(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Regression: CLI fallback must use a real BrowserBridgeStore discovery API."""
+    from dev_orchestrator.cli import cmd_websol_probe
+    import argparse
+
+    runtime = tmp_path / "runtime"
+    bridge = BrowserBridgeStore(runtime)
+    # A claim poll persists presence even when no request is queued.
+    assert bridge.claim("chatgpt_web", "bind-discovered") is None
+
+    with patch("dev_orchestrator.core.websol_probe.run_websol_probe") as mock_probe:
+        mock_probe.return_value = ProbeResult(
+            success=True, request_id="probe:discovered", nonce="nonce",
+            duration_seconds=0.1, reason="ok",
+        )
+        args = argparse.Namespace(
+            runtime_root=str(runtime), project_id="proj-discovered",
+            adapter="chatgpt_web", binding_id=None, timeout=1.0,
+            format="json", config=str(tmp_path / "missing-projects.json"),
+        )
+        assert cmd_websol_probe(args) == 0
+        mock_probe.assert_called_once()
+        assert mock_probe.call_args.args[2] == "bind-discovered"
+        assert json.loads(capsys.readouterr().out)["status"] == "success"
+
+
 # ============================================================================
 # 10. Remediation Tests: Findings (1) through (6)
 # ============================================================================

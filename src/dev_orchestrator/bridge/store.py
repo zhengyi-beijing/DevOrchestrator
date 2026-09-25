@@ -57,7 +57,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from dev_orchestrator.bridge.prompt import ensure_websol_response_contract
 from dev_orchestrator.core.websol import WebSolRequest
@@ -364,6 +364,24 @@ class BrowserBridgeStore:
     # ------------------------------------------------------------------
     # public transport API
     # ------------------------------------------------------------------
+
+    def list_bindings(self, *, adapter: Optional[str] = None) -> list[str]:
+        """Return persisted binding IDs, optionally limited to one adapter.
+
+        Discovery includes queue and presence records so callers can resolve a
+        live binding even when its queue is currently empty.
+        """
+        adapters = [adapter] if adapter else sorted({p.parent.name for p in [*self._queue_files(), *self._presence_dir.glob("*/*.json")]})
+        binding_ids: set[str] = set()
+        for adapter_name in adapters:
+            if not adapter_name:
+                continue
+            for base in (self._queue_dir, self._presence_dir):
+                directory = base / _encode_segment(adapter_name)
+                if directory.is_dir():
+                    for path in directory.glob("*.json"):
+                        binding_ids.add(unquote(path.stem))
+        return sorted(binding_ids)
 
     def binding_status(
         self, adapter: str, binding_id: str, *, now: Optional[datetime] = None

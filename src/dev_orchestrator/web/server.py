@@ -1079,7 +1079,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             websol_health = None
             if hasattr(self.server, "websol_health_store") and proj_id:
                 h_rec = self.server.websol_health_store.get(proj_id, adapter, binding_id)
-                websol_health = asdict(h_rec) if h_rec else None
+                websol_health = h_rec.to_dict() if h_rec else None
 
             response_payload = {
                 **session,

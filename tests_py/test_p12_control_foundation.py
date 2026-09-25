@@ -20,6 +20,7 @@ from dev_orchestrator.storage.json_store import write_json
 from dev_orchestrator.control.security import ControlSecurity
 from dev_orchestrator.control.store import ConversationConflictError, ConversationControlStore
 from dev_orchestrator.core.control_commands import ControlCommandCoordinator
+from dev_orchestrator.core.websol_health import WebSolAvailability, WebSolHealth
 from dev_orchestrator.web.server import broker_proxy_payload, make_server
 from tests_py.test_control_commands import FakeExecutor, write_config
 
@@ -395,11 +396,25 @@ class P12HTTPTests(unittest.TestCase):
         )
         self.assertEqual(status, 200); capability = json.loads(body)["data"]["capability"]
         heartbeat = json.dumps({
-            "adapter": "chatgpt", "binding_id": "conv", "title": "Conversation",
+            "adapter": "chatgpt", "binding_id": "conv", "project_id": "p1", "title": "Conversation",
             "url": "https://chatgpt.com/c/conv", "tab_instance_id": "tab-1",
         })
         cap_headers = {"Origin": "https://chatgpt.com", "Content-Type": "application/json", "Authorization": "Bearer " + capability}
         self.assertEqual(self.request("POST", "/api/v1/control/session-heartbeats", body=heartbeat, headers=cap_headers)[0], 200)
+
+        now = datetime.now(timezone.utc)
+        health = WebSolHealth(
+            project_id="p1", adapter="chatgpt", binding_id="conv",
+            availability=WebSolAvailability.AVAILABLE.value,
+            evaluated_at=now.isoformat(),
+            valid_until=(now + timedelta(minutes=5)).isoformat(),
+            reason="regression_seed", signals={}, probe_generation=1,
+        )
+        self.server.websol_health_store.put(health)
+        status, _, body = self.request("POST", "/api/v1/control/session-heartbeats", body=heartbeat, headers=cap_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["data"]["websol_health"]["availability"], "AVAILABLE")
+
         self.assertEqual(self.request("POST", f"/api/v1/control/adapter-pairings/{pairing['pairing_id']}/revoke", headers=owner)[0], 200)
         self.assertEqual(self.request("POST", "/api/v1/control/session-heartbeats", body=heartbeat, headers=cap_headers)[0], 401)
 
