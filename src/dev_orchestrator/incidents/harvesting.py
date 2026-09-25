@@ -413,7 +413,11 @@ def harvest_tick(
         if not policy.get("enabled"):
             return []
 
+        seen_detectors = set()
         for detector_name, detector_fn in DETECTORS.items():
+            if detector_fn in seen_detectors:
+                continue
+            seen_detectors.add(detector_fn)
             try:
                 findings = detector_fn(
                     runtime_root=runtime,

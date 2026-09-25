@@ -1519,3 +1519,38 @@ Closed all 5 concrete BLOCKING review findings from ai_review:8fcec80a-ca9a-4ce4
    - Candidate test collection isolation verified (0 tests collected without DEVORCH_CANDIDATE_TESTS=1).
    - compileall and git diff --check clean.
    - Knowledge graph updated via graphify update . (5984 nodes, 16759 edges, 260 communities).
+
+
+### P16.10 Technical Review Remediation Round 2 (2026-09-25)
+
+Remediated all findings from Technical Review Round 2 against commit bd46b79:
+1. Candidate Synthesis Gap:
+   - In src/dev_orchestrator/incidents/capture.py, replaced duplicated inline generator emitting vacuous self.assertTrue(True) with generate_candidate(runtime, ...). Emits valid deterministic test code with failing and corrected fixture oracles.
+   - Resolved content SHA-256 mismatch caused by storing incident fingerprint instead of test content hash, allowing reproduction gate and deduplication comparison to pass cleanly.
+   - Enforced newline="\n" across candidate and store test file generation to prevent Windows CRLF conversions from altering byte-exact SHA-256 digests.
+2. Fail-Closed Role Liveness Gap:
+   - In src/dev_orchestrator/incidents/liveness.py, updated _check_worker_liveness to inspect executor whether passed as dict or object with .state() method. Inspects active executions table.
+   - Only increments sources_inspected when sources are successfully read. When no sources are readable, returns alive: None, state: 'unknown', failing closed rather than falsely declaring worker idle or dead.
+3. Store Durability on Mutation:
+   - In src/dev_orchestrator/incidents/store.py, added fail-closed verification in execute_txn and reconcile_journal: checks if current_index.get("degraded") or is_degraded is True, raising RuntimeError("Cannot mutate degraded incident store") before any file modifications.
+   - Added @property is_degraded on IncidentStore. Prevents transient read errors or corrupted state from overwriting index.json and wiping families or the promotion_blocked flag.
+4. Isolation Gate Under-Enforcement:
+   - In src/dev_orchestrator/incidents/evaluation.py, expanded _FORBIDDEN_MODULES to include subprocess, urllib, serial, http, http.client, socket, requests, paramiko, telnetlib, ftplib, aiohttp, and ctypes.
+   - Added AST Call inspection for _FORBIDDEN_OS_CALLS (os.system, os.popen, os.spawn*, os.exec*) and _FORBIDDEN_BUILTIN_CALLS (eval, exec, __import__).
+5. False-Running Regression Strengthening:
+   - In tests_py/test_p1610_false_running_regression.py, eliminated mocked namespace objects; wired real unmocked evaluate_stall, real WatchdogCoordinator.advance running diagnostic worker, and build_project_status status remap to STALLED.
+   - In src/dev_orchestrator/core/project_status.py, populated "stall": copy.deepcopy(stall) in _watchdog_view and differentiated task_active = bool(worker_alive) from task_progressing = bool(task_active and not is_stalled).
+6. InterProcessFileLock Path Normalization on Windows:
+   - In src/dev_orchestrator/accounting/events.py, implemented _normalize_lock_key to strip \\?\ and \\?\UNC\ extended path prefixes from resolved lock paths.
+   - Prevents process-local RLock aliasing in _thread_lock between paths resolved before and after file creation, eliminating thread collision in control command submissions.
+7. Secondary / Non-blocking Fixes:
+   - In src/dev_orchestrator/incidents/harvesting.py, preserved DETECTORS aliases while deduplicating execution in harvest_tick via seen_detectors set.
+   - In src/dev_orchestrator/daemon.py, replaced except TypeError around watchdog.advance with inspect.signature inspection.
+   - In src/dev_orchestrator/core/watchdog.py, populated last_task_activity_at in signal_sources.
+   - In src/dev_orchestrator/core/diagnostics.py, restored truncated comment at line 372.
+8. Verification:
+   - 63 focused tests across 8 P16.10 test modules passing 100%.
+   - 1135 full repository regression tests passing, 0 failures.
+   - Candidate test collection isolation verified (0 tests collected without DEVORCH_CANDIDATE_TESTS=1).
+   - compileall and git diff --check clean.
+   - Knowledge graph updated via graphify update . (5993 nodes, 16787 edges, 246 communities).

@@ -184,6 +184,72 @@ class TestRoleLiveness(unittest.TestCase):
         self.assertTrue(res["any_unknown"])
         self.assertFalse(res["all_dead"])
 
+    def test_worker_liveness_executor_dict_active(self):
+        self._setup_idle_ledgers()
+        fake_planner = MagicMock()
+        fake_planner.has_live_role.return_value = False
+        fake_reviewer = MagicMock()
+        fake_reviewer.has_live_role.return_value = False
+
+        res = resolve_role_liveness(
+            runtime_root=self.runtime_root,
+            project_id=self.project_id,
+            snapshot={},
+            planner=fake_planner,
+            reviewer=fake_reviewer,
+            executor={"executions": {"e1": {"project_id": self.project_id, "state": "running"}}},
+        )
+
+        self.assertTrue(res["worker"]["alive"])
+        self.assertEqual(res["worker"]["source"], "executor_active_no_pid")
+        self.assertFalse(res["all_dead"])
+        self.assertTrue(res["any_alive"])
+
+    def test_worker_liveness_executor_dict_idle(self):
+        self._setup_idle_ledgers()
+        fake_planner = MagicMock()
+        fake_planner.has_live_role.return_value = False
+        fake_reviewer = MagicMock()
+        fake_reviewer.has_live_role.return_value = False
+
+        res = resolve_role_liveness(
+            runtime_root=self.runtime_root,
+            project_id=self.project_id,
+            snapshot={},
+            planner=fake_planner,
+            reviewer=fake_reviewer,
+            executor={"executions": {}},
+        )
+
+        self.assertFalse(res["worker"]["alive"])
+        self.assertEqual(res["worker"]["state"], "idle")
+        self.assertEqual(res["worker"]["source"], "no_active_worker")
+        self.assertTrue(res["all_dead"])
+        self.assertFalse(res["any_unknown"])
+
+    def test_worker_liveness_no_readable_sources_yields_unknown(self):
+        self._setup_idle_ledgers()
+        fake_planner = MagicMock()
+        fake_planner.has_live_role.return_value = False
+        fake_reviewer = MagicMock()
+        fake_reviewer.has_live_role.return_value = False
+
+        # No lineage file, executor is None, snapshot has no worker info
+        res = resolve_role_liveness(
+            runtime_root=self.runtime_root,
+            project_id=self.project_id,
+            snapshot={},
+            planner=fake_planner,
+            reviewer=fake_reviewer,
+            executor=None,
+        )
+
+        self.assertIsNone(res["worker"]["alive"])
+        self.assertEqual(res["worker"]["state"], "unknown")
+        self.assertEqual(res["worker"]["source"], "no_readable_sources")
+        self.assertTrue(res["any_unknown"])
+        self.assertFalse(res["all_dead"])
+
 
 if __name__ == "__main__":
     unittest.main()

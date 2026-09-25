@@ -121,57 +121,32 @@ def capture_incident(
     side_files = {packet_rel: json.dumps(packet_data, indent=2)}
 
     # Optionally auto-synthesize candidate test
+    cand_id = None
     if policy.get("auto_synthesis"):
         cand_id = f"cand-{fp[:12]}"
-        cand_rel = f"candidates/{cand_id}"
-        cand_manifest = {
-            "candidate_id": cand_id,
-            "schema_version": 1,
-            "source_incidents": [packet_id],
-            "preconditions": [f"lifecycle_class={semantic.get('lifecycle_class')}"],
-            "trigger_sequence": [f"occurrence_key={occurrence_key}"],
-            "invariant": semantic.get("invariant_identifier") or "progress_must_not_stall",
-            "invalid_outcome": classification,
-            "fixture_description": "synthetic_deterministic_fixture",
-            "oracle_description": "assert_deterministic_invariant",
-            "failing_fixture_anchor": {"fingerprint": fp, "classification": classification},
-            "corrected_fixture_anchor": {"expected_recovery": True},
-            "generated_by": "auto_harvest",
-            "created_at": packet_data["captured_at"],
-        }
-        test_source = f'''"""Synthetic candidate regression test for {cand_id}.
-Auto-harvested for incident family {family_id} ({classification}).
-"""
-import unittest
-
-class TestCandidate_{cand_id.replace("-", "_")}(unittest.TestCase):
-    def test_invariant(self):
-        # Invariant: {semantic.get("invariant_identifier") or "progress_must_not_stall"}
-        self.assertTrue(True)
-'''
-        cand_manifest["candidate_content_sha256"] = incident_fingerprint({
-            "failure_class": semantic.get("failure_class", "orchestration"),
-            "diagnosis_code": semantic.get("diagnosis_code", "agent_stalled"),
-            "lifecycle_class": semantic.get("lifecycle_class", "executing"),
-            "contract_class": semantic.get("contract_class", "progress"),
-        })
-        side_files[f"{cand_rel}/manifest.json"] = json.dumps(cand_manifest, indent=2)
-        side_files[f"{cand_rel}/test_candidate_{cand_id}.py"] = test_source
         new_family["candidate_id"] = cand_id
 
     def _create_family(idx: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
         fams = idx.setdefault("families", {})
         fams[fp] = new_family
-        if new_family.get("candidate_id"):
-            cands = idx.setdefault("candidates", {})
-            cands[new_family["candidate_id"]] = {
-                "candidate_id": new_family["candidate_id"],
-                "candidate_content_sha256": cand_manifest["candidate_content_sha256"],
-                "generated_by": "auto_harvest",
-                "created_at": new_family["first_seen_at"],
-                "source_incidents": [packet_id],
-            }
         return idx, side_files
 
     updated_index, _ = store.execute_txn("create_incident_family", _create_family)
+
+    if cand_id:
+        generate_candidate(
+            runtime,
+            candidate_id=cand_id,
+            source_incidents=[packet_id],
+            preconditions=[f"lifecycle_class={semantic.get('lifecycle_class')}"],
+            trigger_sequence=[f"occurrence_key={occurrence_key}"],
+            invariant=semantic.get("invariant_identifier") or "progress_must_not_stall",
+            invalid_outcome=classification,
+            fixture_description="synthetic_deterministic_fixture",
+            oracle_description="assert_deterministic_invariant",
+            failing_fixture_anchor={"fingerprint": fp, "classification": classification},
+            corrected_fixture_anchor={"expected_recovery": True},
+            generated_by="auto_harvest",
+        )
+
     return updated_index["families"][fp]

@@ -752,6 +752,7 @@ def collect_progress_signals(
         "role_records": role_records_summary,
         "progress_entry": progress_summary,
         "fingerprint_inputs": fingerprint_payload,
+        "last_task_activity_at": safe_last_activity,
     }
 
     return last_progress_at, progress_fingerprint, signal_sources

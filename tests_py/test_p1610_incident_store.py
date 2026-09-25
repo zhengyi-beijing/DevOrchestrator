@@ -3,6 +3,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from dev_orchestrator.incidents.fingerprint import incident_fingerprint
@@ -297,6 +298,31 @@ class TestIncidentStore(unittest.TestCase):
         orphans = list((store.orphans_dir / intent.txn_id).glob("*.json"))
         self.assertEqual(len(orphans), 1)
         self.assertEqual(orphans[0].name, "pkt-unref.json")
+
+    def test_execute_txn_refuses_to_commit_on_degraded_index(self):
+        store = load_incident_store(self.runtime_root)
+        index_file = self.runtime_root / "incident-packets" / "index.json"
+        valid_idx = {
+            "schema_version": 1,
+            "revision": 3,
+            "last_txn_id": "prior_txn",
+            "promotion_blocked": True,
+            "families": {"fam-1": {"family_id": "fam-1"}},
+            "candidates": {},
+        }
+        index_file.write_text(json.dumps(valid_idx), encoding="utf-8")
+
+        # Simulate transient sharing violation on Windows during read
+        with patch.object(Path, "read_text", side_effect=OSError("Windows sharing violation: file in use")):
+            with self.assertRaises(RuntimeError) as ctx:
+                store.execute_txn("test_op", lambda idx: (idx, {}))
+            self.assertIn("Refusing to execute mutation on degraded store index", str(ctx.exception))
+
+        # Crucial: valid index on disk with promotion_blocked MUST NOT have been overwritten
+        persisted = json.loads(index_file.read_text(encoding="utf-8"))
+        self.assertTrue(persisted.get("promotion_blocked"))
+        self.assertEqual(persisted.get("revision"), 3)
+        self.assertIn("fam-1", persisted.get("families", {}))
 
 
 if __name__ == "__main__":

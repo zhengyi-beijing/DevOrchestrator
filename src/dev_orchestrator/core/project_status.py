@@ -190,6 +190,7 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
     return {
         "schema_version": 1,
         "state": wd_state,
+        "stall": copy.deepcopy(stall) if isinstance(stall, dict) else None,
         "recovery_epoch": epoch_view,
         "recovery_epoch_id": epoch_id,
         "recovery_handoff": handoff_view,
@@ -391,7 +392,7 @@ def build_project_status(
 
     worker_obj = result.get("worker") if isinstance(result.get("worker"), dict) else {}
     worker_alive = bool(worker_obj.get("process_alive"))
-    task_active = bool(worker_alive and not is_stalled)
+    task_active = bool(worker_alive)
     task_progressing = bool(task_active and not is_stalled)
 
     if is_stalled and str(result.get("status") or "").upper() in {"RUNNING", "WORKER_RUNNING", "EXECUTING"}:

@@ -339,6 +339,81 @@ class TestCandidatePromotion(unittest.TestCase):
         self.assertFalse(res_blocked["promoted"])
         self.assertEqual(res_blocked["code"], "promotion_blocked")
 
+    def test_isolation_gate_forbidden_modules_and_calls(self):
+        from dev_orchestrator.incidents.evaluation import _check_isolation_ast
+        # Forbidden modules
+        ok, reason = _check_isolation_ast("import subprocess\nsubprocess.run(['ls'])")
+        self.assertFalse(ok)
+        self.assertIn("forbidden_import: subprocess", reason)
+
+        ok, reason = _check_isolation_ast("from urllib import request")
+        self.assertFalse(ok)
+        self.assertIn("forbidden_import_from: urllib", reason)
+
+        ok, reason = _check_isolation_ast("import serial")
+        self.assertFalse(ok)
+        self.assertIn("forbidden_import: serial", reason)
+
+        ok, reason = _check_isolation_ast("import http.client")
+        self.assertFalse(ok)
+        self.assertIn("forbidden_import: http.client", reason)
+
+        # Forbidden calls
+        ok, reason = _check_isolation_ast("import os\nos.system('echo hi')")
+        self.assertFalse(ok)
+        self.assertIn("forbidden_call: os.system", reason)
+
+        ok, reason = _check_isolation_ast("eval('1 + 1')")
+        self.assertFalse(ok)
+        self.assertIn("forbidden_call: eval", reason)
+
+        ok, reason = _check_isolation_ast("from os import system\nsystem('echo 1')")
+        self.assertFalse(ok)
+        self.assertIn("forbidden_import_from: os.system", reason)
+
+    def test_auto_synthesized_candidate_passes_executable_gates(self):
+        from dev_orchestrator.incidents.capture import capture_incident
+        from dev_orchestrator.incidents.store import load_incident_store
+        semantic = {
+            "failure_class": "watchdog_stall",
+            "diagnosis_code": "agent_stalled",
+            "lifecycle_class": "executing",
+            "contract_class": "progress",
+            "invariant_identifier": "worker_must_not_stall",
+        }
+        family = capture_incident(
+            self.runtime_root,
+            project_id="test-proj",
+            task_id="P16.10",
+            classification="ORCHESTRATOR_ALIVE_TASK_STALLED",
+            semantic=semantic,
+            evidence={"log": "stall"},
+            occurrence_key="test-occ-1",
+            config={"incidents": {"enabled": True, "auto_synthesis": True}},
+        )
+        cand_id = family.get("candidate_id")
+        self.assertIsNotNone(cand_id)
+
+        # Verify candidate manifest and sha in store
+        store = load_incident_store(self.runtime_root)
+        cdata = store.index["candidates"][cand_id]
+        cand_source_file = self.runtime_root / "incident-packets" / "candidates" / cand_id / f"test_candidate_{cand_id}.py"
+        self.assertTrue(cand_source_file.is_file())
+        real_sha = hashlib.sha256(cand_source_file.read_bytes()).hexdigest()
+        self.assertEqual(cdata["candidate_content_sha256"], real_sha)
+
+        # Evaluate candidate: all five executable gates must pass!
+        eval_res = evaluate_promotion(self.runtime_root, cand_id)
+        gates = eval_res["executable_gates"]
+        self.assertTrue(gates["reproduction"]["verdict"], "Reproduction gate must pass on auto-synthesized candidate")
+        self.assertTrue(gates["discrimination"]["verdict"], "Discrimination gate must pass on auto-synthesized candidate")
+        self.assertTrue(gates["stability"]["verdict"], "Stability gate must pass on auto-synthesized candidate")
+        self.assertTrue(gates["isolation"]["verdict"], "Isolation gate must pass on auto-synthesized candidate")
+        self.assertTrue(gates["deduplication"]["verdict"], "Deduplication gate must pass on auto-synthesized candidate")
+        self.assertTrue(all(g["verdict"] for g in gates.values()))
+        store.reload()
+        self.assertTrue(store.index["candidates"][cand_id]["executable_gates_passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

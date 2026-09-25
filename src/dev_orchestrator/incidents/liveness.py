@@ -22,11 +22,11 @@ def _check_worker_liveness(
     # Check lineage store
     lineage_file = runtime_root / "execution-lineage.json"
     if lineage_file.is_file():
-        sources_inspected += 1
         try:
             lineage_data = read_json(lineage_file, None)
             if not isinstance(lineage_data, dict):
                 return {"alive": None, "state": "unknown", "source": "lineage_corrupt", "details": {}}
+            sources_inspected += 1
             records = lineage_data.get("records") if isinstance(lineage_data.get("records"), dict) else {}
             for rec in records.values():
                 if isinstance(rec, dict) and str(rec.get("project_id") or "") == project_id:
@@ -39,24 +39,33 @@ def _check_worker_liveness(
 
     # Check executor state
     if executor is not None:
-        sources_inspected += 1
         try:
-            exec_state_fn = getattr(executor, "state", None)
-            if callable(exec_state_fn):
-                exec_data = exec_state_fn()
-                if isinstance(exec_data, dict):
-                    executions = exec_data.get("executions") if isinstance(exec_data.get("executions"), dict) else {}
-                    for row in executions.values():
-                        if isinstance(row, dict) and str(row.get("project_id") or "") == project_id:
-                            if row.get("state") in {"launching", "running"}:
-                                r_pid = row.get("pid")
-                                if r_pid and is_pid_alive(r_pid):
-                                    return {"alive": True, "state": "running", "source": "executor_active", "details": row}
+            exec_data = None
+            if isinstance(executor, dict):
+                exec_data = executor
+            elif hasattr(executor, "state") and callable(getattr(executor, "state")):
+                exec_data = executor.state()
+            else:
+                return {"alive": None, "state": "unknown", "source": "executor_unreadable", "details": {}}
+
+            if isinstance(exec_data, dict):
+                sources_inspected += 1
+                executions = exec_data.get("executions") if isinstance(exec_data.get("executions"), dict) else {}
+                for row in executions.values():
+                    if isinstance(row, dict) and str(row.get("project_id") or "") == project_id:
+                        if row.get("state") in {"launching", "running"}:
+                            r_pid = row.get("pid")
+                            if r_pid and is_pid_alive(r_pid):
+                                return {"alive": True, "state": "running", "source": "executor_active", "details": row}
+                            elif not r_pid:
+                                return {"alive": True, "state": str(row.get("state")), "source": "executor_active_no_pid", "details": row}
+            else:
+                return {"alive": None, "state": "unknown", "source": "executor_invalid_shape", "details": {}}
         except Exception as exc:
             return {"alive": None, "state": "unknown", "source": f"executor_error: {exc}", "details": {}}
 
     # Check snapshot worker process
-    if isinstance(snapshot, dict) and snapshot.get("worker") is not None:
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("worker"), dict) and snapshot.get("worker"):
         sources_inspected += 1
         if w_state in {"running", "starting"}:
             if pid and is_pid_alive(pid):

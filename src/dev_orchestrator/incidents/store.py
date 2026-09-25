@@ -149,6 +149,10 @@ class IncidentStore:
         self.index = self._load_index_failclosed()
         return self.index
 
+    @property
+    def is_degraded(self) -> bool:
+        return bool(self.index.get("degraded"))
+
     def execute_txn(
         self,
         operation: str,
@@ -163,6 +167,10 @@ class IncidentStore:
         with InterProcessFileLock(self.lock_path):
             self.reconcile_journal()
             current_index = self._load_index_failclosed()
+            if current_index.get("degraded"):
+                raise RuntimeError(
+                    f"Refusing to execute mutation on degraded store index: {current_index.get('degraded_reason')}"
+                )
             prior_rev = int(current_index.get("revision", 0))
             target_rev = prior_rev + 1
             txn_id = f"txn-{uuid4().hex[:12]}"
@@ -196,7 +204,7 @@ class IncidentStore:
                 target_file = self.base_dir / rel_str
                 target_file.parent.mkdir(parents=True, exist_ok=True)
                 if isinstance(content, str):
-                    target_file.write_text(content, encoding="utf-8")
+                    target_file.write_text(content, encoding="utf-8", newline="\n")
                 else:
                     target_file.write_bytes(content)
 
@@ -226,6 +234,8 @@ class IncidentStore:
             return results
 
         live_index = self._load_index_failclosed()
+        if live_index.get("degraded"):
+            return results
         live_rev = int(live_index.get("revision", 0))
         live_last_txn = live_index.get("last_txn_id")
 

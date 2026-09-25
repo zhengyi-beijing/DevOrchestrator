@@ -22,10 +22,22 @@ _FORBIDDEN_MODULES = {
     "paramiko",
     "telnetlib",
     "ftplib",
+    "http",
     "http.client",
+    "urllib",
     "aiohttp",
     "ctypes",
+    "subprocess",
+    "serial",
 }
+
+_FORBIDDEN_OS_CALLS = {
+    "system", "popen", "spawnl", "spawnle", "spawnlp", "spawnlpe",
+    "spawnv", "spawnve", "spawnvp", "spawnvpe", "execl", "execle",
+    "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
+}
+
+_FORBIDDEN_BUILTIN_CALLS = {"eval", "exec", "__import__"}
 
 
 def _check_isolation_ast(source_code: str) -> tuple[bool, str]:
@@ -37,13 +49,25 @@ def _check_isolation_ast(source_code: str) -> tuple[bool, str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                mod = alias.name.split(".")[0]
-                if mod in _FORBIDDEN_MODULES:
+                full_mod = alias.name
+                top_mod = alias.name.split(".")[0]
+                if full_mod in _FORBIDDEN_MODULES or top_mod in _FORBIDDEN_MODULES:
                     return False, f"forbidden_import: {alias.name}"
         elif isinstance(node, ast.ImportFrom):
-            mod = (node.module or "").split(".")[0]
-            if mod in _FORBIDDEN_MODULES:
+            mod = node.module or ""
+            top_mod = mod.split(".")[0]
+            if mod in _FORBIDDEN_MODULES or top_mod in _FORBIDDEN_MODULES:
                 return False, f"forbidden_import_from: {node.module}"
+            for alias in node.names:
+                if mod == "os" and alias.name in _FORBIDDEN_OS_CALLS:
+                    return False, f"forbidden_import_from: os.{alias.name}"
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == "os" and node.func.attr in _FORBIDDEN_OS_CALLS:
+                    return False, f"forbidden_call: os.{node.func.attr}"
+            elif isinstance(node.func, ast.Name):
+                if node.func.id in _FORBIDDEN_BUILTIN_CALLS or node.func.id in _FORBIDDEN_OS_CALLS:
+                    return False, f"forbidden_call: {node.func.id}"
     return True, "clean_isolated_ast"
 
 
@@ -77,7 +101,7 @@ def run_executable_candidate_gates(
     with tempfile.TemporaryDirectory() as tmp_dir_str:
         tmp_dir = Path(tmp_dir_str)
         test_file = tmp_dir / f"test_candidate_{candidate_id}.py"
-        test_file.write_text(source_code, encoding="utf-8")
+        test_file.write_text(source_code, encoding="utf-8", newline="\n")
 
         # Gate 4: Isolation
         iso_ok, iso_reason = _check_isolation_ast(source_code)

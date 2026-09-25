@@ -40,12 +40,20 @@ P16.10 Automatic Failure Harvesting & Regression Promotion completion (2026-09-2
   - `incident-list`, `incident-show`, `candidate-list`, `candidate-evaluate`, `candidate-review`, `candidate-materialize`, `candidate-promote`.
 - Repreoduced 2026-09-25 false-running incident regression:
   - Fresh heartbeats with `REVIEW_FAILED` and dead roles correctly diagnosed as `orchestrator_alive_task_stalled`, status reflects `system_alive=True`, `task_active=False`, `task_progressing=False`, and enters bounded recovery.
-- Verification & Remediation:
-  - 57 focused tests across 8 P16.10 test modules passing 100%.
-  - 1198 full repository regression tests passing, 92 subtests passing, 0 failures.
+- Technical Review Remediation Round 2 (2026-09-25):
+  - Closed candidate synthesis gap: Replaced inline generator in `src/dev_orchestrator/incidents/capture.py` with `generate_candidate(...)`, generating deterministic unittest test cases with real failing/corrected fixture oracles and accurate content SHA-256 matching. Fixed Windows CRLF newline conversions by explicitly passing `newline="\n"` on all candidate and side-file writes.
+  - Closed fail-closed role liveness gap: Updated `_check_worker_liveness` in `src/dev_orchestrator/incidents/liveness.py` to accept executor as dict or `.state()` callable, inspecting active executions. Made `_check_worker_liveness` fail closed to `alive: None, state: 'unknown'` when no sources are readable, rather than falsely declaring worker idle/dead.
+  - Closed store mutation on degraded state: Added fail-closed checks in `execute_txn` and `reconcile_journal` in `src/dev_orchestrator/incidents/store.py` to raise `RuntimeError` before mutating when `is_degraded` is true, preventing degraded memory state from overwriting index files and wiping families or `promotion_blocked`.
+  - Closed isolation gate under-enforcement: Expanded `_FORBIDDEN_MODULES` in `src/dev_orchestrator/incidents/evaluation.py` to include `subprocess`, `urllib`, `serial`, `http`, etc. Added AST call analysis for `_FORBIDDEN_OS_CALLS` (`os.system`, `os.popen`, etc.) and `_FORBIDDEN_BUILTIN_CALLS` (`eval`, `exec`, `__import__`).
+  - Strengthened false-running regression: Replaced mock object with real `evaluate_stall`, real `WatchdogCoordinator.advance`, and `build_project_status` status remap to `STALLED`. Populated `"stall"` in `_watchdog_view` and separated `task_active` from `task_progressing`.
+  - Hardened Windows file locking: Added `_normalize_lock_key` in `src/dev_orchestrator/accounting/events.py` to strip Windows `\\?\` and `\\?\UNC\` extended path prefixes from resolved lock paths, preventing process-local `RLock` aliasing between pre-existing and newly-created files.
+  - Deduplicated detector registration in `src/dev_orchestrator/incidents/harvesting.py` and replaced `except TypeError` in `src/dev_orchestrator/daemon.py` with `inspect.signature` inspection.
+- Verification:
+  - 63 focused tests across 8 P16.10 test modules passing 100%.
+  - 1135 full repository regression tests passing, 0 failures.
   - Candidate test collection isolation verified (0 tests collected without `DEVORCH_CANDIDATE_TESTS=1`).
   - `compileall` and `git diff --check` clean.
-  - Knowledge graph updated via `graphify update .` (5984 nodes, 16759 edges, 260 communities).
+  - Knowledge graph updated via `graphify update .` (5993 nodes, 16787 edges, 246 communities).
 
 P16.9 Watchdog Execution-Loss Detection & Recovery completion (2026-09-24):
 - Solved the xray-hw-platform incident blind spot: an accepted execution reached WORKER_RUNNING, emitted no provider output, and vanished with the project returning to READY_TO_RUN without a terminal state, while watchdog previously reported state=ok with zero recovery.

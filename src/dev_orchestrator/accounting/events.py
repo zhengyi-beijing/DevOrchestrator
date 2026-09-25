@@ -102,8 +102,17 @@ def _utc_now_iso() -> str:
 _FILE_LOCK_STATE: dict[str, tuple[int, Any]] = {}
 
 
+def _normalize_lock_key(path: Path | str) -> str:
+    resolved = str(Path(path).resolve(strict=False))
+    if resolved.startswith("\\\\?\\UNC\\"):
+        resolved = "\\\\" + resolved[8:]
+    elif resolved.startswith("\\\\?\\"):
+        resolved = resolved[4:]
+    return os.path.normcase(resolved)
+
+
 def _thread_lock(path: Path) -> threading.RLock:
-    key = os.path.normcase(str(path.resolve(strict=False)))
+    key = _normalize_lock_key(path)
     with _LOCKS_GUARD:
         return _LOCKS.setdefault(key, threading.RLock())
 
@@ -118,7 +127,7 @@ class InterProcessFileLock:
         self._thread_lock = _thread_lock(self.path)
 
     def __enter__(self) -> "InterProcessFileLock":
-        key = os.path.normcase(str(self.path.resolve(strict=False)))
+        key = _normalize_lock_key(self.path)
         deadline = time.monotonic() + self.timeout_seconds
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._thread_lock.acquire()
@@ -165,7 +174,7 @@ class InterProcessFileLock:
             raise
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        key = os.path.normcase(str(self.path.resolve(strict=False)))
+        key = _normalize_lock_key(self.path)
         handle = None
         should_close = False
         try:

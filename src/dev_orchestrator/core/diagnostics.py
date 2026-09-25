@@ -370,6 +370,8 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
     lifecycle = str(getattr(assessment, "lifecycle_state", "")).upper()
     # A worker process is expected ONLY when the lifecycle is an execution-phase state.
     # Worker.state from the executor ledger is not used here because it may be stale from a
+    # prior EXECUTING run and would otherwise cause spurious process_dead during PLANNING /
+    # REVIEWING_PLAN / APPLYING_PLAN / REVIEWING.
     worker_active = lifecycle in WORKER_EXPECTED_LIFECYCLE_STATES
 
     # READY_TO_RUN is a normal execution-launch boundary, not an owner gate.

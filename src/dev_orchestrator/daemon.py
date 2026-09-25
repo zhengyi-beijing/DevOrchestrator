@@ -167,9 +167,11 @@ def _run_orchestration_tick(
                 )
             else:
                 watchdog_summary = raw_summary
-            try:
+            import inspect
+            sig = inspect.signature(watchdog.advance)
+            if "planner" in sig.parameters:
                 watchdog.advance(config, watchdog_summary, executor=executor, planner=planner_obj, reviewer=reviewer)
-            except TypeError:
+            else:
                 watchdog.advance(config, watchdog_summary, executor=executor)
         except Exception as _wd_exc:
             watchdog.record_tick_error(_wd_exc)
