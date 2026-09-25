@@ -162,12 +162,14 @@ def project_control_view(
     gate = _latest_owner_gate(runtime, project_id)
     active_lifecycles = {
         "EXECUTING", "REVIEWING", "PLANNING", "REVIEWING_PLAN",
-        "APPLYING_PLAN", "REMEDIATING_PLAN", "DONE", "COMPLETED", "TERMINAL"
+        "APPLYING_PLAN", "REMEDIATING_PLAN",
     }
+    terminal_lifecycles = {"DONE", "COMPLETED", "TERMINAL"}
     if (
         isinstance(gate, dict)
         and projected.get("lifecycle_state") not in active_lifecycles
-        and str(projected.get("state") or "").upper() not in {"DONE", "COMPLETED", "TERMINAL"}
+        and projected.get("lifecycle_state") not in terminal_lifecycles
+        and str(projected.get("state") or "").upper() not in terminal_lifecycles
     ):
         if gate.get("gate_source") == "reviewer":
             if str(gate.get("state") or "") == "completed" and gate.get("decision") == "owner_gate":

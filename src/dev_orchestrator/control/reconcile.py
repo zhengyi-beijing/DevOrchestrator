@@ -262,7 +262,7 @@ def _rereview_task_matches_current_or_pending_successor(
     if reviewed_task_id == current_task_id:
         return True
     lifecycle = str(snapshot.get("lifecycle_state") or snapshot.get("state") or "")
-    if snapshot.get("state") != "IDLE" or lifecycle != "IDLE":
+    if snapshot.get("state") not in {"IDLE", "OWNER_GATE"} or lifecycle not in {"IDLE", "OWNER_GATE"}:
         return False
     if not parse_task_status(snapshot.get("next_status")).is_pending_design():
         return False

@@ -277,7 +277,10 @@ def _legacy_no_next_settle(record: Any) -> bool:
         and record.get("state") == "settled"
         and record.get("source_kind") == "decision"
         and record.get("outcome") == "task_complete"
-        and record.get("reason") == "reviewed task is COMPLETE and no next executable task is advertised"
+        and record.get("reason") in (
+            "reviewed task is COMPLETE and no next executable task is advertised",
+            "review accepted current READY_TO_RUN task and no next executable task is advertised",
+        )
         and not record.get("next_task_id")
     )
 

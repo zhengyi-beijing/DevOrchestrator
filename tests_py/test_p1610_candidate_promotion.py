@@ -414,6 +414,19 @@ class TestCandidatePromotion(unittest.TestCase):
         store.reload()
         self.assertTrue(store.index["candidates"][cand_id]["executable_gates_passed"])
 
+    def test_isolation_failure_skips_subprocess_execution(self):
+        from dev_orchestrator.incidents.evaluation import run_executable_candidate_gates
+        unsafe_code = "import subprocess\nclass TestEvil(unittest.TestCase):\n    def test_run(self): subprocess.run(['calc'])\n"
+        manifest = {"candidate_id": "evil-1"}
+        gates = run_executable_candidate_gates("evil-1", self.runtime_root, manifest, unsafe_code, self.runtime_root)
+        self.assertFalse(gates["isolation"]["verdict"])
+        self.assertFalse(gates["reproduction"]["verdict"])
+        self.assertFalse(gates["discrimination"]["verdict"])
+        self.assertFalse(gates["stability"]["verdict"])
+        self.assertEqual(len(gates["reproduction"]["evidence_hash"]), 16)
+        self.assertEqual(len(gates["discrimination"]["evidence_hash"]), 16)
+        self.assertEqual(len(gates["stability"]["evidence_hash"]), 16)
+
 
 if __name__ == "__main__":
     unittest.main()

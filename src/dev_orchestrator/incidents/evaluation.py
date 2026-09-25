@@ -117,6 +117,27 @@ def run_executable_candidate_gates(
             "evidence_hash": hashlib.sha256(f"dedup:{dedup_reason}".encode("utf-8")).hexdigest()[:16],
         }
 
+        if not iso_ok:
+            reproduction = {
+                "verdict": False,
+                "evidence_hash": hashlib.sha256(f"repro:skipped_due_to_isolation_failure:{iso_reason}".encode("utf-8")).hexdigest()[:16],
+            }
+            discrimination = {
+                "verdict": False,
+                "evidence_hash": hashlib.sha256(f"discrim:skipped_due_to_isolation_failure:{iso_reason}".encode("utf-8")).hexdigest()[:16],
+            }
+            stability = {
+                "verdict": False,
+                "evidence_hash": hashlib.sha256(b"stability:skipped_due_to_isolation_failure").hexdigest()[:16],
+            }
+            return {
+                "reproduction": reproduction,
+                "discrimination": discrimination,
+                "stability": stability,
+                "isolation": isolation,
+                "deduplication": deduplication,
+            }
+
         # Gate 1: Reproduction (fail-before)
         # Running the test in failing mode MUST produce a failure (exit code != 0)
         env_failing = dict(os.environ)

@@ -304,6 +304,13 @@ class P127ClosureRereviewTests(unittest.TestCase):
             decision["disposition"] = "owner_gate"
             decisions_path.write_text(json.dumps(payload), encoding="utf-8")
 
+            reviewer_path = runtime / "ai-reviewer.json"
+            reviewer_payload = json.loads(reviewer_path.read_text(encoding="utf-8"))
+            review_row = reviewer_payload["reviews"][review_id]
+            review_row["decision"] = "owner_gate"
+            review_row["next_action"] = "stop"
+            reviewer_path.write_text(json.dumps(reviewer_payload), encoding="utf-8")
+
             candidate, reason = resolve_rereview_candidate(snapshot, runtime, project)
             self.assertEqual(reason, "")
             self.assertIsNotNone(candidate)
@@ -311,6 +318,8 @@ class P127ClosureRereviewTests(unittest.TestCase):
             self.assertEqual(candidate["kind"], "remediate")
 
             view = project_control_view(snapshot, runtime, project)
+            self.assertIsNotNone(view["gate"])
+            self.assertEqual(view["gate"]["gate_source"], "reviewer")
             control = next(row for row in view["controls"] if row["action"] == "rereview")
             self.assertTrue(control["available"], control)
             self.assertEqual(control["target_id"], review_id)

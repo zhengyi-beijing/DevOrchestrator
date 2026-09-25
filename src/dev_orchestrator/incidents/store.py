@@ -254,8 +254,8 @@ class IncidentStore:
             payload_hashes = intent.get("payload_hashes") or {}
             target_index = intent.get("target_index")
 
-            # 1. Matching last_txn_id or target_revision already committed
-            if live_last_txn == txn_id or (live_rev >= target_rev and live_rev > prior_rev and live_last_txn is not None and target_rev > 0 and live_last_txn == txn_id):
+            # 1. Matching last_txn_id already committed
+            if live_last_txn == txn_id:
                 intent_file.unlink(missing_ok=True)
                 results.append({"status": "committed_confirmed", "txn_id": txn_id, "revision": live_rev})
                 continue
