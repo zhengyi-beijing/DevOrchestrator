@@ -43,6 +43,7 @@ from dev_orchestrator.core.watchdog import WatchdogCoordinator
 from dev_orchestrator.core.activation_supervisor import ActivationSupervisor
 from dev_orchestrator.core.project_status import write_project_statuses
 from dev_orchestrator.core.websol_health import (
+    DEFAULT_PROBE_FAILURE_RESET_SECONDS,
     WebSolAvailability,
     WebSolHealth,
     WebSolHealthStore,
@@ -50,7 +51,7 @@ from dev_orchestrator.core.websol_health import (
     evaluate_websol_availability,
 )
 from dev_orchestrator.core.websol_failover import FailoverEngine, WebSolFailoverStore
-from dev_orchestrator.core.websol_probe import run_websol_probe
+from dev_orchestrator.core.websol_probe import DEFAULT_PROBE_TIMEOUT_SECONDS, run_websol_probe
 from dev_orchestrator.incidents import capture_incident
 from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.control.security import ControlSecurity
@@ -225,13 +226,31 @@ def _run_orchestration_tick(
                     occurrence_key=f"probe_failed:{p_id}:{adp}:{bid}",
                 )
 
-            if health_store.should_probe(p_id, adp, bid, interval_seconds=300, bridge_store=bridge_store):
-                def _do_probe(proj: str, a: str, b: str) -> None:
+            probe_timeout = float(
+                binding.get("probe_timeout_seconds")
+                or binding.get("probe_timeout")
+                or getattr(bridge_store, "max_claim_lifetime_seconds", None)
+                or DEFAULT_PROBE_TIMEOUT_SECONDS
+            )
+            probe_reset_sec = float(
+                binding.get("probe_reset_seconds")
+                or binding.get("probe_failure_reset_seconds")
+                or DEFAULT_PROBE_FAILURE_RESET_SECONDS
+            )
+
+            if health_store.should_probe(
+                p_id, adp, bid,
+                interval_seconds=300,
+                reset_seconds=probe_reset_sec,
+                bridge_store=bridge_store,
+            ):
+                health_store.mark_probe_in_flight(p_id, adp, bid)
+                def _do_probe(proj: str, a: str, b: str, timeout: float) -> None:
                     try:
                         pres = run_websol_probe(
                             bridge_store, a, b,
                             generation=health_store.current_generation(),
-                            timeout_seconds=10.0,
+                            timeout_seconds=timeout,
                         )
                         health_store.record_probe_result(
                             project_id=proj, adapter=a, binding_id=b,
@@ -241,7 +260,9 @@ def _run_orchestration_tick(
                         )
                     except Exception as exc:
                         logger.exception("Web Sol background probe failed for project=%s adapter=%s binding=%s: %s", proj, a, b, exc)
-                threading.Thread(target=_do_probe, args=(p_id, adp, bid), daemon=True).start()
+                    finally:
+                        health_store.clear_probe_in_flight(proj, a, b)
+                threading.Thread(target=_do_probe, args=(p_id, adp, bid, probe_timeout), daemon=True).start()
         except Exception as exc:
             logger.exception("Web Sol health evaluation failed for project=%s adapter=%s binding=%s: %s", p_id, adp, bid, exc)
 

@@ -89,15 +89,27 @@ P16.12 Web Sol Persistent Pairing & Truthful Availability completion (2026-09-25
      - In `binding_resolver.py`, preserved `conversation_binding` extra options (such as `require_truthful_availability` and `require_availability`) across static and runtime project resolution.
      - In `daemon.py`, skipped Web Sol health evaluation, probe scheduling, and binding synchronization when `require_truthful_availability` or `require_availability` is explicitly `False`.
      - Added `"require_truthful_availability": False` to P13 legacy integration test configs testing basic BrowserBridge dispatch without control plane/Tampermonkey userscripts.
+- Round 3 Technical Review Remediation (2026-09-26):
+  1. Authoritative-Unknown Capability vs Missing Capability Classification (`src/dev_orchestrator/core/websol_health.py`):
+     - Corrected `evaluate_websol_availability` so authoritative unknown capability (`CapabilityVerdict.UNKNOWN`, status `"unknown"`, reason `"capability_unknown"`) properly classifies as `PAIRING_REQUIRED`, restoring incident emission and contract compliance.
+     - Preserved missing capability signal (`status="missing"`, reason `"capability_missing"`) demotion to `DEGRADED`.
+  2. Realistic Default & Configurable Probe Timeout (`src/dev_orchestrator/core/websol_probe.py`, `src/dev_orchestrator/daemon.py`, `src/dev_orchestrator/config.py`, `src/dev_orchestrator/control/binding_resolver.py`):
+     - Added `DEFAULT_PROBE_TIMEOUT_SECONDS = 900.0` aligned to the 15-minute browser wait deadline.
+     - Made probe timeout configurable via `conversation_binding` (`probe_timeout_seconds` or `probe_timeout`), preserved across runtime binding resolution, and validated in project config normalization.
+     - Wired daemon tick background probe execution to use the configured timeout or the 900.0s deadline default instead of hardcoded 10.0s.
+  3. Bounded Time-Based Attempt Cap Reset (`src/dev_orchestrator/core/websol_health.py`, `src/dev_orchestrator/daemon.py`):
+     - Added `DEFAULT_PROBE_FAILURE_RESET_SECONDS = 900.0` (15 minutes).
+     - In `WebSolHealthStore.probe_consecutive_failures` and `should_probe`, added bounded time-based reset: if `last_failure_at` is older than `reset_seconds`, consecutive failures reset to 0 and probe attempts resume.
+     - Allowed `probe_reset_seconds` / `probe_failure_reset_seconds` override on `conversation_binding`.
+  4. In-Flight Probe Guard & Non-Blocking Hardening (`src/dev_orchestrator/core/websol_health.py`, `src/dev_orchestrator/daemon.py`, `src/dev_orchestrator/bridge/store.py`):
+     - Added `is_probe_in_flight`, `mark_probe_in_flight`, `clear_probe_in_flight` to `WebSolHealthStore`, preventing concurrent/overlapping daemon ticks from launching duplicate probe requests.
+     - Fixed `BrowserBridgeStore.list_bindings` so adapters requiring percent-encoding (e.g. `custom/adapter`) are discovered in the no-adapter discovery path.
 - Verification:
-  - 26 dedicated unit and integration tests in `tests_py/test_p1612_websol_pairing_and_availability.py` passing 100% (added 4 remediation tests covering daemon orchestration tick integration with probe scheduling, generation invalidation lifecycle on rebinding/pairing, hard probe attempt capping, and capability missing demoting to degraded).
-  - 14 tests in `tests_py/test_chatgpt_web_adapter.py` passing 100%.
-  - 4 tests in `tests_py/test_daemon_transition_integration.py` passing 100%.
-  - Legacy daemon integration tests (`test_worker_done_daemon_integration.py`, `test_response_consumer_daemon_integration.py`) passing 100%.
-  - 34 tests in adjacent suites (`test_web.py`, `test_p13_web_bridge_adapter.py`, `test_p13_control_logs.py`, `test_p15_acceptance.py`, `test_p15_mobile_gateway.py`) passing 100%.
-  - Full repository regression: 1264 passed in pytest (100%).
+  - 32 dedicated unit and integration tests in `tests_py/test_p1612_websol_pairing_and_availability.py` passing 100% (added 5 focused remediation tests covering authoritative unknown capability, time-based attempt cap reset, in-flight guard, percent-encoded adapter discovery, and daemon configurable probe timeout).
+  - 64 tests in adjacent suites (`test_chatgpt_web_adapter.py`, `test_daemon_transition_integration.py`, `test_worker_done_daemon_integration.py`, `test_response_consumer_daemon_integration.py`, `test_p12_control_foundation.py`, `test_p13_web_bridge_adapter.py`, `test_p13_control_logs.py`, `test_p15_acceptance.py`, `test_p15_mobile_gateway.py`) passing 100%.
+  - Full repository regression: 1270 passed in pytest (100% pass, 0 failures).
   - Python compilation (`compileall src ops tests_py`) and `git diff --check` clean.
-  - Knowledge graph updated via `graphify update .` (6363 nodes, 17811 edges, 268 communities).
+  - Knowledge graph updated via `graphify update .` (6382 nodes, 17865 edges, 279 communities).
 
 
 

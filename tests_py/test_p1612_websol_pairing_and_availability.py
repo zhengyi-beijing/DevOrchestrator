@@ -209,6 +209,13 @@ def test_websol_health_evaluation_precedence() -> None:
     )
     assert avail == WebSolAvailability.PAIRING_REQUIRED
 
+    avail, reason = evaluate_websol_availability(
+        make_signals(capability=WebSolSignal(name="capability", status="unknown", reason="capability_unknown", observed_at=now_iso)),
+        probe_passed=True,
+    )
+    assert avail == WebSolAvailability.PAIRING_REQUIRED
+    assert reason == "capability_unknown"
+
     # 3. Bridge listener offline -> OFFLINE
     avail, reason = evaluate_websol_availability(
         make_signals(bridge_listener=WebSolSignal(name="bridge_listener", status="offline", reason="unreachable", observed_at=now_iso)),
@@ -1328,4 +1335,152 @@ def test_evaluate_websol_availability_missing_capability_demotes_to_degraded() -
     avail, reason = evaluate_websol_availability(signals, probe_passed=True)
     assert avail == WebSolAvailability.DEGRADED
     assert reason == "capability_missing"
+
+
+def test_evaluate_websol_availability_authoritative_unknown_capability_is_pairing_required() -> None:
+    """Remediation: Authoritative CapabilityVerdict.UNKNOWN emits capability_unknown and must reach PAIRING_REQUIRED."""
+    signals = {
+        "bridge_listener": WebSolSignal("bridge_listener", "healthy", "ok", "2026-09-25T00:00:00Z"),
+        "browser_claim_presence": WebSolSignal("browser_claim_presence", "healthy", "ok", "2026-09-25T00:00:00Z"),
+        "control_heartbeat": WebSolSignal("control_heartbeat", "healthy", "ok", "2026-09-25T00:00:00Z"),
+        "binding_identity": WebSolSignal("binding_identity", "healthy", "ok", "2026-09-25T00:00:00Z"),
+        "probe": WebSolSignal("probe", "healthy", "probe_passed", "2026-09-25T00:00:00Z"),
+        "capability": WebSolSignal("capability", "unknown", "capability_unknown", "2026-09-25T00:00:00Z"),
+    }
+    avail, reason = evaluate_websol_availability(signals, probe_passed=True)
+    assert avail == WebSolAvailability.PAIRING_REQUIRED
+    assert reason == "capability_unknown"
+
+
+def test_should_probe_attempt_cap_time_based_reset(tmp_path: Path) -> None:
+    """Remediation: Consecutive probe failures must reset after bounded time window."""
+    from dev_orchestrator.core.websol_health import (
+        DEFAULT_PROBE_FAILURE_RESET_SECONDS,
+        DEFAULT_PROBE_MAX_ATTEMPTS,
+    )
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(parents=True)
+    health_store = WebSolHealthStore(runtime)
+
+    start_time = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+    for i in range(DEFAULT_PROBE_MAX_ATTEMPTS):
+        health_store.record_probe_result(
+            "p1", "chatgpt_web", "b1", ok=False, error=f"fail-{i}", now=start_time
+        )
+
+    # Immediately at attempt cap: probe blocked
+    assert health_store.probe_consecutive_failures("p1", "chatgpt_web", "b1", now=start_time) == DEFAULT_PROBE_MAX_ATTEMPTS
+    assert health_store.should_probe("p1", "chatgpt_web", "b1", now=start_time) is False
+
+    # After reset window (e.g. 15 minutes / DEFAULT_PROBE_FAILURE_RESET_SECONDS): resets to 0 and permits probe
+    after_window = start_time + timedelta(seconds=DEFAULT_PROBE_FAILURE_RESET_SECONDS + 1)
+    assert health_store.probe_consecutive_failures("p1", "chatgpt_web", "b1", now=after_window) == 0
+    assert health_store.should_probe("p1", "chatgpt_web", "b1", now=after_window) is True
+
+
+def test_should_probe_in_flight_guard(tmp_path: Path) -> None:
+    """Remediation: Active in-flight probe prevents overlapping probe launches."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(parents=True)
+    health_store = WebSolHealthStore(runtime)
+
+    assert health_store.should_probe("p1", "chatgpt_web", "b1") is True
+    assert health_store.is_probe_in_flight("p1", "chatgpt_web", "b1") is False
+
+    # Mark in-flight
+    assert health_store.mark_probe_in_flight("p1", "chatgpt_web", "b1") is True
+    assert health_store.is_probe_in_flight("p1", "chatgpt_web", "b1") is True
+    # Duplicate mark returns False
+    assert health_store.mark_probe_in_flight("p1", "chatgpt_web", "b1") is False
+
+    # While in-flight, should_probe is blocked
+    assert health_store.should_probe("p1", "chatgpt_web", "b1") is False
+
+    # Clearing in-flight allows probe again
+    health_store.clear_probe_in_flight("p1", "chatgpt_web", "b1")
+    assert health_store.is_probe_in_flight("p1", "chatgpt_web", "b1") is False
+    assert health_store.should_probe("p1", "chatgpt_web", "b1") is True
+
+
+def test_list_bindings_discovers_percent_encoded_adapters(tmp_path: Path) -> None:
+    """Remediation: BrowserBridgeStore.list_bindings discovers bindings when adapter requires percent-encoding."""
+    runtime = tmp_path / "runtime"
+    bridge = BrowserBridgeStore(runtime)
+
+    # Claim poll creates presence under encoded adapter directory
+    bridge.claim("custom/adapter", "bind-encoded")
+
+    # Specific adapter discovery
+    assert bridge.list_bindings(adapter="custom/adapter") == ["bind-encoded"]
+    # All-adapter discovery (no adapter specified)
+    assert bridge.list_bindings() == ["bind-encoded"]
+
+
+def test_daemon_configurable_probe_timeout_and_reset(tmp_path: Path) -> None:
+    """Remediation: Daemon tick extracts configured probe_timeout and probe_reset from conversation_binding."""
+    from dev_orchestrator.daemon import _run_orchestration_tick
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(parents=True)
+    bridge = BrowserBridgeStore(runtime)
+    bridge._touch_presence("chatgpt_web", "bind-cfg", datetime.now(timezone.utc))
+
+    health_store = WebSolHealthStore(runtime)
+
+    cfg_file = tmp_path / "projects.json"
+    cfg_data = {
+        "projects": [
+            {
+                "project_id": "proj-cfg",
+                "repo_path": str(tmp_path),
+                "conversation_binding": {
+                    "transport": "browser_bridge",
+                    "adapter": "chatgpt_web",
+                    "binding_id": "bind-cfg",
+                    "probe_timeout_seconds": 45.0,
+                    "probe_reset_seconds": 120.0,
+                },
+            }
+        ]
+    }
+    cfg_file.write_text(json.dumps(cfg_data), encoding="utf-8")
+
+    captured_timeouts = []
+    def spy_run_probe(b_store: Any, adp: str, bid: str, **kwargs: Any) -> ProbeResult:
+        captured_timeouts.append(kwargs.get("timeout_seconds"))
+        return ProbeResult(success=True, duration_seconds=0.05)
+
+    raw_summary = {
+        "projects": [
+            {
+                "project_id": "proj-cfg",
+                "conversation_binding": {
+                    "transport": "browser_bridge",
+                    "adapter": "chatgpt_web",
+                    "binding_id": "bind-cfg",
+                    "probe_timeout_seconds": 45.0,
+                    "probe_reset_seconds": 120.0,
+                },
+            }
+        ]
+    }
+
+    class LocalDummyExecutor:
+        def overlay_managed_runs(self, summary: Any) -> Any:
+            return dict(summary)
+        def advance(self, summary: Any, config: Any, *, decision_summary: Any = None) -> list[Any]:
+            return []
+
+    with patch("dev_orchestrator.daemon.run_monitor_once", return_value=raw_summary), \
+         patch("dev_orchestrator.daemon.write_project_statuses", return_value=[]), \
+         patch("dev_orchestrator.daemon.consume_websol_responses", return_value=None), \
+         patch("dev_orchestrator.daemon.dispatch_worker_done_events", return_value=[]), \
+         patch("dev_orchestrator.daemon.run_websol_probe", side_effect=spy_run_probe):
+
+        _run_orchestration_tick(
+            cfg_file, runtime, bridge, LocalDummyExecutor(), health_store=health_store, pid=999
+        )
+        time.sleep(0.3)
+        assert len(captured_timeouts) >= 1
+        assert captured_timeouts[0] == 45.0
 

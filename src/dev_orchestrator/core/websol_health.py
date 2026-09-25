@@ -26,6 +26,7 @@ DEFAULT_PROBE_INITIAL_BACKOFF_SECONDS = 5.0
 DEFAULT_PROBE_BACKOFF_MULTIPLIER = 2.0
 DEFAULT_PROBE_MAX_BACKOFF_SECONDS = 60.0
 DEFAULT_PROBE_MAX_ATTEMPTS = 3
+DEFAULT_PROBE_FAILURE_RESET_SECONDS = 900.0
 
 
 class WebSolAvailability(str, Enum):
@@ -391,12 +392,14 @@ def evaluate_websol_availability(
     def _sig(name: str) -> tuple[str, str]:
         obj = signals.get(name)
         if obj is None:
-            return "unknown", f"{name}_missing"
+            return "missing", f"{name}_missing"
         if isinstance(obj, WebSolSignal):
             return obj.status, obj.reason
         if isinstance(obj, dict):
-            return str(obj.get("status") or "unknown"), str(obj.get("reason") or f"{name}_missing")
-        return "unknown", f"{name}_unknown"
+            status = str(obj.get("status") or "missing")
+            reason = str(obj.get("reason") or f"{name}_missing")
+            return status, reason
+        return "missing", f"{name}_missing"
 
     cap_status, cap_reason = _sig("capability")
     bl_status, bl_reason = _sig("bridge_listener")
@@ -406,9 +409,9 @@ def evaluate_websol_availability(
     pr_status, pr_reason = _sig("probe")
 
     # 1. Authoritative capability failures (revoked or unknown credential)
-    if cap_status in ("revoked", "unknown") and cap_reason not in (
-        "no_active_tabs", "no_active_tabs_missing", "capability_missing", "capability_unknown"
-    ):
+    if (cap_status in ("revoked", "unknown") or cap_reason in ("capability_revoked", "capability_unknown")) and cap_reason not in (
+        "no_active_tabs", "no_active_tabs_missing", "capability_missing"
+    ) and cap_status not in ("missing", "absent", "no_active_tabs"):
         return WebSolAvailability.PAIRING_REQUIRED, cap_reason or "capability_revoked_or_unknown"
 
     # 2. Bridge listener or browser claim presence offline
@@ -432,7 +435,7 @@ def evaluate_websol_availability(
         return WebSolAvailability.DEGRADED, "capability_store_unavailable"
     if cap_status in ("unverified", "degraded") or cap_reason == "capability_unverified":
         return WebSolAvailability.DEGRADED, "capability_unverified"
-    if cap_status in ("no_active_tabs", "absent") or cap_status != "healthy":
+    if cap_status in ("no_active_tabs", "absent", "missing") or cap_status != "healthy":
         return WebSolAvailability.DEGRADED, cap_reason or "no_active_tabs"
 
     # 5. Probe required (generation mismatch or not yet passed)
@@ -466,6 +469,25 @@ class WebSolHealthStore:
         self.lock_path = self.runtime_root / "websol-health.lock"
         self.default_ttl_seconds = max(10, int(default_ttl_seconds))
         self._lock = threading.RLock()
+        self._in_flight_probes: set[str] = set()
+
+    def is_probe_in_flight(self, project_id: str, adapter: str, binding_id: str) -> bool:
+        key = health_key(project_id, adapter, binding_id)
+        with self._lock:
+            return key in self._in_flight_probes
+
+    def mark_probe_in_flight(self, project_id: str, adapter: str, binding_id: str) -> bool:
+        key = health_key(project_id, adapter, binding_id)
+        with self._lock:
+            if key in self._in_flight_probes:
+                return False
+            self._in_flight_probes.add(key)
+            return True
+
+    def clear_probe_in_flight(self, project_id: str, adapter: str, binding_id: str) -> None:
+        key = health_key(project_id, adapter, binding_id)
+        with self._lock:
+            self._in_flight_probes.discard(key)
 
     def _empty_payload(self) -> dict[str, Any]:
         return {
@@ -499,6 +521,8 @@ class WebSolHealthStore:
     def invalidate_generation(self, reason: str = "restart") -> int:
         """Bump probe generation, invalidating past probe successes."""
         with InterProcessFileLock(self.lock_path):
+            with self._lock:
+                self._in_flight_probes.clear()
             data = self._load_data()
             new_gen = int(data.get("generation", 1)) + 1
             data["generation"] = new_gen
@@ -524,6 +548,8 @@ class WebSolHealthStore:
                         changed = True
                         break
             if changed:
+                with self._lock:
+                    self._in_flight_probes.clear()
                 new_gen = int(data.get("generation", 1)) + 1
                 data["generation"] = new_gen
                 data["generation_invalidated_at"] = utc_now_iso()
@@ -703,13 +729,31 @@ class WebSolHealthStore:
                 return False
             return True
 
-    def probe_consecutive_failures(self, project_id: str, adapter: str, binding_id: str) -> int:
+    def probe_consecutive_failures(
+        self,
+        project_id: str,
+        adapter: str,
+        binding_id: str,
+        *,
+        now: Optional[datetime] = None,
+        reset_seconds: float = DEFAULT_PROBE_FAILURE_RESET_SECONDS,
+    ) -> int:
         key = health_key(project_id, adapter, binding_id)
+        moment = _as_utc(now)
         with self._lock:
             data = self._load_data()
             backoff_map = data.get("probe_backoff") or {}
             b_info = backoff_map.get(key)
             if isinstance(b_info, dict):
+                last_failure = parse_utc(b_info.get("last_failure_at"))
+                if (
+                    last_failure is not None
+                    and reset_seconds > 0
+                    and (moment - last_failure).total_seconds() >= reset_seconds
+                ):
+                    b_info["consecutive_failures"] = 0
+                    write_json(self.health_path, data, indent=2)
+                    return 0
                 return int(b_info.get("consecutive_failures", 0))
             return 0
 
@@ -720,11 +764,20 @@ class WebSolHealthStore:
         binding_id: str,
         *,
         interval_seconds: int = 300,
+        reset_seconds: float = DEFAULT_PROBE_FAILURE_RESET_SECONDS,
+        max_attempts: int = DEFAULT_PROBE_MAX_ATTEMPTS,
         bridge_store: Optional[Any] = None,
         now: Optional[datetime] = None,
     ) -> bool:
         """Return True if prerequisites permit running an inference probe."""
-        if self.probe_consecutive_failures(project_id, adapter, binding_id) >= DEFAULT_PROBE_MAX_ATTEMPTS:
+        if self.is_probe_in_flight(project_id, adapter, binding_id):
+            return False
+        if (
+            self.probe_consecutive_failures(
+                project_id, adapter, binding_id, now=now, reset_seconds=reset_seconds
+            )
+            >= max_attempts
+        ):
             return False
         if not self.can_probe(project_id, adapter, binding_id, now=now):
             return False

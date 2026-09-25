@@ -371,13 +371,16 @@ class BrowserBridgeStore:
         Discovery includes queue and presence records so callers can resolve a
         live binding even when its queue is currently empty.
         """
-        adapters = [adapter] if adapter else sorted({p.parent.name for p in [*self._queue_files(), *self._presence_dir.glob("*/*.json")]})
+        if adapter:
+            adapter_dirs = [_encode_segment(adapter)]
+        else:
+            adapter_dirs = sorted({p.parent.name for p in [*self._queue_files(), *self._presence_dir.glob("*/*.json")]})
         binding_ids: set[str] = set()
-        for adapter_name in adapters:
-            if not adapter_name:
+        for dir_name in adapter_dirs:
+            if not dir_name:
                 continue
             for base in (self._queue_dir, self._presence_dir):
-                directory = base / _encode_segment(adapter_name)
+                directory = base / dir_name
                 if directory.is_dir():
                     for path in directory.glob("*.json"):
                         binding_ids.add(unquote(path.stem))

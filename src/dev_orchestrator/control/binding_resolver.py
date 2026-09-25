@@ -30,7 +30,14 @@ def resolve_effective_project(project: dict[str, Any], store: ConversationContro
         route = {"transport": "browser_bridge", "adapter": adapter, "binding_id": binding_id} if adapter and binding_id else None
         if route and isinstance(result.get("conversation_binding"), dict):
             orig_binding = result["conversation_binding"]
-            for extra_key in ("require_truthful_availability", "require_availability"):
+            for extra_key in (
+                "require_truthful_availability",
+                "require_availability",
+                "probe_timeout_seconds",
+                "probe_timeout",
+                "probe_reset_seconds",
+                "probe_failure_reset_seconds",
+            ):
                 if extra_key in orig_binding:
                     route[extra_key] = orig_binding[extra_key]
         result.update({"conversation_binding": route, "conversation_binding_source": "runtime" if route else "runtime_invalid", "orchestration_ready": route is not None})

@@ -13,6 +13,7 @@ from dev_orchestrator.core.websol import WebSolEvent, WebSolRequest, WebSolRole
 from dev_orchestrator.storage.json_store import utc_now
 
 PROBE_PREFIX = "probe:websol:"
+DEFAULT_PROBE_TIMEOUT_SECONDS = 900.0  # Aligned with browser wait deadline (15 minutes)
 
 
 @dataclass(frozen=True)
@@ -67,7 +68,7 @@ def run_websol_probe(
     binding_id: str,
     *,
     generation: int = 1,
-    timeout_seconds: float = 10.0,
+    timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
     simulated_responder: Optional[Callable[[WebSolRequest, str], None]] = None,
     now: Optional[datetime] = None,
     poll_interval_seconds: float = 0.1,

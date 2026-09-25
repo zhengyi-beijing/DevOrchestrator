@@ -794,6 +794,11 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
             val = binding_copy["require_truthful_availability"]
             if not isinstance(val, bool):
                 raise ValueError("config {0} project #{1} conversation_binding.require_truthful_availability must be a boolean".format(config_path, index))
+        for time_key in ("probe_timeout_seconds", "probe_timeout", "probe_reset_seconds", "probe_failure_reset_seconds"):
+            if time_key in binding_copy:
+                val = binding_copy[time_key]
+                if not isinstance(val, (int, float)) or val <= 0:
+                    raise ValueError("config {0} project #{1} conversation_binding.{2} must be a positive number".format(config_path, index, time_key))
         normalized["conversation_binding"] = binding_copy
     normalized["orchestration_ready"] = (
         _binding_ready(normalized.get("conversation_binding"))
