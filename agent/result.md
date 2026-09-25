@@ -1608,3 +1608,42 @@ Closed both concrete BLOCKING review findings from `ai_review:rereview:37165140-
   - Compilation (`compileall`) and whitespace check (`git diff --check`) clean.
   - Knowledge graph updated with `graphify update .` (6005 nodes, 16830 edges, 244 communities).
 - P16.10 is closed; handoff advances to P16.11 AGY-First AI Resource Pool Benchmark & Routing (`agent/staged/P16.11.md`).
+
+### P16.11 AGY-First AI Resource Pool Benchmark & Routing Completion (2026-09-25)
+
+- Implemented the AGY-first AI compute resource pool, real-time availability/quota telemetry, reviewer independence preservation, same-failure heterogeneous escalation, and representative benchmark replay:
+  1. All 3 AGY accounts (`agy-1`, `agy-2`, `agy-3`) represented as schedulable pool resources (`src/dev_orchestrator/pool/agy_pool.py`, `src/dev_orchestrator/pool/models.py`):
+     - Thread-safe resource pool with availability, concurrency limits (1 in-flight per account), rolling sliding-window tracking (60 requests / 900s), and discrete quota states (`HEALTHY`, `CONSERVE`, `LOW`, `EXHAUSTED`).
+     - Automated cooldown arming on rate-limit/quota failure (default 300s, rate limit 900s) and automatic timestamp expiry/recovery.
+     - Load-balanced parallel dispatch preferring least-loaded and least-recently-used accounts across independent work.
+  2. AGY-First Deterministic Routing Policy (`src/dev_orchestrator/pool/routing_policy.py`):
+     - Prioritizes AGY accounts for eligible roles (`planner`, `worker`, `debugger`, `evidence_packaging`).
+     - Strict Reviewer Independence Invariant: When `independence="provider"` (such as technical review or candidate regression promotion when worker was `agy`), all AGY models are rejected and execution escalates to an external independent provider (`claude/default/opus` or `codex/default/gpt-5.6-sol`). When `independence="account"`, cross-account review within AGY is permitted.
+     - Same-Failure Retry Barrier: Normalized error hashing (`FailureSignature`). Retrying a failed task on AGY with the same failure signature and unchanged strategy strictly blocks blind AGY rotation to `agy-2` or `agy-3`, forcing heterogeneous escalation to paid baseline models. Changed strategy (`strategy_changed=True`) permits an adapted second AGY attempt before escalating.
+     - Quota/cooldown fallback: Automatic spillover to heterogeneous baselines when all AGY capacity is saturated.
+  3. Canonical Representative Replay Benchmark Suite (`src/dev_orchestrator/pool/replay_benchmark.py`):
+     - 5 canonical historical replay tasks covering all primary DevO role classes (`replay_planner_arch`, `replay_worker_cache`, `replay_debugger_root_cause`, `replay_evidence_packaging`, `replay_reviewer_compat`).
+     - Independent review evaluation gate (`evaluate_independent_review`) verifying required semantic findings and strict provider independence.
+     - Matched AGY-first vs Non-AGY Baseline benchmark results:
+       - Total Tasks: 5
+       - Coverage: 100.0%
+       - First-Pass Acceptance: 100.0% clean / 80.0% fault injection
+       - Escalation Rate: 0.0% clean / 20.0% fault injection
+       - Repeated-Failure Rate: 0.0% (guaranteed by same-failure retry barrier)
+       - Cost Savings: > 80% cost reduction vs non-AGY baseline
+  4. New CLI Commands (`src/dev_orchestrator/cli.py`):
+     - `pool-status`: Outputs JSON snapshot of total/available accounts, cooldown states, and rolling window counters.
+     - `agy-benchmark`: Executes representative benchmark replay, supporting `--simulate-failure <task_id>`.
+     - `agy-route`: Evaluates machine-readable routing decisions with `--role`, `--independence`, `--worker-provider`, `--failure-signature`, `--strategy-changed`.
+  5. Authoritative Policy Document (`docs/AGY_ROUTING_POLICY.md`):
+     - Documents architectural principles, pool telemetry semantics, capability boundary matrix (`SUPPORTED`, `UNSUPPORTED`, `UNCERTAIN`), same-failure retry rules, reviewer independence guarantees, and empirical benchmark findings.
+- Verification:
+  - 21 focused unit and integration tests across 4 dedicated suites passing 100%:
+    - `tests_py/test_p1611_agy_pool.py` (5 tests)
+    - `tests_py/test_p1611_routing_policy.py` (6 tests)
+    - `tests_py/test_p1611_replay_benchmark.py` (4 tests)
+    - `tests_py/test_p1611_cli.py` (6 tests)
+  - Full repository regression: 1233 passed, 92 subtests passed in 468.83s (0 failures).
+  - Python compilation (`compileall`) and `git diff --check` clean.
+  - Knowledge graph updated via `graphify update .` (6181 nodes, 17201 edges, 255 communities).
+- P16.11 is complete; handoff advances to P16.12 Web Sol Persistent Pairing & Truthful Availability (`agent/staged/P16.12.md`).

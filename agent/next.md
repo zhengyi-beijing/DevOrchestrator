@@ -1,24 +1,36 @@
-# P16.11 AGY-First AI Resource Pool Benchmark & Routing
+# P16.12 Web Sol Persistent Pairing & Truthful Availability
 
 Status: **PENDING DESIGN**
 
-Goal: quantify how much DevO workload can be completed by the three near-zero marginal-cost AGY accounts, then use measured evidence to design an AGY-first model-routing policy without sacrificing reviewer independence or lifecycle reliability.
+Goal: make Web Sol a restart-safe AI resource that normally requires only one manual pairing, automatically restores service after Chrome/Tampermonkey/DevO restarts, and never reports AVAILABLE/LIVE from partial transport health.
 
-- Treat the three AGY accounts as a shared quota/time-window constrained compute pool, not fixed Planner/Reviewer/Worker identities.
-- Benchmark AGY by DevO role and real historical/replay task class: Planner, Worker/Implementer, Debugger/Root-cause Analyst, evidence packaging, and review where independence permits.
-- Measure AGY coverage: tasks completed by AGY and accepted by an independent reviewer / total eligible tasks.
-- Record first-pass acceptance, paid-model escalation rate, repeated-failure rate, median/p95 wall time, retries, quota/cooldown state, and successful-task cost.
-- Compare AGY-first routing against representative Codex/Sol, Claude, Web Sol and other available resources under matched tasks and acceptance criteria.
-- Prefer parallel use of the three AGY accounts on independent work; do not rotate accounts blindly against the same failure signature.
-- On repeated equivalent failure, require a changed strategy/context or escalate to a heterogeneous model/provider rather than consuming another AGY account with the same approach.
-- Keep final/high-risk review independent from the implementation path; free/low-cost execution must not weaken review, safety, Git, owner or lifecycle gates.
-- Produce a machine-readable routing recommendation based on observed role/task success, availability and quota state rather than a static model ranking.
+## Problems to close
 
-Acceptance:
-1. All three AGY accounts are represented as schedulable pool resources with availability/quota/cooldown telemetry.
-2. A representative replay set reports AGY coverage, independent-review acceptance, escalation rate, repeated-failure rate and wall time.
-3. At least one AGY-first vs non-AGY baseline comparison is reproducible under matched task conditions.
-4. Same-failure retry policy prevents blind AGY-account rotation and demonstrates heterogeneous escalation.
-5. Results yield a documented routing policy identifying where AGY-first is supported, unsupported, or still uncertain.
+1. The ChatGPT userscript can show `LIVE` when the 8765 claim bridge is reachable even if the independent 8770 control heartbeat is stale or absent.
+2. Heartbeat capability loss/expiry currently can require a manual `Pair DevOrchestrator 8770 heartbeat` recovery, despite the capability being stored in Tampermonkey.
+3. Browser, userscript, bridge, control service, conversation binding and end-to-end inference health are not represented as one authoritative availability state.
+4. A healthy port or heartbeat alone does not prove that DevO can enqueue a request, have the browser claim it, receive a Web Sol response and acknowledge/consume it.
 
-Sequence: P16.10 automatic failure harvesting -> P16.11 AGY-first pool benchmark and evidence-based routing.
+## Requirements & Scope
+
+- Normal lifecycle is **pair once, recover automatically** across Chrome/Tampermonkey and DevO service restarts.
+- Persist or safely renew/recover the heartbeat capability. Require owner re-pairing only when credentials are truly unrecoverable/revoked or security policy requires it.
+- Separate and expose at least: bridge reachability, browser claim presence, control heartbeat, binding identity, capability validity, and end-to-end probe status.
+- Replace misleading `LIVE` semantics: browser UI must show `DEGRADED/OFFLINE` when heartbeat/control health is stale even if 8765 claim polling succeeds.
+- DevO resource routing must not mark Web Sol `AVAILABLE` from a single signal. Availability requires fresh browser presence + fresh control heartbeat and, after startup/recovery, a successful bounded end-to-end probe.
+- Implement a lightweight deterministic probe covering `enqueue -> browser claim -> ChatGPT/Web Sol response -> Bridge acknowledge/consume`, with timeout and failure classification.
+- Automatically retry/recover bounded transient failures; integrate unrecoverable/repeated failures with P16.10 incident harvesting and resource failover.
+- Detect duplicate/stale tabs and stale bindings without allowing them to create false availability.
+- Record timestamps and reason codes so the scheduler can distinguish `AVAILABLE`, `DEGRADED`, `OFFLINE`, `PAIRING_REQUIRED`, and `PROBE_FAILED`.
+- Do not fabricate heartbeat/presence or synthetic success merely to satisfy health checks.
+
+## Acceptance
+
+1. After one successful pairing, restart Chrome and restart DevO services independently; Web Sol returns to AVAILABLE without manual pairing in normal cases.
+2. Kill or invalidate the 8770 heartbeat path while leaving 8765 healthy; UI and scheduler stop reporting LIVE/AVAILABLE within the defined freshness window.
+3. Startup/recovery runs a bounded real end-to-end probe and only marks Web Sol AVAILABLE after the probe succeeds.
+4. Expired/revoked/unrecoverable capability produces explicit PAIRING_REQUIRED rather than false LIVE or an infinite retry loop.
+5. Duplicate/stale ChatGPT tabs do not cause false availability or route requests to the wrong conversation.
+6. Automated tests cover capability persistence/recovery, split-brain 8765/8770 health, stale heartbeat, stale binding, probe timeout/failure, and successful restart recovery.
+
+Sequence: P16.10 automatic failure harvesting -> P16.11 AGY-first pool benchmark and evidence-based routing -> P16.12 Web Sol persistent pairing and truthful availability.

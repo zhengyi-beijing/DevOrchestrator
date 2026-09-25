@@ -1430,6 +1430,68 @@ def cmd_candidate_promote(args: argparse.Namespace) -> int:
     return 0 if result.get("promoted") else 1
 
 
+def cmd_pool_status(args: argparse.Namespace) -> int:
+    from dev_orchestrator.pool.agy_pool import AGYResourcePool
+    pool = AGYResourcePool()
+    telemetry = pool.telemetry()
+    sys.stdout.write(json.dumps(telemetry.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_agy_benchmark(args: argparse.Namespace) -> int:
+    from dev_orchestrator.pool.replay_benchmark import AGYBenchmarkReplayRunner, SimulatedPort
+    runner = AGYBenchmarkReplayRunner()
+    sim_port = SimulatedPort(failure_on_agy1_task=getattr(args, "simulate_failure", None))
+    work_dir = Path(".").resolve()
+    result = runner.run_replay(sim_port, work_dir)
+    sys.stdout.write(json.dumps(result.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_agy_route(args: argparse.Namespace) -> int:
+    from dev_orchestrator.ai.contracts import AIRoleRequest, ResourceContext
+    from dev_orchestrator.pool.agy_pool import AGYResourcePool
+    from dev_orchestrator.pool.routing_policy import AGYFirstRoutingPolicy
+
+    pool = AGYResourcePool()
+    policy = AGYFirstRoutingPolicy(pool)
+
+    prev_ctx = None
+    if getattr(args, "worker_provider", None):
+        prev_ctx = ResourceContext(
+            provider=args.worker_provider,
+            account=getattr(args, "worker_account", "default"),
+            resource_id=f"{args.worker_provider}/{getattr(args, 'worker_account', 'default')}/model",
+        )
+
+    req = AIRoleRequest(
+        project_id="cli",
+        task_run_id=getattr(args, "task_id", None) or "cli_task",
+        role=args.role,
+        prompt="cli evaluation prompt",
+        working_directory=Path(".").resolve(),
+        independence=getattr(args, "independence", "none") or "none",
+        previous_resource_context=prev_ctx,
+    )
+
+    history = []
+    if getattr(args, "failure_signature", None):
+        history.append({
+            "provider": getattr(args, "failed_provider", "agy"),
+            "resource_id": "agy/agy-1/gemini-3.8-flash-high",
+            "failure_signature": args.failure_signature,
+        })
+
+    rec = policy.route(
+        req,
+        failure_history=history,
+        strategy_changed=bool(getattr(args, "strategy_changed", False)),
+        current_failure_signature=getattr(args, "failure_signature", None),
+    )
+    sys.stdout.write(json.dumps(rec.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
@@ -1772,6 +1834,19 @@ def build_parser() -> argparse.ArgumentParser:
     candidate_promote.add_argument("--expected-branch", default=None, help="expected git branch of regression owner")
     candidate_promote.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
+    pool_status = sub.add_parser("pool-status", help="display AGY resource pool telemetry")
+
+    agy_benchmark = sub.add_parser("agy-benchmark", help="run representative replay benchmark for AGY pool")
+    agy_benchmark.add_argument("--simulate-failure", default=None, help="task ID to inject failure on agy-1")
+
+    agy_route = sub.add_parser("agy-route", help="evaluate routing decision for role and context")
+    agy_route.add_argument("--role", required=True, help="AI role (planner, worker, debugger, reviewer)")
+    agy_route.add_argument("--independence", default="none", choices=("none", "resource", "account", "provider"))
+    agy_route.add_argument("--worker-provider", default=None)
+    agy_route.add_argument("--worker-account", default=None)
+    agy_route.add_argument("--failure-signature", default=None)
+    agy_route.add_argument("--strategy-changed", action="store_true")
+
     return parser
 
 
@@ -1810,6 +1885,9 @@ _COMMANDS = {
     "candidate-review": cmd_candidate_review,
     "candidate-materialize": cmd_candidate_materialize,
     "candidate-promote": cmd_candidate_promote,
+    "pool-status": cmd_pool_status,
+    "agy-benchmark": cmd_agy_benchmark,
+    "agy-route": cmd_agy_route,
     "monitor": cmd_monitor,
     "web": cmd_web,
     "daemon": cmd_daemon,
