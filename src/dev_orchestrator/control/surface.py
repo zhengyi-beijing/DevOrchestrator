@@ -33,10 +33,20 @@ def latest_owner_gate(runtime: Path | str, project_id: str) -> dict[str, Any] | 
     planner = read_json(rt / "ai-planner.json", {})
     plans = planner.get("plans") if isinstance(planner, dict) else None
     matches = [value for value in (plans or {}).values() if isinstance(value, dict) and value.get("project_id") == project_id and value.get("state") == "owner_gate"]
-    if not matches:
+    if matches:
+        result = copy.deepcopy(max(matches, key=lambda value: str(value.get("completed_at") or value.get("started_at") or "")))
+        result["gate_source"] = "planner"
+        return result
+    # Technical-review remediation exhaustion is also an owner gate. It is
+    # durable in ai-reviewer.json and must participate in the same control
+    # identity as planner/watchdog gates.
+    reviewer = read_json(rt / "ai-reviewer.json", {})
+    reviews = reviewer.get("reviews") if isinstance(reviewer, dict) else None
+    review_matches = [value for value in (reviews or {}).values() if isinstance(value, dict) and value.get("project_id") == project_id and value.get("state") == "completed" and value.get("decision") == "owner_gate"]
+    if not review_matches:
         return None
-    result = copy.deepcopy(max(matches, key=lambda value: str(value.get("completed_at") or value.get("started_at") or "")))
-    result["gate_source"] = "planner"
+    result = copy.deepcopy(max(review_matches, key=lambda value: str(value.get("completed_at") or value.get("started_at") or "")))
+    result["gate_source"] = "reviewer"
     return result
 
 

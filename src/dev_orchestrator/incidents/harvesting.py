@@ -345,8 +345,11 @@ def _detect_orchestrator_alive_task_stalled(
         if liveness.get("any_unknown") or not liveness.get("all_dead"):
             continue
 
-        # Check progress obligation
-        obligation = resolve_progress_obligation(proj)
+        # Check progress obligation and require stale task evidence before
+        # classifying a stall.  READY_TO_RUN/PENDING states are normal for a
+        # bounded window and must not become incidents on their first tick.
+        policy = resolve_incident_policy(config)
+        obligation = resolve_progress_obligation(proj, policy=policy)
         if obligation.get("legal_wait") or obligation.get("is_terminal"):
             continue
 
@@ -354,10 +357,21 @@ def _detect_orchestrator_alive_task_stalled(
         if lifecycle in {"DONE", "COMPLETED", "TERMINAL", "IDLE"}:
             continue
 
-        # Check task activity
-        activity = proj.get("activity") if isinstance(proj.get("activity"), dict) else {}
-        task_active = bool(activity.get("task_active"))
-        if task_active:
+        # task_active is a top-level project-status field.  Older synthetic
+        # fixtures placed it under activity, which does not match production.
+        if bool(proj.get("task_active")):
+            continue
+        telemetry = proj.get("telemetry") if isinstance(proj.get("telemetry"), dict) else {}
+        age = telemetry.get("watchdog_safe_activity_age_seconds")
+        if not isinstance(age, (int, float)):
+            age = telemetry.get("last_activity_age_seconds")
+        if not isinstance(age, (int, float)):
+            continue  # fail closed: unknown task-evidence age is not a stall
+        stale_after = max(
+            float(policy.get("stale_task_activity_threshold_seconds", 300)),
+            float(policy.get("progress_obligation_window_seconds", 300)),
+        )
+        if float(age) < stale_after:
             continue
 
         semantic = {

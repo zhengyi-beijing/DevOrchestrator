@@ -213,7 +213,8 @@ class TestHarvestingDetectors(unittest.TestCase):
                     "task_id": "T-stalled",
                     "lifecycle_state": "EXECUTING",
                     "worker": {"state": "idle", "pid": None},
-                    "activity": {"task_active": False},
+                    "task_active": False,
+                    "telemetry": {"watchdog_safe_activity_age_seconds": 601},
                 }
             ]
         }
