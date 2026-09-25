@@ -78,7 +78,7 @@ def project_identity(snapshot: dict[str, Any], runtime_root: Path | str) -> dict
         "status_hash": git.get("status_hash"),
         "task_id": telemetry.get("task_id"),
         "lifecycle_state": projected.get("lifecycle_state") or projected.get("state"),
-        "gate_id": (gate.get("gate_id") or gate.get("request_id") or gate.get("plan_id")) if gate else None,
+        "gate_id": (gate.get("gate_id") or gate.get("request_id") or gate.get("plan_id") or gate.get("review_id")) if gate else None,
         "paused": bool(paused.get("paused")),
         "binding_state": binding.get("state") if isinstance(binding, dict) else None,
         "binding_id": binding.get("binding_id") if isinstance(binding, dict) else None,

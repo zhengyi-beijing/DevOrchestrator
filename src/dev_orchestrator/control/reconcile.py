@@ -367,12 +367,14 @@ def resolve_rereview_candidate(
                     or _text(decision.get("reason"))
                     or "stale accepted NEXT review"
                 )
-            elif pair == ("remediate", "continue_current_stage"):
+            elif pair in {("remediate", "continue_current_stage"), ("owner_gate", "stop")}:
+                # An exhausted remediation review becomes a stale reviewable
+                # anchor once the owner supplies a clean descendant fix.
                 kind = "remediate"
                 prior_reason = (
                     _text(review.get("reason"))
                     or _text(decision.get("reason"))
-                    or "stale REMEDIATE review"
+                    or "stale REMEDIATE/OWNER_GATE review"
                 )
             else:
                 continue
