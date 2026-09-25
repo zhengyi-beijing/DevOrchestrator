@@ -48,12 +48,29 @@ P16.10 Automatic Failure Harvesting & Regression Promotion completion (2026-09-2
   - Strengthened false-running regression: Replaced mock object with real `evaluate_stall`, real `WatchdogCoordinator.advance`, and `build_project_status` status remap to `STALLED`. Populated `"stall"` in `_watchdog_view` and separated `task_active` from `task_progressing`.
   - Hardened Windows file locking: Added `_normalize_lock_key` in `src/dev_orchestrator/accounting/events.py` to strip Windows `\\?\` and `\\?\UNC\` extended path prefixes from resolved lock paths, preventing process-local `RLock` aliasing between pre-existing and newly-created files.
   - Deduplicated detector registration in `src/dev_orchestrator/incidents/harvesting.py` and replaced `except TypeError` in `src/dev_orchestrator/daemon.py` with `inspect.signature` inspection.
+- Technical Review Remediation Round 3 (2026-09-25):
+  - Closed Finding 1 (Stall detector fail-closed telemetry staleness & false-running regression failure):
+    - In `src/dev_orchestrator/incidents/harvesting.py`, updated `_detect_orchestrator_alive_task_stalled` to derive activity age from multiple telemetry metrics (`telemetry.watchdog_safe_activity_age_seconds`, `last_activity_age_seconds`, `activity.watchdog_safe_activity_age_seconds`, `activity.age_seconds`), or fallback timestamp age difference against `now` / `utc_now()`. Inspected `task_active` from both top-level and nested `activity`.
+    - In `tests_py/test_p1610_false_running_regression.py`, aligned snapshot fixture with `task_active: False` and `telemetry` age metrics, passed `now=eval_now` to `harvest_tick`, and added `test_stalled_detector_accepts_absent_age_as_stale_by_timestamp` verifying fallback timestamp age derivation without numeric telemetry.
+  - Closed Finding 2 (Sticky Reviewer Owner Gate & Lifecycle Override):
+    - In `src/dev_orchestrator/control/surface.py`:
+      - Updated `latest_owner_gate` to import `_latest` from `lifecycle_projection`, compute consumed reviews from `rereview_of` references, check the latest review via `_latest(reviews, project_id)`, and require unconsumed `completed` status with `decision == "owner_gate"`.
+      - Scoped `OWNER_GATE` lifecycle override in both `project_identity` and `project_control_view` to exclude active running lifecycles (`EXECUTING`, `REVIEWING`, `PLANNING`, etc.) and terminal states (`DONE`, `COMPLETED`, `TERMINAL`).
+    - In `tests_py/test_p1610_owner_gate_and_attribution.py`:
+      - Added 4 dedicated regression tests:
+        - `test_reviewer_owner_gate_recognized`
+        - `test_reviewer_owner_gate_not_sticky_after_later_next_review`
+        - `test_reviewer_owner_gate_not_sticky_when_consumed_by_rereview`
+        - `test_reviewer_owner_gate_scoped_out_for_executing_and_terminal`
 - Verification:
-  - 63 focused tests across 8 P16.10 test modules passing 100%.
-  - 1135 full repository regression tests passing, 0 failures.
+  - 68 focused tests across 8 P16.10 test modules passing 100%.
+  - Adjacent suites: 43 passed (`test_lifecycle_projection.py`, `test_p169_*.py`, `test_control_commands.py`).
+  - Watchdog suites: 119 passed, 5 subtests passed (`test_watchdog*.py`).
+  - Coordinator and CLI suites: 117 passed, 18 subtests passed.
+  - Full repository regression: 1209 passed, 92 subtests passed in 476.57s (0 failures).
   - Candidate test collection isolation verified (0 tests collected without `DEVORCH_CANDIDATE_TESTS=1`).
   - `compileall` and `git diff --check` clean.
-  - Knowledge graph updated via `graphify update .` (5993 nodes, 16787 edges, 246 communities).
+  - Knowledge graph updated via `graphify update .` (6000 nodes, 16811 edges, 260 communities).
 
 P16.9 Watchdog Execution-Loss Detection & Recovery completion (2026-09-24):
 - Solved the xray-hw-platform incident blind spot: an accepted execution reached WORKER_RUNNING, emitted no provider output, and vanished with the project returning to READY_TO_RUN without a terminal state, while watchdog previously reported state=ok with zero recovery.

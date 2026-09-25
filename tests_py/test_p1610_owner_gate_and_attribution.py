@@ -7,6 +7,7 @@ from pathlib import Path
 from dev_orchestrator.incidents.attribution import classify_owner_action
 from dev_orchestrator.incidents.owner_gate import resolve_owner_gate_authority
 from dev_orchestrator.control.owner_store import OwnerControlStore
+from dev_orchestrator.control.surface import latest_owner_gate, project_control_view, project_identity
 from dev_orchestrator.core.control_commands import (
     ControlCommandCoordinator,
     latest_control_result,
@@ -167,6 +168,114 @@ class TestOwnerGateAndAttribution(unittest.TestCase):
             "worker_running": False,
         }
         self.assertEqual(classify_owner_action("continue", cmd_record, before, stale_after), "UNCONFIRMED_PROGRESS")
+
+    def test_reviewer_owner_gate_recognized(self):
+        rev_data = {
+            "reviews": {
+                "rev-1": {
+                    "review_id": "rev-1",
+                    "project_id": self.project_id,
+                    "state": "completed",
+                    "decision": "owner_gate",
+                    "started_at": "2026-09-25T10:00:00Z",
+                    "completed_at": "2026-09-25T10:05:00Z",
+                }
+            }
+        }
+        (self.runtime_root / "ai-reviewer.json").write_text(json.dumps(rev_data), encoding="utf-8")
+        gate = latest_owner_gate(self.runtime_root, self.project_id)
+        self.assertIsNotNone(gate)
+        self.assertEqual(gate.get("gate_source"), "reviewer")
+        self.assertEqual(gate.get("review_id"), "rev-1")
+
+        snapshot = {"project_id": self.project_id, "state": "WAITING_REVIEW"}
+        view = project_control_view(snapshot, self.runtime_root)
+        self.assertEqual(view.get("lifecycle_state"), "OWNER_GATE")
+        self.assertEqual(view["control_identity"].get("gate_id"), "rev-1")
+        self.assertEqual(view["control_identity"].get("lifecycle_state"), "OWNER_GATE")
+
+    def test_reviewer_owner_gate_not_sticky_after_later_next_review(self):
+        rev_data = {
+            "reviews": {
+                "rev-1": {
+                    "review_id": "rev-1",
+                    "project_id": self.project_id,
+                    "state": "completed",
+                    "decision": "owner_gate",
+                    "started_at": "2026-09-25T10:00:00Z",
+                    "completed_at": "2026-09-25T10:05:00Z",
+                },
+                "rev-2": {
+                    "review_id": "rev-2",
+                    "project_id": self.project_id,
+                    "state": "completed",
+                    "decision": "next",
+                    "started_at": "2026-09-25T11:00:00Z",
+                    "completed_at": "2026-09-25T11:05:00Z",
+                },
+            }
+        }
+        (self.runtime_root / "ai-reviewer.json").write_text(json.dumps(rev_data), encoding="utf-8")
+        gate = latest_owner_gate(self.runtime_root, self.project_id)
+        self.assertIsNone(gate)
+
+        snapshot = {"project_id": self.project_id, "state": "READY_TO_RUN"}
+        view = project_control_view(snapshot, self.runtime_root)
+        self.assertNotEqual(view.get("lifecycle_state"), "OWNER_GATE")
+        self.assertIsNone(view["control_identity"].get("gate_id"))
+        self.assertNotEqual(view["control_identity"].get("lifecycle_state"), "OWNER_GATE")
+
+    def test_reviewer_owner_gate_not_sticky_when_consumed_by_rereview(self):
+        rev_data = {
+            "reviews": {
+                "rev-1": {
+                    "review_id": "rev-1",
+                    "project_id": self.project_id,
+                    "state": "completed",
+                    "decision": "owner_gate",
+                    "started_at": "2026-09-25T10:00:00Z",
+                    "completed_at": "2026-09-25T10:05:00Z",
+                },
+                "rev-2": {
+                    "review_id": "rev-2",
+                    "project_id": self.project_id,
+                    "state": "running",
+                    "rereview_of": "rev-1",
+                    "started_at": "2026-09-25T11:00:00Z",
+                },
+            }
+        }
+        (self.runtime_root / "ai-reviewer.json").write_text(json.dumps(rev_data), encoding="utf-8")
+        gate = latest_owner_gate(self.runtime_root, self.project_id)
+        self.assertIsNone(gate)
+
+        snapshot = {"project_id": self.project_id, "state": "WAITING_REVIEW"}
+        view = project_control_view(snapshot, self.runtime_root)
+        self.assertNotEqual(view.get("lifecycle_state"), "OWNER_GATE")
+
+    def test_reviewer_owner_gate_scoped_out_for_executing_and_terminal(self):
+        rev_data = {
+            "reviews": {
+                "rev-1": {
+                    "review_id": "rev-1",
+                    "project_id": self.project_id,
+                    "state": "completed",
+                    "decision": "owner_gate",
+                    "started_at": "2026-09-25T10:00:00Z",
+                    "completed_at": "2026-09-25T10:05:00Z",
+                }
+            }
+        }
+        (self.runtime_root / "ai-reviewer.json").write_text(json.dumps(rev_data), encoding="utf-8")
+        # 1. Executing snapshot
+        exec_snapshot = {"project_id": self.project_id, "state": "WORKER_RUNNING", "lifecycle_state": "EXECUTING"}
+        view_exec = project_control_view(exec_snapshot, self.runtime_root)
+        self.assertEqual(view_exec.get("lifecycle_state"), "EXECUTING")
+
+        # 2. Terminal snapshot
+        term_snapshot = {"project_id": self.project_id, "state": "DONE", "lifecycle_state": "DONE", "next_status": "DONE"}
+        view_term = project_control_view(term_snapshot, self.runtime_root)
+        self.assertEqual(view_term.get("lifecycle_state"), "DONE")
 
 
 if __name__ == "__main__":

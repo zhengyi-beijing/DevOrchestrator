@@ -11,7 +11,7 @@ from dev_orchestrator.incidents.liveness import resolve_role_liveness
 from dev_orchestrator.incidents.obligations import resolve_progress_obligation
 from dev_orchestrator.incidents.owner_gate import resolve_owner_gate_authority
 from dev_orchestrator.incidents.policy import resolve_incident_policy
-from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso
+from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now, utc_now_iso
 
 
 # Detector functions return list of tuples: (project_id, task_id, classification, semantic, evidence, occurrence_key)
@@ -357,14 +357,38 @@ def _detect_orchestrator_alive_task_stalled(
         if lifecycle in {"DONE", "COMPLETED", "TERMINAL", "IDLE"}:
             continue
 
-        # task_active is a top-level project-status field.  Older synthetic
-        # fixtures placed it under activity, which does not match production.
-        if bool(proj.get("task_active")):
+        # task_active is a top-level project-status field; check both top-level
+        # and nested activity for compatibility with synthetic test fixtures.
+        activity = proj.get("activity") if isinstance(proj.get("activity"), dict) else {}
+        task_active = bool(proj.get("task_active")) or bool(activity.get("task_active"))
+        if task_active:
             continue
         telemetry = proj.get("telemetry") if isinstance(proj.get("telemetry"), dict) else {}
         age = telemetry.get("watchdog_safe_activity_age_seconds")
         if not isinstance(age, (int, float)):
             age = telemetry.get("last_activity_age_seconds")
+        if not isinstance(age, (int, float)):
+            age = activity.get("watchdog_safe_activity_age_seconds")
+        if not isinstance(age, (int, float)):
+            age = activity.get("age_seconds")
+        if not isinstance(age, (int, float)):
+            # Fall back to timestamp derivation if numeric age is absent
+            ts_str = (
+                activity.get("last_task_activity_at")
+                or (activity.get("watchdog_safe") or {}).get("last_activity_at")
+                or activity.get("last_meaningful_progress_at")
+                or activity.get("last_activity_at")
+                or telemetry.get("last_task_activity_at")
+                or telemetry.get("watchdog_safe_activity_at")
+                or telemetry.get("last_activity_at")
+                or proj.get("last_task_activity_at")
+            )
+            if ts_str:
+                ts_dt = parse_utc(ts_str)
+                if ts_dt is not None:
+                    current_now = parse_utc(now) if now is not None else utc_now()
+                    if current_now is not None:
+                        age = (current_now - ts_dt).total_seconds()
         if not isinstance(age, (int, float)):
             continue  # fail closed: unknown task-evidence age is not a stall
         stale_after = max(

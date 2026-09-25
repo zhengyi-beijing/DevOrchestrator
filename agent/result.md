@@ -1554,3 +1554,30 @@ Remediated all findings from Technical Review Round 2 against commit bd46b79:
    - Candidate test collection isolation verified (0 tests collected without DEVORCH_CANDIDATE_TESTS=1).
    - compileall and git diff --check clean.
    - Knowledge graph updated via graphify update . (5993 nodes, 16787 edges, 246 communities).
+
+
+### P16.10 Technical Review Remediation Round 3 (2026-09-25)
+
+Closed both concrete BLOCKING review findings from `ai_review:rereview:37165140-9dbb-4b85-947b-dd4be5fa0549` on HEAD `3f705fd`:
+1. Finding 1 (Stall detector fail-closed telemetry staleness & false-running regression failure):
+   - In `src/dev_orchestrator/incidents/harvesting.py`, updated `_detect_orchestrator_alive_task_stalled` to derive activity age from multiple telemetry metrics (`telemetry.watchdog_safe_activity_age_seconds`, `last_activity_age_seconds`, `activity.watchdog_safe_activity_age_seconds`, `activity.age_seconds`), or fallback timestamp age difference against `now` / `utc_now()`. Inspected `task_active` from both top-level and nested `activity`.
+   - In `tests_py/test_p1610_false_running_regression.py`, aligned snapshot fixture with `task_active: False` and `telemetry` age metrics, passed `now=eval_now` to `harvest_tick`, and added `test_stalled_detector_accepts_absent_age_as_stale_by_timestamp` verifying fallback timestamp age derivation without numeric telemetry.
+2. Finding 2 (Sticky Reviewer Owner Gate & Lifecycle Override):
+   - In `src/dev_orchestrator/control/surface.py`:
+     - Updated `latest_owner_gate` to import `_latest` from `lifecycle_projection`, compute consumed reviews from `rereview_of` references, check the latest review via `_latest(reviews, project_id)`, and require unconsumed `completed` status with `decision == "owner_gate"`.
+     - Scoped `OWNER_GATE` lifecycle override in both `project_identity` and `project_control_view` to exclude active running lifecycles (`EXECUTING`, `REVIEWING`, `PLANNING`, etc.) and terminal states (`DONE`, `COMPLETED`, `TERMINAL`).
+   - In `tests_py/test_p1610_owner_gate_and_attribution.py`:
+     - Added 4 dedicated regression tests:
+       - `test_reviewer_owner_gate_recognized`
+       - `test_reviewer_owner_gate_not_sticky_after_later_next_review`
+       - `test_reviewer_owner_gate_not_sticky_when_consumed_by_rereview`
+       - `test_reviewer_owner_gate_scoped_out_for_executing_and_terminal`
+3. Verification:
+   - 68 focused tests across 8 P16.10 test modules passing 100%.
+   - Adjacent suites: 43 passed (`test_lifecycle_projection.py`, `test_p169_*.py`, `test_control_commands.py`).
+   - Watchdog suites: 119 passed, 5 subtests passed (`test_watchdog*.py`).
+   - Coordinator and CLI suites: 117 passed, 18 subtests passed.
+   - Full repository regression: 1209 passed, 92 subtests passed in 476.57s (0 failures).
+   - Candidate test collection isolation verified (0 tests collected without `DEVORCH_CANDIDATE_TESTS=1`).
+   - `compileall` and `git diff --check` clean.
+   - Knowledge graph updated via `graphify update .` (6000 nodes, 16811 edges, 260 communities).

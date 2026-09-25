@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from dev_orchestrator.core.lifecycle_projection import _latest
 from dev_orchestrator.core.project_status import project_runtime_status
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.storage.json_store import read_json
@@ -39,15 +40,32 @@ def latest_owner_gate(runtime: Path | str, project_id: str) -> dict[str, Any] | 
         return result
     # Technical-review remediation exhaustion is also an owner gate. It is
     # durable in ai-reviewer.json and must participate in the same control
-    # identity as planner/watchdog gates.
+    # identity as planner/watchdog gates, subject to rereview_of consumption
+    # and latest-review-wins semantics.
     reviewer = read_json(rt / "ai-reviewer.json", {})
     reviews = reviewer.get("reviews") if isinstance(reviewer, dict) else None
-    review_matches = [value for value in (reviews or {}).values() if isinstance(value, dict) and value.get("project_id") == project_id and value.get("state") == "completed" and value.get("decision") == "owner_gate"]
-    if not review_matches:
+    if not isinstance(reviews, dict):
         return None
-    result = copy.deepcopy(max(review_matches, key=lambda value: str(value.get("completed_at") or value.get("started_at") or "")))
-    result["gate_source"] = "reviewer"
-    return result
+    consumed = {
+        str(row.get("rereview_of") or "")
+        for row in reviews.values()
+        if isinstance(row, dict) and row.get("project_id") == project_id
+    }
+    consumed.discard("")
+    latest_review = _latest(reviews, project_id)
+    if not isinstance(latest_review, dict):
+        return None
+    latest_review_id = str(latest_review.get("review_id") or "")
+    if latest_review_id in consumed:
+        return None
+    if (
+        str(latest_review.get("state") or "") == "completed"
+        and latest_review.get("decision") == "owner_gate"
+    ):
+        result = copy.deepcopy(latest_review)
+        result["gate_source"] = "reviewer"
+        return result
+    return None
 
 
 _latest_owner_gate = latest_owner_gate
@@ -60,6 +78,20 @@ def project_identity(snapshot: dict[str, Any], runtime_root: Path | str) -> dict
     git = projected.get("git") if isinstance(projected.get("git"), dict) else {}
     telemetry = projected.get("telemetry") if isinstance(projected.get("telemetry"), dict) else {}
     gate = _latest_owner_gate(runtime, project_id)
+    active_lifecycles = {
+        "EXECUTING", "REVIEWING", "PLANNING", "REVIEWING_PLAN",
+        "APPLYING_PLAN", "REMEDIATING_PLAN", "DONE", "COMPLETED", "TERMINAL"
+    }
+    if (
+        isinstance(gate, dict)
+        and projected.get("lifecycle_state") not in active_lifecycles
+        and str(projected.get("state") or "").upper() not in {"DONE", "COMPLETED", "TERMINAL"}
+    ):
+        if gate.get("gate_source") == "reviewer":
+            if str(gate.get("state") or "") == "completed" and gate.get("decision") == "owner_gate":
+                projected["lifecycle_state"] = "OWNER_GATE"
+        elif str(gate.get("state") or "") in {"owner_gate", "completed"}:
+            projected["lifecycle_state"] = "OWNER_GATE"
     binding = ConversationControlStore(runtime).runtime_record_for_project(project_id)
     if binding is None:
         route = projected.get("conversation_binding")
@@ -128,8 +160,20 @@ def project_control_view(
     projected = project_runtime_status(snapshot, runtime)
     project_id = str(projected.get("project_id") or projected.get("id") or "")
     gate = _latest_owner_gate(runtime, project_id)
-    if isinstance(gate, dict) and str(gate.get("state") or "") in {"owner_gate", "completed"}:
-        projected["lifecycle_state"] = "OWNER_GATE"
+    active_lifecycles = {
+        "EXECUTING", "REVIEWING", "PLANNING", "REVIEWING_PLAN",
+        "APPLYING_PLAN", "REMEDIATING_PLAN", "DONE", "COMPLETED", "TERMINAL"
+    }
+    if (
+        isinstance(gate, dict)
+        and projected.get("lifecycle_state") not in active_lifecycles
+        and str(projected.get("state") or "").upper() not in {"DONE", "COMPLETED", "TERMINAL"}
+    ):
+        if gate.get("gate_source") == "reviewer":
+            if str(gate.get("state") or "") == "completed" and gate.get("decision") == "owner_gate":
+                projected["lifecycle_state"] = "OWNER_GATE"
+        elif str(gate.get("state") or "") in {"owner_gate", "completed"}:
+            projected["lifecycle_state"] = "OWNER_GATE"
     identity = project_identity(projected, runtime)
     owner = OwnerControlStore(runtime).project_state(project_id)
     conversations = ConversationControlStore(runtime)

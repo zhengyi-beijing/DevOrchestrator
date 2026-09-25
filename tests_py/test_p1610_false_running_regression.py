@@ -81,6 +81,7 @@ class TestFalseRunningRegression(unittest.TestCase):
             "lifecycle_state": "REVIEW_FAILED",
             "state": "REVIEW_FAILED",
             "repo_path": str(self.repo),
+            "task_active": False,
             "worker": {"state": "idle", "pid": None, "process_alive": False},
             "activity": {
                 "task_active": False,
@@ -92,6 +93,10 @@ class TestFalseRunningRegression(unittest.TestCase):
                     "repo_root_fingerprint": repo_fp,
                     "last_activity_at": "2026-09-25T08:00:00Z",
                 },
+            },
+            "telemetry": {
+                "watchdog_safe_activity_age_seconds": 7200,
+                "last_activity_age_seconds": 7200,
             },
             "git": {"head": self.head, "branch": "main", "dirty": False},
             "watchdog": {},
@@ -190,6 +195,52 @@ class TestFalseRunningRegression(unittest.TestCase):
             summary=summary,
             planner=fake_planner,
             reviewer=fake_reviewer,
+            now=eval_now,
+        )
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["classification"], "ORCHESTRATOR_ALIVE_TASK_STALLED")
+
+    def test_stalled_detector_accepts_absent_age_as_stale_by_timestamp(self):
+        """Verify harvesting._detect_orchestrator_alive_task_stalled derives age
+        from activity/watchdog_safe timestamps when numeric telemetry age is absent.
+        """
+        import hashlib
+        from dev_orchestrator.core.watchdog import canonical_path
+        repo_fp = hashlib.sha256(canonical_path(str(self.repo)).encode("utf-8")).hexdigest()[:16]
+        snapshot_no_telemetry = {
+            "project_id": self.project_id,
+            "lifecycle_state": "REVIEW_FAILED",
+            "state": "REVIEW_FAILED",
+            "repo_path": str(self.repo),
+            "worker": {"state": "idle", "pid": None, "process_alive": False},
+            "activity": {
+                "task_active": False,
+                "task_progressing": False,
+                "last_task_activity_at": "2026-09-25T08:00:00Z",
+                "last_meaningful_progress_at": "2026-09-25T08:00:00Z",
+                "watchdog_safe": {
+                    "repo_scope": "canonical",
+                    "repo_root_fingerprint": repo_fp,
+                    "last_activity_at": "2026-09-25T08:00:00Z",
+                },
+            },
+            # No telemetry key at all
+            "git": {"head": self.head, "branch": "main", "dirty": False},
+            "watchdog": {},
+        }
+        fake_planner = MagicMock()
+        fake_planner.has_live_role.return_value = False
+        fake_reviewer = MagicMock()
+        fake_reviewer.has_live_role.return_value = False
+        summary = {"projects": [snapshot_no_telemetry]}
+        eval_now = datetime.fromisoformat("2026-09-25T10:00:00+00:00")
+        captured = harvest_tick(
+            self.runtime_root,
+            config=self.config_data,
+            summary=summary,
+            planner=fake_planner,
+            reviewer=fake_reviewer,
+            now=eval_now,
         )
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0]["classification"], "ORCHESTRATOR_ALIVE_TASK_STALLED")
