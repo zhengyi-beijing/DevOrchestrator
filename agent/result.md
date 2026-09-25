@@ -1440,3 +1440,41 @@ Externally coordinated. DevOrchestrator was owner-paused throughout
      - Clean `compileall` and `git diff --check`.
      - Knowledge graph refreshed via `graphify update .`: 5722 nodes, 16076 edges, 263 communities.
 - Preserved handoff: P16.10 Automatic Failure Harvesting & Regression Promotion (`agent/next.md`). DevOrchestrator remained owner-paused; no P16.10 implementation attempted.
+
+## P16.10 Automatic Failure Harvesting & Regression Promotion (2026-09-25)
+
+- Implemented restart-safe incident packet store under `runtime/incident-packets/` (`src/dev_orchestrator/incidents/store.py`):
+  - Atomic commit protocol via `TransactionIntent` with single-point-of-commit index mutation and automatic reconciliation on open/tick (`committed_confirmed`, `reapplied`, `superseded_txn`, `payload_unverified`).
+  - Strict append-only family recurrence: duplicate fingerprints increment recurrence count and append bounded evidence references without creating duplicate packets.
+  - Fail-closed corruption quarantine with degraded memory state.
+- Semantic incident fingerprinting (`src/dev_orchestrator/incidents/fingerprint.py`):
+  - Normalized semantic failure hashing strictly over allowlisted semantic fields; volatile keys (timestamps, ages, UUIDs, PIDs, paths) rejected fail-closed.
+- Automated failure harvesting detectors in `harvest_tick` (`src/dev_orchestrator/incidents/harvesting.py`):
+  - 8 named detectors: `watchdog_recovery`, `actionable_execution_loss`, `unconsumed_plan_or_review`, `launch_gap`, `restart_reconcile_outcome_change`, `recovery_cycle_exhaustion_or_livelock`, `control_only_intervention`, and `orchestrator_alive_task_stalled`.
+  - Guarded invocation in daemon tick (`src/dev_orchestrator/daemon.py`).
+- Fail-closed owner-gate authority resolution (`src/dev_orchestrator/incidents/owner_gate.py`):
+  - Surfaces `latest_owner_gate` from watchdog or planner ledgers, evaluates `OwnerControlStore` pause state, and resolves pending gate authority.
+- 3-Role liveness resolution (`src/dev_orchestrator/incidents/liveness.py`):
+  - Resolves Worker, Planner, and Reviewer liveness independently.
+  - Classifies dead only when all required sources are readable and negative; any unreadable/missing source yields unknown.
+- Progress obligation resolution (`src/dev_orchestrator/incidents/obligations.py`):
+  - Differentiates legal wait states (pauses, declared external waits, startup grace, pending owner gates) from silent stalls.
+- Truthful task status and activity distinction (`src/dev_orchestrator/core/project_status.py`):
+  - Exposes `system_alive`, `task_active`, `task_progressing`, and `incident_metrics` (`control_only_interventions`, `target_control_only_interventions: 0`, `incidents_captured`, `recurrence_count`, `candidates_generated`, `promotions_settled`).
+  - Normalizes `last_task_activity_at` separately from `last_meaningful_progress_at`; daemon heartbeats and watchdog self-writes do not count as meaningful task progress.
+- Operator-invoked, destination-free staged candidate regression promotion pipeline:
+  - Candidates synthesized in runtime store (`generate_candidate`), materialized strictly into git-excluded `tests_candidate/` of verified DevOrchestrator owner (`materialize_candidate`).
+  - Five executable gates: reproduction, discrimination, stability, isolation, deduplication.
+  - Immutable `pre_review_digest` computed solely over candidate content SHA256 and the 5 executable gate results.
+  - Independent review gate binds to `pre_review_digest` without modifying executable snapshots.
+  - Promotion (`promote_candidate`) verifies clean tree, HEAD/branch match, 6 passed gates, writes only new files into `tests_py/` with rollback on failure.
+- New CLI commands in `src/dev_orchestrator/cli.py`:
+  - `incident-list`, `incident-show`, `candidate-list`, `candidate-evaluate`, `candidate-review`, `candidate-materialize`, `candidate-promote`.
+- Reproduced 2026-09-25 false-running incident regression:
+  - Fresh heartbeats with `REVIEW_FAILED` and dead roles correctly diagnosed as `orchestrator_alive_task_stalled`, status reflects `system_alive=True`, `task_active=False`, `task_progressing=False`, and enters bounded recovery.
+- Verification:
+  - 45 focused tests across 7 P16.10 test modules passing 100%.
+  - 1186 full repository regression tests passing, 92 subtests passing, 0 failures.
+  - Candidate test collection isolation verified (0 tests collected without `DEVORCH_CANDIDATE_TESTS=1`).
+  - `compileall` and `git diff --check` clean.
+  - Knowledge graph updated via `graphify update .` (5956 nodes, 16691 edges, 260 communities).

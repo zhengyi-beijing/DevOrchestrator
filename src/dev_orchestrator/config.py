@@ -788,6 +788,7 @@ def _normalize_project(project: Any, index: int, config_path: Path) -> dict[str,
         or _direct_planner_ready(normalized)
         or (isinstance(normalized.get("reviewer_harness"), dict) and normalized["reviewer_harness"].get("enabled") is True)
     )
+    normalized["regression_owner"] = bool(project.get("regression_owner", False))
     return normalized
 
 
@@ -889,6 +890,17 @@ def load_projects_config(path: Path | str) -> dict[str, Any]:
     raw_mobile = data.get("mobile_gateway")
     if raw_mobile is not None:
         data["mobile_gateway"] = _normalize_mobile_gateway(raw_mobile, config_path)
+    raw_regression_owner = data.get("regression_owner")
+    if raw_regression_owner is not None:
+        if isinstance(raw_regression_owner, str):
+            data["regression_owner"] = {"project_id": raw_regression_owner.strip()}
+        elif isinstance(raw_regression_owner, dict):
+            pid = raw_regression_owner.get("project_id")
+            if pid is not None and not isinstance(pid, str):
+                raise ValueError("config {0} regression_owner.project_id must be a string".format(config_path))
+            data["regression_owner"] = dict(raw_regression_owner)
+        else:
+            raise ValueError("config {0} regression_owner must be a string or object".format(config_path))
     return data
 
 

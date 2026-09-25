@@ -1,6 +1,7 @@
 """Stateless local control-command inbox for project-scoped actions."""
 from __future__ import annotations
 
+import copy
 import hashlib
 from pathlib import Path
 import re
@@ -373,8 +374,14 @@ class ControlCommandCoordinator:
                 reviewer_state=reviewer_state,
             )["projects"][0]
         valid, reason, observed = validate_expected(record.get("expected"), validation_snapshot, self.runtime_root)
+        record = {
+            **record,
+            "observed": observed,
+            "pre_command_identity": copy.deepcopy(observed),
+            "project_identity": copy.deepcopy(observed),
+        }
         if not valid:
-            return self._blocked(command_id, project_id, action, reason, now, {**record, "observed": observed})
+            return self._blocked(command_id, project_id, action, reason, now, record)
         target = record.get("target") if isinstance(record.get("target"), dict) else {}
         gate_id = _nonblank(target.get("gate_id"))
         if action == "approve_owner_gate" and gate_id != _nonblank(observed.get("gate_id")):

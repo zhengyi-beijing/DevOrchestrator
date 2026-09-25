@@ -41,6 +41,7 @@ DIAGNOSIS_CODES = (
     "readiness_not_ready_to_run",
     "recovery_budget_exhausted",
     "recovery_livelock_detected",
+    "orchestrator_alive_task_stalled",
     "unknown",
 )
 
@@ -371,6 +372,20 @@ def classify_evidence(evidence: dict[str, Any], assessment: Any) -> Diagnosis:
     # Worker.state from the executor ledger is not used here because it may be stale from a
     # prior EXECUTING run and would otherwise cause spurious process_dead during PLANNING /
     # REVIEWING_PLAN / APPLYING_PLAN / REVIEWING.
+    if (
+        getattr(assessment, "stall_classification", None) == "orchestrator_alive_task_stalled"
+        or bool(evidence.get("orchestrator_alive_task_stalled"))
+    ):
+        return Diagnosis(
+            code="orchestrator_alive_task_stalled",
+            confidence=1.0,
+            reason="daemon continues ticking but all roles are dead and task progress is stalled",
+            recommended_action="route bounded recovery through safe continue or retry",
+            owner_gate_required=False,
+            evidence=evidence,
+            evidence_hash=ev_hash,
+        )
+
     worker_active = lifecycle in WORKER_EXPECTED_LIFECYCLE_STATES
 
     # READY_TO_RUN is a normal execution-launch boundary, not an owner gate.

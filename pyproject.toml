@@ -17,3 +17,7 @@ dev-orchestrator = "dev_orchestrator.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests_py"]
+norecursedirs = ["benchmark", "tests_candidate"]

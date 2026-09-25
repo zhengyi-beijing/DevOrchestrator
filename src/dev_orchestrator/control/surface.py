@@ -18,8 +18,9 @@ from .reconcile import resolve_reconcile_candidate, resolve_retry_candidate, res
 from .store import ConversationControlStore
 
 
-def _latest_owner_gate(runtime: Path, project_id: str) -> dict[str, Any] | None:
-    watchdog = read_json(runtime / "watchdog.json", {})
+def latest_owner_gate(runtime: Path | str, project_id: str) -> dict[str, Any] | None:
+    rt = Path(runtime)
+    watchdog = read_json(rt / "watchdog.json", {})
     projects = watchdog.get("projects") if isinstance(watchdog, dict) else None
     row = projects.get(project_id) if isinstance(projects, dict) else None
     gate = row.get("owner_gate") if isinstance(row, dict) else None
@@ -29,7 +30,7 @@ def _latest_owner_gate(runtime: Path, project_id: str) -> dict[str, Any] | None:
         if not result.get("state"):
             result["state"] = "owner_gate"
         return result
-    planner = read_json(runtime / "ai-planner.json", {})
+    planner = read_json(rt / "ai-planner.json", {})
     plans = planner.get("plans") if isinstance(planner, dict) else None
     matches = [value for value in (plans or {}).values() if isinstance(value, dict) and value.get("project_id") == project_id and value.get("state") == "owner_gate"]
     if not matches:
@@ -37,6 +38,9 @@ def _latest_owner_gate(runtime: Path, project_id: str) -> dict[str, Any] | None:
     result = copy.deepcopy(max(matches, key=lambda value: str(value.get("completed_at") or value.get("started_at") or "")))
     result["gate_source"] = "planner"
     return result
+
+
+_latest_owner_gate = latest_owner_gate
 
 
 def project_identity(snapshot: dict[str, Any], runtime_root: Path | str) -> dict[str, Any]:

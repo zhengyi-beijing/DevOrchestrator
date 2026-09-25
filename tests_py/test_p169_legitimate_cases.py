@@ -56,6 +56,8 @@ class TestLegitimateCases(unittest.TestCase):
             ]
         }
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
+        self.now_iso = datetime.now(timezone.utc).isoformat()
+        self.dummy_signals = (self.now_iso, "fp123", {"activity_evidence": "available", "sources": {}})
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -72,7 +74,7 @@ class TestLegitimateCases(unittest.TestCase):
                 "watchdog_safe": {
                     "repo_scope": "canonical",
                     "repo_root_fingerprint": unittest.mock.ANY,
-                    "last_activity_at": "2026-09-24T12:00:00Z",
+                    "last_activity_at": self.now_iso,
                 }
             },
         }
@@ -123,7 +125,7 @@ class TestLegitimateCases(unittest.TestCase):
         exec_file.write_text(json.dumps(exec_data), encoding="utf-8")
 
         watchdog = WatchdogCoordinator(self.runtime)
-        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        dummy_signals = self.dummy_signals
         with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
             snap = self._make_snapshot(state="READY_TO_RUN")
             ticks = watchdog.advance(self.config_path, {"projects": [snap]}, executor=executor)
@@ -169,7 +171,7 @@ class TestLegitimateCases(unittest.TestCase):
         exec_file.write_text(json.dumps(exec_data), encoding="utf-8")
 
         watchdog = WatchdogCoordinator(self.runtime)
-        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        dummy_signals = self.dummy_signals
         with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
             snap = self._make_snapshot(state="READY_TO_RUN")
             ticks = watchdog.advance(self.config_path, {"projects": [snap]}, executor=executor)
@@ -212,7 +214,7 @@ class TestLegitimateCases(unittest.TestCase):
         exec_file.write_text(json.dumps(exec_data), encoding="utf-8")
 
         watchdog = WatchdogCoordinator(self.runtime)
-        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        dummy_signals = self.dummy_signals
         with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
             snap = self._make_snapshot(state="READY_TO_RUN")
             ticks = watchdog.advance(self.config_path, {"projects": [snap]}, executor=executor)
@@ -266,7 +268,7 @@ class TestLegitimateCases(unittest.TestCase):
 
         # Fresh WatchdogCoordinator (after restart)
         watchdog = WatchdogCoordinator(self.runtime, ai_execution_port=mock_port)
-        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        dummy_signals = self.dummy_signals
         with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
             snap = self._make_snapshot(state="WORKER_RUNNING", worker_state="running", pid=99999)
             snap["broker_execution"] = {"state": "running", "request_id": "broker-handle-123"}
@@ -322,7 +324,7 @@ class TestLegitimateCases(unittest.TestCase):
 
         alive_probe = lambda p: True
         watchdog = WatchdogCoordinator(self.runtime, liveness_probe=alive_probe)
-        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        dummy_signals = self.dummy_signals
         with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
             snap = self._make_snapshot(state="WORKER_RUNNING", worker_state="running", pid=44444)
             snap["active_roles"] = ["worker"]
@@ -377,7 +379,7 @@ class TestLegitimateCases(unittest.TestCase):
         mock_port.status.return_value = {"status": "running"}
 
         watchdog = WatchdogCoordinator(self.runtime, ai_execution_port=mock_port)
-        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        dummy_signals = self.dummy_signals
         with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
             snap = self._make_snapshot(state="READY_TO_RUN", worker_state=None, pid=None)
             ticks = watchdog.advance(self.config_path, {"projects": [snap]}, executor=executor)

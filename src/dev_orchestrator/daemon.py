@@ -186,6 +186,20 @@ def _run_orchestration_tick(
             supervisor.advance(config, supervisor_summary, executor=executor, watchdog=watchdog)
         except Exception as _sup_exc:
             supervisor_error = str(_sup_exc)
+    try:
+        from dev_orchestrator.incidents import harvest_tick
+        harvest_tick(
+            runtime_root=runtime,
+            config=config if isinstance(config, dict) else None,
+            summary=projected,
+            executor=executor,
+            watchdog=watchdog,
+            planner=planner_obj,
+            reviewer=reviewer,
+        )
+    except Exception as _harv_exc:
+        projected = dict(projected) if isinstance(projected, dict) else {"projects": [], "summary": projected}
+        projected["_harvesting_tick_error"] = str(_harv_exc)
     if job_recovery is not None:
         try:
             job_recovery.advance()

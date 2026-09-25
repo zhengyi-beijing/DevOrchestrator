@@ -368,6 +368,24 @@ class AIPlannerCoordinator:
         with self._lock:
             return copy.deepcopy(self._load_state())
 
+    def has_live_role(self, project_id: str) -> bool | None:
+        """Return True if any active thread exists for project, False if idle, None on error."""
+        try:
+            with self._lock:
+                state = self._load_state()
+                plans = state.get("plans", {})
+                active_plan_ids = {
+                    pid for pid, rec in plans.items()
+                    if isinstance(rec, dict) and str(rec.get("project_id") or "") == str(project_id)
+                    and rec.get("state") in _ACTIVE_STATES
+                }
+                for pid, thread in self._threads.items():
+                    if pid in active_plan_ids and thread.is_alive():
+                        return True
+                return False
+        except Exception:
+            return None
+
     def _wait_for_launch_barrier(self, plan_id: str, project_id: str) -> bool:
         while True:
             with self._lock:

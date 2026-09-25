@@ -1296,6 +1296,140 @@ def cmd_review_findings(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_incident_list(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.incidents.store import load_incident_store
+    store = load_incident_store(runtime)
+    families = store.index.get("families", {})
+    records = []
+    project_filter = getattr(args, "project_id", None)
+    for fam_id, fam in families.items():
+        if project_filter and fam.get("project_id") != project_filter:
+            continue
+        records.append(fam)
+    records.sort(key=lambda r: (r.get("last_seen_at") or "", r.get("family_id") or ""), reverse=True)
+    fmt = getattr(args, "format", "json") or "json"
+    if fmt == "json":
+        sys.stdout.write(json.dumps(records, indent=2, ensure_ascii=False) + "\n")
+    else:
+        for r in records:
+            sys.stdout.write(f"{r.get('family_id')} | {r.get('project_id')} | {r.get('classification')} | recurrences={r.get('recurrence_count', 1)} | last_seen={r.get('last_seen_at')}\n")
+    return 0
+
+
+def cmd_incident_show(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.incidents.store import load_incident_store
+    store = load_incident_store(runtime)
+    family_id = args.family_id
+    families = store.index.get("families", {})
+    family = families.get(family_id)
+    if not family:
+        matching = [
+            f for f in families.values()
+            if f.get("family_id") == family_id or f.get("packet_id") == family_id or f.get("fingerprint") == family_id
+        ]
+        if matching:
+            family = matching[0]
+    if not family:
+        raise CliError(f"incident family or packet '{family_id}' not found")
+
+    packet_id = family.get("packet_id")
+    packet_data = None
+    if packet_id:
+        p_path = store.packets_dir / f"{packet_id}.json"
+        if p_path.is_file():
+            try:
+                packet_data = json.loads(p_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+    out = {
+        "family": family,
+        "packet": packet_data,
+    }
+    sys.stdout.write(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_candidate_list(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.incidents.store import load_incident_store
+    store = load_incident_store(runtime)
+    candidates = store.index.get("candidates", {})
+    records = []
+    project_filter = getattr(args, "project_id", None)
+    for cand_id, cand in candidates.items():
+        if project_filter and cand.get("project_id") != project_filter:
+            continue
+        records.append(cand)
+    records.sort(key=lambda r: (r.get("created_at") or "", r.get("candidate_id") or ""), reverse=True)
+    fmt = getattr(args, "format", "json") or "json"
+    if fmt == "json":
+        sys.stdout.write(json.dumps(records, indent=2, ensure_ascii=False) + "\n")
+    else:
+        for r in records:
+            sys.stdout.write(f"{r.get('candidate_id')} | {r.get('status')} | pre_review={r.get('pre_review_digest')} | {r.get('created_at')}\n")
+    return 0
+
+
+def cmd_candidate_evaluate(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.incidents.evaluation import evaluate_promotion
+    try:
+        result = evaluate_promotion(runtime, args.candidate_id)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_candidate_review(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.incidents.review import record_candidate_review
+    try:
+        result = record_candidate_review(
+            runtime,
+            candidate_id=args.candidate_id,
+            reviewer_id=args.reviewer_id,
+            verdict=args.verdict,
+            notes=getattr(args, "notes", "") or "",
+        )
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_candidate_materialize(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.incidents.candidate import materialize_candidate
+    config_path = resolve_config_path(args.config) if getattr(args, "config", None) else None
+    try:
+        result = materialize_candidate(runtime, args.candidate_id, config_path=config_path)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_candidate_promote(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.incidents.promotion import promote_candidate
+    config_path = resolve_config_path(args.config) if getattr(args, "config", None) else None
+    try:
+        result = promote_candidate(
+            runtime,
+            candidate_id=args.candidate_id,
+            config_path=config_path,
+            expected_head=getattr(args, "expected_head", None),
+            expected_branch=getattr(args, "expected_branch", None),
+        )
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+    return 0 if result.get("promoted") else 1
+
+
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
@@ -1600,6 +1734,44 @@ def build_parser() -> argparse.ArgumentParser:
     review_findings.add_argument("--format", choices=("json", "sarif"), default="json", help="output format")
     review_findings.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
+    incident_list = sub.add_parser("incident-list", help="list harvested incident families")
+    incident_list.add_argument("--project-id", default=None, help="filter by project ID")
+    incident_list.add_argument("--format", choices=("json", "text"), default="json", help="output format")
+    incident_list.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    incident_show = sub.add_parser("incident-show", help="show details of an incident family")
+    incident_show.add_argument("family_id", help="incident family ID or packet ID")
+    incident_show.add_argument("--format", choices=("json", "text"), default="json", help="output format")
+    incident_show.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    candidate_list = sub.add_parser("candidate-list", help="list synthesized regression candidates")
+    candidate_list.add_argument("--project-id", default=None, help="filter by project ID")
+    candidate_list.add_argument("--format", choices=("json", "text"), default="json", help="output format")
+    candidate_list.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    candidate_evaluate = sub.add_parser("candidate-evaluate", help="evaluate a candidate against the 5 executable gates")
+    candidate_evaluate.add_argument("candidate_id", help="candidate ID")
+    candidate_evaluate.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    candidate_review = sub.add_parser("candidate-review", help="record independent review for a candidate")
+    candidate_review.add_argument("candidate_id", help="candidate ID")
+    candidate_review.add_argument("--reviewer-id", required=True, help="independent reviewer identity")
+    candidate_review.add_argument("--verdict", choices=("ACCEPTED", "REJECTED"), required=True, help="review verdict")
+    candidate_review.add_argument("--notes", default="", help="review notes")
+    candidate_review.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    candidate_materialize = sub.add_parser("candidate-materialize", help="materialize a candidate into staging tests_candidate/")
+    candidate_materialize.add_argument("candidate_id", help="candidate ID")
+    candidate_materialize.add_argument("--config", default=None, help="path to projects.json")
+    candidate_materialize.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    candidate_promote = sub.add_parser("candidate-promote", help="promote a validated and reviewed candidate to regression owner tests_py/")
+    candidate_promote.add_argument("candidate_id", help="candidate ID")
+    candidate_promote.add_argument("--config", default=None, help="path to projects.json")
+    candidate_promote.add_argument("--expected-head", default=None, help="expected git HEAD of regression owner")
+    candidate_promote.add_argument("--expected-branch", default=None, help="expected git branch of regression owner")
+    candidate_promote.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     return parser
 
 
@@ -1631,6 +1803,13 @@ _COMMANDS = {
     "review-status": cmd_review_status,
     "review-reconcile": cmd_review_reconcile,
     "review-findings": cmd_review_findings,
+    "incident-list": cmd_incident_list,
+    "incident-show": cmd_incident_show,
+    "candidate-list": cmd_candidate_list,
+    "candidate-evaluate": cmd_candidate_evaluate,
+    "candidate-review": cmd_candidate_review,
+    "candidate-materialize": cmd_candidate_materialize,
+    "candidate-promote": cmd_candidate_promote,
     "monitor": cmd_monitor,
     "web": cmd_web,
     "daemon": cmd_daemon,

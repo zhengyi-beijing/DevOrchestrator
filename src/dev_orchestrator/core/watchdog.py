@@ -93,12 +93,15 @@ WATCHDOG_OWNED_REPO_GLOBS = (
 
 WATCHDOG_OWNED_RUNTIME_PATHS = (
     "watchdog.json",
+    "incident-packets",
 )
 
 WATCHDOG_OWNED_RUNTIME_GLOBS = (
     "watchdog.json.corrupt-*",
     "control/inbox/wd-*.json",
     "control/history/wd-*.json",
+    "incident-packets/*",
+    "incident-packets/**/*",
 )
 
 FINGERPRINT_FIELDS = frozenset({
@@ -246,6 +249,8 @@ def is_watchdog_owned_path(
                 return True
         if path_contains(runtime_root, c_cand):
             try:
+                if path_contains(Path(runtime_root) / "incident-packets", c_cand):
+                    return True
                 rel_rt = os.path.relpath(c_cand, c_rt).replace("\\", "/")
                 for g in WATCHDOG_OWNED_RUNTIME_GLOBS:
                     if _glob_match_no_cross(rel_rt, g):
@@ -838,6 +843,11 @@ class StallAssessment:
     active_execution: bool
     recovery_epoch: dict[str, Any] | None
     last_progress_at: str | None
+    last_task_activity_at: str | None = None
+    last_meaningful_progress_at: str | None = None
+    progress_obligation: dict[str, Any] | None = None
+    role_liveness: dict[str, Any] | None = None
+    stall_classification: str | None = None
 
 
 def evaluate_stall(
@@ -859,6 +869,7 @@ def evaluate_stall(
     active_execution = _has_active_execution(snapshot, executor_state)
     if lifecycle_state == "READY_TO_RUN" and not active_execution:
         last_progress_at, progress_fingerprint, signal_sources = _ready_launch_gap_signals(signals)
+
     monitored = lifecycle_state in ACTIVE_LIFECYCLE_STATES and not (
         lifecycle_state == "READY_TO_RUN" and active_execution
     )
@@ -878,6 +889,29 @@ def evaluate_stall(
             if monitored and no_progress_seconds >= threshold_seconds:
                 breached = True
 
+    last_meaningful_progress_at = last_progress_at
+    last_task_activity_at = signal_sources.get("last_task_activity_at") or last_progress_at
+
+    progress_obligation = None
+    role_liveness = None
+    stall_classification = None
+
+    if runtime_root is not None:
+        try:
+            from dev_orchestrator.incidents.obligations import resolve_progress_obligation
+            from dev_orchestrator.incidents.liveness import resolve_role_liveness
+            from dev_orchestrator.incidents.owner_gate import resolve_owner_gate_authority
+
+            progress_obligation = resolve_progress_obligation(snapshot)
+            role_liveness = resolve_role_liveness(runtime_root, project_id, snapshot, executor=executor_state)
+            gate_auth = resolve_owner_gate_authority(runtime_root, snapshot)
+
+            if breached and role_liveness.get("all_dead") and not progress_obligation.get("legal_wait"):
+                if not gate_auth.get("pending") and not gate_auth.get("paused") and gate_auth.get("resolved"):
+                    stall_classification = "orchestrator_alive_task_stalled"
+        except Exception:
+            pass
+
     return StallAssessment(
         monitored=monitored,
         lifecycle_state=lifecycle_state,
@@ -892,6 +926,11 @@ def evaluate_stall(
         active_execution=active_execution,
         recovery_epoch=resolve_recovery_epoch(snapshot, executor_state, runtime_root=runtime_root),
         last_progress_at=last_progress_at,
+        last_task_activity_at=last_task_activity_at,
+        last_meaningful_progress_at=last_meaningful_progress_at,
+        progress_obligation=progress_obligation,
+        role_liveness=role_liveness,
+        stall_classification=stall_classification,
     )
 
 
@@ -2000,6 +2039,7 @@ class WatchdogCoordinator:
         if diag_code not in (
             "agent_stalled", "process_dead", "reviewer_failed",
             "plan_reviewer_failed", "planner_failed", "ready_to_run_unlaunched",
+            "orchestrator_alive_task_stalled",
         ):
             self._emit_owner_gate_once(pid, attempt_record, f"diagnosis_{diag_code}_requires_owner")
             return
@@ -2091,6 +2131,25 @@ class WatchdogCoordinator:
                 return
             recovery_action = "continue"
             recovery_target = {}
+
+        if diag_code == "orchestrator_alive_task_stalled":
+            from dev_orchestrator.incidents.owner_gate import resolve_owner_gate_authority
+            gate_auth = resolve_owner_gate_authority(self.runtime_root, snapshot)
+            if gate_auth.get("pending") or gate_auth.get("paused") or not gate_auth.get("resolved"):
+                self._emit_owner_gate_once(pid, attempt_record, "orchestrator_alive_owner_gate_pending")
+                return
+            if current_lifecycle in {"REVIEW_FAILED", "REMEDIATE_READY"}:
+                from dev_orchestrator.control.reconcile import resolve_retry_candidate
+                retry_candidate, retry_reason = resolve_retry_candidate(snapshot, self.runtime_root, project_config)
+                if retry_candidate is not None:
+                    recovery_action = "retry"
+                    recovery_target = {"target_id": retry_candidate["target_id"]}
+                else:
+                    recovery_action = "continue"
+                    recovery_target = {}
+            else:
+                recovery_action = "continue"
+                recovery_target = {}
 
         if diag_code == "agent_stalled":
             # R3-F1: agent_stalled recovery is only valid when the current snapshot lifecycle

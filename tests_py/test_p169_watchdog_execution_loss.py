@@ -66,6 +66,8 @@ class TestWatchdogExecutionLoss(unittest.TestCase):
             ]
         }
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
+        self.now_iso = datetime.now(timezone.utc).isoformat()
+        self.dummy_signals = (self.now_iso, "fp123", {"activity_evidence": "available", "sources": {}})
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -82,7 +84,7 @@ class TestWatchdogExecutionLoss(unittest.TestCase):
                 "watchdog_safe": {
                     "repo_scope": "canonical",
                     "repo_root_fingerprint": unittest.mock.ANY,
-                    "last_activity_at": "2026-09-24T12:00:00Z",
+                    "last_activity_at": self.now_iso,
                 }
             },
         }
@@ -143,7 +145,7 @@ class TestWatchdogExecutionLoss(unittest.TestCase):
         watchdog = WatchdogCoordinator(self.runtime, liveness_probe=dead_liveness_probe)
 
         # Mock collect_progress_signals to return valid available signals
-        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        dummy_signals = self.dummy_signals
         with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
             snap = self._make_snapshot(state="READY_TO_RUN")
             summary = {"projects": [snap]}
@@ -541,7 +543,7 @@ class TestWatchdogExecutionLoss(unittest.TestCase):
         dead_probe = lambda p: False
         watchdog = WatchdogCoordinator(self.runtime, liveness_probe=dead_probe)
 
-        dummy_signals = ("2026-09-24T12:05:00Z", "fp123", {"activity_evidence": "available", "sources": {}})
+        dummy_signals = self.dummy_signals
         with patch("dev_orchestrator.core.watchdog.collect_progress_signals", return_value=dummy_signals):
             # Tick 1: Watchdog detects execution loss, reconciles row, and enqueues continue command
             snap = self._make_snapshot(state="READY_TO_RUN", worker_state="not_started", pid=None)

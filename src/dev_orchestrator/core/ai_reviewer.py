@@ -705,6 +705,24 @@ class AIReviewerCoordinator:
         with self._lock:
             return copy.deepcopy(self._load_state())
 
+    def has_live_role(self, project_id: str) -> bool | None:
+        """Return True if any active thread exists for project, False if idle, None on error."""
+        try:
+            with self._lock:
+                state = self._load_state()
+                reviews = state.get("reviews", {})
+                active_review_ids = {
+                    rid for rid, rec in reviews.items()
+                    if isinstance(rec, dict) and str(rec.get("project_id") or "") == str(project_id)
+                    and rec.get("state") in _ACTIVE_STATES
+                }
+                for rid, thread in self._threads.items():
+                    if rid in active_review_ids and thread.is_alive():
+                        return True
+                return False
+        except Exception:
+            return None
+
     def enabled_project_ids(self, config_path: Path | str) -> frozenset[str]:
         config = load_projects_config(config_path)
         result = set()

@@ -381,6 +381,54 @@ def build_project_status(
     if epoch is not None:
         result["recovery_epoch"] = epoch
         result["recovery_epoch_id"] = epoch["id"]
+
+    system_alive = bool(daemon_state == "running" or pid is not None)
+    is_stalled = False
+    if watchdog_view is not None:
+        wd_state = str(watchdog_view.get("state") or "").lower()
+        if wd_state == "stalled" or watchdog_view.get("stall") is not None:
+            is_stalled = True
+
+    worker_obj = result.get("worker") if isinstance(result.get("worker"), dict) else {}
+    worker_alive = bool(worker_obj.get("process_alive"))
+    task_active = bool(worker_alive and not is_stalled)
+    task_progressing = bool(task_active and not is_stalled)
+
+    if is_stalled and str(result.get("status") or "").upper() in {"RUNNING", "WORKER_RUNNING", "EXECUTING"}:
+        result["status"] = "STALLED"
+
+    inc_file = runtime / "incident-packets" / "index.json"
+    inc_data = read_json(inc_file, {}) if inc_file.is_file() else {}
+    fams = inc_data.get("families") if isinstance(inc_data, dict) else {}
+    cands = inc_data.get("candidates") if isinstance(inc_data, dict) else {}
+
+    ctrl_only_count = sum(
+        1 for fam in fams.values()
+        if isinstance(fam, dict) and fam.get("classification") == "CONTROL_ONLY_INTERVENTION"
+    ) if isinstance(fams, dict) else 0
+
+    recurrence_sum = sum(
+        int(fam.get("recurrence_count", 1))
+        for fam in fams.values()
+        if isinstance(fam, dict)
+    ) if isinstance(fams, dict) else 0
+
+    promotions_count = sum(
+        1 for c in cands.values()
+        if isinstance(c, dict) and c.get("promoted") is True
+    ) if isinstance(cands, dict) else 0
+
+    result["system_alive"] = system_alive
+    result["task_active"] = task_active
+    result["task_progressing"] = task_progressing
+    result["incident_metrics"] = {
+        "control_only_interventions": ctrl_only_count,
+        "target_control_only_interventions": 0,
+        "incidents_captured": len(fams) if isinstance(fams, dict) else 0,
+        "recurrence_count": recurrence_sum,
+        "candidates_generated": len(cands) if isinstance(cands, dict) else 0,
+        "promotions_settled": promotions_count,
+    }
     return result
 
 
