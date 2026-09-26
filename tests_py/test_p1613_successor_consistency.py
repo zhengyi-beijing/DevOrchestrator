@@ -922,5 +922,230 @@ class BoundedRecoveryActuationTests(unittest.TestCase):
             row.get("owner_gate"), "a transient condition was gated to the owner")
 
 
+class _PlanningPort:
+    """Approves one bounded plan, so the real Planner can run end to end."""
+
+    def __init__(self):
+        self.requests = []
+
+    def execute(self, request):
+        from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
+
+        self.requests.append(request)
+        if request.role == "planner":
+            payload = json.dumps({
+                "task_id": request.task_run_id,
+                "summary": "Freeze a bounded implementation plan.",
+                "implementation_steps": ["Add the seam", "Implement the bounded change"],
+                "interfaces": ["Keep the public ABI stable"],
+                "validation": ["Run the focused tests", "Run the regression"],
+                "risks": ["Do not expand scope"],
+                "out_of_scope": ["No unrelated refactor"],
+            })
+            suffix = "plan"
+        else:
+            payload = json.dumps({"decision": "approve", "reason": "bounded and testable"})
+            suffix = "review"
+        return AIRoleResult(
+            request_id=request.request_id,
+            role_run_id=request.role_run_id,
+            status="succeeded",
+            output=payload,
+            dispatch_id="dispatch-" + suffix,
+            decision_id="decision-" + suffix,
+            execution_id="execution-" + suffix,
+            resource_context=ResourceContext("r-" + suffix, "p", "a", "m"),
+        )
+
+
+class ZeroTouchSuccessorHandoffEndToEndTests(unittest.TestCase):
+    """Acceptance 4, 5, 6, 7 and 8 across the real component boundary.
+
+    Every other P16.13 test calls the executor or the resolver directly. This one
+    drives the real WatchdogCoordinator, TransitionExecutor,
+    ControlCommandCoordinator and AIPlannerCoordinator in the order the daemon
+    tick runs them, starting from the matrix-B fault (an accepted NEXT_TASK
+    decision whose durable handoff was lost) and asserting that the successor
+    Planner starts with no owner command anywhere in the loop.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.runtime = root / "runtime"
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        # Predecessor P1 is COMPLETE; P2 is staged and named by the roadmap.
+        self.repo = _repo(root, roadmap_target="P2", current="P1")
+        (self.repo / "agent" / "next.md").write_bytes(
+            b"# P1 task\n\nStatus: **COMPLETE**\n"
+        )
+        _commit(self.repo, "predecessor complete")
+
+        self.project = {
+            "project_id": "p1",
+            "repo_path": str(self.repo),
+            "execution": {"engine": "aibroker"},
+            "ai_roles": {"planner": {
+                "enabled": True, "quality": "high", "review_quality": "high",
+                "review_independence": "resource",
+            }},
+            "watchdog": {"enabled": True, "auto_recovery": True,
+                         "no_progress_threshold_minutes": 1},
+        }
+        self.config_path = self.runtime / "projects.json"
+        self.config_path.write_text(
+            json.dumps({"projects": [self.project]}), encoding="utf-8")
+
+        # Matrix B: the reviewer's NEXT_TASK verdict was accepted, but the
+        # durable handoff never landed.
+        (self.runtime / "review-decisions.json").write_text(json.dumps({"decisions": {
+            "ai_review:d1": {
+                "project_id": "p1", "task_id": "P1", "disposition": "apply",
+                "decision": "next", "next_action": "next_task",
+                "request_id": "ai_review:d1",
+                "consumed_at": "2026-09-26T00:00:00+00:00",
+            },
+        }}), encoding="utf-8")
+
+        self.executor = TransitionExecutor(self.runtime)
+        self.port = _PlanningPort()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _snapshot(self):
+        """What the monitor would publish, with the authority overlaid."""
+        summary = {"projects": [{
+            "project_id": "p1", "repo_path": str(self.repo),
+            "state": "IDLE",
+            "next_title": "P1 task", "next_status": "**COMPLETE**",
+            "telemetry": {"task_id": "P1"},
+            "git": {"head": _git(self.repo, "rev-parse", "HEAD"),
+                    "branch": _git(self.repo, "rev-parse", "--abbrev-ref", "HEAD")},
+        }]}
+        return self.executor.overlay_lifecycle_authority(summary)
+
+    def _owner_commands(self):
+        """Any owner/continue command that reached the control plane."""
+        inbox = self.runtime / "control" / "inbox"
+        history = self.runtime / "control" / "history"
+        found = []
+        for base in (inbox, history):
+            if not base.exists():
+                continue
+            for path in base.glob("*.json"):
+                row = json.loads(path.read_text(encoding="utf-8"))
+                if str(row.get("source") or "") != "automatic_review_handoff":
+                    found.append({"path": path.name, "source": row.get("source"),
+                                  "action": row.get("action")})
+        return found
+
+    def _tick(self, watchdog, controls):
+        """One ordered tick: watchdog recovery, then control-plane actuation."""
+        snapshot_summary = self._snapshot()
+        watchdog.advance(str(self.config_path), snapshot_summary, executor=self.executor)
+        for thread in getattr(watchdog, "_threads", {}).values():
+            thread.join(timeout=10.0)
+        controls.advance(str(self.config_path), self._snapshot(), self.executor)
+
+    def test_lost_handoff_converges_and_starts_the_successor_planner(self):
+        from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
+        from dev_orchestrator.core.control_commands import ControlCommandCoordinator
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        planner = AIPlannerCoordinator(self.runtime, self.port)
+        controls = ControlCommandCoordinator(self.runtime, planner)
+        watchdog = WatchdogCoordinator(self.runtime, planner=planner)
+
+        # Acceptance 2: the lost handoff is a detected violation, not a
+        # terminal-settled complete project.
+        findings = {
+            item.code: item for item in evaluate_lifecycle_invariants(
+                snapshot=self._snapshot()["projects"][0],
+                executor_state=self.executor.state(),
+                decisions_state=json.loads(
+                    (self.runtime / "review-decisions.json").read_text(encoding="utf-8")),
+            )
+        }
+        self.assertFalse(findings["NEXT_TASK_WITHOUT_HANDOFF"].holds)
+        self.assertTrue(findings["NEXT_TASK_WITHOUT_HANDOFF"].recoverable)
+
+        self._tick(watchdog, controls)
+        for thread in getattr(planner, "_threads", {}).values():
+            thread.join(timeout=15.0)
+
+        # Acceptance 3: exactly one handoff was created automatically.
+        handoffs = [
+            row for row in self.executor.state()["executions"].values()
+            if isinstance(row, dict) and row.get("project_id") == "p1"
+            and row.get("next_task_id") == "P2"
+        ]
+        self.assertEqual(len(handoffs), 1, f"expected one handoff, got {len(handoffs)}")
+
+        # Acceptance 5: lineage is source=P1, target=P2.
+        self.assertEqual(handoffs[0]["source_task_id"], "P1")
+        self.assertEqual(handoffs[0]["target_task_id"], "P2")
+
+        # Acceptance 4: the successor Planner started with no owner continue.
+        plans = [
+            row for row in planner.state()["plans"].values()
+            if isinstance(row, dict) and row.get("project_id") == "p1"
+        ]
+        self.assertEqual(
+            len(plans), 1,
+            f"the successor Planner did not start automatically: {plans}",
+        )
+        self.assertEqual(plans[0].get("task_id"), "P2")
+        self.assertEqual(
+            self._owner_commands(), [],
+            "an owner command was required, so recovery was not zero-touch",
+        )
+
+        # Acceptance 5 (authority half): the handoff was consumed and the
+        # authority advanced to the successor, keeping the predecessor as source.
+        authority = self.executor.state()["lifecycle"]["p1"]
+        self.assertEqual(authority["current_task_id"], "P2")
+        self.assertEqual(authority["source_task_id"], "P1")
+        self.assertIsNone(authority.get("owner_gate"), "recovery stopped at an owner gate")
+        self.assertTrue(handoffs[0].get("handoff_consumed"))
+
+        # Acceptance 8: the repository actually advanced to the successor.
+        self.assertIn("P2", (self.repo / "agent" / "next.md").read_text(encoding="utf-8"))
+
+        # Acceptance 6: the lost-handoff violation is resolved afterwards.
+        after = {
+            item.code: item for item in evaluate_lifecycle_invariants(
+                snapshot=self._snapshot()["projects"][0],
+                executor_state=self.executor.state(),
+                decisions_state=json.loads(
+                    (self.runtime / "review-decisions.json").read_text(encoding="utf-8")),
+            )
+        }
+        unresolved = [code for code, item in after.items() if not item.holds]
+        self.assertEqual(
+            unresolved, [],
+            f"lifecycle invariants did not converge after the handoff: {unresolved}",
+        )
+
+        # Acceptance 7: repeated ticks are idempotent -- no second handoff, no
+        # second plan, no owner gate, no duplicate planner launch.
+        for _ in range(3):
+            self._tick(watchdog, controls)
+            for thread in getattr(planner, "_threads", {}).values():
+                thread.join(timeout=15.0)
+        self.assertEqual(
+            len([
+                row for row in self.executor.state()["executions"].values()
+                if isinstance(row, dict) and row.get("project_id") == "p1"
+                and row.get("next_task_id") == "P2"
+            ]), 1, "repeated ticks duplicated the handoff")
+        self.assertEqual(
+            len([
+                row for row in planner.state()["plans"].values()
+                if isinstance(row, dict) and row.get("project_id") == "p1"
+            ]), 1, "repeated ticks launched a duplicate Planner")
+        self.assertEqual(self._owner_commands(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
