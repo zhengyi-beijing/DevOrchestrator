@@ -1,120 +1,125 @@
-{
-  "schema_version": 1,
-  "tasks": [
-    {
-      "task_id": "P11x",
-      "successor": "P11b",
-      "successor_spec_path": "agent/staged/P11b.md"
-    },
-    {
-      "task_id": "P11b",
-      "successor": "P11c",
-      "successor_spec_path": "agent/staged/P11c.md"
-    },
-    {
-      "task_id": "P11c",
-      "successor": "P11d",
-      "successor_spec_path": "agent/staged/P11d.md"
-    },
-    {
-      "task_id": "P11d",
-      "successor": "P12",
-      "successor_spec_path": "agent/staged/P12.md"
-    },
-    {
-      "task_id": "P12",
-      "successor": null,
-      "successor_spec_path": null
-    },
-    {
-      "task_id": "P12.5",
-      "successor": "P12.6",
-      "successor_spec_path": "agent/staged/P12.6.md"
-    },
-    {
-      "task_id": "P12.6",
-      "successor": "P12.7",
-      "successor_spec_path": "agent/staged/P12.7.md"
-    },
-    {
-      "task_id": "P12.7",
-      "successor": "P13",
-      "successor_spec_path": "agent/staged/P13.md"
-    },
-    {
-      "task_id": "P13",
-      "successor": "P13.5",
-      "successor_spec_path": "agent/staged/P13.5.md"
-    },
-    {
-      "task_id": "P13.5",
-      "successor": "P14",
-      "successor_spec_path": "agent/staged/P14.md"
-    },
-    {
-      "task_id": "P14",
-      "successor": "P14.5",
-      "successor_spec_path": "agent/staged/P14.5.md"
-    },
-    {
-      "task_id": "P14.5",
-      "successor": "P14.6",
-      "successor_spec_path": "agent/staged/P14.6.md"
-    },
-    {
-      "task_id": "P14.6",
-      "successor": "P15",
-      "successor_spec_path": "agent/staged/P15.md"
-    },
-    {
-      "task_id": "P15",
-      "successor": "P16",
-      "successor_spec_path": "agent/staged/P16.md"
-    },
-    {
-      "task_id": "P16",
-      "successor": "P16.7",
-      "successor_spec_path": "agent/staged/P16.7.md"
-    },
-    {
-      "task_id": "P16.7",
-      "successor": "P16.8",
-      "successor_spec_path": "agent/staged/P16.8.md"
-    },
-    {
-      "task_id": "P16.8",
-      "successor": "P16.9",
-      "successor_spec_path": "agent/staged/P16.9.md"
-    },
-    {
-      "task_id": "P16.9",
-      "successor": "P16.10",
-      "successor_spec_path": "agent/staged/P16.10.md"
-    },
-    {
-      "task_id": "P16.10",
-      "successor": "P16.11",
-      "successor_spec_path": "agent/staged/P16.11.md"
-    },
-    {
-      "task_id": "P16.11",
-      "successor": "P16.12",
-      "successor_spec_path": "agent/staged/P16.12.md"
-    },
-    {
-      "task_id": "P16.12",
-      "successor": "P16.13",
-      "successor_spec_path": "agent/staged/P16.13.md"
-    },
-    {
-      "task_id": "P16.13",
-      "successor": "P16.14",
-      "successor_spec_path": "agent/staged/P16.14.md"
-    },
-    {
-      "task_id": "P16.14",
-      "successor": null,
-      "successor_spec_path": null
-    }
-  ]
+﻿{
+    "schema_version":  1,
+    "tasks":  [
+                  {
+                      "task_id":  "P11x",
+                      "successor":  "P11b",
+                      "successor_spec_path":  "agent/staged/P11b.md"
+                  },
+                  {
+                      "task_id":  "P11b",
+                      "successor":  "P11c",
+                      "successor_spec_path":  "agent/staged/P11c.md"
+                  },
+                  {
+                      "task_id":  "P11c",
+                      "successor":  "P11d",
+                      "successor_spec_path":  "agent/staged/P11d.md"
+                  },
+                  {
+                      "task_id":  "P11d",
+                      "successor":  "P12",
+                      "successor_spec_path":  "agent/staged/P12.md"
+                  },
+                  {
+                      "task_id":  "P12",
+                      "successor":  null,
+                      "successor_spec_path":  null
+                  },
+                  {
+                      "task_id":  "P12.5",
+                      "successor":  "P12.6",
+                      "successor_spec_path":  "agent/staged/P12.6.md"
+                  },
+                  {
+                      "task_id":  "P12.6",
+                      "successor":  "P12.7",
+                      "successor_spec_path":  "agent/staged/P12.7.md"
+                  },
+                  {
+                      "task_id":  "P12.7",
+                      "successor":  "P13",
+                      "successor_spec_path":  "agent/staged/P13.md"
+                  },
+                  {
+                      "task_id":  "P13",
+                      "successor":  "P13.5",
+                      "successor_spec_path":  "agent/staged/P13.5.md"
+                  },
+                  {
+                      "task_id":  "P13.5",
+                      "successor":  "P14",
+                      "successor_spec_path":  "agent/staged/P14.md"
+                  },
+                  {
+                      "task_id":  "P14",
+                      "successor":  "P14.5",
+                      "successor_spec_path":  "agent/staged/P14.5.md"
+                  },
+                  {
+                      "task_id":  "P14.5",
+                      "successor":  "P14.6",
+                      "successor_spec_path":  "agent/staged/P14.6.md"
+                  },
+                  {
+                      "task_id":  "P14.6",
+                      "successor":  "P15",
+                      "successor_spec_path":  "agent/staged/P15.md"
+                  },
+                  {
+                      "task_id":  "P15",
+                      "successor":  "P16",
+                      "successor_spec_path":  "agent/staged/P16.md"
+                  },
+                  {
+                      "task_id":  "P16",
+                      "successor":  "P16.7",
+                      "successor_spec_path":  "agent/staged/P16.7.md"
+                  },
+                  {
+                      "task_id":  "P16.7",
+                      "successor":  "P16.8",
+                      "successor_spec_path":  "agent/staged/P16.8.md"
+                  },
+                  {
+                      "task_id":  "P16.8",
+                      "successor":  "P16.9",
+                      "successor_spec_path":  "agent/staged/P16.9.md"
+                  },
+                  {
+                      "task_id":  "P16.9",
+                      "successor":  "P16.10",
+                      "successor_spec_path":  "agent/staged/P16.10.md"
+                  },
+                  {
+                      "task_id":  "P16.10",
+                      "successor":  "P16.11",
+                      "successor_spec_path":  "agent/staged/P16.11.md"
+                  },
+                  {
+                      "task_id":  "P16.11",
+                      "successor":  "P16.12",
+                      "successor_spec_path":  "agent/staged/P16.12.md"
+                  },
+                  {
+                      "task_id":  "P16.12",
+                      "successor":  "P16.13",
+                      "successor_spec_path":  "agent/staged/P16.13.md"
+                  },
+                  {
+                      "task_id":  "P16.13",
+                      "successor":  "P16.14",
+                      "successor_spec_path":  "agent/staged/P16.14.md"
+                  },
+                  {
+                      "task_id":  "P16.14",
+                      "successor":  "P17",
+                      "successor_spec_path":  "agent/staged/P17.md"
+                  },
+                  {
+                      "task_id":  "P17",
+                      "successor":  null,
+                      "successor_spec_path":  null
+                  }
+              ]
 }
