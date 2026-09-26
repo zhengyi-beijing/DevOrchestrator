@@ -1798,8 +1798,15 @@ Closed both concrete BLOCKING review findings from `ai_review:rereview:37165140-
   gate.
 - Independent provider re-review
   `ai_review:p1613-closure-delta-57c7f19-r3` returned `NEXT` with no findings.
-- Final validation: 111 focused tests and 15 subtests passed; full regression
-  1,310 tests and 102 subtests passed in 588.16s; compileall, diff-check, and
+- Exact-head settlement exposed one last projection gap: Watchdog retained a
+  lifecycle owner gate after the shared invariant recovered. Commit `2e4c162`
+  archives the full resolved gate record, clears only evaluated lifecycle gates
+  that now hold, caps history at 20, and is replay-idempotent.
+- Independent review `ai_review:p1613-resolved-gate-delta-2e4c162-r5` returned
+  `NEXT` with no findings. Two real ticks remained P16.13 COMPLETE with six
+  invariants holding, no gate, no pause, and no Worker.
+- Final validation: 112 focused tests and 15 subtests passed; full regression
+  1,311 tests and 102 subtests passed in 550.19s; compileall, diff-check, and
   Graphify update passed.
 - P16.13 has no roadmap successor and is COMPLETE. The two external project
   owner gates remain correctly fail closed pending their owners' disposition.

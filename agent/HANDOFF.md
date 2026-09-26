@@ -27,6 +27,7 @@ Continued from the interrupted Codex session. Commits on top of `9e5909a`:
 | `8565773` | Closes the N5 assertion-weak spots and acceptance 2 |
 | `0140cbd` | Migrates pre-fence failed recovery history to durable gated evidence without re-actuation |
 | `57c7f19` | Preserves malformed recovery history while still failing closed to the owner gate |
+| `2e4c162` | Archives and clears lifecycle owner gates once their shared invariant holds |
 
 The inherited dirty `src/dev_orchestrator/daemon.py` diff was classified **A
 (valid unfinished P16.13 work)** and committed as part of `f51a01b`. It was valid
@@ -43,8 +44,8 @@ the implementer's conclusions.
 
 ## 2. Current validation state
 
-- Full Python regression: **1,310 tests + 102 subtests** passing.
-- Final focused lifecycle/watchdog/daemon suite: **111 tests + 15 subtests** passing.
+- Full Python regression: **1,311 tests + 102 subtests** passing.
+- Final focused lifecycle/watchdog/daemon suite: **112 tests + 15 subtests** passing.
 - `python -m compileall -q src ops tests_py` clean; `git diff --check` clean.
 - Runtime smoke `python ops/p1613_lifecycle_smoke.py`: **35 of 35 checks pass**
   across two distinct real daemon ticks.
@@ -67,7 +68,11 @@ Their counts and gate IDs remained byte-stable across the next real 60-second
 tick, and the runtime smoke passed 35/35 twice. The restart also exposed the
 legacy migration gap closed by `0140cbd` and the malformed-history case closed
 by `57c7f19`. Independent review first returned `REMEDIATE`; the bounded delta
-re-review then returned `NEXT` with no findings.
+re-review then returned `NEXT` with no findings. Exact-head terminal settlement
+subsequently exposed a sticky resolved Watchdog gate; `2e4c162` archives its
+evidence and clears only a lifecycle gate whose evaluator code now holds.
+Independent review `ai_review:p1613-resolved-gate-delta-2e4c162-r5` returned
+`NEXT` with no findings. Two later live ticks remained COMPLETE with no gate.
 
 ## 4. Issue status
 

@@ -27,8 +27,17 @@ P16.13 final closure evidence (2026-09-26):
   `ai_review:p1613-closure-delta-57c7f19-r3` returned `NEXT` with no findings.
   Reviewer resource: `agy/agy-1/claude-opus-4-6-thinking`; the prior Codex
   reviewer and failed `claude/default/opus` resource were excluded.
-- Final focused verification: 111 tests and 15 subtests passed. Final full
-  regression: 1,310 tests and 102 subtests passed in 588.16s. `compileall`,
+- Exact closure review `ai_review:p1613-final-exact-head-c0293ab-r4` returned
+  `NEXT` and its decision settled terminally. That live settlement exposed a
+  sticky Watchdog projection: all six invariants held, but the prior resolved
+  lifecycle gate remained active. Commit `2e4c162` now archives resolved gate
+  evidence and clears only gates whose shared-evaluator code currently holds.
+- Independent delta review
+  `ai_review:p1613-resolved-gate-delta-2e4c162-r5` returned `NEXT` with no
+  findings. Two live ticks then held P16.13 at COMPLETE with no authority or
+  Watchdog gate, one archived gate, `paused=false`, and no Worker.
+- Final focused verification: 112 tests and 15 subtests passed. Final full
+  regression: 1,311 tests and 102 subtests passed in 550.19s. `compileall`,
   `git diff --check`, and Graphify update passed.
 - P16.13 has no roadmap successor. The two external-project owner gates remain
   deliberately fail closed and require per-project owner disposition; they do

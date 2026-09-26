@@ -11,7 +11,12 @@ AIReviewer/AIBroker path. Review `ai_review:p1613-closure-delta-0140cbd-r2`
 found one malformed-history fail-closed gap; commit `57c7f19` remediated it,
 and independent delta re-review
 `ai_review:p1613-closure-delta-57c7f19-r3` returned `next` with no findings.
-Final regression: 1,310 tests and 102 subtests passed.
+Exact-head terminal settlement then exposed a stale Watchdog gate projection
+after all six invariants held. Commit `2e4c162` archives the resolved lifecycle
+gate and removes it from the active projection; independent review
+`ai_review:p1613-resolved-gate-delta-2e4c162-r5` returned `next` with no
+findings. Two later live ticks remained COMPLETE with no active gate, no pause,
+and no Worker. Final regression: 1,311 tests and 102 subtests passed.
 
 ## Incident and causal chain
 
