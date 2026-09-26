@@ -1,83 +1,35 @@
-# P16.13 Successor Consistency & Zero-Touch Handoff Recovery
+# P16.14 Invariant-Driven Control-Plane Development & Validation
 
-Status: **COMPLETE**
+Status: **PENDING DESIGN**
 
-Predecessor: P16.12
+Predecessor: P16.13
 
 ## Goal
-Eliminate silent task-chain stalls caused by roadmap/staged-task/reviewer successor disagreement, and guarantee zero-touch recovery without owner continue.
+Institutionalize the invariant-driven control-plane engineering method proven during P16.13 so future lifecycle changes are designed, tested, reviewed, and accepted against explicit invariants rather than accumulated incident-specific patches.
+
+P16.14 is the sole closing objective currently defined for P16. Do not predefine P16.15 or P16.16.
 
 ## Scope
-- Validate roadmap successor links against staged task predecessor/sequence metadata.
-- Fail closed on NEXT/next_task when roadmap advertises no successor but staged evidence indicates one.
-- Add automatic successor reconcile/rebuild before terminal settlement.
-- Add Watchdog invariant NEXT_TASK_WITHOUT_HANDOFF as final recovery layer.
-- Correct handoff lineage: completed source task becomes source_task_id; active execution task_id must be the successor.
-- Reconcile/close obsolete execution-loss findings when successor handoff is authoritative.
-- Add end-to-end fault injection for missing/incorrect successor metadata.
-- Add bounded remediation-budget extension: when review findings are explicit, localized, testable, and do not expand task scope, allow exactly one automatic extension instead of stopping at OWNER_GATE; fail closed to OWNER_GATE when eligibility is ambiguous or the extension is exhausted.
-
-## State-machine convergence strategy
-P16.13 must solve the lifecycle-consistency class, not only patch the current P16.12 -> P16.13 incident.
-
-- Establish one authoritative lifecycle state; CURRENT/next/execution/reviewer/transition/watchdog are derived projections or validators, not competing task authorities.
-- Make lifecycle transitions atomic and idempotent with source_task_id, target_task_id, and transition generation/epoch.
-- Do not publish a successor until all source-task Worker/Reviewer/Remediation ownership is terminal or explicitly transferred.
-- Enforce successor execution lineage and forbid pending-design successors from appearing EXECUTING without an authorized planning/design transition.
-- Persist a transition journal and recover/replay from it after daemon restart instead of inferring state from contradictory projections.
-- Drive Watchdog from invariants: CURRENT_TASK_MATCHES_ACTIVE_EXECUTION, TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION, PENDING_DESIGN_NOT_EXECUTING, SUCCESSOR_HANDOFF_LINEAGE_VALID, NEXT_TASK_WITHOUT_HANDOFF, SINGLE_ACTIVE_LIFECYCLE_OWNER.
-- Build a P15-P16 fault-injection matrix covering stale Worker, lost review handoff, restart mid-transition, dirty worktree, successor disagreement, duplicate remediation/review, exhausted remediation budget, and old-task execution surviving successor publication.
-- Zero-touch recovery is allowed only for unambiguous evidence; ambiguous ownership or repeated invariant failure must fail closed to OWNER_GATE.
-- Preserve the live P16.12 -> P16.13 mismatch as a required regression fixture.
+- Make invariant-first planning a required control-plane design step.
+- Require an explicit transition/fault model for lifecycle-affecting changes.
+- Turn relevant historical lifecycle failures into durable fault-injection scenarios.
+- Require adversarial review against invariants and transition boundaries, not only happy-path functional review.
+- Define measurable recovery/convergence evidence for autonomous recovery paths.
+- Reuse the P16.13 authoritative lifecycle, transition journal, centralized invariant evaluator, and zero-touch recovery mechanisms rather than creating a parallel control plane.
+- Preserve fail-closed OWNER_GATE behavior when ownership or recovery evidence is ambiguous.
 
 ## Acceptance
-1. Inject: reviewer returns NEXT/next_task, roadmap says current successor=null, while next staged task declares itself after current.
-2. DevO detects ROADMAP_SUCCESSOR_INCONSISTENT and does not terminal-settle as project complete.
-3. DevO automatically reconciles successor metadata and creates exactly one handoff.
-4. Successor Planner/Worker starts automatically with no owner continue.
-5. Active execution lineage uses successor task_id and prior task as source_task_id.
-6. Stale execution-loss state converges to resolved after authoritative handoff.
-7. Repeated ticks are idempotent and do not duplicate handoffs/recovery.
-8. Regression/fault-injection test passes end-to-end with zero manual intervention.
-9. When the normal remediation budget is exhausted but the reviewer returns only explicit localized blockers with bounded fixes and required regression tests, DevO grants at most one automatic bounded extension and re-reviews without owner intervention.
-10. Ambiguous, scope-expanding, repeated, or still-failing findings after that extension stop at OWNER_GATE; repeated ticks never grant duplicate extensions.
+1. A control-plane task can declare the invariants and transition boundaries it may affect before implementation starts.
+2. Its validation plan includes normal-path tests plus fault injection for the declared transition/failure model.
+3. Review explicitly checks invariant preservation, idempotence, restart/replay behavior, and fail-closed boundaries.
+4. Recovery tests record evidence that the system converges to one authoritative lifecycle owner without manual continue when evidence is unambiguous.
+5. Repeated ticks/restarts do not duplicate handoffs, Workers, Reviews, remediation, or recovery actions.
+6. Ambiguous ownership, contradictory authority, or non-converging recovery fails closed instead of creating autonomous work.
+7. At least one representative post-P16.13 control-plane change is exercised through the invariant-first workflow end-to-end.
+8. Full regression remains green and the resulting method is documented as the default control-plane development/validation contract.
 
-## Approved executable design
+## Relationship to P16.13
+P16.13 repaired and validated successor consistency and zero-touch handoff recovery. P16.14 does not reopen that incident. It generalizes the engineering method used there—explicit invariants, transition/fault modeling, fault injection, adversarial review, and convergence evidence—so the same class of lifecycle defects is prevented or detected systematically.
 
-The approved implementation is the bounded authority/journal design in
-`docs/P16_13_SUCCESSOR_CONSISTENCY_CONTRACT.md`:
-
-1. Extend the existing `runtime/transition-executor.json` ledger with one
-   authoritative `lifecycle` record per project and a sibling `transitions`
-   journal; do not add another lifecycle state file.
-2. Treat repository task files, execution records, Planner/Reviewer ledgers,
-   project status, and Watchdog as projections or evidence. A partially
-   published repository successor does not advance authority.
-3. Persist deterministic source/target/generation transition intent, drain all
-   source-task ownership, persist a replayable handoff, activate the staged
-   successor, then publish the authority transition.
-4. Cross-check explicit staged predecessor evidence against the roadmap.
-   Automatically repair one unambiguous null/unlisted successor only from a
-   clean worktree; preserve dirty work and fail closed on disagreement.
-5. Use one centralized invariant evaluator in reconciliation and Watchdog.
-   Automatically rebuild a missing handoff; gate invalid lineage, ambiguous
-   ownership, or repeated non-transient recovery failure.
-6. Extend the existing recovery epoch with lifecycle generation/transition
-   identity. Migrate old ledgers in place while retaining execution evidence.
-7. Permit exactly one durable, diff-localized remediation-budget extension;
-   gate missing, repeated, cross-task, or still-failing findings.
-8. Verify the complete A-J matrix in
-   `tests_py/test_p1613_successor_consistency.py`, then full regression,
-   runtime smoke, and independent Technical Review before closure.
-
-## Incident root cause
-
-P16.13 was published by `2b326fd` while the P16.12 technical-review obligation
-was still valid. That review launched P16.12 remediation after publication and
-eventually produced `78dfc95`. Managed-run overlay then selected the active old
-execution independently of repository task selection, reporting the P16.13
-projection as executing while its execution lineage remained P16.12. Watchdog
-observed a live Worker and had no cross-task ownership invariant, so it could
-not converge the competing authorities. This is addressed as an ordering,
-transactionality, and multiple-authority defect rather than by relabeling the
-historical execution.
+## Planning constraint
+Start through the normal roadmap successor/handoff mechanism. Do not manually launch a Worker merely to bypass lifecycle planning. P16.14 must itself exercise the P16.13 successor path.
