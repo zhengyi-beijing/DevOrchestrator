@@ -1097,6 +1097,57 @@ class BoundedRecoveryActuationTests(unittest.TestCase):
             "NEXT_TASK_WITHOUT_HANDOFF",
         )
 
+    def test_B1_malformed_legacy_attempts_still_records_nonrecoverable_gate(self):
+        """Malformed legacy evidence is preserved while the gate fails closed."""
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        snapshot = _summary(self.repo, "P2")["projects"][0]
+        seed_executor = self._CountingExecutor(
+            "agent/staged/roadmap.json does not exist",
+        )
+        seed_watchdog = WatchdogCoordinator(self.runtime)
+        seed_watchdog.advance(
+            str(self.config_path), {"projects": [snapshot]}, executor=seed_executor,
+        )
+        seed_state = json.loads(
+            (self.runtime / "watchdog.json").read_text(encoding="utf-8"),
+        )
+        for malformed in (None, ["preserve-this-legacy-evidence"], "legacy-scalar"):
+            with self.subTest(malformed=malformed):
+                legacy_state = copy.deepcopy(seed_state)
+                legacy_state["projects"]["p1"]["lifecycle_recovery_attempts"] = malformed
+                (self.runtime / "watchdog.json").write_text(
+                    json.dumps(legacy_state), encoding="utf-8",
+                )
+                executor = self._CountingExecutor("must not be called")
+                executor.ledger["executions"]["ai_review:d1"] = {
+                    "project_id": "p1",
+                    "task_id": "P1",
+                    "state": "blocked",
+                }
+                watchdog = WatchdogCoordinator(self.runtime)
+
+                watchdog.advance(
+                    str(self.config_path), {"projects": [snapshot]}, executor=executor,
+                )
+
+                row = (watchdog.state().get("projects") or {}).get("p1") or {}
+                self.assertEqual(executor.calls, 0, "malformed evidence triggered recovery")
+                self.assertEqual(row.get("lifecycle_recovery_attempts"), malformed)
+                self.assertEqual(
+                    row.get("lifecycle_recovery_evidence_error"),
+                    "lifecycle_recovery_attempts is not an object",
+                )
+                self.assertEqual(
+                    (row.get("owner_gate") or {}).get("code"),
+                    "NEXT_TASK_WITHOUT_HANDOFF",
+                )
+                self.assertFalse(
+                    str(row.get("last_error") or "").startswith(
+                        "lifecycle_invariant_evaluation_failed",
+                    ),
+                )
+
     def test_NA_undrained_source_ownership_is_a_wait_not_a_refusal(self):
         """Review finding N-A: only _record_handoff rebuilds the durable handoff.
 
