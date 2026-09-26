@@ -1,16 +1,19 @@
 # P16.13 Handoff — Successor Consistency & Zero-Touch Handoff Recovery
 
-Last updated: 2026-09-26. Branch `main`, worktree clean at `8565773`.
+Last updated: 2026-09-26. Branch `main`, worktree clean at `989eefa`.
 
 Status: **REVIEW ACCEPTED / AWAITING DAEMON RESTART**. Implementation and
 independent Technical Review are complete. One closure gate remains and it needs
 owner action, not more implementation.
 
 Repository state is authoritative. Verify everything below before acting on it.
+Live figures in section 3 were last confirmed at tick `2026-09-26T05:02:30Z`.
+The recovery counters advance once per tick until the daemon is restarted, so
+expect them to read higher.
 
 ## 1. What was done in this session
 
-Continued from the interrupted Codex session. Five commits on top of `9e5909a`:
+Continued from the interrupted Codex session. Commits on top of `9e5909a`:
 
 | Commit | What it does |
 | --- | --- |
@@ -19,7 +22,7 @@ Continued from the interrupted Codex session. Five commits on top of `9e5909a`:
 | `981a342` | Closes the non-blocking follow-ups (N-A, N-B, N-D) from the delta re-review |
 | `e8eece7` | Adds `ops/p1613_lifecycle_smoke.py` as a durable runtime smoke |
 | `af91981` | Records review/remediation evidence in `agent/CURRENT.md` |
-| `b39d2a7` | This handoff |
+| `b39d2a7`, `989eefa` | This handoff |
 | `60ef19b` | End-to-end zero-touch test: closes acceptance 4, 6, 8 |
 | `9629c44` | Closes the deferred N1 and N2 findings |
 | `8565773` | Closes the N5 assertion-weak spots and acceptance 2 |
@@ -56,13 +59,14 @@ any of this session's commits. It therefore does not have the recovery fence
 loaded. Consequence, observed live and still growing:
 
 ```
-linescanviewer     lifecycle_recovery_attempts count=133 state=failed  gate_id=None
-xray-hw-platform   lifecycle_recovery_attempts count=133 state=failed  gate_id=None
+linescanviewer     lifecycle_recovery_attempts count=240 state=failed  gate_id=None
+xray-hw-platform   lifecycle_recovery_attempts count=240 state=failed  gate_id=None
 devorchestrator    lifecycle_recovery_attempts count=1   state=recovered
 ```
 
-The counters climbed 63 -> 91 -> 121 -> 133 over the course of the session. This
-is the B1 loop, still live, purely because the fix is committed but not deployed.
+The counters climbed 63 -> 91 -> 121 -> 137 -> 240 over the course of the
+session, one per 60-second tick, and keep climbing until the restart. This is the
+B1 loop, still live, purely because the fix is committed but not deployed.
 
 **Required action (owner).** Restart the daemon so it loads the fence. In-session
 restart was attempted and **denied by the environment's permission classifier
@@ -83,9 +87,10 @@ python -m dev_orchestrator daemon \
 ```
 
 **Expected post-restart behavior.** Each gated project performs **at most one
-more** recovery attempt (133 -> 134) because the legacy gate records predate the
-`recovery_key` field, then fences permanently with `state="gated"`,
-`fenced=true`, and a stable `gate_id`. Then re-run the smoke:
+more** recovery attempt -- whatever the counter reads, plus one -- because the
+legacy gate records predate the `recovery_key` field. It then fences permanently
+with `state="gated"`, `fenced=true`, and a stable `gate_id`. Then re-run the
+smoke:
 
 ```
 python ops/p1613_lifecycle_smoke.py
@@ -95,7 +100,12 @@ It should report **35 of 35**. The smoke judges boundedness structurally (attemp
 is `recovered`, `gated`, or a transient wait) rather than by the absolute
 counter, because a ledger written before the fence keeps its historical count.
 
-## 4. Known open issues, by severity
+## 4. Issue status
+
+Still open: the daemon restart in section 3, the two per-project dispositions in
+4.1, and the accepted fail-closed risk N-C in 4.2. Everything else recorded here
+is closed, with the commit that closed it named. Nothing in this section blocks
+P16.13 closure except section 3.
 
 ### 4.1 Needs owner disposition, not code (liveness, per-project)
 
@@ -111,7 +121,7 @@ correct fail-closed outcome. To clear them, the owner must either add
 `CURRENT_TASK_MATCHES_ACTIVE_EXECUTION` (`repository_task_id=P16`,
 `authority_task_id=P15`) for the same root cause.
 
-### 4.2 Deferred NON_BLOCKING findings
+### 4.2 NON_BLOCKING review findings (all closed except N-C)
 
 - **N1 — CLOSED in `9629c44`.** The Watchdog no longer answers the invariant
   block from an empty ledger; it skips it and records
@@ -133,7 +143,7 @@ correct fail-closed outcome. To clear them, the owner must either add
   accumulate one per git HEAD; and the attempt counter is an unbounded int for
   transient reasons (by design, since a transient wait must keep retrying).
 
-### 4.3 Acceptance criteria evidence
+### 4.3 Acceptance criteria evidence (complete)
 
 **Closed in `60ef19b`.** `ZeroTouchSuccessorHandoffEndToEndTests` drives the real
 `WatchdogCoordinator`, `TransitionExecutor`, `ControlCommandCoordinator` and
