@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
-from dev_orchestrator.core.lifecycle_authority import evaluate_lifecycle_invariants
+from dev_orchestrator.core.lifecycle_authority import active_owners, evaluate_lifecycle_invariants
 from dev_orchestrator.core.successor_consistency import (
     reconcile_roadmap_successor,
     resolve_successor,
@@ -271,6 +271,71 @@ class SuccessorConsistencyFaultMatrixTests(unittest.TestCase):
         self.assertFalse(findings["PENDING_DESIGN_NOT_EXECUTING"].holds)
         _, reason = TransitionExecutor._lifecycle_launch_guard(executor_state, "p1", "P2", "P1")
         self.assertIn("PENDING_DESIGN", reason or "")
+
+    def test_legacy_consumed_history_is_not_current_ownership_or_bad_lineage(self):
+        executor_state = {
+            "lifecycle": {"p1": {"current_task_id": "P2", "lifecycle_state": "READY_TO_RUN"}},
+            "executions": {
+                "worker-old": {
+                    "project_id": "p1", "source_request_id": "worker-old",
+                    "task_id": "P1", "state": "completed", "review_state": "pending",
+                    "completed_at": "2026-09-20T01:00:00+00:00",
+                },
+                "review-old": {
+                    "project_id": "p1", "source_request_id": "review-old",
+                    "task_id": "P1", "next_task_id": "P2", "state": "handoff",
+                    "recorded_at": "2026-09-20T02:00:00+00:00",
+                    "handoff_consumed": True,
+                },
+            },
+            "transitions": {},
+        }
+        snapshot = {
+            "project_id": "p1", "state": "READY_TO_RUN",
+            "next_status": "READY TO RUN", "telemetry": {"task_id": "P2"},
+        }
+        decisions = {"decisions": {"review-final": {
+            "project_id": "p1", "request_id": "review-final", "task_id": "P1",
+            "disposition": "apply", "decision": "next", "next_action": "next_task",
+            "consumed_at": "2026-09-20T01:30:00+00:00",
+        }}}
+        self.assertEqual(active_owners("p1", executor_state), [])
+        findings = {
+            item.code: item for item in evaluate_lifecycle_invariants(
+                snapshot=snapshot, executor_state=executor_state,
+                decisions_state=decisions,
+            )
+        }
+        self.assertTrue(findings["SUCCESSOR_HANDOFF_LINEAGE_VALID"].holds)
+        self.assertTrue(findings["NEXT_TASK_WITHOUT_HANDOFF"].holds)
+        self.assertTrue(findings["SINGLE_ACTIVE_LIFECYCLE_OWNER"].holds)
+
+    def test_false_legacy_review_obligation_gate_reconciles_without_deleting_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = _repo(root); executor = TransitionExecutor(root / "runtime")
+            ledger = executor.state()
+            ledger["lifecycle"]["p1"] = {
+                "schema_version": 1, "project_id": "p1", "generation": 0,
+                "current_task_id": "P1", "lifecycle_state": "OWNER_GATE",
+                "source_task_id": "P1", "active_transition_id": "bad-bootstrap",
+                "active_owner": None,
+                "owner_gate": {
+                    "code": "SINGLE_ACTIVE_LIFECYCLE_OWNER",
+                    "owners": [{"role": "review_obligation", "id": "old", "task_id": "P1"}],
+                },
+            }
+            ledger["transitions"]["bad-bootstrap"] = {
+                "transition_id": "bad-bootstrap", "project_id": "p1",
+                "source_task_id": "P1", "target_task_id": "P2",
+                "generation": 1, "state": "intent",
+            }
+            executor._save_ledger(ledger)
+            reconciled = executor.reconcile_lifecycle_authority(_summary(repo))
+            authority = reconciled["lifecycle"]["p1"]
+            self.assertEqual(authority["current_task_id"], "P2")
+            self.assertIsNone(authority["owner_gate"])
+            self.assertIn("legacy_bootstrap_reconciled", authority)
+            self.assertEqual(reconciled["transitions"]["bad-bootstrap"]["state"], "owner_gate")
 
 
 if __name__ == "__main__":

@@ -719,6 +719,50 @@ class TransitionExecutor:
                     authority = new_authority(project_id, initial_task, initial_state)
                     lifecycle[project_id] = authority
 
+                prior_gate = authority.get("owner_gate")
+                prior_gate_owners = (
+                    prior_gate.get("owners") if isinstance(prior_gate, dict) else None
+                )
+                legacy_owner_gate = (
+                    isinstance(prior_gate, dict)
+                    and prior_gate.get("code") == "SINGLE_ACTIVE_LIFECYCLE_OWNER"
+                    and isinstance(prior_gate_owners, list)
+                    and prior_gate_owners
+                    and all(
+                        isinstance(owner, dict) and owner.get("role") == "review_obligation"
+                        for owner in prior_gate_owners
+                    )
+                )
+                if (
+                    not owners
+                    and legacy_owner_gate
+                    and int(authority.get("generation") or 0) == 0
+                ):
+                    prior_task = authority.get("current_task_id")
+                    for transition in transitions.values():
+                        if (
+                            isinstance(transition, dict)
+                            and transition.get("project_id") == project_id
+                            and transition.get("state") in {"intent", "waiting_source"}
+                            and transition.get("source_task_id") == prior_task
+                        ):
+                            transition["state"] = "owner_gate"
+                            transition["reason"] = "superseded historical review-obligation migration"
+                            transition["updated_at"] = utc_now_iso()
+                    authority.update({
+                        "current_task_id": repo_task,
+                        "source_task_id": None,
+                        "active_transition_id": None,
+                        "active_owner": None,
+                        "owner_gate": None,
+                        "lifecycle_state": lifecycle_state_from_snapshot(snapshot),
+                        "legacy_bootstrap_reconciled": {
+                            "from_task_id": prior_task,
+                            "reason": "historical resolved review obligations are not active owners",
+                            "recorded_at": utc_now_iso(),
+                        },
+                    })
+
                 current_task = str(authority.get("current_task_id") or repo_task)
                 if len(owner_tasks) > 1:
                     authority["owner_gate"] = {

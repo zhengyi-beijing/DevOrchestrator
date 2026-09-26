@@ -14,7 +14,7 @@ from typing import Any
 
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.monitor.telemetry import extract_task_id
-from dev_orchestrator.storage.json_store import utc_now_iso
+from dev_orchestrator.storage.json_store import parse_utc, utc_now_iso
 
 
 AUTHORITY_SCHEMA_VERSION = 1
@@ -85,6 +85,12 @@ def active_owners(
 ) -> list[dict[str, Any]]:
     owners: list[dict[str, Any]] = []
     executions = executor_state.get("executions") if isinstance(executor_state, dict) else {}
+    lifecycle_barriers = [
+        row for row in (executions or {}).values()
+        if isinstance(row, dict)
+        and row.get("project_id") == project_id
+        and row.get("state") in {"handoff", "settled"}
+    ]
     for row in (executions or {}).values():
         if not isinstance(row, dict) or row.get("project_id") != project_id:
             continue
@@ -92,6 +98,21 @@ def active_owners(
             owners.append({"role": "worker", "id": row.get("source_request_id"), "task_id": row.get("task_id")})
             continue
         if row.get("state") == "completed" and row.get("review_state") == "pending":
+            completed_at = parse_utc(row.get("completed_at") or row.get("started_at"))
+            resolved_by_barrier = False
+            for barrier in lifecycle_barriers:
+                if barrier.get("task_id") != row.get("task_id"):
+                    continue
+                barrier_at = parse_utc(
+                    barrier.get("handoff_consumed_at")
+                    or barrier.get("recorded_at")
+                    or barrier.get("completed_at")
+                )
+                if completed_at is None or barrier_at is None or barrier_at >= completed_at:
+                    resolved_by_barrier = True
+                    break
+            if resolved_by_barrier:
+                continue
             review_id = "ai_review:" + str(row.get("source_request_id") or "")
             reviews = reviewer_state.get("reviews") if isinstance(reviewer_state, dict) else {}
             review = reviews.get(review_id) if isinstance(reviews, dict) else None
@@ -168,19 +189,48 @@ def evaluate_lifecycle_invariants(
             continue
         request_id = str(row.get("request_id") or decision_id or "")
         actuation = (executions or {}).get(request_id)
-        if not isinstance(actuation, dict) or actuation.get("state") not in {"handoff", "settled"}:
+        satisfied = isinstance(actuation, dict) and actuation.get("state") in {"handoff", "settled"}
+        if not satisfied:
+            decision_at = parse_utc(row.get("consumed_at") or row.get("created_at"))
+            for candidate in (executions or {}).values():
+                if not isinstance(candidate, dict):
+                    continue
+                if (
+                    candidate.get("project_id") != project_id
+                    or candidate.get("task_id") != row.get("task_id")
+                    or candidate.get("state") not in {"handoff", "settled"}
+                ):
+                    continue
+                candidate_at = parse_utc(
+                    candidate.get("handoff_consumed_at")
+                    or candidate.get("recorded_at")
+                    or candidate.get("completed_at")
+                )
+                if decision_at is None or candidate_at is None or candidate_at >= decision_at:
+                    satisfied = True
+                    break
+        if not satisfied:
             next_decisions.append({**row, "request_id": request_id})
 
     current_holds = not worker_owners or all(str(owner.get("task_id") or "") == authority_task for owner in worker_owners)
     terminal_holds = not (authority_state in {"COMPLETE", "SETTLED"} and worker_owners)
     pending_holds = not (authority_state == "PENDING_DESIGN" and worker_owners)
-    lineage_bad = [
-        row for row in handoffs
-        if not row.get("source_task_id")
-        or row.get("source_task_id") != row.get("task_id")
-        or not row.get("next_task_id")
-        or row.get("next_task_id") == row.get("source_task_id")
-    ]
+    lineage_bad = []
+    for row in handoffs:
+        source_task_id = row.get("source_task_id")
+        # Consumed handoffs from the pre-P16.13 schema used task_id as the
+        # predecessor identity. They are immutable accepted history, not live
+        # malformed work items.
+        if not source_task_id and row.get("handoff_consumed") is True:
+            source_task_id = row.get("task_id")
+        target_task_id = row.get("target_task_id") or row.get("next_task_id")
+        if (
+            not source_task_id
+            or source_task_id != row.get("task_id")
+            or not target_task_id
+            or target_task_id == source_task_id
+        ):
+            lineage_bad.append(row)
     lineage_holds = not lineage_bad
     next_without = bool(next_decisions)
     single_owner_holds = len(owner_tasks) <= 1 and len([o for o in owners if o.get("role") != "review_obligation"]) <= 1
