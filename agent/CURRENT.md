@@ -5,7 +5,24 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P16.13 Successor Consistency & Zero-Touch Handoff Recovery** (Status: **COMPLETE**). Previous task: **P16.12 Web Sol Persistent Pairing & Truthful Availability** (Status: **COMPLETE**).
+Current task: **P16.14 Invariant-Driven Control-Plane Development & Validation** (Status: **COMPLETE**). Previous task: **P16.13 Successor Consistency & Zero-Touch Handoff Recovery** (Status: **COMPLETE**).
+
+P16.14 final closure evidence (2026-09-26):
+- Worker's first commit `cb1648e` committed canonical declaration to `agent/next.md` and `agent/staged/P16.14.md` prior to any source modifications, establishing historical proof of impact declaration before implementation.
+- Implemented `core/control_plane_faults.py` with durable fault registry (`CPF-01` through `CPF-10`) covering all six lifecycle invariants with resolvable AST test references and strict boundary validation.
+- Implemented `core/control_plane_contract.py` providing deterministic declaration parsing (`declared`, `absent`, `invalid`, `ambiguous`, `unavailable`), task-level classification (`control_plane`, `ordinary`, `invalid`, `unevaluable`), launch declaration evaluation against committed Git HEAD, prompt injection blocks, review scope-gap analysis, and read-only convergence/traversal evidence projections.
+- Implemented authoritative gate transition and lazy schema v2 upgrade in `core/lifecycle_authority.py`: `open_declaration_gate` atomically asserts `OWNER_GATE` lifecycle state with stable `gate_id` and resume state, and `resolve_declaration_gate` archives resolved gate evidence into bounded `resolved_owner_gates` (max 50, deduplicated) without polluting the transition journal.
+- Integrated declaration gate reconciliation, replay authorization for different-HEAD retries, and gate evaluation into `core/transition_executor.py` before generic owner-gate fences across both DSH and AIBroker execution paths.
+- Integrated invariant-driven contract prompt injection and validation into `core/ai_planner.py` (materializing canonical declaration section on plan freeze) and `core/ai_reviewer.py` (flagging undeclared control-plane scope gaps).
+- Created CLI projection script `ops/p1614_evidence.py` and documented comprehensive invariant-driven method contract in `docs/CONTROL_PLANE_INVARIANT_METHOD_CONTRACT.md` and `docs/development-workflow.md`.
+- Verification:
+  - Focused test suite `tests_py/test_p1614_invariant_workflow.py`: 32/32 tests passed covering grammar, classification, plan freeze, git history, gate lifecycle, prompt injection, scope gap, fault registry, evidence projections, and end-to-end traversal.
+  - Touched regressions: 158 passed (and 10 subtests passed).
+  - Full test suite: 1,353 passed, 102 subtests passed in 481.32s with zero failures.
+  - `python ops/p1614_evidence.py`: clean output with valid fault registry.
+  - `python -m compileall src`: 0 errors.
+  - `git diff --check`: 0 errors.
+  - `graphify update .`: knowledge graph updated cleanly.
 
 P16.13 final closure evidence (2026-09-26):
 - Restarted the canonical daemon from stale PID 26264 onto the committed

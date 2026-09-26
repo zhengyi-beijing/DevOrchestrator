@@ -1,5 +1,39 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P16.14 Invariant-Driven Control-Plane Development & Validation (complete 2026-09-26):
+- Institutionalized invariant-first control plane development, testing, and validation:
+  1. Worker's First Commit (`cb1648e`):
+     - Added canonical `## Control-Plane Impact` section declaring invariants, transition boundaries, fault scenarios, and convergence expectations to `agent/next.md` and `agent/staged/P16.14.md` prior to source code changes.
+  2. Durable Fault Scenario Registry (`src/dev_orchestrator/core/control_plane_faults.py`):
+     - Registered scenarios `CPF-01` through `CPF-10` covering all six lifecycle invariants (`CURRENT_TASK_MATCHES_ACTIVE_EXECUTION`, `TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION`, `PENDING_DESIGN_NOT_EXECUTING`, `SUCCESSOR_HANDOFF_LINEAGE_VALID`, `NEXT_TASK_WITHOUT_HANDOFF`, `SINGLE_ACTIVE_LIFECYCLE_OWNER`).
+     - Bound transition boundaries (`plan_freeze`, `worker_launch`, `special_gate_reconciliation`, `owner_gate_transition`, `successor_handoff`, `handoff_publication`, `authority_reconciliation`, `watchdog_recovery`).
+     - Connected resolvable AST test references and validated registry consistency via `validate_fault_registry`.
+  3. Canonical Declaration Grammar & Task-Level Classification (`src/dev_orchestrator/core/control_plane_contract.py`):
+     - Bounded parser for `## Control-Plane Impact` returning `declared`, `absent`, `invalid`, `ambiguous`, or `unavailable`.
+     - Task-level classification (`classify_control_plane_task`): ordinary tasks (UI, provider, doc, benchmark) remain ordinary; tasks touching `CONTROL_PLANE_RUNTIME_SURFACES` are control-plane; explicit ordinary claims on protected surfaces fail as `invalid`.
+     - Committed-artifact loading (`load_control_plane_declaration`, `evaluate_launch_declaration`) enforcing authenticated Git HEAD bytes.
+     - Role prompt injection (`inject_control_plane_contract`) and Technical Review scope-gap analysis (`declared_scope_gap`).
+     - Read-only projections for `convergence_evidence` and `traversal_evidence`.
+  4. Authoritative Gate Lifecycle & Lazy Schema V2 Upgrade (`src/dev_orchestrator/core/lifecycle_authority.py`):
+     - `open_declaration_gate`: atomically sets `owner_gate` and `lifecycle_state="OWNER_GATE"` with stable `gate_id` and resume state while preserving ownership/generation. Same-HEAD retries are byte-stable.
+     - `resolve_declaration_gate`: archives gate into bounded `resolved_owner_gates` (max 50, deduplicated), clears `owner_gate`, restores resume state, and upgrades authority to `schema_version = 2`.
+  5. Launch Fencing, Gate Reconciliation, & Replay Authorization (`src/dev_orchestrator/core/transition_executor.py`):
+     - Reordered launch checks: authentication -> replay eligibility -> special declaration gate reconciliation at new HEAD -> generic owner-gate fence & PENDING_DESIGN -> declaration evaluation -> worker launch.
+     - Replay authorization (`_is_declaration_gate_replayable`) permits retrying blocked requests specifically when a new committed HEAD repairs the declaration.
+  6. Planner & Reviewer Integration (`src/dev_orchestrator/core/ai_planner.py`, `src/dev_orchestrator/core/ai_reviewer.py`, `src/dev_orchestrator/core/workflow_policy.py`):
+     - Plan freeze validates canonical declaration and scenario coverage, materializing the declaration in `agent/next.md`.
+     - Reviewer checks scope gaps and injects contract prompt blocks.
+  7. Tooling & Documentation (`ops/p1614_evidence.py`, `docs/CONTROL_PLANE_INVARIANT_METHOD_CONTRACT.md`, `docs/development-workflow.md`):
+     - Created CLI evidence projection tool.
+     - Documented invariant-driven control plane development contract and updated canonical development workflow.
+- Verification:
+  - 32 dedicated unit/integration/fault-injection tests in `tests_py/test_p1614_invariant_workflow.py` passing 100%.
+  - Touched regression suites (158 tests + 10 subtests) passing 100%.
+  - Full regression (1,353 tests + 102 subtests in 481s) passing 100% with 0 failures.
+  - `python ops/p1614_evidence.py` valid.
+  - Python compilation and `git diff --check` clean.
+  - Knowledge graph updated via `graphify update .`.
+
 P16.12 Web Sol Persistent Pairing & Truthful Availability (complete 2026-09-25):
 - Implemented persistent pairing, truthful multi-signal availability, probe lifecycle, and failover:
   1. Capability Security Hardening (`src/dev_orchestrator/control/security.py`):

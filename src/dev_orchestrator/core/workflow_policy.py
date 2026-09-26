@@ -95,3 +95,15 @@ def inject_workflow_policy(
     if prompt.rstrip().endswith(policy):
         return prompt
     return prompt.rstrip() + "\n\n" + policy
+
+
+def inject_control_plane_contract(
+    prompt: str,
+    role: str,
+    declaration: Any = None,
+) -> str:
+    """Append control-plane contract prompt block idempotently."""
+    from dev_orchestrator.core.control_plane_contract import (
+        inject_control_plane_contract as _inject,
+    )
+    return _inject(prompt, role, declaration)

@@ -45,8 +45,13 @@ from dev_orchestrator.core.lifecycle_authority import (
     invariant_payload,
     lifecycle_state_from_snapshot,
     new_authority,
+    open_declaration_gate,
+    resolve_declaration_gate,
     source_ownership_blockers,
     transition_id_for,
+)
+from dev_orchestrator.core.control_plane_contract import (
+    evaluate_launch_declaration,
 )
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.core.workflow_policy import inject_workflow_policy
@@ -327,6 +332,23 @@ def _transient_remediation_state_block(record: Any) -> bool:
         and record.get("state") == "blocked"
         and record.get("source_kind") == "remediation"
         and record.get("reason") == "project state is not eligible for exact remediation"
+    )
+
+
+def _is_declaration_gate_replayable(record: Any, authority: Any, current_head: str) -> bool:
+    """A launch request blocked by CONTROL_PLANE_DECLARATION_REQUIRED may replay against a new HEAD."""
+    if not (isinstance(record, dict) and record.get("state") == "blocked"):
+        return False
+    if record.get("blocked_gate_code") != "CONTROL_PLANE_DECLARATION_REQUIRED":
+        return False
+    if str(record.get("head") or "") == current_head:
+        return False
+    if not (isinstance(authority, dict) and isinstance(authority.get("owner_gate"), dict)):
+        return False
+    gate = authority["owner_gate"]
+    return (
+        gate.get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"
+        and gate.get("gate_id") == record.get("gate_id")
     )
 
 
@@ -789,7 +811,9 @@ class TransitionExecutor:
                         if owner.get("role") == "review_obligation"
                         and owner.get("actuation_state") in {"blocked", "recovery_required"}
                     ]
-                    if "worker" in roles:
+                    if authority.get("owner_gate"):
+                        authority["lifecycle_state"] = "OWNER_GATE"
+                    elif "worker" in roles:
                         authority["lifecycle_state"] = "EXECUTING"
                     elif blocked_obligations and repo_task != owner_task:
                         prior_blocked_gate = authority.get("owner_gate")
@@ -883,7 +907,8 @@ class TransitionExecutor:
                             authority["source_task_id"] = current_task
                             authority["current_task_id"] = repo_task
                             authority["active_transition_id"] = transition.get("transition_id")
-                            authority["owner_gate"] = None
+                            if not (isinstance(authority.get("owner_gate"), dict) and authority["owner_gate"].get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"):
+                                authority["owner_gate"] = None
                         elif matching:
                             # Repository publication alone is only a projection.
                             # Keep the predecessor authoritative until the durable
@@ -907,6 +932,8 @@ class TransitionExecutor:
                             authority["lifecycle_state"] = "OWNER_GATE"
                     if authority.get("current_task_id") == repo_task and not authority.get("owner_gate"):
                         authority["lifecycle_state"] = lifecycle_state_from_snapshot(snapshot)
+                if authority.get("owner_gate"):
+                    authority["lifecycle_state"] = "OWNER_GATE"
 
                 authority["repository_projection"] = {
                     "task_id": repo_task,
@@ -1290,8 +1317,11 @@ class TransitionExecutor:
                 authority["source_task_id"] = record.get("source_task_id") or record.get("task_id")
                 authority["current_task_id"] = record.get("target_task_id") or record.get("next_task_id")
                 authority["active_transition_id"] = transition_id
-                authority["lifecycle_state"] = "PLANNING"
-                authority["owner_gate"] = None
+                if not (isinstance(authority.get("owner_gate"), dict) and authority["owner_gate"].get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"):
+                    authority["lifecycle_state"] = "PLANNING"
+                    authority["owner_gate"] = None
+                else:
+                    authority["lifecycle_state"] = "OWNER_GATE"
                 authority["updated_at"] = utc_now_iso()
                 authority["recovery_epoch_id"] = epoch_for(authority)
             self._save_ledger(ledger)
@@ -1603,13 +1633,64 @@ class TransitionExecutor:
         with self._lock:
             ledger = self._load_ledger()
             existing = ledger["executions"].get(source_request_id)
+            project_id = str(project["project_id"])
+            authority = ledger.setdefault("lifecycle", {}).get(project_id)
             replayed_from_block = None
             if existing is not None:
                 if _transient_remediation_state_block(existing):
                     replayed_from_block = copy.deepcopy(existing)
+                elif _is_declaration_gate_replayable(existing, authority, head):
+                    replayed_from_block = copy.deepcopy(existing)
                 else:
                     return None
-            project_id = str(project["project_id"])
+
+            if not isinstance(authority, dict):
+                authority = new_authority(project_id, task_id, "READY_TO_RUN")
+                ledger.setdefault("lifecycle", {})[project_id] = authority
+
+            # Special-gate reconciliation before generic owner_gate fence
+            owner_gate = authority.get("owner_gate")
+            if (
+                isinstance(owner_gate, dict)
+                and owner_gate.get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"
+            ):
+                repo_path = project.get("repo_path") or ""
+                scope, declaration, gate_eval = evaluate_launch_declaration(
+                    repo_path, project_id, task_id, head,
+                )
+                if gate_eval.allowed:
+                    resolve_declaration_gate(
+                        authority,
+                        reason=f"repaired control-plane declaration at head {head[:12]} verified",
+                    )
+                else:
+                    open_declaration_gate(
+                        authority,
+                        gate_id=gate_eval.gate_id or f"cp-gate:{project_id}:{task_id}:required",
+                        reason=gate_eval.reason,
+                        task_id=task_id,
+                        head=head,
+                        declaration_hash=declaration.content_hash,
+                        evidence=gate_eval.evidence,
+                    )
+                    ledger["executions"][source_request_id] = {
+                        "project_id": project_id,
+                        "source_request_id": source_request_id,
+                        "source_kind": source_kind,
+                        "source_task_id": source_task_id,
+                        "task_id": task_id,
+                        "branch": branch,
+                        "head": head,
+                        "state": "blocked",
+                        "reason": gate_eval.reason,
+                        "blocked_gate_code": "CONTROL_PLANE_DECLARATION_REQUIRED",
+                        "gate_id": gate_eval.gate_id,
+                        "declaration_hash": declaration.content_hash,
+                        "recorded_at": utc_now_iso(),
+                    }
+                    self._save_ledger(ledger)
+                    return None
+
             source_task_id, lifecycle_error = self._lifecycle_launch_guard(
                 ledger, project_id, task_id, source_task_id,
             )
@@ -1618,6 +1699,39 @@ class TransitionExecutor:
                     "project_id": project_id, "source_request_id": source_request_id,
                     "source_kind": source_kind, "source_task_id": source_task_id,
                     "task_id": task_id, "state": "blocked", "reason": lifecycle_error,
+                    "recorded_at": utc_now_iso(),
+                }
+                self._save_ledger(ledger)
+                return None
+
+            # Current declaration evaluation for tasks where gate was not already active
+            repo_path = project.get("repo_path") or ""
+            scope, declaration, gate_eval = evaluate_launch_declaration(
+                repo_path, project_id, task_id, head,
+            )
+            if not gate_eval.allowed:
+                open_declaration_gate(
+                    authority,
+                    gate_id=gate_eval.gate_id or f"cp-gate:{project_id}:{task_id}:required",
+                    reason=gate_eval.reason,
+                    task_id=task_id,
+                    head=head,
+                    declaration_hash=declaration.content_hash,
+                    evidence=gate_eval.evidence,
+                )
+                ledger["executions"][source_request_id] = {
+                    "project_id": project_id,
+                    "source_request_id": source_request_id,
+                    "source_kind": source_kind,
+                    "source_task_id": source_task_id,
+                    "task_id": task_id,
+                    "branch": branch,
+                    "head": head,
+                    "state": "blocked",
+                    "reason": gate_eval.reason,
+                    "blocked_gate_code": "CONTROL_PLANE_DECLARATION_REQUIRED",
+                    "gate_id": gate_eval.gate_id,
+                    "declaration_hash": declaration.content_hash,
                     "recorded_at": utc_now_iso(),
                 }
                 self._save_ledger(ledger)
@@ -1661,6 +1775,7 @@ class TransitionExecutor:
                 "context_state": resolution.state,
                 "context_digest": resolution.document.digest if resolution.document else None,
                 **(copy.deepcopy(lineage) if lineage else {}),
+                **({"replayed_from_block": replayed_from_block} if replayed_from_block is not None else {}),
             }
             authority = ledger["lifecycle"].get(project_id)
             if isinstance(authority, dict):
@@ -1794,12 +1909,63 @@ class TransitionExecutor:
         with self._lock:
             ledger = self._load_ledger()
             existing = ledger["executions"].get(source_request_id)
+            authority = ledger.setdefault("lifecycle", {}).get(project_id)
             replayed_from_block = None
             if existing is not None:
                 if _transient_remediation_state_block(existing):
                     replayed_from_block = copy.deepcopy(existing)
+                elif _is_declaration_gate_replayable(existing, authority, head):
+                    replayed_from_block = copy.deepcopy(existing)
                 else:
                     return None
+
+            if not isinstance(authority, dict):
+                authority = new_authority(project_id, task_id, "READY_TO_RUN")
+                ledger.setdefault("lifecycle", {})[project_id] = authority
+
+            # Special-gate reconciliation before generic owner_gate fence
+            owner_gate = authority.get("owner_gate")
+            if (
+                isinstance(owner_gate, dict)
+                and owner_gate.get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"
+            ):
+                repo_path = project.get("repo_path") or ""
+                scope, declaration, gate_eval = evaluate_launch_declaration(
+                    repo_path, project_id, task_id, head,
+                )
+                if gate_eval.allowed:
+                    resolve_declaration_gate(
+                        authority,
+                        reason=f"repaired control-plane declaration at head {head[:12]} verified",
+                    )
+                else:
+                    open_declaration_gate(
+                        authority,
+                        gate_id=gate_eval.gate_id or f"cp-gate:{project_id}:{task_id}:required",
+                        reason=gate_eval.reason,
+                        task_id=task_id,
+                        head=head,
+                        declaration_hash=declaration.content_hash,
+                        evidence=gate_eval.evidence,
+                    )
+                    ledger["executions"][source_request_id] = {
+                        "project_id": project_id,
+                        "source_request_id": source_request_id,
+                        "source_kind": source_kind,
+                        "source_task_id": source_task_id,
+                        "task_id": task_id,
+                        "branch": branch,
+                        "head": head,
+                        "state": "blocked",
+                        "reason": gate_eval.reason,
+                        "blocked_gate_code": "CONTROL_PLANE_DECLARATION_REQUIRED",
+                        "gate_id": gate_eval.gate_id,
+                        "declaration_hash": declaration.content_hash,
+                        "recorded_at": utc_now_iso(),
+                    }
+                    self._save_ledger(ledger)
+                    return None
+
             source_task_id, lifecycle_error = self._lifecycle_launch_guard(
                 ledger, project_id, task_id, source_task_id,
             )
@@ -1808,6 +1974,39 @@ class TransitionExecutor:
                     "project_id": project_id, "source_request_id": source_request_id,
                     "source_kind": source_kind, "source_task_id": source_task_id,
                     "task_id": task_id, "state": "blocked", "reason": lifecycle_error,
+                    "recorded_at": utc_now_iso(),
+                }
+                self._save_ledger(ledger)
+                return None
+
+            # Current declaration evaluation for tasks where gate was not already active
+            repo_path = project.get("repo_path") or ""
+            scope, declaration, gate_eval = evaluate_launch_declaration(
+                repo_path, project_id, task_id, head,
+            )
+            if not gate_eval.allowed:
+                open_declaration_gate(
+                    authority,
+                    gate_id=gate_eval.gate_id or f"cp-gate:{project_id}:{task_id}:required",
+                    reason=gate_eval.reason,
+                    task_id=task_id,
+                    head=head,
+                    declaration_hash=declaration.content_hash,
+                    evidence=gate_eval.evidence,
+                )
+                ledger["executions"][source_request_id] = {
+                    "project_id": project_id,
+                    "source_request_id": source_request_id,
+                    "source_kind": source_kind,
+                    "source_task_id": source_task_id,
+                    "task_id": task_id,
+                    "branch": branch,
+                    "head": head,
+                    "state": "blocked",
+                    "reason": gate_eval.reason,
+                    "blocked_gate_code": "CONTROL_PLANE_DECLARATION_REQUIRED",
+                    "gate_id": gate_eval.gate_id,
+                    "declaration_hash": declaration.content_hash,
                     "recorded_at": utc_now_iso(),
                 }
                 self._save_ledger(ledger)
@@ -3085,12 +3284,17 @@ class TransitionExecutor:
         }
         for request_id, record in ordered:
             with self._lock:
-                existing = self._load_ledger()["executions"].get(request_id)
+                ledger = self._load_ledger()
+                existing = ledger["executions"].get(request_id)
+                proj_id = _non_blank_config(record.get("project_id"))
+                authority = ledger.get("lifecycle", {}).get(proj_id) if proj_id else None
+                rec_head = _non_blank_config(record.get("head")) or ""
                 if existing is not None and not (
                     _legacy_not_ready_block(existing)
                     or _legacy_no_next_settle(existing)
                     or _legacy_not_advanced_block(existing)
                     or _transient_remediation_state_block(existing)
+                    or _is_declaration_gate_replayable(existing, authority, rec_head)
                 ):
                     continue
             if record.get("disposition") != "apply":

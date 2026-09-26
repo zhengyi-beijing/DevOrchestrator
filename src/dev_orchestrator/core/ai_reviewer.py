@@ -26,7 +26,13 @@ from dev_orchestrator.ai.structured_output import (
     require_exact_keys,
 )
 from dev_orchestrator.accounting import ExecutionRecorder, FailureMemory, environment_for_project
+from types import SimpleNamespace
 from dev_orchestrator.config import load_projects_config
+from dev_orchestrator.core.control_plane_contract import (
+    declared_scope_gap,
+    inject_control_plane_contract,
+    load_control_plane_declaration,
+)
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.workflow_policy import workflow_policy_prompt
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
@@ -1555,6 +1561,8 @@ class AIReviewerCoordinator:
         context_block: str = "",
         failure_memory_block: str = "",
         reanchor_context: str = "",
+        repo_path: str = "",
+        declaration: Any = None,
     ) -> str:
         prompt = (
             "You are the independent reviewer for a completed software-development Worker. "
@@ -1575,6 +1583,11 @@ class AIReviewerCoordinator:
             prompt += f"\n{failure_memory_block}\n"
         if reanchor_context:
             prompt += f"\n{reanchor_context}\n"
+        decl = declaration
+        if decl is None and repo_path and truth and getattr(truth, "head", None):
+            decl = load_control_plane_declaration(repo_path, task_id, truth.head)
+        if decl is not None and getattr(decl, "kind", None) == "declared":
+            prompt = inject_control_plane_contract(prompt, "technical_reviewer", decl)
         return prompt
 
     def _launch_harness_review(
@@ -1938,6 +1951,34 @@ class AIReviewerCoordinator:
         # 4. Findings classification
         blocking_severities = set(harness_cfg.get("blocking_severities") or ["blocking"])
         blocking_findings = [f for f in review_result.findings if f.severity in blocking_severities]
+
+        # Scope-gap check against control-plane surfaces
+        if repo_path and head:
+            try:
+                launch_head = _nonblank(worker.get("head")) if isinstance(worker, dict) else None
+                diff_spec = f"{launch_head}..{head}" if launch_head and launch_head != head else "HEAD~1..HEAD"
+                diff_proc = subprocess.run(
+                    ["git", "-C", str(repo_path), "diff", "--name-only", diff_spec],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=10, check=False,
+                )
+                if diff_proc.returncode == 0:
+                    changed_files = [line.strip() for line in diff_proc.stdout.splitlines() if line.strip()]
+                    if changed_files:
+                        decl = load_control_plane_declaration(repo_path, task_id, head)
+                        gaps = declared_scope_gap(decl, changed_files)
+                        for gap in gaps:
+                            gap_file = gap.split("'")[1] if "'" in gap else "agent/next.md"
+                            finding_obj = SimpleNamespace(
+                                rule_id="CONTROL_PLANE_SCOPE_GAP",
+                                file=gap_file,
+                                start_line=1,
+                                severity="blocking",
+                                message=gap,
+                            )
+                            blocking_findings.append(finding_obj)
+            except Exception:
+                pass
 
         if blocking_findings:
             decision = "remediate"

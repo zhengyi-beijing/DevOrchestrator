@@ -131,6 +131,28 @@ idempotent. Missing or ambiguous evidence, a repeated finding, or another
 the unresolved evidence for owner disposition. `NON_BLOCKING` findings never
 consume another round.
 
+## Control-Plane Invariant Contract
+
+For tasks that affect DevOrchestrator control-plane runtime surfaces
+(lifecycle authority, invariant evaluation, transition execution, launch fences,
+successor consistency, owner gates, or watchdog recovery), the workflow enforces
+an invariant-first contract:
+
+1. **Pre-Implementation Declaration**: The task specification must declare its
+   affected invariants, transition boundaries, registered `CPF-` fault scenarios,
+   and convergence evidence before implementation starts.
+2. **Task-Level Classification**: Classification is based strictly on the current
+   task artifact, candidate plan, or modified protected surfaces. Repository
+   identity never classifies ordinary work as control-plane.
+3. **Adversarial Verification**: Validation plans must include normal-path tests
+   plus fault injection for declared transition and failure models.
+4. **Authoritative Gate and Repair**: Unannounced or invalid control-plane changes
+   fail closed to `CONTROL_PLANE_DECLARATION_REQUIRED` (`OWNER_GATE`). A repaired
+   commit at a new authenticated HEAD resolves the gate automatically, archives gate
+   evidence, and replays the blocked request.
+5. **Detailed Specification**: See `docs/CONTROL_PLANE_INVARIANT_METHOD_CONTRACT.md`
+   for the complete grammar, registry, and state-machine transitions.
+
 ## Context Propagation Contract
 
 Ordinary documentation cannot be assumed to enter every provider's context.

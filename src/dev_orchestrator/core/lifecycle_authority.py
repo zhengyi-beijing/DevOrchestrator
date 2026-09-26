@@ -7,6 +7,7 @@ none may independently redefine the current task.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import dataclass
@@ -75,6 +76,95 @@ def new_authority(project_id: str, task_id: str, state: str) -> dict[str, Any]:
         "owner_gate": None,
         "updated_at": utc_now_iso(),
     }
+
+
+def open_declaration_gate(
+    authority: dict[str, Any],
+    *,
+    gate_id: str,
+    reason: str,
+    task_id: str,
+    head: str,
+    declaration_hash: str = "",
+    evidence: dict[str, Any] | None = None,
+) -> bool:
+    """Atomically set owner_gate and lifecycle_state='OWNER_GATE' for declaration refusal.
+
+    Stores the safe prior resumable state in the gate. Leaves lifecycle ownership,
+    generation, and transition identity unchanged. Repeating the same refusal
+    performs no write or timestamp refresh.
+    Returns True if mutated, False if byte-stable identical gate already active.
+    """
+    existing_gate = authority.get("owner_gate")
+    if (
+        isinstance(existing_gate, dict)
+        and existing_gate.get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"
+        and existing_gate.get("gate_id") == gate_id
+        and existing_gate.get("head") == head
+        and str(authority.get("lifecycle_state")) == "OWNER_GATE"
+    ):
+        return False
+
+    current_state = str(authority.get("lifecycle_state") or "READY_TO_RUN")
+    if current_state == "OWNER_GATE" and isinstance(existing_gate, dict) and existing_gate.get("resume_state"):
+        resume_state = existing_gate["resume_state"]
+    else:
+        resume_state = current_state if current_state != "OWNER_GATE" else "READY_TO_RUN"
+
+    gate = {
+        "code": "CONTROL_PLANE_DECLARATION_REQUIRED",
+        "gate_id": gate_id,
+        "state": "OWNER_GATE",
+        "resume_state": resume_state,
+        "reason": reason,
+        "task_id": task_id,
+        "head": head,
+        "declaration_hash": declaration_hash,
+        "evidence": evidence or {},
+        "recorded_at": (
+            existing_gate.get("recorded_at")
+            if (isinstance(existing_gate, dict) and existing_gate.get("gate_id") == gate_id and existing_gate.get("recorded_at"))
+            else utc_now_iso()
+        ),
+    }
+    authority["owner_gate"] = gate
+    authority["lifecycle_state"] = "OWNER_GATE"
+    authority["updated_at"] = utc_now_iso()
+    return True
+
+
+def resolve_declaration_gate(
+    authority: dict[str, Any],
+    *,
+    reason: str,
+    resolved_at: str | None = None,
+) -> bool:
+    """Resolve an authoritative CONTROL_PLANE_DECLARATION_REQUIRED gate.
+
+    Atomically appends gate evidence to bounded resolved_owner_gates, clears owner_gate,
+    and restores only the validated stored resumable state.
+    Lazily upgrades authority schema_version to 2.
+    """
+    current_gate = authority.get("owner_gate")
+    if not (isinstance(current_gate, dict) and current_gate.get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"):
+        return False
+
+    resolved_entry = copy.deepcopy(current_gate)
+    resolved_entry["resolved_at"] = resolved_at or utc_now_iso()
+    resolved_entry["resolution_reason"] = reason
+
+    history = authority.setdefault("resolved_owner_gates", [])
+    if not any(g.get("gate_id") == resolved_entry.get("gate_id") for g in history):
+        history.append(resolved_entry)
+        if len(history) > 50:
+            history.pop(0)
+
+    resume_state = current_gate.get("resume_state") or "READY_TO_RUN"
+    authority["owner_gate"] = None
+    authority["lifecycle_state"] = resume_state
+    authority["schema_version"] = 2
+    authority["updated_at"] = utc_now_iso()
+    return True
 
 
 def active_owners(
@@ -261,6 +351,8 @@ def evaluate_lifecycle_invariants(
     authority = authorities.get(project_id) if isinstance(authorities, dict) else None
     authority_task = str(authority.get("current_task_id") or "") if isinstance(authority, dict) else ""
     authority_state = str(authority.get("lifecycle_state") or "") if isinstance(authority, dict) else ""
+    if isinstance(authority, dict) and authority.get("owner_gate"):
+        authority_state = "OWNER_GATE"
     owners = active_owners(project_id, executor_state, planner_state, reviewer_state)
     worker_owners = [owner for owner in owners if owner.get("role") == "worker"]
     owner_tasks = {str(owner.get("task_id") or "") for owner in owners if owner.get("task_id")}

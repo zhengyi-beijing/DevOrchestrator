@@ -31,6 +31,13 @@ from dev_orchestrator.core.task_status import (
 )
 
 from dev_orchestrator.core.workflow_policy import workflow_policy_prompt
+from dev_orchestrator.core.control_plane_contract import (
+    classify_control_plane_task,
+    inject_control_plane_contract,
+    parse_control_plane_declaration,
+    render_declaration_section,
+    require_control_plane_declaration,
+)
 from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
@@ -1838,6 +1845,21 @@ class AIPlannerCoordinator:
                     return
 
                 if decision == "approve":
+                    _, task_source_text = self._task_source(record)
+                    scope = classify_control_plane_task(task_text=task_source_text, candidate_plan=plan)
+                    if scope.kind == "control_plane":
+                        interfaces_text = "\n".join(str(item) for item in (plan.get("interfaces") or []))
+                        decl = parse_control_plane_declaration(interfaces_text, allow_bare=True)
+                        if decl.kind != "declared":
+                            decl = parse_control_plane_declaration(task_source_text, allow_bare=True)
+                        gate_eval = require_control_plane_declaration(
+                            record["project_id"], record["task_id"], scope, decl, plan=plan,
+                        )
+                        if not gate_eval.allowed:
+                            decision = "reject"
+                            reason = f"control-plane declaration validation failed: {gate_eval.reason}"
+
+                if decision == "approve":
                     if self.accounting is not None:
                         self.accounting.record_attempt_outcome(
                             f"{plan_id}:recovery-{recovery_cycle}:plan-round-{round_no}",
@@ -2224,6 +2246,19 @@ class AIPlannerCoordinator:
         lines[idx] = render_status_line("ready_to_run")
 
         text = "\n".join(lines).rstrip() + "\n\n"
+
+        if "## Control-Plane Impact" not in original:
+            scope = classify_control_plane_task(task_text=original, candidate_plan=plan)
+            if scope.kind == "control_plane":
+                interfaces_text = "\n".join(str(item) for item in (plan.get("interfaces") or []))
+                decl = parse_control_plane_declaration(interfaces_text, allow_bare=True)
+                if decl.kind != "declared":
+                    decl = parse_control_plane_declaration(original, allow_bare=True)
+                if decl.kind == "declared":
+                    decl_sec = render_declaration_section(decl)
+                    if decl_sec:
+                        text += decl_sec.rstrip() + "\n\n"
+
         text += marker + "\n\n"
         text += str(plan["summary"]).strip() + "\n\n"
         for title, key in (("Implementation steps", "implementation_steps"), ("Interfaces / contracts", "interfaces"), ("Validation plan", "validation"), ("Risks / failure modes", "risks"), ("Out of scope", "out_of_scope")):
@@ -2454,6 +2489,10 @@ class AIPlannerCoordinator:
             + task_text
             + "\n---END NEXT---\n"
         )
+        scope = classify_control_plane_task(task_text=task_text)
+        if scope.kind == "control_plane":
+            decl = parse_control_plane_declaration(task_text, allow_bare=True)
+            prompt = inject_control_plane_contract(prompt, "planner", decl)
         return prompt
 
     @staticmethod
@@ -2481,6 +2520,13 @@ class AIPlannerCoordinator:
             f"{task_heading}:\n---BEGIN NEXT---\n" + task_text + "\n---END NEXT---\n\n"
             + "Proposed plan JSON:\n" + json.dumps(plan, ensure_ascii=False, indent=2)
         )
+        scope = classify_control_plane_task(task_text=task_text, candidate_plan=plan)
+        if scope.kind == "control_plane":
+            interfaces_text = "\n".join(str(item) for item in (plan.get("interfaces") or []))
+            decl = parse_control_plane_declaration(interfaces_text, allow_bare=True)
+            if decl.kind != "declared":
+                decl = parse_control_plane_declaration(task_text, allow_bare=True)
+            prompt = inject_control_plane_contract(prompt, "plan_reviewer", decl)
         return prompt
 
     def _finish(self, plan_id: str, state_name: str, reason: str) -> None:
