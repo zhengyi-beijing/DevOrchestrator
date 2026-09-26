@@ -1714,6 +1714,35 @@ class WatchdogCoordinator:
                     prow["lifecycle_invariants"] = invariant_payload(lifecycle_findings)
                     violations = [finding for finding in lifecycle_findings if not finding.holds]
                     prow["unresolved_invariants"] = [finding.code for finding in violations]
+                    active_codes = {finding.code for finding in violations}
+                    evaluated_codes = {finding.code for finding in lifecycle_findings}
+                    existing_gate = prow.get("owner_gate")
+                    existing_gate_code = (
+                        str(existing_gate.get("code") or "")
+                        if isinstance(existing_gate, dict)
+                        else ""
+                    )
+                    if (
+                        existing_gate_code in evaluated_codes
+                        and existing_gate_code not in active_codes
+                    ):
+                        resolved = prow.setdefault("resolved_lifecycle_owner_gates", [])
+                        if not isinstance(resolved, list):
+                            resolved = []
+                            prow["resolved_lifecycle_owner_gates"] = resolved
+                        gate_id = existing_gate.get("gate_id")
+                        if not any(
+                            isinstance(item, dict)
+                            and item.get("gate_id") == gate_id
+                            for item in resolved
+                        ):
+                            resolved.append({
+                                **existing_gate,
+                                "resolved_at": now_iso,
+                                "resolved_reason": "lifecycle invariant now holds",
+                            })
+                            del resolved[:-20]
+                        prow["owner_gate"] = None
                     for finding in violations:
                         evidence_raw = json.dumps(finding.evidence, sort_keys=True, default=str)
                         occurrence = hashlib.sha256(

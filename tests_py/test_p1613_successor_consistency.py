@@ -1148,6 +1148,51 @@ class BoundedRecoveryActuationTests(unittest.TestCase):
                     ),
                 )
 
+    def test_B1_resolved_lifecycle_invariant_archives_and_clears_owner_gate(self):
+        """A recovered invariant must not leave a sticky published gate."""
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        executor = self._CountingExecutor(
+            "agent/staged/roadmap.json does not exist",
+        )
+        watchdog = WatchdogCoordinator(self.runtime)
+        snapshot = _summary(self.repo, "P2")["projects"][0]
+        for _ in range(2):
+            watchdog.advance(
+                str(self.config_path), {"projects": [snapshot]}, executor=executor,
+            )
+        gated = (watchdog.state().get("projects") or {}).get("p1") or {}
+        gate = gated.get("owner_gate") or {}
+        self.assertEqual(gate.get("code"), "NEXT_TASK_WITHOUT_HANDOFF")
+
+        executor.ledger["executions"]["ai_review:d1"] = {
+            "project_id": "p1",
+            "task_id": "P1",
+            "state": "settled",
+            "outcome": "task_complete",
+            "recorded_at": "2026-09-22T21:00:00+00:00",
+        }
+        watchdog.advance(
+            str(self.config_path), {"projects": [snapshot]}, executor=executor,
+        )
+        recovered = (watchdog.state().get("projects") or {}).get("p1") or {}
+        self.assertIsNone(recovered.get("owner_gate"))
+        self.assertEqual(recovered.get("unresolved_invariants"), [])
+        history = recovered.get("resolved_lifecycle_owner_gates") or []
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].get("gate_id"), gate.get("gate_id"))
+        self.assertEqual(
+            history[0].get("resolved_reason"),
+            "lifecycle invariant now holds",
+        )
+
+        watchdog.advance(
+            str(self.config_path), {"projects": [snapshot]}, executor=executor,
+        )
+        replayed = (watchdog.state().get("projects") or {}).get("p1") or {}
+        self.assertIsNone(replayed.get("owner_gate"))
+        self.assertEqual(len(replayed.get("resolved_lifecycle_owner_gates") or []), 1)
+
     def test_NA_undrained_source_ownership_is_a_wait_not_a_refusal(self):
         """Review finding N-A: only _record_handoff rebuilds the durable handoff.
 
