@@ -31,6 +31,7 @@ from dev_orchestrator.core.control_plane_contract import (
     render_declaration_section,
     require_control_plane_declaration,
     traversal_evidence,
+    _matches_protected_surface,
 )
 from dev_orchestrator.core.control_plane_faults import (
     FaultScenario,
@@ -662,8 +663,8 @@ class ControlPlanePromptAndScopeGapTests(unittest.TestCase):
         self.assertEqual(len(gaps), 1)
         self.assertIn("lifecycle_authority.py", gaps[0])
 
-        # With declared declaration
-        decl = ControlPlaneDeclaration(
+        # With under-scoped declaration (declares plan_freeze but not authority_reconciliation)
+        decl_underscoped = ControlPlaneDeclaration(
             kind="declared",
             source_path="agent/next.md",
             revision="h",
@@ -673,8 +674,23 @@ class ControlPlanePromptAndScopeGapTests(unittest.TestCase):
             fault_scenarios=("CPF-06",),
             convergence_evidence="ok",
         )
-        gaps2 = declared_scope_gap(decl, changed_paths)
-        self.assertEqual(len(gaps2), 0)
+        gaps2 = declared_scope_gap(decl_underscoped, changed_paths)
+        self.assertEqual(len(gaps2), 1)
+        self.assertIn("requires declaration of transition boundaries", gaps2[0])
+
+        # With covered declaration (declares authority_reconciliation)
+        decl_covered = ControlPlaneDeclaration(
+            kind="declared",
+            source_path="agent/next.md",
+            revision="h",
+            content_hash="h",
+            invariants=("SINGLE_ACTIVE_LIFECYCLE_OWNER",),
+            transition_boundaries=("authority_reconciliation",),
+            fault_scenarios=("CPF-06",),
+            convergence_evidence="ok",
+        )
+        gaps3 = declared_scope_gap(decl_covered, changed_paths)
+        self.assertEqual(len(gaps3), 0)
 
 
 class ControlPlaneFaultRegistryTests(unittest.TestCase):
@@ -800,6 +816,214 @@ Status: **PENDING DESIGN**
         conv = convergence_evidence(executor_state, project_id="proj")
         self.assertEqual(conv["lifecycle_state"], "READY_TO_RUN")
         self.assertFalse(conv["manual_intervention_required"])
+
+
+class ControlPlaneRemediationTests(unittest.TestCase):
+    """Targeted regression tests for the five technical review remediation findings."""
+
+    def test_finding1_task_mismatch_refuses_before_special_gate_reconciliation(self):
+        """A launch request for task B while gate is open for task A must not resolve or clear A's gate."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _init_repo(root)
+            truth = read_repository_truth(repo)
+            head = truth.head
+            branch = truth.branch
+
+            # Create authority for Task A in OWNER_GATE
+            authority = new_authority("p1", "TaskA", "READY_TO_RUN")
+            open_declaration_gate(
+                authority,
+                gate_id="cp-gate:p1:TaskA:required",
+                reason="missing declaration",
+                task_id="TaskA",
+                head=head,
+            )
+            self.assertEqual(authority["lifecycle_state"], "OWNER_GATE")
+            self.assertIsNotNone(authority["owner_gate"])
+
+            # 1. resolve_declaration_gate with mismatched task_id fails
+            resolved = resolve_declaration_gate(authority, reason="test resolution", task_id="TaskB")
+            self.assertFalse(resolved)
+            self.assertIsNotNone(authority["owner_gate"])
+            self.assertEqual(authority["lifecycle_state"], "OWNER_GATE")
+
+            # 2. Launch execution for Task B against project with Task A authority
+            executor = TransitionExecutor(root, ai_execution_port=unittest.mock.MagicMock())
+            policy = {
+                "engine": "aibroker",
+                "enabled": True,
+                "owner_authorized": True,
+                "allowed_next_actions": ["continue_current_stage", "next_task"],
+            }
+            project = {
+                "project_id": "p1",
+                "repo_path": str(repo),
+                "execution": policy,
+            }
+            # Preload ledger with Task A authority
+            with executor._lock:
+                ledger = executor._load_ledger()
+                ledger.setdefault("lifecycle", {})["p1"] = authority
+                executor._save_ledger(ledger)
+
+            # Attempt to launch Task B
+            result = executor._launch(
+                project=project,
+                task_id="TaskB",
+                head=head,
+                branch=branch,
+                source_request_id="req-task-b",
+                source_kind="review",
+                source_task_id=None,
+                worker_prompt="test prompt",
+                policy=project["execution"],
+            )
+            self.assertIsNone(result)
+
+            # Verify Task A's gate is PRESERVED, not resolved or cleared
+            state = executor.state()
+            auth = state["lifecycle"]["p1"]
+            self.assertEqual(auth["lifecycle_state"], "OWNER_GATE")
+            self.assertIsNotNone(auth["owner_gate"])
+            self.assertEqual(auth["owner_gate"]["task_id"], "TaskA")
+
+            # Verify the execution record for req-task-b is blocked with task mismatch
+            exec_row = state["executions"]["req-task-b"]
+            self.assertEqual(exec_row["state"], "blocked")
+            self.assertIn("authoritative lifecycle task mismatch", exec_row["reason"])
+
+    def test_finding2_bare_declaration_surrounded_by_unrelated_interfaces(self):
+        """Unrelated interfaces before/after declaration do not fail parsing or pollute convergence evidence."""
+        interfaces_blob = """
+def get_user_profile(user_id: str) -> dict[str, Any]:
+    pass
+
+Invariants: SINGLE_ACTIVE_LIFECYCLE_OWNER, CURRENT_TASK_MATCHES_ACTIVE_EXECUTION
+Transition boundaries: plan_freeze, worker_launch
+Fault scenarios: CPF-01, CPF-08
+Convergence evidence: Clean single owner convergence without manual continue.
+
+def record_metric(name: str, value: float) -> None:
+    pass
+"""
+        decl = parse_control_plane_declaration(interfaces_blob, allow_bare=True)
+        self.assertEqual(decl.kind, "declared")
+        self.assertEqual(decl.invariants, ("SINGLE_ACTIVE_LIFECYCLE_OWNER", "CURRENT_TASK_MATCHES_ACTIVE_EXECUTION"))
+        self.assertEqual(decl.transition_boundaries, ("plan_freeze", "worker_launch"))
+        self.assertEqual(decl.fault_scenarios, ("CPF-01", "CPF-08"))
+        self.assertEqual(decl.convergence_evidence, "Clean single owner convergence without manual continue.")
+        self.assertNotIn("record_metric", decl.convergence_evidence)
+        self.assertNotIn("get_user_profile", decl.convergence_evidence)
+
+    def test_finding2_prompt_injection_teaches_grammar_to_planner_when_undeclared(self):
+        """When declaration is missing, prompt injection teaches grammar to planner and plan reviewer."""
+        base_prompt = "You are drafting an implementation plan."
+        injected = inject_control_plane_contract(base_prompt, "planner", None)
+        self.assertIn("[CONTROL_PLANE_CONTRACT_BEGIN]", injected)
+        self.assertIn("CONTROL-PLANE CONTRACT REQUIREMENT:", injected)
+        self.assertIn("Invariants:", injected)
+        self.assertIn("Transition boundaries:", injected)
+        self.assertIn("Fault scenarios:", injected)
+        self.assertIn("Convergence evidence:", injected)
+        self.assertIn("Adversarial verification checklist:", injected)
+        self.assertIn("[CONTROL_PLANE_CONTRACT_END]", injected)
+
+        # Idempotence
+        reinjected = inject_control_plane_contract(injected, "planner", None)
+        self.assertEqual(injected, reinjected)
+
+        # Worker role is not injected with requirement when declaration is missing
+        worker_prompt = inject_control_plane_contract("Worker prompt.", "worker", None)
+        self.assertEqual(worker_prompt, "Worker prompt.")
+
+    def test_finding3_scope_gap_detects_under_scoped_boundary_declarations(self):
+        """Technical review detects when changed protected surface is not covered by declared boundaries."""
+        decl = ControlPlaneDeclaration(
+            kind="declared",
+            source_path="agent/next.md",
+            revision="h",
+            content_hash="h",
+            invariants=("SINGLE_ACTIVE_LIFECYCLE_OWNER",),
+            transition_boundaries=("plan_freeze",),
+            fault_scenarios=("CPF-06",),
+            convergence_evidence="ok",
+        )
+        # watchdog.py requires watchdog_recovery
+        gaps = declared_scope_gap(decl, ["src/dev_orchestrator/core/watchdog.py"])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("watchdog_recovery", gaps[0])
+
+        # transition_executor.py requires worker_launch / special_gate_reconciliation
+        gaps2 = declared_scope_gap(decl, ["src/dev_orchestrator/core/transition_executor.py"])
+        self.assertEqual(len(gaps2), 1)
+        self.assertIn("worker_launch", gaps2[0])
+
+    def test_finding4_transient_failure_recovery_on_same_head(self):
+        """Transient unevaluable evaluation escapes for ordinary repos and allows same-HEAD replay."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ordinary_repo = _init_repo(root)
+            head = _git(ordinary_repo, "rev-parse", "HEAD")
+
+            # Ordinary repo without core surfaces escapes to ordinary immediately
+            scope, decl, gate = evaluate_launch_declaration(ordinary_repo, "p-ord", "T1", head)
+            self.assertEqual(scope.kind, "ordinary")
+            self.assertTrue(gate.allowed)
+
+            # Same-HEAD replay is allowed when blocked due to transient unevaluable evaluation
+            authority = new_authority("p-trans", "T1", "OWNER_GATE")
+            open_declaration_gate(
+                authority,
+                gate_id="cp-gate:p-trans:T1:unevaluable",
+                reason="task classification unevaluable: timeout",
+                task_id="T1",
+                head=head,
+                evidence={"transient": True},
+            )
+            blocked_record = {
+                "state": "blocked",
+                "blocked_gate_code": "CONTROL_PLANE_DECLARATION_REQUIRED",
+                "gate_id": "cp-gate:p-trans:T1:unevaluable",
+                "reason": "task classification unevaluable: timeout",
+                "head": head,
+                "evidence": {"transient": True},
+            }
+            # On same HEAD, transient unevaluable is replayable
+            replayable = _is_declaration_gate_replayable(blocked_record, authority, current_head=head)
+            self.assertTrue(replayable)
+
+            # Normal non-transient declaration refusal is NOT replayable on the same HEAD
+            blocked_normal = {
+                "state": "blocked",
+                "blocked_gate_code": "CONTROL_PLANE_DECLARATION_REQUIRED",
+                "gate_id": "cp-gate:p-trans:T1:declaration_absent",
+                "reason": "control-plane declaration required: absent",
+                "head": head,
+                "evidence": {},
+            }
+            authority["owner_gate"]["gate_id"] = "cp-gate:p-trans:T1:declaration_absent"
+            replayable_normal = _is_declaration_gate_replayable(blocked_normal, authority, current_head=head)
+            self.assertFalse(replayable_normal)
+
+    def test_finding5_matches_protected_surface_word_boundaries(self):
+        """Substring matching does not falsely match bare symbols like _launch inside worker_launch."""
+        # worker_launch is NOT _launch
+        matched = _matches_protected_surface("Add worker_launch button in settings panel UI")
+        self.assertEqual(matched, [])
+
+        # Exact identifier _launch IS matched
+        matched2 = _matches_protected_surface("Call _launch(task_id) directly")
+        self.assertEqual(matched2, ["_launch"])
+
+        # read_successor matched as exact token
+        matched3 = _matches_protected_surface("Inspect read_successor return value")
+        self.assertEqual(matched3, ["read_successor"])
+
+        # Ordinary task mentioning worker_launch remains ordinary
+        task_text = "# P30 UI\n\nAdd worker_launch button and UI indicators for jobs."
+        scope = classify_control_plane_task(task_text=task_text)
+        self.assertEqual(scope.kind, "ordinary")
 
 
 if __name__ == "__main__":

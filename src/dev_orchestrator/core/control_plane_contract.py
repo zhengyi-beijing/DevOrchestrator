@@ -170,8 +170,10 @@ def parse_control_plane_declaration(
         return _empty_declaration("invalid", "text must be a string", source_path, revision)
 
     matches = list(re.finditer(r"^##\s+Control-Plane Impact\s*$", text, flags=re.MULTILINE))
+    is_bare = False
     if len(matches) == 0:
         if allow_bare and ("invariants:" in text.lower()):
+            is_bare = True
             section_text = text
         else:
             return _empty_declaration("absent", "no '## Control-Plane Impact' section found", source_path, revision)
@@ -205,9 +207,11 @@ def parse_control_plane_declaration(
         "Convergence evidence": re.compile(r"^[-*]?\s*Convergence evidence\s*:\s*(.*)$", re.IGNORECASE),
     }
 
+    current_field: str | None = None
     for line in raw_lines:
         line_str = line.strip()
         if not line_str:
+            current_field = None
             continue
         matched_any = False
         for field_name, pattern in field_patterns.items():
@@ -217,13 +221,32 @@ def parse_control_plane_declaration(
                     return _empty_declaration("invalid", f"duplicate field '{field_name}'", source_path, revision)
                 parsed_fields[field_name] = m.group(1).strip()
                 matched_any = True
+                current_field = field_name
                 break
         if not matched_any and not line_str.startswith("#"):
-            # If line is continuation of convergence evidence, allow multi-line if previously started
-            if "Convergence evidence" in parsed_fields:
-                parsed_fields["Convergence evidence"] += " " + line_str
+            if is_bare:
+                # In bare mode, only indented continuation lines directly following Convergence evidence are joined
+                if (
+                    current_field == "Convergence evidence"
+                    and (line.startswith(" ") or line.startswith("\t"))
+                    and not line_str.startswith(("-", "*", "def ", "class ", "import ", "from "))
+                ):
+                    parsed_fields["Convergence evidence"] += " " + line_str
+                else:
+                    current_field = None
+                # Other non-matching lines in bare mode are ignored (e.g. interfaces, other text)
             else:
-                return _empty_declaration("invalid", f"unrecognized declaration line '{line_str}'", source_path, revision)
+                # In canonical section mode, allow continuation of convergence evidence if indented or continuation
+                if (
+                    current_field == "Convergence evidence"
+                    and (line.startswith(" ") or line.startswith("\t") or not line_str.startswith(("-", "*")))
+                ):
+                    parsed_fields["Convergence evidence"] += " " + line_str
+                else:
+                    return _empty_declaration("invalid", f"unrecognized declaration line '{line_str}'", source_path, revision)
+
+    if is_bare and not parsed_fields:
+        return _empty_declaration("absent", "no control-plane declaration found in text", source_path, revision)
 
     # Check required fields
     for field_name in field_patterns:
@@ -370,6 +393,16 @@ def evaluate_launch_declaration(
     # If the repository does not contain dev_orchestrator/core surfaces and has no agent/next.md,
     # it is an ordinary managed repository that cannot touch the DevOrchestrator control plane.
     has_core_surfaces = (repo / "src" / "dev_orchestrator" / "core").is_dir()
+    if not has_core_surfaces and not (repo / "agent" / "next.md").exists():
+        scope = ControlPlaneScope(
+            kind="ordinary",
+            matched_surfaces=(),
+            evidence_source="default",
+            reason="repository does not contain control-plane surfaces and has no task declaration",
+        )
+        declaration = _empty_declaration("absent", "task is ordinary", "agent/next.md", head)
+        gate = require_control_plane_declaration(project_id, task_id, scope, declaration)
+        return scope, declaration, gate
 
     try:
         proc = subprocess.run(
@@ -449,6 +482,16 @@ def evaluate_launch_declaration(
             return scope, declaration, gate
         committed_text = proc.stdout
     except subprocess.TimeoutExpired:
+        if not has_core_surfaces and not (repo / "agent" / "next.md").exists():
+            scope = ControlPlaneScope(
+                kind="ordinary",
+                matched_surfaces=(),
+                evidence_source="default",
+                reason="repository does not contain control-plane surfaces and has no task declaration",
+            )
+            declaration = _empty_declaration("absent", "task is ordinary", "agent/next.md", head)
+            gate = require_control_plane_declaration(project_id, task_id, scope, declaration)
+            return scope, declaration, gate
         scope = ControlPlaneScope(
             kind="unevaluable",
             matched_surfaces=(),
@@ -459,6 +502,16 @@ def evaluate_launch_declaration(
         gate = require_control_plane_declaration(project_id, task_id, scope, declaration)
         return scope, declaration, gate
     except Exception as exc:
+        if not has_core_surfaces and not (repo / "agent" / "next.md").exists():
+            scope = ControlPlaneScope(
+                kind="ordinary",
+                matched_surfaces=(),
+                evidence_source="default",
+                reason="repository does not contain control-plane surfaces and has no task declaration",
+            )
+            declaration = _empty_declaration("absent", "task is ordinary", "agent/next.md", head)
+            gate = require_control_plane_declaration(project_id, task_id, scope, declaration)
+            return scope, declaration, gate
         scope = ControlPlaneScope(
             kind="unevaluable",
             matched_surfaces=(),
@@ -483,8 +536,13 @@ def evaluate_launch_declaration(
 def _matches_protected_surface(text: str) -> list[str]:
     matched = []
     for surface in CONTROL_PLANE_RUNTIME_SURFACES:
-        if surface in text:
-            matched.append(surface)
+        if "/" in surface or surface.endswith(".py"):
+            if surface in text:
+                matched.append(surface)
+        else:
+            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(surface)}(?![A-Za-z0-9_])")
+            if pattern.search(text):
+                matched.append(surface)
     return matched
 
 
@@ -621,7 +679,7 @@ def require_control_plane_declaration(
             reason=f"task classification unevaluable: {scope.reason}",
             gate_id=f"cp-gate:{project_id}:{task_id}:unevaluable",
             required_scenarios=(),
-            evidence={"scope": scope.to_dict(), "declaration": declaration.to_dict()},
+            evidence={"scope": scope.to_dict(), "declaration": declaration.to_dict(), "transient": True},
         )
 
     if scope.kind == "invalid":
@@ -709,20 +767,53 @@ def declaration_prompt_block(declaration: ControlPlaneDeclaration) -> str:
     return "\n".join(lines)
 
 
+def declaration_requirement_prompt_block(role: str = "planner") -> str:
+    lines = [
+        "[CONTROL_PLANE_CONTRACT_BEGIN]",
+        "CONTROL-PLANE CONTRACT REQUIREMENT:",
+        "This task touches protected control-plane runtime surfaces. Your plan MUST include a canonical Control-Plane Impact declaration in its interfaces or plan text with exactly these four fields:",
+        f"- Invariants: <comma-separated subset of: {', '.join(sorted(INVARIANT_CODES))}>",
+        f"- Transition boundaries: <comma-separated subset of: {', '.join(sorted(TRANSITION_BOUNDARIES))}>",
+        "- Fault scenarios: <comma-separated CPF scenario IDs covering all declared invariants, e.g. CPF-01, CPF-02>",
+        "- Convergence evidence: <human-readable description of convergence criteria>",
+        "Adversarial verification checklist:",
+        "- Invariant preservation: verify declared invariants hold across normal and failure paths",
+        "- Idempotence: verify repeated ticks/restarts do not duplicate handoffs, workers, or transitions",
+        "- Restart/replay behavior: verify recovery converges to single owner from journal",
+        "- Fail-closed boundaries: verify ambiguous or contradictory authority refuses to OWNER_GATE",
+        "[CONTROL_PLANE_CONTRACT_END]",
+    ]
+    return "\n".join(lines)
+
+
 def inject_control_plane_contract(
     prompt: str,
     role: str,
     declaration: ControlPlaneDeclaration | None,
 ) -> str:
     """Inject control-plane contract prompt block idempotently."""
-    if declaration is None or declaration.kind != "declared":
-        return prompt
     if "[CONTROL_PLANE_CONTRACT_BEGIN]" in prompt:
         return prompt
-    block = declaration_prompt_block(declaration)
+    if declaration is not None and declaration.kind == "declared":
+        block = declaration_prompt_block(declaration)
+    elif role in ("planner", "plan_reviewer"):
+        block = declaration_requirement_prompt_block(role)
+    else:
+        return prompt
     if not block:
         return prompt
     return f"{prompt.rstrip()}\n\n{block}\n"
+
+
+PROTECTED_SURFACE_BOUNDARIES: dict[str, set[str]] = {
+    "lifecycle_authority.py": {"authority_reconciliation", "owner_gate_transition"},
+    "transition_executor.py": {"worker_launch", "special_gate_reconciliation", "authority_reconciliation", "owner_gate_transition"},
+    "successor_consistency.py": {"successor_handoff", "handoff_publication"},
+    "watchdog.py": {"watchdog_recovery"},
+    "staged_roadmap.py": {"successor_handoff"},
+    "control_plane_contract.py": {"plan_freeze", "worker_launch", "special_gate_reconciliation"},
+    "control_plane_faults.py": {"special_gate_reconciliation", "worker_launch"},
+}
 
 
 def declared_scope_gap(
@@ -742,8 +833,15 @@ def declared_scope_gap(
         if declaration is None or declaration.kind != "declared":
             gaps.append(f"changed protected runtime surface '{norm}' has no control-plane declaration")
         else:
-            # Check if surface represents transitions or invariants that are not declared
-            pass
+            stem = Path(norm).name
+            expected_boundaries = PROTECTED_SURFACE_BOUNDARIES.get(stem) or PROTECTED_SURFACE_BOUNDARIES.get(norm)
+            if expected_boundaries:
+                declared_boundaries = set(declaration.transition_boundaries)
+                if not (declared_boundaries & expected_boundaries):
+                    gaps.append(
+                        f"changed protected runtime surface '{norm}' requires declaration of transition boundaries: "
+                        f"{sorted(expected_boundaries)}"
+                    )
     return gaps
 
 

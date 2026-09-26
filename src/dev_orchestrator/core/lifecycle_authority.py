@@ -138,6 +138,7 @@ def resolve_declaration_gate(
     *,
     reason: str,
     resolved_at: str | None = None,
+    task_id: str | None = None,
 ) -> bool:
     """Resolve an authoritative CONTROL_PLANE_DECLARATION_REQUIRED gate.
 
@@ -148,6 +149,13 @@ def resolve_declaration_gate(
     current_gate = authority.get("owner_gate")
     if not (isinstance(current_gate, dict) and current_gate.get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"):
         return False
+    if task_id is not None:
+        gate_task = current_gate.get("task_id")
+        if gate_task and gate_task != task_id:
+            return False
+        auth_task = authority.get("current_task_id")
+        if auth_task and auth_task != task_id:
+            return False
 
     resolved_entry = copy.deepcopy(current_gate)
     resolved_entry["resolved_at"] = resolved_at or utc_now_iso()
@@ -350,7 +358,8 @@ def evaluate_lifecycle_invariants(
     authorities = executor_state.get("lifecycle") if isinstance(executor_state, dict) else {}
     authority = authorities.get(project_id) if isinstance(authorities, dict) else None
     authority_task = str(authority.get("current_task_id") or "") if isinstance(authority, dict) else ""
-    authority_state = str(authority.get("lifecycle_state") or "") if isinstance(authority, dict) else ""
+    raw_authority_state = str(authority.get("lifecycle_state") or "") if isinstance(authority, dict) else ""
+    authority_state = raw_authority_state
     if isinstance(authority, dict) and authority.get("owner_gate"):
         authority_state = "OWNER_GATE"
     owners = active_owners(project_id, executor_state, planner_state, reviewer_state)
@@ -415,8 +424,14 @@ def evaluate_lifecycle_invariants(
             })
 
     current_holds = not worker_owners or all(str(owner.get("task_id") or "") == authority_task for owner in worker_owners)
-    terminal_holds = not (authority_state in {"COMPLETE", "SETTLED"} and worker_owners)
-    pending_holds = not (authority_state == "PENDING_DESIGN" and worker_owners)
+    terminal_holds = not (
+        (raw_authority_state in {"COMPLETE", "SETTLED"} or authority_state in {"COMPLETE", "SETTLED"})
+        and worker_owners
+    )
+    pending_holds = not (
+        (raw_authority_state == "PENDING_DESIGN" or authority_state == "PENDING_DESIGN")
+        and worker_owners
+    )
     lineage_bad = []
     for row in handoffs:
         source_task_id = row.get("source_task_id")

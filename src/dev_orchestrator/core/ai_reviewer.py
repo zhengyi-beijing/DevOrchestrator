@@ -35,6 +35,7 @@ from dev_orchestrator.core.control_plane_contract import (
 )
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.workflow_policy import workflow_policy_prompt
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 REVIEWER_STATE_FILE = "ai-reviewer.json"
@@ -1961,6 +1962,7 @@ class AIReviewerCoordinator:
                     ["git", "-C", str(repo_path), "diff", "--name-only", diff_spec],
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
                     timeout=10, check=False,
+                    **hidden_subprocess_kwargs(),
                 )
                 if diff_proc.returncode == 0:
                     changed_files = [line.strip() for line in diff_proc.stdout.splitlines() if line.strip()]

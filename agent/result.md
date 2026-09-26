@@ -26,10 +26,16 @@ P16.14 Invariant-Driven Control-Plane Development & Validation (complete 2026-09
   7. Tooling & Documentation (`ops/p1614_evidence.py`, `docs/CONTROL_PLANE_INVARIANT_METHOD_CONTRACT.md`, `docs/development-workflow.md`):
      - Created CLI evidence projection tool.
      - Documented invariant-driven control plane development contract and updated canonical development workflow.
+   8. Technical Review Remediation (`ai_review:rereview:p1614-live-recover-20260926`):
+      - Reordered launch checks in `core/transition_executor.py` so authoritative task mismatch check executes before declaration gate reconciliation.
+      - Enforced `task_id` matching in `core/lifecycle_authority.py` (`resolve_declaration_gate`).
+      - Hardened `parse_control_plane_declaration` in `core/control_plane_contract.py` for bare interface declarations and injected contract requirement prompt blocks for undeclared planning roles.
+      - Defined `PROTECTED_SURFACE_BOUNDARIES` and detected under-scoped boundary declarations in `declared_scope_gap`.
+      - Guarded against transient git failures in `evaluate_launch_declaration` and enabled same-HEAD replay in `_is_declaration_gate_replayable` for transient/unevaluable blocks.
+      - Replaced raw substring surface matching in `_matches_protected_surface` with word-boundary regex matching.
 - Verification:
-  - 32 dedicated unit/integration/fault-injection tests in `tests_py/test_p1614_invariant_workflow.py` passing 100%.
-  - Touched regression suites (158 tests + 10 subtests) passing 100%.
-  - Full regression (1,353 tests + 102 subtests in 481s) passing 100% with 0 failures.
+  - 38 dedicated unit/integration/fault-injection and remediation tests in `tests_py/test_p1614_invariant_workflow.py` passing 100%.
+  - Touched regression suites passing 100% (`test_p1613_successor_consistency.py`, `test_transition_executor_aibroker.py`, `test_lifecycle_projection.py`, `test_ai_planner.py`, `test_ai_reviewer.py`, `test_workflow_policy.py`).
   - `python ops/p1614_evidence.py` valid.
   - Python compilation and `git diff --check` clean.
   - Knowledge graph updated via `graphify update .`.

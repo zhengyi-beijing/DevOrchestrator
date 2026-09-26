@@ -336,20 +336,29 @@ def _transient_remediation_state_block(record: Any) -> bool:
 
 
 def _is_declaration_gate_replayable(record: Any, authority: Any, current_head: str) -> bool:
-    """A launch request blocked by CONTROL_PLANE_DECLARATION_REQUIRED may replay against a new HEAD."""
+    """A launch request blocked by CONTROL_PLANE_DECLARATION_REQUIRED may replay against a new HEAD,
+    or on the same HEAD if the block was caused by a transient evaluation failure."""
     if not (isinstance(record, dict) and record.get("state") == "blocked"):
         return False
     if record.get("blocked_gate_code") != "CONTROL_PLANE_DECLARATION_REQUIRED":
         return False
-    if str(record.get("head") or "") == current_head:
-        return False
     if not (isinstance(authority, dict) and isinstance(authority.get("owner_gate"), dict)):
         return False
     gate = authority["owner_gate"]
-    return (
-        gate.get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"
-        and gate.get("gate_id") == record.get("gate_id")
+    if gate.get("code") != "CONTROL_PLANE_DECLARATION_REQUIRED":
+        return False
+    if gate.get("gate_id") != record.get("gate_id"):
+        return False
+
+    is_transient = (
+        (record.get("gate_id") or "").endswith(":unevaluable")
+        or "unevaluable" in str(record.get("reason") or "")
+        or bool((record.get("evidence") or {}).get("transient"))
     )
+    if str(record.get("head") or "") == current_head:
+        return is_transient
+
+    return True
 
 
 def _execution_policy(project: dict[str, Any]) -> tuple[Optional[dict[str, Any]], str]:
@@ -1648,20 +1657,40 @@ class TransitionExecutor:
                 authority = new_authority(project_id, task_id, "READY_TO_RUN")
                 ledger.setdefault("lifecycle", {})[project_id] = authority
 
-            # Special-gate reconciliation before generic owner_gate fence
+            # 1. Authoritative task-mismatch fence first
+            current_task = _non_blank_config(authority.get("current_task_id"))
+            if current_task is not None and current_task != task_id:
+                mismatch_err = (
+                    "authoritative lifecycle task mismatch: "
+                    f"current={current_task}, requested={task_id}"
+                )
+                ledger["executions"][source_request_id] = {
+                    "project_id": project_id, "source_request_id": source_request_id,
+                    "source_kind": source_kind, "source_task_id": source_task_id,
+                    "task_id": task_id, "state": "blocked", "reason": mismatch_err,
+                    "recorded_at": utc_now_iso(),
+                }
+                self._save_ledger(ledger)
+                return None
+
+            # 2. Special-gate reconciliation before generic owner_gate fence
             owner_gate = authority.get("owner_gate")
+            evaluated_gate = False
             if (
                 isinstance(owner_gate, dict)
                 and owner_gate.get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"
+                and owner_gate.get("task_id") in (None, task_id)
             ):
                 repo_path = project.get("repo_path") or ""
                 scope, declaration, gate_eval = evaluate_launch_declaration(
                     repo_path, project_id, task_id, head,
                 )
+                evaluated_gate = True
                 if gate_eval.allowed:
                     resolve_declaration_gate(
                         authority,
                         reason=f"repaired control-plane declaration at head {head[:12]} verified",
+                        task_id=task_id,
                     )
                 else:
                     open_declaration_gate(
@@ -1704,38 +1733,39 @@ class TransitionExecutor:
                 self._save_ledger(ledger)
                 return None
 
-            # Current declaration evaluation for tasks where gate was not already active
-            repo_path = project.get("repo_path") or ""
-            scope, declaration, gate_eval = evaluate_launch_declaration(
-                repo_path, project_id, task_id, head,
-            )
-            if not gate_eval.allowed:
-                open_declaration_gate(
-                    authority,
-                    gate_id=gate_eval.gate_id or f"cp-gate:{project_id}:{task_id}:required",
-                    reason=gate_eval.reason,
-                    task_id=task_id,
-                    head=head,
-                    declaration_hash=declaration.content_hash,
-                    evidence=gate_eval.evidence,
+            # Current declaration evaluation for tasks where gate was not already evaluated
+            if not evaluated_gate:
+                repo_path = project.get("repo_path") or ""
+                scope, declaration, gate_eval = evaluate_launch_declaration(
+                    repo_path, project_id, task_id, head,
                 )
-                ledger["executions"][source_request_id] = {
-                    "project_id": project_id,
-                    "source_request_id": source_request_id,
-                    "source_kind": source_kind,
-                    "source_task_id": source_task_id,
-                    "task_id": task_id,
-                    "branch": branch,
-                    "head": head,
-                    "state": "blocked",
-                    "reason": gate_eval.reason,
-                    "blocked_gate_code": "CONTROL_PLANE_DECLARATION_REQUIRED",
-                    "gate_id": gate_eval.gate_id,
-                    "declaration_hash": declaration.content_hash,
-                    "recorded_at": utc_now_iso(),
-                }
-                self._save_ledger(ledger)
-                return None
+                if not gate_eval.allowed:
+                    open_declaration_gate(
+                        authority,
+                        gate_id=gate_eval.gate_id or f"cp-gate:{project_id}:{task_id}:required",
+                        reason=gate_eval.reason,
+                        task_id=task_id,
+                        head=head,
+                        declaration_hash=declaration.content_hash,
+                        evidence=gate_eval.evidence,
+                    )
+                    ledger["executions"][source_request_id] = {
+                        "project_id": project_id,
+                        "source_request_id": source_request_id,
+                        "source_kind": source_kind,
+                        "source_task_id": source_task_id,
+                        "task_id": task_id,
+                        "branch": branch,
+                        "head": head,
+                        "state": "blocked",
+                        "reason": gate_eval.reason,
+                        "blocked_gate_code": "CONTROL_PLANE_DECLARATION_REQUIRED",
+                        "gate_id": gate_eval.gate_id,
+                        "declaration_hash": declaration.content_hash,
+                        "recorded_at": utc_now_iso(),
+                    }
+                    self._save_ledger(ledger)
+                    return None
             barrier = self._launch_barrier_reason(project_id, source_kind)
             if barrier:
                 ledger["executions"][source_request_id] = {
@@ -1923,20 +1953,40 @@ class TransitionExecutor:
                 authority = new_authority(project_id, task_id, "READY_TO_RUN")
                 ledger.setdefault("lifecycle", {})[project_id] = authority
 
-            # Special-gate reconciliation before generic owner_gate fence
+            # 1. Authoritative task-mismatch fence first
+            current_task = _non_blank_config(authority.get("current_task_id"))
+            if current_task is not None and current_task != task_id:
+                mismatch_err = (
+                    "authoritative lifecycle task mismatch: "
+                    f"current={current_task}, requested={task_id}"
+                )
+                ledger["executions"][source_request_id] = {
+                    "project_id": project_id, "source_request_id": source_request_id,
+                    "source_kind": source_kind, "source_task_id": source_task_id,
+                    "task_id": task_id, "state": "blocked", "reason": mismatch_err,
+                    "recorded_at": utc_now_iso(),
+                }
+                self._save_ledger(ledger)
+                return None
+
+            # 2. Special-gate reconciliation before generic owner_gate fence
             owner_gate = authority.get("owner_gate")
+            evaluated_gate = False
             if (
                 isinstance(owner_gate, dict)
                 and owner_gate.get("code") == "CONTROL_PLANE_DECLARATION_REQUIRED"
+                and owner_gate.get("task_id") in (None, task_id)
             ):
                 repo_path = project.get("repo_path") or ""
                 scope, declaration, gate_eval = evaluate_launch_declaration(
                     repo_path, project_id, task_id, head,
                 )
+                evaluated_gate = True
                 if gate_eval.allowed:
                     resolve_declaration_gate(
                         authority,
                         reason=f"repaired control-plane declaration at head {head[:12]} verified",
+                        task_id=task_id,
                     )
                 else:
                     open_declaration_gate(
@@ -1979,38 +2029,39 @@ class TransitionExecutor:
                 self._save_ledger(ledger)
                 return None
 
-            # Current declaration evaluation for tasks where gate was not already active
-            repo_path = project.get("repo_path") or ""
-            scope, declaration, gate_eval = evaluate_launch_declaration(
-                repo_path, project_id, task_id, head,
-            )
-            if not gate_eval.allowed:
-                open_declaration_gate(
-                    authority,
-                    gate_id=gate_eval.gate_id or f"cp-gate:{project_id}:{task_id}:required",
-                    reason=gate_eval.reason,
-                    task_id=task_id,
-                    head=head,
-                    declaration_hash=declaration.content_hash,
-                    evidence=gate_eval.evidence,
+            # 3. Current declaration evaluation for tasks where gate was not already evaluated
+            if not evaluated_gate:
+                repo_path = project.get("repo_path") or ""
+                scope, declaration, gate_eval = evaluate_launch_declaration(
+                    repo_path, project_id, task_id, head,
                 )
-                ledger["executions"][source_request_id] = {
-                    "project_id": project_id,
-                    "source_request_id": source_request_id,
-                    "source_kind": source_kind,
-                    "source_task_id": source_task_id,
-                    "task_id": task_id,
-                    "branch": branch,
-                    "head": head,
-                    "state": "blocked",
-                    "reason": gate_eval.reason,
-                    "blocked_gate_code": "CONTROL_PLANE_DECLARATION_REQUIRED",
-                    "gate_id": gate_eval.gate_id,
-                    "declaration_hash": declaration.content_hash,
-                    "recorded_at": utc_now_iso(),
-                }
-                self._save_ledger(ledger)
-                return None
+                if not gate_eval.allowed:
+                    open_declaration_gate(
+                        authority,
+                        gate_id=gate_eval.gate_id or f"cp-gate:{project_id}:{task_id}:required",
+                        reason=gate_eval.reason,
+                        task_id=task_id,
+                        head=head,
+                        declaration_hash=declaration.content_hash,
+                        evidence=gate_eval.evidence,
+                    )
+                    ledger["executions"][source_request_id] = {
+                        "project_id": project_id,
+                        "source_request_id": source_request_id,
+                        "source_kind": source_kind,
+                        "source_task_id": source_task_id,
+                        "task_id": task_id,
+                        "branch": branch,
+                        "head": head,
+                        "state": "blocked",
+                        "reason": gate_eval.reason,
+                        "blocked_gate_code": "CONTROL_PLANE_DECLARATION_REQUIRED",
+                        "gate_id": gate_eval.gate_id,
+                        "declaration_hash": declaration.content_hash,
+                        "recorded_at": utc_now_iso(),
+                    }
+                    self._save_ledger(ledger)
+                    return None
             barrier = self._launch_barrier_reason(project_id, source_kind)
             if barrier:
                 ledger["executions"][source_request_id] = {

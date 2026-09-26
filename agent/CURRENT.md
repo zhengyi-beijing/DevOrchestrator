@@ -16,13 +16,36 @@ P16.14 final closure evidence (2026-09-26):
 - Integrated invariant-driven contract prompt injection and validation into `core/ai_planner.py` (materializing canonical declaration section on plan freeze) and `core/ai_reviewer.py` (flagging undeclared control-plane scope gaps).
 - Created CLI projection script `ops/p1614_evidence.py` and documented comprehensive invariant-driven method contract in `docs/CONTROL_PLANE_INVARIANT_METHOD_CONTRACT.md` and `docs/development-workflow.md`.
 - Verification:
-  - Focused test suite `tests_py/test_p1614_invariant_workflow.py`: 32/32 tests passed covering grammar, classification, plan freeze, git history, gate lifecycle, prompt injection, scope gap, fault registry, evidence projections, and end-to-end traversal.
-  - Touched regressions: 158 passed (and 10 subtests passed).
-  - Full test suite: 1,353 passed, 102 subtests passed in 481.32s with zero failures.
+  - Focused test suite `tests_py/test_p1614_invariant_workflow.py`: 38/38 tests passed (including 6 remediation tests for Technical Review findings).
+  - Touched regressions:
+    - `test_p1613_successor_consistency.py`: 49 passed, 10 subtests passed.
+    - `test_transition_executor_aibroker.py`: 24 passed, 8 subtests passed.
+    - `test_lifecycle_projection.py`: 3 passed.
+    - `test_ai_planner.py`: 38 passed.
+    - `test_ai_reviewer.py`: 12 passed.
+    - `test_workflow_policy.py`: 10 passed.
   - `python ops/p1614_evidence.py`: clean output with valid fault registry.
-  - `python -m compileall src`: 0 errors.
+  - `python -m compileall src ops tests_py`: 0 errors.
   - `git diff --check`: 0 errors.
   - `graphify update .`: knowledge graph updated cleanly.
+
+P16.14 Technical Review remediation evidence (2026-09-26):
+- Addressed all 5 Technical Review findings from `ai_review:rereview:p1614-live-recover-20260926`:
+  1. Finding 1 (Task mismatch before gate reconciliation):
+     - In `core/transition_executor.py` (`_launch` and `_launch_aibroker`), reordered checks so authoritative task mismatch check executes before declaration gate reconciliation.
+     - In `core/lifecycle_authority.py`, updated `resolve_declaration_gate` to require and enforce `task_id` matching on both `current_gate` and `authority`.
+  2. Finding 2 (Bare declaration parser & grammar teaching):
+     - In `core/control_plane_contract.py`, `parse_control_plane_declaration` with `allow_bare=True` terminates `convergence_evidence` continuation upon blank/non-indented lines and ignores leading unrelated interfaces.
+     - In `inject_control_plane_contract`, added canonical contract requirement prompt block for `planner` and `plan_reviewer` roles when declaration is undeclared/missing.
+  3. Finding 3 (Review scope-gap check on declared branch):
+     - In `core/control_plane_contract.py`, defined `PROTECTED_SURFACE_BOUNDARIES` mapping protected surfaces to required transition boundaries; updated `declared_scope_gap` to detect under-scoped declarations where modified protected surfaces are omitted from transition boundaries.
+  4. Finding 4 (Transient git failure & same-HEAD recovery):
+     - In `core/control_plane_contract.py`, `evaluate_launch_declaration` fast-paths ordinary repositories without protected surfaces and escapes transient failures without false owner gating.
+     - In `core/transition_executor.py`, `_is_declaration_gate_replayable` permits same-HEAD replay for transient/unevaluable blocks.
+  5. Finding 5 (Substring false-positives on bare symbols):
+     - In `core/control_plane_contract.py`, `_matches_protected_surface` uses word-boundary regex `(?<![A-Za-z0-9_]){re.escape(surface)}(?![A-Za-z0-9_])` preventing false positive matches on bare symbols.
+- Added targeted tests in `tests_py/test_p1614_invariant_workflow.py` (`ControlPlaneRemediationTests`, 6 tests covering all 5 findings).
+
 
 P16.13 final closure evidence (2026-09-26):
 - Restarted the canonical daemon from stale PID 26264 onto the committed
