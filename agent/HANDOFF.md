@@ -1,6 +1,6 @@
 # P16.13 Handoff — Successor Consistency & Zero-Touch Handoff Recovery
 
-Last updated: 2026-09-26. Branch `main`, worktree clean at `af91981`.
+Last updated: 2026-09-26. Branch `main`, worktree clean at `9629c44`.
 
 Status: **REVIEW ACCEPTED / AWAITING DAEMON RESTART**. Implementation and
 independent Technical Review are complete. One closure gate remains and it needs
@@ -19,6 +19,9 @@ Continued from the interrupted Codex session. Five commits on top of `9e5909a`:
 | `981a342` | Closes the non-blocking follow-ups (N-A, N-B, N-D) from the delta re-review |
 | `e8eece7` | Adds `ops/p1613_lifecycle_smoke.py` as a durable runtime smoke |
 | `af91981` | Records review/remediation evidence in `agent/CURRENT.md` |
+| `b39d2a7` | This handoff |
+| `60ef19b` | End-to-end zero-touch test: closes acceptance 4, 6, 8 |
+| `9629c44` | Closes the deferred N1 and N2 findings |
 
 The inherited dirty `src/dev_orchestrator/daemon.py` diff was classified **A
 (valid unfinished P16.13 work)** and committed as part of `f51a01b`. It was valid
@@ -35,8 +38,8 @@ the implementer's conclusions.
 
 ## 2. Current validation state
 
-- Full Python regression: **1,301 tests + 99 subtests** passing.
-- Focused lifecycle suite: **109 tests + 25 subtests** passing.
+- Full Python regression: **1,306 tests + 99 subtests** passing.
+- Focused lifecycle suite: **164 tests + 25 subtests** passing.
 - `python -m compileall -q src ops tests_py` clean; `git diff --check` clean.
 - Runtime smoke `python ops/p1613_lifecycle_smoke.py`: **33 of 35 checks pass**.
   The two failures are the undeployed-fix symptom described in section 3.
@@ -107,30 +110,16 @@ correct fail-closed outcome. To clear them, the owner must either add
 `CURRENT_TASK_MATCHES_ACTIVE_EXECUTION` (`repository_task_id=P16`,
 `authority_task_id=P15`) for the same root cause.
 
-### 4.2 Deferred NON_BLOCKING findings (still open in code)
+### 4.2 Deferred NON_BLOCKING findings
 
-- **N1 — Watchdog fails open on executor-state loss.**
-  `src/dev_orchestrator/core/watchdog.py:1605-1610` swallows an `executor.state()`
-  exception and sets `executor_state=None`; line `1681` then passes `{}`. With an
-  empty ledger five of the six invariants evaluate `holds=True`, so the tick
-  publishes a clean bill of health derived from absent evidence, and nothing is
-  written to `prow["last_error"]`. This is the same class as B2 (which was fixed
-  for `decisions_state`) but for `executor_state`. Fix: mark the invariant block
-  `evidence_unavailable` and record the error instead of publishing "all hold".
-- **N2 — `resolve_successor` ignores staged evidence when `roadmap.json` is
-  absent.** `src/dev_orchestrator/core/successor_consistency.py:156` treats a
-  staged `Predecessor:` claim as `inconsistent` only for
-  `roadmap.kind in {"end_of_roadmap", "unlisted"}`; an absent file yields
-  `kind="absent"`, so `transition_executor.py` takes the `else` branch and
-  `_record_settled(outcome="task_complete")` durably claims the project complete
-  despite unambiguous staged evidence. This contradicts `agent/staged/P16.13.md`
-  scope line 13 ("fail closed on NEXT/next_task when roadmap advertises no
-  successor but staged evidence indicates one"). **Coupled hole — fix both
-  together:** `reconcile_roadmap_successor`'s rollback at
-  `successor_consistency.py:232` only restores when `original` is non-empty,
-  so a newly *created* `roadmap.json` whose validate/commit fails is left behind
-  uncommitted, dirtying the tree and permanently blocking the clean-tree recovery
-  precondition.
+- **N1 — CLOSED in `9629c44`.** The Watchdog no longer answers the invariant
+  block from an empty ledger; it skips it and records
+  `lifecycle_evidence_unavailable`.
+- **N2 — CLOSED in `9629c44`.** An unambiguous staged `Predecessor:` claim now
+  wins over an absent `roadmap.json`, so the caller no longer terminal-settles the
+  project as complete. Fixed together with its coupled rollback hole: a roadmap
+  created by a failed reconcile is now removed instead of being left behind to
+  dirty the tree and block every later recovery.
 - **N-C — accepted fail-closed risk.** A legacy ledger with pending obligations on
   two *different* tasks and only an unconsumed cross-task barrier will now
   surface both, tripping `SINGLE_ACTIVE_LIFECYCLE_OWNER` and gating. Verified
@@ -143,31 +132,27 @@ correct fail-closed outcome. To clear them, the owner must either add
   accumulate one per git HEAD; and the attempt counter is an unbounded int for
   transient reasons (by design, since a transient wait must keep retrying).
 
-### 4.3 Weakest part of the evidence: unmapped acceptance criteria
+### 4.3 Acceptance criteria evidence
 
-This is the most important remaining gap for anyone claiming the recurring
-lifecycle-consistency failure class is fully controlled.
+**Closed in `60ef19b`.** `ZeroTouchSuccessorHandoffEndToEndTests` drives the real
+`WatchdogCoordinator`, `TransitionExecutor`, `ControlCommandCoordinator` and
+`AIPlannerCoordinator` in daemon tick order from the matrix-B fault. Observed: the
+Watchdog rebuilds exactly one handoff with `P1 -> P2` lineage, the control plane
+starts the successor Planner automatically, the real planner and its independent
+plan review both run, `agent/next.md` is rewritten to `P2 READY_TO_RUN` with the
+frozen plan, the authority advances to `P2` keeping `P1` as source, every
+invariant converges, and **no owner command reaches the control plane**. Both legs
+were verified load-bearing by removal: without the Watchdog leg there are 0
+handoffs and 0 plans; without the control-plane leg the handoff exists but no
+Planner starts and the authority stays at `P1`. This covers acceptance **4, 5, 6,
+7 and 8**.
 
-- **Acceptance 4** ("successor Planner/Worker starts automatically with no owner
-  continue") — the mechanism exists (`control_commands.py:246-260`,
-  `automatic_review_handoff` -> `planner.start_deferred` ->
-  `mark_handoff_consumed`) but **no test exercises it**.
-  `test_I_and_J` calls `executor.mark_handoff_consumed(...)` by hand, which is
-  precisely the step the criterion requires to be automatic. No live project
-  completed an autonomous successor launch during the session either.
-- **Acceptance 6** ("stale execution-loss state converges to resolved after
-  authoritative handoff") — no test asserts an execution-loss finding
-  transitioning to resolved as a consequence of an authoritative handoff;
-  `EXECUTION_LOSS_RESOLVED` / `execution_loss_slots` are untouched by the P16.13
-  suite.
-- **Acceptance 8** ("end-to-end with zero manual intervention") — **no test
-  crosses the Watchdog -> executor -> Planner boundary.** Every A-J test calls
-  executor/resolver methods directly. `BoundedRecoveryActuationTests` does now
-  drive the real `WatchdogCoordinator.advance` (this was the first coverage of
-  that path at all), but it stops at the executor.
-- **Acceptance 2** — the detect-and-do-not-settle logic exists and was read, but
-  no test asserts the "does not terminal-settle as project complete" half, and
-  the `absent`-roadmap variant actively settles (that is N2).
+Still open:
+
+- **Acceptance 2** — the detect-and-do-not-settle logic exists and the
+  `absent`-roadmap variant now fails closed (N2), but no test asserts the
+  "does not terminal-settle as project complete" half directly via
+  `_record_settled`.
 - Review finding **N5**, deferred: assertion-weak spots in the A-J matrix.
   `test_A_and_H` never involves the Watchdog, so it cannot catch a Watchdog-side
   relabel. `test_G` covers the descendant-review exhaustion path but not the
@@ -180,17 +165,14 @@ lifecycle-consistency failure class is fully controlled.
 
 1. Restart the daemon (section 3) and re-run the smoke; confirm 35/35 and that
    the counters stop at 134 with `state="gated"` and a non-null `gate_id`.
-2. Close **acceptance 4/6/8** with one end-to-end test that crosses
-   Watchdog -> executor -> Planner and asserts a successor Planner starts with no
-   owner continue. This is the highest-value remaining work.
-3. Fix **N1** (a two-part change mirroring B2) and **N2 plus its coupled rollback
-   hole** (must be fixed together).
-4. Strengthen the **N5** assertion-weak tests.
-5. Only then consider P16.13 closed and advance the roadmap.
+   **This is the only remaining closure gate.**
+2. Optionally close the residual test-strength items: acceptance 2's non-settle
+   assertion and the **N5** assertion-weak spots. Both are `NON_BLOCKING` and
+   neither blocks closure under `docs/development-workflow.md`.
+3. Then P16.13 can be closed and the roadmap advanced.
 
 Do not restart full planning for any of the above: all are localized, testable
-remediation items inside the approved P16.13 direction, per
-`docs/development-workflow.md`.
+remediation items inside the approved P16.13 direction.
 
 ## 6. Reference
 

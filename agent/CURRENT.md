@@ -42,6 +42,18 @@ P16.13 review and remediation evidence (2026-09-26):
 - Validation: focused lifecycle regression 95 tests and 25 subtests; full Python
   regression 1,301 tests and 99 subtests; `compileall` and `git diff --check`
   clean.
+- Acceptance 4/6/8 evidence (`60ef19b`): `ZeroTouchSuccessorHandoffEndToEndTests`
+  drives the real Watchdog, TransitionExecutor, ControlCommandCoordinator and
+  AIPlannerCoordinator in tick order from the matrix-B fault. The Watchdog
+  rebuilds one handoff, the control plane starts the successor Planner
+  automatically, `agent/next.md` advances to `P2 READY_TO_RUN` with the frozen
+  plan, the authority advances to `P2` keeping `P1` as source, and no owner
+  command reaches the control plane. Both legs verified load-bearing by removal.
+- Deferred findings N1 and N2 closed (`9629c44`): the Watchdog no longer answers
+  the invariant block from an empty ledger, an unambiguous staged predecessor
+  claim now wins over an absent roadmap, and a roadmap created by a failed
+  reconcile is removed instead of dirtying the tree.
+- Full Python regression after the above: 1,306 tests and 99 subtests.
 - Remaining closure gate: restart the canonical daemon so it loads the fence,
   then re-run `python ops/p1613_lifecycle_smoke.py` and confirm 35 of 35. Each
   gated project performs at most one more recovery attempt and then fences with
