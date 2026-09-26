@@ -34,6 +34,12 @@ P16.13 repaired and validated successor consistency and zero-touch handoff recov
 ## Planning constraint
 Start through the normal roadmap successor/handoff mechanism. Do not manually launch a Worker merely to bypass lifecycle planning. P16.14 must itself exercise the P16.13 successor path.
 
+## Control-Plane Impact
+- Invariants: CURRENT_TASK_MATCHES_ACTIVE_EXECUTION, TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION, PENDING_DESIGN_NOT_EXECUTING, SUCCESSOR_HANDOFF_LINEAGE_VALID, NEXT_TASK_WITHOUT_HANDOFF, SINGLE_ACTIVE_LIFECYCLE_OWNER
+- Transition boundaries: plan_freeze, worker_launch, special_gate_reconciliation, owner_gate_transition, successor_handoff, handoff_publication, authority_reconciliation, watchdog_recovery
+- Fault scenarios: CPF-01, CPF-02, CPF-03, CPF-04, CPF-05, CPF-06, CPF-07, CPF-08, CPF-09, CPF-10
+- Convergence evidence: Unambiguous convergence to a single authoritative owner without manual continue, zero duplicate handoffs or workers, and fail-closed OWNER_GATE on contradictory authority.
+
 ## Approved executable design
 
 Establish an invariant-first contract for lifecycle-affecting tasks using task-level classification, committed declarations, durable fault scenarios, adversarial review, and convergence evidence. Classification is based only on the current task artifact, candidate approved design, and an exact protected runtime-surface inventory; repository identity never classifies all DevOrchestrator work as control-plane. Declaration refusals use the complete authoritative OWNER_GATE representation, and special-gate reconciliation occurs before the generic owner-gate fence so a repaired HEAD can safely resume.
