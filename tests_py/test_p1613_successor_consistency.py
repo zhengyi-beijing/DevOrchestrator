@@ -283,7 +283,7 @@ class SuccessorConsistencyFaultMatrixTests(unittest.TestCase):
                 },
                 "review-old": {
                     "project_id": "p1", "source_request_id": "review-old",
-                    "task_id": "P1", "next_task_id": "P2", "state": "handoff",
+                    "task_id": "P1.5", "next_task_id": "P2", "state": "handoff",
                     "recorded_at": "2026-09-20T02:00:00+00:00",
                     "handoff_consumed": True,
                 },
@@ -295,7 +295,7 @@ class SuccessorConsistencyFaultMatrixTests(unittest.TestCase):
             "next_status": "READY TO RUN", "telemetry": {"task_id": "P2"},
         }
         decisions = {"decisions": {"review-final": {
-            "project_id": "p1", "request_id": "review-final", "task_id": "P1",
+            "project_id": "p1", "request_id": "review-final", "task_id": "P1.5",
             "disposition": "apply", "decision": "next", "next_action": "next_task",
             "consumed_at": "2026-09-20T01:30:00+00:00",
         }}}

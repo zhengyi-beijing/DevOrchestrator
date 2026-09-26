@@ -101,14 +101,15 @@ def active_owners(
             completed_at = parse_utc(row.get("completed_at") or row.get("started_at"))
             resolved_by_barrier = False
             for barrier in lifecycle_barriers:
-                if barrier.get("task_id") != row.get("task_id"):
-                    continue
                 barrier_at = parse_utc(
                     barrier.get("handoff_consumed_at")
                     or barrier.get("recorded_at")
                     or barrier.get("completed_at")
                 )
                 if completed_at is None or barrier_at is None or barrier_at >= completed_at:
+                    # Any later project lifecycle barrier supersedes older
+                    # pending-review flags, including legacy chains that
+                    # skipped or renamed intermediate task identities.
                     resolved_by_barrier = True
                     break
             if resolved_by_barrier:
