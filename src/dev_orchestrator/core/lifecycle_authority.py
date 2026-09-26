@@ -177,6 +177,77 @@ def source_ownership_blockers(
     ]
 
 
+_BLOCKED_TRANSITION_STATES = frozenset({"failed", "owner_gate", "waiting_recovery"})
+
+
+def _roadmap_successor_obligation(
+    snapshot: dict[str, Any],
+    authority: Any,
+    authority_task: str,
+    authority_state: str,
+    owners: list[dict[str, Any]],
+    executions: dict[str, Any],
+    transitions: dict[str, Any],
+    project_id: str,
+) -> dict[str, Any] | None:
+    """Return the missing roadmap handoff owed by a terminal authority, if any.
+
+    Only a quiescent terminal authority that repository truth also reports
+    COMPLETE qualifies.  An existing handoff or in-flight transition for the
+    source already owns the successor.  A refused transition, or a roadmap
+    that is ambiguous, inconsistent or invalid, is reported non-recoverable so
+    it gates for the owner instead of being actuated blindly.
+    """
+    if not isinstance(authority, dict) or not authority_task:
+        return None
+    if authority_state not in {"COMPLETE", "SETTLED"} or authority.get("owner_gate") or owners:
+        return None
+    if (
+        advertised_task_id(snapshot) != authority_task
+        or not parse_task_status(snapshot.get("next_status")).is_completed()
+    ):
+        return None
+    repo_path = snapshot.get("repo_path") or snapshot.get("root")
+    if not repo_path:
+        return None
+    for row in executions.values():
+        if (
+            isinstance(row, dict)
+            and row.get("project_id") == project_id
+            and row.get("state") == "handoff"
+            and (row.get("source_task_id") or row.get("task_id")) == authority_task
+        ):
+            return None
+    blocked_transitions = []
+    for row in transitions.values():
+        if (
+            not isinstance(row, dict)
+            or row.get("project_id") != project_id
+            or row.get("source_task_id") != authority_task
+        ):
+            continue
+        if row.get("state") not in _BLOCKED_TRANSITION_STATES:
+            return None
+        blocked_transitions.append(row.get("transition_id"))
+    from dev_orchestrator.core.successor_consistency import resolve_successor
+
+    try:
+        resolution = resolve_successor(repo_path, authority_task)
+        kind, reason = resolution.kind, resolution.reason
+    except Exception as exc:  # unreadable evidence gates, never recovers
+        resolution, kind, reason = None, "error", str(exc)
+    if kind in {"end_of_roadmap", "absent", "unlisted"}:
+        return None
+    return {
+        "source_task_id": authority_task,
+        "target_task_id": resolution.successor_task_id if resolution else None,
+        "kind": kind,
+        "reason": reason,
+        "blocked_transitions": blocked_transitions,
+        "recoverable": kind == "successor" and not blocked_transitions,
+    }
+
+
 def evaluate_lifecycle_invariants(
     *,
     snapshot: dict[str, Any],
@@ -271,7 +342,16 @@ def evaluate_lifecycle_invariants(
         ):
             lineage_bad.append(row)
     lineage_holds = not lineage_bad
-    next_without = bool(next_decisions)
+    # A terminal authority whose roadmap names a successor owes a durable
+    # handoff even when no NEXT review decision survives (for example the
+    # roadmap edge was restored after the task was settled task_complete).
+    roadmap_successor = None
+    if decisions_available and not next_decisions:
+        roadmap_successor = _roadmap_successor_obligation(
+            snapshot, authority, authority_task, authority_state,
+            owners, executions or {}, transitions or {}, project_id,
+        )
+    next_without = bool(next_decisions) or roadmap_successor is not None
     # Recovery can only rebuild a genuinely missing handoff.  When every
     # unsatisfied decision is durably blocked, autonomous recovery cannot
     # converge, so the finding is not recoverable and must fail closed to an
@@ -282,6 +362,8 @@ def evaluate_lifecycle_invariants(
         next_recoverable = False
     elif next_decisions:
         next_recoverable = any(not row.get("actuation_blocked") for row in next_decisions)
+    elif roadmap_successor is not None:
+        next_recoverable = bool(roadmap_successor.get("recoverable"))
     else:
         next_recoverable = True
     single_owner_holds = len(owner_tasks) <= 1 and len([o for o in owners if o.get("role") != "review_obligation"]) <= 1
@@ -311,7 +393,9 @@ def evaluate_lifecycle_invariants(
                               for row in next_decisions
                           ], "handoffs": len(handoffs),
                           "transitions": len(transitions or {}),
-                          "evidence_unavailable": not decisions_available}),
+                          "evidence_unavailable": not decisions_available,
+                          **({"roadmap_successor": roadmap_successor}
+                             if roadmap_successor is not None else {})}),
         InvariantFinding("SINGLE_ACTIVE_LIFECYCLE_OWNER", single_owner_holds, False,
                          "only one lifecycle role may own a project",
                          {"owners": owners, "owner_tasks": sorted(owner_tasks)}),

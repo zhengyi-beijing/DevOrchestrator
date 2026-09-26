@@ -1576,5 +1576,290 @@ class DeferredReviewFindingTests(unittest.TestCase):
             )
 
 
+def _complete_repo(root: Path, **kwargs) -> Path:
+    """Predecessor P1 COMPLETE in repository truth; roadmap per ``kwargs``."""
+    repo = _repo(root, current="P1", **kwargs)
+    (repo / "agent" / "next.md").write_bytes(b"# P1 task\n\nStatus: **COMPLETE**\n")
+    _commit(repo, "predecessor complete")
+    return repo
+
+
+def _repo_summary(repo: Path) -> dict:
+    """What the monitor publishes: current agent/next.md truth, not a fixture."""
+    lines = (repo / "agent" / "next.md").read_text(encoding="utf-8").splitlines()
+    title = next(line[2:].strip() for line in lines if line.startswith("# "))
+    status = next(
+        (line.split(":", 1)[1].strip() for line in lines
+         if line.strip().casefold().startswith("status:")), "",
+    )
+    return {"projects": [{
+        "project_id": "p1", "repo_path": str(repo), "state": "IDLE",
+        "next_title": title, "next_status": status,
+        "telemetry": {"task_id": title.split()[0]},
+        "git": {"head": _git(repo, "rev-parse", "HEAD"),
+                "branch": _git(repo, "rev-parse", "--abbrev-ref", "HEAD")},
+    }]}
+
+
+# The reviewer settled P1 task_complete before the roadmap named a successor:
+# terminal history, never a successor handoff.
+_STALE_SETTLE = {
+    "project_id": "p1", "source_request_id": "ai_review:settled",
+    "source_kind": "decision", "task_id": "P1", "state": "settled",
+    "outcome": "task_complete",
+    "reason": "reviewed task is COMPLETE and no next executable task is advertised",
+    "recorded_at": "2026-09-26T06:30:29+00:00",
+}
+
+
+def _terminal_state(executions=None, transitions=None) -> dict:
+    return {
+        "lifecycle": {"p1": {
+            "project_id": "p1", "current_task_id": "P1",
+            "lifecycle_state": "COMPLETE", "owner_gate": None,
+        }},
+        "executions": {"ai_review:settled": dict(_STALE_SETTLE), **(executions or {})},
+        "transitions": transitions or {},
+    }
+
+
+def _next_finding(repo: Path, executor_state: dict, decisions=None):
+    return {
+        item.code: item for item in evaluate_lifecycle_invariants(
+            snapshot=_repo_summary(repo)["projects"][0],
+            executor_state=executor_state,
+            decisions_state={"decisions": {}} if decisions is None else decisions,
+        )
+    }["NEXT_TASK_WITHOUT_HANDOFF"]
+
+
+class TerminalRoadmapSuccessorInvariantTests(unittest.TestCase):
+    """P16.13 -> P16.14 live incident: COMPLETE authority, valid roadmap
+    successor, no surviving NEXT decision and no durable handoff."""
+
+    def test_missing_handoff_is_a_recoverable_violation_without_a_decision(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            finding = _next_finding(repo, _terminal_state())
+            self.assertFalse(finding.holds, "the roadmap successor obligation was ignored")
+            self.assertTrue(finding.recoverable)
+            self.assertEqual(finding.evidence["next_decisions"], [])
+            self.assertEqual(
+                (finding.evidence["roadmap_successor"]["source_task_id"],
+                 finding.evidence["roadmap_successor"]["target_task_id"],
+                 finding.evidence["roadmap_successor"]["kind"]),
+                ("P1", "P2", "successor"),
+            )
+
+    def test_existing_or_in_flight_handoff_satisfies_the_obligation(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            handoff = {"h": {"project_id": "p1", "task_id": "P1", "source_task_id": "P1",
+                             "target_task_id": "P2", "state": "handoff"}}
+            self.assertTrue(_next_finding(repo, _terminal_state(executions=handoff)).holds)
+            intent = {"t": {"transition_id": "t", "project_id": "p1", "source_task_id": "P1",
+                            "target_task_id": "P2", "state": "intent"}}
+            self.assertTrue(_next_finding(repo, _terminal_state(transitions=intent)).holds)
+
+    def test_refused_transition_gates_instead_of_recovering(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            refused = {"t": {"transition_id": "t", "project_id": "p1", "source_task_id": "P1",
+                             "target_task_id": "P2", "state": "waiting_recovery"}}
+            finding = _next_finding(repo, _terminal_state(transitions=refused))
+            self.assertFalse(finding.holds)
+            self.assertFalse(finding.recoverable)
+
+    def test_ambiguous_successor_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            # Roadmap names P3 while staged P2 claims P1 as its predecessor.
+            repo = _complete_repo(Path(td), roadmap_target="P3")
+            finding = _next_finding(repo, _terminal_state())
+            self.assertFalse(finding.holds)
+            self.assertFalse(finding.recoverable)
+            self.assertEqual(finding.evidence["roadmap_successor"]["kind"], "ambiguous")
+
+    def test_invalid_successor_spec_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            (repo / "agent" / "staged" / "P2.md").write_bytes(
+                b"# P2 task\n\nStatus: **COMPLETE**\n\nPredecessor: P1\n")
+            _commit(repo, "successor spec no longer pending design")
+            finding = _next_finding(repo, _terminal_state())
+            self.assertFalse(finding.holds)
+            self.assertFalse(finding.recoverable)
+            self.assertEqual(finding.evidence["roadmap_successor"]["kind"], "invalid")
+
+    def test_end_of_roadmap_stays_settled(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td), roadmap_target=None)
+            (repo / "agent" / "staged" / "P2.md").unlink()
+            _commit(repo, "no staged successor")
+            finding = _next_finding(repo, _terminal_state())
+            self.assertTrue(finding.holds)
+            self.assertNotIn("roadmap_successor", finding.evidence)
+
+    def test_active_ownership_is_not_a_missing_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            running = {"w": {"project_id": "p1", "source_request_id": "w",
+                             "task_id": "P1", "state": "running"}}
+            self.assertTrue(_next_finding(repo, _terminal_state(executions=running)).holds)
+
+    def test_surviving_decision_path_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            # Consumed after the stale settle, so that settle cannot satisfy it.
+            decisions = {"decisions": {"d": {
+                "project_id": "p1", "task_id": "P1", "request_id": "d",
+                "disposition": "apply", "decision": "next", "next_action": "next_task",
+                "consumed_at": "2026-09-26T07:00:00+00:00",
+            }}}
+            finding = _next_finding(repo, _terminal_state(), decisions)
+            self.assertFalse(finding.holds)
+            self.assertTrue(finding.recoverable)
+            self.assertEqual([row["request_id"] for row in finding.evidence["next_decisions"]], ["d"])
+            self.assertNotIn("roadmap_successor", finding.evidence)
+
+
+class TerminalRoadmapSuccessorEndToEndTests(unittest.TestCase):
+    """COMPLETE P1 + roadmap P1->P2 + valid staged P2 + no NEXT decision and
+    no handoff, driven through the real daemon-ordered components."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.runtime = root / "runtime"
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        self.repo = _complete_repo(root)
+        self.project = {
+            "project_id": "p1",
+            "repo_path": str(self.repo),
+            "execution": {"engine": "aibroker"},
+            "ai_roles": {"planner": {
+                "enabled": True, "quality": "high", "review_quality": "high",
+                "review_independence": "resource",
+            }},
+            "watchdog": {"enabled": True, "auto_recovery": True,
+                         "no_progress_threshold_minutes": 1},
+        }
+        self.config_path = self.runtime / "projects.json"
+        self.config_path.write_text(json.dumps({"projects": [self.project]}), encoding="utf-8")
+        # No surviving NEXT decision at all.
+        (self.runtime / "review-decisions.json").write_text(
+            json.dumps({"decisions": {}}), encoding="utf-8")
+        self.executor = TransitionExecutor(self.runtime)
+        ledger = self.executor.state()
+        ledger["executions"]["ai_review:settled"] = dict(_STALE_SETTLE)
+        self.executor._save_ledger(ledger)
+        self.port = _PlanningPort()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _owner_commands(self):
+        found = []
+        for base in (self.runtime / "control" / "inbox", self.runtime / "control" / "history"):
+            if not base.exists():
+                continue
+            for path in base.glob("*.json"):
+                row = json.loads(path.read_text(encoding="utf-8"))
+                if str(row.get("source") or "") != "automatic_review_handoff":
+                    found.append({"path": path.name, "source": row.get("source")})
+        return found
+
+    def _handoffs(self):
+        return [
+            row for row in self.executor.state()["executions"].values()
+            if isinstance(row, dict) and row.get("project_id") == "p1"
+            and row.get("state") == "handoff"
+        ]
+
+    def _tick(self, planner, controls, watchdog):
+        """The daemon's order: authority, control plane, authority, Watchdog."""
+        def reconcile():
+            self.executor.reconcile_lifecycle_authority(
+                _repo_summary(self.repo), planner_state=planner.state())
+
+        reconcile()
+        controls.advance(str(self.config_path),
+                         self.executor.overlay_lifecycle_authority(_repo_summary(self.repo)),
+                         self.executor)
+        for thread in getattr(planner, "_threads", {}).values():
+            thread.join(timeout=15.0)
+        reconcile()
+        watchdog.advance(str(self.config_path),
+                         self.executor.overlay_lifecycle_authority(_repo_summary(self.repo)),
+                         executor=self.executor)
+        for thread in getattr(watchdog, "_threads", {}).values():
+            thread.join(timeout=10.0)
+
+    def test_terminal_authority_recovers_roadmap_successor_zero_touch(self):
+        from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
+        from dev_orchestrator.core.control_commands import ControlCommandCoordinator
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        planner = AIPlannerCoordinator(self.runtime, self.port)
+        controls = ControlCommandCoordinator(self.runtime, planner)
+        watchdog = WatchdogCoordinator(self.runtime, planner=planner)
+
+        # Tick 1: authority is P1/COMPLETE; the Watchdog recovers the handoff.
+        self._tick(planner, controls, watchdog)
+        authority = self.executor.state()["lifecycle"]["p1"]
+        self.assertEqual(authority["current_task_id"], "P1")
+        handoffs = self._handoffs()
+        self.assertEqual(len(handoffs), 1, "exactly one handoff must be recovered")
+        self.assertEqual((handoffs[0]["source_task_id"], handoffs[0]["target_task_id"]),
+                         ("P1", "P2"))
+        self.assertTrue(handoffs[0]["source_request_id"].startswith("recover-handoff:p1:P1:P2:"))
+
+        # Tick 2: the normal control plane consumes it and starts the Planner.
+        self._tick(planner, controls, watchdog)
+        plans = [row for row in planner.state()["plans"].values()
+                 if isinstance(row, dict) and row.get("project_id") == "p1"]
+        self.assertEqual(len(plans), 1, f"successor Planner did not start: {plans}")
+        self.assertEqual(plans[0].get("task_id"), "P2")
+        self.assertTrue(self._handoffs()[0].get("handoff_consumed"))
+        authority = self.executor.state()["lifecycle"]["p1"]
+        self.assertEqual((authority["source_task_id"], authority["current_task_id"]), ("P1", "P2"))
+        self.assertIsNone(authority.get("owner_gate"))
+        self.assertIn("P2", (self.repo / "agent" / "next.md").read_text(encoding="utf-8"))
+        self.assertEqual(self._owner_commands(), [], "recovery required an owner command")
+
+        # Repeated ticks are idempotent.
+        for _ in range(3):
+            self._tick(planner, controls, watchdog)
+        self.assertEqual(len(self._handoffs()), 1, "repeated ticks duplicated the handoff")
+        self.assertEqual(
+            len([row for row in planner.state()["plans"].values()
+                 if isinstance(row, dict) and row.get("project_id") == "p1"]),
+            1, "repeated ticks launched a duplicate Planner")
+        self.assertEqual(len(self.executor.state()["transitions"]), 1)
+        self.assertEqual(self._owner_commands(), [])
+        wrow = (watchdog.state().get("projects") or {}).get("p1") or {}
+        self.assertNotIn("NEXT_TASK_WITHOUT_HANDOFF", wrow.get("unresolved_invariants") or [])
+        attempts = wrow.get("lifecycle_recovery_attempts") or {}
+        self.assertEqual([a.get("state") for a in attempts.values()], ["recovered"])
+
+    def test_dirty_worktree_waits_without_gating_then_recovers(self):
+        from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
+        from dev_orchestrator.core.control_commands import ControlCommandCoordinator
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        planner = AIPlannerCoordinator(self.runtime, self.port)
+        controls = ControlCommandCoordinator(self.runtime, planner)
+        watchdog = WatchdogCoordinator(self.runtime, planner=planner)
+        (self.repo / "stray").write_text("", encoding="utf-8")
+        for _ in range(3):
+            self._tick(planner, controls, watchdog)
+        self.assertEqual(self._handoffs(), [], "recovery ran on a dirty worktree")
+        wrow = (watchdog.state().get("projects") or {}).get("p1") or {}
+        self.assertIsNone(wrow.get("owner_gate"), "a dirty-tree wait was gated")
+
+        (self.repo / "stray").unlink()
+        self._tick(planner, controls, watchdog)
+        self.assertEqual(len(self._handoffs()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

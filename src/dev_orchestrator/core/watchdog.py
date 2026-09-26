@@ -1771,7 +1771,11 @@ class WatchdogCoordinator:
                             and not finding.recoverable
                         ):
                             decisions = finding.evidence.get("next_decisions") or []
-                            source_task_id = str(decisions[0].get("task_id") or "") if decisions else ""
+                            roadmap_successor = finding.evidence.get("roadmap_successor") or {}
+                            source_task_id = str(
+                                (decisions[0].get("task_id") if decisions
+                                 else roadmap_successor.get("source_task_id")) or ""
+                            )
                             key = f"{source_task_id}:{(snapshot.get('git') or {}).get('head') if isinstance(snapshot.get('git'), dict) else ''}"
                             attempts = prow.get("lifecycle_recovery_attempts")
                             if isinstance(attempts, dict):
@@ -1793,7 +1797,13 @@ class WatchdogCoordinator:
                                 )
                         if finding.code == "NEXT_TASK_WITHOUT_HANDOFF" and finding.recoverable:
                             decisions = finding.evidence.get("next_decisions") or []
-                            source_task_id = str(decisions[0].get("task_id") or "") if decisions else ""
+                            # Without a surviving NEXT decision, the terminal
+                            # authority's roadmap obligation names the source.
+                            roadmap_successor = finding.evidence.get("roadmap_successor") or {}
+                            source_task_id = str(
+                                (decisions[0].get("task_id") if decisions
+                                 else roadmap_successor.get("source_task_id")) or ""
+                            )
                             key = f"{source_task_id}:{(snapshot.get('git') or {}).get('head') if isinstance(snapshot.get('git'), dict) else ''}"
                             attempts = prow.setdefault("lifecycle_recovery_attempts", {})
                             prior_attempt = attempts.get(key) if isinstance(attempts.get(key), dict) else {}

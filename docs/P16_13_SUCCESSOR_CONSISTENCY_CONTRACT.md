@@ -120,6 +120,25 @@ successor resolver and handoff writer. One unambiguous failure can therefore
 heal with no owner `continue`. Repeated non-transient failure or contradictory
 ownership becomes a durable `OWNER_GATE`.
 
+The invariant has two evidence sources. An accepted `NEXT_TASK` decision still
+owes a handoff. A **terminal authority** also owes one when no decision
+survives. That applies when the authority is `COMPLETE`/`SETTLED`, has no owner
+gate and no active owner, repository truth reports that same task `COMPLETE`,
+the roadmap names a successor, and no `handoff` row or in-flight transition
+exists for the source. A `settled`/`task_complete` row is terminal history and
+is never treated as a successor handoff: the roadmap may gain the edge after the
+reviewer settled the task. Only a valid, unambiguous roadmap `successor` is
+recoverable. Ambiguous, inconsistent, invalid, or unreadable successor evidence,
+and a refused (`failed`/`owner_gate`/`waiting_recovery`) transition for the
+source, are non-recoverable and gate. The evidence carries
+`roadmap_successor.source_task_id`, which Watchdog uses as the recovery source
+when `next_decisions` is empty.
+
+Live incident (2026-09-26): P16.13 was settled `task_complete` three times
+before commit `6eb8e57` restored the P16.13 -> P16.14 roadmap edge. With
+`next_decisions=[]` the invariant reported `holds=true`, so the daemon stayed
+IDLE with a valid staged P16.14 and no handoff.
+
 ## Central invariants
 
 `core.lifecycle_authority.evaluate_lifecycle_invariants` is shared by lifecycle

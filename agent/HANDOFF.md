@@ -10,6 +10,36 @@ Repository state is authoritative. The two owner gates described in section
 4.1 belong to other projects and remain intentionally fail closed; they do not
 block P16.13.
 
+## 0. OPEN: P16.13 -> P16.14 successor recovery (terminal authority, no decision)
+
+After `6eb8e57` restored the P16.13 -> P16.14 roadmap edge, the daemon stayed
+IDLE. The authority was `P16.13/COMPLETE`, and there were no owners, no gate,
+and no P16.14 handoff or transition. `NEXT_TASK_WITHOUT_HANDOFF` held because it
+was derived only from surviving NEXT decisions, and P16.13's reviews had all
+settled `task_complete` before the roadmap edge existed.
+
+Fix (see `docs/P16_13_SUCCESSOR_CONSISTENCY_CONTRACT.md`): the shared evaluator
+now also raises the invariant for a quiescent terminal authority with an
+unambiguous valid roadmap successor and no durable handoff. Watchdog recovers it
+through the existing `reconcile_successor_handoff`, using
+`roadmap_successor.source_task_id`. Ambiguity, invalid specs and lineage, and
+refused transitions gate. Dirty worktrees wait. Active ownership suppresses the
+obligation.
+
+Remaining gates, in order:
+1. Run `python -m pytest tests_py/test_p1613_successor_consistency.py`, then the
+   focused lifecycle/watchdog/daemon suites, the full regression,
+   `python -m compileall -q src ops tests_py`, and `git diff --check`.
+2. Commit and push, which gives the clean worktree that recovery requires. The
+   stray empty untracked `P2` file at the repo root also dirties the tree and
+   must be removed.
+3. Restart the canonical daemon so it loads the fix. Do not start P16.14
+   manually.
+4. Confirm the live handoff `recover-handoff:devorchestrator:P16.13:P16.14:*`
+   with `source_task_id=P16.13` and `target_task_id=P16.14`, its consumption,
+   authority `current_task_id=P16.14` with `source_task_id=P16.13`, and a
+   started P16.14 Planner. Do not invent P16.15.
+
 ## 1. What was done in this session
 
 Continued from the interrupted Codex session. Commits on top of `9e5909a`:

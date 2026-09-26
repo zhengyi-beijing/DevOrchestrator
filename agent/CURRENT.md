@@ -39,9 +39,33 @@ P16.13 final closure evidence (2026-09-26):
 - Final focused verification: 112 tests and 15 subtests passed. Final full
   regression: 1,311 tests and 102 subtests passed in 550.19s. `compileall`,
   `git diff --check`, and Graphify update passed.
-- P16.13 has no roadmap successor. The two external-project owner gates remain
-  deliberately fail closed and require per-project owner disposition; they do
-  not block this task's accepted closure.
+- At closure P16.13 had no roadmap successor. Commit `6eb8e57` later restored
+  the P16.13 -> P16.14 roadmap edge and staged P16.14. The two external-project
+  owner gates remain deliberately fail closed and require per-project owner
+  disposition; they do not block this task's accepted closure.
+
+P16.13 -> P16.14 successor recovery fix (2026-09-26):
+- Live symptom: the authority was `P16.13/COMPLETE` with no owners, no owner
+  gate and no P16.14 handoff or transition, and the roadmap validly named
+  P16.14. The daemon stayed IDLE because `NEXT_TASK_WITHOUT_HANDOFF` evidence
+  showed `next_decisions=[]` and `holds=true`.
+- Root cause: `evaluate_lifecycle_invariants` derived the invariant only from
+  surviving `apply/next/next_task` decisions. All three P16.13 closure reviews
+  settled `task_complete` ("no next executable task is advertised") at
+  06:07-06:30Z, before the roadmap edge existed. So no decision owed a handoff
+  and the roadmap successor was never considered.
+- Fix: the shared evaluator also raises the invariant for a quiescent terminal
+  authority whose roadmap names a successor with no durable handoff or in-flight
+  transition. It is recoverable only for an unambiguous valid `successor`.
+  Ambiguous, inconsistent or invalid evidence, and refused transitions, gate.
+  Watchdog takes the recovery source from `roadmap_successor.source_task_id` and
+  reuses `reconcile_successor_handoff`, the transition journal and the normal
+  Planner handoff consumer. No new authority file was added.
+- Regression: `TerminalRoadmapSuccessorInvariantTests` and
+  `TerminalRoadmapSuccessorEndToEndTests` in
+  `tests_py/test_p1613_successor_consistency.py`.
+- Verification status: PENDING. Test execution, live daemon reload and live
+  P16.13 -> P16.14 lineage evidence were not yet produced.
 
 P16.13 review and remediation evidence (2026-09-26):
 - Projection boundary (`f51a01b`): the lifecycle authority overlay is re-applied

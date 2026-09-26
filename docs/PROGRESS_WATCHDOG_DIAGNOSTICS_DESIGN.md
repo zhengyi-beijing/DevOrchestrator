@@ -281,7 +281,11 @@ Watchdog evaluates the centralized lifecycle invariant set from
 durable authority and transition journal live in `transition-executor.json`.
 `NEXT_TASK_WITHOUT_HANDOFF` is the sole automatically repairable successor
 violation: Watchdog invokes the executor's idempotent handoff reconciliation,
-records the attempt, and remains silent after convergence. Dirty repositories
+records the attempt, and remains silent after convergence. The violation is
+raised either by an accepted `NEXT_TASK` decision or by a quiescent terminal
+authority whose roadmap names an unambiguous successor with no durable handoff;
+the recovery source is the decision task or `roadmap_successor.source_task_id`
+respectively. Dirty repositories
 wait for a later clean tick. Contradictory ownership, invalid lineage, and
 repeated non-transient recovery failures emit a real `OWNER_GATE`.
 
