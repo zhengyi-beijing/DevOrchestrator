@@ -137,6 +137,8 @@ def _run_orchestration_tick(
         planner_state=planner_state_fn() if callable(planner_state_fn) else None,
         reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
     )
+    if callable(overlay_authority):
+        projected = overlay_authority(projected)
     browser_summary = dict(projected) if isinstance(projected, dict) else projected
     if isinstance(browser_summary, dict) and isinstance(browser_summary.get("projects"), list):
         browser_summary = dict(browser_summary)
@@ -335,6 +337,8 @@ def _run_orchestration_tick(
         planner_state=planner_state_fn() if callable(planner_state_fn) else None,
         reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
     )
+    if callable(overlay_authority):
+        projected = overlay_authority(projected)
     if watchdog is not None:
         try:
             # The watchdog's READY_TO_RUN launch-gap detector must see the
@@ -359,6 +363,8 @@ def _run_orchestration_tick(
                 )
             else:
                 watchdog_summary = authoritative_summary
+            if callable(overlay_authority):
+                watchdog_summary = overlay_authority(watchdog_summary)
             import inspect
             sig = inspect.signature(watchdog.advance)
             if "planner" in sig.parameters:
@@ -374,12 +380,14 @@ def _run_orchestration_tick(
             reviewer_st = reviewer_state_fn() if callable(reviewer_state_fn) else None
             if planner_st or reviewer_st:
                 supervisor_summary = overlay_orchestration_lifecycle(
-                    raw_summary,
+                    authoritative_summary,
                     planner_state=planner_st,
                     reviewer_state=reviewer_st,
                 )
             else:
-                supervisor_summary = raw_summary
+                supervisor_summary = authoritative_summary
+            if callable(overlay_authority):
+                supervisor_summary = overlay_authority(supervisor_summary)
             supervisor.advance(config, supervisor_summary, executor=executor, watchdog=watchdog)
         except Exception as _sup_exc:
             supervisor_error = str(_sup_exc)
