@@ -1,6 +1,8 @@
 # P16.13 Successor Consistency & Zero-Touch Handoff Recovery
 
-Status: **PENDING DESIGN**
+Status: **READY TO RUN**
+
+Predecessor: P16.12
 
 ## Goal
 Eliminate silent task-chain stalls caused by roadmap/staged-task/reviewer successor disagreement, and guarantee zero-touch recovery without owner continue.
@@ -39,3 +41,43 @@ P16.13 must solve the lifecycle-consistency class, not only patch the current P1
 8. Regression/fault-injection test passes end-to-end with zero manual intervention.
 9. When the normal remediation budget is exhausted but the reviewer returns only explicit localized blockers with bounded fixes and required regression tests, DevO grants at most one automatic bounded extension and re-reviews without owner intervention.
 10. Ambiguous, scope-expanding, repeated, or still-failing findings after that extension stop at OWNER_GATE; repeated ticks never grant duplicate extensions.
+
+## Approved executable design
+
+The approved implementation is the bounded authority/journal design in
+`docs/P16_13_SUCCESSOR_CONSISTENCY_CONTRACT.md`:
+
+1. Extend the existing `runtime/transition-executor.json` ledger with one
+   authoritative `lifecycle` record per project and a sibling `transitions`
+   journal; do not add another lifecycle state file.
+2. Treat repository task files, execution records, Planner/Reviewer ledgers,
+   project status, and Watchdog as projections or evidence. A partially
+   published repository successor does not advance authority.
+3. Persist deterministic source/target/generation transition intent, drain all
+   source-task ownership, persist a replayable handoff, activate the staged
+   successor, then publish the authority transition.
+4. Cross-check explicit staged predecessor evidence against the roadmap.
+   Automatically repair one unambiguous null/unlisted successor only from a
+   clean worktree; preserve dirty work and fail closed on disagreement.
+5. Use one centralized invariant evaluator in reconciliation and Watchdog.
+   Automatically rebuild a missing handoff; gate invalid lineage, ambiguous
+   ownership, or repeated non-transient recovery failure.
+6. Extend the existing recovery epoch with lifecycle generation/transition
+   identity. Migrate old ledgers in place while retaining execution evidence.
+7. Permit exactly one durable, diff-localized remediation-budget extension;
+   gate missing, repeated, cross-task, or still-failing findings.
+8. Verify the complete A-J matrix in
+   `tests_py/test_p1613_successor_consistency.py`, then full regression,
+   runtime smoke, and independent Technical Review before closure.
+
+## Incident root cause
+
+P16.13 was published by `2b326fd` while the P16.12 technical-review obligation
+was still valid. That review launched P16.12 remediation after publication and
+eventually produced `78dfc95`. Managed-run overlay then selected the active old
+execution independently of repository task selection, reporting the P16.13
+projection as executing while its execution lineage remained P16.12. Watchdog
+observed a live Worker and had no cross-task ownership invariant, so it could
+not converge the competing authorities. This is addressed as an ordering,
+transactionality, and multiple-authority defect rather than by relabeling the
+historical execution.

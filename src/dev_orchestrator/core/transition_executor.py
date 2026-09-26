@@ -32,6 +32,22 @@ from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import read_successor
+from dev_orchestrator.core.successor_consistency import (
+    SuccessorResolution,
+    reconcile_roadmap_successor,
+    resolve_successor,
+)
+from dev_orchestrator.core.lifecycle_authority import (
+    active_owners,
+    advertised_task_id,
+    epoch_for,
+    evaluate_lifecycle_invariants,
+    invariant_payload,
+    lifecycle_state_from_snapshot,
+    new_authority,
+    source_ownership_blockers,
+    transition_id_for,
+)
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.core.workflow_policy import inject_workflow_policy
 
@@ -48,7 +64,7 @@ from dev_orchestrator.monitor.telemetry import extract_task_id
 from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
 ACTUATION_FILE = "transition-executor.json"
-_LEDGER_VERSION = 1
+_LEDGER_VERSION = 2
 _ACTIVE_STATES = frozenset({"launching", "running"})
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "explicitly_reconciled"})
 
@@ -81,7 +97,12 @@ class ActuationLaunch:
 
 
 def _empty_ledger() -> dict[str, Any]:
-    return {"version": _LEDGER_VERSION, "executions": {}}
+    return {
+        "version": _LEDGER_VERSION,
+        "executions": {},
+        "lifecycle": {},
+        "transitions": {},
+    }
 
 
 def _project_map(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -517,7 +538,20 @@ class TransitionExecutor:
             key: value for key, value in executions.items()
             if isinstance(key, str) and isinstance(value, dict)
         }
-        return {"version": _LEDGER_VERSION, "executions": clean}
+        lifecycle = data.get("lifecycle")
+        transitions = data.get("transitions")
+        return {
+            "version": _LEDGER_VERSION,
+            "executions": clean,
+            "lifecycle": {
+                key: value for key, value in (lifecycle or {}).items()
+                if isinstance(key, str) and isinstance(value, dict)
+            } if isinstance(lifecycle, dict) else {},
+            "transitions": {
+                key: value for key, value in (transitions or {}).items()
+                if isinstance(key, str) and isinstance(value, dict)
+            } if isinstance(transitions, dict) else {},
+        }
 
     def _save_ledger(self, ledger: dict[str, Any]) -> None:
         write_json(self.ledger_path, ledger, indent=2)
@@ -610,12 +644,237 @@ class TransitionExecutor:
                     record["reason"] = "daemon restarted while managed execution was active; Broker state is unavailable; automatic replay is forbidden"
                 record["recovered_at"] = recovered_at
                 changed = True
+            for transition in ledger.setdefault("transitions", {}).values():
+                if not isinstance(transition, dict):
+                    continue
+                source_id = _non_blank_config(transition.get("source_request_id"))
+                state = str(transition.get("state") or "")
+                execution = ledger["executions"].get(source_id) if source_id else None
+                if execution is None and state == "ready":
+                    handoff = transition.get("handoff_record")
+                    if isinstance(handoff, dict) and source_id:
+                        ledger["executions"][source_id] = copy.deepcopy(handoff)
+                        execution = ledger["executions"][source_id]
+                        transition["replayed_at"] = utc_now_iso()
+                        changed = True
+                if isinstance(execution, dict) and execution.get("handoff_consumed") is True:
+                    if state not in {"published", "completed"}:
+                        transition["state"] = "published"
+                        transition["published_at"] = execution.get("handoff_consumed_at") or utc_now_iso()
+                        transition["updated_at"] = utc_now_iso()
+                        changed = True
+                    project_id = str(transition.get("project_id") or "")
+                    authority = ledger.setdefault("lifecycle", {}).get(project_id)
+                    if isinstance(authority, dict):
+                        authority["generation"] = int(transition.get("generation") or authority.get("generation") or 0)
+                        authority["source_task_id"] = transition.get("source_task_id")
+                        authority["current_task_id"] = transition.get("target_task_id")
+                        authority["active_transition_id"] = transition.get("transition_id")
+                        authority["updated_at"] = utc_now_iso()
+                        authority["recovery_epoch_id"] = epoch_for(authority)
+                        changed = True
             if changed:
                 self._save_ledger(ledger)
 
     def state(self) -> dict[str, Any]:
         with self._lock:
             return copy.deepcopy(self._load_ledger())
+
+    def reconcile_lifecycle_authority(
+        self,
+        summary: Any,
+        *,
+        planner_state: Any = None,
+        reviewer_state: Any = None,
+    ) -> dict[str, Any]:
+        """Converge repository/role projections into the one runtime authority.
+
+        A repository successor published while source-task ownership still
+        exists is retained as a projection only.  The authority advances after
+        that ownership is terminal and a deterministic transition record proves
+        the lineage.
+        """
+        snapshots = _snapshot_map(summary)
+        with self._lock:
+            ledger = self._load_ledger()
+            lifecycle = ledger.setdefault("lifecycle", {})
+            transitions = ledger.setdefault("transitions", {})
+            for project_id, snapshot in snapshots.items():
+                repo_task = advertised_task_id(snapshot)
+                if not repo_task:
+                    continue
+                authority = lifecycle.get(project_id)
+                owners = active_owners(
+                    project_id, ledger,
+                    planner_state if isinstance(planner_state, dict) else None,
+                    reviewer_state if isinstance(reviewer_state, dict) else None,
+                )
+                owner_tasks = {
+                    str(owner.get("task_id") or "") for owner in owners
+                    if owner.get("task_id")
+                }
+                if not isinstance(authority, dict):
+                    initial_task = next(iter(owner_tasks)) if len(owner_tasks) == 1 else repo_task
+                    initial_state = lifecycle_state_from_snapshot(snapshot)
+                    authority = new_authority(project_id, initial_task, initial_state)
+                    lifecycle[project_id] = authority
+
+                current_task = str(authority.get("current_task_id") or repo_task)
+                if len(owner_tasks) > 1:
+                    authority["owner_gate"] = {
+                        "code": "SINGLE_ACTIVE_LIFECYCLE_OWNER",
+                        "reason": "active lifecycle ownership spans multiple tasks",
+                        "owners": copy.deepcopy(owners),
+                        "recorded_at": utc_now_iso(),
+                    }
+                    authority["lifecycle_state"] = "OWNER_GATE"
+                elif len(owner_tasks) == 1:
+                    owner_task = next(iter(owner_tasks))
+                    authority["current_task_id"] = owner_task
+                    authority["active_owner"] = copy.deepcopy(owners[0] if len(owners) == 1 else owners)
+                    roles = {str(owner.get("role") or "") for owner in owners}
+                    if "worker" in roles:
+                        authority["lifecycle_state"] = "EXECUTING"
+                    elif "reviewer" in roles or "review_obligation" in roles:
+                        authority["lifecycle_state"] = "REVIEWING"
+                    elif "planner" in roles:
+                        authority["lifecycle_state"] = "PLANNING"
+                    current_task = owner_task
+                    if repo_task != owner_task:
+                        resolution = resolve_successor(snapshot.get("repo_path") or snapshot.get("root") or "", owner_task)
+                        if resolution.successor_task_id == repo_task and resolution.kind in {"successor", "inconsistent"}:
+                            generation = int(authority.get("generation") or 0) + 1
+                            tid = transition_id_for(project_id, owner_task, repo_task, generation)
+                            transitions.setdefault(tid, {
+                                "transition_id": tid,
+                                "project_id": project_id,
+                                "source_task_id": owner_task,
+                                "target_task_id": repo_task,
+                                "generation": generation,
+                                "state": "waiting_source",
+                                "idempotency_key": tid,
+                                "evidence": {"source": resolution.evidence, "reason": resolution.reason},
+                                "recorded_at": utc_now_iso(),
+                                "updated_at": utc_now_iso(),
+                            })
+                            authority["active_transition_id"] = tid
+                            authority["source_task_id"] = owner_task
+                else:
+                    authority["active_owner"] = None
+                    if repo_task != current_task:
+                        matching = [
+                            row for row in transitions.values()
+                            if isinstance(row, dict)
+                            and row.get("project_id") == project_id
+                            and row.get("source_task_id") == current_task
+                            and row.get("target_task_id") == repo_task
+                            and row.get("state") in {
+                                "intent", "waiting_source", "ready", "published",
+                                "completed", "waiting_recovery",
+                            }
+                        ]
+                        if not matching:
+                            resolution = resolve_successor(
+                                snapshot.get("repo_path") or snapshot.get("root") or "", current_task,
+                            )
+                            if resolution.successor_task_id == repo_task and resolution.kind in {"successor", "inconsistent"}:
+                                generation = int(authority.get("generation") or 0) + 1
+                                tid = transition_id_for(project_id, current_task, repo_task, generation)
+                                transition = {
+                                    "transition_id": tid,
+                                    "project_id": project_id,
+                                    "source_task_id": current_task,
+                                    "target_task_id": repo_task,
+                                    "generation": generation,
+                                    "state": "intent",
+                                    "idempotency_key": tid,
+                                    "evidence": {"source": "recovered_repository_projection"},
+                                    "recorded_at": utc_now_iso(),
+                                    "updated_at": utc_now_iso(),
+                                }
+                                transitions[tid] = transition
+                                matching = [transition]
+                        publishable = [
+                            row for row in matching
+                            if row.get("state") in {"published", "completed"}
+                        ]
+                        if publishable:
+                            transition = max(publishable, key=lambda row: int(row.get("generation") or 0))
+                            transition["state"] = "completed"
+                            transition["updated_at"] = utc_now_iso()
+                            authority["generation"] = int(transition.get("generation") or authority.get("generation") or 0)
+                            authority["source_task_id"] = current_task
+                            authority["current_task_id"] = repo_task
+                            authority["active_transition_id"] = transition.get("transition_id")
+                            authority["owner_gate"] = None
+                        elif matching:
+                            # Repository publication alone is only a projection.
+                            # Keep the predecessor authoritative until the durable
+                            # handoff is replayed and consumed by the Planner.
+                            transition = max(matching, key=lambda row: int(row.get("generation") or 0))
+                            if transition.get("state") == "waiting_source":
+                                transition["state"] = "intent"
+                                transition["ownership_blockers"] = []
+                                transition["updated_at"] = utc_now_iso()
+                            authority["active_transition_id"] = transition.get("transition_id")
+                            authority["source_task_id"] = current_task
+                            authority["lifecycle_state"] = "TRANSITIONING"
+                        else:
+                            authority["owner_gate"] = {
+                                "code": "CURRENT_TASK_MATCHES_ACTIVE_EXECUTION",
+                                "reason": "repository task changed without an authoritative transition",
+                                "repository_task_id": repo_task,
+                                "authority_task_id": current_task,
+                                "recorded_at": utc_now_iso(),
+                            }
+                            authority["lifecycle_state"] = "OWNER_GATE"
+                    if authority.get("current_task_id") == repo_task and not authority.get("owner_gate"):
+                        authority["lifecycle_state"] = lifecycle_state_from_snapshot(snapshot)
+
+                authority["repository_projection"] = {
+                    "task_id": repo_task,
+                    "state": lifecycle_state_from_snapshot(snapshot),
+                    "matches_authority": repo_task == authority.get("current_task_id"),
+                }
+                authority["updated_at"] = utc_now_iso()
+                authority["recovery_epoch_id"] = epoch_for(authority)
+                findings = evaluate_lifecycle_invariants(
+                    snapshot=snapshot,
+                    executor_state=ledger,
+                    planner_state=planner_state if isinstance(planner_state, dict) else None,
+                    reviewer_state=reviewer_state if isinstance(reviewer_state, dict) else None,
+                )
+                authority["invariants"] = invariant_payload(findings)
+            self._save_ledger(ledger)
+            return copy.deepcopy(ledger)
+
+    def overlay_lifecycle_authority(self, summary: Any) -> Any:
+        projected = copy.deepcopy(summary)
+        if not isinstance(projected, dict) or not isinstance(projected.get("projects"), list):
+            return projected
+        ledger = self.state()
+        authorities = ledger.get("lifecycle", {})
+        for snapshot in projected["projects"]:
+            if not isinstance(snapshot, dict):
+                continue
+            project_id = str(snapshot.get("project_id") or snapshot.get("id") or "")
+            authority = authorities.get(project_id) if isinstance(authorities, dict) else None
+            if not isinstance(authority, dict):
+                continue
+            telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+            telemetry = copy.deepcopy(telemetry)
+            telemetry["task_id"] = authority.get("current_task_id")
+            snapshot["telemetry"] = telemetry
+            snapshot["authoritative_lifecycle"] = copy.deepcopy(authority)
+            state = str(authority.get("lifecycle_state") or "UNKNOWN")
+            snapshot["lifecycle_state"] = state
+            if state == "EXECUTING":
+                snapshot["state"] = "WORKER_RUNNING"
+            elif state in {"PLANNING", "REVIEWING", "OWNER_GATE"}:
+                snapshot["state"] = state
+            elif state == "PENDING_DESIGN":
+                snapshot["state"] = "IDLE"
+        return projected
 
     def overlay_managed_runs(self, summary: Any) -> Any:
         """Project managed-run truth onto a deep copy for WORKER_DONE dispatch."""
@@ -715,7 +974,7 @@ class TransitionExecutor:
                     "started_at": record.get("started_at"),
                     "engine": "aibroker",
                 }
-        return projected
+        return self.overlay_lifecycle_authority(projected)
 
     @staticmethod
     def _active_project(ledger: dict[str, Any], project_id: str) -> bool:
@@ -783,7 +1042,10 @@ class TransitionExecutor:
         reviewed_branch: str | None = None,
         reviewed_head: str | None = None,
         reviewed_ready: bool = False,
-    ) -> None:
+        successor_evidence: str | None = None,
+    ) -> bool:
+        planner_state = read_json(self.runtime_root / "ai-planner.json", {})
+        reviewer_state = read_json(self.runtime_root / "ai-reviewer.json", {})
         with self._lock:
             ledger = self._load_ledger()
             existing = ledger["executions"].get(source_request_id)
@@ -792,13 +1054,94 @@ class TransitionExecutor:
                 or _legacy_no_next_settle(existing)
                 or _legacy_not_advanced_block(existing)
             ):
-                return
+                return existing.get("state") == "handoff"
+            lifecycle = ledger.setdefault("lifecycle", {})
+            authority = lifecycle.get(project_id)
+            if not isinstance(authority, dict):
+                authority = new_authority(project_id, reviewed_task_id, "REVIEWING")
+                lifecycle[project_id] = authority
+            prior_transition = next((
+                row for row in ledger.setdefault("transitions", {}).values()
+                if isinstance(row, dict)
+                and row.get("project_id") == project_id
+                and row.get("source_task_id") == reviewed_task_id
+                and row.get("target_task_id") == next_task_id
+                and row.get("state") not in {"failed", "owner_gate"}
+            ), None)
+            generation = (
+                int(prior_transition.get("generation") or 0)
+                if isinstance(prior_transition, dict)
+                else int(authority.get("generation") or 0) + 1
+            )
+            transition_id = (
+                str(prior_transition.get("transition_id"))
+                if isinstance(prior_transition, dict) and prior_transition.get("transition_id")
+                else transition_id_for(project_id, reviewed_task_id, next_task_id, generation)
+            )
+            transition = ledger["transitions"].setdefault(transition_id, {
+                "transition_id": transition_id,
+                "idempotency_key": transition_id,
+                "project_id": project_id,
+                "source_request_id": source_request_id,
+                "source_task_id": reviewed_task_id,
+                "target_task_id": next_task_id,
+                "generation": generation,
+                "state": "intent",
+                "recorded_at": utc_now_iso(),
+                "evidence": {
+                    "successor": successor_evidence or ("roadmap" if staged is not None else "repository_projection"),
+                    "reviewed_branch": reviewed_branch,
+                    "reviewed_head": reviewed_head,
+                },
+            })
+            source_owners = source_ownership_blockers(
+                project_id, reviewed_task_id, ledger,
+                planner_state if isinstance(planner_state, dict) else None,
+                reviewer_state if isinstance(reviewer_state, dict) else None,
+            )
+            reconciled_orphans = [
+                owner for owner in source_owners
+                if (
+                    # The accepted, fresh-truth review that is creating this
+                    # handoff validly transfers older pending review
+                    # obligations for the same task. Its branch/HEAD/status
+                    # anchors cover the aggregate repository result.
+                    owner.get("role") == "review_obligation"
+                    or (
+                        owner.get("role") == "reviewer"
+                        and owner.get("source_request_id")
+                        and owner.get("source_request_id") not in ledger["executions"]
+                    )
+                )
+            ]
+            blockers = [
+                owner for owner in source_owners
+                if str(owner.get("id") or "") != source_request_id
+                and owner not in reconciled_orphans
+            ]
+            if blockers:
+                transition["state"] = "waiting_source"
+                transition["ownership_blockers"] = copy.deepcopy(blockers)
+                transition["updated_at"] = utc_now_iso()
+                authority["current_task_id"] = reviewed_task_id
+                authority["active_transition_id"] = transition_id
+                authority["source_task_id"] = reviewed_task_id
+                authority["lifecycle_state"] = "REVIEWING"
+                authority["updated_at"] = utc_now_iso()
+                authority["recovery_epoch_id"] = epoch_for(authority)
+                self._save_ledger(ledger)
+                return False
             row: dict[str, Any] = {
                 "project_id": project_id, "source_request_id": source_request_id,
                 "source_kind": "decision", "task_id": reviewed_task_id,
+                "source_task_id": reviewed_task_id,
+                "target_task_id": next_task_id,
                 "next_task_id": next_task_id, "state": "handoff",
                 "outcome": "planning_required", "reason": reason,
                 "recorded_at": utc_now_iso(),
+                "lifecycle_transition_id": transition_id,
+                "transition_generation": generation,
+                "successor_evidence": successor_evidence or ("roadmap" if staged is not None else "repository_projection"),
                 # `handoff` is the successor activation work item.  The
                 # reviewed task itself is terminal at this point and must
                 # never be eligible for a new planner/Worker launch.
@@ -814,6 +1157,20 @@ class TransitionExecutor:
                 row["reviewed_head"] = reviewed_head
                 row["reviewed_ready"] = bool(reviewed_ready)
             ledger["executions"][source_request_id] = row
+            transition.update({
+                "source_request_id": source_request_id,
+                "state": "ready",
+                "ownership_blockers": [],
+                "handoff_record": copy.deepcopy(row),
+                "updated_at": utc_now_iso(),
+                "reconciled_orphan_owners": copy.deepcopy(reconciled_orphans),
+            })
+            authority["current_task_id"] = reviewed_task_id
+            authority["source_task_id"] = reviewed_task_id
+            authority["active_transition_id"] = transition_id
+            authority["lifecycle_state"] = "TRANSITIONING"
+            authority["updated_at"] = utc_now_iso()
+            authority["recovery_epoch_id"] = epoch_for(authority)
             self._save_ledger(ledger)
         if self._progress_channel is not None:
             self._progress_channel.emit(
@@ -821,6 +1178,7 @@ class TransitionExecutor:
                 task_id=next_task_id, occurrence_key=source_request_id,
                 details={"reason": reason, "previous_task_id": reviewed_task_id},
             )
+        return True
 
     def mark_handoff_consumed(
         self, source_request_id: str, continuation_id: str, plan_id: str,
@@ -834,6 +1192,25 @@ class TransitionExecutor:
             record["continuation_id"] = continuation_id
             record["plan_id"] = plan_id
             record["handoff_consumed_at"] = utc_now_iso()
+            transition_id = record.get("lifecycle_transition_id")
+            transition = ledger.setdefault("transitions", {}).get(transition_id)
+            if isinstance(transition, dict):
+                transition["state"] = "published"
+                transition["continuation_id"] = continuation_id
+                transition["plan_id"] = plan_id
+                transition["published_at"] = utc_now_iso()
+                transition["updated_at"] = transition["published_at"]
+            project_id = str(record.get("project_id") or "")
+            authority = ledger.setdefault("lifecycle", {}).get(project_id)
+            if isinstance(authority, dict):
+                authority["generation"] = int(record.get("transition_generation") or authority.get("generation") or 0)
+                authority["source_task_id"] = record.get("source_task_id") or record.get("task_id")
+                authority["current_task_id"] = record.get("target_task_id") or record.get("next_task_id")
+                authority["active_transition_id"] = transition_id
+                authority["lifecycle_state"] = "PLANNING"
+                authority["owner_gate"] = None
+                authority["updated_at"] = utc_now_iso()
+                authority["recovery_epoch_id"] = epoch_for(authority)
             self._save_ledger(ledger)
 
     def mark_handoff_blocked(self, source_request_id: str, reason: str) -> None:
@@ -845,6 +1222,11 @@ class TransitionExecutor:
             record["state"] = "blocked"
             record["reason"] = reason
             record["handoff_blocked_at"] = utc_now_iso()
+            transition = ledger.setdefault("transitions", {}).get(record.get("lifecycle_transition_id"))
+            if isinstance(transition, dict):
+                transition["state"] = "waiting_recovery"
+                transition["reason"] = reason
+                transition["updated_at"] = utc_now_iso()
             self._save_ledger(ledger)
 
     def _fresh_guard(
@@ -945,6 +1327,101 @@ class TransitionExecutor:
     def _project_context_for_worker(project: dict[str, Any]) -> tuple[str, Any]:
         from dev_orchestrator.core.project_context import context_prompt_block
         return context_prompt_block(project, "worker")
+
+    @staticmethod
+    def _lifecycle_launch_guard(
+        ledger: dict[str, Any], project_id: str, task_id: str,
+        source_task_id: str | None,
+    ) -> tuple[str | None, str | None]:
+        lifecycle = ledger.setdefault("lifecycle", {})
+        authority = lifecycle.get(project_id)
+        if not isinstance(authority, dict):
+            authority = new_authority(project_id, task_id, "READY_TO_RUN")
+            lifecycle[project_id] = authority
+        current_task = _non_blank_config(authority.get("current_task_id"))
+        if current_task is not None and current_task != task_id:
+            return source_task_id, (
+                "authoritative lifecycle task mismatch: "
+                f"current={current_task}, requested={task_id}"
+            )
+        if authority.get("owner_gate"):
+            return source_task_id, "authoritative lifecycle is stopped at OWNER_GATE"
+        if str(authority.get("lifecycle_state") or "").upper() == "PENDING_DESIGN":
+            return source_task_id, "PENDING_DESIGN task cannot launch a Worker"
+        lineage_source = _non_blank_config(source_task_id)
+        if lineage_source is None:
+            prior = _non_blank_config(authority.get("source_task_id"))
+            if prior is not None and prior != task_id:
+                lineage_source = prior
+        return lineage_source, None
+
+    def _migrate_legacy_handoff_authority(
+        self, ledger: dict[str, Any], project_id: str, target_task_id: str,
+    ) -> bool:
+        """Upgrade one terminal pre-P16.13 handoff at its first safe launch.
+
+        Old handoffs did not carry source/target/generation fields.  A completed
+        reviewer record plus the repository-selected target is sufficient only
+        when no execution is active and exactly one unapplied legacy handoff
+        exists.  The historical row is annotated, never replaced.
+        """
+        authority = ledger.setdefault("lifecycle", {}).get(project_id)
+        if not isinstance(authority, dict):
+            return False
+        source_task_id = _non_blank_config(authority.get("current_task_id"))
+        if source_task_id is None or source_task_id == target_task_id:
+            return False
+        if self._active_project(ledger, project_id):
+            return False
+        reviews_raw = read_json(self.runtime_root / "ai-reviewer.json", {})
+        reviews = reviews_raw.get("reviews") if isinstance(reviews_raw, dict) else {}
+        candidates = [
+            row for row in ledger.get("executions", {}).values()
+            if isinstance(row, dict)
+            and row.get("project_id") == project_id
+            and row.get("state") == "handoff"
+            and not row.get("lifecycle_transition_id")
+            and isinstance(reviews, dict)
+            and isinstance(reviews.get(str(row.get("source_request_id") or "")), dict)
+            and reviews[str(row.get("source_request_id") or "")].get("state") == "completed"
+        ]
+        if len(candidates) != 1:
+            return False
+        row = candidates[0]
+        generation = int(authority.get("generation") or 0) + 1
+        transition_id = transition_id_for(project_id, source_task_id, target_task_id, generation)
+        ledger.setdefault("transitions", {})[transition_id] = {
+            "transition_id": transition_id,
+            "idempotency_key": transition_id,
+            "project_id": project_id,
+            "source_request_id": row.get("source_request_id"),
+            "source_task_id": source_task_id,
+            "target_task_id": target_task_id,
+            "generation": generation,
+            "state": "completed",
+            "evidence": {"source": "legacy_terminal_handoff_migration"},
+            "recorded_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+        row.update({
+            "legacy_lifecycle_migrated": True,
+            "source_task_id": source_task_id,
+            "target_task_id": target_task_id,
+            "next_task_id": target_task_id,
+            "lifecycle_transition_id": transition_id,
+            "transition_generation": generation,
+        })
+        authority.update({
+            "generation": generation,
+            "source_task_id": source_task_id,
+            "current_task_id": target_task_id,
+            "active_transition_id": transition_id,
+            "lifecycle_state": "READY_TO_RUN",
+            "owner_gate": None,
+            "updated_at": utc_now_iso(),
+        })
+        authority["recovery_epoch_id"] = epoch_for(authority)
+        return True
 
     def _launch(
         self,
@@ -1050,6 +1527,18 @@ class TransitionExecutor:
                 else:
                     return None
             project_id = str(project["project_id"])
+            source_task_id, lifecycle_error = self._lifecycle_launch_guard(
+                ledger, project_id, task_id, source_task_id,
+            )
+            if lifecycle_error:
+                ledger["executions"][source_request_id] = {
+                    "project_id": project_id, "source_request_id": source_request_id,
+                    "source_kind": source_kind, "source_task_id": source_task_id,
+                    "task_id": task_id, "state": "blocked", "reason": lifecycle_error,
+                    "recorded_at": utc_now_iso(),
+                }
+                self._save_ledger(ledger)
+                return None
             barrier = self._launch_barrier_reason(project_id, source_kind)
             if barrier:
                 ledger["executions"][source_request_id] = {
@@ -1090,6 +1579,14 @@ class TransitionExecutor:
                 "context_digest": resolution.document.digest if resolution.document else None,
                 **(copy.deepcopy(lineage) if lineage else {}),
             }
+            authority = ledger["lifecycle"].get(project_id)
+            if isinstance(authority, dict):
+                authority["active_owner"] = {
+                    "role": "worker", "id": source_request_id, "task_id": task_id,
+                }
+                authority["lifecycle_state"] = "EXECUTING"
+                authority["updated_at"] = utc_now_iso()
+                authority["recovery_epoch_id"] = epoch_for(authority)
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])
 
@@ -1220,6 +1717,18 @@ class TransitionExecutor:
                     replayed_from_block = copy.deepcopy(existing)
                 else:
                     return None
+            source_task_id, lifecycle_error = self._lifecycle_launch_guard(
+                ledger, project_id, task_id, source_task_id,
+            )
+            if lifecycle_error:
+                ledger["executions"][source_request_id] = {
+                    "project_id": project_id, "source_request_id": source_request_id,
+                    "source_kind": source_kind, "source_task_id": source_task_id,
+                    "task_id": task_id, "state": "blocked", "reason": lifecycle_error,
+                    "recorded_at": utc_now_iso(),
+                }
+                self._save_ledger(ledger)
+                return None
             barrier = self._launch_barrier_reason(project_id, source_kind)
             if barrier:
                 ledger["executions"][source_request_id] = {
@@ -1262,6 +1771,14 @@ class TransitionExecutor:
                 **({"replayed_from_block": replayed_from_block} if replayed_from_block is not None else {}),
                 **(copy.deepcopy(lineage) if lineage else {}),
             }
+            authority = ledger["lifecycle"].get(project_id)
+            if isinstance(authority, dict):
+                authority["active_owner"] = {
+                    "role": "worker", "id": source_request_id, "task_id": task_id,
+                }
+                authority["lifecycle_state"] = "EXECUTING"
+                authority["updated_at"] = utc_now_iso()
+                authority["recovery_epoch_id"] = epoch_for(authority)
             self._save_ledger(ledger)
             status_record = copy.deepcopy(ledger["executions"][source_request_id])
 
@@ -1681,6 +2198,24 @@ class TransitionExecutor:
             if not isinstance(record, dict):
                 return
             record.update(changes)
+            authority = ledger.setdefault("lifecycle", {}).get(str(record.get("project_id") or ""))
+            if isinstance(authority, dict):
+                state = str(record.get("state") or "")
+                if state in _ACTIVE_STATES:
+                    authority["active_owner"] = {
+                        "role": "worker", "id": source_request_id,
+                        "task_id": record.get("task_id"),
+                    }
+                    authority["lifecycle_state"] = "EXECUTING"
+                elif state in _TERMINAL_STATES:
+                    owner = authority.get("active_owner")
+                    if not isinstance(owner, dict) or owner.get("id") == source_request_id:
+                        authority["active_owner"] = None
+                    authority["lifecycle_state"] = (
+                        "REVIEWING" if state == "completed" else "READY_TO_RUN"
+                    )
+                authority["updated_at"] = utc_now_iso()
+                authority["recovery_epoch_id"] = epoch_for(authority)
             self._save_ledger(ledger)
             status_record = copy.deepcopy(record)
         write_execution_status(status_record, self.runtime_root)
@@ -1693,6 +2228,62 @@ class TransitionExecutor:
             )
         except Exception:
             pass
+
+    def reconcile_successor_handoff(
+        self,
+        project: dict[str, Any],
+        snapshot: dict[str, Any],
+        *,
+        completed_task_id: str,
+        trigger: str,
+    ) -> dict[str, Any]:
+        """Idempotently restore one lost, unambiguous successor handoff."""
+        project_id = str(project.get("project_id") or "")
+        repo_path = project.get("repo_path") or ""
+        truth = read_repository_truth(repo_path)
+        if not truth.valid or truth.dirty:
+            return {"status": "blocked", "reason": "successor recovery requires clean repository"}
+        resolution = resolve_successor(repo_path, completed_task_id)
+        reconciled = False
+        if resolution.kind == "inconsistent":
+            outcome = reconcile_roadmap_successor(repo_path, completed_task_id, resolution)
+            if outcome.status not in {"applied", "already_consistent"}:
+                return {"status": "blocked", "reason": outcome.reason}
+            reconciled = True
+            truth = read_repository_truth(repo_path)
+            resolution = resolve_successor(repo_path, completed_task_id)
+        if resolution.kind != "successor" or not resolution.successor_task_id:
+            return {
+                "status": "conflict" if resolution.kind == "ambiguous" else "blocked",
+                "reason": resolution.reason or resolution.kind,
+            }
+        request_id = (
+            f"recover-handoff:{project_id}:{completed_task_id}:"
+            f"{resolution.successor_task_id}:{truth.head[:12]}"
+        )
+        with self._lock:
+            existing = self._load_ledger()["executions"].get(request_id)
+            if isinstance(existing, dict):
+                return {
+                    "status": "noop", "source_request_id": request_id,
+                    "successor_task_id": resolution.successor_task_id,
+                }
+        applied = self._record_handoff(
+            request_id, project_id, completed_task_id,
+            str(resolution.successor_task_id),
+            f"{trigger}: recovered missing successor handoff",
+            staged=resolution,
+            reviewed_branch=truth.branch,
+            reviewed_head=truth.head,
+            reviewed_ready=False,
+            successor_evidence="reconciled" if reconciled else resolution.evidence,
+        )
+        return {
+            "status": "applied" if applied else "blocked",
+            "source_request_id": request_id,
+            "successor_task_id": resolution.successor_task_id,
+            "reason": None if applied else "source-task lifecycle ownership is not terminal",
+        }
 
     def reconcile_execution_loss(
         self,
@@ -2507,18 +3098,58 @@ class TransitionExecutor:
                     _task_marked_complete(snapshot) or reviewed_current_ready
                 ):
                     repo_dir = project.get("repo_path") or ""
-                    rm_res = read_successor(repo_dir, task_id)
-                    if rm_res.kind == "invalid":
+                    successor = resolve_successor(repo_dir, task_id)
+                    if successor.kind in {"invalid", "ambiguous"}:
                         self._record_blocked(
                             request_id, project_id,
-                            f"staged roadmap invalid: {rm_res.reason}",
+                            "ROADMAP_SUCCESSOR_INCONSISTENT: staged roadmap invalid: "
+                            f"{successor.reason}",
                             task_id=task_id, source_kind="decision",
                         )
                         continue
+                    reconciled_head: str | None = None
+                    if successor.kind == "inconsistent":
+                        if self._progress_channel is not None:
+                            self._progress_channel.emit(
+                                {"project_id": project_id}, "ROADMAP_SUCCESSOR_INCONSISTENT",
+                                task_id=task_id, occurrence_key=f"{request_id}:successor-inconsistent",
+                                details={"reason": successor.reason, "successor": successor.successor_task_id},
+                            )
+                        outcome = reconcile_roadmap_successor(repo_dir, task_id, successor)
+                        if outcome.status not in {"applied", "already_consistent"}:
+                            # Dirty-worktree and other transient failures must not
+                            # terminally consume the accepted NEXT decision.
+                            if self._progress_channel is not None:
+                                self._progress_channel.emit(
+                                    {"project_id": project_id}, "BLOCKED",
+                                    task_id=task_id, occurrence_key=request_id,
+                                    details={
+                                        "code": "ROADMAP_SUCCESSOR_INCONSISTENT",
+                                        "reason": outcome.reason,
+                                        "retryable": "clean repository" in str(outcome.reason or ""),
+                                    },
+                                )
+                            continue
+                        reconciled_head = outcome.head
+                        if self._progress_channel is not None:
+                            self._progress_channel.emit(
+                                {"project_id": project_id}, "SUCCESSOR_RECONCILED",
+                                task_id=task_id, occurrence_key=f"{request_id}:successor-reconciled",
+                                details={"successor": outcome.successor_task_id, "head": outcome.head},
+                            )
+                        successor = resolve_successor(repo_dir, task_id)
+                        if successor.kind != "successor":
+                            self._record_blocked(
+                                request_id, project_id,
+                                "ROADMAP_SUCCESSOR_INCONSISTENT: reconciliation did not converge",
+                                task_id=task_id, source_kind="decision",
+                            )
+                            continue
                     truth = read_repository_truth(repo_dir)
                     reviewed_hash = _non_blank_config(record.get("review_status_hash"))
                     if (
-                        not truth.valid or truth.branch != branch or truth.head != head
+                        not truth.valid or truth.branch != branch
+                        or (truth.head != head and truth.head != reconciled_head)
                         or truth.dirty or (reviewed_hash is not None and truth.status_hash != reviewed_hash)
                     ):
                         self._record_blocked(
@@ -2526,15 +3157,18 @@ class TransitionExecutor:
                             "reviewed task repository truth changed before terminal settle",
                             task_id=task_id, source_kind="decision",
                         )
-                    elif rm_res.kind == "successor":
+                    elif successor.kind == "successor":
                         self._record_handoff(
                             request_id, project_id, task_id,
-                            str(rm_res.successor_task_id),
+                            str(successor.successor_task_id),
                             "staged roadmap specifies successor task; planner handoff required",
-                            staged=rm_res,
+                            staged=successor,
                             reviewed_branch=truth.branch,
                             reviewed_head=truth.head,
                             reviewed_ready=reviewed_current_ready,
+                            successor_evidence=(
+                                "reconciled" if reconciled_head else successor.evidence
+                            ),
                         )
                     else:
                         reason = (
@@ -2568,6 +3202,7 @@ class TransitionExecutor:
                         self._record_handoff(
                             request_id, project_id, task_id, current_task,
                             "reviewed task advanced to a PENDING DESIGN task; planner handoff required",
+                            successor_evidence="repository_projection",
                         )
                     continue
                 next_snapshot = snapshot
@@ -2630,6 +3265,7 @@ class TransitionExecutor:
     def start_control(
         self, project: dict[str, Any], snapshot: dict[str, Any], source_request_id: str,
         *, exact_remediation_only: bool = False, lineage: Optional[dict[str, Any]] = None,
+        source_task_id: Optional[str] = None,
     ) -> Optional[ActuationLaunch]:
         """Start the current executable task for one stateless owner continue command."""
         project_id = str(project.get("project_id") or "")
@@ -2825,9 +3461,16 @@ class TransitionExecutor:
                                 "recovery_reason": "watchdog execution loss recovery",
                             }
                         break
+        with self._lock:
+            current_ledger = self._load_ledger()
+            if self._migrate_legacy_handoff_authority(
+                current_ledger, project_id, launch_task,
+            ):
+                self._save_ledger(current_ledger)
         return self._launch(
             project, source_request_id=source_request_id, source_kind="control",
-            task_id=launch_task, source_task_id=None, branch=truth.branch, head=truth.head,
+            task_id=launch_task, source_task_id=source_task_id,
+            branch=truth.branch, head=truth.head,
             worker_prompt=str(policy["worker_prompt"]), policy=policy,
             lineage=lineage,
         )
@@ -2882,8 +3525,14 @@ class TransitionExecutor:
                 ledger = self._load_ledger()
                 if self._active_project(ledger, project_id):
                     continue
-                rm_res = read_successor(repo_dir, current_task)
-                successor_id = str(rm_res.successor_task_id) if rm_res.kind == "successor" else None
+                successor = resolve_successor(repo_dir, current_task)
+                if successor.kind == "inconsistent":
+                    outcome = reconcile_roadmap_successor(repo_dir, current_task, successor)
+                    if outcome.status not in {"applied", "already_consistent"}:
+                        continue
+                    truth = read_repository_truth(repo_dir)
+                    successor = resolve_successor(repo_dir, current_task)
+                successor_id = str(successor.successor_task_id) if successor.kind == "successor" else None
                 has_handoff_or_settled = any(
                     rec.get("project_id") == project_id
                     and (
@@ -2925,7 +3574,7 @@ class TransitionExecutor:
                     # is strictly governed by accepted technical review decisions via
                     # _advance_decisions; auto-handoff must never bypass mandatory review.
                     continue
-            if rm_res.kind == "successor":
+            if successor.kind == "successor":
                 request_id = f"auto-handoff:{current_task}:{truth.head[:12]}"
                 with self._lock:
                     if request_id in self._load_ledger()["executions"]:
@@ -2934,14 +3583,15 @@ class TransitionExecutor:
                     request_id,
                     project_id,
                     current_task,
-                    str(rm_res.successor_task_id),
+                    str(successor.successor_task_id),
                     "predecessor task marked complete; planner handoff required for successor",
-                    staged=rm_res,
+                    staged=successor,
                     reviewed_branch=truth.branch,
                     reviewed_head=truth.head,
                     reviewed_ready=False,
+                    successor_evidence=successor.evidence,
                 )
-            elif rm_res.kind == "settled":
+            elif successor.kind == "end_of_roadmap":
                 request_id = f"auto-settled:{current_task}:{truth.head[:12]}"
                 with self._lock:
                     if request_id in self._load_ledger()["executions"]:

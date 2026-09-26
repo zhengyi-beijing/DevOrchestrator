@@ -273,3 +273,19 @@ Watchdog emits notifications tagged with `details.source = "watchdog"` and stabl
 ## 11. Self-Healing Project Activation & Watchdog Handoff
 
 For watchdog coordination with daemon self-healing and recovery handoffs under active execution intents without fabricating owner gates, see [P16.7 Self-Healing Project Activation & Readiness Contract](P16_7_SELF_HEALING_ACTIVATION_CONTRACT.md).
+
+## 12. P16.13 Lifecycle Invariant Validation
+
+Watchdog evaluates the centralized lifecycle invariant set from
+`core.lifecycle_authority`; it does not infer or publish a current task. The
+durable authority and transition journal live in `transition-executor.json`.
+`NEXT_TASK_WITHOUT_HANDOFF` is the sole automatically repairable successor
+violation: Watchdog invokes the executor's idempotent handoff reconciliation,
+records the attempt, and remains silent after convergence. Dirty repositories
+wait for a later clean tick. Contradictory ownership, invalid lineage, and
+repeated non-transient recovery failures emit a real `OWNER_GATE`.
+
+Recovery epoch evidence includes the lifecycle generation and active transition
+identity, so attempts from an earlier authority boundary cannot poison the new
+one. The complete protocol is defined in
+[P16.13 Successor Consistency and Zero-Touch Handoff Contract](P16_13_SUCCESSOR_CONSISTENCY_CONTRACT.md).

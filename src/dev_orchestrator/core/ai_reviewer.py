@@ -5,6 +5,8 @@ import copy
 import hashlib
 import datetime as dt
 import json
+import re
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -37,6 +39,8 @@ _ACTIVE_STATES = frozenset({"launching", "running"})
 _TERMINAL_STATES = frozenset({"completed", "failed", "recovery_required"})
 _DEFAULT_MAX_REMEDIATION_ROUNDS = 2
 _MAX_REMEDIATION_ROUNDS = 5
+_DEFAULT_MAX_REMEDIATION_EXTENSIONS = 1
+_DEFAULT_MAX_EXTENSION_FINDINGS = 3
 #: States a daemon restart must resolve. ``recovery_required`` is no longer
 #: produced by this coordinator, but records written by an earlier daemon are
 #: picked up here so legacy state is migrated to a retry-eligible outcome
@@ -132,22 +136,60 @@ def _review_policy(project: dict[str, Any]) -> tuple[dict[str, Any] | None, str]
         or not 1 <= max_rounds <= _MAX_REMEDIATION_ROUNDS
     ):
         return None, "reviewer max_remediation_rounds must be an integer from 1 to 5"
+    max_extensions = raw.get("max_remediation_extensions", _DEFAULT_MAX_REMEDIATION_EXTENSIONS)
+    if isinstance(max_extensions, bool) or not isinstance(max_extensions, int) or not 0 <= max_extensions <= 1:
+        return None, "reviewer max_remediation_extensions must be 0 or 1"
+    max_extension_findings = raw.get("max_extension_findings", _DEFAULT_MAX_EXTENSION_FINDINGS)
+    if (
+        isinstance(max_extension_findings, bool)
+        or not isinstance(max_extension_findings, int)
+        or not 1 <= max_extension_findings <= 5
+    ):
+        return None, "reviewer max_extension_findings must be an integer from 1 to 5"
     return {
         "quality": quality,
         "independence": independence,
         "timeout_seconds": float(timeout),
         "max_remediation_rounds": max_rounds,
+        "max_remediation_extensions": max_extensions,
+        "max_extension_findings": max_extension_findings,
     }, ""
 
 
-def _parse_review_output(text: str | None) -> tuple[str, str, str]:
+def _parse_review_output_with_findings(
+    text: str | None,
+) -> tuple[str, str, str, tuple[dict[str, str], ...]]:
     payload = extract_unique_json_object(text, label="reviewer")
-    require_exact_keys(payload, {"decision", "next_action", "reason"}, label="reviewer")
+    require_exact_keys(
+        payload, {"decision", "next_action", "reason"},
+        label="reviewer", optional={"findings"},
+    )
     decision = _nonblank(payload.get("decision"))
     next_action = _nonblank(payload.get("next_action"))
     reason = _nonblank(payload.get("reason"))
     if (decision, next_action) not in _ALLOWED_DECISIONS or reason is None:
         raise StructuredOutputError("semantic", "invalid reviewer decision")
+    findings: list[dict[str, str]] = []
+    raw_findings = payload.get("findings")
+    if isinstance(raw_findings, list):
+        for item in raw_findings:
+            if not isinstance(item, dict):
+                findings = []
+                break
+            normalized = {
+                key: str(item.get(key) or "").strip()
+                for key in ("file", "summary", "fix", "regression_test")
+            }
+            if not all(normalized.values()):
+                findings = []
+                break
+            findings.append(normalized)
+    return decision, next_action, reason, tuple(findings)
+
+
+def _parse_review_output(text: str | None) -> tuple[str, str, str]:
+    """Preserve the established parser contract for external/test callers."""
+    decision, next_action, reason, _findings = _parse_review_output_with_findings(text)
     return decision, next_action, reason
 
 
@@ -806,26 +848,137 @@ class AIReviewerCoordinator:
     def _apply_remediation_budget(
         self, review_id: str, project_id: str, task_id: str,
         decision: str, next_action: str, reason: str, max_rounds: int,
-    ) -> tuple[str, str, str, int]:
+        *, findings: tuple[dict[str, str], ...] = (),
+        max_extensions: int = _DEFAULT_MAX_REMEDIATION_EXTENSIONS,
+        max_extension_findings: int = _DEFAULT_MAX_EXTENSION_FINDINGS,
+    ) -> tuple[str, str, str, int, bool]:
         """Fail closed to owner judgment when technical remediation is exhausted."""
         depth, lineage_error = self._technical_remediation_depth(review_id, project_id, task_id)
         if decision != "remediate":
-            return decision, next_action, reason, depth
+            return decision, next_action, reason, depth, False
         if lineage_error is not None:
             return (
                 "owner_gate", "stop",
                 "technical review remediation lineage is not safely recoverable: "
                 + lineage_error + "; unresolved reviewer finding: " + reason,
-                depth,
+                depth, False,
             )
         if depth >= max_rounds:
+            with self._lock:
+                current = self._load_state()["reviews"].get(review_id, {})
+            if isinstance(current, dict) and current.get("remediation_extension_granted") is True:
+                return decision, next_action, reason, depth, True
+            grants, prior_fingerprints = self._remediation_extension_history(
+                review_id, project_id, task_id,
+            )
+            eligible, eligibility_reason, fingerprints = self._remediation_extension_eligible(
+                review_id, project_id, task_id, findings,
+                max_extension_findings=max_extension_findings,
+                prior_fingerprints=prior_fingerprints,
+            )
+            if max_extensions > grants and eligible:
+                granted_at = utc_now_iso()
+                with self._lock:
+                    state = self._load_state()
+                    row = state["reviews"].get(review_id)
+                    if isinstance(row, dict):
+                        row.update({
+                            "remediation_extension_granted": True,
+                            "remediation_extension_granted_at": granted_at,
+                            "remediation_extension_review_id": review_id,
+                            "remediation_extension_finding_fingerprints": list(fingerprints),
+                        })
+                        self._save_state(state)
+                return (
+                    decision, next_action,
+                    f"bounded remediation extension granted after normal budget ({depth} >= {max_rounds}): " + reason,
+                    depth, True,
+                )
             return (
                 "owner_gate", "stop",
                 f"technical review remediation budget exhausted ({depth} >= {max_rounds}); "
+                "bounded extension ineligible or exhausted (" + eligibility_reason + "); "
                 "unresolved blocking finding requires owner disposition: " + reason,
-                depth,
+                depth, False,
             )
-        return decision, next_action, reason, depth
+        return decision, next_action, reason, depth, False
+
+    def _remediation_extension_history(
+        self, review_id: str, project_id: str, task_id: str,
+    ) -> tuple[int, set[str]]:
+        transitions = self._transition_records()
+        with self._lock:
+            reviews = self._load_state()["reviews"]
+        grants = 0
+        fingerprints: set[str] = set()
+        cursor = review_id
+        seen: set[str] = set()
+        while cursor and cursor not in seen:
+            seen.add(cursor)
+            review = reviews.get(cursor)
+            if not isinstance(review, dict):
+                break
+            if review.get("project_id") != project_id or review.get("task_id") != task_id:
+                break
+            if review.get("remediation_extension_granted") is True:
+                grants += 1
+                fingerprints.update(str(value) for value in (review.get("remediation_extension_finding_fingerprints") or []))
+            source_id = _nonblank(review.get("source_request_id"))
+            worker = transitions.get(source_id) if source_id else None
+            if not isinstance(worker, dict) or worker.get("source_kind") != "remediation":
+                break
+            cursor = _nonblank(worker.get("review_decision_id")) or ""
+        return grants, fingerprints
+
+    def _remediation_extension_eligible(
+        self,
+        review_id: str,
+        project_id: str,
+        task_id: str,
+        findings: tuple[dict[str, str], ...],
+        *,
+        max_extension_findings: int,
+        prior_fingerprints: set[str],
+    ) -> tuple[bool, str, tuple[str, ...]]:
+        if not findings:
+            return False, "explicit structured findings are absent", ()
+        if len(findings) > max_extension_findings:
+            return False, "finding count exceeds bounded extension limit", ()
+        with self._lock:
+            review = self._load_state()["reviews"].get(review_id, {})
+        transitions = self._transition_records()
+        worker = transitions.get(_nonblank(review.get("source_request_id")) or "") if isinstance(review, dict) else None
+        repo_path = _nonblank(review.get("repo_path")) if isinstance(review, dict) else None
+        if repo_path is None and isinstance(worker, dict):
+            repo_path = _nonblank(worker.get("repo_path"))
+        launch_head = _nonblank(worker.get("head")) if isinstance(worker, dict) else None
+        review_head = _nonblank(review.get("head")) if isinstance(review, dict) else None
+        if repo_path is None or launch_head is None or review_head is None:
+            return False, "reviewed diff identity is incomplete", ()
+        diff = subprocess.run(
+            ["git", "-C", repo_path, "diff", "--name-only", launch_head, review_head],
+            check=False, capture_output=True, text=True,
+        )
+        if diff.returncode != 0:
+            return False, "reviewed diff is unavailable", ()
+        changed = {line.strip().replace("\\", "/") for line in diff.stdout.splitlines() if line.strip()}
+        fingerprints: list[str] = []
+        for finding in findings:
+            path = str(finding.get("file") or "").strip().replace("\\", "/")
+            if not path or path not in changed:
+                return False, f"finding is not localized to reviewed diff: {path or '<missing>'}", ()
+            if path == "agent/staged/roadmap.json" or path.startswith("agent/staged/"):
+                return False, "finding expands lifecycle task scope", ()
+            text = " ".join(str(finding.get(key) or "") for key in ("summary", "fix", "regression_test"))
+            mentioned = {value.upper() for value in re.findall(r"\bP\d+(?:\.\d+)*\b", text, re.IGNORECASE)}
+            if any(value != task_id.upper() for value in mentioned):
+                return False, "finding references a different task scope", ()
+            canonical = json.dumps(finding, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+            if fingerprint in prior_fingerprints:
+                return False, "finding fingerprint already consumed an extension", ()
+            fingerprints.append(fingerprint)
+        return True, "eligible", tuple(fingerprints)
 
     @staticmethod
     def _project_map(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -862,6 +1015,8 @@ class AIReviewerCoordinator:
                     "independence": "resource",
                     "timeout_seconds": 600.0,
                     "max_remediation_rounds": _DEFAULT_MAX_REMEDIATION_ROUNDS,
+                    "max_remediation_extensions": _DEFAULT_MAX_REMEDIATION_EXTENSIONS,
+                    "max_extension_findings": _DEFAULT_MAX_EXTENSION_FINDINGS,
                 }
                 policy["harness"] = True
                 if harness_cfg.get("timeout_seconds"):
@@ -973,6 +1128,8 @@ class AIReviewerCoordinator:
                     "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                     "failure_environment": environment_for_project(proj_dict),
                     "max_remediation_rounds": policy["max_remediation_rounds"],
+                    "max_remediation_extensions": policy["max_remediation_extensions"],
+                    "max_extension_findings": policy["max_extension_findings"],
                 },
             )
             self._launch_review(
@@ -1069,6 +1226,8 @@ class AIReviewerCoordinator:
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 "failure_environment": environment_for_project(project),
                 "max_remediation_rounds": policy["max_remediation_rounds"],
+                "max_remediation_extensions": policy["max_remediation_extensions"],
+                "max_extension_findings": policy["max_extension_findings"],
                 "reconcile_of": target["target_id"],
             },
         )
@@ -1123,6 +1282,7 @@ class AIReviewerCoordinator:
             working_directory=Path(repo_path), quality=policy["quality"], independence=policy["independence"], previous_resource_context=previous,
             timeout_seconds=policy["timeout_seconds"], metadata={"worker_source_request_id": source_id, "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
             "failure_environment": environment_for_project(project), "max_remediation_rounds": policy["max_remediation_rounds"],
+            "max_remediation_extensions": policy["max_remediation_extensions"], "max_extension_findings": policy["max_extension_findings"],
             "rereview_of": target["target_id"]})
         self._launch_review(review_id, source_id, request, truth, conversation_binding=binding, resolution=resolution)
         if target.get("kind") == "next":
@@ -1210,6 +1370,8 @@ class AIReviewerCoordinator:
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 "failure_environment": environment_for_project(project),
                 "max_remediation_rounds": policy["max_remediation_rounds"],
+                "max_remediation_extensions": policy["max_remediation_extensions"],
+                "max_extension_findings": policy["max_extension_findings"],
                 "retry_of": target["target_id"],
             },
         )
@@ -1294,6 +1456,8 @@ class AIReviewerCoordinator:
                     "independence": "resource",
                     "timeout_seconds": 600.0,
                     "max_remediation_rounds": _DEFAULT_MAX_REMEDIATION_ROUNDS,
+                    "max_remediation_extensions": _DEFAULT_MAX_REMEDIATION_EXTENSIONS,
+                    "max_extension_findings": _DEFAULT_MAX_EXTENSION_FINDINGS,
                 }
 
         harness_cfg = proj_dict.get("reviewer_harness")
@@ -1369,6 +1533,8 @@ class AIReviewerCoordinator:
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 "failure_environment": environment_for_project(proj_dict),
                 "max_remediation_rounds": policy.get("max_remediation_rounds", _DEFAULT_MAX_REMEDIATION_ROUNDS),
+                "max_remediation_extensions": policy.get("max_remediation_extensions", _DEFAULT_MAX_REMEDIATION_EXTENSIONS),
+                "max_extension_findings": policy.get("max_extension_findings", _DEFAULT_MAX_EXTENSION_FINDINGS),
                 "failover_record_id": failover_record_id,
             },
         )
@@ -1395,7 +1561,7 @@ class AIReviewerCoordinator:
             "Review only; do not modify files, commit, push, or start another Worker. "
             "Inspect the repository, current diff/status, task evidence, tests, and acceptance criteria. "
             "Return exactly one JSON object and no markdown or extra text, with exactly these keys: "
-            '{"decision":"next|remediate|owner_gate|stop","next_action":"next_task|continue_current_stage|stop","reason":"..."}. '
+            '{"decision":"next|remediate|owner_gate|stop","next_action":"next_task|continue_current_stage|stop","reason":"...","findings":[{"file":"path","summary":"...","fix":"...","regression_test":"test_name"}]}. '
             "Allowed pairs are next/next_task, remediate/continue_current_stage, owner_gate/stop, stop/stop. "
             "Use next only when the reviewed task is actually complete and repository evidence supports advancing. "
             "Use remediate for bounded fixable gaps in this reviewed task; owner_gate only when owner input is genuinely required.\n\n"
@@ -1786,8 +1952,16 @@ class AIReviewerCoordinator:
 
         policy = rec.get("policy") if isinstance(rec.get("policy"), dict) else {}
         max_rounds = int(policy.get("max_remediation_rounds", _DEFAULT_MAX_REMEDIATION_ROUNDS))
-        decision, next_action, reason, remediation_round = self._apply_remediation_budget(
-            review_id, project_id, task_id, decision, next_action, reason, max_rounds
+        decision, next_action, reason, remediation_round, extension_granted = self._apply_remediation_budget(
+            review_id, project_id, task_id, decision, next_action, reason, max_rounds,
+            findings=tuple({
+                "file": finding.file,
+                "summary": finding.message,
+                "fix": f"resolve {finding.rule_id}",
+                "regression_test": f"regression for {finding.rule_id}",
+            } for finding in blocking_findings),
+            max_extensions=int(policy.get("max_remediation_extensions", _DEFAULT_MAX_REMEDIATION_EXTENSIONS)),
+            max_extension_findings=int(policy.get("max_extension_findings", _DEFAULT_MAX_EXTENSION_FINDINGS)),
         )
         disposition = _DECISION_DISPOSITIONS[(decision, next_action)]
 
@@ -1853,6 +2027,7 @@ class AIReviewerCoordinator:
                 "blocking_count": len(blocking_findings),
                 "remediation_round": remediation_round,
                 "max_remediation_rounds": max_rounds,
+                "remediation_extension_granted": extension_granted,
             }
         )
 
@@ -2017,6 +2192,7 @@ class AIReviewerCoordinator:
                 "project_id": request.project_id,
                 "source_request_id": source_request_id,
                 "task_id": request.task_run_id,
+                "repo_path": str(request.working_directory),
                 "branch": truth.branch,
                 "head": truth.head,
                 "review_status_hash": truth.status_hash,
@@ -2142,7 +2318,7 @@ class AIReviewerCoordinator:
         return protocol_repair_prompt(
             raw_output=raw_output,
             failure=failure,
-            schema_example='{"decision":"next|remediate|owner_gate|stop","next_action":"next_task|continue_current_stage|stop","reason":"..."}',
+            schema_example='{"decision":"next|remediate|owner_gate|stop","next_action":"next_task|continue_current_stage|stop","reason":"...","findings":[{"file":"path","summary":"...","fix":"...","regression_test":"test_name"}]}',
             label="technical reviewer",
         )
 
@@ -2332,7 +2508,7 @@ class AIReviewerCoordinator:
             raw_output = result.output if isinstance(result.output, str) else ""
             self._capture_reviewer_output(review_id, current_request, result)
             try:
-                parsed_review = _parse_review_output(raw_output)
+                parsed_review = _parse_review_output_with_findings(raw_output)
             except StructuredOutputError as protocol_exc:
                 if protocol_exc.stage not in {"extract", "schema"}:
                     extra_semantic: dict[str, Any] = {}
@@ -2369,7 +2545,7 @@ class AIReviewerCoordinator:
                     )
                 if repair_result is not None and repair_result.status == "succeeded":
                     try:
-                        parsed_review = _parse_review_output(repair_result.output)
+                        parsed_review = _parse_review_output_with_findings(repair_result.output)
                         result = repair_result
                     except StructuredOutputError:
                         parsed_review = None
@@ -2395,7 +2571,7 @@ class AIReviewerCoordinator:
         if parsed_review is None:
             self._finish_result(review_id, result, "failed", "reviewer structured output unavailable", **extra)
             return
-        decision, next_action, reason = parsed_review
+        decision, next_action, reason, findings = parsed_review
         with self._lock:
             record = self._load_state()["reviews"].get(review_id, {})
         repo = read_repository_truth(request.working_directory)
@@ -2410,13 +2586,24 @@ class AIReviewerCoordinator:
         max_rounds = request.metadata.get("max_remediation_rounds", _DEFAULT_MAX_REMEDIATION_ROUNDS)
         if isinstance(max_rounds, bool) or not isinstance(max_rounds, int):
             max_rounds = _DEFAULT_MAX_REMEDIATION_ROUNDS
-        decision, next_action, reason, remediation_round = self._apply_remediation_budget(
+        max_extensions = request.metadata.get("max_remediation_extensions", _DEFAULT_MAX_REMEDIATION_EXTENSIONS)
+        max_extension_findings = request.metadata.get("max_extension_findings", _DEFAULT_MAX_EXTENSION_FINDINGS)
+        if isinstance(max_extensions, bool) or not isinstance(max_extensions, int):
+            max_extensions = _DEFAULT_MAX_REMEDIATION_EXTENSIONS
+        if isinstance(max_extension_findings, bool) or not isinstance(max_extension_findings, int):
+            max_extension_findings = _DEFAULT_MAX_EXTENSION_FINDINGS
+        decision, next_action, reason, remediation_round, extension_granted = self._apply_remediation_budget(
             review_id, request.project_id, request.task_run_id,
             decision, next_action, reason, max_rounds,
+            findings=findings,
+            max_extensions=max_extensions,
+            max_extension_findings=max_extension_findings,
         )
         disposition = _DECISION_DISPOSITIONS[(decision, next_action)]
         extra["remediation_round"] = remediation_round
         extra["max_remediation_rounds"] = max_rounds
+        extra["review_findings"] = list(findings)
+        extra["remediation_extension_granted"] = extension_granted
         try:
             self._write_decision(
                 review_id=review_id,

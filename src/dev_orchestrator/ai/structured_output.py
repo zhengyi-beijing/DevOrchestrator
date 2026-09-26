@@ -101,12 +101,17 @@ def extract_unique_json_object(text: str | None, *, label: str = "AI") -> dict[s
     return payload
 
 
-def require_exact_keys(payload: dict[str, Any], keys: Iterable[str], *, label: str) -> None:
+def require_exact_keys(
+    payload: dict[str, Any], keys: Iterable[str], *, label: str,
+    optional: Iterable[str] = (),
+) -> None:
     expected = set(keys)
-    if set(payload) != expected:
+    allowed = expected | set(optional)
+    if not expected.issubset(payload) or not set(payload).issubset(allowed):
         raise StructuredOutputError(
             "schema",
-            f"{label} JSON must contain exactly {', '.join(sorted(expected))}",
+            f"{label} JSON must contain {', '.join(sorted(expected))}"
+            + (f" and may contain {', '.join(sorted(set(optional)))}" if optional else ""),
         )
 
 

@@ -526,6 +526,9 @@ def resolve_recovery_epoch(
         if te_file.is_file():
             exec_state = read_json(te_file, {})
 
+    authorities = exec_state.get("lifecycle") if isinstance(exec_state, dict) else {}
+    authority = authorities.get(project_id) if isinstance(authorities, dict) else None
+
     evidence = {
         "project_id": project_id,
         "task_id": task_id,
@@ -535,6 +538,11 @@ def resolve_recovery_epoch(
         "control_id": control_id,
         "execution_id": _active_execution_id(snapshot, exec_state),
     }
+    if isinstance(authority, dict):
+        # Extend the existing recovery epoch with the authoritative lifecycle
+        # boundary instead of maintaining an unrelated generation mechanism.
+        evidence["lifecycle_generation"] = authority.get("generation")
+        evidence["lifecycle_transition_id"] = authority.get("active_transition_id")
     raw = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return {"id": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16], "evidence": evidence}
 
@@ -1648,6 +1656,90 @@ class WatchdogCoordinator:
                 if degraded or pid in quarantined or not policy["enabled"]:
                     results.append({"project_id": pid, "status": "skipped", "reason": "degraded_or_quarantined_or_disabled"})
                     continue
+
+                # P16.13: every lifecycle path consumes the same invariant
+                # evaluator. Watchdog is a validator/recovery actuator, never a
+                # competing task authority.
+                try:
+                    from dev_orchestrator.core.lifecycle_authority import (
+                        evaluate_lifecycle_invariants,
+                        invariant_payload,
+                    )
+                    planner_obj = planner or self.planner
+                    reviewer_obj = reviewer or self.reviewer
+                    planner_fn = getattr(planner_obj, "state", None)
+                    reviewer_fn = getattr(reviewer_obj, "state", None)
+                    decisions_state = read_json(self.runtime_root / "review-decisions.json", {})
+                    lifecycle_findings = evaluate_lifecycle_invariants(
+                        snapshot=snapshot,
+                        executor_state=executor_state or {},
+                        planner_state=planner_fn() if callable(planner_fn) else None,
+                        reviewer_state=reviewer_fn() if callable(reviewer_fn) else None,
+                        decisions_state=decisions_state,
+                    )
+                    prow["lifecycle_invariants"] = invariant_payload(lifecycle_findings)
+                    violations = [finding for finding in lifecycle_findings if not finding.holds]
+                    prow["unresolved_invariants"] = [finding.code for finding in violations]
+                    for finding in violations:
+                        evidence_raw = json.dumps(finding.evidence, sort_keys=True, default=str)
+                        occurrence = hashlib.sha256(
+                            (pid + "|" + finding.code + "|" + evidence_raw).encode("utf-8")
+                        ).hexdigest()[:16]
+                        self._emit_milestone(
+                            pid, "LIFECYCLE_INVARIANT_VIOLATION",
+                            task_id=(snapshot.get("telemetry") or {}).get("task_id")
+                            if isinstance(snapshot.get("telemetry"), dict) else None,
+                            occurrence_key=f"{finding.code}:{occurrence}",
+                            details={
+                                "code": finding.code,
+                                "recoverable": finding.recoverable,
+                                "reason": finding.reason,
+                                "evidence": finding.evidence,
+                            },
+                        )
+                        if finding.code == "NEXT_TASK_WITHOUT_HANDOFF" and finding.recoverable:
+                            decisions = finding.evidence.get("next_decisions") or []
+                            source_task_id = str(decisions[0].get("task_id") or "") if decisions else ""
+                            if source_task_id and executor is not None and hasattr(executor, "reconcile_successor_handoff"):
+                                recovery = executor.reconcile_successor_handoff(
+                                    pcfg, snapshot,
+                                    completed_task_id=source_task_id,
+                                    trigger="watchdog NEXT_TASK_WITHOUT_HANDOFF",
+                                )
+                                key = f"{source_task_id}:{(snapshot.get('git') or {}).get('head') if isinstance(snapshot.get('git'), dict) else ''}"
+                                attempts = prow.setdefault("lifecycle_recovery_attempts", {})
+                                if recovery.get("status") in {"applied", "noop"}:
+                                    attempts[key] = {"count": 1, "state": "recovered", "result": recovery}
+                                else:
+                                    prior = attempts.get(key) if isinstance(attempts.get(key), dict) else {}
+                                    count = int(prior.get("count") or 0) + 1
+                                    attempts[key] = {"count": count, "state": "failed", "result": recovery}
+                                    if count >= 2 and "clean repository" not in str(recovery.get("reason") or ""):
+                                        prow["owner_gate"] = {
+                                            "state": "owner_gate",
+                                            "reason": "repeated lifecycle recovery failure",
+                                            "code": finding.code,
+                                            "recorded_at": now_iso,
+                                        }
+                                        self._emit_milestone(
+                                            pid, "OWNER_GATE", task_id=source_task_id,
+                                            occurrence_key=f"lifecycle:{finding.code}:{key}",
+                                            details={"reason": prow["owner_gate"]["reason"], "recovery": recovery},
+                                        )
+                        elif not finding.recoverable:
+                            prow["owner_gate"] = {
+                                "state": "owner_gate",
+                                "reason": finding.reason,
+                                "code": finding.code,
+                                "recorded_at": now_iso,
+                            }
+                            self._emit_milestone(
+                                pid, "OWNER_GATE",
+                                occurrence_key=f"lifecycle:{finding.code}:{occurrence}",
+                                details={"reason": finding.reason, "evidence": finding.evidence},
+                            )
+                except Exception as exc:
+                    prow["last_error"] = f"lifecycle_invariant_evaluation_failed: {exc}"
 
                 # Execution Loss Observation & Evaluation
                 loss_summary = None

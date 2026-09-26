@@ -209,8 +209,24 @@ class ControlCommandCoordinator:
             else:
                 status_obj = parse_task_status(snapshot.get("next_status"))
                 current_task = _nonblank(telemetry.get("task_id"))
+                authority = (
+                    snapshot.get("authoritative_lifecycle")
+                    if isinstance(snapshot.get("authoritative_lifecycle"), dict)
+                    else {}
+                )
+                repository_projection = (
+                    authority.get("repository_projection")
+                    if isinstance(authority.get("repository_projection"), dict)
+                    else {}
+                )
+                transition_matches = (
+                    _nonblank(authority.get("current_task_id")) == _nonblank(row.get("task_id"))
+                    and _nonblank(authority.get("active_transition_id"))
+                    == _nonblank(row.get("lifecycle_transition_id"))
+                    and _nonblank(repository_projection.get("task_id")) == staged_successor
+                )
                 successor_already_current = (
-                    current_task == staged_successor
+                    (current_task == staged_successor or transition_matches)
                     and status_obj.is_pending_design()
                 )
                 if row.get("reviewed_ready") is True:
@@ -301,7 +317,19 @@ class ControlCommandCoordinator:
                 launch_snapshot = dict(snapshot)
                 launch_snapshot["state"] = "READY_TO_RUN"
             source_id = command_id + ":execute"
-            launch = executor.start_control(project, launch_snapshot, source_id)
+            predecessor_task_id = _nonblank(plan.get("predecessor_task_id"))
+            if predecessor_task_id is not None:
+                import inspect
+                params = inspect.signature(executor.start_control).parameters
+                if "source_task_id" in params:
+                    launch = executor.start_control(
+                        project, launch_snapshot, source_id,
+                        source_task_id=predecessor_task_id,
+                    )
+                else:
+                    launch = executor.start_control(project, launch_snapshot, source_id)
+            else:
+                launch = executor.start_control(project, launch_snapshot, source_id)
             if launch is None:
                 row = executor.state().get("executions", {}).get(source_id, {})
                 reason = str(row.get("reason") or "approved plan Worker launch failed") if isinstance(row, dict) else "approved plan Worker launch failed"

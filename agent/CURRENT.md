@@ -5,7 +5,15 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P16.13 Successor Consistency & Zero-Touch Handoff Recovery** (Status: **PENDING DESIGN**). Previous task: **P16.12 Web Sol Persistent Pairing & Truthful Availability** (Status: **COMPLETE**).
+Current task: **P16.13 Successor Consistency & Zero-Touch Handoff Recovery** (Status: **IMPLEMENTED / TECHNICAL REVIEW PENDING**). Previous task: **P16.12 Web Sol Persistent Pairing & Truthful Availability** (Status: **COMPLETE**).
+
+P16.13 implementation evidence (2026-09-26):
+- Added one authoritative lifecycle record and source/target/generation transition journal inside the existing transition-executor ledger.
+- Fenced successor authority until predecessor Worker/Reviewer/remediation ownership drains and the handoff is durably consumed.
+- Added staged predecessor/roadmap consistency repair, centralized lifecycle invariants, Watchdog missing-handoff recovery, restart replay, and exact lineage propagation.
+- Added the bounded exactly-one diff-localized remediation extension and the deterministic A-J lifecycle fault matrix.
+- Root-cause and authority/projection boundaries are recorded in `docs/P16_13_SUCCESSOR_CONSISTENCY_CONTRACT.md`.
+- Focused lifecycle regression: 122 tests and 10 subtests passed. Full Python regression: 1,281 tests and 92 subtests passed. Runtime smoke and independent Technical Review remain closure gates.
 
 P16.12 Web Sol Persistent Pairing & Truthful Availability completion (2026-09-25):
 - Implemented persistent pairing, truthful multi-signal availability, probe lifecycle, and failover:

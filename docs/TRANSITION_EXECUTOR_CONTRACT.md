@@ -60,6 +60,17 @@ Before starting a model, the executor persists an entry keyed by the source requ
 
 This fail-closed restart rule is required because the current `AgentBackend` contract tracks active runs only within one process.
 
+### P16.13 authoritative lifecycle and successor journal
+
+The executor ledger now also owns the single project lifecycle authority and
+its transition journal. See
+[P16.13 Successor Consistency and Zero-Touch Handoff Contract](P16_13_SUCCESSOR_CONSISTENCY_CONTRACT.md).
+Repository task files, Planner/Reviewer records, status mirrors, and Watchdog
+are projections or validators. A repository successor is not authoritative
+until source ownership has drained and a durable source/target/generation
+handoff is consumed. Ready handoffs replay after restart; duplicate ticks reuse
+their deterministic transition identity.
+
 ## Project isolation and completion truth
 
 Authoritative managed-run truth stays under the DevOrchestrator runtime (`agent-runs/` plus the transition ledger). For operator visibility only, the daemon writes a derived project-local mirror at `.devorch/status.json`. That mirror is never consumed as execution authority, contains no prompt/nonce/claim token, is written atomically, and `.devorch/` is added only to the repository-local `.git/info/exclude` so tracked project files and Git cleanliness are unchanged.

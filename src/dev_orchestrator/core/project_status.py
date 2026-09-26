@@ -668,6 +668,26 @@ def project_runtime_status(snapshot: dict[str, Any], runtime_root: Path | str) -
                 planner_view["rejection_chain_length"] = len(chain) if isinstance(chain, list) else 0
             projected["planner"] = planner_view
 
+    # The transition-executor lifecycle record is the runtime authority.
+    # Repository readiness and role ledgers above are projections/evidence and
+    # may not independently relabel the current task during a partial handoff.
+    lifecycle_rows = actuation_data.get("lifecycle") if isinstance(actuation_data, dict) else None
+    authority = lifecycle_rows.get(project_id) if isinstance(lifecycle_rows, dict) else None
+    if isinstance(authority, dict):
+        projected["authoritative_lifecycle"] = copy.deepcopy(authority)
+        telemetry = projected.get("telemetry") if isinstance(projected.get("telemetry"), dict) else {}
+        telemetry = copy.deepcopy(telemetry)
+        telemetry["task_id"] = authority.get("current_task_id")
+        projected["telemetry"] = telemetry
+        lifecycle_state = str(authority.get("lifecycle_state") or "UNKNOWN")
+        projected["lifecycle_state"] = lifecycle_state
+        if lifecycle_state == "EXECUTING":
+            projected["state"] = "WORKER_RUNNING"
+        elif lifecycle_state in {"PLANNING", "REVIEWING", "OWNER_GATE"}:
+            projected["state"] = lifecycle_state
+        elif lifecycle_state == "PENDING_DESIGN":
+            projected["state"] = "IDLE"
+
     from dev_orchestrator.core.watchdog import resolve_recovery_epoch
     epoch = resolve_recovery_epoch(projected, actuation_data, runtime_root=runtime)
     if epoch is not None:

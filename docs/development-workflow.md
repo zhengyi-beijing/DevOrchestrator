@@ -122,10 +122,14 @@ Technical Review remediation is bounded by the same convergence principle as
 Plan Review. It defaults to at most two remediation rounds; project reviewer
 policy may explicitly set `max_remediation_rounds` from 1 through 5. After the
 configured number of remediation Workers, one final Technical Review may still
-accept the task. If that review again returns `REMEDIATE`, DevOrchestrator must
-not launch another Remediator: it converts the exhausted remediation request to
-a durable `OWNER_GATE`, preserves the unresolved finding as evidence, and waits
-for owner disposition. `NON_BLOCKING` findings never consume another round.
+accept the task. If that review again returns `REMEDIATE`, DevOrchestrator may
+grant exactly one bounded extension only when the blocking findings are
+explicit, few, localized to the reviewed diff, testable, and do not expand the
+task or architectural scope. The grant and finding identities are durable and
+idempotent. Missing or ambiguous evidence, a repeated finding, or another
+`REMEDIATE` after the extension converts to a durable `OWNER_GATE` and preserves
+the unresolved evidence for owner disposition. `NON_BLOCKING` findings never
+consume another round.
 
 ## Context Propagation Contract
 
