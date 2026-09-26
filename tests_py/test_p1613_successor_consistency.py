@@ -116,6 +116,54 @@ class SuccessorConsistencyFaultMatrixTests(unittest.TestCase):
             self.assertEqual(set(second["transitions"]), set(first["transitions"]))
             self.assertEqual(second["lifecycle"]["p1"]["generation"], 0)
 
+            # The Watchdog is the other component that could relabel the
+            # published successor as current.  Drive the real coordinator over
+            # the same state and assert it neither relabels the authority nor
+            # actuates recovery while the predecessor Worker is still running.
+            from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+            config_path = runtime / "projects.json"
+            config_path.write_text(json.dumps({"projects": [{
+                "project_id": "p1", "repo_path": str(repo),
+                "watchdog": {"enabled": True, "auto_recovery": True,
+                             "no_progress_threshold_minutes": 1},
+            }]}), encoding="utf-8")
+            watchdog = WatchdogCoordinator(runtime)
+            overlaid = executor.overlay_lifecycle_authority(_summary(repo))
+            watchdog.advance(str(config_path), overlaid, executor=executor)
+            for thread in getattr(watchdog, "_threads", {}).values():
+                thread.join(timeout=10.0)
+
+            after = executor.state()["lifecycle"]["p1"]
+            self.assertEqual(
+                (after["current_task_id"], after["lifecycle_state"]), ("P1", "EXECUTING"),
+                "the Watchdog relabelled the authority while the predecessor was running",
+            )
+            self.assertIsNone(after.get("owner_gate"))
+            self.assertEqual(
+                len(executor.state()["transitions"]), 1,
+                "the Watchdog created a second transition for the published successor",
+            )
+            self.assertEqual(
+                [row for row in executor.state()["executions"].values()
+                 if isinstance(row, dict) and row.get("state") == "handoff"], [],
+                "the Watchdog published a handoff while source ownership was live",
+            )
+            wrow = (watchdog.state().get("projects") or {}).get("p1") or {}
+            # Guard against a vacuous pass: the Watchdog must actually have
+            # evaluated this project rather than skipped it.
+            self.assertEqual(
+                len(wrow.get("lifecycle_invariants") or []), 6,
+                f"the Watchdog did not evaluate this project: {wrow.get('last_error')}",
+            )
+            self.assertNotIn(
+                "PENDING_DESIGN_NOT_EXECUTING", wrow.get("unresolved_invariants") or [],
+            )
+            self.assertEqual(
+                [f["code"] for f in wrow["lifecycle_invariants"] if not f["holds"]], [],
+                "the Watchdog saw a lifecycle violation in the fenced-successor state",
+            )
+
     def test_B_review_verdict_without_handoff_recovers_once(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); repo = _repo(root, current="P1"); runtime = root / "runtime"
@@ -171,6 +219,69 @@ class SuccessorConsistencyFaultMatrixTests(unittest.TestCase):
             self.assertEqual(applied.status, "applied")
             self.assertEqual(resolve_successor(repo, "P1").kind, "successor")
             self.assertEqual(_git(repo, "status", "--porcelain"), "")
+
+    def test_acceptance_2_inconsistent_successor_never_settles_project_complete(self):
+        """Acceptance 2: detect ROADMAP_SUCCESSOR_INCONSISTENT and do not settle.
+
+        Drives the real decision actuation rather than the resolver, because the
+        terminal-settle branch that must not be taken lives there.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _repo(root, roadmap_target=None, current="P1")
+            runtime = root / "runtime"; runtime.mkdir()
+            self.assertEqual(resolve_successor(repo, "P1").kind, "inconsistent")
+
+            truth = read_repository_truth(repo)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {
+                    "engine": "aibroker", "enabled": True, "owner_authorized": True,
+                    "allowed_next_actions": ["next_task"],
+                },
+            }
+            config = root / "projects.json"
+            config.write_text(json.dumps({"projects": [project]}), encoding="utf-8")
+            snapshot = {
+                "project_id": "p1", "repo_path": str(repo), "state": "WAITING_REVIEW",
+                "next_title": "P1 task", "next_status": "**COMPLETE**",
+                "telemetry": {"task_id": "P1"},
+                "git": {"branch": truth.branch, "head": truth.head, "dirty": False,
+                        "status_hash": truth.status_hash},
+            }
+            (runtime / "review-decisions.json").write_text(json.dumps({"version": 1, "decisions": {
+                "ai_review:d1": {
+                    "project_id": "p1", "request_id": "ai_review:d1", "disposition": "apply",
+                    "decision": "next", "next_action": "next_task",
+                    "reason": "reviewed task complete", "task_id": "P1",
+                    "branch": truth.branch, "head": truth.head,
+                    "review_status_hash": truth.status_hash,
+                    "role": "reviewer", "event": "worker_done",
+                    "consumed_at": "2026-09-26T00:00:00+00:00",
+                },
+            }}), encoding="utf-8")
+
+            executor = TransitionExecutor(runtime)
+            executor.advance({"projects": [snapshot]}, config,
+                             decision_summary={"projects": [snapshot]})
+
+            rows = [row for row in executor.state()["executions"].values() if isinstance(row, dict)]
+            self.assertEqual(
+                [row for row in rows if row.get("outcome") == "task_complete"], [],
+                "an inconsistent successor was terminal-settled as project complete",
+            )
+            handoffs = [row for row in rows if row.get("state") == "handoff"]
+            self.assertEqual(
+                len(handoffs), 1,
+                f"reconciliation did not produce exactly one handoff: {rows}",
+            )
+            self.assertEqual(
+                (handoffs[0].get("source_task_id"), handoffs[0].get("target_task_id")),
+                ("P1", "P2"),
+            )
+            # The repair is committed, so the recovery precondition survives.
+            self.assertEqual(_git(repo, "status", "--porcelain"), "")
+            self.assertEqual(resolve_successor(repo, "P1").kind, "successor")
 
     def test_E_roadmap_and_staged_claim_disagreement_fails_closed(self):
         with tempfile.TemporaryDirectory() as td:
@@ -234,6 +345,71 @@ class SuccessorConsistencyFaultMatrixTests(unittest.TestCase):
                 findings=finding, max_extensions=1, max_extension_findings=3,
             )
             self.assertEqual((second[0], second[1], second[4]), ("owner_gate", "stop", False))
+
+    def test_G_replayed_tick_reuses_the_grant_and_never_grants_a_second(self):
+        """Acceptance 10: repeated ticks never grant a duplicate extension."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = _repo(root, current="P1"); runtime = root / "runtime"; runtime.mkdir()
+            base = _git(repo, "rev-parse", "HEAD")
+            (repo / "app.py").write_text("value = 1\n", encoding="utf-8")
+            head = _commit(repo, "implementation")
+            executions = {
+                "root": {"project_id": "p1", "task_id": "P1", "source_kind": "decision", "state": "completed"},
+                "rem1": {"project_id": "p1", "task_id": "P1", "source_kind": "remediation", "review_decision_id": "r1", "state": "completed"},
+                "rem2": {"project_id": "p1", "task_id": "P1", "source_kind": "remediation", "review_decision_id": "r2", "state": "completed", "repo_path": str(repo), "head": base},
+            }
+            reviews = {
+                "r1": {"review_id": "r1", "project_id": "p1", "task_id": "P1", "source_request_id": "root", "state": "completed"},
+                "r2": {"review_id": "r2", "project_id": "p1", "task_id": "P1", "source_request_id": "rem1", "state": "completed"},
+                "r3": {"review_id": "r3", "project_id": "p1", "task_id": "P1", "source_request_id": "rem2", "state": "completed", "repo_path": str(repo), "head": head},
+            }
+            (runtime / "transition-executor.json").write_text(json.dumps(
+                {"version": 2, "executions": executions, "lifecycle": {}, "transitions": {}}), encoding="utf-8")
+            (runtime / "ai-reviewer.json").write_text(json.dumps(
+                {"version": 1, "reviews": reviews}), encoding="utf-8")
+            reviewer = AIReviewerCoordinator(runtime, None)
+            finding = ({"file": "app.py", "summary": "local bug", "fix": "correct value",
+                        "regression_test": "test_value"},)
+
+            args = ("r3", "p1", "P1", "remediate", "continue_current_stage", "bug", 2)
+            kwargs = dict(findings=finding, max_extensions=1, max_extension_findings=3)
+            first = reviewer._apply_remediation_budget(*args, **kwargs)
+            self.assertEqual((first[0], first[4]), ("remediate", True))
+            granted_at = reviewer.state()["reviews"]["r3"]["remediation_extension_granted_at"]
+
+            # Replay the same review identity, as a repeated daemon tick would.
+            for _ in range(3):
+                replay = reviewer._apply_remediation_budget(*args, **kwargs)
+                self.assertEqual(
+                    (replay[0], replay[4]), ("remediate", True),
+                    "a replayed tick did not reuse the already-granted extension",
+                )
+            row = reviewer.state()["reviews"]["r3"]
+            self.assertEqual(
+                row["remediation_extension_granted_at"], granted_at,
+                "a replayed tick re-granted the extension instead of reusing it",
+            )
+            self.assertEqual(row["remediation_extension_review_id"], "r3")
+
+            # The single grant is still consumed for the next descendant review,
+            # which must gate rather than receive a second extension.
+            executions["rem3"] = {"project_id": "p1", "task_id": "P1", "source_kind": "remediation",
+                                  "review_decision_id": "r3", "state": "completed",
+                                  "repo_path": str(repo), "head": base}
+            state = reviewer.state()
+            state["reviews"]["r4"] = {"review_id": "r4", "project_id": "p1", "task_id": "P1",
+                                      "source_request_id": "rem3", "state": "completed",
+                                      "repo_path": str(repo), "head": head}
+            reviewer._save_state(state)
+            (runtime / "transition-executor.json").write_text(json.dumps(
+                {"version": 2, "executions": executions, "lifecycle": {}, "transitions": {}}), encoding="utf-8")
+            descendant = reviewer._apply_remediation_budget(
+                "r4", "p1", "P1", "remediate", "continue_current_stage", "still broken", 2, **kwargs,
+            )
+            self.assertEqual(
+                (descendant[0], descendant[1], descendant[4]), ("owner_gate", "stop", False),
+                "the replayed grant was double-counted into a second extension",
+            )
 
     def test_I_and_J_repeated_recovery_after_intent_is_single_and_live(self):
         with tempfile.TemporaryDirectory() as td:
