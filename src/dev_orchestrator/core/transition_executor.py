@@ -1392,7 +1392,7 @@ class TransitionExecutor:
 
         state = snapshot.get("state")
         if expected_status_hash is not None:
-            if state not in ("READY_TO_RUN", "WAITING_REVIEW", "IDLE"):
+            if state not in ("READY_TO_RUN", "WAITING_REVIEW", "REVIEWING", "IDLE"):
                 return None, "project state is not eligible for exact remediation"
         elif state != "READY_TO_RUN":
             return None, "project is not READY_TO_RUN"
