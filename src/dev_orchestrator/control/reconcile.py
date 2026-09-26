@@ -62,7 +62,7 @@ def _active_reason(
     if isinstance(worker, dict) and (worker.get("state") in {"starting", "running"} or worker.get("process_alive") is True):
         return "active execution makes reconcile ambiguous"
     lifecycle = str(snapshot.get("lifecycle_state") or snapshot.get("state") or "")
-    if lifecycle in {"PLANNING", "REVIEWING_PLAN", "REMEDIATING_PLAN", "APPLYING_PLAN", "REVIEWING", "WORKER_RUNNING"}:
+    if lifecycle in {"PLANNING", "REVIEWING_PLAN", "REMEDIATING_PLAN", "APPLYING_PLAN", "WORKER_RUNNING"}:
         return "active AI role makes reconcile ambiguous"
     return ""
 
