@@ -1731,6 +1731,27 @@ class WatchdogCoordinator:
                                 "evidence": finding.evidence,
                             },
                         )
+                        # Legacy ledgers may contain an unbounded failed
+                        # attempt from before blocked transition actuation made
+                        # this invariant non-recoverable.  Authority now gates
+                        # that case before Watchdog runs, so do not actuate it
+                        # again; migrate the matching historical evidence to an
+                        # explicit, durable fence instead.
+                        if (
+                            finding.code == "NEXT_TASK_WITHOUT_HANDOFF"
+                            and not finding.recoverable
+                        ):
+                            decisions = finding.evidence.get("next_decisions") or []
+                            source_task_id = str(decisions[0].get("task_id") or "") if decisions else ""
+                            key = f"{source_task_id}:{(snapshot.get('git') or {}).get('head') if isinstance(snapshot.get('git'), dict) else ''}"
+                            attempts = prow.setdefault("lifecycle_recovery_attempts", {})
+                            prior_attempt = attempts.get(key) if isinstance(attempts.get(key), dict) else None
+                            if source_task_id and prior_attempt is not None:
+                                attempts[key] = {
+                                    **prior_attempt,
+                                    "state": "gated",
+                                    "fenced": True,
+                                }
                         if finding.code == "NEXT_TASK_WITHOUT_HANDOFF" and finding.recoverable:
                             decisions = finding.evidence.get("next_decisions") or []
                             source_task_id = str(decisions[0].get("task_id") or "") if decisions else ""

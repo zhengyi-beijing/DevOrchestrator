@@ -1046,6 +1046,57 @@ class BoundedRecoveryActuationTests(unittest.TestCase):
             f"recovery attempt counter kept climbing past the gate: {counts}",
         )
 
+    def test_B1_legacy_failed_attempt_is_fenced_when_actuation_is_already_blocked(self):
+        """Restart migrates old loop evidence without retrying blocked work."""
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        head = _git(self.repo, "rev-parse", "HEAD")
+        key = f"P1:{head}"
+        snapshot = _summary(self.repo, "P2")["projects"][0]
+        seed_executor = self._CountingExecutor(
+            "agent/staged/roadmap.json does not exist",
+        )
+        seed_watchdog = WatchdogCoordinator(self.runtime)
+        seed_watchdog.advance(
+            str(self.config_path), {"projects": [snapshot]}, executor=seed_executor,
+        )
+        legacy_state = json.loads(
+            (self.runtime / "watchdog.json").read_text(encoding="utf-8"),
+        )
+        legacy_state["projects"]["p1"]["lifecycle_recovery_attempts"][key] = {
+            "count": 244,
+            "state": "failed",
+            "result": {
+                "status": "blocked",
+                "reason": "agent/staged/roadmap.json does not exist",
+            },
+        }
+        (self.runtime / "watchdog.json").write_text(
+            json.dumps(legacy_state), encoding="utf-8",
+        )
+        executor = self._CountingExecutor("must not be called")
+        executor.ledger["executions"]["ai_review:d1"] = {
+            "project_id": "p1",
+            "task_id": "P1",
+            "state": "blocked",
+        }
+        watchdog = WatchdogCoordinator(self.runtime)
+
+        watchdog.advance(
+            str(self.config_path), {"projects": [snapshot]}, executor=executor,
+        )
+
+        row = (watchdog.state().get("projects") or {}).get("p1") or {}
+        attempt = (row.get("lifecycle_recovery_attempts") or {}).get(key) or {}
+        self.assertEqual(executor.calls, 0, "blocked actuation was retried during migration")
+        self.assertEqual(attempt.get("count"), 244, "historical attempt evidence changed")
+        self.assertEqual(attempt.get("state"), "gated")
+        self.assertTrue(attempt.get("fenced"))
+        self.assertEqual(
+            (row.get("owner_gate") or {}).get("code"),
+            "NEXT_TASK_WITHOUT_HANDOFF",
+        )
+
     def test_NA_undrained_source_ownership_is_a_wait_not_a_refusal(self):
         """Review finding N-A: only _record_handoff rebuilds the durable handoff.
 
