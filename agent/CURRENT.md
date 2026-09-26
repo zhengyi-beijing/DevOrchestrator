@@ -66,6 +66,28 @@ P16.14 Technical Review second-round remediation evidence (2026-09-26):
   - `git diff --check`: 0 errors.
   - `graphify update .`: updated cleanly.
 
+P16.14 Technical Review third-round remediation evidence (2026-09-27):
+- Addressed all Technical Review findings from `ai_review:ai_review:ai_review:rereview:p1614-live-recover-20260926`:
+  1. Regression Evidence and Full Validation Coverage:
+     - Executed full 10-suite dispatcher regression suite (93/93 passed): `test_worker_done_dispatcher.py` (6), `test_worker_done_dispatcher_slice.py` (3), `test_bridge_reviewer_regressions.py` (5), `test_remediation_flow.py` (9), `test_binding_presence_gate.py` (3), `test_daemon_transition_integration.py` (4), `test_response_consumer.py` (11), `test_accounting_instrumentation.py` (4), `test_chatgpt_web_adapter.py` (14), and `test_p1612_websol_pairing_and_availability.py` (34).
+     - Executed touched suites (136/136 passed): `test_p1613_successor_consistency.py` (49), `test_transition_executor_aibroker.py` (24), `test_lifecycle_projection.py` (3), `test_ai_planner.py` (38), `test_ai_reviewer.py` (12), and `test_workflow_policy.py` (10).
+     - Executed full repository regression test suite: 1,363/1,363 passed in 526.69s.
+  2. Failover Reviewer Launch Head Propagation:
+     - In `core/ai_reviewer.py` (`_launch_web_sol_failover_reviewer`), extracted `worker_launch_head` from transitions or dispatcher occurrence and passed `"worker_launch_head": worker_launch_head` in `AIRoleRequest.metadata`. This guarantees `_detect_scope_gaps` receives the exact launch head on failover review paths without falling back to `HEAD~1..HEAD`.
+  3. Cleaned Redundant Variable Rebinding:
+     - In `core/dispatcher.py`, removed redundant `repo_path = snapshot.get("repo_path")` assignment.
+  4. Repaired Roadmap UTF-8 BOM:
+     - Stripped accidental UTF-8 BOM from `agent/staged/roadmap.json` (resolving strict UTF-8 JSON parsing in `staged_roadmap.py`).
+- Verification:
+  - Focused test suite `tests_py/test_p1614_invariant_workflow.py`: 42/42 passed (added `test_dispatcher_prompt_injection_and_failover_launch_head`).
+  - Touched regressions: 136 passed across 6 suites.
+  - Dispatcher regressions: 93 passed across 10 suites.
+  - Full suite regression: 1,363 passed in 526.69s.
+  - `python ops/p1614_evidence.py`: valid output with clean registry.
+  - `python -m compileall src ops tests_py`: 0 errors.
+  - `git diff --check`: 0 errors.
+  - `graphify update .`: updated cleanly.
+
 
 P16.13 final closure evidence (2026-09-26):
 - Restarted the canonical daemon from stale PID 26264 onto the committed

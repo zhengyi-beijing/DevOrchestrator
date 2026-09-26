@@ -1348,6 +1348,99 @@ def record_metric(name: str, value: float) -> None:
             self.assertIn("[WORKFLOW_POLICY role=remediator]", remediator_call_args.prompt)
             self.assertIn("[CONTROL_PLANE_CONTRACT_END]", remediator_call_args.prompt)
 
+    def test_dispatcher_prompt_injection_and_failover_launch_head(self):
+        """Dispatcher injects control-plane contract and failover reviewer carries launch head metadata."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _init_repo(root)
+            decl_text = (
+                "# P16.14 Invariant-Driven Control-Plane Development & Validation\n\n"
+                "## Control-Plane Impact\n"
+                "- Invariants: SINGLE_ACTIVE_LIFECYCLE_OWNER, CURRENT_TASK_MATCHES_ACTIVE_EXECUTION\n"
+                "- Transition boundaries: worker_launch\n"
+                "- Fault scenarios: CPF-01, CPF-06, CPF-08, CPF-09, CPF-10\n"
+                "- Convergence evidence: Clean single owner convergence.\n"
+            )
+            (repo / "agent" / "next.md").write_text(decl_text, encoding="utf-8")
+            head = _commit(repo, "add declaration")
+
+            from dev_orchestrator.core.dispatcher import dispatch_worker_done_events, DISPATCHER_STATE_FILE
+            from dev_orchestrator.bridge.store import BrowserBridgeStore
+
+            runtime = root / "runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            bridge_store = BrowserBridgeStore(runtime / "bridge")
+
+            snapshot = {
+                "id": "p1",
+                "project_id": "p1",
+                "repo_path": str(repo),
+                "conversation_binding": {
+                    "transport": "browser_bridge",
+                    "adapter": "chatgpt_web",
+                    "binding_id": "test-binding",
+                },
+                "orchestration_ready": True,
+                "state": "WAITING_REVIEW",
+                "git": {"branch": "main", "head": head},
+                "worker": {
+                    "kind": "task",
+                    "state": "completed",
+                    "exit_code": 0,
+                    "updated_at": "2026-09-26T22:30:00+00:00",
+                    "command": "worker command",
+                },
+                "telemetry": {"run_id": "run-disp-1", "task_id": "P16.14"},
+                "stage_id": "review",
+            }
+
+            summary = {"projects": [snapshot]}
+            dispatch_worker_done_events(summary, bridge_store, runtime)
+            disp_ledger = json.loads((runtime / DISPATCHER_STATE_FILE).read_text(encoding="utf-8"))
+            prepared_occ = disp_ledger["worker_done"]["p1"]["occurrences"]["run-disp-1"]
+            self.assertIn("[CONTROL_PLANE_CONTRACT_BEGIN]", prepared_occ["prompt"])
+            self.assertIn("Invariants: SINGLE_ACTIVE_LIFECYCLE_OWNER, CURRENT_TASK_MATCHES_ACTIVE_EXECUTION", prepared_occ["prompt"])
+            self.assertIn("[CONTROL_PLANE_CONTRACT_END]", prepared_occ["prompt"])
+
+            # Test failover reviewer propagates launch head into metadata
+            port = _TestReviewerVerdictPort(decision="next")
+            reviewer = AIReviewerCoordinator(
+                runtime_root=runtime,
+                port=port,
+            )
+            projects_cfg = {
+                "projects": [
+                    {
+                        "project_id": "p1",
+                        "repo_path": str(repo),
+                        "review_policy": {
+                            "quality": "high",
+                            "independence": "none",
+                            "timeout_seconds": 60.0,
+                        },
+                    }
+                ]
+            }
+            write_json(runtime / "projects.json", projects_cfg)
+
+            failover_id = reviewer.submit_failover_review(
+                project_id="p1",
+                run_id="run-disp-1",
+                failover_record_id="rec-1",
+                policy={
+                    "quality": "high",
+                    "independence": "none",
+                    "timeout_seconds": 60.0,
+                },
+            )
+            self.assertIsNotNone(failover_id)
+            if failover_id in reviewer._threads:
+                reviewer._threads[failover_id].join(timeout=5)
+            self.assertTrue(port.requests)
+            req = port.requests[0]
+            self.assertEqual(req.metadata.get("worker_launch_head"), head)
+            self.assertIn("[CONTROL_PLANE_CONTRACT_BEGIN]", req.prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

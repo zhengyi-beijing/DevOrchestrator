@@ -1446,22 +1446,23 @@ class AIReviewerCoordinator:
         repo_path = _nonblank(worker.get("repo_path")) or _nonblank(proj_dict.get("repo_path"))
         task_id = _nonblank(worker.get("task_id"))
 
-        if not task_id or not repo_path:
-            from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE
-            d_path = self.runtime_root / DISPATCHER_STATE_FILE
-            if d_path.exists():
-                try:
-                    ledger = read_json(d_path, None)
-                    if isinstance(ledger, dict):
-                        p_data = (ledger.get("worker_done") or {}).get(project_id) or {}
-                        occ = (p_data.get("occurrences") or {}).get(run_id)
-                        if isinstance(occ, dict):
-                            if not task_id:
-                                task_id = _nonblank(occ.get("task_id"))
-                            if not repo_path:
-                                repo_path = _nonblank(occ.get("repo_path"))
-                except Exception:
-                    pass
+        occ = None
+        from dev_orchestrator.core.dispatcher import DISPATCHER_STATE_FILE
+        d_path = self.runtime_root / DISPATCHER_STATE_FILE
+        if d_path.exists():
+            try:
+                ledger = read_json(d_path, None)
+                if isinstance(ledger, dict):
+                    p_data = (ledger.get("worker_done") or {}).get(project_id) or {}
+                    cand_occ = (p_data.get("occurrences") or {}).get(run_id)
+                    if isinstance(cand_occ, dict):
+                        occ = cand_occ
+                        if not task_id:
+                            task_id = _nonblank(occ.get("task_id"))
+                        if not repo_path:
+                            repo_path = _nonblank(occ.get("repo_path"))
+            except Exception:
+                pass
 
         if not repo_path or not task_id:
             return None
@@ -1544,6 +1545,12 @@ class AIReviewerCoordinator:
             repo_path=repo_path,
         )
 
+        worker_launch_head = (
+            _nonblank(worker.get("launch_head"))
+            or _nonblank(worker.get("head"))
+            or (_nonblank(occ.get("head")) if isinstance(occ, dict) else None)
+        )
+
         request = AIRoleRequest(
             project_id=project_id,
             task_run_id=task_id,
@@ -1559,6 +1566,7 @@ class AIReviewerCoordinator:
             timeout_seconds=policy.get("timeout_seconds", 600.0),
             metadata={
                 "worker_source_request_id": run_id,
+                "worker_launch_head": worker_launch_head,
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 "failure_environment": environment_for_project(proj_dict),
                 "max_remediation_rounds": policy.get("max_remediation_rounds", _DEFAULT_MAX_REMEDIATION_ROUNDS),

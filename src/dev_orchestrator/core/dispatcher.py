@@ -468,7 +468,6 @@ def _dispatch_one(
             max_chars=failure_memory_max_chars,
         )
 
-    repo_path = snapshot.get("repo_path")
     if repo_path and truth and getattr(truth, "head", None):
         try:
             from dev_orchestrator.core.control_plane_contract import (

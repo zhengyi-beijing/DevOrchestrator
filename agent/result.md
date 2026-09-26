@@ -37,9 +37,17 @@ P16.14 Invariant-Driven Control-Plane Development & Validation (complete 2026-09
       - Wired `repo_path` and `worker_launch_head` to `_review_prompt` across all 5 reviewer launch sites in `core/ai_reviewer.py` and dispatcher, ensuring `[CONTROL_PLANE_CONTRACT_BEGIN]` prompt injection for Technical Reviewers.
       - Integrated `_detect_scope_gaps` into the active production review path `_handle_review_completion` (as well as `_finalize_harness_review`), converting accepting `decision="next"` to `decision="remediate"` on undeclared protected surface changes with `CONTROL_PLANE_SCOPE_GAP` findings.
       - Wired control-plane contract prompt injection into `_launch` in `core/transition_executor.py` for `worker` and `remediator` roles.
+   10. Technical Review Remediation Round 3 (`ai_review:ai_review:ai_review:rereview:p1614-live-recover-20260926`):
+       - Executed 10-suite dispatcher regression suite (93 tests passing): `test_worker_done_dispatcher.py` (6), `test_worker_done_dispatcher_slice.py` (3), `test_bridge_reviewer_regressions.py` (5), `test_remediation_flow.py` (9), `test_binding_presence_gate.py` (3), `test_daemon_transition_integration.py` (4), `test_response_consumer.py` (11), `test_accounting_instrumentation.py` (4), `test_chatgpt_web_adapter.py` (14), and `test_p1612_websol_pairing_and_availability.py` (34).
+       - In `core/ai_reviewer.py` (`_launch_web_sol_failover_reviewer`), resolved and passed `worker_launch_head` in `AIRoleRequest.metadata`, ensuring `_detect_scope_gaps` receives the exact launch head on failover review paths without falling back to `HEAD~1..HEAD`.
+       - In `core/dispatcher.py`, eliminated redundant `repo_path` assignment.
+       - In `agent/staged/roadmap.json`, stripped UTF-8 BOM byte order mark.
+       - Executed full repository regression test suite: 1,363/1,363 tests passed in 526.69s.
 - Verification:
-  - 41 dedicated unit/integration/fault-injection and remediation tests in `tests_py/test_p1614_invariant_workflow.py` passing 100%.
-  - Touched regression suites passing 100% (`test_p1613_successor_consistency.py`, `test_transition_executor_aibroker.py`, `test_ai_reviewer.py`, `test_ai_planner.py`, `test_workflow_policy.py`).
+  - 42 dedicated unit/integration/fault-injection and remediation tests in `tests_py/test_p1614_invariant_workflow.py` passing 100%.
+  - 93 tests passing across 10 dispatcher regression suites.
+  - 136 tests passing across 6 touched regression suites (`test_p1613_successor_consistency.py`, `test_transition_executor_aibroker.py`, `test_lifecycle_projection.py`, `test_ai_reviewer.py`, `test_ai_planner.py`, `test_workflow_policy.py`).
+  - 1,363 tests passing across full repository regression in 526.69s.
   - `python ops/p1614_evidence.py` valid.
   - Python compilation and `git diff --check` clean.
   - Knowledge graph updated via `graphify update .`.
