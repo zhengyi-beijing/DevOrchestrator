@@ -1670,6 +1670,12 @@ class WatchdogCoordinator:
                     planner_fn = getattr(planner_obj, "state", None)
                     reviewer_fn = getattr(reviewer_obj, "state", None)
                     decisions_state = read_json(self.runtime_root / "review-decisions.json", {})
+                    # Normalize exactly as reconciliation does.  A ledger that
+                    # parses as a non-mapping would otherwise be treated as
+                    # absent evidence here but as an empty mapping there,
+                    # re-opening the authority/Watchdog divergence.
+                    if not isinstance(decisions_state, dict):
+                        decisions_state = {}
                     lifecycle_findings = evaluate_lifecycle_invariants(
                         snapshot=snapshot,
                         executor_state=executor_state or {},
@@ -1734,10 +1740,15 @@ class WatchdogCoordinator:
                                     attempts[key] = {"count": 1, "state": "recovered", "result": recovery}
                                 else:
                                     count = int(prior_attempt.get("count") or 0) + 1
-                                    # A dirty worktree is transient: keep retrying
-                                    # so the wait stays zero-touch.  Anything else
-                                    # is non-transient and gates once.
-                                    transient = "clean repository" in str(recovery.get("reason") or "")
+                                    # A dirty worktree, or source ownership that
+                                    # has not drained yet, is transient: keep
+                                    # retrying so the wait stays zero-touch.
+                                    # Anything else is non-transient and gates
+                                    # once.
+                                    transient = (
+                                        bool(recovery.get("waiting"))
+                                        or "clean repository" in str(recovery.get("reason") or "")
+                                    )
                                     gated = count >= 2 and not transient
                                     attempts[key] = {
                                         "count": count,

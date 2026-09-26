@@ -684,6 +684,16 @@ class ReviewFindingRegressionTests(unittest.TestCase):
                 recorded["holds"],
                 "an unsatisfied NEXT_TASK decision was attested as satisfied",
             )
+            # Pin the executor half: the verdict must come from the ledger, not
+            # from the evaluator's absent-evidence fallback.
+            self.assertFalse(
+                recorded["evidence"]["evidence_unavailable"],
+                "reconciliation reached its verdict without reading the decisions ledger",
+            )
+            self.assertEqual(
+                [row["task_id"] for row in recorded["evidence"]["next_decisions"]],
+                ["P1"],
+            )
 
     def test_B4_durably_blocked_actuation_gates_instead_of_recovering(self):
         snapshot, state, decisions = self._next_decision_fixture("blocked")
@@ -740,6 +750,10 @@ class ReviewFindingRegressionTests(unittest.TestCase):
             again = executor.state()["lifecycle"]["p1"]["owner_gate"]
             self.assertEqual(again.get("code"), first.get("code"))
             self.assertEqual(again.get("authority_task_id"), first.get("authority_task_id"))
+            self.assertEqual(
+                again.get("recorded_at"), first.get("recorded_at"),
+                "the authority gate was re-stamped on repeated ticks",
+            )
 
 
 class BoundedRecoveryActuationTests(unittest.TestCase):
@@ -770,9 +784,10 @@ class BoundedRecoveryActuationTests(unittest.TestCase):
     class _CountingExecutor:
         """Handoff recovery that always fails for the given reason."""
 
-        def __init__(self, reason):
+        def __init__(self, reason, waiting=False):
             self.calls = 0
             self.reason = reason
+            self.waiting = waiting
             self.ledger = {
                 "executions": {}, "transitions": {},
                 "lifecycle": {"p1": {
@@ -785,12 +800,15 @@ class BoundedRecoveryActuationTests(unittest.TestCase):
 
         def reconcile_successor_handoff(self, _pcfg, _snapshot, *, completed_task_id, trigger):
             self.calls += 1
-            return {"status": "blocked", "reason": self.reason}
+            return {
+                "status": "blocked", "reason": self.reason,
+                "waiting": self.waiting,
+            }
 
-    def _drive(self, reason, ticks):
+    def _drive(self, reason, ticks, waiting=False):
         from dev_orchestrator.core.watchdog import WatchdogCoordinator
 
-        executor = self._CountingExecutor(reason)
+        executor = self._CountingExecutor(reason, waiting=waiting)
         watchdog = WatchdogCoordinator(self.runtime)
         snapshot = _summary(self.repo, "P2")["projects"][0]
         for _ in range(ticks):
@@ -820,16 +838,76 @@ class BoundedRecoveryActuationTests(unittest.TestCase):
             "the gated recovery attempt was not marked gated",
         )
 
-    def test_B1_owner_gate_is_durable_and_not_restamped(self):
-        _, row = self._drive("agent/staged/roadmap.json does not exist", ticks=6)
-        first = (row.get("owner_gate") or {}).get("recorded_at")
-        self.assertIsNotNone(first)
-        _, row2 = self._drive("agent/staged/roadmap.json does not exist", ticks=8)
-        attempts = row2.get("lifecycle_recovery_attempts") or {}
+    def test_B1_owner_gate_recorded_at_is_durable_across_ticks(self):
+        """The gate must be declared once, not re-stamped every tick."""
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        executor = self._CountingExecutor("agent/staged/roadmap.json does not exist")
+        watchdog = WatchdogCoordinator(self.runtime)
+        snapshot = _summary(self.repo, "P2")["projects"][0]
+        stamps = []
+        for _ in range(6):
+            watchdog.advance(str(self.config_path), {"projects": [snapshot]},
+                             executor=executor)
+            for thread in getattr(watchdog, "_threads", {}).values():
+                thread.join(timeout=10.0)
+            gate = ((watchdog.state().get("projects") or {}).get("p1") or {}).get("owner_gate")
+            if isinstance(gate, dict) and gate.get("recorded_at"):
+                stamps.append(gate["recorded_at"])
+        self.assertTrue(stamps, "no owner gate was ever declared")
+        self.assertEqual(
+            len(set(stamps)), 1,
+            f"the owner gate was re-stamped across ticks: {sorted(set(stamps))}",
+        )
+
+    def test_B1_attempt_counter_stops_climbing_past_the_gate(self):
+        _, row = self._drive("agent/staged/roadmap.json does not exist", ticks=8)
+        attempts = row.get("lifecycle_recovery_attempts") or {}
         counts = [int(a.get("count") or 0) for a in attempts.values()]
         self.assertTrue(
             counts and max(counts) <= 2,
             f"recovery attempt counter kept climbing past the gate: {counts}",
+        )
+
+    def test_NA_undrained_source_ownership_is_a_wait_not_a_refusal(self):
+        """Review finding N-A: only _record_handoff rebuilds the durable handoff.
+
+        Gating the "ownership is not terminal" wait would fence off the only
+        code path that can ever publish it, converting a self-healing wait into
+        a permanent stall.
+        """
+        executor, row = self._drive(
+            "source-task lifecycle ownership is not terminal", ticks=6, waiting=True)
+        self.assertEqual(
+            executor.calls, 6,
+            f"a source-ownership wait was gated after {executor.calls} of 6 ticks",
+        )
+        self.assertIsNone(
+            row.get("owner_gate"),
+            "a transient ownership wait was escalated to an owner gate",
+        )
+        states = {a.get("state") for a in (row.get("lifecycle_recovery_attempts") or {}).values()}
+        self.assertNotIn("gated", states)
+
+    def test_NB_non_mapping_decisions_ledger_does_not_gate_every_project(self):
+        """Review finding N-B: a malformed ledger must normalize, not gate."""
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        (self.runtime / "review-decisions.json").write_text("[]", encoding="utf-8")
+        executor = self._CountingExecutor("unused")
+        watchdog = WatchdogCoordinator(self.runtime)
+        snapshot = _summary(self.repo, "P2")["projects"][0]
+        watchdog.advance(str(self.config_path), {"projects": [snapshot]}, executor=executor)
+        for thread in getattr(watchdog, "_threads", {}).values():
+            thread.join(timeout=10.0)
+        row = (watchdog.state().get("projects") or {}).get("p1") or {}
+        codes = {
+            item["code"] for item in (row.get("lifecycle_invariants") or [])
+            if not item.get("holds")
+        }
+        self.assertNotIn(
+            "NEXT_TASK_WITHOUT_HANDOFF", codes,
+            "a non-mapping decisions ledger was treated as absent evidence and gated",
         )
 
     def test_B1_transient_dirty_worktree_keeps_retrying(self):

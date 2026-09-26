@@ -792,13 +792,24 @@ class TransitionExecutor:
                     if "worker" in roles:
                         authority["lifecycle_state"] = "EXECUTING"
                     elif blocked_obligations and repo_task != owner_task:
+                        prior_blocked_gate = authority.get("owner_gate")
+                        same_gate = (
+                            isinstance(prior_blocked_gate, dict)
+                            and prior_blocked_gate.get("code") == "NEXT_TASK_WITHOUT_HANDOFF"
+                            and prior_blocked_gate.get("authority_task_id") == owner_task
+                            and prior_blocked_gate.get("repository_task_id") == repo_task
+                        )
                         authority["owner_gate"] = {
                             "code": "NEXT_TASK_WITHOUT_HANDOFF",
                             "reason": "review actuation is durably blocked and cannot drain autonomously",
                             "repository_task_id": repo_task,
                             "authority_task_id": owner_task,
                             "owners": copy.deepcopy(blocked_obligations),
-                            "recorded_at": utc_now_iso(),
+                            # Durable: repeated ticks must not re-stamp the gate.
+                            "recorded_at": (
+                                prior_blocked_gate.get("recorded_at") if same_gate
+                                else utc_now_iso()
+                            ),
                         }
                         authority["lifecycle_state"] = "OWNER_GATE"
                     elif "reviewer" in roles or "review_obligation" in roles:
@@ -2355,6 +2366,11 @@ class TransitionExecutor:
             "source_request_id": request_id,
             "successor_task_id": resolution.successor_task_id,
             "reason": None if applied else "source-task lifecycle ownership is not terminal",
+            # Ownership that has not drained yet is a wait, not a refusal: the
+            # transition is parked in waiting_source and will publish once the
+            # source drains.  Callers must not gate on it, or the only code that
+            # rebuilds a durable handoff would be fenced off permanently.
+            "waiting": not applied,
         }
 
     def reconcile_execution_loss(
