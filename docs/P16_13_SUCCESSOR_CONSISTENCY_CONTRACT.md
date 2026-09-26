@@ -1,6 +1,17 @@
 # P16.13 Successor Consistency and Zero-Touch Handoff Contract
 
-Status: IMPLEMENTED / TECHNICAL REVIEW PENDING
+Status: ACCEPTED / COMPLETE
+
+Closure evidence (2026-09-26): the canonical daemon was restarted onto the
+committed fence, `ops/p1613_lifecycle_smoke.py` passed 35/35 across two real
+60-second ticks, and the two legacy recovery counters remained stable at 244
+with `state=gated`, `fenced=true`, and stable gate identities. The final
+post-restart delta was independently reviewed through the normal
+AIReviewer/AIBroker path. Review `ai_review:p1613-closure-delta-0140cbd-r2`
+found one malformed-history fail-closed gap; commit `57c7f19` remediated it,
+and independent delta re-review
+`ai_review:p1613-closure-delta-57c7f19-r3` returned `next` with no findings.
+Final regression: 1,310 tests and 102 subtests passed.
 
 ## Incident and causal chain
 

@@ -1774,3 +1774,32 @@ Closed both concrete BLOCKING review findings from `ai_review:rereview:37165140-
   - Python compilation (`compileall`) and `git diff --check` clean.
   - Knowledge graph updated via `graphify update .` (6181 nodes, 17201 edges, 255 communities).
 - P16.11 is complete; handoff advances to P16.12 Web Sol Persistent Pairing & Truthful Availability (`agent/staged/P16.12.md`).
+
+### P16.13 Successor Consistency & Zero-Touch Handoff Recovery Closure (2026-09-26)
+
+- Implemented a single lifecycle authority and transition journal in the
+  existing transition-executor ledger, atomic successor publication, source
+  ownership draining, restart replay, centralized six-invariant evaluation,
+  staged/roadmap successor repair, missing-handoff recovery, and one bounded
+  diff-localized remediation-budget extension.
+- Converted the P16.12 -> P16.13 incident and the A-J fault matrix into durable
+  regressions, including a real zero-touch Watchdog -> control -> Planner ->
+  reviewed-plan path with no owner command.
+- Restarted the canonical daemon onto the committed recovery fence. Runtime
+  smoke passed 35/35 across two distinct 60-second ticks. Historical recovery
+  counts for `linescanviewer` and `xray-hw-platform` remained 244 while their
+  records converged to `state=gated`, `fenced=true`, with stable gate IDs.
+- Post-restart repair `0140cbd` fences legacy failed attempts without retrying
+  blocked actuation or changing historical counts.
+- Independent review `ai_review:p1613-closure-delta-0140cbd-r2` returned
+  `REMEDIATE` for malformed non-mapping recovery history. Commit `57c7f19`
+  preserves `null`/list/scalar evidence, records a deterministic diagnostic,
+  performs no recovery, and still records the generic non-recoverable owner
+  gate.
+- Independent provider re-review
+  `ai_review:p1613-closure-delta-57c7f19-r3` returned `NEXT` with no findings.
+- Final validation: 111 focused tests and 15 subtests passed; full regression
+  1,310 tests and 102 subtests passed in 588.16s; compileall, diff-check, and
+  Graphify update passed.
+- P16.13 has no roadmap successor and is COMPLETE. The two external project
+  owner gates remain correctly fail closed pending their owners' disposition.

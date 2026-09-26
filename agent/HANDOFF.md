@@ -1,15 +1,14 @@
 # P16.13 Handoff — Successor Consistency & Zero-Touch Handoff Recovery
 
-Last updated: 2026-09-26. Branch `main`, worktree clean at `989eefa`.
+Last updated: 2026-09-26. Branch `main`; implementation anchor `57c7f19`.
 
-Status: **REVIEW ACCEPTED / AWAITING DAEMON RESTART**. Implementation and
-independent Technical Review are complete. One closure gate remains and it needs
-owner action, not more implementation.
+Status: **COMPLETE / REVIEW ACCEPTED**. The canonical daemon restart, live
+runtime convergence, final remediation, independent delta re-review, and full
+regression are complete. No P16.13 closure gate remains.
 
-Repository state is authoritative. Verify everything below before acting on it.
-Live figures in section 3 were last confirmed at tick `2026-09-26T05:02:30Z`.
-The recovery counters advance once per tick until the daemon is restarted, so
-expect them to read higher.
+Repository state is authoritative. The two owner gates described in section
+4.1 belong to other projects and remain intentionally fail closed; they do not
+block P16.13.
 
 ## 1. What was done in this session
 
@@ -26,6 +25,8 @@ Continued from the interrupted Codex session. Commits on top of `9e5909a`:
 | `60ef19b` | End-to-end zero-touch test: closes acceptance 4, 6, 8 |
 | `9629c44` | Closes the deferred N1 and N2 findings |
 | `8565773` | Closes the N5 assertion-weak spots and acceptance 2 |
+| `0140cbd` | Migrates pre-fence failed recovery history to durable gated evidence without re-actuation |
+| `57c7f19` | Preserves malformed recovery history while still failing closed to the owner gate |
 
 The inherited dirty `src/dev_orchestrator/daemon.py` diff was classified **A
 (valid unfinished P16.13 work)** and committed as part of `f51a01b`. It was valid
@@ -42,70 +43,37 @@ the implementer's conclusions.
 
 ## 2. Current validation state
 
-- Full Python regression: **1,308 tests + 99 subtests** passing.
-- P16.13 suite: **36 tests + 7 subtests** passing.
+- Full Python regression: **1,310 tests + 102 subtests** passing.
+- Final focused lifecycle/watchdog/daemon suite: **111 tests + 15 subtests** passing.
 - `python -m compileall -q src ops tests_py` clean; `git diff --check` clean.
-- Runtime smoke `python ops/p1613_lifecycle_smoke.py`: **33 of 35 checks pass**.
-  The two failures are the undeployed-fix symptom described in section 3.
+- Runtime smoke `python ops/p1613_lifecycle_smoke.py`: **35 of 35 checks pass**
+  across two distinct real daemon ticks.
 - Live `devorchestrator` authority: `current_task_id=P16.13`,
   `lifecycle_state=READY_TO_RUN`, `matches_authority=true`, no owner gate, no
   surviving predecessor owner. **The original P16.12 -> P16.13 incident is
   resolved.**
 
-## 3. THE ONE BLOCKING ITEM: the canonical daemon still runs pre-fix code
+## 3. RESOLVED: canonical daemon restart and recovery fencing
 
-The running daemon is **PID 26264**, started `2026-09-26T00:47:00Z`, i.e. before
-any of this session's commits. It therefore does not have the recovery fence
-loaded. Consequence, observed live and still growing:
-
-```
-linescanviewer     lifecycle_recovery_attempts count=240 state=failed  gate_id=None
-xray-hw-platform   lifecycle_recovery_attempts count=240 state=failed  gate_id=None
-devorchestrator    lifecycle_recovery_attempts count=1   state=recovered
-```
-
-The counters climbed 63 -> 91 -> 121 -> 137 -> 240 over the course of the
-session, one per 60-second tick, and keep climbing until the restart. This is the
-B1 loop, still live, purely because the fix is committed but not deployed.
-
-**Required action (owner).** Restart the daemon so it loads the fence. In-session
-restart was attempted and **denied by the environment's permission classifier
-(`Interfere With Workloads`)**; it was deliberately not routed around. Zero
-active executions were verified before the attempt, so a restart interrupts no
-Worker.
-
-`ops/stop-monitor.ps1` reads `runtime/monitor.pid`, which is currently **empty**,
-so it will probably not find the process. The daemon's actual invocation is:
+The stale PID 26264 was stopped cleanly with no broker interruption. After the
+daemon loaded the committed fence, both historical attempts converged in place:
 
 ```
-python -m dev_orchestrator daemon \
-  --config C:\work\github\DevOrchestrator-dev\config\projects.json \
-  --runtime-root C:\work\github\DevOrchestrator-dev\runtime \
-  --web-root C:\work\github\DevOrchestrator-dev\web \
-  --listen 127.0.0.1 --port 8770 \
-  --bridge-listen 127.0.0.1 --bridge-port 8765 --interval 60
+linescanviewer     count=244 state=gated fenced=true
+xray-hw-platform   count=244 state=gated fenced=true
 ```
 
-**Expected post-restart behavior.** Each gated project performs **at most one
-more** recovery attempt -- whatever the counter reads, plus one -- because the
-legacy gate records predate the `recovery_key` field. It then fences permanently
-with `state="gated"`, `fenced=true`, and a stable `gate_id`. Then re-run the
-smoke:
-
-```
-python ops/p1613_lifecycle_smoke.py
-```
-
-It should report **35 of 35**. The smoke judges boundedness structurally (attempt
-is `recovered`, `gated`, or a transient wait) rather than by the absolute
-counter, because a ledger written before the fence keeps its historical count.
+Their counts and gate IDs remained byte-stable across the next real 60-second
+tick, and the runtime smoke passed 35/35 twice. The restart also exposed the
+legacy migration gap closed by `0140cbd` and the malformed-history case closed
+by `57c7f19`. Independent review first returned `REMEDIATE`; the bounded delta
+re-review then returned `NEXT` with no findings.
 
 ## 4. Issue status
 
-Still open: the daemon restart in section 3, the two per-project dispositions in
-4.1, and the accepted fail-closed risk N-C in 4.2. Everything else recorded here
-is closed, with the commit that closed it named. Nothing in this section blocks
-P16.13 closure except section 3.
+P16.13 is closed. Still open outside this task are the two per-project owner
+dispositions in 4.1 and the accepted fail-closed risk N-C in 4.2. Neither is a
+P16.13 closure blocker.
 
 ### 4.1 Needs owner disposition, not code (liveness, per-project)
 
@@ -181,15 +149,11 @@ No known test-strength gaps remain in the A-J matrix.
 
 ## 5. Recommended order for the next session
 
-1. Restart the daemon (section 3) and re-run the smoke; confirm 35/35 and that
-   the counters stop at one past their current value with `state="gated"` and a
-   non-null `gate_id`. **This is the only remaining closure gate, and it is
-   operational, not implementation.**
-2. Then P16.13 can be closed and the roadmap advanced.
-
-Everything in section 4.2 that was open in code is now closed. The only recorded
-residual is **N-C**, an accepted fail-closed risk that is not reachable in any
-live project. Do not restart full planning for any of the above.
+No P16.13 continuation work remains. Do not restart planning or implementation
+for this task. If work resumes on the two external owner gates, treat each as a
+separate per-project owner disposition and preserve its gated evidence. The only
+recorded P16.13 residual is **N-C**, an accepted fail-closed risk that is not
+reachable in any live project.
 
 ## 6. Reference
 

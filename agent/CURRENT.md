@@ -5,7 +5,34 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P16.13 Successor Consistency & Zero-Touch Handoff Recovery** (Status: **REVIEW ACCEPTED / AWAITING DAEMON RESTART**). Previous task: **P16.12 Web Sol Persistent Pairing & Truthful Availability** (Status: **COMPLETE**).
+Current task: **P16.13 Successor Consistency & Zero-Touch Handoff Recovery** (Status: **COMPLETE**). Previous task: **P16.12 Web Sol Persistent Pairing & Truthful Availability** (Status: **COMPLETE**).
+
+P16.13 final closure evidence (2026-09-26):
+- Restarted the canonical daemon from stale PID 26264 onto the committed
+  lifecycle fence. The real runtime smoke passed 35/35 twice across distinct
+  60-second ticks. `linescanviewer` and `xray-hw-platform` each retained its
+  historical count of 244 while converging to `state=gated`, `fenced=true`,
+  with a stable non-null gate ID; no recovery was re-actuated.
+- Live `devorchestrator` authority remained P16.13 with repository/authority
+  agreement, no owner gate, no predecessor owner, and all six invariants held.
+- The restart exposed a legacy-attempt migration omission. Commit `0140cbd`
+  fenced matching historical failed attempts without changing their counts or
+  retrying blocked actuation.
+- Normal independent review
+  `ai_review:p1613-closure-delta-0140cbd-r2` returned `REMEDIATE` for one
+  malformed-history fail-closed gap. Commit `57c7f19` preserves malformed
+  `null`/list/scalar evidence, records a deterministic diagnostic, invokes no
+  recovery, and still records the generic non-recoverable owner gate.
+- Independent provider delta re-review
+  `ai_review:p1613-closure-delta-57c7f19-r3` returned `NEXT` with no findings.
+  Reviewer resource: `agy/agy-1/claude-opus-4-6-thinking`; the prior Codex
+  reviewer and failed `claude/default/opus` resource were excluded.
+- Final focused verification: 111 tests and 15 subtests passed. Final full
+  regression: 1,310 tests and 102 subtests passed in 588.16s. `compileall`,
+  `git diff --check`, and Graphify update passed.
+- P16.13 has no roadmap successor. The two external-project owner gates remain
+  deliberately fail closed and require per-project owner disposition; they do
+  not block this task's accepted closure.
 
 P16.13 review and remediation evidence (2026-09-26):
 - Projection boundary (`f51a01b`): the lifecycle authority overlay is re-applied
