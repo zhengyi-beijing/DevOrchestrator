@@ -26,6 +26,7 @@ from dev_orchestrator.core.successor_consistency import (
     resolve_successor,
 )
 from dev_orchestrator.core.transition_executor import TransitionExecutor
+from dev_orchestrator.core.repository import read_repository_truth
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -1145,6 +1146,111 @@ class ZeroTouchSuccessorHandoffEndToEndTests(unittest.TestCase):
                 if isinstance(row, dict) and row.get("project_id") == "p1"
             ]), 1, "repeated ticks launched a duplicate Planner")
         self.assertEqual(self._owner_commands(), [])
+
+
+class DeferredReviewFindingTests(unittest.TestCase):
+    """Deferred NON_BLOCKING review findings N1 and N2."""
+
+    def test_N1_executor_state_loss_does_not_publish_a_clean_bill_of_health(self):
+        """Absent ownership evidence must be recorded, not answered."""
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runtime = root / "runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            repo = _repo(root)
+            config_path = runtime / "projects.json"
+            config_path.write_text(json.dumps({"projects": [{
+                "project_id": "p1", "repo_path": str(repo),
+                "watchdog": {"enabled": True, "auto_recovery": True,
+                             "no_progress_threshold_minutes": 1},
+            }]}), encoding="utf-8")
+
+            class _BrokenExecutor:
+                def state(self):
+                    raise RuntimeError("ledger is unreadable")
+
+            watchdog = WatchdogCoordinator(runtime)
+            snapshot = _summary(repo, "P2")["projects"][0]
+            watchdog.advance(str(config_path), {"projects": [snapshot]},
+                             executor=_BrokenExecutor())
+            for thread in getattr(watchdog, "_threads", {}).values():
+                thread.join(timeout=10.0)
+
+            row = (watchdog.state().get("projects") or {}).get("p1") or {}
+            self.assertEqual(
+                row.get("lifecycle_invariants"), [],
+                "invariants were evaluated from an empty ledger",
+            )
+            self.assertIn(
+                "executor_state_unavailable", str(row.get("lifecycle_evidence_unavailable")),
+                "the loss of ownership evidence was not recorded",
+            )
+            self.assertEqual(
+                row.get("unresolved_invariants"), [],
+                "absent evidence was reported as a set of resolved invariants",
+            )
+
+    def test_N2_absent_roadmap_with_staged_claim_fails_closed(self):
+        """A missing roadmap is not evidence that the project is complete."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _repo(root)
+            # Drop the roadmap entirely; agent/staged/P2.md still declares
+            # "Predecessor: P1".
+            (repo / "agent" / "staged" / "roadmap.json").unlink()
+            _commit(repo, "remove roadmap")
+
+            resolution = resolve_successor(str(repo), "P1")
+            self.assertEqual(
+                resolution.kind, "inconsistent",
+                f"an unambiguous staged claim was ignored: kind={resolution.kind}",
+            )
+            self.assertEqual(resolution.successor_task_id, "P2")
+            self.assertIn("ROADMAP_SUCCESSOR_INCONSISTENT", str(resolution.reason))
+
+    def test_N2_absent_roadmap_without_staged_claim_stays_absent(self):
+        """With no staged evidence there is nothing to fail closed on."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _repo(root)
+            (repo / "agent" / "staged" / "roadmap.json").unlink()
+            (repo / "agent" / "staged" / "P2.md").unlink()
+            _commit(repo, "remove roadmap and staged successor")
+            self.assertEqual(resolve_successor(str(repo), "P1").kind, "absent")
+
+    def test_N2_failed_reconcile_does_not_leave_a_created_roadmap_behind(self):
+        """A rollback must not dirty the tree and block later recovery."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _repo(root)
+            roadmap = repo / "agent" / "staged" / "roadmap.json"
+            roadmap.unlink()
+            _commit(repo, "remove roadmap")
+            before = read_repository_truth(repo)
+            self.assertFalse(before.dirty, "fixture did not start clean")
+
+            resolution = resolve_successor(str(repo), "P1")
+            self.assertEqual(resolution.kind, "inconsistent")
+
+            # Fail the validation stage after the roadmap has been written.
+            with patch(
+                "dev_orchestrator.core.successor_consistency.read_successor",
+                side_effect=RuntimeError("validate failed"),
+            ):
+                outcome = reconcile_roadmap_successor(str(repo), "P1", resolution)
+
+            self.assertEqual(outcome.status, "rejected")
+            self.assertFalse(
+                roadmap.exists(),
+                "a roadmap created by the failed attempt was left in the worktree",
+            )
+            after = read_repository_truth(repo)
+            self.assertFalse(
+                after.dirty,
+                "the failed reconcile dirtied the tree, blocking later recovery",
+            )
 
 
 if __name__ == "__main__":

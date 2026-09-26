@@ -143,6 +143,14 @@ _FORBIDDEN_KEY_PATTERNS = (
 )
 
 
+class _LifecycleEvidenceUnavailable(Exception):
+    """The executor ledger could not be read, so invariants are unevaluable.
+
+    Raised to skip the lifecycle-invariant block rather than let it answer from
+    an empty ledger, which would report five of the six invariants as holding.
+    """
+
+
 def canonical_path(p: Path | str) -> str:
     """Normcase, realpath and abspath canonical identity."""
     return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(p))))
@@ -1603,11 +1611,13 @@ class WatchdogCoordinator:
         }
 
         executor_state: Optional[dict[str, Any]] = None
+        executor_state_error: Optional[str] = None
         if executor is not None and hasattr(executor, "state"):
             try:
                 executor_state = executor.state()
-            except Exception:
+            except Exception as exc:
                 executor_state = None
+                executor_state_error = f"executor_state_unavailable: {exc}"
 
         with self._lock:
             self._reap_overdue_attempts(tick_now)
@@ -1676,6 +1686,24 @@ class WatchdogCoordinator:
                     # re-opening the authority/Watchdog divergence.
                     if not isinstance(decisions_state, dict):
                         decisions_state = {}
+                    # Without the executor ledger there is no ownership,
+                    # handoff or authority evidence, so five of the six
+                    # invariants would evaluate to "holds" and this tick would
+                    # publish a clean bill of health derived from absent
+                    # evidence.  Record the loss and skip the block instead.
+                    if executor_state is None and executor is not None:
+                        prow["lifecycle_invariants"] = []
+                        prow["unresolved_invariants"] = []
+                        prow["lifecycle_evidence_unavailable"] = (
+                            executor_state_error or "executor_state_unavailable"
+                        )
+                        prow["last_error"] = (
+                            executor_state_error or "executor_state_unavailable"
+                        )
+                        raise _LifecycleEvidenceUnavailable(
+                            executor_state_error or "executor_state_unavailable"
+                        )
+                    prow.pop("lifecycle_evidence_unavailable", None)
                     lifecycle_findings = evaluate_lifecycle_invariants(
                         snapshot=snapshot,
                         executor_state=executor_state or {},
@@ -1800,6 +1828,10 @@ class WatchdogCoordinator:
                                 occurrence_key=f"lifecycle:{finding.code}:{occurrence}",
                                 details={"reason": finding.reason, "evidence": finding.evidence},
                             )
+                except _LifecycleEvidenceUnavailable:
+                    # Already recorded on prow; the invariant block is skipped
+                    # rather than answered from absent evidence.
+                    pass
                 except Exception as exc:
                     prow["last_error"] = f"lifecycle_invariant_evaluation_failed: {exc}"
 

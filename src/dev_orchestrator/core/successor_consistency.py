@@ -153,7 +153,11 @@ def resolve_successor(repo_path: str | Path, completed_task_id: str) -> Successo
             spec_text=roadmap.spec_text,
             evidence="roadmap" if claim is None else "roadmap+staged_claim",
         )
-    if roadmap.kind in {"end_of_roadmap", "unlisted"} and claim is not None:
+    # An absent roadmap is not evidence that the project is finished.  When a
+    # staged task unambiguously declares this task as its predecessor, that
+    # claim must win over the missing file, or the caller terminal-settles the
+    # project as complete while an unambiguous successor is staged.
+    if roadmap.kind in {"end_of_roadmap", "unlisted", "absent"} and claim is not None:
         try:
             text = (Path(repo_path) / claim.spec_path).read_text(encoding="utf-8")
         except OSError as exc:
@@ -233,6 +237,16 @@ def reconcile_roadmap_successor(
                 roadmap_path.write_bytes(original)
                 subprocess.run(
                     ["git", "-C", str(repo), "add", "--", "agent/staged/roadmap.json"],
+                    check=False, capture_output=True, text=True,
+                )
+            else:
+                # The roadmap did not exist before this attempt, so leaving the
+                # file behind would dirty the tree and permanently block the
+                # clean-worktree precondition that every later recovery needs.
+                roadmap_path.unlink(missing_ok=True)
+                subprocess.run(
+                    ["git", "-C", str(repo), "rm", "--cached", "--quiet", "--ignore-unmatch",
+                     "--", "agent/staged/roadmap.json"],
                     check=False, capture_output=True, text=True,
                 )
             return ReconcileOutcome(status="rejected", reason=str(exc))
