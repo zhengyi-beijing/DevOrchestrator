@@ -101,15 +101,28 @@ def active_owners(
             completed_at = parse_utc(row.get("completed_at") or row.get("started_at"))
             resolved_by_barrier = False
             for barrier in lifecycle_barriers:
+                # Only accepted history may supersede a pending-review flag:
+                # a barrier for the same task, or a consumed handoff (immutable
+                # accepted history, including legacy chains that skipped or
+                # renamed intermediate task identities).  An unconsumed barrier
+                # for an unrelated task is live work, not history, and must
+                # never drain another task's obligation -- P16.13's own recovery
+                # path mints exactly such freshly stamped cross-task barriers.
+                if not (
+                    str(barrier.get("task_id") or "") == str(row.get("task_id") or "")
+                    or barrier.get("handoff_consumed") is True
+                ):
+                    continue
                 barrier_at = parse_utc(
                     barrier.get("handoff_consumed_at")
                     or barrier.get("recorded_at")
                     or barrier.get("completed_at")
                 )
-                if completed_at is None or barrier_at is None or barrier_at >= completed_at:
-                    # Any later project lifecycle barrier supersedes older
-                    # pending-review flags, including legacy chains that
-                    # skipped or renamed intermediate task identities.
+                # Unknown ordering cannot prove supersession: fail closed and
+                # keep the obligation rather than draining it.
+                if completed_at is None or barrier_at is None:
+                    continue
+                if barrier_at >= completed_at:
                     resolved_by_barrier = True
                     break
             if resolved_by_barrier:
@@ -123,7 +136,16 @@ def active_owners(
                 and isinstance(transition, dict)
                 and transition.get("state") not in {"blocked", "recovery_required"}
             ):
-                owners.append({"role": "review_obligation", "id": review_id, "task_id": row.get("task_id")})
+                owners.append({
+                    "role": "review_obligation", "id": review_id,
+                    "task_id": row.get("task_id"),
+                    # A durably blocked/recovery_required actuation cannot drain
+                    # on its own, so the authority must gate rather than pin
+                    # silently on it forever.
+                    "actuation_state": (
+                        transition.get("state") if isinstance(transition, dict) else None
+                    ),
+                })
     plans = planner_state.get("plans") if isinstance(planner_state, dict) else {}
     for row in (plans or {}).values():
         if isinstance(row, dict) and row.get("project_id") == project_id and row.get("state") in ACTIVE_PLAN_STATES:
@@ -177,7 +199,12 @@ def evaluate_lifecycle_invariants(
         row for row in (executions or {}).values()
         if isinstance(row, dict) and row.get("project_id") == project_id and row.get("state") == "handoff"
     ]
-    decisions = decisions_state.get("decisions") if isinstance(decisions_state, dict) else {}
+    # NEXT_TASK_WITHOUT_HANDOFF is derived exclusively from the decisions
+    # ledger.  Without it the invariant is not satisfied, it is unevaluable, so
+    # record that explicitly instead of letting a call site publish a
+    # satisfied verdict it was never given the evidence to reach.
+    decisions_available = isinstance(decisions_state, dict)
+    decisions = decisions_state.get("decisions") if decisions_available else {}
     next_decisions: list[dict[str, Any]] = []
     for decision_id, row in (decisions or {}).items():
         if not isinstance(row, dict) or row.get("project_id") != project_id:
@@ -191,6 +218,14 @@ def evaluate_lifecycle_invariants(
         request_id = str(row.get("request_id") or decision_id or "")
         actuation = (executions or {}).get(request_id)
         satisfied = isinstance(actuation, dict) and actuation.get("state") in {"handoff", "settled"}
+        # A durably blocked/recovery_required actuation is not a lost handoff
+        # that recovery can rebuild: the handoff was attempted and refused, and
+        # the row is never revisited.  Retrying it every tick cannot converge,
+        # so it is owner-gate evidence rather than recovery input.
+        actuation_blocked = (
+            isinstance(actuation, dict)
+            and actuation.get("state") in {"blocked", "recovery_required"}
+        )
         if not satisfied:
             decision_at = parse_utc(row.get("consumed_at") or row.get("created_at"))
             for candidate in (executions or {}).values():
@@ -211,7 +246,10 @@ def evaluate_lifecycle_invariants(
                     satisfied = True
                     break
         if not satisfied:
-            next_decisions.append({**row, "request_id": request_id})
+            next_decisions.append({
+                **row, "request_id": request_id,
+                "actuation_blocked": actuation_blocked,
+            })
 
     current_holds = not worker_owners or all(str(owner.get("task_id") or "") == authority_task for owner in worker_owners)
     terminal_holds = not (authority_state in {"COMPLETE", "SETTLED"} and worker_owners)
@@ -234,6 +272,18 @@ def evaluate_lifecycle_invariants(
             lineage_bad.append(row)
     lineage_holds = not lineage_bad
     next_without = bool(next_decisions)
+    # Recovery can only rebuild a genuinely missing handoff.  When every
+    # unsatisfied decision is durably blocked, autonomous recovery cannot
+    # converge, so the finding is not recoverable and must fail closed to an
+    # owner gate instead of being retried on every tick.
+    # Absent evidence is never treated as a recoverable condition either: it
+    # gates for owner disposition instead of driving blind recovery attempts.
+    if not decisions_available:
+        next_recoverable = False
+    elif next_decisions:
+        next_recoverable = any(not row.get("actuation_blocked") for row in next_decisions)
+    else:
+        next_recoverable = True
     single_owner_holds = len(owner_tasks) <= 1 and len([o for o in owners if o.get("role") != "review_obligation"]) <= 1
 
     return (
@@ -249,13 +299,19 @@ def evaluate_lifecycle_invariants(
         InvariantFinding("SUCCESSOR_HANDOFF_LINEAGE_VALID", lineage_holds, False,
                          "handoff lineage requires distinct source and target identities",
                          {"invalid_handoffs": lineage_bad}),
-        InvariantFinding("NEXT_TASK_WITHOUT_HANDOFF", not next_without, True,
-                         "accepted NEXT_TASK must have a durable handoff",
+        InvariantFinding("NEXT_TASK_WITHOUT_HANDOFF",
+                         not next_without if decisions_available else False,
+                         next_recoverable,
+                         "accepted NEXT_TASK must have a durable handoff"
+                         if decisions_available else
+                         "decisions ledger unavailable: NEXT_TASK_WITHOUT_HANDOFF is unevaluable",
                          {"next_decisions": [
-                              {"request_id": row.get("request_id"), "task_id": row.get("task_id")}
+                              {"request_id": row.get("request_id"), "task_id": row.get("task_id"),
+                               "actuation_blocked": bool(row.get("actuation_blocked"))}
                               for row in next_decisions
                           ], "handoffs": len(handoffs),
-                          "transitions": len(transitions or {})}),
+                          "transitions": len(transitions or {}),
+                          "evidence_unavailable": not decisions_available}),
         InvariantFinding("SINGLE_ACTIVE_LIFECYCLE_OWNER", single_owner_holds, False,
                          "only one lifecycle role may own a project",
                          {"owners": owners, "owner_tasks": sorted(owner_tasks)}),

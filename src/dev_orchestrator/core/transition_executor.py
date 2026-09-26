@@ -695,6 +695,9 @@ class TransitionExecutor:
         the lineage.
         """
         snapshots = _snapshot_map(summary)
+        decisions_state = read_json(self.runtime_root / "review-decisions.json", {})
+        if not isinstance(decisions_state, dict):
+            decisions_state = {}
         with self._lock:
             ledger = self._load_ledger()
             lifecycle = ledger.setdefault("lifecycle", {})
@@ -777,8 +780,27 @@ class TransitionExecutor:
                     authority["current_task_id"] = owner_task
                     authority["active_owner"] = copy.deepcopy(owners[0] if len(owners) == 1 else owners)
                     roles = {str(owner.get("role") or "") for owner in owners}
+                    # A review obligation whose actuation is durably blocked can
+                    # never drain by itself, so pinning the authority to it
+                    # while the repository has advanced is an unbounded stall
+                    # with no owner-visible state.  Gate instead.
+                    blocked_obligations = [
+                        owner for owner in owners
+                        if owner.get("role") == "review_obligation"
+                        and owner.get("actuation_state") in {"blocked", "recovery_required"}
+                    ]
                     if "worker" in roles:
                         authority["lifecycle_state"] = "EXECUTING"
+                    elif blocked_obligations and repo_task != owner_task:
+                        authority["owner_gate"] = {
+                            "code": "NEXT_TASK_WITHOUT_HANDOFF",
+                            "reason": "review actuation is durably blocked and cannot drain autonomously",
+                            "repository_task_id": repo_task,
+                            "authority_task_id": owner_task,
+                            "owners": copy.deepcopy(blocked_obligations),
+                            "recorded_at": utc_now_iso(),
+                        }
+                        authority["lifecycle_state"] = "OWNER_GATE"
                     elif "reviewer" in roles or "review_obligation" in roles:
                         authority["lifecycle_state"] = "REVIEWING"
                     elif "planner" in roles:
@@ -887,6 +909,12 @@ class TransitionExecutor:
                     executor_state=ledger,
                     planner_state=planner_state if isinstance(planner_state, dict) else None,
                     reviewer_state=reviewer_state if isinstance(reviewer_state, dict) else None,
+                    # NEXT_TASK_WITHOUT_HANDOFF is derived only from the
+                    # decisions ledger.  Omitting it here made the authority of
+                    # record attest that the invariant held while the Watchdog,
+                    # reading the same evaluator with the ledger, reported it
+                    # violated for the same project and tick.
+                    decisions_state=decisions_state,
                 )
                 authority["invariants"] = invariant_payload(findings)
             self._save_ledger(ledger)

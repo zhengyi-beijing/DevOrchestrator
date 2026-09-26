@@ -16,7 +16,11 @@ from unittest.mock import patch
 
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.daemon import _run_orchestration_tick
-from dev_orchestrator.core.lifecycle_authority import active_owners, evaluate_lifecycle_invariants
+from dev_orchestrator.core.lifecycle_authority import (
+    active_owners,
+    evaluate_lifecycle_invariants,
+    source_ownership_blockers,
+)
 from dev_orchestrator.core.successor_consistency import (
     reconcile_roadmap_successor,
     resolve_successor,
@@ -554,6 +558,290 @@ class AuthorityProjectionDerivationTests(unittest.TestCase):
         self.assertNotIn("authoritative_lifecycle", result["projects"][0])
         self.assertEqual(watchdog.calls, 1)
         self.assertEqual(supervisor.calls, 1)
+
+
+class ReviewFindingRegressionTests(unittest.TestCase):
+    """Technical Review findings B2-B4 from the P16.13 independent review."""
+
+    # -- B3: barrier scoping ----------------------------------------------
+    def _pending_obligation_state(self, barrier: dict | None) -> dict:
+        executions = {"run-pred": {
+            "project_id": "p1", "task_id": "P16.12", "state": "completed",
+            "review_state": "pending", "source_request_id": "wd-pred",
+            "completed_at": "2026-09-26T05:00:00+00:00",
+        }}
+        if barrier is not None:
+            executions["barrier"] = barrier
+        return {"executions": executions, "lifecycle": {}, "transitions": {}}
+
+    def test_B3_unconsumed_cross_task_barrier_cannot_drain_an_obligation(self):
+        """P16.13's own recovery mints freshly stamped cross-task barriers."""
+        state = self._pending_obligation_state({
+            "project_id": "p1", "task_id": "P12.6", "source_task_id": "P12.6",
+            "target_task_id": "P12.7", "state": "handoff",
+            "recorded_at": "2026-09-26T06:00:00+00:00",
+        })
+        self.assertEqual(
+            [o.get("task_id") for o in active_owners("p1", state)], ["P16.12"],
+            "an unconsumed barrier for an unrelated task drained a live obligation",
+        )
+        self.assertEqual(
+            [o.get("task_id") for o in source_ownership_blockers("p1", "P16.12", state)],
+            ["P16.12"],
+        )
+
+    def test_B3_consumed_history_and_same_task_barriers_still_supersede(self):
+        """The accepted legacy-migration behavior must be preserved."""
+        consumed = self._pending_obligation_state({
+            "project_id": "p1", "task_id": "P12.6", "state": "handoff",
+            "handoff_consumed": True,
+            "handoff_consumed_at": "2026-09-26T06:00:00+00:00",
+        })
+        self.assertEqual(active_owners("p1", consumed), [])
+        same_task = self._pending_obligation_state({
+            "project_id": "p1", "task_id": "P16.12", "state": "settled",
+            "recorded_at": "2026-09-26T06:00:00+00:00",
+        })
+        self.assertEqual(active_owners("p1", same_task), [])
+
+    def test_B3_unknown_ordering_fails_closed(self):
+        state = self._pending_obligation_state({
+            "project_id": "p1", "task_id": "P16.12", "state": "settled",
+        })
+        state["executions"]["run-pred"].pop("completed_at")
+        self.assertEqual(
+            [o.get("task_id") for o in active_owners("p1", state)], ["P16.12"],
+            "an unparseable barrier ordering drained the obligation",
+        )
+
+    # -- B2 / B4: evidence and disposition --------------------------------
+    def _next_decision_fixture(self, actuation_state: str | None):
+        snapshot = {"project_id": "p1", "telemetry": {"task_id": "P2"}, "state": "IDLE"}
+        executions = {}
+        if actuation_state is not None:
+            executions["ai_review:d1"] = {
+                "project_id": "p1", "task_id": "P1", "state": actuation_state,
+            }
+        state = {
+            "lifecycle": {"p1": {"current_task_id": "P1", "lifecycle_state": "REVIEWING"}},
+            "executions": executions, "transitions": {},
+        }
+        decisions = {"decisions": {"d1": {
+            "project_id": "p1", "task_id": "P1", "disposition": "apply",
+            "decision": "next", "next_action": "next_task",
+            "request_id": "ai_review:d1", "consumed_at": "2026-09-22T20:51:00+00:00",
+        }}}
+        return snapshot, state, decisions
+
+    def _finding(self, snapshot, state, decisions=None):
+        kwargs = {"snapshot": snapshot, "executor_state": state}
+        if decisions is not None:
+            kwargs["decisions_state"] = decisions
+        return {
+            item.code: item for item in evaluate_lifecycle_invariants(**kwargs)
+        }["NEXT_TASK_WITHOUT_HANDOFF"]
+
+    def test_B2_missing_decisions_evidence_is_not_reported_as_satisfied(self):
+        snapshot, state, _ = self._next_decision_fixture(None)
+        finding = self._finding(snapshot, state)
+        self.assertFalse(
+            finding.holds,
+            "the evaluator claimed an invariant held that it had no evidence to test",
+        )
+        self.assertTrue(finding.evidence.get("evidence_unavailable"))
+        self.assertFalse(finding.recoverable, "absent evidence must not drive recovery")
+
+    def test_B2_reconciliation_records_the_same_verdict_as_an_independent_check(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _repo(root)
+            runtime = root / "runtime"
+            runtime.mkdir(parents=True, exist_ok=True)
+            executor = TransitionExecutor(runtime)
+            (runtime / "review-decisions.json").write_text(json.dumps({"decisions": {"d1": {
+                "project_id": "p1", "task_id": "P1", "disposition": "apply",
+                "decision": "next", "next_action": "next_task",
+                "request_id": "ai_review:d1",
+                "consumed_at": "2026-09-22T20:51:00+00:00",
+            }}}), encoding="utf-8")
+
+            snapshot = _summary(repo, "P2")["projects"][0]
+            executor.reconcile_lifecycle_authority({"projects": [snapshot]})
+            recorded = {
+                row["code"]: row
+                for row in executor.state()["lifecycle"]["p1"]["invariants"]
+            }["NEXT_TASK_WITHOUT_HANDOFF"]
+
+            independent = self._finding(
+                snapshot, executor.state(),
+                json.loads((runtime / "review-decisions.json").read_text(encoding="utf-8")),
+            )
+            self.assertEqual(
+                recorded["holds"], independent.holds,
+                "the authority of record disagreed with an independent evaluation",
+            )
+            self.assertFalse(
+                recorded["holds"],
+                "an unsatisfied NEXT_TASK decision was attested as satisfied",
+            )
+
+    def test_B4_durably_blocked_actuation_gates_instead_of_recovering(self):
+        snapshot, state, decisions = self._next_decision_fixture("blocked")
+        finding = self._finding(snapshot, state, decisions)
+        self.assertFalse(finding.holds)
+        self.assertFalse(
+            finding.recoverable,
+            "a durably blocked actuation was offered to recovery, which cannot converge",
+        )
+        self.assertTrue(finding.evidence["next_decisions"][0]["actuation_blocked"])
+
+    def test_B4_missing_actuation_remains_zero_touch_recoverable(self):
+        """Liveness: a genuinely lost handoff must still heal automatically."""
+        snapshot, state, decisions = self._next_decision_fixture(None)
+        finding = self._finding(snapshot, state, decisions)
+        self.assertFalse(finding.holds)
+        self.assertTrue(finding.recoverable)
+
+    def test_B4_blocked_obligation_gates_the_authority_idempotently(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _repo(root)
+            executor = TransitionExecutor(root / "runtime")
+            ledger = executor.state()
+            ledger["executions"]["run-p1"] = {
+                "project_id": "p1", "task_id": "P1", "state": "completed",
+                "review_state": "pending", "source_request_id": "req-p1",
+                "completed_at": "2026-09-22T20:00:00+00:00",
+            }
+            ledger["executions"]["ai_review:req-p1"] = {
+                "project_id": "p1", "task_id": "P1", "state": "blocked",
+                "reason": "project is not READY_TO_RUN",
+            }
+            executor._save_ledger(ledger)
+
+            snapshot = _summary(repo, "P2")["projects"][0]
+            reviewer_state = {"reviews": {"ai_review:req-p1": {
+                "project_id": "p1", "task_id": "P1", "state": "completed",
+            }}}
+            executor.reconcile_lifecycle_authority(
+                {"projects": [snapshot]}, reviewer_state=reviewer_state)
+            authority = executor.state()["lifecycle"]["p1"]
+            self.assertEqual(authority["lifecycle_state"], "OWNER_GATE")
+            self.assertEqual(
+                (authority.get("owner_gate") or {}).get("code"),
+                "NEXT_TASK_WITHOUT_HANDOFF",
+                "a blocked obligation pinned the authority with no owner-visible gate",
+            )
+
+            first = copy.deepcopy(authority["owner_gate"])
+            for _ in range(3):
+                executor.reconcile_lifecycle_authority(
+                    {"projects": [snapshot]}, reviewer_state=reviewer_state)
+            again = executor.state()["lifecycle"]["p1"]["owner_gate"]
+            self.assertEqual(again.get("code"), first.get("code"))
+            self.assertEqual(again.get("authority_task_id"), first.get("authority_task_id"))
+
+
+class BoundedRecoveryActuationTests(unittest.TestCase):
+    """B1/N4: drive the real Watchdog so recovery actuation itself is covered."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.runtime = root / "runtime"
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        self.repo = _repo(root)
+        self.config_path = self.runtime / "projects.json"
+        self.config_path.write_text(json.dumps({"projects": [{
+            "project_id": "p1",
+            "repo_path": str(self.repo),
+            "watchdog": {"enabled": True, "auto_recovery": True,
+                         "no_progress_threshold_minutes": 1},
+        }]}), encoding="utf-8")
+        (self.runtime / "review-decisions.json").write_text(json.dumps({"decisions": {"d1": {
+            "project_id": "p1", "task_id": "P1", "disposition": "apply",
+            "decision": "next", "next_action": "next_task",
+            "request_id": "ai_review:d1", "consumed_at": "2026-09-22T20:51:00+00:00",
+        }}}), encoding="utf-8")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    class _CountingExecutor:
+        """Handoff recovery that always fails for the given reason."""
+
+        def __init__(self, reason):
+            self.calls = 0
+            self.reason = reason
+            self.ledger = {
+                "executions": {}, "transitions": {},
+                "lifecycle": {"p1": {
+                    "current_task_id": "P1", "lifecycle_state": "REVIEWING",
+                }},
+            }
+
+        def state(self):
+            return copy.deepcopy(self.ledger)
+
+        def reconcile_successor_handoff(self, _pcfg, _snapshot, *, completed_task_id, trigger):
+            self.calls += 1
+            return {"status": "blocked", "reason": self.reason}
+
+    def _drive(self, reason, ticks):
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        executor = self._CountingExecutor(reason)
+        watchdog = WatchdogCoordinator(self.runtime)
+        snapshot = _summary(self.repo, "P2")["projects"][0]
+        for _ in range(ticks):
+            watchdog.advance(str(self.config_path), {"projects": [snapshot]},
+                             executor=executor)
+            for thread in getattr(watchdog, "_threads", {}).values():
+                thread.join(timeout=10.0)
+        row = (watchdog.state().get("projects") or {}).get("p1") or {}
+        return executor, row
+
+    def test_B1_non_transient_failure_gates_and_stops_actuating(self):
+        executor, row = self._drive("agent/staged/roadmap.json does not exist", ticks=6)
+        self.assertGreaterEqual(executor.calls, 1, "recovery never ran at all")
+        self.assertLessEqual(
+            executor.calls, 2,
+            f"recovery kept actuating after the owner gate was declared "
+            f"({executor.calls} calls over 6 ticks)",
+        )
+        gate = row.get("owner_gate")
+        self.assertIsInstance(gate, dict, "no durable owner gate was recorded")
+        self.assertEqual(gate.get("code"), "NEXT_TASK_WITHOUT_HANDOFF")
+        self.assertTrue(gate.get("gate_id"), "owner gate carries no stable identity")
+        attempts = row.get("lifecycle_recovery_attempts") or {}
+        self.assertTrue(attempts, "no recovery attempt was recorded")
+        self.assertEqual(
+            {a.get("state") for a in attempts.values()}, {"gated"},
+            "the gated recovery attempt was not marked gated",
+        )
+
+    def test_B1_owner_gate_is_durable_and_not_restamped(self):
+        _, row = self._drive("agent/staged/roadmap.json does not exist", ticks=6)
+        first = (row.get("owner_gate") or {}).get("recorded_at")
+        self.assertIsNotNone(first)
+        _, row2 = self._drive("agent/staged/roadmap.json does not exist", ticks=8)
+        attempts = row2.get("lifecycle_recovery_attempts") or {}
+        counts = [int(a.get("count") or 0) for a in attempts.values()]
+        self.assertTrue(
+            counts and max(counts) <= 2,
+            f"recovery attempt counter kept climbing past the gate: {counts}",
+        )
+
+    def test_B1_transient_dirty_worktree_keeps_retrying(self):
+        """A zero-touch dirty-tree wait must not be gated away."""
+        executor, row = self._drive(
+            "successor repair requires a clean repository", ticks=5)
+        self.assertEqual(
+            executor.calls, 5,
+            f"a transient dirty-tree wait stopped retrying ({executor.calls}/5)",
+        )
+        self.assertIsNone(
+            row.get("owner_gate"), "a transient condition was gated to the owner")
 
 
 if __name__ == "__main__":

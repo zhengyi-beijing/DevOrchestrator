@@ -1700,26 +1700,68 @@ class WatchdogCoordinator:
                         if finding.code == "NEXT_TASK_WITHOUT_HANDOFF" and finding.recoverable:
                             decisions = finding.evidence.get("next_decisions") or []
                             source_task_id = str(decisions[0].get("task_id") or "") if decisions else ""
-                            if source_task_id and executor is not None and hasattr(executor, "reconcile_successor_handoff"):
+                            key = f"{source_task_id}:{(snapshot.get('git') or {}).get('head') if isinstance(snapshot.get('git'), dict) else ''}"
+                            attempts = prow.setdefault("lifecycle_recovery_attempts", {})
+                            prior_attempt = attempts.get(key) if isinstance(attempts.get(key), dict) else {}
+                            # A declared owner gate is a fence, not an advisory
+                            # note: once this recovery key has been gated for a
+                            # non-transient failure, stop actuating and preserve
+                            # the evidence for owner disposition.  Without this
+                            # the same blocked recovery was retried on every
+                            # tick indefinitely, and would still launch a
+                            # successor if the blocker later cleared after an
+                            # owner gate had already been declared.
+                            gate_fenced = (
+                                str(prior_attempt.get("state") or "") == "gated"
+                                or (
+                                    isinstance(prow.get("owner_gate"), dict)
+                                    and prow["owner_gate"].get("code") == finding.code
+                                    and prow["owner_gate"].get("recovery_key") == key
+                                )
+                            )
+                            if source_task_id and gate_fenced:
+                                attempts[key] = {
+                                    **prior_attempt, "state": "gated",
+                                    "fenced": True,
+                                }
+                            elif source_task_id and executor is not None and hasattr(executor, "reconcile_successor_handoff"):
                                 recovery = executor.reconcile_successor_handoff(
                                     pcfg, snapshot,
                                     completed_task_id=source_task_id,
                                     trigger="watchdog NEXT_TASK_WITHOUT_HANDOFF",
                                 )
-                                key = f"{source_task_id}:{(snapshot.get('git') or {}).get('head') if isinstance(snapshot.get('git'), dict) else ''}"
-                                attempts = prow.setdefault("lifecycle_recovery_attempts", {})
                                 if recovery.get("status") in {"applied", "noop"}:
                                     attempts[key] = {"count": 1, "state": "recovered", "result": recovery}
                                 else:
-                                    prior = attempts.get(key) if isinstance(attempts.get(key), dict) else {}
-                                    count = int(prior.get("count") or 0) + 1
-                                    attempts[key] = {"count": count, "state": "failed", "result": recovery}
-                                    if count >= 2 and "clean repository" not in str(recovery.get("reason") or ""):
+                                    count = int(prior_attempt.get("count") or 0) + 1
+                                    # A dirty worktree is transient: keep retrying
+                                    # so the wait stays zero-touch.  Anything else
+                                    # is non-transient and gates once.
+                                    transient = "clean repository" in str(recovery.get("reason") or "")
+                                    gated = count >= 2 and not transient
+                                    attempts[key] = {
+                                        "count": count,
+                                        "state": "gated" if gated else "failed",
+                                        "result": recovery,
+                                    }
+                                    if gated:
+                                        existing = prow.get("owner_gate")
+                                        already = (
+                                            isinstance(existing, dict)
+                                            and existing.get("code") == finding.code
+                                            and existing.get("recovery_key") == key
+                                        )
                                         prow["owner_gate"] = {
                                             "state": "owner_gate",
                                             "reason": "repeated lifecycle recovery failure",
                                             "code": finding.code,
-                                            "recorded_at": now_iso,
+                                            "recovery_key": key,
+                                            "gate_id": f"lifecycle:{finding.code}:{key}",
+                                            # Durable: keep the first declaration
+                                            # instead of re-stamping every tick.
+                                            "recorded_at": (
+                                                existing.get("recorded_at") if already else now_iso
+                                            ),
                                         }
                                         self._emit_milestone(
                                             pid, "OWNER_GATE", task_id=source_task_id,
@@ -1727,11 +1769,20 @@ class WatchdogCoordinator:
                                             details={"reason": prow["owner_gate"]["reason"], "recovery": recovery},
                                         )
                         elif not finding.recoverable:
+                            existing = prow.get("owner_gate")
+                            gate_id = f"lifecycle:{finding.code}:{occurrence}"
+                            already = (
+                                isinstance(existing, dict)
+                                and existing.get("gate_id") == gate_id
+                            )
                             prow["owner_gate"] = {
                                 "state": "owner_gate",
                                 "reason": finding.reason,
                                 "code": finding.code,
-                                "recorded_at": now_iso,
+                                "gate_id": gate_id,
+                                "recorded_at": (
+                                    existing.get("recorded_at") if already else now_iso
+                                ),
                             }
                             self._emit_milestone(
                                 pid, "OWNER_GATE",
