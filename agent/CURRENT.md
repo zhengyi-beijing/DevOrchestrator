@@ -5,7 +5,48 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P16.13 Successor Consistency & Zero-Touch Handoff Recovery** (Status: **IMPLEMENTED / TECHNICAL REVIEW PENDING**). Previous task: **P16.12 Web Sol Persistent Pairing & Truthful Availability** (Status: **COMPLETE**).
+Current task: **P16.13 Successor Consistency & Zero-Touch Handoff Recovery** (Status: **REVIEW ACCEPTED / AWAITING DAEMON RESTART**). Previous task: **P16.12 Web Sol Persistent Pairing & Truthful Availability** (Status: **COMPLETE**).
+
+P16.13 review and remediation evidence (2026-09-26):
+- Projection boundary (`f51a01b`): the lifecycle authority overlay is re-applied
+  after the managed-run and orchestration-role projections, and the Activation
+  Supervisor advances on the authoritative summary instead of the raw monitor
+  summary. Both projections rewrite `lifecycle_state`/`telemetry.task_id` from
+  evidence that can name a stale predecessor, so without this the dispatch view
+  and published projection reported the predecessor task and the Supervisor saw
+  no authority at all. Confirmed live before the fix: the authority read
+  `READY_TO_RUN` while `summary.json` published `RECOVERY_REQUIRED`.
+- Independent Technical Review returned `REMEDIATE` with four blocking findings;
+  the bounded remediation re-review of the delta returned `ACCEPT` with all four
+  closed and four `NON_BLOCKING` follow-ups.
+- Remediation (`b5d42f2`): recovery actuation is fenced by its own owner gate
+  (the gate was advisory, so two projects reached 91 consecutive failed attempts
+  on a non-transient reason); reconciliation passes the decisions ledger so the
+  authority no longer attests that `NEXT_TASK_WITHOUT_HANDOFF` holds while the
+  Watchdog reports it violated for the same project and tick; lifecycle barriers
+  must name the same task or be a consumed handoff, so an unconsumed cross-task
+  barrier can no longer drain a pending review obligation; and a durably blocked
+  review actuation fails closed to a durable gate instead of pinning the
+  authority forever.
+- Follow-ups (`981a342`): undrained source ownership is reported as a wait rather
+  than a refusal, so the fence cannot permanently stop the only code path that
+  rebuilds a durable handoff; the Watchdog normalizes a non-mapping decisions
+  ledger exactly as reconciliation does; and the durability/isolation assertions
+  were strengthened. Review finding N-C (a legacy ledger with pending
+  obligations on two different tasks could newly gate on
+  `SINGLE_ACTIVE_LIFECYCLE_OWNER`) is recorded as accepted fail-closed risk and
+  is not reachable in any live project.
+- Runtime smoke (`ops/p1613_lifecycle_smoke.py`, `e8eece7`): 33 of 35 checks
+  pass. The two failures are `linescanviewer` and `xray-hw-platform`, whose
+  recovery is still looping under the daemon process that predates the fence.
+- Validation: focused lifecycle regression 95 tests and 25 subtests; full Python
+  regression 1,301 tests and 99 subtests; `compileall` and `git diff --check`
+  clean.
+- Remaining closure gate: restart the canonical daemon so it loads the fence,
+  then re-run `python ops/p1613_lifecycle_smoke.py` and confirm 35 of 35. Each
+  gated project performs at most one more recovery attempt and then fences with
+  a stable `gate_id`. The restart was not performed in-session because the
+  environment denied stopping the running daemon.
 
 P16.13 implementation evidence (2026-09-26):
 - Added one authoritative lifecycle record and source/target/generation transition journal inside the existing transition-executor ledger.
