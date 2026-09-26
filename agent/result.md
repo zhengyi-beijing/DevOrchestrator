@@ -33,9 +33,13 @@ P16.14 Invariant-Driven Control-Plane Development & Validation (complete 2026-09
       - Defined `PROTECTED_SURFACE_BOUNDARIES` and detected under-scoped boundary declarations in `declared_scope_gap`.
       - Guarded against transient git failures in `evaluate_launch_declaration` and enabled same-HEAD replay in `_is_declaration_gate_replayable` for transient/unevaluable blocks.
       - Replaced raw substring surface matching in `_matches_protected_surface` with word-boundary regex matching.
+   9. Technical Review Remediation Round 2 (`ai_review:ai_review:rereview:p1614-live-recover-20260926`):
+      - Wired `repo_path` and `worker_launch_head` to `_review_prompt` across all 5 reviewer launch sites in `core/ai_reviewer.py` and dispatcher, ensuring `[CONTROL_PLANE_CONTRACT_BEGIN]` prompt injection for Technical Reviewers.
+      - Integrated `_detect_scope_gaps` into the active production review path `_handle_review_completion` (as well as `_finalize_harness_review`), converting accepting `decision="next"` to `decision="remediate"` on undeclared protected surface changes with `CONTROL_PLANE_SCOPE_GAP` findings.
+      - Wired control-plane contract prompt injection into `_launch` in `core/transition_executor.py` for `worker` and `remediator` roles.
 - Verification:
-  - 38 dedicated unit/integration/fault-injection and remediation tests in `tests_py/test_p1614_invariant_workflow.py` passing 100%.
-  - Touched regression suites passing 100% (`test_p1613_successor_consistency.py`, `test_transition_executor_aibroker.py`, `test_lifecycle_projection.py`, `test_ai_planner.py`, `test_ai_reviewer.py`, `test_workflow_policy.py`).
+  - 41 dedicated unit/integration/fault-injection and remediation tests in `tests_py/test_p1614_invariant_workflow.py` passing 100%.
+  - Touched regression suites passing 100% (`test_p1613_successor_consistency.py`, `test_transition_executor_aibroker.py`, `test_ai_reviewer.py`, `test_ai_planner.py`, `test_workflow_policy.py`).
   - `python ops/p1614_evidence.py` valid.
   - Python compilation and `git diff --check` clean.
   - Knowledge graph updated via `graphify update .`.

@@ -468,6 +468,19 @@ def _dispatch_one(
             max_chars=failure_memory_max_chars,
         )
 
+    repo_path = snapshot.get("repo_path")
+    if repo_path and truth and getattr(truth, "head", None):
+        try:
+            from dev_orchestrator.core.control_plane_contract import (
+                load_control_plane_declaration,
+                inject_control_plane_contract,
+            )
+            decl = load_control_plane_declaration(str(repo_path), task_id, truth.head)
+            if decl is not None and getattr(decl, "kind", None) == "declared":
+                prompt = inject_control_plane_contract(prompt, "technical_reviewer", decl)
+        except Exception:
+            pass
+
     # Freeze the occurrence exactly once, before any delivery decision. The
     # frozen identity/prompt is what a later binding or live presence resumes;
     # a project that is not yet deliverable stays prepared/unbound (visible in

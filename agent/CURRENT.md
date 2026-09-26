@@ -46,6 +46,26 @@ P16.14 Technical Review remediation evidence (2026-09-26):
      - In `core/control_plane_contract.py`, `_matches_protected_surface` uses word-boundary regex `(?<![A-Za-z0-9_]){re.escape(surface)}(?![A-Za-z0-9_])` preventing false positive matches on bare symbols.
 - Added targeted tests in `tests_py/test_p1614_invariant_workflow.py` (`ControlPlaneRemediationTests`, 6 tests covering all 5 findings).
 
+P16.14 Technical Review second-round remediation evidence (2026-09-26):
+- Addressed all 3 Technical Review findings from `ai_review:ai_review:rereview:p1614-live-recover-20260926`:
+  1. Finding (a) (Reviewer prompt injection wiring):
+     - In `core/ai_reviewer.py`, updated all 5 call sites of `_review_prompt` (`advance`, `reconcile_stale`, `rereview_descendant`, `retry_failed`, and `_launch_web_sol_failover_reviewer`) to pass `repo_path=repo_path` and `worker_launch_head` in metadata.
+     - Hardened `_review_prompt` to extract `head` from `truth` whether `truth` is a `RepositoryTruth` instance or a dictionary.
+     - In `core/dispatcher.py`, wired control-plane contract prompt injection into WebSol reviewer dispatch.
+  2. Finding (b) (Review scope-gap backstop on live review path):
+     - In `core/ai_reviewer.py`, extracted `AIReviewerCoordinator._detect_scope_gaps` static method using safe diff inspection (`hidden_subprocess_kwargs`) and exact launch head comparison.
+     - Replaced inline scope gap code in `_finalize_harness_review` with `_detect_scope_gaps`.
+     - Integrated `_detect_scope_gaps` into `_handle_review_completion` (the live production review path), overriding accepting `decision="next"` to `decision="remediate"`, setting `next_action="continue_current_stage"`, and appending `CONTROL_PLANE_SCOPE_GAP` findings.
+  3. Finding (c) (Worker and remediator contract prompt injection):
+     - In `core/transition_executor.py` (`_launch`), loaded committed declaration at `head` and injected the control plane contract for `policy_role` (`worker` and `remediator`) into `effective_worker_prompt`.
+- Verification:
+  - Focused test suite `tests_py/test_p1614_invariant_workflow.py`: 41/41 passed (added `test_finding_a_reviewer_prompt_injection_wired_at_launch`, `test_finding_b_live_review_scope_gap_overrides_acceptance_to_remediate`, and `test_finding_c_worker_and_remediator_prompt_injection_wired_at_launch`).
+  - Touched regressions: 133 passed, 18 subtests passed across `test_p1613_successor_consistency.py`, `test_transition_executor_aibroker.py`, `test_ai_reviewer.py`, `test_ai_planner.py`, and `test_workflow_policy.py`.
+  - `python ops/p1614_evidence.py`: valid output with clean registry.
+  - `python -m compileall src ops tests_py`: 0 errors.
+  - `git diff --check`: 0 errors.
+  - `graphify update .`: updated cleanly.
+
 
 P16.13 final closure evidence (2026-09-26):
 - Restarted the canonical daemon from stale PID 26264 onto the committed

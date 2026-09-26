@@ -52,6 +52,8 @@ from dev_orchestrator.core.lifecycle_authority import (
 )
 from dev_orchestrator.core.control_plane_contract import (
     evaluate_launch_declaration,
+    inject_control_plane_contract,
+    load_control_plane_declaration,
 )
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.core.workflow_policy import inject_workflow_policy
@@ -1580,6 +1582,17 @@ class TransitionExecutor:
             )
             if failure_block:
                 effective_worker_prompt = effective_worker_prompt.rstrip() + "\n\n" + failure_block
+
+        repo_path = project.get("repo_path")
+        if repo_path and head:
+            try:
+                decl = load_control_plane_declaration(str(repo_path), task_id, head)
+                if decl is not None and getattr(decl, "kind", None) == "declared":
+                    effective_worker_prompt = inject_control_plane_contract(
+                        effective_worker_prompt, policy_role, decl
+                    )
+            except Exception:
+                pass
 
         if policy.get("engine") == "aibroker":
             return self._launch_aibroker(

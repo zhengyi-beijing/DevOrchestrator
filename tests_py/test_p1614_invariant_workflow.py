@@ -53,6 +53,9 @@ from dev_orchestrator.core.transition_executor import (
 )
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
+from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
+from dev_orchestrator.ai.contracts import AIRoleRequest, AIRoleResult, ResourceContext
+from dev_orchestrator.storage.json_store import write_json
 from dev_orchestrator.core.workflow_policy import (
     inject_control_plane_contract as policy_inject_cp,
 )
@@ -80,6 +83,33 @@ def _init_repo(root: Path) -> Path:
     (repo / "README.md").write_text("test repo\n", encoding="utf-8")
     _commit(repo, "initial commit")
     return repo
+
+
+class _TestReviewerVerdictPort:
+    def __init__(self, decision: str = "next", next_action: str = "next_task"):
+        self.decision = decision
+        self.next_action = next_action
+        self.requests: list[AIRoleRequest] = []
+
+    def execute(self, request: AIRoleRequest) -> AIRoleResult:
+        self.requests.append(request)
+        return AIRoleResult(
+            request_id=request.request_id,
+            role_run_id=request.role_run_id,
+            status="succeeded",
+            output=json.dumps({
+                "decision": self.decision,
+                "next_action": self.next_action,
+                "reason": "review verdict",
+                "findings": [],
+            }),
+            dispatch_id="review-dispatch",
+            decision_id="review-decision",
+            execution_id="review-execution",
+            resource_context=ResourceContext(
+                "reviewer/default/model", "reviewer-provider", "default", "model",
+            ),
+        )
 
 
 class ControlPlaneDeclarationGrammarTests(unittest.TestCase):
@@ -1024,6 +1054,299 @@ def record_metric(name: str, value: float) -> None:
         task_text = "# P30 UI\n\nAdd worker_launch button and UI indicators for jobs."
         scope = classify_control_plane_task(task_text=task_text)
         self.assertEqual(scope.kind, "ordinary")
+
+    def test_finding_a_reviewer_prompt_injection_wired_at_launch(self):
+        """Technical review prompts are injected with control-plane contract on all launch paths when declared."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _init_repo(root)
+            decl_text = (
+                "# P16.14 Invariant-Driven Control-Plane Development & Validation\n\n"
+                "## Control-Plane Impact\n"
+                "- Invariants: SINGLE_ACTIVE_LIFECYCLE_OWNER, CURRENT_TASK_MATCHES_ACTIVE_EXECUTION\n"
+                "- Transition boundaries: worker_launch\n"
+                "- Fault scenarios: CPF-01, CPF-06, CPF-08, CPF-09, CPF-10\n"
+                "- Convergence evidence: Clean single owner convergence.\n"
+            )
+            (repo / "agent" / "next.md").write_text(decl_text, encoding="utf-8")
+            head = _commit(repo, "add control plane declaration")
+            truth = read_repository_truth(repo)
+
+            runtime = root / "runtime"
+            runtime.mkdir()
+            source_id = "req-worker-1"
+            write_json(runtime / "transition-executor.json", {
+                "executions": {
+                    source_id: {
+                        "engine": "aibroker",
+                        "state": "completed",
+                        "project_id": "p1",
+                        "task_id": "P16.14",
+                        "repo_path": str(repo),
+                        "branch": truth.branch,
+                        "head": head,
+                        "resource_context": {
+                            "resource_id": "worker/default/model",
+                            "provider": "worker-provider",
+                            "account": "default",
+                            "model": "model",
+                        },
+                        "completed_at": "2026-09-26T22:00:00Z",
+                    }
+                }
+            })
+
+            config = {
+                "projects": [{
+                    "project_id": "p1",
+                    "repo_path": str(repo),
+                    "execution": {"engine": "aibroker"},
+                    "ai_roles": {
+                        "reviewer": {
+                            "enabled": True,
+                            "quality": "high",
+                            "independence": "resource",
+                            "timeout_seconds": 60.0,
+                        },
+                    },
+                }]
+            }
+            config_path = root / "projects.json"
+            write_json(config_path, config)
+
+            port = _TestReviewerVerdictPort(decision="next", next_action="next_task")
+            reviewer = AIReviewerCoordinator(runtime, port)
+            launched = reviewer.advance(config_path)
+            self.assertEqual(len(launched), 1)
+            reviewer._threads[launched[0]].join(timeout=5)
+
+            self.assertEqual(len(port.requests), 1)
+            prompt = port.requests[0].prompt
+            self.assertIn("[CONTROL_PLANE_CONTRACT_BEGIN]", prompt)
+            self.assertIn("Invariants: SINGLE_ACTIVE_LIFECYCLE_OWNER, CURRENT_TASK_MATCHES_ACTIVE_EXECUTION", prompt)
+            self.assertIn("Transition boundaries: worker_launch", prompt)
+            self.assertIn("Fault scenarios: CPF-01, CPF-06, CPF-08, CPF-09, CPF-10", prompt)
+            self.assertIn("Adversarial verification checklist:", prompt)
+            self.assertIn("[CONTROL_PLANE_CONTRACT_END]", prompt)
+
+            # Ordinary repo without declaration does not get contract injection
+            ord_repo = root / "ordinary_repo"
+            ord_repo.mkdir()
+            (ord_repo / "agent").mkdir(parents=True)
+            subprocess.run(["git", "init", str(ord_repo)], check=True, capture_output=True)
+            _git(ord_repo, "config", "user.email", "test@example.com")
+            _git(ord_repo, "config", "user.name", "Test")
+            (ord_repo / "README.md").write_text("ordinary", encoding="utf-8")
+            _commit(ord_repo, "init ord")
+            ord_truth = read_repository_truth(ord_repo)
+
+            ord_prompt = reviewer._review_prompt("p-ord", "T-ord", "src-ord", ord_truth, repo_path=str(ord_repo))
+            self.assertNotIn("[CONTROL_PLANE_CONTRACT_BEGIN]", ord_prompt)
+
+    def test_finding_b_live_review_scope_gap_overrides_acceptance_to_remediate(self):
+        """Review completion overrides accepting verdict to REMEDIATE when protected surface is under-scoped."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _init_repo(root)
+
+            # Declaration does not include watchdog_recovery
+            decl_text = (
+                "# P16.14 Invariant-Driven Control-Plane Development & Validation\n\n"
+                "## Control-Plane Impact\n"
+                "- Invariants: SINGLE_ACTIVE_LIFECYCLE_OWNER, CURRENT_TASK_MATCHES_ACTIVE_EXECUTION\n"
+                "- Transition boundaries: plan_freeze, worker_launch\n"
+                "- Fault scenarios: CPF-01, CPF-06, CPF-08, CPF-09, CPF-10\n"
+                "- Convergence evidence: Clean single owner convergence.\n"
+            )
+            (repo / "agent" / "next.md").write_text(decl_text, encoding="utf-8")
+            launch_head = _commit(repo, "add declaration")
+
+            # Worker commits change to watchdog.py (protected runtime surface)
+            core_dir = repo / "src" / "dev_orchestrator" / "core"
+            core_dir.mkdir(parents=True)
+            (core_dir / "watchdog.py").write_text("# modified watchdog\n", encoding="utf-8")
+            review_head = _commit(repo, "modify watchdog")
+            truth = read_repository_truth(repo)
+
+            runtime = root / "runtime"
+            runtime.mkdir()
+            source_id = "req-worker-gap"
+            write_json(runtime / "transition-executor.json", {
+                "executions": {
+                    source_id: {
+                        "engine": "aibroker",
+                        "state": "completed",
+                        "project_id": "p-gap",
+                        "task_id": "P16.14",
+                        "repo_path": str(repo),
+                        "branch": truth.branch,
+                        "head": launch_head,
+                        "resource_context": {
+                            "resource_id": "worker/default/model",
+                            "provider": "worker-provider",
+                            "account": "default",
+                            "model": "model",
+                        },
+                        "completed_at": "2026-09-26T22:00:00Z",
+                    }
+                }
+            })
+
+            config = {
+                "projects": [{
+                    "project_id": "p-gap",
+                    "repo_path": str(repo),
+                    "execution": {"engine": "aibroker"},
+                    "ai_roles": {
+                        "reviewer": {
+                            "enabled": True,
+                            "quality": "high",
+                            "independence": "resource",
+                            "timeout_seconds": 60.0,
+                        },
+                    },
+                }]
+            }
+            config_path = root / "projects.json"
+            write_json(config_path, config)
+
+            # Reviewer returns NEXT (attempting to accept)
+            port = _TestReviewerVerdictPort(decision="next", next_action="next_task")
+            reviewer = AIReviewerCoordinator(runtime, port)
+            launched = reviewer.advance(config_path)
+            self.assertEqual(len(launched), 1)
+            reviewer._threads[launched[0]].join(timeout=5)
+
+            # Verified: the acceptance was OVERRIDDEN to remediate
+            decisions_data = json.loads((runtime / "review-decisions.json").read_text(encoding="utf-8"))
+            decision_entry = decisions_data["decisions"][launched[0]]
+            self.assertEqual(decision_entry["decision"], "remediate")
+            self.assertEqual(decision_entry["next_action"], "continue_current_stage")
+            self.assertIn("blocking control-plane scope gap detected", decision_entry["reason"])
+            self.assertIn("watchdog_recovery", decision_entry["reason"])
+
+            # Now test that when watchdog_recovery IS declared, NEXT is accepted
+            decl_covered = (
+                "# P16.14 Invariant-Driven Control-Plane Development & Validation\n\n"
+                "## Control-Plane Impact\n"
+                "- Invariants: SINGLE_ACTIVE_LIFECYCLE_OWNER, CURRENT_TASK_MATCHES_ACTIVE_EXECUTION\n"
+                "- Transition boundaries: plan_freeze, worker_launch, watchdog_recovery\n"
+                "- Fault scenarios: CPF-01, CPF-02, CPF-06, CPF-08, CPF-09, CPF-10\n"
+                "- Convergence evidence: Clean single owner convergence.\n"
+            )
+            (repo / "agent" / "next.md").write_text(decl_covered, encoding="utf-8")
+            covered_head = _commit(repo, "cover watchdog_recovery")
+            covered_truth = read_repository_truth(repo)
+
+            source_id_ok = "req-worker-ok"
+            write_json(runtime / "transition-executor.json", {
+                "executions": {
+                    source_id_ok: {
+                        "engine": "aibroker",
+                        "state": "completed",
+                        "project_id": "p-gap",
+                        "task_id": "P16.14",
+                        "repo_path": str(repo),
+                        "branch": covered_truth.branch,
+                        "head": review_head,
+                        "resource_context": {
+                            "resource_id": "worker/default/model",
+                            "provider": "worker-provider",
+                            "account": "default",
+                            "model": "model",
+                        },
+                        "completed_at": "2026-09-26T22:30:00Z",
+                    }
+                }
+            })
+            launched_ok = reviewer.advance(config_path)
+            self.assertEqual(len(launched_ok), 1)
+            reviewer._threads[launched_ok[0]].join(timeout=5)
+
+            decisions_data_ok = json.loads((runtime / "review-decisions.json").read_text(encoding="utf-8"))
+            decision_entry_ok = decisions_data_ok["decisions"][launched_ok[0]]
+            self.assertEqual(decision_entry_ok["decision"], "next")
+            self.assertEqual(decision_entry_ok["next_action"], "next_task")
+
+    def test_finding_c_worker_and_remediator_prompt_injection_wired_at_launch(self):
+        """Worker and remediator prompts are injected with control-plane contract when declared."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _init_repo(root)
+            decl_text = (
+                "# P16.14 Invariant-Driven Control-Plane Development & Validation\n\n"
+                "## Control-Plane Impact\n"
+                "- Invariants: SINGLE_ACTIVE_LIFECYCLE_OWNER, CURRENT_TASK_MATCHES_ACTIVE_EXECUTION\n"
+                "- Transition boundaries: worker_launch\n"
+                "- Fault scenarios: CPF-01, CPF-06, CPF-08, CPF-09, CPF-10\n"
+                "- Convergence evidence: Clean single owner convergence.\n"
+            )
+            (repo / "agent" / "next.md").write_text(decl_text, encoding="utf-8")
+            head = _commit(repo, "add declaration")
+            truth = read_repository_truth(repo)
+
+            mock_port = unittest.mock.MagicMock()
+            mock_port.execute.return_value = AIRoleResult(
+                request_id="req-1", role_run_id="worker-1", status="succeeded",
+                output="worker output", dispatch_id="disp-1",
+            )
+            executor = TransitionExecutor(root, ai_execution_port=mock_port)
+            policy = {
+                "engine": "aibroker",
+                "enabled": True,
+                "quality": "high",
+                "independence": "resource",
+                "timeout_seconds": 60.0,
+                "preferred_backends": ["mock"],
+            }
+            project = {
+                "project_id": "p1",
+                "repo_path": str(repo),
+                "execution": policy,
+            }
+
+            # 1. Test worker launch
+            executor._launch(
+                project=project,
+                task_id="P16.14",
+                head=head,
+                branch=truth.branch,
+                source_request_id="req-worker-launch",
+                source_kind="worker",
+                source_task_id=None,
+                worker_prompt="Original worker prompt.",
+                policy=policy,
+            )
+            if "req-worker-launch" in executor._threads:
+                executor._threads["req-worker-launch"].join(timeout=5)
+            self.assertTrue(mock_port.execute.called)
+            worker_call_args = mock_port.execute.call_args[0][0]
+            self.assertIn("[CONTROL_PLANE_CONTRACT_BEGIN]", worker_call_args.prompt)
+            self.assertIn("Invariants: SINGLE_ACTIVE_LIFECYCLE_OWNER, CURRENT_TASK_MATCHES_ACTIVE_EXECUTION", worker_call_args.prompt)
+            self.assertIn("[WORKFLOW_POLICY role=worker]", worker_call_args.prompt)
+            self.assertIn("[CONTROL_PLANE_CONTRACT_END]", worker_call_args.prompt)
+
+            # 2. Test remediator launch
+            mock_port.reset_mock()
+            executor._launch(
+                project=project,
+                task_id="P16.14",
+                head=head,
+                branch=truth.branch,
+                source_request_id="req-remediator-launch",
+                source_kind="remediation",
+                source_task_id=None,
+                worker_prompt="Original remediator prompt.",
+                policy=policy,
+            )
+            if "req-remediator-launch" in executor._threads:
+                executor._threads["req-remediator-launch"].join(timeout=5)
+            self.assertTrue(mock_port.execute.called)
+            remediator_call_args = mock_port.execute.call_args[0][0]
+            self.assertIn("[CONTROL_PLANE_CONTRACT_BEGIN]", remediator_call_args.prompt)
+            self.assertIn("Invariants: SINGLE_ACTIVE_LIFECYCLE_OWNER, CURRENT_TASK_MATCHES_ACTIVE_EXECUTION", remediator_call_args.prompt)
+            self.assertIn("[WORKFLOW_POLICY role=remediator]", remediator_call_args.prompt)
+            self.assertIn("[CONTROL_PLANE_CONTRACT_END]", remediator_call_args.prompt)
 
 
 if __name__ == "__main__":

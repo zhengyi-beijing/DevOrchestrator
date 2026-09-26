@@ -1122,6 +1122,7 @@ class AIReviewerCoordinator:
                 truth,
                 context_block=context_block,
                 failure_memory_block=failure_memory_block,
+                repo_path=repo_path,
             )
             request = AIRoleRequest(
                 project_id=project_id, task_run_id=task_id, stage_run_id="review",
@@ -1132,6 +1133,7 @@ class AIReviewerCoordinator:
                 timeout_seconds=policy["timeout_seconds"],
                 metadata={
                     "worker_source_request_id": source_request_id,
+                    "worker_launch_head": worker.get("head"),
                     "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                     "failure_environment": environment_for_project(proj_dict),
                     "max_remediation_rounds": policy["max_remediation_rounds"],
@@ -1224,12 +1226,14 @@ class AIReviewerCoordinator:
                 str(project["project_id"]), task_id, source_id, truth,
                 context_block=context_block, failure_memory_block=failure_memory_block,
                 reanchor_context=reanchor_context,
+                repo_path=repo_path,
             ),
             working_directory=Path(repo_path), quality=policy["quality"],
             independence=policy["independence"], previous_resource_context=previous,
             timeout_seconds=policy["timeout_seconds"],
             metadata={
                 "worker_source_request_id": source_id,
+                "worker_launch_head": target.get("launch_head") or target.get("head"),
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 "failure_environment": environment_for_project(project),
                 "max_remediation_rounds": policy["max_remediation_rounds"],
@@ -1283,14 +1287,29 @@ class AIReviewerCoordinator:
             reanchor = ("[FAILED_REVIEW_DESCENDANT_REREVIEW]\nPrior reviewer infrastructure failed at HEAD {0}: {1}\n"
                         "The current clean HEAD is a descendant containing bounded recovery fixes. Independently review CURRENT HEAD; do not inherit a verdict.\n"
                         "[/FAILED_REVIEW_DESCENDANT_REREVIEW]").format(target.get("reviewed_head"), target.get("prior_reason"))
-        request = AIRoleRequest(project_id=str(project["project_id"]), task_run_id=task_id, stage_run_id="review",
+        failure_memory_block = ""
+        if self.failure_memory is not None:
+            failure_memory_block = self.failure_memory.prompt_block(
+                environment_for_project(project), max_chars=self.failure_memory_max_chars
+            )
+        request = AIRoleRequest(
+            project_id=str(project["project_id"]), task_run_id=task_id, stage_run_id="review",
             role_run_id="reviewer-rereview-" + command_id, request_id=review_id, role="reviewer",
-            prompt=self._review_prompt(str(project["project_id"]), task_id, source_id, truth, context_block=context_block, reanchor_context=reanchor),
+            prompt=self._review_prompt(
+                str(project["project_id"]), task_id, source_id, truth,
+                context_block=context_block, failure_memory_block=failure_memory_block,
+                reanchor_context=reanchor, repo_path=repo_path,
+            ),
             working_directory=Path(repo_path), quality=policy["quality"], independence=policy["independence"], previous_resource_context=previous,
-            timeout_seconds=policy["timeout_seconds"], metadata={"worker_source_request_id": source_id, "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
-            "failure_environment": environment_for_project(project), "max_remediation_rounds": policy["max_remediation_rounds"],
-            "max_remediation_extensions": policy["max_remediation_extensions"], "max_extension_findings": policy["max_extension_findings"],
-            "rereview_of": target["target_id"]})
+            timeout_seconds=policy["timeout_seconds"], metadata={
+                "worker_source_request_id": source_id,
+                "worker_launch_head": target.get("launch_head") or target.get("head"),
+                "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
+                "failure_environment": environment_for_project(project), "max_remediation_rounds": policy["max_remediation_rounds"],
+                "max_remediation_extensions": policy["max_remediation_extensions"], "max_extension_findings": policy["max_extension_findings"],
+                "rereview_of": target["target_id"],
+            },
+        )
         self._launch_review(review_id, source_id, request, truth, conversation_binding=binding, resolution=resolution)
         if target.get("kind") == "next":
             return review_id, "stale accepted NEXT re-reviewed at current clean descendant HEAD"
@@ -1368,12 +1387,14 @@ class AIReviewerCoordinator:
                 str(project["project_id"]), task_id, source_id, truth,
                 context_block=context_block, failure_memory_block=failure_memory_block,
                 reanchor_context=retry_context,
+                repo_path=repo_path,
             ),
             working_directory=Path(repo_path), quality=policy["quality"],
             independence=policy["independence"], previous_resource_context=previous,
             timeout_seconds=policy["timeout_seconds"],
             metadata={
                 "worker_source_request_id": source_id,
+                "worker_launch_head": target.get("launch_head") or target.get("head"),
                 "conversation_binding": copy.deepcopy(binding) if isinstance(binding, dict) else None,
                 "failure_environment": environment_for_project(project),
                 "max_remediation_rounds": policy["max_remediation_rounds"],
@@ -1520,6 +1541,7 @@ class AIReviewerCoordinator:
             context_block=context_block,
             failure_memory_block=failure_memory_block,
             reanchor_context=failover_context,
+            repo_path=repo_path,
         )
 
         request = AIRoleRequest(
@@ -1585,8 +1607,9 @@ class AIReviewerCoordinator:
         if reanchor_context:
             prompt += f"\n{reanchor_context}\n"
         decl = declaration
-        if decl is None and repo_path and truth and getattr(truth, "head", None):
-            decl = load_control_plane_declaration(repo_path, task_id, truth.head)
+        head = getattr(truth, "head", None) or (truth.get("head") if isinstance(truth, dict) else None)
+        if decl is None and repo_path and head:
+            decl = load_control_plane_declaration(repo_path, task_id, head)
         if decl is not None and getattr(decl, "kind", None) == "declared":
             prompt = inject_control_plane_contract(prompt, "technical_reviewer", decl)
         return prompt
@@ -1827,6 +1850,43 @@ class AIReviewerCoordinator:
             review_result=review_result,
         )
 
+    @staticmethod
+    def _detect_scope_gaps(
+        repo_path: str,
+        task_id: str,
+        review_head: str,
+        launch_head: str | None = None,
+    ) -> list[str]:
+        if not repo_path or not review_head:
+            return []
+        try:
+            diff_spec = (
+                f"{launch_head}..{review_head}"
+                if launch_head and launch_head != review_head
+                else ("HEAD~1..HEAD" if not launch_head else None)
+            )
+            if not diff_spec:
+                return []
+            diff_proc = subprocess.run(
+                ["git", "-C", str(repo_path), "diff", "--name-only", diff_spec],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+                **hidden_subprocess_kwargs(),
+            )
+            if diff_proc.returncode != 0:
+                return []
+            changed_files = [line.strip().replace("\\", "/") for line in diff_proc.stdout.splitlines() if line.strip()]
+            if not changed_files:
+                return []
+            decl = load_control_plane_declaration(repo_path, task_id, review_head)
+            return declared_scope_gap(decl, changed_files)
+        except Exception:
+            return []
+
     def _finalize_harness_review(
         self,
         *,
@@ -1954,33 +2014,18 @@ class AIReviewerCoordinator:
         blocking_findings = [f for f in review_result.findings if f.severity in blocking_severities]
 
         # Scope-gap check against control-plane surfaces
-        if repo_path and head:
-            try:
-                launch_head = _nonblank(worker.get("head")) if isinstance(worker, dict) else None
-                diff_spec = f"{launch_head}..{head}" if launch_head and launch_head != head else "HEAD~1..HEAD"
-                diff_proc = subprocess.run(
-                    ["git", "-C", str(repo_path), "diff", "--name-only", diff_spec],
-                    capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    timeout=10, check=False,
-                    **hidden_subprocess_kwargs(),
-                )
-                if diff_proc.returncode == 0:
-                    changed_files = [line.strip() for line in diff_proc.stdout.splitlines() if line.strip()]
-                    if changed_files:
-                        decl = load_control_plane_declaration(repo_path, task_id, head)
-                        gaps = declared_scope_gap(decl, changed_files)
-                        for gap in gaps:
-                            gap_file = gap.split("'")[1] if "'" in gap else "agent/next.md"
-                            finding_obj = SimpleNamespace(
-                                rule_id="CONTROL_PLANE_SCOPE_GAP",
-                                file=gap_file,
-                                start_line=1,
-                                severity="blocking",
-                                message=gap,
-                            )
-                            blocking_findings.append(finding_obj)
-            except Exception:
-                pass
+        launch_head = _nonblank(worker.get("head")) if isinstance(worker, dict) else None
+        gaps = self._detect_scope_gaps(repo_path or "", task_id, head, launch_head)
+        for gap in gaps:
+            gap_file = gap.split("'")[1] if "'" in gap else "agent/next.md"
+            finding_obj = SimpleNamespace(
+                rule_id="CONTROL_PLANE_SCOPE_GAP",
+                file=gap_file,
+                start_line=1,
+                severity="blocking",
+                message=gap,
+            )
+            blocking_findings.append(finding_obj)
 
         if blocking_findings:
             decision = "remediate"
@@ -2626,6 +2671,33 @@ class AIReviewerCoordinator:
         ):
             self._finish_result(review_id, result, "failed", "repository changed during review")
             return
+
+        worker = self._transition_records().get(source_request_id)
+        launch_head = _nonblank(worker.get("head")) if isinstance(worker, dict) else None
+        if not launch_head and isinstance(request.metadata, dict):
+            launch_head = _nonblank(request.metadata.get("worker_launch_head"))
+        repo_path = str(request.working_directory)
+        task_id = request.task_run_id
+        review_head = str(record.get("head") or repo.head or "")
+        gaps = self._detect_scope_gaps(repo_path, task_id, review_head, launch_head)
+        if gaps:
+            scope_gap_findings = []
+            for gap in gaps:
+                gap_file = gap.split("'")[1] if "'" in gap else "agent/next.md"
+                scope_gap_findings.append({
+                    "file": gap_file,
+                    "summary": gap,
+                    "fix": "resolve CONTROL_PLANE_SCOPE_GAP",
+                    "regression_test": "regression for CONTROL_PLANE_SCOPE_GAP",
+                })
+            findings = tuple(list(findings) + scope_gap_findings)
+            if decision == "next":
+                decision = "remediate"
+                next_action = "continue_current_stage"
+                reason = f"blocking control-plane scope gap detected: {'; '.join(gaps)}"
+            else:
+                reason = f"{reason}; blocking scope gap: {'; '.join(gaps)}"
+
         max_rounds = request.metadata.get("max_remediation_rounds", _DEFAULT_MAX_REMEDIATION_ROUNDS)
         if isinstance(max_rounds, bool) or not isinstance(max_rounds, int):
             max_rounds = _DEFAULT_MAX_REMEDIATION_ROUNDS
