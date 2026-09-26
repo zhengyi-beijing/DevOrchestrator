@@ -1,6 +1,6 @@
 # P16.13 Handoff — Successor Consistency & Zero-Touch Handoff Recovery
 
-Last updated: 2026-09-26. Branch `main`, worktree clean at `9629c44`.
+Last updated: 2026-09-26. Branch `main`, worktree clean at `8565773`.
 
 Status: **REVIEW ACCEPTED / AWAITING DAEMON RESTART**. Implementation and
 independent Technical Review are complete. One closure gate remains and it needs
@@ -22,6 +22,7 @@ Continued from the interrupted Codex session. Five commits on top of `9e5909a`:
 | `b39d2a7` | This handoff |
 | `60ef19b` | End-to-end zero-touch test: closes acceptance 4, 6, 8 |
 | `9629c44` | Closes the deferred N1 and N2 findings |
+| `8565773` | Closes the N5 assertion-weak spots and acceptance 2 |
 
 The inherited dirty `src/dev_orchestrator/daemon.py` diff was classified **A
 (valid unfinished P16.13 work)** and committed as part of `f51a01b`. It was valid
@@ -38,8 +39,8 @@ the implementer's conclusions.
 
 ## 2. Current validation state
 
-- Full Python regression: **1,306 tests + 99 subtests** passing.
-- Focused lifecycle suite: **164 tests + 25 subtests** passing.
+- Full Python regression: **1,308 tests + 99 subtests** passing.
+- P16.13 suite: **36 tests + 7 subtests** passing.
 - `python -m compileall -q src ops tests_py` clean; `git diff --check` clean.
 - Runtime smoke `python ops/p1613_lifecycle_smoke.py`: **33 of 35 checks pass**.
   The two failures are the undeployed-fix symptom described in section 3.
@@ -147,32 +148,38 @@ handoffs and 0 plans; without the control-plane leg the handoff exists but no
 Planner starts and the authority stays at `P1`. This covers acceptance **4, 5, 6,
 7 and 8**.
 
-Still open:
+**Acceptance 2 and review finding N5 closed in `8565773`** (tests only, no source
+change; each new assertion was verified to fail when the behavior it guards is
+broken):
 
-- **Acceptance 2** — the detect-and-do-not-settle logic exists and the
-  `absent`-roadmap variant now fails closed (N2), but no test asserts the
-  "does not terminal-settle as project complete" half directly via
-  `_record_settled`.
-- Review finding **N5**, deferred: assertion-weak spots in the A-J matrix.
-  `test_A_and_H` never involves the Watchdog, so it cannot catch a Watchdog-side
-  relabel. `test_G` covers the descendant-review exhaustion path but not the
-  replay path at `ai_reviewer.py:869`, which is the half of acceptance 10 stating
-  "repeated ticks never grant duplicate extensions". `test_D` asserts
-  `reconcile_roadmap_successor` directly and never exercises or excludes
-  `_record_settled`.
+- **Acceptance 2** is now proven through the real decision actuation: no
+  execution row carries `outcome="task_complete"` for an inconsistent successor,
+  exactly one `P1 -> P2` handoff is produced instead, and the repair leaves a
+  clean tree. Verified by disabling the inconsistent-successor reconcile branch,
+  which produces exactly the forbidden settled/`task_complete` row.
+- **N5 / `test_A_and_H`** now drives the real `WatchdogCoordinator` over the
+  fenced state, so a Watchdog-side relabel would be caught, plus a vacuity guard
+  asserting all six invariants were actually evaluated.
+- **N5 / `test_G`** now covers the replay half of acceptance 10: a replayed tick
+  reuses the grant with an unchanged `remediation_extension_granted_at`, and the
+  next descendant review still gates. Verified by removing the replay
+  short-circuit at `ai_reviewer.py:868-870`.
+- **N5 / `test_D`** keeps its resolver assertions and is complemented by the
+  acceptance-2 test above.
+
+No known test-strength gaps remain in the A-J matrix.
 
 ## 5. Recommended order for the next session
 
 1. Restart the daemon (section 3) and re-run the smoke; confirm 35/35 and that
-   the counters stop at 134 with `state="gated"` and a non-null `gate_id`.
-   **This is the only remaining closure gate.**
-2. Optionally close the residual test-strength items: acceptance 2's non-settle
-   assertion and the **N5** assertion-weak spots. Both are `NON_BLOCKING` and
-   neither blocks closure under `docs/development-workflow.md`.
-3. Then P16.13 can be closed and the roadmap advanced.
+   the counters stop at one past their current value with `state="gated"` and a
+   non-null `gate_id`. **This is the only remaining closure gate, and it is
+   operational, not implementation.**
+2. Then P16.13 can be closed and the roadmap advanced.
 
-Do not restart full planning for any of the above: all are localized, testable
-remediation items inside the approved P16.13 direction.
+Everything in section 4.2 that was open in code is now closed. The only recorded
+residual is **N-C**, an accepted fail-closed risk that is not reachable in any
+live project. Do not restart full planning for any of the above.
 
 ## 6. Reference
 
