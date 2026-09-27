@@ -39,6 +39,7 @@ class ReplayCase:
     work_record_snapshot: dict[str, Any]
     evidence_snapshot: dict[str, Any]
     policy: dict[str, Any]
+    now: str = "2026-09-27T00:00:00Z"
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ReplayCase:
@@ -56,6 +57,7 @@ class ReplayCase:
             work_record_snapshot=dict(data["work_record_snapshot"]),
             evidence_snapshot=dict(data.get("evidence_snapshot", {})),
             policy=dict(data.get("policy", {})),
+            now=str(data.get("now") or "2026-09-27T00:00:00Z"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -73,6 +75,7 @@ class ReplayCase:
             "work_record_snapshot": self.work_record_snapshot,
             "evidence_snapshot": self.evidence_snapshot,
             "policy": self.policy,
+            "now": self.now,
         }
 
 
@@ -85,6 +88,7 @@ class ReplayCaseResult:
     invariant_matches: bool
     invariant_failures: tuple[str, ...]
     details: str
+    measured_duplicate_executions: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +100,7 @@ class ReplayCaseResult:
             "invariant_matches": self.invariant_matches,
             "invariant_failures": list(self.invariant_failures),
             "details": self.details,
+            "measured_duplicate_executions": self.measured_duplicate_executions,
         }
 
 
@@ -220,8 +225,34 @@ class ReplayHarness:
             wait_bounds=p_raw.get("wait_bounds", {}),
         )
 
-        decision = decide(work_record, evidence, policy)
+        decision = decide(work_record, evidence, policy, now=case.now)
         invariants = evaluate_convergence_invariants(work_record, evidence, policy)
+
+        # Measure duplicate executions through single ActuatorGuard seeded from work record
+        from dev_orchestrator.convergence.actuator_guard import ActuatorGuard
+        guard = ActuatorGuard(work_record=work_record)
+        expected_head = (case.evidence_snapshot.get("exact_anchors") or {}).get("head")
+        verdict1 = guard.validate(
+            decision,
+            work_record,
+            evidence,
+            expected_anchor_head=expected_head,
+            expected_goal_id=work_record.goal_id,
+            expected_authority_revision=work_record.authority_revision,
+        )
+        if verdict1.accepted and decision.idempotency_key:
+            guard.record_executed(decision.idempotency_key)
+
+        decision2 = decide(work_record, evidence, policy, now=case.now)
+        verdict2 = guard.validate(
+            decision2,
+            work_record,
+            evidence,
+            expected_anchor_head=expected_head,
+            expected_goal_id=work_record.goal_id,
+            expected_authority_revision=work_record.authority_revision,
+        )
+        measured_duplicates = 1 if (verdict2.accepted and verdict1.accepted) else 0
 
         # Compare decision
         decision_matches = (decision.kind.value == case.expected_v0_decision)
@@ -234,9 +265,10 @@ class ReplayHarness:
                 inv_failures.append(f"{inv_code}: expected holds={expected_holds}, got {actual.holds if actual else 'missing'}")
 
         invariant_matches = (len(inv_failures) == 0)
-        passed = decision_matches and invariant_matches
+        duplicate_matches = (measured_duplicates == case.duplicate_execution_count)
+        passed = decision_matches and invariant_matches and duplicate_matches
 
-        details = "Replay passed" if passed else f"Decision match: {decision_matches}; Invariant failures: {inv_failures}"
+        details = "Replay passed" if passed else f"Decision match: {decision_matches}; Invariant failures: {inv_failures}; Duplicate match: {duplicate_matches} (measured={measured_duplicates}, expected={case.duplicate_execution_count})"
         return ReplayCaseResult(
             case=case,
             passed=passed,
@@ -245,6 +277,7 @@ class ReplayHarness:
             invariant_matches=invariant_matches,
             invariant_failures=tuple(inv_failures),
             details=details,
+            measured_duplicate_executions=measured_duplicates,
         )
 
     def run_corpus(self, cases: Sequence[ReplayCase]) -> ReplayReport:
@@ -261,7 +294,7 @@ class ReplayHarness:
             decision_trace_hash=trace_hash,
             aggregate_human_interventions=sum(c.human_intervention_count for c in cases),
             aggregate_attempts=sum(c.attempt_count for c in cases),
-            aggregate_duplicate_executions=sum(c.duplicate_execution_count for c in cases),
+            aggregate_duplicate_executions=sum(r.measured_duplicate_executions for r in results),
         )
 
     def simulate_crash_injection(

@@ -383,3 +383,65 @@ class TestP17LeaseAndEffects(unittest.TestCase):
             verdict = guard.validate(d, work_rec, contradictory_evidence, expected_anchor_head="head-1")
             self.assertFalse(verdict.accepted)
             self.assertEqual(verdict.rejection_code, "LEASE_ALREADY_ACTIVE")
+
+    def test_terminal_success_lease_emits_verify_and_guard_admits_it(self) -> None:
+        """Finding 3: Active lease with broker terminal success emits VERIFY and guard admits it."""
+        from dev_orchestrator.convergence.evidence import EvidenceItem
+
+        succ_evidence = EvidenceSnapshot(
+            items=(
+                EvidenceItem(
+                    source="broker_effect",
+                    source_id="broker-1",
+                    timestamp="2026-09-27T00:01:00Z",
+                    anchor="head-succ",
+                    data={"execution_id": "exec-1", "role": "worker", "state": "succeeded"},
+                    digest="sha256:succ-1",
+                    read_status="OK",
+                ),
+            ),
+            conflicts=(),
+            shared_leases=(),
+            exact_anchors={"head": "head-succ"},
+            emergency_pause_asserted=False,
+            metadata={},
+        )
+        work_rec = validate_work_record({
+            "schema_version": 1,
+            "project_id": "test-succ",
+            "goal_id": "P17",
+            "goal_revision": 1,
+            "goal_spec_digest": "s",
+            "predecessor_goal_id": "p0",
+            "repository_identity": {"repo_path": ".", "branch": "main"},
+            "status": "OPEN",
+            "acceptance": {"kind": "NONE"},
+            "authority_revision": "rev-1",
+            "active_lease": self.active_lease,
+            "attempts": [
+                {
+                    "attempt_id": "att-1",
+                    "problem_id": "p1",
+                    "strategy_id": "worker_run",
+                    "typed_outcome": "done",
+                }
+            ],
+        })
+        policy = build_policy()
+        # 1. Evaluator emits VERIFY rather than failing closed to REQUEST_HUMAN
+        decision = decide(work_rec, succ_evidence, policy)
+        self.assertEqual(decision.kind, DecisionKind.VERIFY)
+        self.assertTrue(decision.parameters.get("terminal_success"))
+        self.assertEqual(decision.parameters.get("role"), "worker")
+
+        # 2. Guard admits VERIFY on terminal_success lease
+        guard = ActuatorGuard(work_record=work_rec)
+        verdict = guard.validate(
+            decision,
+            work_rec,
+            succ_evidence,
+            expected_anchor_head="head-succ",
+            expected_goal_id="P17",
+            expected_authority_revision="rev-1",
+        )
+        self.assertTrue(verdict.accepted, f"Guard rejected VERIFY: {verdict.reason}")

@@ -42,3 +42,15 @@ class TestP17ReplayCorpus(unittest.TestCase):
     def test_bootstrap_owner_override_fixture_integrity(self) -> None:
         override_file = Path("agent/evidence/P17_BOOTSTRAP_OWNER_OVERRIDE.json")
         self.assertTrue(override_file.exists(), "P17_BOOTSTRAP_OWNER_OVERRIDE.json missing")
+
+    def test_duplicate_execution_count_is_measured_not_declared(self) -> None:
+        """Finding 4: Duplicate execution count across replay cases is measured through ActuatorGuard, not declared."""
+        report = self.harness.run_corpus(self.cases)
+        for r in report.case_results:
+            self.assertTrue(hasattr(r, "measured_duplicate_executions"))
+            self.assertEqual(r.measured_duplicate_executions, 0)
+        self.assertEqual(report.aggregate_duplicate_executions, 0)
+
+        case = self.cases[0]
+        res = self.harness.run_case(case)
+        self.assertEqual(res.measured_duplicate_executions, 0)

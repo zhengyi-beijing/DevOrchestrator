@@ -213,3 +213,45 @@ class TestP17PreflightConstraints(unittest.TestCase):
         self.assertEqual(decision.problem_id, "missing_required_sources")
         self.assertIn("FAIL_CLOSED_AMBIGUITY", decision.invariant_citations)
         self.assertIn("broker_telemetry", decision.parameters.get("missing_sources", []))
+
+    def test_environment_constraint_problem_retries_with_rewrite_before_handoff(self) -> None:
+        """Finding 2: Problem with ENVIRONMENT_CONSTRAINT failure class retries with preflight rewrite before exhausting budget."""
+        from dev_orchestrator.convergence.evaluator import decide, DecisionKind
+        from dev_orchestrator.convergence.evidence import EvidenceSnapshot
+        from dev_orchestrator.convergence.policy import ProblemBudget, build_policy
+        from dev_orchestrator.convergence.problems import FailureClass
+        from dev_orchestrator.convergence.work_record import validate_work_record
+
+        rec = validate_work_record({
+            "schema_version": 1,
+            "project_id": "test-env",
+            "goal_id": "P17",
+            "goal_revision": 1,
+            "goal_spec_digest": "s",
+            "predecessor_goal_id": "p0",
+            "repository_identity": {"repo_path": ".", "branch": "main"},
+            "status": "OPEN",
+            "acceptance": {"kind": "NONE"},
+            "authority_revision": "r1",
+            "current_problem": {
+                "problem_id": "prob-ps51",
+                "failure_class": FailureClass.ENVIRONMENT_CONSTRAINT.value,
+                "normalized_fingerprint": "fp-ps51",
+                "command": 'powershell -Command "git status && git log -n 1"',
+            },
+            "attempts": [
+                {
+                    "attempt_id": "att-1",
+                    "problem_id": "prob-ps51",
+                    "command": 'powershell -Command "git status && git log -n 1"',
+                    "strategy_id": "strategy_change",
+                    "typed_outcome": "fail",
+                }
+            ],
+        })
+        policy = build_policy(default_budget=ProblemBudget(max_strategy_attempts=2, max_total_attempts=5))
+        decision = decide(rec, EvidenceSnapshot(), policy)
+        self.assertEqual(decision.kind, DecisionKind.RETRY_SAME_STRATEGY)
+        self.assertTrue(decision.parameters.get("preflight_rewrite"))
+        self.assertIn("rewrite_template", decision.parameters)
+        self.assertEqual(decision.parameters.get("rewrite_template"), "Use semicolon sequencing or explicit $LASTEXITCODE checks")

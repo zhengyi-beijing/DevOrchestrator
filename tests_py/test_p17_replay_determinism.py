@@ -190,3 +190,18 @@ class TestP17ReplayDeterminism(unittest.TestCase):
             self.assertEqual(record1["record_hash"], record2["record_hash"])
             self.assertEqual(record1["source_evidence_digest"], record2["source_evidence_digest"])
             self.assertEqual(record1["decision"], record2["decision"])
+
+    def test_corpus_replay_is_wall_clock_independent(self) -> None:
+        """Finding 1: Replay results and trace hashes are identical regardless of when executed."""
+        report1 = self.harness.run_corpus(self.cases)
+
+        future_cases = [
+            ReplayCase.from_dict({**c.to_dict(), "now": "2026-09-27T01:00:00Z"})
+            for c in self.cases
+        ]
+        report2 = self.harness.run_corpus(future_cases)
+        self.assertEqual(report1.passed_cases, 26)
+        self.assertEqual(report2.passed_cases, 26)
+        self.assertEqual(report1.decision_trace_hash, report2.decision_trace_hash)
+        self.assertEqual(report1.aggregate_duplicate_executions, 0)
+        self.assertEqual(report2.aggregate_duplicate_executions, 0)

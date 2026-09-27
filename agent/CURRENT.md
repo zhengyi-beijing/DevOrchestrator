@@ -7,6 +7,42 @@
 
 Current task: **P17 Single-Authority Goal Convergence Baseline** (Status: **COMPLETE**). Previous task: **P16.14 Invariant-Driven Control-Plane Development & Validation** (Status: **COMPLETE**).
 
+P17 Technical Review Round 4 remediation evidence (2026-09-27):
+- Addressed all 4 Technical Review findings and observations from review `ai_review:wd-e7b2c8466f922be2` at HEAD `9188611`:
+  1. Finding 1 (Wall-clock dependency in replay corpus):
+     - Added explicit `now: str = "2026-09-27T00:00:00Z"` parameter to `ReplayCase` (with `from_dict`/`to_dict`).
+     - Updated `ReplayHarness.run_case` to pass `now=case.now` to `decide(...)`.
+     - In `tests_py/test_p17_retry_wait_escalation.py::test_known_quota_reset_produces_budget_free_wait`, passed explicit `now="2026-09-27T12:00:00Z"` to eliminate wall-clock dependency against 16:00:00Z quota reset.
+     - Added regression test `tests_py/test_p17_replay_determinism.py::TestP17ReplayDeterminism::test_corpus_replay_is_wall_clock_independent` proving identical replay results, trace hashes, and zero duplicates across time.
+  2. Finding 2 (Missing failure classes in Section 9 & case_12 fixture):
+     - In `evaluator.py` Section 9, added explicit bounded recovery branches:
+       - `ENVIRONMENT_CONSTRAINT`: emits `RETRY_SAME_STRATEGY` with preflight `rewrite_template` while attempts remain within budget.
+       - `CONTROL_PLANE_DEFECT`: emits bounded `RETRY_NEW_STRATEGY` then `ESCALATE_CAPABILITY`.
+       - `INTEGRITY_OR_IDENTITY_AMBIGUITY`: fails closed to `REQUEST_HUMAN` citing `FAIL_CLOSED_AMBIGUITY`.
+     - Reclassified `tests_py/data/p17_corpus/case_12_known_powershell_incompatibility_after_rule_learned.json` with `failure_class: "ENVIRONMENT_CONSTRAINT"`, attempt carrying prohibited `&&` command under PowerShell 5.1, `expected_v0_decision: "RETRY_SAME_STRATEGY"`, and `expected_invariant_verdicts: {"BOUNDED_PROBLEM": true, "LEARNED_CONSTRAINT_CONSUMPTION": false, "LEARNING_REGRESSION": false}`.
+     - In `invariants.py`, updated `LEARNING_REGRESSION` to scan `work_record.attempts` via `classify_recurrence` with seeded rules so executing a prohibited command sets `lr_holds = False`.
+     - Added regression test `tests_py/test_p17_preflight_constraints.py::TestP17PreflightConstraints::test_environment_constraint_problem_retries_with_rewrite_before_handoff`.
+  3. Finding 3 (Completed execution with active lease / terminal success deadlocks on human):
+     - In `evaluator.py` Section 4, added check for `liveness.terminal_success` before dead-lease fall-through; emits `DecisionKind.VERIFY` for independent verification (`parameters={"role": role, "attempt_id": attempt_id, "terminal_success": True}`).
+     - In `actuator_guard.py`, `is_verify_on_terminal_success` admits `VERIFY` on demonstrably non-live terminal success lease.
+     - In `invariants.py`, updated `PROGRESS_TOTALITY` to resolve lease liveness via `resolve_lease_liveness` and verify progress totality holds (`pt_holds = True`) on `terminal_success`.
+     - In `tests_py/data/p17_corpus/case_14_reviewer_unable_to_run_tests_with_claimed_counts.json`, added active lease and succeeded broker_effect so terminal success is exercised across all 26 replay cases.
+     - Added regression test `tests_py/test_p17_lease_and_effects.py::TestP17LeaseAndEffects::test_terminal_success_lease_emits_verify_and_guard_admits_it`.
+  4. Finding 4 (Duplicate execution count measured not declared):
+     - In `replay.py`, `run_case` evaluates `decide()` twice through a single `ActuatorGuard` seeded from `work_record`; if admitted twice for the same idempotency key, records `measured_duplicates = 1`, else `0`. Added `duplicate_matches = (measured_duplicates == case.duplicate_execution_count)`.
+     - In `replay.py`, `run_corpus` calculates `aggregate_duplicate_executions = sum(r.measured_duplicate_executions for r in results)` rather than summing fixture constants.
+     - Added regression test `tests_py/test_p17_replay_corpus.py::TestP17ReplayCorpus::test_duplicate_execution_count_is_measured_not_declared`.
+  5. Non-blocking doc corrections:
+     - Updated `docs/P17_INCIDENT_CORPUS.md` row 04 (`ANCHOR_BINDING: False`) and row 12 (`RETRY_SAME_STRATEGY`, `LEARNED_CONSTRAINT_CONSUMPTION: False`, `LEARNING_REGRESSION: False`).
+- Verification Summary:
+  - 19 dedicated P17 test suites (100 tests): 100% passed.
+  - Full historical incident corpus replay: 26/26 passed (0 failures).
+  - Touched regression suites (`test_p12_planner_singleflight.py`, `test_p1614_invariant_workflow.py`, `test_p1613_successor_consistency.py`, `test_workflow_policy.py`, `test_transition_executor_aibroker.py`): 138 passed.
+  - Convergence replay CLI (`python -m dev_orchestrator.convergence replay --corpus tests_py/data/p17_corpus`): 26/26 passed.
+  - Shadow mode CLI (`python -m dev_orchestrator.convergence shadow --evidence-root . --stdout --json`): clean execution, 0 mutations.
+  - Python AST and syntax compilation: clean (`compileall` 0 errors).
+  - Whitespace check (`git diff --check`): clean.
+
 P17 final closure and technical review acceptance evidence (2026-09-27):
 - Independent Technical Review (`ai_review:ai_review:ai_review:ai_review:a04b4803-cc11-41fe-8ccd-38263decfb5d`) on clean HEAD `7f1430f` accepted all P17 deliverables with `decision: "next"`, `next_action: "next_task"`, `remediation_round: 3`, and `review_findings: []`:
   - Verified Finding 1 (dead lease / answered human request): `actuator_guard.py` includes `DecisionKind.EXECUTE` in `is_recovery_decision`, and `evaluator.decide` evaluates active lease liveness in Section 4 ahead of human requests, admitting `EXECUTE` on demonstrably dead leases with an answered request while emitting `NOOP_ACTIVE` on live leases.

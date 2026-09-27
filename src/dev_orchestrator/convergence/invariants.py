@@ -10,9 +10,15 @@ import hashlib
 import json
 from typing import Any, Mapping
 
+from dev_orchestrator.convergence.effects import resolve_lease_liveness
 from dev_orchestrator.convergence.evidence import EvidenceSnapshot, has_unresolved_ambiguity
 from dev_orchestrator.convergence.policy import Policy
-from dev_orchestrator.convergence.preflight import PreflightVerdict, evaluate_preflight
+from dev_orchestrator.convergence.preflight import (
+    PreflightVerdict,
+    classify_recurrence,
+    evaluate_preflight,
+    get_seeded_rules,
+)
 from dev_orchestrator.convergence.problems import FailureClass
 from dev_orchestrator.convergence.successor import compute_handoff_idempotency_key
 from dev_orchestrator.convergence.verification import is_goal_satisfied, validate_owner_override
@@ -133,13 +139,22 @@ def evaluate_convergence_invariants(
     if work_record.status == "OPEN":
         if work_record.active_lease is not None:
             role = work_record.active_lease.get("role")
-            lease_dead = any(
-                it.source == "process_probe" and it.data.get("role") == role and not it.data.get("alive")
-                for it in evidence.items
-            )
-            if lease_dead and not work_record.current_problem and not work_record.human_request:
-                pt_holds = False
-                pt_msg = f"Active execution lease held by role {role!r} is dead with no recovery progress"
+            liveness = resolve_lease_liveness(work_record.active_lease, evidence)
+            if liveness.terminal_success:
+                pt_holds = True
+                pt_msg = "Progress totality holds: active lease reached terminal success"
+            elif liveness.found_liveness and not liveness.lease_live and not liveness.lease_ambiguous:
+                if not work_record.current_problem and not work_record.human_request:
+                    pt_holds = False
+                    pt_msg = f"Active execution lease held by role {role!r} is dead with no recovery progress"
+            else:
+                lease_dead = any(
+                    it.source == "process_probe" and it.data.get("role") == role and not it.data.get("alive")
+                    for it in evidence.items
+                )
+                if lease_dead and not work_record.current_problem and not work_record.human_request:
+                    pt_holds = False
+                    pt_msg = f"Active execution lease held by role {role!r} is dead with no recovery progress"
         elif not work_record.human_request and not work_record.wait:
             if work_record.current_problem:
                 prob_id = work_record.current_problem.get("problem_id", "")
@@ -337,6 +352,17 @@ def evaluate_convergence_invariants(
         if fc == FailureClass.CONTROL_PLANE_DEFECT.value:
             lr_holds = False
             lr_msg = f"Learning regression: problem {work_record.current_problem.get('problem_id')} classified as CONTROL_PLANE_DEFECT"
+    if lr_holds:
+        env = {"os": "windows", "shell": "powershell_5.1"}
+        seeded_rules = get_seeded_rules()
+        for att in work_record.attempts:
+            cmd = att.get("command") or att.get("operation", {}).get("command") or ""
+            if cmd:
+                rec_kind, rec_reason = classify_recurrence({"command": cmd}, env, seeded_rules)
+                if rec_kind == "LEARNING_REGRESSION":
+                    lr_holds = False
+                    lr_msg = rec_reason
+                    break
     verdicts["LEARNING_REGRESSION"] = InvariantVerdict("LEARNING_REGRESSION", lr_holds, lr_msg)
 
     # 18. SUCCESSOR_DETERMINISM

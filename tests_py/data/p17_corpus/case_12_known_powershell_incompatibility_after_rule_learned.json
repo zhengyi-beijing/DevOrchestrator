@@ -18,10 +18,10 @@
   },
   "expected_invariant_verdicts": {
     "BOUNDED_PROBLEM": true,
-    "LEARNED_CONSTRAINT_CONSUMPTION": true,
-    "LEARNING_REGRESSION": true
+    "LEARNED_CONSTRAINT_CONSUMPTION": false,
+    "LEARNING_REGRESSION": false
   },
-  "expected_v0_decision": "RETRY_NEW_STRATEGY",
+  "expected_v0_decision": "RETRY_SAME_STRATEGY",
   "human_intervention_count": 0,
   "legacy_result": "PowerShell 5.1 pipeline chaining failed repeatedly despite known lesson",
   "policy": {
@@ -51,10 +51,18 @@
     "acceptance": {
       "kind": "NONE"
     },
-    "attempts": [],
+    "attempts": [
+      {
+        "attempt_id": "att-ps51-1",
+        "command": "powershell -Command \"git status && git log -n 1\"",
+        "problem_id": "prob-ps51-pipeline",
+        "strategy_id": "strategy_change",
+        "typed_outcome": "fail"
+      }
+    ],
     "authority_revision": "rev-1",
     "current_problem": {
-      "failure_class": "IMPLEMENTATION_DEFECT",
+      "failure_class": "ENVIRONMENT_CONSTRAINT",
       "normalized_fingerprint": "281bf686902bf4aa1cd966a92cab25c5d1a66bfec453323ed171726580c1b82c",
       "problem_id": "prob-ps51-pipeline"
     },

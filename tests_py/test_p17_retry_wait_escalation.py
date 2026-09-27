@@ -47,7 +47,7 @@ class TestP17RetryWaitEscalation(unittest.TestCase):
             },
             "attempts": [],
         })
-        decision = decide(rec, EvidenceSnapshot(), self.policy)
+        decision = decide(rec, EvidenceSnapshot(), self.policy, now="2026-09-27T12:00:00Z")
         self.assertEqual(decision.kind, DecisionKind.WAIT_UNTIL)
         self.assertIn("Quota or resource transient failure", decision.reason)
         self.assertEqual(decision.parameters.get("not_before"), "2026-09-27T16:00:00Z")

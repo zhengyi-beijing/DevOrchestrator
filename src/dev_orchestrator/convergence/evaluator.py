@@ -17,6 +17,7 @@ from dev_orchestrator.convergence.effects import resolve_lease_liveness
 from dev_orchestrator.convergence.evidence import EvidenceSnapshot, has_unresolved_ambiguity, snapshot_digest
 from dev_orchestrator.convergence.findings import FindingSeverity
 from dev_orchestrator.convergence.policy import Policy
+from dev_orchestrator.convergence.preflight import evaluate_preflight
 from dev_orchestrator.convergence.problems import FailureClass, ProblemBudget, ProblemTracker
 from dev_orchestrator.convergence.successor import compute_handoff_idempotency_key
 from dev_orchestrator.convergence.verification import is_goal_satisfied
@@ -228,6 +229,13 @@ def decide(
                 invariants=("NO_ORPHAN_OWNER", "PROGRESS_TOTALITY", "HUMAN_TYPED"),
             )
         # Demonstrably non-live lease (found_liveness and not lease_live and not lease_ambiguous):
+        if liveness.terminal_success:
+            return make_decision(
+                DecisionKind.VERIFY,
+                f"Active execution lease held by role {lease.get('role')!r} completed with terminal success; requesting independent verification",
+                parameters={"role": lease.get("role"), "attempt_id": lease.get("attempt_id"), "terminal_success": True},
+                invariants=("ACCEPTANCE_BEFORE_ADVANCE", "PROGRESS_TOTALITY"),
+            )
         # If there is a human request (answered or open), defer to human request handling.
         # Otherwise, if no failure problem is recorded, fail closed:
         if work_record.human_request is None and not work_record.current_problem:
@@ -416,10 +424,65 @@ def decide(
                 invariants=("HUMAN_TYPED", "EMERGENCY_BRAKE"),
             )
 
+        # ENVIRONMENT_CONSTRAINT: preflight rewrite while output/strategy budget remains
+        if f_class == FailureClass.ENVIRONMENT_CONSTRAINT.value:
+            env_attempts = sum(1 for a in matching_attempts if a.get("strategy_id") in ("environment_rewrite", "strategy_change", "preflight_rewrite"))
+            if env_attempts < budget.max_strategy_attempts and total_attempts < budget.max_total_attempts:
+                cmd = ""
+                for a in reversed(matching_attempts):
+                    cmd = a.get("command") or a.get("operation", {}).get("command") or ""
+                    if cmd:
+                        break
+                if not cmd and curr_prob:
+                    cmd = curr_prob.get("command") or curr_prob.get("operation", {}).get("command") or ""
+                _, _, matched_rule = evaluate_preflight({"command": cmd}, {"os": "windows", "shell": "powershell_5.1"})
+                rewrite = matched_rule.rewrite_template if matched_rule and matched_rule.rewrite_template else curr_prob.get("rewrite_template")
+                return make_decision(
+                    DecisionKind.RETRY_SAME_STRATEGY,
+                    f"Environment constraint detected for {p_id!r}; retrying with preflight rewrite: {rewrite}",
+                    problem_id=p_id,
+                    parameters={
+                        "failure_class": f_class,
+                        "rewrite_template": rewrite,
+                        "preflight_rewrite": True,
+                        "attempt": env_attempts + 1,
+                    },
+                    invariants=("LEARNED_CONSTRAINT_CONSUMPTION", "BOUNDED_PROBLEM", "PROGRESS_TOTALITY"),
+                )
+
+        # Control-plane defect: bounded changed strategy then capability escalation
+        if f_class == FailureClass.CONTROL_PLANE_DEFECT.value:
+            if strategy_attempts < budget.max_strategy_attempts:
+                return make_decision(
+                    DecisionKind.RETRY_NEW_STRATEGY,
+                    f"Control-plane defect on problem {p_id!r}; trying bounded changed strategy",
+                    problem_id=p_id,
+                    parameters={"strategy_attempt": strategy_attempts + 1, "failure_class": f_class},
+                    invariants=("BOUNDED_PROBLEM", "PROGRESS_TOTALITY"),
+                )
+            elif escalations < budget.max_capability_escalations:
+                return make_decision(
+                    DecisionKind.ESCALATE_CAPABILITY,
+                    f"Strategy attempts exhausted for control-plane defect {p_id!r}; escalating capability tier",
+                    problem_id=p_id,
+                    parameters={"escalation_count": escalations + 1, "failure_class": f_class},
+                    invariants=("BOUNDED_PROBLEM", "PROGRESS_TOTALITY"),
+                )
+
+        # Integrity or identity ambiguity: fail closed
+        if f_class == FailureClass.INTEGRITY_OR_IDENTITY_AMBIGUITY.value:
+            return make_decision(
+                DecisionKind.REQUEST_HUMAN,
+                f"Integrity or identity ambiguity detected for problem {p_id!r}; failing closed",
+                problem_id=p_id,
+                parameters={"failure_class": f_class},
+                invariants=("FAIL_CLOSED_AMBIGUITY", "HUMAN_TYPED"),
+            )
+
         # If total attempts or strategy budgets exhausted
         return make_decision(
             DecisionKind.WRITE_HANDOFF,
-            f"All retry/escalation budgets exhausted for problem {p_id!r}; writing resumable HANDOFF",
+            f"Problem {p_id!r} cannot proceed autonomously after {total_attempts} attempt(s); writing resumable HANDOFF",
             problem_id=p_id,
             parameters={"total_attempts": total_attempts},
             invariants=("COMPLETE_EXHAUSTION", "BOUNDED_PROBLEM"),

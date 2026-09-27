@@ -12,7 +12,21 @@
     "exact_anchors": {
       "head": "da699cd7238ed39caf62fb229ba82a2e4f392734"
     },
-    "items": [],
+    "items": [
+      {
+        "anchor": "da699cd7238ed39caf62fb229ba82a2e4f392734",
+        "data": {
+          "execution_id": "exec-worker-1",
+          "role": "worker",
+          "state": "succeeded"
+        },
+        "digest": "sha256:broker-succ-worker-14",
+        "read_status": "OK",
+        "source": "broker_effect",
+        "source_id": "broker-worker-14",
+        "timestamp": "2026-09-27T10:05:00Z"
+      }
+    ],
     "metadata": {},
     "shared_leases": []
   },
@@ -49,6 +63,13 @@
   "work_record_snapshot": {
     "acceptance": {
       "kind": "NONE"
+    },
+    "active_lease": {
+      "acquired_at": "2026-09-27T00:00:00Z",
+      "attempt_id": "att-worker-1",
+      "execution_id": "exec-worker-1",
+      "lease_id": "lease-worker-1",
+      "role": "worker"
     },
     "attempts": [
       {
