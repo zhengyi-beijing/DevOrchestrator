@@ -44,7 +44,6 @@ def resolve_lease_liveness(
     items = getattr(evidence, "items", ())
     verdicts: set[str] = set()
     found_liveness = False
-    terminal_success = False
 
     for item in items:
         source = getattr(item, "source", None)
@@ -71,26 +70,34 @@ def resolve_lease_liveness(
             st = data.get("state")
             if st in ("running", "live"):
                 verdicts.add("LIVE")
-            elif st in ("failed", "cancelled", "terminal"):
-                verdicts.add("DEAD")
+            elif st in ("failed", "terminal"):
+                verdicts.add("TERMINAL_FAILURE")
+            elif st in ("cancelled",):
+                verdicts.add("CANCELLED")
             elif st in ("succeeded", "completed"):
-                verdicts.add("DEAD")
-                terminal_success = True
+                verdicts.add("TERMINAL_SUCCESS")
             else:
                 verdicts.add("AMBIGUOUS")
 
     if not found_liveness:
-        return LeaseLiveness(found_liveness=False, lease_live=False, lease_ambiguous=False)
+        return LeaseLiveness(found_liveness=False, lease_live=False, lease_ambiguous=False, terminal_success=False)
 
-    if "AMBIGUOUS" in verdicts or len(verdicts) > 1:
+    if "AMBIGUOUS" in verdicts:
         return LeaseLiveness(
             found_liveness=True,
             lease_live=False,
             lease_ambiguous=True,
-            terminal_success=terminal_success,
+            terminal_success=False,
         )
 
-    if verdicts == {"LIVE"}:
+    if "LIVE" in verdicts:
+        if len(verdicts) > 1:
+            return LeaseLiveness(
+                found_liveness=True,
+                lease_live=False,
+                lease_ambiguous=True,
+                terminal_success=False,
+            )
         return LeaseLiveness(
             found_liveness=True,
             lease_live=True,
@@ -98,12 +105,28 @@ def resolve_lease_liveness(
             terminal_success=False,
         )
 
-    # verdicts == {"DEAD"}
+    terminal_outcomes = verdicts.intersection({"TERMINAL_SUCCESS", "TERMINAL_FAILURE", "CANCELLED"})
+    if len(terminal_outcomes) > 1:
+        return LeaseLiveness(
+            found_liveness=True,
+            lease_live=False,
+            lease_ambiguous=True,
+            terminal_success=False,
+        )
+
+    if "TERMINAL_SUCCESS" in verdicts:
+        return LeaseLiveness(
+            found_liveness=True,
+            lease_live=False,
+            lease_ambiguous=False,
+            terminal_success=True,
+        )
+
     return LeaseLiveness(
         found_liveness=True,
         lease_live=False,
         lease_ambiguous=False,
-        terminal_success=terminal_success,
+        terminal_success=False,
     )
 
 

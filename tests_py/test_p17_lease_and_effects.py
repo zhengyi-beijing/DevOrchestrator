@@ -445,3 +445,89 @@ class TestP17LeaseAndEffects(unittest.TestCase):
             expected_authority_revision="rev-1",
         )
         self.assertTrue(verdict.accepted, f"Guard rejected VERIFY: {verdict.reason}")
+
+    def test_conflicting_terminal_success_and_failure_fails_closed_evaluator_and_guard(self) -> None:
+        """Finding 2: Contradictory terminal broker outcomes for same execution fail closed to REQUEST_HUMAN in evaluator and are rejected by guard."""
+        from dev_orchestrator.convergence.effects import resolve_lease_liveness
+        from dev_orchestrator.convergence.evidence import EvidenceItem
+
+        conflicting_evidence = EvidenceSnapshot(
+            items=(
+                EvidenceItem(
+                    source="broker_effect",
+                    source_id="broker-succ",
+                    timestamp="2026-09-27T00:01:00Z",
+                    anchor="head-1",
+                    data={"execution_id": "exec-1", "role": "worker", "state": "succeeded"},
+                    digest="sha256:succ",
+                    read_status="OK",
+                ),
+                EvidenceItem(
+                    source="broker_effect",
+                    source_id="broker-fail",
+                    timestamp="2026-09-27T00:01:05Z",
+                    anchor="head-1",
+                    data={"execution_id": "exec-1", "role": "worker", "state": "failed"},
+                    digest="sha256:fail",
+                    read_status="OK",
+                ),
+            ),
+            conflicts=(),
+            shared_leases=(),
+            exact_anchors={"head": "head-1"},
+            emergency_pause_asserted=False,
+            metadata={},
+        )
+        work_rec = validate_work_record({
+            "schema_version": 1,
+            "project_id": "test-conflict",
+            "goal_id": "P17",
+            "goal_revision": 1,
+            "goal_spec_digest": "s",
+            "predecessor_goal_id": "p0",
+            "repository_identity": {"repo_path": ".", "branch": "main"},
+            "status": "OPEN",
+            "acceptance": {"kind": "NONE"},
+            "authority_revision": "rev-1",
+            "active_lease": self.active_lease,
+            "attempts": [
+                {
+                    "attempt_id": "att-1",
+                    "problem_id": "p1",
+                    "strategy_id": "worker_run",
+                    "typed_outcome": "done",
+                }
+            ],
+        })
+
+        # 1. resolve_lease_liveness marks ambiguous and terminal_success is False
+        liveness = resolve_lease_liveness(self.active_lease, conflicting_evidence)
+        self.assertTrue(liveness.lease_ambiguous)
+        self.assertFalse(liveness.terminal_success)
+        self.assertFalse(liveness.lease_live)
+
+        # 2. Evaluator fails closed to REQUEST_HUMAN citing FAIL_CLOSED_AMBIGUITY
+        policy = build_policy()
+        decision = decide(work_rec, conflicting_evidence, policy)
+        self.assertEqual(decision.kind, DecisionKind.REQUEST_HUMAN)
+        self.assertIn("FAIL_CLOSED_AMBIGUITY", decision.invariant_citations)
+        self.assertEqual(decision.problem_id, "ambiguous_lease_liveness")
+
+        # 3. Guard rejects both verification and mutative decisions
+        guard = ActuatorGuard(work_record=work_rec)
+        for kind in (DecisionKind.VERIFY, DecisionKind.EXECUTE, DecisionKind.RETRY_NEW_STRATEGY):
+            d = Decision(
+                kind=kind,
+                reason="Attempt under ambiguous terminal state",
+                idempotency_key=f"idemp-{kind.value}",
+            )
+            verdict = guard.validate(
+                d,
+                work_rec,
+                conflicting_evidence,
+                expected_anchor_head="head-1",
+                expected_goal_id="P17",
+                expected_authority_revision="rev-1",
+            )
+            self.assertFalse(verdict.accepted, f"Expected {kind.value} to be rejected under conflicting terminal outcomes")
+            self.assertEqual(verdict.rejection_code, "LEASE_ALREADY_ACTIVE")

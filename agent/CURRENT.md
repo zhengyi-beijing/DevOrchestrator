@@ -7,6 +7,28 @@
 
 Current task: **P17 Single-Authority Goal Convergence Baseline** (Status: **COMPLETE**). Previous task: **P16.14 Invariant-Driven Control-Plane Development & Validation** (Status: **COMPLETE**).
 
+P17 Technical Review Round 5 remediation evidence (2026-09-27):
+- Addressed both Technical Review findings from review `ai_review:rereview:p17-final-rereview-20260927` at commit `5975a1a`:
+  1. Finding 1 (Durable Intent/Authority Transition & Restart Idempotence):
+     - Added `consumed_idempotency_keys: tuple[str, ...]` to `WorkRecord` dataclass, canonical serialization (`to_dict` serialized conditionally when non-empty to preserve digest stability for existing fixtures), and `validate_work_record()`.
+     - Implemented `model_durable_decision_transition(record, decision, now=...)` in `work_record.py` applying CAS updates for mutative decisions (`EXECUTE`, `RETRY_*`, `FAILOVER_RESOURCE`, `ESCALATE_CAPABILITY`, `VERIFY`, `PUBLISH_SUCCESSOR`, `SATISFY_GOAL`, `WRITE_HANDOFF`), recording active lease with idempotency key, appending consumed idempotency keys, and advancing authority revision.
+     - Updated `ActuatorGuard.seed_from_work_record()` to restore consumed keys comprehensively from `successor.handoff_idempotency_key`, `active_lease["idempotency_key"]`, `attempts[*]["idempotency_key"]`, `handoff["idempotency_key"]`, and `consumed_idempotency_keys`.
+     - Updated `ReplayHarness.run_case` in `replay.py`: for admitted mutative decisions, models the durable state via `model_durable_decision_transition`, instantiates a restarted `ActuatorGuard` seeded from durable state, and confirms both re-evaluating the original decision and re-evaluating from durable state reject duplicate mutative actuation.
+     - Added regression test `tests_py/test_p17_replay_determinism.py::TestP17ReplayDeterminism::test_execute_replay_after_guard_restart_is_rejected_from_durable_state`.
+  2. Finding 2 (Contradictory Terminal Broker Outcomes Fail-Closed):
+     - In `effects.py`, updated `resolve_lease_liveness` to preserve distinct terminal broker outcomes (`TERMINAL_SUCCESS`, `TERMINAL_FAILURE`, `CANCELLED`).
+     - When conflicting terminal broker outcomes coexist (e.g. `succeeded` and `failed` for the same execution ID), marks `lease_ambiguous=True` and `terminal_success=False`, failing closed in `evaluator.py` to `REQUEST_HUMAN` citing `FAIL_CLOSED_AMBIGUITY` and rejecting in `ActuatorGuard`.
+     - Added regression test `tests_py/test_p17_lease_and_effects.py::TestP17LeaseAndEffects::test_conflicting_terminal_success_and_failure_fails_closed_evaluator_and_guard`.
+- Verification Summary:
+  - 19 dedicated P17 test suites (102 tests): 100% passed.
+  - Full historical incident corpus replay: 26/26 passed (0 failures, trace hash deterministic, 0 duplicate executions).
+  - Touched regression suites (`test_p12_planner_singleflight.py`, `test_p1614_invariant_workflow.py`, `test_p1613_successor_consistency.py`, `test_workflow_policy.py`, `test_transition_executor_aibroker.py`): 138 passed.
+  - Convergence replay CLI (`python -m dev_orchestrator.convergence replay --corpus tests_py/data/p17_corpus`): 26/26 passed.
+  - Shadow mode CLI (`python -m dev_orchestrator.convergence shadow --evidence-root . --stdout --json`): clean execution, 0 mutations.
+  - Python AST and syntax compilation: clean (`compileall` 0 errors).
+  - Whitespace check (`git diff --check`): clean.
+  - Knowledge graph updated cleanly via `graphify update .`.
+
 P17 Technical Review Round 4 remediation evidence (2026-09-27):
 - Addressed all 4 Technical Review findings and observations from review `ai_review:wd-e7b2c8466f922be2` at HEAD `9188611`:
   1. Finding 1 (Wall-clock dependency in replay corpus):

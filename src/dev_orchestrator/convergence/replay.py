@@ -228,11 +228,13 @@ class ReplayHarness:
         decision = decide(work_record, evidence, policy, now=case.now)
         invariants = evaluate_convergence_invariants(work_record, evidence, policy)
 
-        # Measure duplicate executions through single ActuatorGuard seeded from work record
+        # Measure duplicate executions through ActuatorGuard with durable transition modeling and restart
         from dev_orchestrator.convergence.actuator_guard import ActuatorGuard
-        guard = ActuatorGuard(work_record=work_record)
+        from dev_orchestrator.convergence.work_record import model_durable_decision_transition
+
+        guard1 = ActuatorGuard(work_record=work_record)
         expected_head = (case.evidence_snapshot.get("exact_anchors") or {}).get("head")
-        verdict1 = guard.validate(
+        verdict1 = guard1.validate(
             decision,
             work_record,
             evidence,
@@ -240,19 +242,51 @@ class ReplayHarness:
             expected_goal_id=work_record.goal_id,
             expected_authority_revision=work_record.authority_revision,
         )
-        if verdict1.accepted and decision.idempotency_key:
-            guard.record_executed(decision.idempotency_key)
 
-        decision2 = decide(work_record, evidence, policy, now=case.now)
-        verdict2 = guard.validate(
-            decision2,
-            work_record,
-            evidence,
-            expected_anchor_head=expected_head,
-            expected_goal_id=work_record.goal_id,
-            expected_authority_revision=work_record.authority_revision,
+        measured_duplicates = 0
+        is_mutative = decision.kind not in (
+            DecisionKind.NOOP_ACTIVE,
+            DecisionKind.WAIT_UNTIL,
+            DecisionKind.REQUEST_HUMAN,
         )
-        measured_duplicates = 1 if (verdict2.accepted and verdict1.accepted) else 0
+        if verdict1.accepted and is_mutative and decision.idempotency_key:
+            # Model the durable intent/authority transition associated with an admitted mutative decision
+            durable_work_record = model_durable_decision_transition(work_record, decision, now=case.now)
+            # Restart with a fresh ActuatorGuard seeded from that durable state
+            restarted_guard = ActuatorGuard(work_record=durable_work_record)
+
+            # Replay attempt: replaying the admitted decision through the restarted guard
+            replay_verdict = restarted_guard.validate(
+                decision,
+                durable_work_record,
+                evidence,
+                expected_anchor_head=expected_head,
+                expected_goal_id=durable_work_record.goal_id,
+                expected_authority_revision=durable_work_record.authority_revision,
+            )
+            if replay_verdict.accepted:
+                measured_duplicates += 1
+
+            # Re-evaluation attempt: deciding from durable state and validating
+            decision2 = decide(durable_work_record, evidence, policy, now=case.now)
+            verdict2 = restarted_guard.validate(
+                decision2,
+                durable_work_record,
+                evidence,
+                expected_anchor_head=expected_head,
+                expected_goal_id=durable_work_record.goal_id,
+                expected_authority_revision=durable_work_record.authority_revision,
+            )
+            if (
+                verdict2.accepted
+                and decision2.kind not in (
+                    DecisionKind.NOOP_ACTIVE,
+                    DecisionKind.WAIT_UNTIL,
+                    DecisionKind.REQUEST_HUMAN,
+                )
+                and decision2.idempotency_key == decision.idempotency_key
+            ):
+                measured_duplicates += 1
 
         # Compare decision
         decision_matches = (decision.kind.value == case.expected_v0_decision)

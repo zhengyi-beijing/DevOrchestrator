@@ -45,11 +45,12 @@ class WorkRecord:
     human_request: dict[str, Any] | None = None
     handoff: dict[str, Any] | None = None
     authority_revision: str = "rev-1"
+    consumed_idempotency_keys: tuple[str, ...] = field(default_factory=tuple)
     created_at: str = ""
     updated_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "schema_version": self.schema_version,
             "project_id": self.project_id,
             "goal_id": self.goal_id,
@@ -71,6 +72,9 @@ class WorkRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.consumed_idempotency_keys:
+            d["consumed_idempotency_keys"] = list(self.consumed_idempotency_keys)
+        return d
 
 
 def canonical_json(record: WorkRecord | Mapping[str, Any]) -> str:
@@ -211,6 +215,10 @@ def validate_work_record(payload: Mapping[str, Any]) -> WorkRecord:
     auth_rev = str(payload.get("authority_revision") or "rev-1")
     created_at = str(payload.get("created_at") or "")
     updated_at = str(payload.get("updated_at") or "")
+    consumed_raw = payload.get("consumed_idempotency_keys") or payload.get("executed_idempotency_keys") or ()
+    if not isinstance(consumed_raw, (list, tuple, set)):
+        raise WorkRecordValidationError("consumed_idempotency_keys must be a sequence")
+    parsed_consumed = tuple(str(k) for k in consumed_raw if k)
 
     return WorkRecord(
         schema_version=schema_version,
@@ -231,6 +239,7 @@ def validate_work_record(payload: Mapping[str, Any]) -> WorkRecord:
         human_request=dict(human_req) if human_req else None,
         handoff=dict(payload["handoff"]) if payload.get("handoff") else None,
         authority_revision=auth_rev,
+        consumed_idempotency_keys=parsed_consumed,
         created_at=created_at,
         updated_at=updated_at,
     )
@@ -282,3 +291,84 @@ def apply_work_record_cas(
         current_data["created_at"] = iso_now
 
     return validate_work_record(current_data)
+
+
+def model_durable_decision_transition(
+    record: WorkRecord,
+    decision: Any,
+    *,
+    now: str | None = None,
+) -> WorkRecord:
+    """Model the durable intent / authority transition for an admitted decision.
+
+    Pure and side-effect free: applies CAS updates to record to reflect the durable
+    execution intent or terminal publication, persisting consumed idempotency keys,
+    active lease, successor state, or handoff, and bumping authority revision.
+    Non-mutative decisions (NOOP_ACTIVE, WAIT_UNTIL, REQUEST_HUMAN) return the record unchanged.
+    """
+    kind = getattr(decision, "kind", None)
+    kind_val = kind.value if hasattr(kind, "value") else str(kind)
+    if kind_val in ("NOOP_ACTIVE", "WAIT_UNTIL", "REQUEST_HUMAN"):
+        return record
+
+    iso_now = now or datetime.now(timezone.utc).isoformat()
+    idemp_key = getattr(decision, "idempotency_key", "")
+    params = getattr(decision, "parameters", {}) or {}
+
+    new_consumed = set(record.consumed_idempotency_keys)
+    if idemp_key:
+        new_consumed.add(idemp_key)
+
+    updates: dict[str, Any] = {
+        "consumed_idempotency_keys": sorted(new_consumed),
+    }
+
+    if kind_val == "EXECUTE" or kind_val.startswith("RETRY_") or kind_val in ("FAILOVER_RESOURCE", "ESCALATE_CAPABILITY"):
+        role = params.get("role", "worker")
+        attempt_id = params.get("attempt_id") or f"att-{len(record.attempts) + 1}"
+        exec_id = params.get("execution_id") or f"exec-{record.goal_id}-{idemp_key[:8]}"
+        updates["active_lease"] = {
+            "role": role,
+            "attempt_id": attempt_id,
+            "execution_id": exec_id,
+            "acquired_at": iso_now,
+            "idempotency_key": idemp_key,
+        }
+
+    elif kind_val == "VERIFY":
+        role = params.get("role", "reviewer")
+        attempt_id = params.get("attempt_id") or f"att-verify-{len(record.attempts) + 1}"
+        exec_id = params.get("execution_id") or f"exec-verify-{record.goal_id}-{idemp_key[:8]}"
+        updates["active_lease"] = {
+            "role": role,
+            "attempt_id": attempt_id,
+            "execution_id": exec_id,
+            "acquired_at": iso_now,
+            "idempotency_key": idemp_key,
+        }
+
+    elif kind_val == "PUBLISH_SUCCESSOR":
+        succ = dict(record.successor or {})
+        succ["publication_state"] = "PUBLISHED"
+        succ["handoff_idempotency_key"] = idemp_key or succ.get("handoff_idempotency_key") or ""
+        updates["successor"] = succ
+        updates["status"] = "DONE"
+        updates["active_lease"] = None
+
+    elif kind_val == "SATISFY_GOAL":
+        updates["status"] = "DONE"
+        updates["active_lease"] = None
+
+    elif kind_val == "WRITE_HANDOFF":
+        updates["status"] = "NEEDS_HUMAN"
+        h = dict(record.handoff or {})
+        h["created_at"] = iso_now
+        h["idempotency_key"] = idemp_key
+        updates["handoff"] = h
+
+    return apply_work_record_cas(
+        record,
+        expected_revision=record.authority_revision,
+        updates=updates,
+        now=iso_now,
+    )

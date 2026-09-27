@@ -205,3 +205,86 @@ class TestP17ReplayDeterminism(unittest.TestCase):
         self.assertEqual(report1.decision_trace_hash, report2.decision_trace_hash)
         self.assertEqual(report1.aggregate_duplicate_executions, 0)
         self.assertEqual(report2.aggregate_duplicate_executions, 0)
+
+    def test_execute_replay_after_guard_restart_is_rejected_from_durable_state(self) -> None:
+        """Finding 1: Replay of EXECUTE after guard restart is rejected by ActuatorGuard from durable state."""
+        from dev_orchestrator.convergence.actuator_guard import ActuatorGuard
+        from dev_orchestrator.convergence.evaluator import DecisionKind, decide
+        from dev_orchestrator.convergence.policy import build_policy
+        from dev_orchestrator.convergence.problems import ProblemBudget
+        from dev_orchestrator.convergence.replay import _reconstruct_evidence
+        from dev_orchestrator.convergence.work_record import (
+            model_durable_decision_transition,
+            validate_work_record,
+        )
+
+        case24 = [c for c in self.cases if c.class_id == 24][0]
+        work_rec = validate_work_record(case24.work_record_snapshot)
+        evidence = _reconstruct_evidence(case24.evidence_snapshot)
+
+        p_raw = case24.policy
+        default_b = p_raw.get("default_budget", {})
+        policy = build_policy(
+            default_budget=ProblemBudget(
+                max_resource_attempts=default_b.get("max_resource_attempts", 3),
+                max_strategy_attempts=default_b.get("max_strategy_attempts", 2),
+                max_capability_escalations=default_b.get("max_capability_escalations", 2),
+                max_total_attempts=default_b.get("max_total_attempts", 5),
+            ),
+            quota_reset_rules=p_raw.get("quota_reset_rules", {}),
+            wait_bounds=p_raw.get("wait_bounds", {}),
+        )
+
+        # 1. Initial decide emits EXECUTE
+        dec = decide(work_rec, evidence, policy, now=case24.now)
+        self.assertEqual(dec.kind, DecisionKind.EXECUTE)
+        self.assertTrue(bool(dec.idempotency_key))
+
+        # 2. Fresh guard admits initial EXECUTE
+        guard1 = ActuatorGuard(work_record=work_rec)
+        head = (case24.evidence_snapshot.get("exact_anchors") or {}).get("head")
+        v1 = guard1.validate(
+            dec,
+            work_rec,
+            evidence,
+            expected_anchor_head=head,
+            expected_goal_id=work_rec.goal_id,
+            expected_authority_revision=work_rec.authority_revision,
+        )
+        self.assertTrue(v1.accepted, f"Initial EXECUTE was not accepted: {v1.reason}")
+
+        # 3. Model durable intent / authority transition
+        durable_rec = model_durable_decision_transition(work_rec, dec, now=case24.now)
+        self.assertIsNotNone(durable_rec.active_lease)
+        self.assertEqual(durable_rec.active_lease.get("idempotency_key"), dec.idempotency_key)
+        self.assertIn(dec.idempotency_key, durable_rec.consumed_idempotency_keys)
+        self.assertNotEqual(durable_rec.authority_revision, work_rec.authority_revision)
+
+        # 4. Restart: instantiate brand new ActuatorGuard seeded ONLY from durable_rec
+        restarted_guard = ActuatorGuard(work_record=durable_rec)
+        self.assertIn(dec.idempotency_key, restarted_guard._executed_keys)
+
+        # 5. Replaying the identical EXECUTE decision is firmly rejected as duplicate
+        v_replay = restarted_guard.validate(
+            dec,
+            durable_rec,
+            evidence,
+            expected_anchor_head=head,
+            expected_goal_id=durable_rec.goal_id,
+            expected_authority_revision=durable_rec.authority_revision,
+        )
+        self.assertFalse(v_replay.accepted)
+        self.assertEqual(v_replay.rejection_code, "DUPLICATE_IDEMPOTENCY_KEY")
+
+        # 6. Re-evaluating from durable state does NOT emit an admitted duplicate EXECUTE
+        dec2 = decide(durable_rec, evidence, policy, now=case24.now)
+        self.assertNotEqual(dec2.kind, DecisionKind.EXECUTE)
+        v2 = restarted_guard.validate(
+            dec2,
+            durable_rec,
+            evidence,
+            expected_anchor_head=head,
+            expected_goal_id=durable_rec.goal_id,
+            expected_authority_revision=durable_rec.authority_revision,
+        )
+        self.assertNotEqual(v2.rejection_code, "DUPLICATE_IDEMPOTENCY_KEY")

@@ -49,6 +49,7 @@ class ActuatorGuard:
 
     def seed_from_work_record(self, work_record: WorkRecord | Mapping[str, Any]) -> None:
         """Seed executed idempotency keys from durable work record state."""
+        # 1. Successor handoff idempotency key
         succ = getattr(work_record, "successor", None)
         if succ is None and isinstance(work_record, Mapping):
             succ = work_record.get("successor")
@@ -57,6 +58,44 @@ class ActuatorGuard:
             key = succ.get("handoff_idempotency_key")
             if key and pub_state in ("PUBLISHED", "COMMITTED"):
                 self._executed_keys.add(key)
+
+        # 2. Active lease idempotency key
+        lease = getattr(work_record, "active_lease", None)
+        if lease is None and isinstance(work_record, Mapping):
+            lease = work_record.get("active_lease")
+        if isinstance(lease, Mapping):
+            l_key = lease.get("idempotency_key")
+            if l_key:
+                self._executed_keys.add(l_key)
+
+        # 3. Attempts idempotency keys
+        attempts = getattr(work_record, "attempts", ())
+        if isinstance(work_record, Mapping) and not attempts:
+            attempts = work_record.get("attempts", ())
+        if isinstance(attempts, (list, tuple)):
+            for att in attempts:
+                if isinstance(att, Mapping):
+                    a_key = att.get("idempotency_key")
+                    if a_key:
+                        self._executed_keys.add(a_key)
+
+        # 4. Handoff idempotency key
+        handoff = getattr(work_record, "handoff", None)
+        if handoff is None and isinstance(work_record, Mapping):
+            handoff = work_record.get("handoff")
+        if isinstance(handoff, Mapping):
+            h_key = handoff.get("idempotency_key")
+            if h_key:
+                self._executed_keys.add(h_key)
+
+        # 5. Consumed/executed idempotency keys
+        consumed = getattr(work_record, "consumed_idempotency_keys", None)
+        if consumed is None and isinstance(work_record, Mapping):
+            consumed = work_record.get("consumed_idempotency_keys") or work_record.get("executed_idempotency_keys")
+        if consumed and isinstance(consumed, (list, tuple, set)):
+            for k in consumed:
+                if isinstance(k, str) and k:
+                    self._executed_keys.add(k)
 
     def validate(
         self,
@@ -70,12 +109,7 @@ class ActuatorGuard:
     ) -> GuardVerdict:
         """Validate whether a decision can be safely admitted for execution."""
         # Ensure guard is seeded from durable work record
-        succ = getattr(work_record, "successor", None)
-        if isinstance(succ, Mapping):
-            pub_state = succ.get("publication_state")
-            key = succ.get("handoff_idempotency_key")
-            if key and pub_state in ("PUBLISHED", "COMMITTED"):
-                self._executed_keys.add(key)
+        self.seed_from_work_record(work_record)
 
         # 1. Emergency Pause / Stop check (absolute highest priority safety interlock)
         if evidence.emergency_pause_asserted:

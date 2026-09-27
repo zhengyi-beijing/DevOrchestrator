@@ -64,6 +64,7 @@ from dev_orchestrator.convergence.work_record import (
     ALLOWED_GOAL_STATUSES,
     WorkRecord,
     WorkRecordValidationError,
+    model_durable_decision_transition,
     validate_work_record,
     work_record_digest,
 )
@@ -123,6 +124,7 @@ __all__ = [
     "load_legacy_contract_amendments",
     "load_retirement_dispositions",
     "load_seeded_preflight_rules",
+    "model_durable_decision_transition",
     "resolve_runtime_root",
     "snapshot_digest",
     "validate_amendment_test_references",
