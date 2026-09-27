@@ -7,11 +7,10 @@ so humans and tools can inspect one file without reconstructing the ledgers.
 from __future__ import annotations
 
 import copy
-import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
-from dev_orchestrator.platform.process import hidden_subprocess_kwargs
+from dev_orchestrator.core.git_paths import resolve_git_path
 from dev_orchestrator.storage.json_store import (
     parse_utc,
     read_json,
@@ -218,21 +217,9 @@ def _watchdog_view(runtime: Path, project_id: str) -> Optional[dict[str, Any]]:
     }
 
 
-def _git_path(repo: Path, relative: str) -> Optional[Path]:
-    proc = subprocess.run(
-        ["git", "--no-optional-locks", "-C", str(repo), "rev-parse", "--git-path", relative],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=10, check=False, **hidden_subprocess_kwargs(),
-    )
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return None
-    path = Path(proc.stdout.strip())
-    return path if path.is_absolute() else repo / path
-
-
 def ensure_status_is_git_ignored(repo: Path) -> None:
     """Locally exclude ``.devorch/`` without modifying tracked project files."""
-    exclude = _git_path(repo, "info/exclude")
+    exclude = resolve_git_path(repo, "info/exclude")
     if exclude is None:
         raise RuntimeError("repository git exclude path is unavailable")
     exclude.parent.mkdir(parents=True, exist_ok=True)
@@ -363,6 +350,10 @@ def build_project_status(
     }
     if "project_context" in snapshot:
         result["project_context"] = copy.deepcopy(snapshot["project_context"])
+    if isinstance(snapshot.get("actuation_error"), dict):
+        # A contained actuation fault stays visible per project; it is not
+        # settled against the decision or handoff that failed to actuate.
+        result["actuation_error"] = copy.deepcopy(snapshot["actuation_error"])
     watchdog_view = _watchdog_view(runtime, project_id)
     if watchdog_view is not None:
         result["watchdog"] = watchdog_view

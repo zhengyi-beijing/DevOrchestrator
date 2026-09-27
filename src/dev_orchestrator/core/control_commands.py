@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import logging
 from pathlib import Path
 import re
 from typing import Any, Optional, Sequence
@@ -32,6 +33,8 @@ from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lif
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
+
+logger = logging.getLogger(__name__)
 
 CONTROL_DIR = "control"
 CONTROL_VERSION = 1
@@ -152,9 +155,17 @@ class ControlCommandCoordinator:
         projects = self._project_map(config)
         snapshots = self._snapshot_map(summary)
         outcomes = self.command_store.repair_corruption()
-        outcomes.extend(self._sync_planner_terminals())
-        outcomes.extend(self._resume_ready_plans(projects, snapshots, executor))
-        outcomes.extend(self._resume_decision_handoffs(projects, snapshots, executor))
+        # Each automatic phase is contained: one project's planner or handoff
+        # fault must not stop the remaining phases or the command inbox.
+        for phase, resolver in (
+            ("planner_terminals", lambda: self._sync_planner_terminals()),
+            ("ready_plans", lambda: self._resume_ready_plans(projects, snapshots, executor)),
+            ("handoff_resume", lambda: self._resume_decision_handoffs(projects, snapshots, executor)),
+        ):
+            try:
+                outcomes.extend(resolver())
+            except Exception as exc:  # noqa: BLE001 - contain one phase's fault
+                self._record_contained_fault(executor, None, exc, phase=phase)
         for path in self.command_store.pending_paths():
             record = read_json(path, None)
             if not isinstance(record, dict):
@@ -165,10 +176,37 @@ class ControlCommandCoordinator:
             if isinstance(existing, dict):
                 outcomes.append(self.command_store.settle(path, existing))
                 continue
-            outcome = self._consume_one(record, projects, snapshots, executor)
+            try:
+                outcome = self._consume_one(record, projects, snapshots, executor)
+            except Exception as exc:  # noqa: BLE001 - contain one command's fault
+                # The command stays pending: a contained fault must not settle it.
+                self._record_contained_fault(
+                    executor, _nonblank(record.get("project_id")), exc,
+                    request_id=raw_id, phase="control_command",
+                )
+                continue
             outcome = self.command_store.settle(path, outcome)
             outcomes.append(outcome)
         return outcomes
+
+    @staticmethod
+    def _record_contained_fault(
+        executor: Any, project_id: str | None, error: BaseException, *,
+        request_id: str | None = None, task_id: str | None = None,
+        phase: str = "control_actuation",
+    ) -> None:
+        """Attribute a contained coordinator fault to the executor's error surface."""
+        record_error = getattr(executor, "record_actuation_error", None)
+        if callable(record_error):
+            record_error(
+                project_id, error, request_id=request_id, task_id=task_id,
+                source_kind="control", phase=phase,
+            )
+        else:
+            logger.exception(
+                "contained control fault project=%s phase=%s request=%s",
+                project_id, phase, request_id,
+            )
     def _resume_decision_handoffs(
         self, projects: dict[str, dict[str, Any]], snapshots: dict[str, dict[str, Any]], executor: Any,
     ) -> list[dict[str, Any]]:
@@ -179,105 +217,132 @@ class ControlCommandCoordinator:
             return []
         outcomes: list[dict[str, Any]] = []
         for source_id, row in sorted(executions.items()):
-            if (
-                isinstance(row, dict)
-                and row.get("state") == "blocked"
-                and row.get("outcome") == "planning_required"
-            ):
-                # A handoff refused only because HEAD advanced is re-offered
-                # once; the executor owns that decision and the ledger write.
-                reopen = getattr(executor, "reopen_stale_anchor_handoff", None)
-                if callable(reopen) and reopen(source_id):
-                    refreshed = executor.state()
-                    row = (refreshed.get("executions") or {}).get(source_id) if isinstance(refreshed, dict) else None
-            if not isinstance(row, dict) or row.get("state") != "handoff" or row.get("outcome") != "planning_required":
-                continue
-            project_id = _nonblank(row.get("project_id")); next_task_id = _nonblank(row.get("next_task_id"))
-            project = projects.get(project_id or ""); snapshot = snapshots.get(project_id or "")
-            if project is None or snapshot is None or next_task_id is None:
-                continue
-            staged_successor = _nonblank(row.get("staged_successor"))
-            if row.get("handoff_consumed") is True:
-                # Only old deferred handoffs reach this path: new handoffs
-                # activate the staged successor before their P13 planner is
-                # created.  Reconcile at the restart boundary rather than
-                # allowing P12.7 to become current again.
-                if staged_successor is not None:
-                    continuation_id = _continuation_id(source_id)
-                    reconcile = getattr(self.planner, "reconcile_deferred_activation", None)
-                    if callable(reconcile):
-                        reason = reconcile(project, row, continuation_id)
-                        if reason:
-                            outcomes.append({
-                                "version": CONTROL_VERSION, "command_id": continuation_id,
-                                "project_id": project_id, "action": "continue", "state": "blocked",
-                                "source": "automatic_review_handoff", "parent_request_id": source_id,
-                                "reason": reason, "processed_at": utc_now_iso(),
-                            })
-                continue
-            if self.owner_store.is_paused(project_id or ""):
-                continue
-            telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
-            is_staged = staged_successor is not None
-            if not is_staged:
-                if _nonblank(telemetry.get("task_id")) != next_task_id or not parse_task_status(snapshot.get("next_status")).is_pending_design():
-                    continue
-            else:
-                status_obj = parse_task_status(snapshot.get("next_status"))
-                current_task = _nonblank(telemetry.get("task_id"))
-                authority = (
-                    snapshot.get("authoritative_lifecycle")
-                    if isinstance(snapshot.get("authoritative_lifecycle"), dict)
-                    else {}
+            try:
+                outcomes.extend(
+                    self._resume_one_decision_handoff(
+                        source_id, row, projects, snapshots, executor,
+                    )
                 )
-                repository_projection = (
-                    authority.get("repository_projection")
-                    if isinstance(authority.get("repository_projection"), dict)
-                    else {}
+            except Exception as exc:  # noqa: BLE001 - contain one project's handoff fault
+                self._record_contained_fault(
+                    executor,
+                    _nonblank(row.get("project_id")) if isinstance(row, dict) else None,
+                    exc,
+                    request_id=source_id,
+                    task_id=_nonblank(row.get("task_id")) if isinstance(row, dict) else None,
+                    phase="handoff_resume",
                 )
-                transition_matches = (
-                    _nonblank(authority.get("current_task_id")) == _nonblank(row.get("task_id"))
-                    and _nonblank(authority.get("active_transition_id"))
-                    == _nonblank(row.get("lifecycle_transition_id"))
-                    and _nonblank(repository_projection.get("task_id")) == staged_successor
-                )
-                successor_already_current = (
-                    (current_task == staged_successor or transition_matches)
-                    and status_obj.is_pending_design()
-                )
-                if row.get("reviewed_ready") is True:
-                    status_ok = status_obj.is_ready_to_run()
-                else:
-                    status_ok = status_obj.is_completed()
-                if staged_successor != next_task_id or (
-                    not successor_already_current
-                    and (current_task != _nonblank(row.get("task_id")) or not status_ok)
-                ):
-                    continue
+        return outcomes
 
-            continuation_id = _continuation_id(source_id)
-            history_path = self.history / (continuation_id + ".json")
-            existing = read_json(history_path, None)
-            if isinstance(existing, dict) and _nonblank(existing.get("plan_id")):
-                executor.mark_handoff_consumed(source_id, continuation_id, str(existing["plan_id"]))
-                outcomes.append(existing); continue
-            if is_staged:
-                plan_id, reason = self.planner.start_deferred(project, snapshot, continuation_id, row)
+    def _resume_one_decision_handoff(
+        self, source_id: str, row: Any, projects: dict[str, dict[str, Any]],
+        snapshots: dict[str, dict[str, Any]], executor: Any,
+    ) -> list[dict[str, Any]]:
+        """Resume exactly one pending planner handoff.
+
+        Raising is contained by the caller: the handoff stays unconsumed in the
+        executor ledger and the remaining projects still advance this tick.
+        """
+        outcomes: list[dict[str, Any]] = []
+        if (
+            isinstance(row, dict)
+            and row.get("state") == "blocked"
+            and row.get("outcome") == "planning_required"
+        ):
+            # A handoff refused only because HEAD advanced is re-offered
+            # once; the executor owns that decision and the ledger write.
+            reopen = getattr(executor, "reopen_stale_anchor_handoff", None)
+            if callable(reopen) and reopen(source_id):
+                refreshed = executor.state()
+                row = (refreshed.get("executions") or {}).get(source_id) if isinstance(refreshed, dict) else None
+        if not isinstance(row, dict) or row.get("state") != "handoff" or row.get("outcome") != "planning_required":
+            return outcomes
+        project_id = _nonblank(row.get("project_id")); next_task_id = _nonblank(row.get("next_task_id"))
+        project = projects.get(project_id or ""); snapshot = snapshots.get(project_id or "")
+        if project is None or snapshot is None or next_task_id is None:
+            return outcomes
+        staged_successor = _nonblank(row.get("staged_successor"))
+        if row.get("handoff_consumed") is True:
+            # Only old deferred handoffs reach this path: new handoffs
+            # activate the staged successor before their P13 planner is
+            # created.  Reconcile at the restart boundary rather than
+            # allowing P12.7 to become current again.
+            if staged_successor is not None:
+                continuation_id = _continuation_id(source_id)
+                reconcile = getattr(self.planner, "reconcile_deferred_activation", None)
+                if callable(reconcile):
+                    reason = reconcile(project, row, continuation_id)
+                    if reason:
+                        outcomes.append({
+                            "version": CONTROL_VERSION, "command_id": continuation_id,
+                            "project_id": project_id, "action": "continue", "state": "blocked",
+                            "source": "automatic_review_handoff", "parent_request_id": source_id,
+                            "reason": reason, "processed_at": utc_now_iso(),
+                        })
+            return outcomes
+        if self.owner_store.is_paused(project_id or ""):
+            return outcomes
+        telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+        is_staged = staged_successor is not None
+        if not is_staged:
+            if _nonblank(telemetry.get("task_id")) != next_task_id or not parse_task_status(snapshot.get("next_status")).is_pending_design():
+                return outcomes
+        else:
+            status_obj = parse_task_status(snapshot.get("next_status"))
+            current_task = _nonblank(telemetry.get("task_id"))
+            authority = (
+                snapshot.get("authoritative_lifecycle")
+                if isinstance(snapshot.get("authoritative_lifecycle"), dict)
+                else {}
+            )
+            repository_projection = (
+                authority.get("repository_projection")
+                if isinstance(authority.get("repository_projection"), dict)
+                else {}
+            )
+            transition_matches = (
+                _nonblank(authority.get("current_task_id")) == _nonblank(row.get("task_id"))
+                and _nonblank(authority.get("active_transition_id"))
+                == _nonblank(row.get("lifecycle_transition_id"))
+                and _nonblank(repository_projection.get("task_id")) == staged_successor
+            )
+            successor_already_current = (
+                (current_task == staged_successor or transition_matches)
+                and status_obj.is_pending_design()
+            )
+            if row.get("reviewed_ready") is True:
+                status_ok = status_obj.is_ready_to_run()
             else:
-                plan_id, reason = self.planner.start(project, snapshot, continuation_id)
-            now = utc_now_iso()
-            if plan_id is None:
-                executor.mark_handoff_blocked(source_id, "automatic planner handoff failed: " + reason)
-                outcome = {"version":CONTROL_VERSION,"command_id":continuation_id,"project_id":project_id,"action":"continue","state":"blocked","source":"automatic_review_handoff","parent_request_id":source_id,"reason":reason,"processed_at":now}
-            else:
-                outcome = {"version":CONTROL_VERSION,"command_id":continuation_id,"project_id":project_id,"action":"continue","state":"accepted","source":"automatic_review_handoff","parent_request_id":source_id,"lifecycle_action":"plan","plan_id":plan_id,"reason":reason,"processed_at":now}
-                write_json(history_path, outcome, indent=2)
-                self.command_store.audit("command_updated", outcome)
-                executor.mark_handoff_consumed(source_id, continuation_id, plan_id)
-            if plan_id is None:
-                write_json(history_path, outcome, indent=2)
-                self.command_store.audit("command_updated", outcome)
-            outcomes.append(outcome)
+                status_ok = status_obj.is_completed()
+            if staged_successor != next_task_id or (
+                not successor_already_current
+                and (current_task != _nonblank(row.get("task_id")) or not status_ok)
+            ):
+                return outcomes
+
+        continuation_id = _continuation_id(source_id)
+        history_path = self.history / (continuation_id + ".json")
+        existing = read_json(history_path, None)
+        if isinstance(existing, dict) and _nonblank(existing.get("plan_id")):
+            executor.mark_handoff_consumed(source_id, continuation_id, str(existing["plan_id"]))
+            outcomes.append(existing); return outcomes
+        if is_staged:
+            plan_id, reason = self.planner.start_deferred(project, snapshot, continuation_id, row)
+        else:
+            plan_id, reason = self.planner.start(project, snapshot, continuation_id)
+        now = utc_now_iso()
+        if plan_id is None:
+            executor.mark_handoff_blocked(source_id, "automatic planner handoff failed: " + reason)
+            outcome = {"version":CONTROL_VERSION,"command_id":continuation_id,"project_id":project_id,"action":"continue","state":"blocked","source":"automatic_review_handoff","parent_request_id":source_id,"reason":reason,"processed_at":now}
+        else:
+            outcome = {"version":CONTROL_VERSION,"command_id":continuation_id,"project_id":project_id,"action":"continue","state":"accepted","source":"automatic_review_handoff","parent_request_id":source_id,"lifecycle_action":"plan","plan_id":plan_id,"reason":reason,"processed_at":now}
+            write_json(history_path, outcome, indent=2)
+            self.command_store.audit("command_updated", outcome)
+            executor.mark_handoff_consumed(source_id, continuation_id, plan_id)
+        if plan_id is None:
+            write_json(history_path, outcome, indent=2)
+            self.command_store.audit("command_updated", outcome)
+        outcomes.append(outcome)
         return outcomes
 
     def _sync_planner_terminals(self) -> list[dict[str, Any]]:
@@ -307,58 +372,90 @@ class ControlCommandCoordinator:
             return []
         outcomes: list[dict[str, Any]] = []
         for plan in self.planner.ready_records():
-            project_id = _nonblank(plan.get("project_id"))
-            command_id = _safe_command_id(plan.get("command_id"))
-            plan_id = _nonblank(plan.get("plan_id"))
-            if project_id is None or command_id is None or plan_id is None:
-                continue
-            if self.owner_store.is_paused(project_id):
-                continue
-            project = projects.get(project_id); snapshot = snapshots.get(project_id)
-            if project is None or snapshot is None:
-                continue
-            launch_snapshot = snapshot
-            if snapshot.get("state") != "READY_TO_RUN":
-                telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
-                git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
-                approved_idle = (
-                    snapshot.get("state") == "IDLE"
-                    and parse_task_status(snapshot.get("next_status")).is_ready_to_run()
-                    and _nonblank(telemetry.get("task_id")) == _nonblank(plan.get("task_id"))
-                    and _nonblank(git.get("head")) == _nonblank(plan.get("ready_head"))
-                    and _nonblank(plan.get("ready_head")) is not None
+            project_id = _nonblank(plan.get("project_id")) if isinstance(plan, dict) else None
+            try:
+                outcome = self._resume_one_ready_plan(
+                    plan, projects, snapshots, executor,
                 )
-                if not approved_idle:
-                    continue
-                launch_snapshot = dict(snapshot)
-                launch_snapshot["state"] = "READY_TO_RUN"
-            source_id = command_id + ":execute"
-            predecessor_task_id = _nonblank(plan.get("predecessor_task_id"))
-            if predecessor_task_id is not None:
-                import inspect
-                params = inspect.signature(executor.start_control).parameters
-                if "source_task_id" in params:
-                    launch = executor.start_control(
-                        project, launch_snapshot, source_id,
-                        source_task_id=predecessor_task_id,
-                    )
-                else:
-                    launch = executor.start_control(project, launch_snapshot, source_id)
+            except Exception as exc:  # noqa: BLE001 - preserve later project launches
+                self._record_contained_fault(
+                    executor, project_id, exc,
+                    request_id=(
+                        _safe_command_id(plan.get("command_id"))
+                        if isinstance(plan, dict) else None
+                    ),
+                    task_id=(
+                        _nonblank(plan.get("task_id")) if isinstance(plan, dict) else None
+                    ),
+                    phase="ready_plan_launch",
+                )
+                continue
+            if outcome is not None:
+                outcomes.append(outcome)
+        return outcomes
+
+    def _resume_one_ready_plan(
+        self, plan: Any, projects: dict[str, dict[str, Any]],
+        snapshots: dict[str, dict[str, Any]], executor: Any,
+    ) -> dict[str, Any] | None:
+        """Launch one approved plan; the caller contains faults per project."""
+        if not isinstance(plan, dict):
+            return None
+        project_id = _nonblank(plan.get("project_id"))
+        command_id = _safe_command_id(plan.get("command_id"))
+        plan_id = _nonblank(plan.get("plan_id"))
+        if project_id is None or command_id is None or plan_id is None:
+            return None
+        if self.owner_store.is_paused(project_id):
+            return None
+        project = projects.get(project_id); snapshot = snapshots.get(project_id)
+        if project is None or snapshot is None:
+            return None
+        launch_snapshot = snapshot
+        if snapshot.get("state") != "READY_TO_RUN":
+            telemetry = snapshot.get("telemetry") if isinstance(snapshot.get("telemetry"), dict) else {}
+            git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
+            approved_idle = (
+                snapshot.get("state") == "IDLE"
+                and parse_task_status(snapshot.get("next_status")).is_ready_to_run()
+                and _nonblank(telemetry.get("task_id")) == _nonblank(plan.get("task_id"))
+                and _nonblank(git.get("head")) == _nonblank(plan.get("ready_head"))
+                and _nonblank(plan.get("ready_head")) is not None
+            )
+            if not approved_idle:
+                return None
+            launch_snapshot = dict(snapshot)
+            launch_snapshot["state"] = "READY_TO_RUN"
+        source_id = command_id + ":execute"
+        predecessor_task_id = _nonblank(plan.get("predecessor_task_id"))
+        if predecessor_task_id is not None:
+            import inspect
+            params = inspect.signature(executor.start_control).parameters
+            if "source_task_id" in params:
+                launch = executor.start_control(
+                    project, launch_snapshot, source_id,
+                    source_task_id=predecessor_task_id,
+                )
             else:
                 launch = executor.start_control(project, launch_snapshot, source_id)
-            if launch is None:
-                row = executor.state().get("executions", {}).get(source_id, {})
-                reason = str(row.get("reason") or "approved plan Worker launch failed") if isinstance(row, dict) else "approved plan Worker launch failed"
-                self.planner.mark_worker_blocked(plan_id, reason)
-                continue
-            self.planner.mark_worker_launched(plan_id, source_id)
-            history = read_json(self.history / (command_id + ".json"), {})
-            if not isinstance(history, dict): history = {}
-            history.update({"state":"accepted","lifecycle_action":"execute","task_id":launch.task_id,"backend_id":launch.backend_id,"resumed_at":utc_now_iso()})
-            write_json(self.history / (command_id + ".json"), history, indent=2)
-            self.command_store.audit("command_updated", history)
-            outcomes.append(history)
-        return outcomes
+        else:
+            launch = executor.start_control(project, launch_snapshot, source_id)
+        if launch is None:
+            row = executor.state().get("executions", {}).get(source_id, {})
+            reason = str(row.get("reason") or "approved plan Worker launch failed") if isinstance(row, dict) else "approved plan Worker launch failed"
+            self.planner.mark_worker_blocked(plan_id, reason)
+            return None
+        # start_control has durably recorded launch intent before these
+        # projection writes.  If one fails, the caller records degradation and
+        # continues; the durable execution row is not lost or relaunched.
+        self.planner.mark_worker_launched(plan_id, source_id)
+        history = read_json(self.history / (command_id + ".json"), {})
+        if not isinstance(history, dict):
+            history = {}
+        history.update({"state":"accepted","lifecycle_action":"execute","task_id":launch.task_id,"backend_id":launch.backend_id,"resumed_at":utc_now_iso()})
+        write_json(self.history / (command_id + ".json"), history, indent=2)
+        self.command_store.audit("command_updated", history)
+        return history
 
     def _consume_one(
         self,

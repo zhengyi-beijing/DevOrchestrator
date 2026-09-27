@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from dev_orchestrator.core.git_paths import resolve_git_dir
 from dev_orchestrator.core.watchdog import canonical_path
 
 
@@ -13,9 +14,13 @@ def _verify_owner_repo(repo_path: Path, tests_root: Path) -> tuple[bool, str]:
     if not repo_path.is_dir():
         return False, f"repo_path does not exist: {repo_path}"
 
-    git_dir = repo_path / ".git"
-    if not (git_dir.is_dir() or git_dir.is_file()):
+    # ``.git`` is a directory in a primary checkout and a *file* in a linked
+    # worktree; require its presence to keep the check anchored at the checkout
+    # root, then let git confirm the repository, failing closed if it cannot.
+    if not (repo_path / ".git").exists():
         return False, f"not a git repository: {repo_path}"
+    if resolve_git_dir(repo_path) is None:
+        return False, f"git cannot resolve the repository git directory: {repo_path}"
 
     pyproject_file = repo_path / "pyproject.toml"
     if not pyproject_file.is_file():

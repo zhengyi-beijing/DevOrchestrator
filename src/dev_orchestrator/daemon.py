@@ -97,6 +97,96 @@ def _bridge_heartbeat(
     }
 
 
+def _record_contained_tick_fault(
+    executor: Any, error: BaseException, *, phase: str,
+) -> str:
+    """Contain one actuation-phase fault and return its heartbeat error text.
+
+    The fault is never settled against a decision or handoff; it only degrades
+    the heartbeat and lets the remaining tick phases run.
+    """
+    detail = "{0} failed: {1}: {2}".format(phase, type(error).__name__, error)
+    logger.exception("contained control-plane tick fault in %s: %s", phase, error)
+    record_error = getattr(executor, "record_actuation_error", None)
+    if callable(record_error):
+        try:
+            record_error(None, error, source_kind="tick", phase=phase)
+        except Exception:  # noqa: BLE001 - reporting must never mask the fault
+            logger.exception("recording contained tick fault failed")
+    return detail
+
+
+def _drain_actuation_errors(executor: Any) -> dict[str, Any]:
+    """Collect the contained actuation faults recorded during this tick."""
+    drain = getattr(executor, "drain_actuation_errors", None)
+    if not callable(drain):
+        return {}
+    try:
+        errors = drain()
+    except Exception:  # noqa: BLE001 - reporting must never break the tick
+        logger.exception("draining contained actuation faults failed")
+        return {}
+    return errors if isinstance(errors, dict) else {}
+
+
+def _first_actuation_error(errors: dict[str, Any]) -> Optional[str]:
+    for key in sorted(errors):
+        entry = errors[key]
+        if isinstance(entry, dict) and entry.get("error"):
+            return "{0} actuation failed: {1}".format(
+                entry.get("project_id") or "control-plane", entry["error"],
+            )
+    return None
+
+
+def _attach_actuation_errors(projected: Any, errors: dict[str, Any]) -> Any:
+    """Publish each contained fault on its own project row."""
+    if not isinstance(projected, dict) or not isinstance(projected.get("projects"), list):
+        return projected
+    result = dict(projected)
+    rows = []
+    for row in result["projects"]:
+        if isinstance(row, dict):
+            entry = errors.get(str(row.get("project_id") or ""))
+            if isinstance(entry, dict):
+                row = dict(row)
+                row["actuation_error"] = dict(entry)
+        rows.append(row)
+    result["projects"] = rows
+    unattributed = [
+        dict(entry) for key, entry in sorted(errors.items())
+        if isinstance(entry, dict) and not entry.get("project_id")
+    ]
+    if unattributed:
+        result["_unattributed_actuation_errors"] = unattributed
+    return result
+
+
+def _persist_tick_projection(
+    projected: Any, runtime: Path, *, pid: int,
+    actuation_error: str | None = None,
+    watchdog_error: str | None = None,
+    supervisor_error: str | None = None,
+) -> dict[str, Any]:
+    """Persist exactly the degraded projection returned to the daemon loop."""
+    result = (
+        dict(projected)
+        if isinstance(projected, dict)
+        else {"projects": [], "summary": projected}
+    )
+    if actuation_error is not None:
+        result["_actuation_tick_error"] = actuation_error
+    if watchdog_error is not None:
+        result["_watchdog_tick_error"] = watchdog_error
+    if supervisor_error is not None:
+        result["_supervisor_tick_error"] = supervisor_error
+    write_project_statuses(
+        result, runtime, phase="actuation", daemon_state="running", pid=pid,
+    )
+    write_json(runtime / "summary.json", result)
+    return result
+
+
 def _run_orchestration_tick(
     config: Path | str, runtime: Path, bridge_store: BrowserBridgeStore,
     executor: TransitionExecutor, reviewer: AIReviewerCoordinator | None = None,
@@ -110,6 +200,8 @@ def _run_orchestration_tick(
     """Run one ordered control-plane tick and return the projected summary."""
     watchdog_error: Optional[str] = None
     supervisor_error: Optional[str] = None
+    actuation_error: Optional[str] = None
+    authority_fenced = False
     raw_summary = run_monitor_once(config, runtime)
     planner_obj = getattr(controls, "planner", None) if controls is not None else None
     planner_state_fn = getattr(planner_obj, "state", None)
@@ -117,17 +209,47 @@ def _run_orchestration_tick(
     reconcile_authority = getattr(executor, "reconcile_lifecycle_authority", None)
     overlay_authority = getattr(executor, "overlay_lifecycle_authority", None)
     if callable(reconcile_authority):
-        reconcile_authority(
-            raw_summary,
-            planner_state=planner_state_fn() if callable(planner_state_fn) else None,
-            reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
-        )
+        try:
+            reconcile_authority(
+                raw_summary,
+                planner_state=planner_state_fn() if callable(planner_state_fn) else None,
+                reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
+            )
+        except Exception as _auth_exc:  # noqa: BLE001 - contained, keep the tick running
+            authority_fenced = True
+            actuation_error = _record_contained_tick_fault(
+                executor, _auth_exc, phase="lifecycle_authority",
+            )
     authoritative_summary = (
         overlay_authority(raw_summary) if callable(overlay_authority) else raw_summary
     )
     write_project_statuses(raw_summary, runtime, phase="monitor", daemon_state="running", pid=pid)
+    if actuation_error is not None:
+        # Authority is the sole lifecycle source of truth.  If it cannot be
+        # reconciled, every command, decision, recovery and launch path for this
+        # tick is fenced.  Publish the degraded projection without actuating
+        # against stale or contradictory authority.
+        projected = executor.overlay_managed_runs(authoritative_summary)
+        projected = overlay_orchestration_lifecycle(
+            projected,
+            planner_state=planner_state_fn() if callable(planner_state_fn) else None,
+            reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
+        )
+        if callable(overlay_authority):
+            projected = overlay_authority(projected)
+        errors = _drain_actuation_errors(executor)
+        if errors:
+            projected = _attach_actuation_errors(projected, errors)
+        return _persist_tick_projection(
+            projected, runtime, pid=pid, actuation_error=actuation_error,
+        )
     if controls is not None:
-        controls.advance(config, authoritative_summary, executor)
+        try:
+            controls.advance(config, authoritative_summary, executor)
+        except Exception as _ctl_exc:  # noqa: BLE001 - contained, keep the tick running
+            actuation_error = _record_contained_tick_fault(
+                executor, _ctl_exc, phase="control_commands",
+            )
     projected = executor.overlay_managed_runs(authoritative_summary)
     direct_review_projects = reviewer.enabled_project_ids(config) if reviewer is not None else frozenset()
     if reviewer is not None:
@@ -321,13 +443,24 @@ def _run_orchestration_tick(
             browser_summary, bridge_store, runtime, accounting=accounting
         )
     write_project_statuses(projected, runtime, phase="decision", daemon_state="running", pid=pid)
-    executor.advance(raw_summary, config, decision_summary=projected)
-    if callable(reconcile_authority):
-        reconcile_authority(
-            raw_summary,
-            planner_state=planner_state_fn() if callable(planner_state_fn) else None,
-            reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
+    try:
+        executor.advance(raw_summary, config, decision_summary=projected)
+    except Exception as _act_exc:  # noqa: BLE001 - contained, keep the tick running
+        actuation_error = _record_contained_tick_fault(
+            executor, _act_exc, phase="decision_actuation",
         )
+    if callable(reconcile_authority):
+        try:
+            reconcile_authority(
+                raw_summary,
+                planner_state=planner_state_fn() if callable(planner_state_fn) else None,
+                reviewer_state=reviewer_state_fn() if callable(reviewer_state_fn) else None,
+            )
+        except Exception as _auth_exc:  # noqa: BLE001 - contained, keep the tick running
+            authority_fenced = True
+            actuation_error = _record_contained_tick_fault(
+                executor, _auth_exc, phase="lifecycle_authority",
+            )
     authoritative_summary = (
         overlay_authority(raw_summary) if callable(overlay_authority) else raw_summary
     )
@@ -339,7 +472,7 @@ def _run_orchestration_tick(
     )
     if callable(overlay_authority):
         projected = overlay_authority(projected)
-    if watchdog is not None:
+    if watchdog is not None and not authority_fenced:
         try:
             # The watchdog's READY_TO_RUN launch-gap detector must see the
             # monitor's current lifecycle truth.  ``projected`` is a UI and
@@ -374,7 +507,7 @@ def _run_orchestration_tick(
         except Exception as _wd_exc:
             watchdog.record_tick_error(_wd_exc)
             watchdog_error = str(_wd_exc)
-    if supervisor is not None:
+    if supervisor is not None and not authority_fenced:
         try:
             planner_st = planner_state_fn() if callable(planner_state_fn) else None
             reviewer_st = reviewer_state_fn() if callable(reviewer_state_fn) else None
@@ -405,20 +538,22 @@ def _run_orchestration_tick(
     except Exception as _harv_exc:
         projected = dict(projected) if isinstance(projected, dict) else {"projects": [], "summary": projected}
         projected["_harvesting_tick_error"] = str(_harv_exc)
-    if job_recovery is not None:
+    if job_recovery is not None and not authority_fenced:
         try:
             job_recovery.advance()
         except Exception:
             pass
-    write_project_statuses(projected, runtime, phase="actuation", daemon_state="running", pid=pid)
-    write_json(runtime / "summary.json", projected)
-    if watchdog_error is not None:
-        projected = dict(projected) if isinstance(projected, dict) else {"projects": [], "summary": projected}
-        projected["_watchdog_tick_error"] = watchdog_error
-    if supervisor_error is not None:
-        projected = dict(projected) if isinstance(projected, dict) else {"projects": [], "summary": projected}
-        projected["_supervisor_tick_error"] = supervisor_error
-    return projected
+    project_errors = _drain_actuation_errors(executor)
+    if project_errors:
+        projected = _attach_actuation_errors(projected, project_errors)
+        if actuation_error is None:
+            actuation_error = _first_actuation_error(project_errors)
+    return _persist_tick_projection(
+        projected, runtime, pid=pid,
+        actuation_error=actuation_error,
+        watchdog_error=watchdog_error,
+        supervisor_error=supervisor_error,
+    )
 
 
 def run_daemon(
@@ -658,10 +793,14 @@ def run_daemon(
                     pid=pid
                 )
                 if isinstance(tick_result, dict):
-                    if tick_result.get("_watchdog_tick_error"):
-                        last_error = str(tick_result["_watchdog_tick_error"])
-                    elif tick_result.get("_supervisor_tick_error"):
-                        last_error = str(tick_result["_supervisor_tick_error"])
+                    for _err_key in (
+                        "_actuation_tick_error",
+                        "_watchdog_tick_error",
+                        "_supervisor_tick_error",
+                    ):
+                        if tick_result.get(_err_key):
+                            last_error = str(tick_result[_err_key])
+                            break
             except Exception as exc:  # noqa: BLE001 - degraded heartbeat, keep looping
                 last_error = str(exc)
             state = "degraded" if last_error else "running"

@@ -24,6 +24,7 @@ from dev_orchestrator.core.lifecycle_authority import (
 from dev_orchestrator.core.successor_consistency import (
     reconcile_roadmap_successor,
     resolve_successor,
+    scan_staged_specs,
 )
 from dev_orchestrator.core.transition_executor import (
     _STALE_ANCHOR_HANDOFF_REFUSAL,
@@ -2208,6 +2209,183 @@ class StaleAnchorHandoffTests(unittest.TestCase):
         self.assertEqual(self._p2_plans(planner), [])
         self.assertEqual(self.executor.state()["executions"][source_id]["state"], "blocked")
 
+
+class UnusableStagedClaimTests(unittest.TestCase):
+    """A staged spec that declares the completed task must never vanish.
+
+    ``scan_staged_claims`` used to silently drop a predecessor-declaring spec it
+    could not parse (CRLF bytes, an unparseable Status line, invalid UTF-8).  The
+    completed task then looked like the end of the roadmap and was
+    terminal-settled ``task_complete`` -- the live P17 -> P18 incident.  These
+    drive the real decision actuation, as
+    ``test_acceptance_2_inconsistent_successor_never_settles_project_complete``
+    does, because the settle branch that must not be taken lives there.
+    """
+
+    def _advance(self, repo: Path, runtime: Path, root: Path) -> TransitionExecutor:
+        truth = read_repository_truth(repo)
+        self.assertTrue(truth.valid and not truth.dirty, "fixture repository is not clean")
+        project = {
+            "project_id": "p1", "repo_path": str(repo),
+            "execution": {
+                "engine": "aibroker", "enabled": True, "owner_authorized": True,
+                "allowed_next_actions": ["next_task"],
+            },
+        }
+        config = root / "projects.json"
+        config.write_text(json.dumps({"projects": [project]}), encoding="utf-8")
+        snapshot = {
+            "project_id": "p1", "repo_path": str(repo), "state": "WAITING_REVIEW",
+            "next_title": "P1 task", "next_status": "**COMPLETE**",
+            "telemetry": {"task_id": "P1"},
+            "git": {"branch": truth.branch, "head": truth.head, "dirty": False,
+                    "status_hash": truth.status_hash},
+        }
+        (runtime / "review-decisions.json").write_text(json.dumps({"version": 1, "decisions": {
+            "ai_review:d1": {
+                "project_id": "p1", "request_id": "ai_review:d1", "disposition": "apply",
+                "decision": "next", "next_action": "next_task",
+                "reason": "reviewed task complete", "task_id": "P1",
+                "branch": truth.branch, "head": truth.head,
+                "review_status_hash": truth.status_hash,
+                "role": "reviewer", "event": "worker_done",
+                "consumed_at": "2026-09-26T00:00:00+00:00",
+            },
+        }}), encoding="utf-8")
+        executor = TransitionExecutor(runtime)
+        executor.advance({"projects": [snapshot]}, config,
+                         decision_summary={"projects": [snapshot]})
+        return executor
+
+    def _assert_never_settles_complete(self, spec_bytes: bytes) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # No roadmap successor, so the defective spec is the only declarer.
+            repo = _repo(root, roadmap_target=None, current="P1")
+            (repo / "agent" / "staged" / "P2.md").write_bytes(spec_bytes)
+            # Deliberately assert a clean tree afterwards: that is the sharp
+            # part of the bug.  With core.autocrlf=true git normalizes a CRLF
+            # spec back to the committed LF blob, so there is nothing to commit
+            # and `git status` is clean -- CRLF in the worktree, LF in the
+            # index.  The spec stops counting as a successor with nothing dirty
+            # to notice.  Do not "fix" this by forcing a commit.
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            if subprocess.run(
+                ["git", "-C", str(repo), "diff", "--cached", "--quiet"],
+                capture_output=True,
+            ).returncode:
+                _commit(repo, "stage an unusable successor spec")
+            self.assertEqual(_git(repo, "status", "--porcelain"), "")
+
+            resolution = resolve_successor(repo, "P1")
+            self.assertEqual(resolution.kind, "invalid", resolution.reason)
+            self.assertIn("STAGED_SUCCESSOR_CLAIM_UNUSABLE", str(resolution.reason))
+            self.assertIn("agent/staged/P2.md", str(resolution.reason))
+
+            runtime = root / "runtime"; runtime.mkdir()
+            executor = self._advance(repo, runtime, root)
+
+            rows = [row for row in executor.state()["executions"].values() if isinstance(row, dict)]
+            self.assertEqual(
+                [row for row in rows if row.get("outcome") == "task_complete"], [],
+                "an unusable staged successor claim was terminal-settled as project complete",
+            )
+            self.assertEqual(
+                [row for row in rows if row.get("state") == "handoff"], [],
+                "an unusable staged successor claim must not publish a handoff",
+            )
+            blocked = [row for row in rows if row.get("state") == "blocked"]
+            self.assertEqual(len(blocked), 1, f"expected exactly one blocked row: {rows}")
+            self.assertIn("agent/staged/P2.md", str(blocked[0].get("reason")))
+
+    def test_crlf_successor_spec_never_settles_project_complete(self):
+        self._assert_never_settles_complete(
+            b"# P2 task\r\n\r\nStatus: **PENDING DESIGN**\r\n\r\nPredecessor: P1\r\n"
+        )
+
+    def test_unparseable_status_successor_spec_never_settles_project_complete(self):
+        # The live incident token class: a Status the grammar cannot map.
+        self._assert_never_settles_complete(
+            b"# P2 task\n\nStatus: STAGED PENDING OWNER REVIEW\n\nPredecessor: P1\n"
+        )
+
+    def test_undecodable_successor_spec_never_settles_project_complete(self):
+        self._assert_never_settles_complete(
+            b"# P2 task\n\nStatus: **PENDING DESIGN**\n\nPredecessor: P1\n\nNote: \xff\xfe\n"
+        )
+
+    def test_missing_status_line_successor_spec_never_settles_project_complete(self):
+        self._assert_never_settles_complete(b"# P2 task\n\nPredecessor: P1\n")
+
+    def test_unreadable_staged_spec_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _repo(Path(td), roadmap_target=None, current="P1")
+            target = repo / "agent" / "staged" / "P2.md"
+            original = Path.read_bytes
+
+            def read_bytes(path):
+                if path == target:
+                    raise PermissionError("access denied")
+                return original(path)
+
+            with patch.object(Path, "read_bytes", read_bytes):
+                resolution = resolve_successor(repo, "P1")
+            self.assertEqual(resolution.kind, "invalid")
+            self.assertIn("could not be read", str(resolution.reason))
+            self.assertIn("agent/staged/P2.md", str(resolution.reason))
+
+    def test_crlf_claim_is_reported_as_a_defect_not_a_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _repo(root, roadmap_target=None, current="P1")
+            (repo / "agent" / "staged" / "P2.md").write_bytes(
+                b"# P2 task\r\n\r\nStatus: **PENDING DESIGN**\r\n\r\nPredecessor: P1\r\n"
+            )
+            scan = scan_staged_specs(repo)
+            self.assertEqual(scan.claims, ())
+            self.assertEqual([row.spec_path for row in scan.defects], ["agent/staged/P2.md"])
+            self.assertEqual(
+                (scan.defects[0].task_id, scan.defects[0].predecessor_task_id), ("P2", "P1"),
+            )
+            self.assertIn("CRLF", scan.defects[0].reason)
+
+    def test_approved_executable_design_stays_skipped(self):
+        """An approved design is a materialized spec, not an unusable claim."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _repo(root, roadmap_target=None, current="P1")
+            (repo / "agent" / "staged" / "P2.md").write_bytes(
+                b"# P2 task\n\nStatus: **COMPLETE**\n\nPredecessor: P1\n\n"
+                b"## Approved executable design\n\ndone\n"
+            )
+            scan = scan_staged_specs(repo)
+            self.assertEqual((scan.claims, scan.defects), ((), ()))
+            self.assertEqual(resolve_successor(repo, "P1").kind, "end_of_roadmap")
+
+    def test_completed_staged_spec_is_inert_not_a_defect(self):
+        """A valid non-pending-design status is a lifecycle fact, not a defect."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _repo(root, roadmap_target=None, current="P1")
+            (repo / "agent" / "staged" / "P2.md").write_bytes(
+                b"# P2 task\n\nStatus: **COMPLETE**\n\nPredecessor: P1\n"
+            )
+            scan = scan_staged_specs(repo)
+            self.assertEqual((scan.claims, scan.defects), ((), ()))
+            self.assertEqual(resolve_successor(repo, "P1").kind, "end_of_roadmap")
+
+    def test_defect_fails_closed_over_a_valid_roadmap_successor(self):
+        """Two declarers, one unusable, is a conflict rather than a quiet pick."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _repo(root, roadmap_target="P2", current="P1")
+            self.assertEqual(resolve_successor(repo, "P1").kind, "successor")
+            (repo / "agent" / "staged" / "P9.md").write_bytes(
+                b"# P9 task\r\n\r\nStatus: **PENDING DESIGN**\r\n\r\nPredecessor: P1\r\n"
+            )
+            resolution = resolve_successor(repo, "P1")
+            self.assertEqual(resolution.kind, "invalid")
+            self.assertIn("agent/staged/P9.md", str(resolution.reason))
 
 if __name__ == "__main__":
     unittest.main()

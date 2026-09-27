@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from uuid import uuid4
 
 from dev_orchestrator.config import load_projects_config
+from dev_orchestrator.core.git_paths import resolve_git_path
 from dev_orchestrator.incidents.regression_owner import resolve_regression_owner
 from dev_orchestrator.incidents.store import load_incident_store
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
@@ -147,8 +148,16 @@ def materialize_candidate(
     repo_path: Path = owner["repo_path"]
     candidates_root: Path = owner["candidates_root"]
 
-    # 1. Add tests_candidate to .git/info/exclude before writing
-    git_info_exclude = repo_path / ".git" / "info" / "exclude"
+    # 1. Add tests_candidate to git's info/exclude before writing.  Ask git for the
+    # path: in a linked worktree ``.git`` is a file and info/exclude lives in the
+    # common git directory, so joining onto ``repo_path / ".git"`` cannot work.
+    git_info_exclude = resolve_git_path(repo_path, "info/exclude")
+    if git_info_exclude is None:
+        return {
+            "materialized": False,
+            "reason": f"failed_to_resolve_git_exclude_path: {repo_path}",
+            "candidate_id": candidate_id,
+        }
     try:
         git_info_exclude.parent.mkdir(parents=True, exist_ok=True)
         exclude_text = git_info_exclude.read_text(encoding="utf-8") if git_info_exclude.is_file() else ""

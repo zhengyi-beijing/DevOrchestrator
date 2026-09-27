@@ -12,6 +12,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 import re
 import subprocess
 import threading
@@ -72,7 +73,11 @@ from dev_orchestrator.monitor.telemetry import extract_task_id
 from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
+logger = logging.getLogger(__name__)
+
 ACTUATION_FILE = "transition-executor.json"
+# Key used when a contained actuation fault cannot be attributed to a project.
+_UNATTRIBUTED_PROJECT = "_unattributed"
 _LEDGER_VERSION = 2
 # The exact block ControlCommandCoordinator records when the Planner refuses a
 # staged handoff solely because HEAD moved since it was recorded.
@@ -509,6 +514,7 @@ class TransitionExecutor:
         self.failure_memory = failure_memory
         self.failure_memory_max_chars = failure_memory_max_chars
         self.owner_store = owner_store or OwnerControlStore(self.runtime_root)
+        self._actuation_errors: dict[str, dict[str, Any]] = {}
         self._backend_overrides: dict[str, AgentBackend] = {}
         for backend_id, backend in (backend_overrides or {}).items():
             if backend_id not in _SUPPORTED_BACKENDS:
@@ -519,6 +525,85 @@ class TransitionExecutor:
                 raise ValueError("backend override id mismatch for {0}".format(backend_id))
             self._backend_overrides[backend_id] = backend
         self._recover_interrupted_runs()
+
+    def record_actuation_error(
+        self,
+        project_id: str | None,
+        error: BaseException | str,
+        *,
+        request_id: str | None = None,
+        task_id: str | None = None,
+        source_kind: str = "decision",
+        phase: str = "decision_actuation",
+    ) -> dict[str, Any]:
+        """Record one contained actuation fault against a single project.
+
+        A contained fault is deliberately not written to the execution ledger:
+        it must never consume or settle the decision or handoff it failed to
+        actuate, so the next tick retries it. It is instead surfaced through
+        ``drain_actuation_errors`` so the daemon keeps the heartbeat degraded
+        and publishes a per-project error rather than swallowing the fault.
+        """
+        detail = (
+            "{0}: {1}".format(type(error).__name__, error)
+            if isinstance(error, BaseException) else str(error)
+        )
+        entry = {
+            "project_id": project_id,
+            "phase": phase,
+            "source_kind": source_kind,
+            "request_id": request_id,
+            "task_id": task_id,
+            "error": detail,
+            "recorded_at": utc_now_iso(),
+        }
+        logger.exception(
+            "contained actuation fault project=%s phase=%s request=%s: %s",
+            project_id, phase, request_id, detail,
+        )
+        key = project_id or _UNATTRIBUTED_PROJECT
+        with self._lock:
+            # First fault wins: actuation phases run in order, so the earliest
+            # fault carries the decision or handoff identity that failed, and a
+            # later phase failing for the same root cause must not hide it.
+            previous = self._actuation_errors.get(key)
+            if isinstance(previous, dict):
+                previous["fault_count"] = int(previous.get("fault_count") or 1) + 1
+                phases = previous.setdefault("phases", [previous.get("phase")])
+                if phase not in phases:
+                    phases.append(phase)
+                return previous
+            entry["fault_count"] = 1
+            entry["phases"] = [phase]
+            self._actuation_errors[key] = entry
+        if project_id and self._progress_channel is not None:
+            try:
+                self._progress_channel.emit(
+                    {"project_id": project_id}, "BLOCKED",
+                    task_id=task_id,
+                    occurrence_key="{0}:actuation-fault".format(request_id or phase),
+                    details={
+                        "code": "ACTUATION_FAULT_CONTAINED",
+                        "reason": detail,
+                        "phase": phase,
+                        "retryable": True,
+                    },
+                )
+            except Exception:  # noqa: BLE001 - reporting must never mask the fault
+                logger.exception("progress emit failed for contained actuation fault")
+        return entry
+
+    def drain_actuation_errors(self) -> dict[str, dict[str, Any]]:
+        """Return and clear the contained actuation faults seen since last drain."""
+        with self._lock:
+            errors = self._actuation_errors
+            self._actuation_errors = {}
+        return errors
+
+    def actuation_errors(self) -> dict[str, dict[str, Any]]:
+        """Return the currently recorded contained actuation faults."""
+        with self._lock:
+            return copy.deepcopy(self._actuation_errors)
 
     def set_owner_paused(
         self, project_id: str, paused: bool, *, command_id: str,
@@ -3389,271 +3474,297 @@ class TransitionExecutor:
             decisions.items(),
             key=lambda item: (str(item[1].get("consumed_at") or ""), item[0]),
         )
+        for request_id, record in ordered:
+            project_id = _non_blank_config(record.get("project_id"))
+            try:
+                launch = self._actuate_decision(request_id, record, projects, snapshots)
+            except Exception as exc:  # noqa: BLE001 - contain one project's actuation fault
+                self.record_actuation_error(
+                    project_id, exc,
+                    request_id=request_id,
+                    task_id=_non_blank_config(record.get("task_id")),
+                    source_kind="decision",
+                    phase="decision_actuation",
+                )
+                continue
+            if launch is not None:
+                launches.append(launch)
+        return launches
+
+    def _actuate_decision(
+        self,
+        request_id: str,
+        record: dict[str, Any],
+        projects: dict[str, dict[str, Any]],
+        snapshots: dict[str, dict[str, Any]],
+    ) -> Optional[ActuationLaunch]:
+        """Actuate exactly one durable decision row.
+
+        Raising is contained by the caller: an unexpected actuation fault must
+        neither consume this decision nor abort actuation for other projects.
+        """
         accepted = {
             ("next", NextAction.NEXT_TASK.value),
             ("remediate", NextAction.CONTINUE_CURRENT_STAGE.value),
         }
-        for request_id, record in ordered:
-            with self._lock:
-                ledger = self._load_ledger()
-                existing = ledger["executions"].get(request_id)
-                proj_id = _non_blank_config(record.get("project_id"))
-                authority = ledger.get("lifecycle", {}).get(proj_id) if proj_id else None
-                rec_head = _non_blank_config(record.get("head")) or ""
-                if existing is not None and not (
-                    _legacy_not_ready_block(existing)
-                    or _legacy_no_next_settle(existing)
-                    or _legacy_not_advanced_block(existing)
-                    or _transient_remediation_state_block(existing)
-                    or _is_declaration_gate_replayable(existing, authority, rec_head)
-                ):
-                    continue
-            if record.get("disposition") != "apply":
-                continue
-            decision = _non_blank_config(record.get("decision"))
-            next_action = _non_blank_config(record.get("next_action"))
-            if (decision, next_action) not in accepted:
-                continue
-            project_id = _non_blank_config(record.get("project_id"))
-            if project_id is None:
-                continue
-            if not self._automatic_decision_allowed(project_id, record.get("consumed_at")):
-                continue
-            task_id = _non_blank_config(record.get("task_id"))
-            branch = _non_blank_config(record.get("branch"))
-            head = _non_blank_config(record.get("head"))
-            if task_id is None or branch is None or head is None:
-                self._record_blocked(request_id, project_id, "decision identity is incomplete")
-                continue
-            if record.get("role") != WebSolRole.REVIEWER.value or record.get("event") != WebSolEvent.WORKER_DONE.value:
-                self._record_blocked(
-                    request_id, project_id, "V1 actuation requires WORKER_DONE reviewer flow",
-                    task_id=task_id,
-                )
-                continue
-            project = projects.get(project_id)
-            snapshot = snapshots.get(project_id)
-            if project is None or snapshot is None:
+        with self._lock:
+            ledger = self._load_ledger()
+            existing = ledger["executions"].get(request_id)
+            proj_id = _non_blank_config(record.get("project_id"))
+            authority = ledger.get("lifecycle", {}).get(proj_id) if proj_id else None
+            rec_head = _non_blank_config(record.get("head")) or ""
+            if existing is not None and not (
+                _legacy_not_ready_block(existing)
+                or _legacy_no_next_settle(existing)
+                or _legacy_not_advanced_block(existing)
+                or _transient_remediation_state_block(existing)
+                or _is_declaration_gate_replayable(existing, authority, rec_head)
+            ):
+                return None
+        if record.get("disposition") != "apply":
+            return None
+        decision = _non_blank_config(record.get("decision"))
+        next_action = _non_blank_config(record.get("next_action"))
+        if (decision, next_action) not in accepted:
+            return None
+        project_id = _non_blank_config(record.get("project_id"))
+        if project_id is None:
+            return None
+        if not self._automatic_decision_allowed(project_id, record.get("consumed_at")):
+            return None
+        task_id = _non_blank_config(record.get("task_id"))
+        branch = _non_blank_config(record.get("branch"))
+        head = _non_blank_config(record.get("head"))
+        if task_id is None or branch is None or head is None:
+            self._record_blocked(request_id, project_id, "decision identity is incomplete")
+            return None
+        if record.get("role") != WebSolRole.REVIEWER.value or record.get("event") != WebSolEvent.WORKER_DONE.value:
+            self._record_blocked(
+                request_id, project_id, "V1 actuation requires WORKER_DONE reviewer flow",
+                task_id=task_id,
+            )
+            return None
+        project = projects.get(project_id)
+        snapshot = snapshots.get(project_id)
+        if project is None or snapshot is None:
+            self._record_blocked(
+                request_id, project_id,
+                "project configuration or monitor snapshot unavailable",
+                task_id=task_id,
+            )
+            return None
+        policy, error = _execution_policy(project)
+        if policy is None:
+            self._record_blocked(request_id, project_id, error, task_id=task_id)
+            return None
+        if next_action not in policy["allowed_next_actions"]:
+            self._record_blocked(
+                request_id, project_id,
+                "next_action is not owner-authorized by project execution policy",
+                task_id=task_id,
+            )
+            return None
+        lineage: dict[str, Any] | None = None
+        if decision == "remediate":
+            reviewed_hash = _non_blank_config(record.get("review_status_hash"))
+            if reviewed_hash is None:
                 self._record_blocked(
                     request_id, project_id,
-                    "project configuration or monitor snapshot unavailable",
-                    task_id=task_id,
+                    "remediation decision lacks reviewed dirty fingerprint",
+                    task_id=task_id, source_kind="remediation",
                 )
-                continue
-            policy, error = _execution_policy(project)
-            if policy is None:
-                self._record_blocked(request_id, project_id, error, task_id=task_id)
-                continue
-            if next_action not in policy["allowed_next_actions"]:
-                self._record_blocked(
-                    request_id, project_id,
-                    "next_action is not owner-authorized by project execution policy",
-                    task_id=task_id,
-                )
-                continue
-            lineage: dict[str, Any] | None = None
-            if decision == "remediate":
-                reviewed_hash = _non_blank_config(record.get("review_status_hash"))
-                if reviewed_hash is None:
+                return None
+            # Exact remediation is anchored to the reviewed task identity and
+            # reviewed repository truth, not to the task currently advertised
+            # by agent/next.md. A completed Worker may already have advanced
+            # next.md for NEXT_TASK handoff before review; remediation must
+            # still repair the reviewed task without starting that later task.
+            _guard_task, guard_error = self._fresh_guard(
+                project, snapshot,
+                expected_branch=branch, expected_head=head,
+                expected_status_hash=reviewed_hash,
+                anchor_task_id=task_id,
+            )
+            launch_task = task_id if _guard_task is not None else None
+            source_kind = "remediation"
+            reviewed_truth = read_repository_truth(project.get("repo_path") or "")
+            if (
+                launch_task is not None
+                and reviewed_truth.valid
+                and reviewed_truth.status_hash == reviewed_hash
+            ):
+                lineage = {
+                    "review_decision_id": request_id,
+                    "review_status_hash": reviewed_hash,
+                    "review_dirty_entries": list(reviewed_truth.dirty_entries),
+                }
+            prompt = (
+                str(policy["remediation_prompt"])
+                + "\nReviewed task identity: {0}. Remediate only this reviewed task. "
+                + "If agent/next.md already advertises a later task, do not implement "
+                + "that later task; preserve the handoff unless the review gap itself "
+                + "requires correcting it."
+            ).format(task_id)
+        else:
+            current_task = _advertised_task_id(snapshot)
+            reviewed_current_ready = (
+                current_task == task_id and _next_task_ready(snapshot, predecessor_task_id=task_id)
+            )
+            if current_task == task_id and (
+                _task_marked_complete(snapshot) or reviewed_current_ready
+            ):
+                repo_dir = project.get("repo_path") or ""
+                successor = resolve_successor(repo_dir, task_id)
+                if successor.kind in {"invalid", "ambiguous"}:
                     self._record_blocked(
                         request_id, project_id,
-                        "remediation decision lacks reviewed dirty fingerprint",
-                        task_id=task_id, source_kind="remediation",
+                        "ROADMAP_SUCCESSOR_INCONSISTENT: staged roadmap invalid: "
+                        f"{successor.reason}",
+                        task_id=task_id, source_kind="decision",
                     )
-                    continue
-                # Exact remediation is anchored to the reviewed task identity and
-                # reviewed repository truth, not to the task currently advertised
-                # by agent/next.md. A completed Worker may already have advanced
-                # next.md for NEXT_TASK handoff before review; remediation must
-                # still repair the reviewed task without starting that later task.
-                _guard_task, guard_error = self._fresh_guard(
-                    project, snapshot,
-                    expected_branch=branch, expected_head=head,
-                    expected_status_hash=reviewed_hash,
-                    anchor_task_id=task_id,
-                )
-                launch_task = task_id if _guard_task is not None else None
-                source_kind = "remediation"
-                reviewed_truth = read_repository_truth(project.get("repo_path") or "")
-                if (
-                    launch_task is not None
-                    and reviewed_truth.valid
-                    and reviewed_truth.status_hash == reviewed_hash
-                ):
-                    lineage = {
-                        "review_decision_id": request_id,
-                        "review_status_hash": reviewed_hash,
-                        "review_dirty_entries": list(reviewed_truth.dirty_entries),
-                    }
-                prompt = (
-                    str(policy["remediation_prompt"])
-                    + "\nReviewed task identity: {0}. Remediate only this reviewed task. "
-                    + "If agent/next.md already advertises a later task, do not implement "
-                    + "that later task; preserve the handoff unless the review gap itself "
-                    + "requires correcting it."
-                ).format(task_id)
-            else:
-                current_task = _advertised_task_id(snapshot)
-                reviewed_current_ready = (
-                    current_task == task_id and _next_task_ready(snapshot, predecessor_task_id=task_id)
-                )
-                if current_task == task_id and (
-                    _task_marked_complete(snapshot) or reviewed_current_ready
-                ):
-                    repo_dir = project.get("repo_path") or ""
-                    successor = resolve_successor(repo_dir, task_id)
-                    if successor.kind in {"invalid", "ambiguous"}:
-                        self._record_blocked(
-                            request_id, project_id,
-                            "ROADMAP_SUCCESSOR_INCONSISTENT: staged roadmap invalid: "
-                            f"{successor.reason}",
-                            task_id=task_id, source_kind="decision",
-                        )
-                        continue
-                    reconciled_head: str | None = None
-                    if successor.kind == "inconsistent":
-                        if self._progress_channel is not None:
-                            self._progress_channel.emit(
-                                {"project_id": project_id}, "ROADMAP_SUCCESSOR_INCONSISTENT",
-                                task_id=task_id, occurrence_key=f"{request_id}:successor-inconsistent",
-                                details={"reason": successor.reason, "successor": successor.successor_task_id},
-                            )
-                        outcome = reconcile_roadmap_successor(repo_dir, task_id, successor)
-                        if outcome.status not in {"applied", "already_consistent"}:
-                            # Dirty-worktree and other transient failures must not
-                            # terminally consume the accepted NEXT decision.
-                            if self._progress_channel is not None:
-                                self._progress_channel.emit(
-                                    {"project_id": project_id}, "BLOCKED",
-                                    task_id=task_id, occurrence_key=request_id,
-                                    details={
-                                        "code": "ROADMAP_SUCCESSOR_INCONSISTENT",
-                                        "reason": outcome.reason,
-                                        "retryable": "clean repository" in str(outcome.reason or ""),
-                                    },
-                                )
-                            continue
-                        reconciled_head = outcome.head
-                        if self._progress_channel is not None:
-                            self._progress_channel.emit(
-                                {"project_id": project_id}, "SUCCESSOR_RECONCILED",
-                                task_id=task_id, occurrence_key=f"{request_id}:successor-reconciled",
-                                details={"successor": outcome.successor_task_id, "head": outcome.head},
-                            )
-                        successor = resolve_successor(repo_dir, task_id)
-                        if successor.kind != "successor":
-                            self._record_blocked(
-                                request_id, project_id,
-                                "ROADMAP_SUCCESSOR_INCONSISTENT: reconciliation did not converge",
-                                task_id=task_id, source_kind="decision",
-                            )
-                            continue
-                    truth = read_repository_truth(repo_dir)
-                    reviewed_hash = _non_blank_config(record.get("review_status_hash"))
-                    if (
-                        not truth.valid or truth.branch != branch
-                        or (truth.head != head and truth.head != reconciled_head)
-                        or truth.dirty or (reviewed_hash is not None and truth.status_hash != reviewed_hash)
-                    ):
-                        self._record_blocked(
-                            request_id, project_id,
-                            "reviewed task repository truth changed before terminal settle",
-                            task_id=task_id, source_kind="decision",
-                        )
-                    elif successor.kind == "successor":
-                        self._record_handoff(
-                            request_id, project_id, task_id,
-                            str(successor.successor_task_id),
-                            "staged roadmap specifies successor task; planner handoff required",
-                            staged=successor,
-                            reviewed_branch=truth.branch,
-                            reviewed_head=truth.head,
-                            reviewed_ready=reviewed_current_ready,
-                            successor_evidence=(
-                                "reconciled" if reconciled_head else successor.evidence
-                            ),
-                        )
-                    else:
-                        reason = (
-                            "review accepted current READY_TO_RUN task and no next "
-                            "executable task is advertised"
-                            if reviewed_current_ready
-                            else "reviewed task is COMPLETE and no next executable task is advertised"
-                        )
-                        self._record_settled(
-                            request_id, project_id, reason,
-                            task_id=task_id, outcome="task_complete",
-                        )
-                    continue
-                if (
-                    current_task is not None and current_task != task_id
-                    and parse_task_status(snapshot.get("next_status")).is_pending_design()
-                ):
-
-                    truth = read_repository_truth(project.get("repo_path") or "")
-                    reviewed_hash = _non_blank_config(record.get("review_status_hash"))
-                    if (
-                        not truth.valid or truth.branch != branch or truth.head != head
-                        or truth.dirty or (reviewed_hash is not None and truth.status_hash != reviewed_hash)
-                    ):
-                        self._record_blocked(
-                            request_id, project_id,
-                            "next PENDING DESIGN task repository truth changed before lifecycle handoff",
-                            task_id=task_id, source_kind="decision",
-                        )
-                    else:
-                        self._record_handoff(
-                            request_id, project_id, task_id, current_task,
-                            "reviewed task advanced to a PENDING DESIGN task; planner handoff required",
-                            successor_evidence="repository_projection",
-                        )
-                    continue
-                next_snapshot = snapshot
-                if current_task is not None and current_task != task_id and _next_task_ready(snapshot, predecessor_task_id=task_id):
-                    next_snapshot = copy.deepcopy(snapshot)
-                    next_snapshot["state"] = "READY_TO_RUN"
-                    telemetry = next_snapshot.get("telemetry") if isinstance(next_snapshot.get("telemetry"), dict) else {}
-                    telemetry = copy.deepcopy(telemetry); telemetry["task_id"] = current_task
-                    next_snapshot["telemetry"] = telemetry
-                launch_task, guard_error = self._fresh_guard(
-                    project, next_snapshot,
-                    expected_branch=branch, expected_head=head,
-                    must_advance_from=task_id,
-                    predecessor_task_id=task_id,
-                )
-                source_kind = "decision"
-                prompt = str(policy["worker_prompt"])
-            if launch_task is None:
-                if "readiness" in (guard_error or "").lower():
-                    # A readiness-caused block must not permanently consume the decision row;
-                    # allow subsequent recovery/supervisor passes or fixes to actuate it.
+                    return None
+                reconciled_head: str | None = None
+                if successor.kind == "inconsistent":
                     if self._progress_channel is not None:
                         self._progress_channel.emit(
-                            {"project_id": project_id}, "BLOCKED",
-                            task_id=task_id, occurrence_key=request_id,
-                            details={"reason": guard_error},
+                            {"project_id": project_id}, "ROADMAP_SUCCESSOR_INCONSISTENT",
+                            task_id=task_id, occurrence_key=f"{request_id}:successor-inconsistent",
+                            details={"reason": successor.reason, "successor": successor.successor_task_id},
                         )
-                    continue
-                self._record_blocked(
-                    request_id, project_id, guard_error,
-                    task_id=task_id, source_kind=source_kind,
-                )
-                continue
-            launch = self._launch(
-                project,
-                source_request_id=request_id,
-                source_kind=source_kind,
-                task_id=launch_task,
-                source_task_id=task_id,
-                branch=branch,
-                head=head,
-                worker_prompt=prompt,
-                policy=policy,
-                lineage=lineage,
+                    outcome = reconcile_roadmap_successor(repo_dir, task_id, successor)
+                    if outcome.status not in {"applied", "already_consistent"}:
+                        # Dirty-worktree and other transient failures must not
+                        # terminally consume the accepted NEXT decision.
+                        if self._progress_channel is not None:
+                            self._progress_channel.emit(
+                                {"project_id": project_id}, "BLOCKED",
+                                task_id=task_id, occurrence_key=request_id,
+                                details={
+                                    "code": "ROADMAP_SUCCESSOR_INCONSISTENT",
+                                    "reason": outcome.reason,
+                                    "retryable": "clean repository" in str(outcome.reason or ""),
+                                },
+                            )
+                        return None
+                    reconciled_head = outcome.head
+                    if self._progress_channel is not None:
+                        self._progress_channel.emit(
+                            {"project_id": project_id}, "SUCCESSOR_RECONCILED",
+                            task_id=task_id, occurrence_key=f"{request_id}:successor-reconciled",
+                            details={"successor": outcome.successor_task_id, "head": outcome.head},
+                        )
+                    successor = resolve_successor(repo_dir, task_id)
+                    if successor.kind != "successor":
+                        self._record_blocked(
+                            request_id, project_id,
+                            "ROADMAP_SUCCESSOR_INCONSISTENT: reconciliation did not converge",
+                            task_id=task_id, source_kind="decision",
+                        )
+                        return None
+                truth = read_repository_truth(repo_dir)
+                reviewed_hash = _non_blank_config(record.get("review_status_hash"))
+                if (
+                    not truth.valid or truth.branch != branch
+                    or (truth.head != head and truth.head != reconciled_head)
+                    or truth.dirty or (reviewed_hash is not None and truth.status_hash != reviewed_hash)
+                ):
+                    self._record_blocked(
+                        request_id, project_id,
+                        "reviewed task repository truth changed before terminal settle",
+                        task_id=task_id, source_kind="decision",
+                    )
+                elif successor.kind == "successor":
+                    self._record_handoff(
+                        request_id, project_id, task_id,
+                        str(successor.successor_task_id),
+                        "staged roadmap specifies successor task; planner handoff required",
+                        staged=successor,
+                        reviewed_branch=truth.branch,
+                        reviewed_head=truth.head,
+                        reviewed_ready=reviewed_current_ready,
+                        successor_evidence=(
+                            "reconciled" if reconciled_head else successor.evidence
+                        ),
+                    )
+                else:
+                    reason = (
+                        "review accepted current READY_TO_RUN task and no next "
+                        "executable task is advertised"
+                        if reviewed_current_ready
+                        else "reviewed task is COMPLETE and no next executable task is advertised"
+                    )
+                    self._record_settled(
+                        request_id, project_id, reason,
+                        task_id=task_id, outcome="task_complete",
+                    )
+                return None
+            if (
+                current_task is not None and current_task != task_id
+                and parse_task_status(snapshot.get("next_status")).is_pending_design()
+            ):
+
+                truth = read_repository_truth(project.get("repo_path") or "")
+                reviewed_hash = _non_blank_config(record.get("review_status_hash"))
+                if (
+                    not truth.valid or truth.branch != branch or truth.head != head
+                    or truth.dirty or (reviewed_hash is not None and truth.status_hash != reviewed_hash)
+                ):
+                    self._record_blocked(
+                        request_id, project_id,
+                        "next PENDING DESIGN task repository truth changed before lifecycle handoff",
+                        task_id=task_id, source_kind="decision",
+                    )
+                else:
+                    self._record_handoff(
+                        request_id, project_id, task_id, current_task,
+                        "reviewed task advanced to a PENDING DESIGN task; planner handoff required",
+                        successor_evidence="repository_projection",
+                    )
+                return None
+            next_snapshot = snapshot
+            if current_task is not None and current_task != task_id and _next_task_ready(snapshot, predecessor_task_id=task_id):
+                next_snapshot = copy.deepcopy(snapshot)
+                next_snapshot["state"] = "READY_TO_RUN"
+                telemetry = next_snapshot.get("telemetry") if isinstance(next_snapshot.get("telemetry"), dict) else {}
+                telemetry = copy.deepcopy(telemetry); telemetry["task_id"] = current_task
+                next_snapshot["telemetry"] = telemetry
+            launch_task, guard_error = self._fresh_guard(
+                project, next_snapshot,
+                expected_branch=branch, expected_head=head,
+                must_advance_from=task_id,
+                predecessor_task_id=task_id,
             )
-            if launch is not None:
-                launches.append(launch)
-        return launches
+            source_kind = "decision"
+            prompt = str(policy["worker_prompt"])
+        if launch_task is None:
+            if "readiness" in (guard_error or "").lower():
+                # A readiness-caused block must not permanently consume the decision row;
+                # allow subsequent recovery/supervisor passes or fixes to actuate it.
+                if self._progress_channel is not None:
+                    self._progress_channel.emit(
+                        {"project_id": project_id}, "BLOCKED",
+                        task_id=task_id, occurrence_key=request_id,
+                        details={"reason": guard_error},
+                    )
+                return None
+            self._record_blocked(
+                request_id, project_id, guard_error,
+                task_id=task_id, source_kind=source_kind,
+            )
+            return None
+        launch = self._launch(
+            project,
+            source_request_id=request_id,
+            source_kind=source_kind,
+            task_id=launch_task,
+            source_task_id=task_id,
+            branch=branch,
+            head=head,
+            worker_prompt=prompt,
+            policy=policy,
+            lineage=lineage,
+        )
+        return launch
 
     def _automatic_decision_allowed(self, project_id: str, consumed_at: Any) -> bool:
         state = self.owner_store.project_state(project_id)
@@ -4075,114 +4186,135 @@ class TransitionExecutor:
         snapshots: dict[str, dict[str, Any]],
     ) -> None:
         for project_id, project in projects.items():
-            if self.owner_store.is_paused(project_id):
-                continue
-            snapshot = snapshots.get(project_id)
-            if snapshot is None:
-                continue
-            current_task = _advertised_task_id(snapshot)
-            if not current_task:
-                continue
-            if not _task_marked_complete(snapshot):
-                continue
-            repo_dir = project.get("repo_path") or ""
-            truth = read_repository_truth(repo_dir)
-            if not truth.valid or truth.dirty:
-                continue
-            with self._lock:
-                ledger = self._load_ledger()
-                if self._active_project(ledger, project_id):
-                    continue
+            try:
+                self._advance_completed_predecessor_handoff(
+                    project_id, project, snapshots.get(project_id),
+                )
+            except Exception as exc:  # noqa: BLE001 - contain one project's handoff fault
+                self.record_actuation_error(
+                    project_id, exc,
+                    source_kind="predecessor_handoff",
+                    phase="predecessor_handoff",
+                )
+
+    def _advance_completed_predecessor_handoff(
+        self,
+        project_id: str,
+        project: dict[str, Any],
+        snapshot: dict[str, Any] | None,
+    ) -> None:
+        """Record the handoff or settlement owed by one completed predecessor task.
+
+        Raising is contained by the caller: one project's roadmap or successor
+        repair fault must not stop the remaining projects from advancing.
+        """
+        if self.owner_store.is_paused(project_id):
+            return
+        if snapshot is None:
+            return
+        current_task = _advertised_task_id(snapshot)
+        if not current_task:
+            return
+        if not _task_marked_complete(snapshot):
+            return
+        repo_dir = project.get("repo_path") or ""
+        truth = read_repository_truth(repo_dir)
+        if not truth.valid or truth.dirty:
+            return
+        with self._lock:
+            ledger = self._load_ledger()
+            if self._active_project(ledger, project_id):
+                return
+            successor = resolve_successor(repo_dir, current_task)
+            if successor.kind == "inconsistent":
+                outcome = reconcile_roadmap_successor(repo_dir, current_task, successor)
+                if outcome.status not in {"applied", "already_consistent"}:
+                    return
+                truth = read_repository_truth(repo_dir)
                 successor = resolve_successor(repo_dir, current_task)
-                if successor.kind == "inconsistent":
-                    outcome = reconcile_roadmap_successor(repo_dir, current_task, successor)
-                    if outcome.status not in {"applied", "already_consistent"}:
-                        continue
-                    truth = read_repository_truth(repo_dir)
-                    successor = resolve_successor(repo_dir, current_task)
-                successor_id = str(successor.successor_task_id) if successor.kind == "successor" else None
-                has_handoff_or_settled = any(
-                    rec.get("project_id") == project_id
-                    and (
-                        rec.get("task_id") == current_task
-                        or rec.get("source_task_id") == current_task
-                        or (successor_id and (rec.get("staged_successor") == successor_id or rec.get("next_task_id") == successor_id))
-                    )
-                    and rec.get("state") in ("handoff", "settled", "blocked")
-                    # A prior terminal settlement was valid only while the roadmap
-                    # advertised no successor. If a successor is later staged, it
-                    # must not permanently suppress the newly valid handoff.
-                    and not (
-                        successor_id
-                        and rec.get("state") == "settled"
-                        and rec.get("outcome") == "task_complete"
-                    )
-                    for rec in ledger["executions"].values()
-                    if isinstance(rec, dict)
+            successor_id = str(successor.successor_task_id) if successor.kind == "successor" else None
+            has_handoff_or_settled = any(
+                rec.get("project_id") == project_id
+                and (
+                    rec.get("task_id") == current_task
+                    or rec.get("source_task_id") == current_task
+                    or (successor_id and (rec.get("staged_successor") == successor_id or rec.get("next_task_id") == successor_id))
                 )
-                if has_handoff_or_settled:
-                    continue
-                decisions = self._load_decisions()
-                has_decision = any(
-                    dec.get("project_id") == project_id
-                    and dec.get("task_id") == current_task
-                    for dec in decisions.values()
-                    if isinstance(dec, dict)
+                and rec.get("state") in ("handoff", "settled", "blocked")
+                # A prior terminal settlement was valid only while the roadmap
+                # advertised no successor. If a successor is later staged, it
+                # must not permanently suppress the newly valid handoff.
+                and not (
+                    successor_id
+                    and rec.get("state") == "settled"
+                    and rec.get("outcome") == "task_complete"
                 )
-                if has_decision:
-                    continue
-                roles = project.get("ai_roles")
-                reviewer_enabled = (
-                    isinstance(roles, dict)
-                    and isinstance(roles.get("reviewer"), dict)
-                    and roles["reviewer"].get("enabled") is True
-                )
-                if reviewer_enabled:
-                    # When reviewer is enabled, promotion of completed predecessor tasks
-                    # is strictly governed by accepted technical review decisions via
-                    # _advance_decisions; auto-handoff must never bypass mandatory review.
-                    continue
-            if successor.kind == "successor":
-                request_id = f"auto-handoff:{current_task}:{truth.head[:12]}"
-                with self._lock:
-                    if request_id in self._load_ledger()["executions"]:
-                        continue
-                self._record_handoff(
-                    request_id,
-                    project_id,
-                    current_task,
-                    str(successor.successor_task_id),
-                    "predecessor task marked complete; planner handoff required for successor",
-                    staged=successor,
-                    reviewed_branch=truth.branch,
-                    reviewed_head=truth.head,
-                    reviewed_ready=False,
-                    successor_evidence=successor.evidence,
-                )
-            elif successor.kind == "end_of_roadmap":
-                request_id = f"auto-settled:{current_task}:{truth.head[:12]}"
-                with self._lock:
-                    if request_id in self._load_ledger()["executions"]:
-                        continue
-                self._record_settled(
-                    request_id,
-                    project_id,
-                    "predecessor task marked complete and no next executable task is advertised",
-                    task_id=current_task,
-                    outcome="task_complete",
-                )
-            elif rm_res.kind == "invalid":
-                request_id = f"auto-handoff:{current_task}:{truth.head[:12]}"
-                with self._lock:
-                    if request_id in self._load_ledger()["executions"]:
-                        continue
-                self._record_blocked(
-                    request_id,
-                    project_id,
-                    f"staged roadmap invalid: {rm_res.reason}",
-                    task_id=current_task,
-                    source_kind="decision",
-                )
+                for rec in ledger["executions"].values()
+                if isinstance(rec, dict)
+            )
+            if has_handoff_or_settled:
+                return
+            decisions = self._load_decisions()
+            has_decision = any(
+                dec.get("project_id") == project_id
+                and dec.get("task_id") == current_task
+                for dec in decisions.values()
+                if isinstance(dec, dict)
+            )
+            if has_decision:
+                return
+            roles = project.get("ai_roles")
+            reviewer_enabled = (
+                isinstance(roles, dict)
+                and isinstance(roles.get("reviewer"), dict)
+                and roles["reviewer"].get("enabled") is True
+            )
+            if reviewer_enabled:
+                # When reviewer is enabled, promotion of completed predecessor tasks
+                # is strictly governed by accepted technical review decisions via
+                # _advance_decisions; auto-handoff must never bypass mandatory review.
+                return
+        if successor.kind == "successor":
+            request_id = f"auto-handoff:{current_task}:{truth.head[:12]}"
+            with self._lock:
+                if request_id in self._load_ledger()["executions"]:
+                    return
+            self._record_handoff(
+                request_id,
+                project_id,
+                current_task,
+                str(successor.successor_task_id),
+                "predecessor task marked complete; planner handoff required for successor",
+                staged=successor,
+                reviewed_branch=truth.branch,
+                reviewed_head=truth.head,
+                reviewed_ready=False,
+                successor_evidence=successor.evidence,
+            )
+        elif successor.kind == "end_of_roadmap":
+            request_id = f"auto-settled:{current_task}:{truth.head[:12]}"
+            with self._lock:
+                if request_id in self._load_ledger()["executions"]:
+                    return
+            self._record_settled(
+                request_id,
+                project_id,
+                "predecessor task marked complete and no next executable task is advertised",
+                task_id=current_task,
+                outcome="task_complete",
+            )
+        elif successor.kind == "invalid":
+            request_id = f"auto-handoff:{current_task}:{truth.head[:12]}"
+            with self._lock:
+                if request_id in self._load_ledger()["executions"]:
+                    return
+            self._record_blocked(
+                request_id,
+                project_id,
+                f"staged roadmap invalid: {successor.reason}",
+                task_id=current_task,
+                source_kind="decision",
+            )
 
     def _advance_unlaunched_ready(
         self,
@@ -4369,9 +4501,27 @@ class TransitionExecutor:
         decision_snapshots = _snapshot_map(
             summary if decision_summary is None else decision_summary
         )
-        launches = self._advance_decisions(projects, decision_snapshots)
+        launches: list[ActuationLaunch] = []
+        launches.extend(self._advance_decisions(projects, decision_snapshots))
         self._advance_completed_predecessor_handoffs(projects, raw_snapshots)
-        launches.extend(self._advance_unlaunched_ready(projects, raw_snapshots))
-        launches.extend(self._advance_owner_start(projects, raw_snapshots))
-        launches.extend(self._advance_bootstrap(projects, raw_snapshots))
+        # Each remaining phase is contained on its own: a fault in one must not
+        # discard the launches already produced, nor skip the later phases.
+        for phase, resolver in (
+            ("unlaunched_ready", self._advance_unlaunched_ready),
+            ("owner_start", self._advance_owner_start),
+            ("bootstrap", self._advance_bootstrap),
+        ):
+            # Invoke each phase with one project at a time.  The phase helpers
+            # persist launch intent before returning; isolating calls here both
+            # preserves already-produced launch evidence and prevents an early
+            # project failure from skipping later projects in the same phase.
+            for project_id, project in projects.items():
+                try:
+                    launches.extend(resolver(
+                        {project_id: project}, raw_snapshots,
+                    ))
+                except Exception as exc:  # noqa: BLE001 - per-project containment
+                    self.record_actuation_error(
+                        project_id, exc, source_kind=phase, phase=phase,
+                    )
         return launches
