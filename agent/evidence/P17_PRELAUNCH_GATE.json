@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "record_type": "p17_prelaunch_gate",
+  "project_id": "devorchestrator",
+  "task_id": "P17",
+  "pre_resume_status": "PASS",
+  "created_at": "2026-09-27T05:55:16.598044+00:00",
+  "g0_1": {
+    "status": "PASS",
+    "head": "c62cb60fd1949b8c41ba1c12811b06066054142b",
+    "declaration_kind": "declared",
+    "declaration_sha256": "51f8ba5f12eef299527a6df9db4f11ae60414308a08fa9b3e501fb27e350acf6",
+    "scope_kind": "control_plane",
+    "gate_allowed": true,
+    "required_scenarios": [
+      "CPF-01",
+      "CPF-02",
+      "CPF-03",
+      "CPF-04",
+      "CPF-05",
+      "CPF-06",
+      "CPF-07",
+      "CPF-08",
+      "CPF-09",
+      "CPF-10"
+    ],
+    "declaration_commit": "c62cb60fd1949b8c41ba1c12811b06066054142b",
+    "plan_commit": "855d1e5673237560ffb41a90dfd2f6c334eafcf0",
+    "pushed": true
+  },
+  "g0_2": {
+    "status": "PASS",
+    "owner_paused": true,
+    "pause_command_id": "p17-g0-prelaunch-hold-20260927",
+    "stop_command_id": "000-p17-g0-prelaunch-stop-20260927",
+    "liveness": {
+      "worker": {
+        "alive": false,
+        "state": "idle",
+        "source": "no_active_worker",
+        "details": {
+          "state": "not_started",
+          "kind": "none",
+          "process_alive": false
+        }
+      },
+      "planner": {
+        "alive": false,
+        "state": "idle",
+        "source": "planner_idle_in_ledger",
+        "details": {}
+      },
+      "reviewer": {
+        "alive": false,
+        "state": "idle",
+        "source": "reviewer_idle_in_ledger",
+        "details": {}
+      },
+      "all_dead": true,
+      "any_unknown": false,
+      "any_alive": false
+    },
+    "bootstrap_override_sha256": "55fa015941836ee34c85fc501aceedc903ba82febd82cb140b8ecbd1f9c9b58d",
+    "bootstrap_acceptance_kind": "OWNER_OVERRIDE",
+    "bootstrap_authoritative_runtime_record": false
+  },
+  "g0_3": {
+    "status": "PASS",
+    "authoritative_recovery_command_id": "000-p17-g0-prelaunch-stop-20260927",
+    "effect": "pause_and_interrupt",
+    "interruption": {
+      "dispatch_id": "e9a46b34-8b94-46ae-bb4e-c7cf76e944fe",
+      "request_id": "ai-worker:9e6d38bd-b2e1-41ab-9734-945246a881cd:execute",
+      "decision_id": "6779caeb-2268-4f51-b385-ced47b44e89d",
+      "execution_id": "e53cabcd-8d8d-4a51-a47f-6d63785fb737",
+      "resource_id": "agy/agy-2/gemini-3.8-flash-high",
+      "started_at": "2026-09-27T05:49:34.266911+00:00",
+      "finished_at": "2026-09-27T05:50:11.000784+00:00",
+      "status": "failed",
+      "role": "worker",
+      "quality": "balanced",
+      "independence": "none",
+      "usage_json": null,
+      "usage_source": "unknown",
+      "preferred_independence": "none",
+      "execution_status": "failed",
+      "execution_finished_at": "2026-09-27T05:50:11.000784+00:00",
+      "execution_session_id": null,
+      "execution_error": "persistent harness interrupted",
+      "provider": "agy",
+      "account": "agy-2",
+      "model": "gemini-3.8-flash-high",
+      "interrupt_supported": true
+    },
+    "execution_source_request_id": "9e6d38bd-b2e1-41ab-9734-945246a881cd:execute",
+    "execution_state": "failed",
+    "execution_reason": "AIBroker worker lifecycle error [AIBrokerInvocationError]: broker service invocation failed: HTTP 400 for http://127.0.0.1:8875/api/dispatch",
+    "active_execution": null,
+    "reconcile_control_available": false
+  },
+  "g0_4": {
+    "status": "PASS",
+    "daemon_previous_pid": 50408,
+    "daemon_current_pid": 30628,
+    "daemon_started_at": "2026-09-27T05:54:07.847731+00:00",
+    "daemon_last_error": null,
+    "authority_generation": 2,
+    "authority_task_id": "P17",
+    "authority_state": "READY_TO_RUN",
+    "active_owner": null,
+    "recovery_epoch_id": "7718edb9f96bc5f4",
+    "authority_snapshot_sha256": "0d05c7fc69728bd73ad0611b4a6a81e5b3236914885e300e67831d9e064df654",
+    "invariants": {
+      "CURRENT_TASK_MATCHES_ACTIVE_EXECUTION": true,
+      "TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION": true,
+      "PENDING_DESIGN_NOT_EXECUTING": true,
+      "SUCCESSOR_HANDOFF_LINEAGE_VALID": true,
+      "NEXT_TASK_WITHOUT_HANDOFF": true,
+      "SINGLE_ACTIVE_LIFECYCLE_OWNER": true
+    },
+    "all_invariants_hold": true
+  },
+  "declaration_gate_archive": {
+    "required_for_this_prelaunch": false,
+    "reason": "No CONTROL_PLANE_DECLARATION_REQUIRED owner gate is open; exact-HEAD direct declaration evaluation is the operative check per independent plan review."
+  },
+  "abort_conditions": [
+    "owner pause is not asserted before final resume",
+    "any Planner/Worker/Reviewer role is live before final resume",
+    "repository is dirty or HEAD differs from the validated M0 HEAD",
+    "committed P17 declaration is absent, invalid, or missing required CPF coverage",
+    "P17 authority is contradictory or any centralized lifecycle invariant fails",
+    "authenticated final resume is blocked or settles against a different identity"
+  ]
+}
