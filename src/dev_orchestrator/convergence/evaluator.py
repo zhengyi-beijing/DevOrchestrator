@@ -124,10 +124,48 @@ def decide(
             invariants=("EMERGENCY_BRAKE", "SINGLE_AUTHORITY"),
         )
 
-    # 2. STATUS == DONE
+    # 2. FAIL-CLOSED AMBIGUITY & REQUIRED SOURCES
+    # Unresolved integrity ambiguity or conflicting evidence blocks all advancement and side effects.
+    if has_unresolved_ambiguity(evidence):
+        return make_decision(
+            DecisionKind.REQUEST_HUMAN,
+            "Unresolved ambiguity or conflicting evidence detected; failing closed",
+            problem_id="integrity_ambiguity",
+            parameters={"failure_class": FailureClass.INTEGRITY_OR_IDENTITY_AMBIGUITY.value},
+            invariants=("FAIL_CLOSED_AMBIGUITY", "HUMAN_TYPED"),
+        )
+
+    if policy.required_sources:
+        present_sources = {it.source for it in evidence.items}
+        missing_sources = [s for s in policy.required_sources if s not in present_sources]
+        if missing_sources:
+            return make_decision(
+                DecisionKind.REQUEST_HUMAN,
+                f"Required evidence source(s) missing from snapshot: {missing_sources!r}; failing closed",
+                problem_id="missing_required_sources",
+                parameters={
+                    "failure_class": FailureClass.INTEGRITY_OR_IDENTITY_AMBIGUITY.value,
+                    "missing_sources": missing_sources,
+                },
+                invariants=("FAIL_CLOSED_AMBIGUITY", "HUMAN_TYPED"),
+            )
+
+    # 3. STATUS == DONE
     if work_record.status == "DONE":
         # Check if successor needs publication
         if work_record.successor and work_record.successor.get("publication_state") == "PENDING":
+            satisfied, sat_reason = is_goal_satisfied(work_record, evidence=evidence)
+            if not satisfied:
+                return make_decision(
+                    DecisionKind.REQUEST_HUMAN,
+                    f"Goal status is DONE but acceptance is not satisfied ({sat_reason}); cannot publish successor without verification or owner override",
+                    problem_id="acceptance_before_advance",
+                    parameters={
+                        "failure_class": FailureClass.SAFETY_OR_IRREVERSIBLE_AUTHORIZATION.value,
+                        "acceptance_reason": sat_reason,
+                    },
+                    invariants=("ACCEPTANCE_BEFORE_ADVANCE", "FAIL_CLOSED_AMBIGUITY", "HUMAN_TYPED"),
+                )
             return make_decision(
                 DecisionKind.PUBLISH_SUCCESSOR,
                 "Goal is terminal DONE; successor is ready for publication",
@@ -140,7 +178,7 @@ def decide(
             invariants=("SINGLE_AUTHORITY",),
         )
 
-    # 3. HUMAN REQUEST OPEN / ANSWERED
+    # 4. HUMAN REQUEST OPEN / ANSWERED
     hr = work_record.human_request
     if hr is not None:
         answer = hr.get("answer")
@@ -164,7 +202,7 @@ def decide(
                 invariants=("HUMAN_TYPED", "PROGRESS_TOTALITY"),
             )
 
-    # 4. STATUS == NEEDS_HUMAN without active human request
+    # 5. STATUS == NEEDS_HUMAN without active human request
     if work_record.status == "NEEDS_HUMAN":
         if work_record.handoff is None:
             return make_decision(
@@ -178,22 +216,20 @@ def decide(
             invariants=("COMPLETE_EXHAUSTION",),
         )
 
-    # 5. ACTIVE LEASE LIVENESS
+    # 6. ACTIVE LEASE LIVENESS
     lease = work_record.active_lease
     if lease is not None:
-        # Check if lease is reported live in evidence
-        # If evidence indicates lease is live, NOOP_ACTIVE
+        found_liveness = False
         lease_live = False
         for item in evidence.items:
             if item.source == "process_probe" and item.data.get("role") == lease.get("role"):
+                found_liveness = True
                 lease_live = bool(item.data.get("alive"))
                 break
             if item.source == "broker_effect" and item.data.get("execution_id") == lease.get("execution_id"):
+                found_liveness = True
                 lease_live = item.data.get("state") in ("running", "live")
                 break
-        else:
-            # If no probe specifically says dead, assume active if acquired recently or has heartbeat
-            lease_live = True
 
         if lease_live:
             return make_decision(
@@ -202,8 +238,25 @@ def decide(
                 parameters={"role": lease.get("role"), "attempt_id": lease.get("attempt_id")},
                 invariants=("SINGLE_ACTIVE_LEASE", "NOOP_ACTIVE"),
             )
+        if not found_liveness:
+            return make_decision(
+                DecisionKind.REQUEST_HUMAN,
+                f"Active execution lease held by role {lease.get('role')!r} lacks liveness evidence; failing closed to prevent orphan ownership",
+                problem_id="unconfirmed_lease",
+                parameters={"failure_class": FailureClass.CONTROL_PLANE_DEFECT.value, "role": lease.get("role")},
+                invariants=("NO_ORPHAN_OWNER", "PROGRESS_TOTALITY", "HUMAN_TYPED"),
+            )
+        # If found_liveness and not lease_live (lease confirmed dead):
+        if not work_record.current_problem:
+            return make_decision(
+                DecisionKind.REQUEST_HUMAN,
+                f"Active execution lease held by role {lease.get('role')!r} is dead but no failure problem recorded",
+                problem_id="dead_lease_no_problem",
+                parameters={"failure_class": FailureClass.CONTROL_PLANE_DEFECT.value, "role": lease.get("role")},
+                invariants=("NO_ORPHAN_OWNER", "PROGRESS_TOTALITY", "HUMAN_TYPED"),
+            )
 
-    # 6. BOUNDED WAIT
+    # 7. BOUNDED WAIT
     wait = work_record.wait
     if wait is not None:
         not_before = wait.get("not_before")
@@ -220,8 +273,8 @@ def decide(
             except ValueError:
                 pass
 
-    # 7. GOAL SATISFACTION EVALUATION
-    satisfied, sat_reason = is_goal_satisfied(work_record)
+    # 8. GOAL SATISFACTION EVALUATION
+    satisfied, sat_reason = is_goal_satisfied(work_record, evidence=evidence)
     if satisfied:
         if work_record.successor and work_record.successor.get("publication_state") != "PUBLISHED":
             return make_decision(
@@ -234,16 +287,6 @@ def decide(
             DecisionKind.SATISFY_GOAL,
             f"Goal criteria and verification satisfied: {sat_reason}",
             invariants=("ACCEPTANCE_BEFORE_ADVANCE",),
-        )
-
-    # 8. FAIL-CLOSED AMBIGUITY
-    if has_unresolved_ambiguity(evidence):
-        return make_decision(
-            DecisionKind.REQUEST_HUMAN,
-            "Unresolved ambiguity or conflicting evidence detected; failing closed",
-            problem_id="integrity_ambiguity",
-            parameters={"failure_class": FailureClass.INTEGRITY_OR_IDENTITY_AMBIGUITY.value},
-            invariants=("FAIL_CLOSED_AMBIGUITY", "HUMAN_TYPED"),
         )
 
     # 9. CURRENT PROBLEM EVALUATION & STRATEGY ESCALATION
@@ -266,14 +309,20 @@ def decide(
             # Check policy quota reset rules
             for rule_pattern, reset_info in policy.quota_reset_rules.items():
                 if rule_pattern in curr_prob.get("criterion_or_invariant_id", "") or rule_pattern in p_id:
-                    reset_time = reset_info.get("reset_at") or (now_dt.isoformat())
-                    return make_decision(
-                        DecisionKind.WAIT_UNTIL,
-                        f"Quota or resource transient failure with known reset at {reset_time}",
-                        problem_id=p_id,
-                        parameters={"not_before": reset_time, "reset_source": "policy_quota_reset"},
-                        invariants=("WAIT_IS_NOT_PROGRESS",),
-                    )
+                    reset_time = reset_info.get("reset_at")
+                    if reset_time:
+                        try:
+                            reset_dt = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
+                            if now_dt < reset_dt:
+                                return make_decision(
+                                    DecisionKind.WAIT_UNTIL,
+                                    f"Quota or resource transient failure with known reset at {reset_time}",
+                                    problem_id=p_id,
+                                    parameters={"not_before": reset_time, "reset_source": "policy_quota_reset"},
+                                    invariants=("WAIT_IS_NOT_PROGRESS",),
+                                )
+                        except ValueError:
+                            pass
 
             # Resource failover if budget permits
             if resource_attempts < budget.max_resource_attempts:
@@ -357,7 +406,7 @@ def decide(
 
     # 10. VERIFICATION / EXECUTION ROUTING
     # If there is unverified progress (e.g. attempt finished, needs verification)
-    if work_record.attempts and not work_record.verification:
+    if work_record.attempts and (not work_record.verification or not is_goal_satisfied(work_record, evidence=evidence)[0]):
         return make_decision(
             DecisionKind.VERIFY,
             "Execution completed; requesting independent typed verification",

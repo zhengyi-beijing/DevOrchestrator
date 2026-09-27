@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import unittest
 
+from dev_orchestrator.convergence.actuator_guard import ActuatorGuard
+from dev_orchestrator.convergence.evaluator import DecisionKind, decide
+from dev_orchestrator.convergence.evidence import EvidenceSnapshot
 from dev_orchestrator.convergence.findings import Finding, FindingSeverity
+from dev_orchestrator.convergence.policy import build_policy
 from dev_orchestrator.convergence.problems import FailureClass
 from dev_orchestrator.convergence.verification import (
     AcceptanceKind,
@@ -11,7 +15,10 @@ from dev_orchestrator.convergence.verification import (
     is_goal_satisfied,
     validate_owner_override,
 )
-from dev_orchestrator.convergence.work_record import validate_work_record
+from dev_orchestrator.convergence.work_record import (
+    WorkRecordValidationError,
+    validate_work_record,
+)
 
 
 class TestP17AcceptanceModel(unittest.TestCase):
@@ -127,3 +134,84 @@ class TestP17AcceptanceModel(unittest.TestCase):
         satisfied, reason = is_goal_satisfied(record, verification=vr)
         self.assertFalse(satisfied)
         self.assertIn("BLOCKING", reason)
+
+    def test_done_status_with_acceptance_none_cannot_publish_successor(self) -> None:
+        """Finding 1: status=DONE with acceptance.kind=NONE cannot be validated, published, or guarded."""
+        bad_payload = {
+            **self.base_work_record.to_dict(),
+            "status": "DONE",
+            "acceptance": {"kind": "NONE"},
+            "successor": {
+                "successor_goal_id": "P18",
+                "successor_spec_digest": "sha256:p18",
+                "publication_state": "PENDING",
+                "handoff_idempotency_key": "idemp-p18",
+            },
+        }
+        # 1. validate_work_record rejects DONE with acceptance.kind=NONE
+        with self.assertRaises(WorkRecordValidationError) as ctx:
+            validate_work_record(bad_payload)
+        self.assertIn("requires acceptance.kind to be 'VERIFIED' or 'OWNER_OVERRIDE'", str(ctx.exception))
+
+        # 2. ActuatorGuard rejects PUBLISH_SUCCESSOR with acceptance.kind=NONE
+        guard = ActuatorGuard()
+        from dev_orchestrator.convergence.evaluator import Decision
+        decision = Decision(
+            kind=DecisionKind.PUBLISH_SUCCESSOR,
+            reason="Attempting publication",
+            idempotency_key="test-pub-key",
+        )
+        fake_ev = EvidenceSnapshot(
+            items=(),
+            conflicts=(),
+            shared_leases=(),
+            exact_anchors={"head": "h-1"},
+            emergency_pause_asserted=False,
+            metadata={},
+        )
+        guard_verdict = guard.validate(
+            decision,
+            self.base_work_record,
+            fake_ev,
+            expected_anchor_head="h-1",
+        )
+        self.assertFalse(guard_verdict.accepted)
+        self.assertEqual(guard_verdict.rejection_code, "ACCEPTANCE_REQUIRED")
+
+    def test_stale_verification_anchor_blocks_goal_satisfaction(self) -> None:
+        """Finding 2: verification anchor mismatch against evidence exact_anchors['head'] blocks satisfaction."""
+        vr = VerificationRecord(
+            verification_id="ver-stale-1",
+            project_id="devorchestrator",
+            goal_id="P17",
+            branch="main",
+            exact_head="old-c0293ab",
+            clean_status_fingerprint="clean-old",
+            acceptance_criterion_results={"crit-1": True},
+            executed_checks=({"command": "pytest", "exit_status": 0},),
+            reviewer_decision="ACCEPT",
+            structured_findings=(),
+        )
+        record = validate_work_record({
+            **self.base_work_record.to_dict(),
+            "status": "OPEN",
+            "acceptance": {
+                "kind": "VERIFIED",
+                "reviewer_verdict_id": "ver-stale-1",
+                "anchor_head": "old-c0293ab",
+            },
+            "verification": vr.to_dict(),
+        })
+        # Evidence snapshot at new repository HEAD
+        ev_new_head = EvidenceSnapshot(
+            items=(),
+            conflicts=(),
+            shared_leases=(),
+            exact_anchors={"head": "new-da699cd"},
+            emergency_pause_asserted=False,
+            metadata={},
+        )
+        satisfied, reason = is_goal_satisfied(record, evidence=ev_new_head, verification=vr)
+        self.assertFalse(satisfied)
+        self.assertIn("NOT_VERIFIED", reason)
+        self.assertIn("differs from current repository HEAD", reason)

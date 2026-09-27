@@ -28,10 +28,7 @@ DEFAULT_HUMAN_BOUNDARIES = (
     "irreconcilable_identity",
 )
 
-DEFAULT_REQUIRED_SOURCES = (
-    "lifecycle_authority",
-    "git_repository",
-)
+DEFAULT_REQUIRED_SOURCES: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

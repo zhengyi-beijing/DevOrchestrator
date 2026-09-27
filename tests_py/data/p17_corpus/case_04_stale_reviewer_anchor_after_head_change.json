@@ -18,7 +18,7 @@
   },
   "expected_invariant_verdicts": {
     "ACCEPTANCE_BEFORE_ADVANCE": true,
-    "ANCHOR_BINDING": true
+    "ANCHOR_BINDING": false
   },
   "expected_v0_decision": "VERIFY",
   "human_intervention_count": 0,
@@ -48,7 +48,9 @@
   },
   "work_record_snapshot": {
     "acceptance": {
-      "kind": "NONE"
+      "kind": "VERIFIED",
+      "anchor_head": "old-c0293ab",
+      "reviewer_verdict_id": "ai_review:old-c0293ab"
     },
     "attempts": [
       {
@@ -70,6 +72,11 @@
     },
     "schema_version": 1,
     "status": "OPEN",
-    "verification": null
+    "verification": {
+      "exact_head": "old-c0293ab",
+      "reviewer_decision": "ACCEPT",
+      "structured_findings": [],
+      "verification_id": "ver-old-head"
+    }
   }
 }

@@ -10,7 +10,7 @@
     "conflicts": [],
     "emergency_pause_asserted": false,
     "exact_anchors": {
-      "head": "da699cd7238ed39caf62fb229ba82a2e4f392734"
+      "head": "head-p17-clean"
     },
     "items": [],
     "metadata": {},
@@ -64,7 +64,7 @@
       "repo_path": "C:\\work\\github\\DevOrchestrator-dev"
     },
     "schema_version": 1,
-    "status": "OPEN",
+    "status": "DONE",
     "successor": {
       "handoff_idempotency_key": "idemp-p17-p18",
       "publication_state": "PENDING",

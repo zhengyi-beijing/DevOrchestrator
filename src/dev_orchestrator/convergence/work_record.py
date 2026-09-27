@@ -13,6 +13,7 @@ import json
 from typing import Any, Mapping
 
 ALLOWED_STATUSES = frozenset({"OPEN", "NEEDS_HUMAN", "DONE"})
+ALLOWED_GOAL_STATUSES = ALLOWED_STATUSES
 ALLOWED_ACCEPTANCE_KINDS = frozenset({"NONE", "VERIFIED", "OWNER_OVERRIDE"})
 
 
@@ -150,6 +151,11 @@ def validate_work_record(payload: Mapping[str, Any]) -> WorkRecord:
                 raise WorkRecordValidationError(f"OWNER_OVERRIDE acceptance missing required key {k!r}")
         if not isinstance(acceptance.get("waived_obligations"), list):
             raise WorkRecordValidationError("waived_obligations must be a list")
+
+    if status == "DONE" and kind not in ("VERIFIED", "OWNER_OVERRIDE"):
+        raise WorkRecordValidationError(
+            f"status 'DONE' requires acceptance.kind to be 'VERIFIED' or 'OWNER_OVERRIDE', got {kind!r}"
+        )
 
     # Current problem validation
     current_problem = payload.get("current_problem")

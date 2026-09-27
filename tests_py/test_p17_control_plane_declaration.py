@@ -95,10 +95,10 @@ class TestP17ControlPlaneDeclaration(unittest.TestCase):
         self.assertEqual(gate_data["g0_4"]["status"], "PASS")
 
         # Verify authoritative resume history file exists and settled accepted
-        resume_history = self.repo_root / "runtime" / "control" / "history" / "p17-g0-final-resume-20260927.json"
-        if resume_history.exists():
-            with open(resume_history, "r", encoding="utf-8") as f:
-                res_data = json.load(f)
+        resume_history = self.repo_root / "agent" / "evidence" / "p17-g0-final-resume-20260927.json"
+        self.assertTrue(resume_history.is_file(), f"Tracked resume evidence {resume_history} must exist")
+        with open(resume_history, "r", encoding="utf-8") as f:
+            res_data = json.load(f)
             self.assertEqual(res_data.get("action"), "resume")
             self.assertEqual(res_data.get("state"), "accepted")
             self.assertEqual(res_data.get("effect"), "resume_future_launches")

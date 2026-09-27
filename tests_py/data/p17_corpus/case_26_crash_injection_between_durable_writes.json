@@ -11,7 +11,7 @@
     "conflicts": [],
     "emergency_pause_asserted": false,
     "exact_anchors": {
-      "head": "da699cd7238ed39caf62fb229ba82a2e4f392734"
+      "head": "head-p17-final"
     },
     "items": [],
     "metadata": {},
@@ -71,6 +71,22 @@
       "publication_state": "PENDING",
       "successor_goal_id": "P18",
       "successor_spec_digest": "sha256:p18-spec"
+    },
+    "verification": {
+      "acceptance_criterion_results": {
+        "p17_c1": true
+      },
+      "clean_status_fingerprint": "clean-p17-final",
+      "exact_head": "head-p17-final",
+      "executed_checks": [
+        {
+          "command": "pytest tests_py",
+          "exit_status": 0
+        }
+      ],
+      "reviewer_decision": "ACCEPT",
+      "structured_findings": [],
+      "verification_id": "verdict-p17-final"
     }
   }
 }

@@ -1,9 +1,10 @@
 """P17 Contract amendments, legacy classifications, and runtime root fixture tests.
 
 Validates:
-1. SAFETY vs POLICY classifications for conflicting legacy assertions.
-2. Retirement disposition of duplicated budget paths without claiming production deletion.
-3. Fixture-backed isolated check for runtime/config-root fail-closed resolution and state-root ownership lock.
+1. SAFETY vs POLICY classifications for conflicting legacy assertions loaded from document/module.
+2. AST resolution of all named covering tests in the amendment matrix.
+3. Retirement disposition of duplicated budget paths without claiming production deletion.
+4. Fail-closed resolution of runtime root and state-root ownership lock using convergence.roots.
 """
 from __future__ import annotations
 
@@ -12,105 +13,45 @@ from pathlib import Path
 import tempfile
 import unittest
 
-
-# Canonical classification matrix of legacy conflicting assertions
-LEGACY_CONTRACT_AMENDMENTS = (
-    {
-        "assertion_id": "LCA-01",
-        "contract": "TRANSITION_EXECUTOR_CONTRACT",
-        "description": "Owner continue required to advance after review remediation budget exhaustion",
-        "classification": "POLICY",
-        "reason": "Target convergence automatically emits WRITE_HANDOFF or escalating failover instead of manual continue stall",
-        "covering_tests": [
-            "tests_py/test_p1614_invariant_workflow.py::test_repaired_head_reconciles_and_replays_blocked_request",
-            "tests_py/test_p17_retry_wait_escalation.py::TestP17RetryWaitEscalation::test_total_exhaustion_writes_handoff",
-        ],
-    },
-    {
-        "assertion_id": "LCA-02",
-        "contract": "TRANSITION_EXECUTOR_CONTRACT",
-        "description": "Fail-closed check on task mismatch and unannounced control-plane launches",
-        "classification": "SAFETY",
-        "reason": "Enduring safety invariant; must remain in production and target model",
-        "covering_tests": [
-            "tests_py/test_p1614_invariant_workflow.py::ControlPlaneGateLifecycleTests::test_unannounced_control_plane_launch_refuses_to_owner_gate",
-            "tests_py/test_p17_control_plane_declaration.py::TestP17ControlPlaneDeclaration::test_evaluate_launch_declaration_at_current_head",
-        ],
-    },
-    {
-        "assertion_id": "LCA-03",
-        "contract": "docs/development-workflow.md",
-        "description": "Two-round bounded plan review before owner gate",
-        "classification": "POLICY",
-        "reason": "Local bounded review policy; target convergence formalizes per-problem budget",
-        "covering_tests": [
-            "tests_py/test_workflow_policy.py",
-            "tests_py/test_p17_problem_identity.py::TestP17ProblemIdentity::test_problem_tracker_exhaustion",
-        ],
-    },
-    {
-        "assertion_id": "LCA-04",
-        "contract": "P16.13 / P16.14 tests",
-        "description": "Prose string matching for 'BLOCKING:' severity in reviewer output",
-        "classification": "POLICY",
-        "reason": "Target architecture strictly replaces free-text parsing with closed-schema FindingSeverity",
-        "covering_tests": [
-            "tests_py/test_p17_findings_and_output_invalid.py::TestP17FindingsAndOutputInvalid::test_parse_valid_structured_findings",
-            "tests_py/test_p17_acceptance_model.py::TestP17AcceptanceModel::test_verified_acceptance_with_unresolved_blocking_finding_fails",
-        ],
-    },
-    {
-        "assertion_id": "LCA-05",
-        "contract": "P16.13 / P16.14 tests",
-        "description": "Emergency pause/stop enforcement across all lifecycle states",
-        "classification": "SAFETY",
-        "reason": "Enduring out-of-band safety invariant; must never be relaxed",
-        "covering_tests": [
-            "tests_py/test_p17_human_and_emergency.py::TestP17HumanAndEmergency::test_emergency_pause_overrides_all_decisions",
-            "tests_py/test_p17_invariants.py::TestP17Invariants::test_pure_evaluator_evaluates_all_invariants",
-        ],
-    },
+from dev_orchestrator.convergence.amendments import (
+    LEGACY_CONTRACT_AMENDMENTS,
+    RETIREMENT_DISPOSITIONS,
+    load_legacy_contract_amendments,
+    load_retirement_dispositions,
+    validate_amendment_test_references,
 )
-
-# Duplicated decision/budget paths marked for future retirement (M9), not deleted in P17
-RETIREMENT_DISPOSITIONS = {
-    "execution_intent_budgets": {
-        "disposition": "RETIRE_AT_M9",
-        "target_replacement": "WorkRecord.attempts and ProblemBudget",
-        "deleted_in_p17": False,
-    },
-    "reviewer_remediation_extension_budgets": {
-        "disposition": "RETIRE_AT_M9",
-        "target_replacement": "ProblemBudget.max_strategy_attempts",
-        "deleted_in_p17": False,
-    },
-    "watchdog_lifecycle_recovery_attempts": {
-        "disposition": "RETIRE_AT_M9",
-        "target_replacement": "ProblemBudget.max_resource_attempts",
-        "deleted_in_p17": False,
-    },
-    "resolve_progress_obligation_escalation_tables": {
-        "disposition": "RETIRE_AT_M9",
-        "target_replacement": "ConvergenceEvaluator.decide()",
-        "deleted_in_p17": False,
-    },
-}
+from dev_orchestrator.convergence.roots import (
+    acquire_state_root_lock,
+    resolve_runtime_root,
+)
 
 
 class TestP17ContractAmendments(unittest.TestCase):
-    def test_legacy_contract_amendments_structure(self) -> None:
-        for entry in LEGACY_CONTRACT_AMENDMENTS:
+    def setUp(self) -> None:
+        self.doc_path = Path("docs/P17_LEGACY_CONTRACT_AMENDMENTS.md")
+
+    def test_legacy_contract_amendments_structure_and_document_sync(self) -> None:
+        loaded = load_legacy_contract_amendments(self.doc_path)
+        self.assertGreaterEqual(len(loaded), 5)
+        for entry in loaded:
             self.assertIn(entry["classification"], ("SAFETY", "POLICY"))
             self.assertTrue(len(entry["covering_tests"]) > 0)
             self.assertTrue(bool(entry["reason"]))
 
+    def test_all_amendment_covering_tests_resolve_via_ast(self) -> None:
+        """Finding 8: Programmatically verify all covering test references via AST."""
+        loaded = load_legacy_contract_amendments(self.doc_path)
+        errors = validate_amendment_test_references(".", loaded)
+        self.assertEqual(errors, [], f"Covering tests failed AST validation: {errors}")
+
     def test_retirement_dispositions_do_not_claim_p17_deletion(self) -> None:
-        for target, info in RETIREMENT_DISPOSITIONS.items():
+        dispositions = load_retirement_dispositions(self.doc_path)
+        for target, info in dispositions.items():
             self.assertEqual(info["disposition"], "RETIRE_AT_M9")
             self.assertFalse(info["deleted_in_p17"])
 
     def test_isolated_fixture_runtime_root_fail_closed_and_ownership_lock(self) -> None:
-        """Isolated fixture testing target stable/dev root fail-closed resolution and state-root lock."""
+        """Finding 8: Isolated fixture testing convergence.roots fail-closed resolution and state-root lock."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             fake_controller = tmp_path / "controller"
@@ -122,37 +63,34 @@ class TestP17ContractAmendments(unittest.TestCase):
             fake_state.mkdir()
 
             # 1. Fail-closed on missing explicit canonical state root
-            def resolve_runtime_root(explicit_root: Path | None) -> Path:
-                if explicit_root is None or not explicit_root.exists():
-                    raise RuntimeError("FAIL_CLOSED: Runtime root cannot be derived from code location")
-                return explicit_root
-
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(RuntimeError) as ctx:
                 resolve_runtime_root(None)
+            self.assertIn("FAIL_CLOSED", str(ctx.exception))
+
+            non_existent = tmp_path / "non_existent"
+            with self.assertRaises(RuntimeError) as ctx:
+                resolve_runtime_root(non_existent)
+            self.assertIn("FAIL_CLOSED", str(ctx.exception))
 
             resolved = resolve_runtime_root(fake_state)
             self.assertEqual(resolved, fake_state)
 
-            # 2. State-root ownership lock records host, pid, and controller identity
+            # 2. Acquire lock records host, pid, and controller identity
+            lock_res = acquire_state_root_lock(fake_state, fake_controller, 99999, host="ZXZ-PC")
+            self.assertTrue(lock_res)
+
             lock_file = fake_state / "state_root_owner.lock"
-            lock_payload = {
-                "host": "ZXZ-PC",
-                "pid": 99999,
-                "controller_root": str(fake_controller),
-                "acquired_at": "2026-09-27T12:00:00Z",
-            }
-            lock_file.write_text(json.dumps(lock_payload), encoding="utf-8")
+            self.assertTrue(lock_file.exists())
+            lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
+            self.assertEqual(lock_data["host"], "ZXZ-PC")
+            self.assertEqual(lock_data["pid"], 99999)
+            self.assertEqual(lock_data["controller_root"], str(fake_controller))
 
-            # A second daemon with different controller root must fail closed
-            def acquire_state_root_lock(state_root: Path, controller_root: Path, pid: int) -> bool:
-                lf = state_root / "state_root_owner.lock"
-                if lf.exists():
-                    current = json.loads(lf.read_text(encoding="utf-8"))
-                    if current.get("controller_root") != str(controller_root):
-                        raise RuntimeError(
-                            f"LOCKED: State root is already owned by controller {current.get('controller_root')}"
-                        )
-                return True
+            # 3. Same controller re-verifying lock succeeds
+            same_res = acquire_state_root_lock(fake_state, fake_controller, 99999, host="ZXZ-PC")
+            self.assertTrue(same_res)
 
-            with self.assertRaises(RuntimeError):
+            # 4. A second daemon with different controller root must fail closed
+            with self.assertRaises(RuntimeError) as ctx:
                 acquire_state_root_lock(fake_state, fake_workspace, 88888)
+            self.assertIn("LOCKED", str(ctx.exception))

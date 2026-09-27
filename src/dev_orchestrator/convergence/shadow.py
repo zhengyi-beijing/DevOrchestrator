@@ -47,7 +47,7 @@ class ReadOnlyEvidenceRoot:
 
     def read_file(self, relative_path: str) -> str:
         target = (self._root / relative_path).resolve()
-        if not str(target).startswith(str(self._root)):
+        if not target.is_relative_to(self._root):
             raise FenceViolation(f"Path traversal outside evidence root: {relative_path}")
         if not target.exists():
             raise FileNotFoundError(f"File not found in evidence root: {relative_path}")
@@ -85,17 +85,17 @@ def validate_shadow_sink(
     allowed_base = (repo_path / "runtime" / SHADOW_NAMESPACE).resolve()
 
     # Reject if inside evidence root
-    if str(out_path).startswith(str(ev_path)):
+    if out_path.is_relative_to(ev_path):
         raise FenceViolation(f"Shadow sink cannot be located inside evidence root: {out_path}")
 
     # Reject if inside canonical state root
     if canonical_state_root:
         canon_path = Path(canonical_state_root).resolve()
-        if str(out_path).startswith(str(canon_path)):
+        if out_path.is_relative_to(canon_path):
             raise FenceViolation(f"Shadow sink cannot be located inside canonical state root: {out_path}")
 
     # Must resolve inside allowed_base
-    if not (str(out_path) == str(allowed_base) or str(out_path).startswith(str(allowed_base) + os.sep)):
+    if not out_path.is_relative_to(allowed_base):
         raise FenceViolation(
             f"Shadow sink {out_path} is outside the allowed development namespace {allowed_base}"
         )

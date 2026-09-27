@@ -97,3 +97,37 @@ class TestP17RetryWaitEscalation(unittest.TestCase):
         })
         decision = decide(rec, EvidenceSnapshot(), self.policy)
         self.assertEqual(decision.kind, DecisionKind.WRITE_HANDOFF)
+
+    def test_elapsed_quota_reset_wakes_to_failover_without_manual_continue(self) -> None:
+        """Finding 4: When quota reset timestamp elapses, evaluator wakes to FAILOVER_RESOURCE automatically."""
+        rec = validate_work_record({
+            **self.base_record,
+            "current_problem": {
+                "problem_id": "p-quota-elapsed",
+                "failure_class": FailureClass.RESOURCE_TRANSIENT.value,
+                "criterion_or_invariant_id": "rate_limit",
+                "normalized_fingerprint": "fp-rate-elapsed",
+            },
+            "attempts": [],
+        })
+        policy = build_policy(
+            default_budget=ProblemBudget(
+                max_resource_attempts=2,
+                max_strategy_attempts=2,
+                max_capability_escalations=2,
+                max_total_attempts=5,
+            ),
+            quota_reset_rules={
+                "rate_limit": {"reset_at": "2026-09-27T12:00:00Z"},
+            },
+        )
+
+        # 1. Before reset time -> emits WAIT_UNTIL
+        dec_before = decide(rec, EvidenceSnapshot(), policy, now="2026-09-27T11:59:00Z")
+        self.assertEqual(dec_before.kind, DecisionKind.WAIT_UNTIL)
+        self.assertEqual(dec_before.parameters.get("not_before"), "2026-09-27T12:00:00Z")
+
+        # 2. After reset time has elapsed -> automatically wakes to FAILOVER_RESOURCE
+        dec_after = decide(rec, EvidenceSnapshot(), policy, now="2026-09-27T12:00:05Z")
+        self.assertEqual(dec_after.kind, DecisionKind.FAILOVER_RESOURCE)
+        self.assertIn("FAILOVER_RESOURCE", dec_after.kind.value)

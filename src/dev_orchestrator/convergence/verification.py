@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
+from dev_orchestrator.convergence.evidence import EvidenceSnapshot, has_unresolved_ambiguity
 from dev_orchestrator.convergence.findings import Finding, FindingSeverity
 from dev_orchestrator.convergence.work_record import WorkRecord
 
@@ -64,6 +65,9 @@ class VerificationRecord:
         return any(f.severity == FindingSeverity.BLOCKING for f in self.structured_findings)
 
 
+VerificationResult = VerificationRecord
+
+
 def validate_owner_override(override_dict: Mapping[str, Any]) -> tuple[bool, str]:
     """Validate an OWNER_OVERRIDE record.
 
@@ -90,13 +94,18 @@ def validate_owner_override(override_dict: Mapping[str, Any]) -> tuple[bool, str
 
 def is_goal_satisfied(
     work_record: WorkRecord,
+    evidence: EvidenceSnapshot | None = None,
     verification: VerificationRecord | None = None,
     acceptance_override: Mapping[str, Any] | None = None,
+    current_anchor_head: str | None = None,
 ) -> tuple[bool, str]:
     """Determine whether GoalSatisfied invariant holds.
 
     Returns (is_satisfied, reason).
     """
+    if evidence is not None and has_unresolved_ambiguity(evidence):
+        return False, "Unresolved integrity ambiguity or conflicting evidence exists; goal cannot be satisfied"
+
     acceptance = acceptance_override or work_record.acceptance
     acc_kind = acceptance.get("kind", "NONE")
 
@@ -139,6 +148,21 @@ def is_goal_satisfied(
         if vr is None:
             return False, "VERIFIED acceptance requires structured VerificationRecord"
 
+        # Compare accepted / verification anchor against current repository anchor
+        current_head = (
+            evidence.exact_anchors.get("head")
+            if (evidence is not None and evidence.exact_anchors)
+            else current_anchor_head
+        )
+        if current_head is not None:
+            anchor_head = acceptance.get("anchor_head")
+            if anchor_head and anchor_head != current_head:
+                return False, f"NOT_VERIFIED: Acceptance anchor_head {anchor_head!r} differs from current repository HEAD {current_head!r}"
+            if vr.exact_head and vr.exact_head != current_head:
+                return False, f"NOT_VERIFIED: Verification exact_head {vr.exact_head!r} differs from current repository HEAD {current_head!r}"
+        elif evidence is not None:
+            return False, "NOT_VERIFIED: Current repository HEAD anchor missing from evidence snapshot"
+
         # Check blocking findings
         if vr.has_blocking_finding:
             return False, "Verification has unresolved BLOCKING findings"
@@ -164,3 +188,6 @@ def is_goal_satisfied(
         return True, "Goal satisfied via VERIFIED acceptance evidence"
 
     return False, f"Unknown acceptance kind: {acc_kind!r}"
+
+
+evaluate_verification_record = is_goal_satisfied

@@ -5,7 +5,52 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P17 Single-Authority Goal Convergence Baseline** (Status: **IMPLEMENTED / READY_FOR_REVIEW**). Previous task: **P16.14 Invariant-Driven Control-Plane Development & Validation** (Status: **COMPLETE**).
+Current task: **P17 Single-Authority Goal Convergence Baseline** (Status: **REMEDIATED / READY_FOR_REVIEW**). Previous task: **P16.14 Invariant-Driven Control-Plane Development & Validation** (Status: **COMPLETE**).
+
+P17 Technical Review remediation evidence (2026-09-27):
+- Addressed all 8 Technical Review findings from `ai_review:a04b4803-cc11-41fe-8ccd-38263decfb5d`:
+  1. Finding 1 (Acceptance-before-advance on DONE status):
+     - In `evaluator.py` Section 3, required `is_goal_satisfied(work_record, evidence=evidence)` before allowing `PUBLISH_SUCCESSOR`; fails closed to `REQUEST_HUMAN` citing `ACCEPTANCE_BEFORE_ADVANCE` if acceptance is not verified or overridden.
+     - In `work_record.py`, updated `validate_work_record` to reject `status == "DONE"` when `acceptance.kind == "NONE"`.
+     - In `actuator_guard.py`, added acceptance precondition for `PUBLISH_SUCCESSOR` (requires `VERIFIED` or `OWNER_OVERRIDE`).
+     - Covered by `tests_py/test_p17_acceptance_model.py::TestP17AcceptanceModel::test_done_status_with_acceptance_none_cannot_publish_successor`.
+  2. Finding 2 (Stale verification anchor comparison):
+     - In `verification.py`, added `evidence` and `current_anchor_head` parameters to `is_goal_satisfied()`; fails with `NOT_VERIFIED` when `acceptance.anchor_head` or `verification.exact_head` differs from `evidence.exact_anchors['head']`.
+     - Threaded `evidence` snapshot through `evaluator.py` sections 3, 7, and 8.
+     - Rebuilt `tests_py/data/p17_corpus/case_04_stale_reviewer_anchor_after_head_change.json` with stale verification anchor (`old-c0293ab`), `expected_v0_decision: "VERIFY"`, and `expected_invariant_verdicts: {"ANCHOR_BINDING": false}`.
+     - Updated case 18 (`case_18_normal_happy_path_goal_completion.json`) with matching anchor `head-p17-clean` and `status: "DONE"`.
+     - Covered by `tests_py/test_p17_acceptance_model.py::TestP17AcceptanceModel::test_stale_verification_anchor_blocks_goal_satisfaction`.
+  3. Finding 3 (Integrity ambiguity ordering):
+     - In `evaluator.py`, moved `has_unresolved_ambiguity(evidence)` check to Section 2 (above goal satisfaction and above DONE checks), ensuring conflicts and CORRUPT/AMBIGUOUS reads fail closed to `REQUEST_HUMAN` citing `FAIL_CLOSED_AMBIGUITY` before side effects or acceptance are considered.
+     - Covered by `tests_py/test_p17_invariants.py::TestP17Invariants::test_unresolved_ambiguity_blocks_satisfy_and_publish`.
+  4. Finding 4 (Quota reset wake vs elapsed time):
+     - In `evaluator.py`, quota-reset branch only emits `WAIT_UNTIL` when parsed `reset_at` is strictly in the future relative to `now`; when elapsed, falls through to `FAILOVER_RESOURCE` within budget without requiring manual continue. Dropped `now_dt.isoformat()` zero-length wait fallback.
+     - Covered by `tests_py/test_p17_retry_wait_escalation.py::TestP17RetryWaitEscalation::test_elapsed_quota_reset_wakes_to_failover_without_manual_continue`.
+  5. Finding 5 (Active lease liveness default):
+     - In `evaluator.py`, active lease branch defaults to not-live when liveness evidence is absent, failing closed to `REQUEST_HUMAN` citing `NO_ORPHAN_OWNER` and `PROGRESS_TOTALITY` rather than `NOOP_ACTIVE`.
+     - Rebuilt `tests_py/data/p17_corpus/case_06_worker_process_death_stale_active_ownership.json` with active lease, dead process probe (`alive: false`), and `expected_v0_decision: "RETRY_NEW_STRATEGY"`.
+     - Covered by `tests_py/test_p17_lease_and_effects.py::TestP17LeaseAndEffects::test_lease_without_liveness_evidence_is_not_active_progress`.
+  6. Finding 6 (ActuatorGuard anchor and lease coverage):
+     - In `actuator_guard.py`, added `PUBLISH_SUCCESSOR` to anchor-required decisions (`VERIFY`, `SATISFY_GOAL`, `PUBLISH_SUCCESSOR`), and added `FAILOVER_RESOURCE`, `ESCALATE_CAPABILITY`, and `VERIFY` to lease-uniqueness checks (`LEASE_ALREADY_ACTIVE`). Fails closed when required anchor is missing from evidence or expectation.
+     - Covered by `tests_py/test_p17_lease_and_effects.py::TestP17LeaseAndEffects::test_guard_rejects_failover_and_escalation_while_lease_active`.
+  7. Finding 7 (Durable write crash injection and shadow differential):
+     - In `replay.py`, `simulate_crash_injection()` models ordered durable write boundaries (`before/after_verification`, `before/after_acceptance`, `before/after_successor_publish`, `after_handoff`), truncates state at crash points, resumes through `ActuatorGuard`, and asserts trace-hash convergence with zero duplicate publications (`duplicate_publications == 0`).
+     - Covered by `tests_py/test_p17_replay_determinism.py::TestP17ReplayDeterminism::test_truncated_and_repeated_durable_write_sequences_yield_one_publication` and `test_shadow_delete_and_rebuild_differential_trace_hash`.
+  8. Finding 8 (Contract amendments module, AST verification, and preflight constraints):
+     - Implemented `src/dev_orchestrator/convergence/roots.py` (`resolve_runtime_root`, `acquire_state_root_lock`) and `src/dev_orchestrator/convergence/amendments.py` (`LEGACY_CONTRACT_AMENDMENTS`, `RETIREMENT_DISPOSITIONS`, `load_legacy_contract_amendments`, `load_retirement_dispositions`, `validate_amendment_test_references` via AST).
+     - In `preflight.py`, implemented matchers for all 6 seeded constraint rules (`contains_tokens`, `cmdlet + parameter`, `extension`, `cli_flags`, `redirection`, `path_style`) with deterministic derived fingerprints (`derive_constraint_fingerprint`).
+     - In `evaluator.py`, consumed `Policy.required_sources`, failing closed with `REQUEST_HUMAN` citing `FAIL_CLOSED_AMBIGUITY` when any required source is missing.
+     - In `docs/P17_LEGACY_CONTRACT_AMENDMENTS.md`, aligned test reference for LCA-01 to `ControlPlaneGateLifecycleTests`.
+     - In `agent/evidence/p17-g0-final-resume-20260927.json`, tracked authoritative resume command history unconditionally.
+     - Covered by `tests_py/test_p17_contract_amendments.py`, `tests_py/test_p17_control_plane_declaration.py`, and `tests_py/test_p17_preflight_constraints.py::TestP17PreflightConstraints::test_every_seeded_rule_is_reachable_and_classified`.
+- Verification Summary:
+  - All 19 P17 test suites (85 tests): 100% passed.
+  - Full historical incident corpus replay: 26/26 passed (0 failures).
+  - Regression suites (`test_p1614_invariant_workflow.py`, `test_p1613_successor_consistency.py`, `test_workflow_policy.py`): 102 passed, 10 subtests passed.
+  - Python AST and syntax compilation: clean (`compileall` 0 errors).
+  - Whitespace check (`git diff --check`): clean.
+  - Knowledge graph updated cleanly via `graphify update .`.
+
 
 P17 Single-Authority Goal Convergence Baseline implementation evidence (2026-09-27):
 - Pre-launch Gate M0 completed under authoritative owner pause: canonical 4-field Control-Plane Impact declaration committed, liveness and bootstrap override verified, stale records reconciled, daemon restarted and reconciled with one coherent P17 authority, and M0 evidence recorded in `agent/evidence/P17_PRELAUNCH_GATE.json` (`pre_resume_status: PASS`). Authenticated resume command `p17-g0-final-resume-20260927` settled accepted against exact clean M0 HEAD.

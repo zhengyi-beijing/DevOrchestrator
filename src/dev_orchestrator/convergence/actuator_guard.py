@@ -84,23 +84,46 @@ class ActuatorGuard:
                 rejection_code="DUPLICATE_IDEMPOTENCY_KEY",
             )
 
-        # 5. Exact repository anchor check (where required, e.g. for VERIFY or SATISFY_GOAL)
-        if decision.kind in (DecisionKind.VERIFY, DecisionKind.SATISFY_GOAL):
-            current_head = evidence.exact_anchors.get("head")
-            if expected_anchor_head and current_head and current_head != expected_anchor_head:
+        # 5. Acceptance check for PUBLISH_SUCCESSOR
+        if decision.kind == DecisionKind.PUBLISH_SUCCESSOR:
+            acc_kind = work_record.acceptance.get("kind", "NONE")
+            if acc_kind not in ("VERIFIED", "OWNER_OVERRIDE"):
+                return GuardVerdict(
+                    accepted=False,
+                    reason=f"Cannot publish successor: acceptance kind is {acc_kind!r}, expected VERIFIED or OWNER_OVERRIDE",
+                    rejection_code="ACCEPTANCE_REQUIRED",
+                )
+
+        # 6. Exact repository anchor check (where required: VERIFY, SATISFY_GOAL, PUBLISH_SUCCESSOR)
+        if decision.kind in (DecisionKind.VERIFY, DecisionKind.SATISFY_GOAL, DecisionKind.PUBLISH_SUCCESSOR):
+            current_head = (evidence.exact_anchors or {}).get("head")
+            if not current_head or not expected_anchor_head:
+                return GuardVerdict(
+                    accepted=False,
+                    reason="Repository HEAD anchor is required for decision but missing from evidence or expectation",
+                    rejection_code="ANCHOR_REQUIRED_MISSING",
+                )
+            if current_head != expected_anchor_head:
                 return GuardVerdict(
                     accepted=False,
                     reason=f"Repository HEAD anchor mismatch: {current_head!r} != {expected_anchor_head!r}",
                     rejection_code="ANCHOR_MISMATCH",
                 )
 
-        # 6. Active lease uniqueness check
-        if decision.kind in (DecisionKind.EXECUTE, DecisionKind.RETRY_SAME_STRATEGY, DecisionKind.RETRY_NEW_STRATEGY):
+        # 7. Active lease uniqueness check
+        if decision.kind in (
+            DecisionKind.EXECUTE,
+            DecisionKind.RETRY_SAME_STRATEGY,
+            DecisionKind.RETRY_NEW_STRATEGY,
+            DecisionKind.FAILOVER_RESOURCE,
+            DecisionKind.ESCALATE_CAPABILITY,
+            DecisionKind.VERIFY,
+        ):
             if work_record.active_lease is not None:
                 role = work_record.active_lease.get("role")
                 return GuardVerdict(
                     accepted=False,
-                    reason=f"Cannot launch execution: active lease already held by role {role!r}",
+                    reason=f"Cannot admit decision {decision.kind.value}: active lease already held by role {role!r}",
                     rejection_code="LEASE_ALREADY_ACTIVE",
                 )
 

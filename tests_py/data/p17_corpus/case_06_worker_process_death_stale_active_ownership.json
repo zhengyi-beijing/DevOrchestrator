@@ -12,7 +12,22 @@
     "exact_anchors": {
       "head": "da699cd7238ed39caf62fb229ba82a2e4f392734"
     },
-    "items": [],
+    "items": [
+      {
+        "source": "process_probe",
+        "source_id": "probe-worker-6",
+        "timestamp": "2026-09-27T10:05:00Z",
+        "anchor": "da699cd7238ed39caf62fb229ba82a2e4f392734",
+        "data": {
+          "role": "worker",
+          "pid": 9999,
+          "alive": false,
+          "probe_status": "DEAD"
+        },
+        "digest": "sha256:probe-dead-worker",
+        "read_status": "OK"
+      }
+    ],
     "metadata": {},
     "shared_leases": []
   },
@@ -50,7 +65,12 @@
     "acceptance": {
       "kind": "NONE"
     },
-    "active_lease": null,
+    "active_lease": {
+      "role": "worker",
+      "attempt_id": "att-1",
+      "execution_id": "exec-worker-crash-6",
+      "acquired_at": "2026-09-27T10:00:00Z"
+    },
     "attempts": [],
     "authority_revision": "rev-4",
     "current_problem": {

@@ -3,7 +3,12 @@ from __future__ import annotations
 
 import unittest
 
-from dev_orchestrator.convergence.evidence import EvidenceSnapshot
+from dev_orchestrator.convergence.evaluator import DecisionKind, decide
+from dev_orchestrator.convergence.evidence import (
+    ConflictClaim,
+    EvidenceItem,
+    EvidenceSnapshot,
+)
 from dev_orchestrator.convergence.invariants import (
     CONVERGENCE_INVARIANT_CODES,
     CPF_SCENARIO_MAP,
@@ -11,6 +16,7 @@ from dev_orchestrator.convergence.invariants import (
     evaluate_convergence_invariants,
 )
 from dev_orchestrator.convergence.policy import build_policy
+from dev_orchestrator.convergence.verification import is_goal_satisfied
 from dev_orchestrator.convergence.work_record import validate_work_record
 
 
@@ -81,3 +87,59 @@ class TestP17Invariants(unittest.TestCase):
             self.assertIsInstance(v.holds, bool)
             self.assertIsInstance(v.details, str)
             self.assertTrue(bool(v.details))
+
+    def test_unresolved_ambiguity_blocks_satisfy_and_publish(self) -> None:
+        """Finding 3: Unresolved ambiguity in evidence snapshot must fail closed before satisfaction or publication."""
+        done_record = validate_work_record({
+            **self.work_record.to_dict(),
+            "status": "DONE",
+            "acceptance": {
+                "kind": "VERIFIED",
+                "reviewer_verdict_id": "v-1",
+                "anchor_head": "head-clean",
+            },
+            "verification": {
+                "verification_id": "v-1",
+                "exact_head": "head-clean",
+                "clean_status_fingerprint": "clean",
+                "acceptance_criterion_results": {"crit-1": True},
+                "executed_checks": [{"command": "pytest", "exit_status": 0}],
+                "reviewer_decision": "ACCEPT",
+                "structured_findings": [],
+            },
+            "successor": {
+                "successor_goal_id": "P18",
+                "successor_spec_digest": "sha256:p18",
+                "publication_state": "PENDING",
+                "handoff_idempotency_key": "idemp-p18",
+            },
+        })
+
+        # Evidence snapshot with unresolved conflict
+        ambiguous_ev = EvidenceSnapshot(
+            items=(),
+            conflicts=(
+                ConflictClaim(
+                    source_a="repo_truth",
+                    source_b="broker_effect",
+                    conflict_type="HEAD_DIVERGENCE",
+                    details="Unreconciled head divergence between repo and broker",
+                    resolved=False,
+                ),
+            ),
+            shared_leases=(),
+            exact_anchors={"head": "head-clean"},
+            emergency_pause_asserted=False,
+            metadata={},
+        )
+
+        # 1. is_goal_satisfied must evaluate to False
+        satisfied, reason = is_goal_satisfied(done_record, evidence=ambiguous_ev)
+        self.assertFalse(satisfied)
+        self.assertIn("ambiguity", reason.lower())
+
+        # 2. decide() must fail closed to REQUEST_HUMAN, citing FAIL_CLOSED_AMBIGUITY
+        decision = decide(done_record, ambiguous_ev, self.policy)
+        self.assertEqual(decision.kind, DecisionKind.REQUEST_HUMAN)
+        self.assertIn("FAIL_CLOSED_AMBIGUITY", decision.invariant_citations)
+        self.assertIn("ambiguity", decision.reason.lower())

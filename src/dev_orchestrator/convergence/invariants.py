@@ -10,6 +10,8 @@ from typing import Any, Mapping
 
 from dev_orchestrator.convergence.evidence import EvidenceSnapshot, has_unresolved_ambiguity
 from dev_orchestrator.convergence.policy import Policy
+from dev_orchestrator.convergence.preflight import PreflightVerdict, evaluate_preflight
+from dev_orchestrator.convergence.problems import FailureClass
 from dev_orchestrator.convergence.verification import is_goal_satisfied, validate_owner_override
 from dev_orchestrator.convergence.work_record import WorkRecord
 
@@ -36,6 +38,7 @@ CONVERGENCE_INVARIANT_CODES: tuple[str, ...] = (
     "WAIT_IS_NOT_PROGRESS",
     "INVARIANT_CODE_STABILITY",
 )
+INVARIANT_CODES = CONVERGENCE_INVARIANT_CODES
 
 # Mapping to 6 production lifecycle invariants
 LIFECYCLE_INVARIANT_MAP: dict[str, tuple[str, ...]] = {
@@ -124,9 +127,24 @@ def evaluate_convergence_invariants(
     # GOAL_NOT_SATISFIED + NO_ACTIVE_PROGRESS + NO_HUMAN_REQUIRED must produce recovery or fault.
     pt_holds = True
     pt_msg = "Progress totality holds"
-    if work_record.status == "OPEN" and work_record.active_lease is None:
-        if not work_record.human_request and not work_record.wait:
-            pt_msg = "Goal is open without active lease; requires actionable decision"
+    if work_record.status == "OPEN":
+        if work_record.active_lease is not None:
+            role = work_record.active_lease.get("role")
+            lease_dead = any(
+                it.source == "process_probe" and it.data.get("role") == role and not it.data.get("alive")
+                for it in evidence.items
+            )
+            if lease_dead and not work_record.current_problem:
+                pt_holds = False
+                pt_msg = f"Active execution lease held by role {role!r} is dead with no recovery progress"
+        elif not work_record.human_request and not work_record.wait:
+            if work_record.current_problem:
+                prob_id = work_record.current_problem.get("problem_id", "")
+                matching_attempts = [a for a in work_record.attempts if a.get("problem_id") == prob_id]
+                budget = policy.get_budget_for_problem(prob_id)
+                if len(matching_attempts) > budget.max_total_attempts and not work_record.handoff:
+                    pt_holds = False
+                    pt_msg = f"Problem {prob_id!r} exhausted attempts without structured handoff"
     verdicts["PROGRESS_TOTALITY"] = InvariantVerdict("PROGRESS_TOTALITY", pt_holds, pt_msg)
 
     # 4. ACCEPTANCE_BEFORE_ADVANCE
@@ -165,29 +183,46 @@ def evaluate_convergence_invariants(
 
     # 7. MARKDOWN_NON_AUTHORITY
     # Markdown edits alone cannot change lifecycle authority.
-    verdicts["MARKDOWN_NON_AUTHORITY"] = InvariantVerdict(
-        "MARKDOWN_NON_AUTHORITY",
-        True,
-        "Markdown projections cannot create or settle lifecycle authority in v0 model",
-    )
+    mna_holds = True
+    mna_msg = "Markdown projections cannot settle lifecycle authority without verified acceptance"
+    if work_record.status == "DONE" and work_record.acceptance.get("kind") == "NONE":
+        mna_holds = False
+        mna_msg = "Goal claims status DONE while acceptance is NONE"
+    for it in evidence.items:
+        if it.source == "markdown_projection" and it.data.get("status") in ("COMPLETE", "DONE"):
+            if work_record.acceptance.get("kind") == "NONE":
+                mna_holds = False
+                mna_msg = "Markdown projection claims COMPLETE while acceptance is NONE"
+                break
+    verdicts["MARKDOWN_NON_AUTHORITY"] = InvariantVerdict("MARKDOWN_NON_AUTHORITY", mna_holds, mna_msg)
 
     # 8. ANCHOR_BINDING
     # Verification/reviewer evidence bound to exact anchors.
     ab_holds = True
     ab_msg = "Anchor binding holds"
+    curr_head = evidence.exact_anchors.get("head")
     if work_record.verification is not None:
         exact_head = work_record.verification.get("exact_head")
         if not exact_head:
             ab_holds = False
             ab_msg = "Verification record missing exact_head anchor"
+        elif curr_head and exact_head != curr_head:
+            ab_holds = False
+            ab_msg = f"Verification exact_head {exact_head!r} differs from current repository HEAD {curr_head!r}"
+    if work_record.acceptance.get("kind") == "VERIFIED":
+        anchor_head = work_record.acceptance.get("anchor_head")
+        if not anchor_head:
+            ab_holds = False
+            ab_msg = "VERIFIED acceptance missing anchor_head"
+        elif curr_head and anchor_head != curr_head:
+            ab_holds = False
+            ab_msg = f"Acceptance anchor_head {anchor_head!r} differs from current repository HEAD {curr_head!r}"
     verdicts["ANCHOR_BINDING"] = InvariantVerdict("ANCHOR_BINDING", ab_holds, ab_msg)
 
     # 9. IDEMPOTENT_REPLAY
-    verdicts["IDEMPOTENT_REPLAY"] = InvariantVerdict(
-        "IDEMPOTENT_REPLAY",
-        True,
-        "Decisions produce deterministic idempotency keys",
-    )
+    ir_holds = bool(work_record.goal_id and work_record.authority_revision)
+    ir_msg = "Decisions produce deterministic idempotency keys" if ir_holds else "Missing goal_id or authority_revision"
+    verdicts["IDEMPOTENT_REPLAY"] = InvariantVerdict("IDEMPOTENT_REPLAY", ir_holds, ir_msg)
 
     # 10. STABLE_PROBLEM_IDENTITY
     # Problem fingerprint excludes volatile fields.
@@ -236,9 +271,13 @@ def evaluate_convergence_invariants(
     # 14. EMERGENCY_BRAKE
     # Emergency pause prevents new side effects.
     eb_holds = True
-    eb_msg = "Emergency pause respected"
+    eb_msg = "Emergency pause respected or absent"
     if evidence.emergency_pause_asserted:
-        eb_msg = "Emergency pause is asserted; side effects must be gated"
+        if work_record.active_lease is not None:
+            eb_holds = False
+            eb_msg = "Emergency pause is asserted but active execution lease is still held"
+        else:
+            eb_msg = "Emergency pause is asserted; side effects must be gated"
     verdicts["EMERGENCY_BRAKE"] = InvariantVerdict("EMERGENCY_BRAKE", eb_holds, eb_msg)
 
     # 15. FAIL_CLOSED_AMBIGUITY
@@ -248,18 +287,27 @@ def evaluate_convergence_invariants(
     verdicts["FAIL_CLOSED_AMBIGUITY"] = InvariantVerdict("FAIL_CLOSED_AMBIGUITY", fca_holds, fca_msg)
 
     # 16. LEARNED_CONSTRAINT_CONSUMPTION
-    verdicts["LEARNED_CONSTRAINT_CONSUMPTION"] = InvariantVerdict(
-        "LEARNED_CONSTRAINT_CONSUMPTION",
-        True,
-        "Known incompatible operations are checked at preflight",
-    )
+    lcc_holds = True
+    lcc_msg = "Known incompatible operations are checked at preflight"
+    for att in work_record.attempts:
+        cmd = att.get("command") or att.get("operation", {}).get("command") or ""
+        if cmd:
+            v, _, r = evaluate_preflight({"command": cmd}, {"os": "windows", "shell": "powershell_5.1"})
+            if v == PreflightVerdict.REJECT and r is not None:
+                lcc_holds = False
+                lcc_msg = f"Attempt {att.get('attempt_id')} executed prohibited command under rule {r.rule_id}"
+                break
+    verdicts["LEARNED_CONSTRAINT_CONSUMPTION"] = InvariantVerdict("LEARNED_CONSTRAINT_CONSUMPTION", lcc_holds, lcc_msg)
 
     # 17. LEARNING_REGRESSION
-    verdicts["LEARNING_REGRESSION"] = InvariantVerdict(
-        "LEARNING_REGRESSION",
-        True,
-        "Recurrence of learned failure is classified as defect",
-    )
+    lr_holds = True
+    lr_msg = "No learning regression detected"
+    if work_record.current_problem is not None:
+        fc = work_record.current_problem.get("failure_class")
+        if fc == FailureClass.CONTROL_PLANE_DEFECT.value:
+            lr_holds = False
+            lr_msg = f"Learning regression: problem {work_record.current_problem.get('problem_id')} classified as CONTROL_PLANE_DEFECT"
+    verdicts["LEARNING_REGRESSION"] = InvariantVerdict("LEARNING_REGRESSION", lr_holds, lr_msg)
 
     # 18. SUCCESSOR_DETERMINISM
     # Successor identity and handoff idempotency key are deterministic.
@@ -272,11 +320,18 @@ def evaluate_convergence_invariants(
     verdicts["SUCCESSOR_DETERMINISM"] = InvariantVerdict("SUCCESSOR_DETERMINISM", sd_holds, sd_msg)
 
     # 19. NO_HUMAN_CLOCK
-    verdicts["NO_HUMAN_CLOCK"] = InvariantVerdict(
-        "NO_HUMAN_CLOCK",
-        True,
-        "Manual continue is never required solely for deterministic transitions",
-    )
+    nhc_holds = True
+    nhc_msg = "Manual continue is never required solely for deterministic transitions"
+    if work_record.status == "OPEN" and work_record.active_lease is None:
+        if not work_record.human_request and not work_record.wait:
+            if work_record.current_problem:
+                p_id = work_record.current_problem.get("problem_id", "")
+                matching_att = [a for a in work_record.attempts if a.get("problem_id") == p_id]
+                b = policy.get_budget_for_problem(p_id)
+                if len(matching_att) > b.max_total_attempts and not work_record.handoff:
+                    nhc_holds = False
+                    nhc_msg = "Problem attempt budget exhausted without autonomous handoff emission"
+    verdicts["NO_HUMAN_CLOCK"] = InvariantVerdict("NO_HUMAN_CLOCK", nhc_holds, nhc_msg)
 
     # 20. WAIT_IS_NOT_PROGRESS
     # WAIT_UNTIL consumes no attempt budget.
@@ -289,9 +344,10 @@ def evaluate_convergence_invariants(
     verdicts["WAIT_IS_NOT_PROGRESS"] = InvariantVerdict("WAIT_IS_NOT_PROGRESS", winp_holds, winp_msg)
 
     # 21. INVARIANT_CODE_STABILITY
+    ics_holds = len(CONVERGENCE_INVARIANT_CODES) == 21 and all(isinstance(c, str) and c.isupper() for c in CONVERGENCE_INVARIANT_CODES)
     verdicts["INVARIANT_CODE_STABILITY"] = InvariantVerdict(
         "INVARIANT_CODE_STABILITY",
-        True,
+        ics_holds,
         "All 21 invariant codes are stable string identifiers; ordinals are non-identity",
     )
 

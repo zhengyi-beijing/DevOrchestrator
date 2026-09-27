@@ -268,26 +268,80 @@ class ReplayHarness:
         case: ReplayCase,
         crash_points: Sequence[str] = ("before_write", "after_write", "during_handoff"),
     ) -> dict[str, Any]:
-        """Simulate crashes between durable write boundaries and verify trace-hash convergence."""
-        baseline_result = self.run_case(case)
-        baseline_hash = decision_trace_hash([baseline_result.actual_decision])
+        """Simulate crashes between durable write boundaries and verify trace-hash convergence.
 
+        Models an ordered sequence of durable writes for the acceptance/successor/handoff path,
+        replays prefixes truncated at each crash point followed by resumption,
+        and asserts both trace-hash equality and zero duplicate publication via ActuatorGuard idempotency keys.
+        """
+        baseline_result = self.run_case(case)
+        baseline_decision = baseline_result.actual_decision
+        baseline_hash = decision_trace_hash([baseline_decision])
+
+        from dev_orchestrator.convergence.actuator_guard import ActuatorGuard
+
+        total_duplicate_publications = 0
         replays_after_crash = []
+
         for point in crash_points:
-            # Replay from the same work record / evidence snapshot
-            c_result = self.run_case(case)
-            c_hash = decision_trace_hash([c_result.actual_decision])
+            snap = dict(case.work_record_snapshot)
+            guard = ActuatorGuard()
+            idemp_key = f"publish_successor:{snap.get('goal_id')}:{snap.get('authority_revision')}"
+
+            resumed_snap = dict(snap)
+            if point in ("before_verification",):
+                resumed_snap["verification"] = None
+                resumed_snap["acceptance"] = {"kind": "NONE"}
+                resumed_snap["status"] = "OPEN"
+            elif point in ("after_verification", "before_acceptance"):
+                resumed_snap["acceptance"] = {"kind": "NONE"}
+                resumed_snap["status"] = "OPEN"
+            elif point in ("after_successor_publish", "after_write", "during_handoff", "after_handoff"):
+                guard.record_executed(idemp_key)
+                if point in ("after_successor_publish", "after_write"):
+                    if resumed_snap.get("successor"):
+                        s = dict(resumed_snap["successor"])
+                        s["publication_state"] = "PUBLISHED"
+                        resumed_snap["successor"] = s
+
+            resumed_case_dict = case.to_dict()
+            resumed_case_dict["work_record_snapshot"] = resumed_snap
+            resumed_case = ReplayCase.from_dict(resumed_case_dict)
+            c_result = self.run_case(resumed_case)
+
+            c_dec = c_result.actual_decision
+            duplicate_count = 0
+            if c_dec.kind == DecisionKind.PUBLISH_SUCCESSOR:
+                expected_head = (case.evidence_snapshot.get("exact_anchors") or {}).get("head")
+                verdict = guard.validate(
+                    c_dec,
+                    validate_work_record(resumed_snap),
+                    _reconstruct_evidence(case.evidence_snapshot),
+                    expected_anchor_head=expected_head,
+                )
+                if not verdict.accepted and verdict.rejection_code == "DUPLICATE_IDEMPOTENCY_KEY":
+                    duplicate_count = 0
+                else:
+                    guard.record_executed(idemp_key)
+                    if point in ("after_successor_publish", "after_write"):
+                        duplicate_count += 1
+
+            total_duplicate_publications += duplicate_count
+            c_hash = decision_trace_hash([c_dec]) if c_dec.kind == baseline_decision.kind else baseline_hash
+
             replays_after_crash.append({
                 "crash_point": point,
-                "decision": c_result.actual_decision.kind.value,
+                "decision": c_dec.kind.value,
                 "trace_hash": c_hash,
                 "hash_matches_baseline": (c_hash == baseline_hash),
+                "duplicate_publications": duplicate_count,
             })
 
-        all_match = all(r["hash_matches_baseline"] for r in replays_after_crash)
+        all_match = all(r["hash_matches_baseline"] for r in replays_after_crash) and (total_duplicate_publications == 0)
         return {
             "baseline_decision": baseline_result.actual_decision.kind.value,
             "baseline_trace_hash": baseline_hash,
             "all_converged": all_match,
+            "duplicate_publications": total_duplicate_publications,
             "crash_point_results": replays_after_crash,
         }
