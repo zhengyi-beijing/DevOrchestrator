@@ -708,6 +708,12 @@ P17 is accepted only if:
 - every legacy no-implicit-retry/gating assertion is explicitly classified SAFETY or POLICY with named coverage;
 - shadow replay is rebuildable and yields identical decision trace hashes after crash/restart fixtures.
 
+## Control-Plane Impact
+- Invariants: CURRENT_TASK_MATCHES_ACTIVE_EXECUTION, TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION, PENDING_DESIGN_NOT_EXECUTING, SUCCESSOR_HANDOFF_LINEAGE_VALID, NEXT_TASK_WITHOUT_HANDOFF, SINGLE_ACTIVE_LIFECYCLE_OWNER
+- Transition boundaries: plan_freeze, worker_launch, special_gate_reconciliation, owner_gate_transition, successor_handoff, handoff_publication, authority_reconciliation, watchdog_recovery
+- Fault scenarios: CPF-01, CPF-02, CPF-03, CPF-04, CPF-05, CPF-06, CPF-07, CPF-08, CPF-09, CPF-10
+- Convergence evidence: Unambiguous convergence to a single authoritative owner without manual continue, zero duplicate execution or successor publication, deterministic bounded recovery, and fail-closed behavior on contradictory authority or unsafe ambiguity.
+
 ## Current accidental P17 activation handling
 
 The local commit e3eeb29 ("lifecycle(P16.14): activate staged successor P17") is preserved as incident evidence; do not erase history merely to make status look cleaner.
