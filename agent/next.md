@@ -1,6 +1,6 @@
 # P16.14 Invariant-Driven Control-Plane Development & Validation
 
-Status: **READY_TO_RUN**
+Status: **COMPLETE**
 
 Predecessor: P16.13
 
