@@ -1,202 +1,61 @@
-# P16.13 Handoff — Successor Consistency & Zero-Touch Handoff Recovery
+# P17 Handoff — Single-Authority Goal Convergence Baseline
 
-Last updated: 2026-09-26. Branch `main`; implementation anchor `57c7f19`.
+Last updated: 2026-09-27. Branch `main`; implementation anchor `7f1430f`.
 
-Status: **COMPLETE / REVIEW ACCEPTED**. The canonical daemon restart, live
-runtime convergence, final remediation, independent delta re-review, and full
-regression are complete. No P16.13 closure gate remains.
+Status: **COMPLETE / REVIEW ACCEPTED**. Technical Review (`ai_review:ai_review:ai_review:ai_review:a04b4803-cc11-41fe-8ccd-38263decfb5d`) accepted all P17 deliverables with `decision: "next"`, `next_action: "next_task"`, `remediation_round: 3`, and zero blocking findings. Transition executor settled the review execution as `state: "settled"`, `outcome: "task_complete"`.
 
-Repository state is authoritative. The two owner gates described in section
-4.1 belong to other projects and remain intentionally fail closed; they do not
-block P16.13.
+## 1. Executive Summary
 
-## 0. OPEN: P16.13 -> P16.14 successor recovery (terminal authority, no decision)
+P17 successfully designed, implemented, and validated the **Single-Authority Goal Convergence Baseline** (Migration Gates M0 through M4) without replacing the production controller or adding an unverified fourth runtime authority:
 
-After `6eb8e57` restored the P16.13 -> P16.14 roadmap edge, the daemon stayed
-IDLE. The authority was `P16.13/COMPLETE`, and there were no owners, no gate,
-and no P16.14 handoff or transition. `NEXT_TASK_WITHOUT_HANDOFF` held because it
-was derived only from surviving NEXT decisions, and P16.13's reviews had all
-settled `task_complete` before the roadmap edge existed.
+1. **Pure Convergence Model (`src/dev_orchestrator/convergence/`)**:
+   - `work_record.py`: Target WorkRecord v0 schema (20 field groups, `OPEN` | `NEEDS_HUMAN` | `DONE`, active lease, current problem, attempts, acceptance union, wait, verification, successor, human request, handoff, CAS token), strict validation, canonical sorted-key JSON, and sha256 digests.
+   - `evidence.py`: Immutable `EvidenceSnapshot`, `EvidenceItem`, `ConflictClaim`, `SharedCredentialLease`, typed source lookup, unresolved ambiguity detection, and deterministic snapshot digest.
+   - `policy.py`: Immutable `Policy` and `ProblemBudget` with independent budgets, capability tiers, quota resets, wait bounds, and deterministic policy digest; reads neither configuration nor environment.
+   - `evaluator.py`: Pure side-effect-free `decide()` returning one of 12 frozen `DecisionKind` values with reason, problem ID, parameters, invariant citations, idempotency key, and evidence digests.
+   - `problems.py`: 11 frozen `FailureClass` values, `normalized_problem_fingerprint` rejecting volatile keys (HEAD, lifecycle phase, PID, timestamps, retry IDs), `ProblemTracker`, and deterministic next-problem selection.
+   - `findings.py`: Closed-schema `Finding` model, `FindingSeverity` (`BLOCKING`, `NON_BLOCKING`, `INFO`), `OutputInvalidError`, and strict parser eliminating free-text prose scanning.
+   - `verification.py`: `VerificationRecord`, `is_goal_satisfied` evaluator, and `validate_owner_override` enforcing non-waivable safety obligations (no unresolved blockers, no active lease, no unresolved ambiguity, emergency brake, safety authorization).
+   - `invariants.py`: Stable 21-code convergence invariant registry, pure evaluators, and bidirectional mappings to 6 lifecycle invariants and `CPF-01` through `CPF-10`.
+   - `human_request.py`: Stable question ID derivation, `HumanRequest`, active finder, and answer semantics CASing exclusively on `(question_id, question_revision)`.
+   - `successor.py`: Deterministic successor publication transaction plan (`compute_handoff_idempotency_key`) and structured `build_resumable_handoff`.
+   - `preflight.py`: Deterministic capability preflight (`CapabilityConstraint`) with seeded ZXZ-PC rules including `seed:p11b:rdc-powershell-5.1` (fingerprint `281bf686902bf4aa1cd966a92cab25c5d1a66bfec453323ed171726580c1b82c`), and recurrence classification emitting `LEARNING_REGRESSION` / `CONTROL_PLANE_DEFECT`.
+   - `effects.py` & `actuator_guard.py`: In-memory 5-state effect port (`EffectState`), lease reconciliation enforcing `NO_ORPHAN_OWNER`, and non-writing `ActuatorGuard` revalidating revision, identity, anchor, lease uniqueness, emergency pause, authorization, and idempotency.
+   - `replay.py`: Corpus loader, `ReplayHarness`, aggregate reporting, canonical `decision_trace_hash`, and crash injection between durable write boundaries proving trace-hash equality.
+   - `shadow.py`: `ReadOnlyEvidenceRoot` raising `FenceViolation` on mutation, `validate_shadow_sink` strictly confining output to `runtime/p17-shadow/`, and `ShadowEvaluator` projecting legacy evidence with source digests.
+   - `cli.py` & `__main__.py`: Isolated CLI entry point `python -m dev_orchestrator.convergence` supporting `replay` and `shadow` commands.
+   - `roots.py` & `amendments.py`: Runtime root inventory and legacy contract amendments matrix.
 
-Fix (see `docs/P16_13_SUCCESSOR_CONSISTENCY_CONTRACT.md`): the shared evaluator
-now also raises the invariant for a quiescent terminal authority with an
-unambiguous valid roadmap successor and no durable handoff. Watchdog recovers it
-through the existing `reconcile_successor_handoff`, using
-`roadmap_successor.source_task_id`. Ambiguity, invalid specs and lineage, and
-refused transitions gate. Dirty worktrees wait. Active ownership suppresses the
-obligation.
+2. **Corpus & Documentation Deliverables**:
+   - `tests_py/data/p17_corpus/`: 26 schema-valid historical replay fixtures covering all required incident classes from P12 through P16.14.
+   - `docs/P17_ARCHITECTURE_CONTRACT.md`: Target architecture, pure control loop, WorkRecord v0, non-waivable safety rules, and legacy vs v0 metrics.
+   - `docs/P17_BACKLOG_RECONCILIATION.md`: Canonical reconciliation matrix covering all 15 backlog capability areas.
+   - `docs/P17_INCIDENT_CORPUS.md`: Deduplicated mapping of all 26 replay classes to CPF scenarios, legacy behavior, expected decisions, and covering regressions.
+   - `docs/P17_LEGACY_CONTRACT_AMENDMENTS.md`: Classification of legacy conflicting assertions as SAFETY vs POLICY, and inventory of 4 duplicated budget paths scheduled for retirement at M9.
+   - `docs/P17_RUNTIME_ROOT_INVENTORY.md`: Complete root inventory, stable/dev deployment architecture, state-root ownership lock, and 7-step promotion protocol.
+   - `docs/P17_MIGRATION_GATES.md`: Full specification of M0-M4 completed gates, P17 authority boundary freeze, and deferred M5-M9 gates.
 
-Remaining gates, in order:
-1. Run `python -m pytest tests_py/test_p1613_successor_consistency.py`, then the
-   focused lifecycle/watchdog/daemon suites, the full regression,
-   `python -m compileall -q src ops tests_py`, and `git diff --check`.
-2. Commit and push, which gives the clean worktree that recovery requires. The
-   stray empty untracked `P2` file at the repo root also dirties the tree and
-   must be removed.
-3. Restart the canonical daemon so it loads the fix. Do not start P16.14
-   manually.
-4. Confirm the live handoff `recover-handoff:devorchestrator:P16.13:P16.14:*`
-   with `source_task_id=P16.13` and `target_task_id=P16.14`, its consumption,
-   authority `current_task_id=P16.14` with `source_task_id=P16.13`, and a
-   started P16.14 Planner. Do not invent P16.15.
+## 2. Technical Review Remediation Summary
 
-## 1. What was done in this session
+Three bounded review rounds resolved all findings:
+- **Round 1 (8 findings)**: Acceptance-before-advance on DONE status, stale verification anchor checks, integrity ambiguity ordering, quota reset wake versus elapsed time, active lease liveness default, ActuatorGuard anchor and lease coverage, durable write crash injection harness, and contract amendments module.
+- **Round 2 (6 findings)**: Honest decision trace-hash comparison and guard key verification in crash simulation, ActuatorGuard dead lease recovery liveness awareness, stable `PUBLISH_SUCCESSOR` idempotency keys across churn, `IDEMPOTENT_REPLAY` invariant enforcement, required evidence source read status filtering, and exact assertion pinning in planner singleflight tests.
+- **Round 3 (2 findings)**: Dead lease recovery deadlock with answered human requests resolved by admitting `EXECUTE` in `ActuatorGuard` and checking lease liveness in Section 4 of `evaluator.py`; contradictory/ambiguous process probe and broker effect liveness resolution unified in `effects.resolve_lease_liveness`.
+- **Round 3 Acceptance**: Clean `decision: "next"`, `next_action: "next_task"`, 0 blocking findings.
 
-Continued from the interrupted Codex session. Commits on top of `9e5909a`:
+## 3. Validation State
 
-| Commit | What it does |
-| --- | --- |
-| `f51a01b` | Derives every tick consumer from the lifecycle authority; adds the missing projection regression |
-| `b5d42f2` | Remediates the four blocking review findings (B1-B4) |
-| `981a342` | Closes the non-blocking follow-ups (N-A, N-B, N-D) from the delta re-review |
-| `e8eece7` | Adds `ops/p1613_lifecycle_smoke.py` as a durable runtime smoke |
-| `af91981` | Records review/remediation evidence in `agent/CURRENT.md` |
-| `b39d2a7`, `989eefa` | This handoff |
-| `60ef19b` | End-to-end zero-touch test: closes acceptance 4, 6, 8 |
-| `9629c44` | Closes the deferred N1 and N2 findings |
-| `8565773` | Closes the N5 assertion-weak spots and acceptance 2 |
-| `0140cbd` | Migrates pre-fence failed recovery history to durable gated evidence without re-actuation |
-| `57c7f19` | Preserves malformed recovery history while still failing closed to the owner gate |
-| `2e4c162` | Archives and clears lifecycle owner gates once their shared invariant holds |
+- **19 dedicated P17 test suites (96 tests)**: 100% passed.
+- **Historical incident corpus replay**: 26/26 passed (0 failures).
+- **Touched regression suites**: 113 passed, 10 subtests passed (`test_p12_planner_singleflight.py`, `test_p1614_invariant_workflow.py`, `test_p1613_successor_consistency.py`, `test_workflow_policy.py`).
+- **Core control plane suites**: 136 passed, 8 subtests passed (`test_transition_executor_aibroker.py`, `test_staged_roadmap.py`, `test_staged_handoff.py`, `test_lifecycle_projection.py`, `test_control_commands.py`, `test_ai_reviewer.py`, `test_ai_planner.py`).
+- **Shadow mode CLI**: Clean execution, 0 mutations, verified via `python -m dev_orchestrator.convergence shadow --evidence-root . --stdout --json`.
+- **Python AST compilation & formatting**: `python -m compileall -q src ops tests_py` clean (0 errors); `git diff --check` clean.
+- **Structured readiness authority**: `agent/execution-state.json` set to `completed` and `agent/next.md` set to `COMPLETE`.
 
-The inherited dirty `src/dev_orchestrator/daemon.py` diff was classified **A
-(valid unfinished P16.13 work)** and committed as part of `f51a01b`. It was valid
-but had no test coverage at all: the suite passed identically with and without
-it. Without it the Supervisor advanced on `raw_summary` (no authority), and the
-dispatch view and published projection both reported the predecessor `P16.12`.
-The live daemon corroborated the defect independently: the authority read
-`READY_TO_RUN` while `runtime/summary.json` published `RECOVERY_REQUIRED`.
+## 4. Operational & Successor Status
 
-Independent Technical Review returned `REMEDIATE` with four blocking findings.
-The bounded, delta-only re-review of `b5d42f2` returned `ACCEPT` with all four
-closed. Both reviews were performed by independent reviewers that were not given
-the implementer's conclusions.
-
-## 2. Current validation state
-
-- Full Python regression: **1,311 tests + 102 subtests** passing.
-- Final focused lifecycle/watchdog/daemon suite: **112 tests + 15 subtests** passing.
-- `python -m compileall -q src ops tests_py` clean; `git diff --check` clean.
-- Runtime smoke `python ops/p1613_lifecycle_smoke.py`: **35 of 35 checks pass**
-  across two distinct real daemon ticks.
-- Live `devorchestrator` authority: `current_task_id=P16.13`,
-  `lifecycle_state=READY_TO_RUN`, `matches_authority=true`, no owner gate, no
-  surviving predecessor owner. **The original P16.12 -> P16.13 incident is
-  resolved.**
-
-## 3. RESOLVED: canonical daemon restart and recovery fencing
-
-The stale PID 26264 was stopped cleanly with no broker interruption. After the
-daemon loaded the committed fence, both historical attempts converged in place:
-
-```
-linescanviewer     count=244 state=gated fenced=true
-xray-hw-platform   count=244 state=gated fenced=true
-```
-
-Their counts and gate IDs remained byte-stable across the next real 60-second
-tick, and the runtime smoke passed 35/35 twice. The restart also exposed the
-legacy migration gap closed by `0140cbd` and the malformed-history case closed
-by `57c7f19`. Independent review first returned `REMEDIATE`; the bounded delta
-re-review then returned `NEXT` with no findings. Exact-head terminal settlement
-subsequently exposed a sticky resolved Watchdog gate; `2e4c162` archives its
-evidence and clears only a lifecycle gate whose evaluator code now holds.
-Independent review `ai_review:p1613-resolved-gate-delta-2e4c162-r5` returned
-`NEXT` with no findings. Two later live ticks remained COMPLETE with no gate.
-
-## 4. Issue status
-
-P16.13 is closed. Still open outside this task are the two per-project owner
-dispositions in 4.1 and the accepted fail-closed risk N-C in 4.2. Neither is a
-P16.13 closure blocker.
-
-### 4.1 Needs owner disposition, not code (liveness, per-project)
-
-`linescanviewer` and `xray-hw-platform` each hold an accepted
-`apply`+`next`+`next_task` decision whose actuation is durably `blocked`, and
-**neither repository has `agent/staged/roadmap.json`**. `resolve_successor`
-returns `kind="absent"`, so no successor lineage can be proven and recovery
-cannot converge. Post-restart they will sit in a durable owner gate, which is the
-correct fail-closed outcome. To clear them, the owner must either add
-`agent/staged/roadmap.json` to those repos or dispose of the pending decision.
-
-`linescanviewer` additionally has an authority gate
-`CURRENT_TASK_MATCHES_ACTIVE_EXECUTION` (`repository_task_id=P16`,
-`authority_task_id=P15`) for the same root cause.
-
-### 4.2 NON_BLOCKING review findings (all closed except N-C)
-
-- **N1 — CLOSED in `9629c44`.** The Watchdog no longer answers the invariant
-  block from an empty ledger; it skips it and records
-  `lifecycle_evidence_unavailable`.
-- **N2 — CLOSED in `9629c44`.** An unambiguous staged `Predecessor:` claim now
-  wins over an absent `roadmap.json`, so the caller no longer terminal-settles the
-  project as complete. Fixed together with its coupled rollback hole: a roadmap
-  created by a failed reconcile is now removed instead of being left behind to
-  dirty the tree and block every later recovery.
-- **N-C — accepted fail-closed risk.** A legacy ledger with pending obligations on
-  two *different* tasks and only an unconsumed cross-task barrier will now
-  surface both, tripping `SINGLE_ACTIVE_LIFECYCLE_OWNER` and gating. Verified
-  **not reachable** in any live project today (each has at most one surviving
-  obligation on one task). Also, the `319b5e2` legacy bootstrap migration at
-  `transition_executor.py:740` requires `not owners`, so a resurfaced obligation
-  permanently blocks it.
-- **Pre-existing, unchanged by this work:** `_prune_state`
-  (`watchdog.py:1157`) does not prune `lifecycle_recovery_attempts`, so entries
-  accumulate one per git HEAD; and the attempt counter is an unbounded int for
-  transient reasons (by design, since a transient wait must keep retrying).
-
-### 4.3 Acceptance criteria evidence (complete)
-
-**Closed in `60ef19b`.** `ZeroTouchSuccessorHandoffEndToEndTests` drives the real
-`WatchdogCoordinator`, `TransitionExecutor`, `ControlCommandCoordinator` and
-`AIPlannerCoordinator` in daemon tick order from the matrix-B fault. Observed: the
-Watchdog rebuilds exactly one handoff with `P1 -> P2` lineage, the control plane
-starts the successor Planner automatically, the real planner and its independent
-plan review both run, `agent/next.md` is rewritten to `P2 READY_TO_RUN` with the
-frozen plan, the authority advances to `P2` keeping `P1` as source, every
-invariant converges, and **no owner command reaches the control plane**. Both legs
-were verified load-bearing by removal: without the Watchdog leg there are 0
-handoffs and 0 plans; without the control-plane leg the handoff exists but no
-Planner starts and the authority stays at `P1`. This covers acceptance **4, 5, 6,
-7 and 8**.
-
-**Acceptance 2 and review finding N5 closed in `8565773`** (tests only, no source
-change; each new assertion was verified to fail when the behavior it guards is
-broken):
-
-- **Acceptance 2** is now proven through the real decision actuation: no
-  execution row carries `outcome="task_complete"` for an inconsistent successor,
-  exactly one `P1 -> P2` handoff is produced instead, and the repair leaves a
-  clean tree. Verified by disabling the inconsistent-successor reconcile branch,
-  which produces exactly the forbidden settled/`task_complete` row.
-- **N5 / `test_A_and_H`** now drives the real `WatchdogCoordinator` over the
-  fenced state, so a Watchdog-side relabel would be caught, plus a vacuity guard
-  asserting all six invariants were actually evaluated.
-- **N5 / `test_G`** now covers the replay half of acceptance 10: a replayed tick
-  reuses the grant with an unchanged `remediation_extension_granted_at`, and the
-  next descendant review still gates. Verified by removing the replay
-  short-circuit at `ai_reviewer.py:868-870`.
-- **N5 / `test_D`** keeps its resolver assertions and is complemented by the
-  acceptance-2 test above.
-
-No known test-strength gaps remain in the A-J matrix.
-
-## 5. Recommended order for the next session
-
-No P16.13 continuation work remains. Do not restart planning or implementation
-for this task. If work resumes on the two external owner gates, treat each as a
-separate per-project owner disposition and preserve its gated evidence. The only
-recorded P16.13 residual is **N-C**, an accepted fail-closed risk that is not
-reachable in any live project.
-
-## 6. Reference
-
-- Task spec: `agent/staged/P16.13.md`
-- Lifecycle contract: `docs/P16_13_SUCCESSOR_CONSISTENCY_CONTRACT.md`
-- Workflow/review policy: `docs/development-workflow.md`
-- Invariant evaluator: `src/dev_orchestrator/core/lifecycle_authority.py`
-- Authority/journal: `src/dev_orchestrator/core/transition_executor.py`
-- Fault matrix and regressions: `tests_py/test_p1613_successor_consistency.py`
-- Runtime smoke: `ops/p1613_lifecycle_smoke.py`
-- Session evidence: `agent/CURRENT.md`
+- P17 is terminal `COMPLETE`.
+- P17 stops strictly at Migration Gate M4. Migration Gates M5-M9 (external root migration, single-project canary, dual-run comparison, authority switch, and legacy decision path retirement) are explicitly deferred.
+- Staged task P18 (`agent/staged/P18.md`) defines "Native Execution Transport & RDC Dependency Reduction".
+- In accordance with the successor policy, P18 starts only through the normal authoritative lifecycle handoff when authorized; it is not auto-started.

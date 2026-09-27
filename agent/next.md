@@ -1,6 +1,6 @@
 # P17 - Single-Authority Goal Convergence Baseline
 
-Status: **READY_TO_RUN**
+Status: **COMPLETE**
 
 Predecessor: P16.14
 

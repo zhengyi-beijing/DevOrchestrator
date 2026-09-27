@@ -5,7 +5,25 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P17 Single-Authority Goal Convergence Baseline** (Status: **REMEDIATED / READY_FOR_REVIEW**). Previous task: **P16.14 Invariant-Driven Control-Plane Development & Validation** (Status: **COMPLETE**).
+Current task: **P17 Single-Authority Goal Convergence Baseline** (Status: **COMPLETE**). Previous task: **P16.14 Invariant-Driven Control-Plane Development & Validation** (Status: **COMPLETE**).
+
+P17 final closure and technical review acceptance evidence (2026-09-27):
+- Independent Technical Review (`ai_review:ai_review:ai_review:ai_review:a04b4803-cc11-41fe-8ccd-38263decfb5d`) on clean HEAD `7f1430f` accepted all P17 deliverables with `decision: "next"`, `next_action: "next_task"`, `remediation_round: 3`, and `review_findings: []`:
+  - Verified Finding 1 (dead lease / answered human request): `actuator_guard.py` includes `DecisionKind.EXECUTE` in `is_recovery_decision`, and `evaluator.decide` evaluates active lease liveness in Section 4 ahead of human requests, admitting `EXECUTE` on demonstrably dead leases with an answered request while emitting `NOOP_ACTIVE` on live leases.
+  - Verified Finding 2 (contradictory liveness): shared `effects.resolve_lease_liveness` scans all matching `process_probe` and `broker_effect` evidence rows, sets `lease_ambiguous = True` on disagreements or indeterminate rows, fails closed in `evaluator.py` to `REQUEST_HUMAN` citing `FAIL_CLOSED_AMBIGUITY`, and rejects in `ActuatorGuard`.
+  - Confirmed all 8 Round-1 + 6 Round-2 + 2 Round-3 findings closed with load-bearing regressions; crash injection simulation and `IDEMPOTENT_REPLAY` invariant non-vacuous; `PUBLISH_SUCCESSOR` idempotency keys stable across churn; all 26 replay cases and 19 dedicated test suites preserved.
+  - One non-blocking observation recorded for deferred M5-M9 wiring (unconfirmed/contradictory lease owner request consumption without transport-level actuator).
+- Authoritative transition executor settlement: recorded execution `ai_review:ai_review:ai_review:ai_review:a04b4803-cc11-41fe-8ccd-38263decfb5d` as `state: "settled"`, `outcome: "task_complete"`, `reason: "review accepted current READY_TO_RUN task and no next executable task is advertised"`.
+- Verification Summary:
+  - 19 dedicated P17 test suites (96 tests): 100% passed.
+  - Full historical incident corpus replay: 26/26 passed (0 failures).
+  - Touched regression suites (`test_p12_planner_singleflight.py`, `test_p1614_invariant_workflow.py`, `test_p1613_successor_consistency.py`, `test_workflow_policy.py`): 113 passed, 10 subtests passed.
+  - Core control plane suites (`test_transition_executor_aibroker.py`, `test_staged_roadmap.py`, `test_staged_handoff.py`, `test_lifecycle_projection.py`, `test_control_commands.py`, `test_ai_reviewer.py`, `test_ai_planner.py`): 136 passed, 8 subtests passed.
+  - Shadow mode CLI (`python -m dev_orchestrator.convergence shadow --evidence-root . --stdout --json`): clean execution, 0 mutations.
+  - Python AST and syntax compilation: clean (`compileall` 0 errors).
+  - Whitespace check (`git diff --check`): clean.
+  - Structured readiness authority: `agent/execution-state.json` set to `completed` and `agent/next.md` set to `COMPLETE`.
+  - Knowledge graph updated cleanly via `graphify update .`.
 
 P17 Technical Review Round 3 remediation evidence (2026-09-27):
 - Addressed all Technical Review findings from `ai_review:ai_review:ai_review:a04b4803-cc11-41fe-8ccd-38263decfb5d`:
