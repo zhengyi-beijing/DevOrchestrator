@@ -17,6 +17,95 @@ class EffectState(str, Enum):
     CANCELLED = "CANCELLED"
     AMBIGUOUS = "AMBIGUOUS"
 
+@dataclass(frozen=True)
+class LeaseLiveness:
+    found_liveness: bool
+    lease_live: bool
+    lease_ambiguous: bool
+    terminal_success: bool = False
+
+
+def resolve_lease_liveness(
+    active_lease: Mapping[str, Any] | None,
+    evidence: Any,
+) -> LeaseLiveness:
+    """Resolve active lease liveness across all matching evidence items.
+
+    Enforces fail-closed behavior on contradictory authority:
+    if multiple process_probe or broker_effect rows for the same role/execution
+    yield conflicting or ambiguous liveness states, lease_ambiguous is set to True.
+    """
+    if not active_lease:
+        return LeaseLiveness(found_liveness=False, lease_live=False, lease_ambiguous=False)
+
+    role = active_lease.get("role")
+    exec_id = active_lease.get("execution_id")
+
+    items = getattr(evidence, "items", ())
+    verdicts: set[str] = set()
+    found_liveness = False
+    terminal_success = False
+
+    for item in items:
+        source = getattr(item, "source", None)
+        if source is None and isinstance(item, Mapping):
+            source = item.get("source")
+        data = getattr(item, "data", None)
+        if data is None and isinstance(item, Mapping):
+            data = item.get("data")
+        if not isinstance(data, Mapping):
+            continue
+
+        if source == "process_probe" and role and data.get("role") == role:
+            found_liveness = True
+            alive = data.get("alive")
+            if alive is True:
+                verdicts.add("LIVE")
+            elif alive is False:
+                verdicts.add("DEAD")
+            else:
+                verdicts.add("AMBIGUOUS")
+
+        if source == "broker_effect" and exec_id and data.get("execution_id") == exec_id:
+            found_liveness = True
+            st = data.get("state")
+            if st in ("running", "live"):
+                verdicts.add("LIVE")
+            elif st in ("failed", "cancelled", "terminal"):
+                verdicts.add("DEAD")
+            elif st in ("succeeded", "completed"):
+                verdicts.add("DEAD")
+                terminal_success = True
+            else:
+                verdicts.add("AMBIGUOUS")
+
+    if not found_liveness:
+        return LeaseLiveness(found_liveness=False, lease_live=False, lease_ambiguous=False)
+
+    if "AMBIGUOUS" in verdicts or len(verdicts) > 1:
+        return LeaseLiveness(
+            found_liveness=True,
+            lease_live=False,
+            lease_ambiguous=True,
+            terminal_success=terminal_success,
+        )
+
+    if verdicts == {"LIVE"}:
+        return LeaseLiveness(
+            found_liveness=True,
+            lease_live=True,
+            lease_ambiguous=False,
+            terminal_success=False,
+        )
+
+    # verdicts == {"DEAD"}
+    return LeaseLiveness(
+        found_liveness=True,
+        lease_live=False,
+        lease_ambiguous=False,
+        terminal_success=terminal_success,
+    )
+
 
 @dataclass(frozen=True)
 class ExecutionEffectPort:

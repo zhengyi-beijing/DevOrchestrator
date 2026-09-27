@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Set
 
+from dev_orchestrator.convergence.effects import resolve_lease_liveness
 from dev_orchestrator.convergence.evaluator import Decision, DecisionKind
 from dev_orchestrator.convergence.evidence import EvidenceSnapshot
 from dev_orchestrator.convergence.work_record import WorkRecord
@@ -146,53 +147,30 @@ class ActuatorGuard:
         ):
             if work_record.active_lease is not None:
                 role = work_record.active_lease.get("role")
-                exec_id = work_record.active_lease.get("execution_id")
-
-                found_liveness = False
-                lease_live = False
-                lease_ambiguous = False
-                terminal_success = False
-
-                for item in evidence.items:
-                    if item.source == "process_probe" and item.data.get("role") == role:
-                        found_liveness = True
-                        alive = item.data.get("alive")
-                        if alive is True:
-                            lease_live = True
-                        elif alive is False:
-                            lease_live = False
-                        else:
-                            lease_ambiguous = True
-                        break
-                    if item.source == "broker_effect" and item.data.get("execution_id") == exec_id:
-                        found_liveness = True
-                        st = item.data.get("state")
-                        if st in ("running", "live"):
-                            lease_live = True
-                        elif st in ("failed", "cancelled", "terminal"):
-                            lease_live = False
-                        elif st in ("succeeded", "completed"):
-                            lease_live = False
-                            terminal_success = True
-                        else:
-                            lease_ambiguous = True
-                        break
+                liveness = resolve_lease_liveness(work_record.active_lease, evidence)
 
                 is_recovery_decision = decision.kind in (
+                    DecisionKind.EXECUTE,
                     DecisionKind.RETRY_SAME_STRATEGY,
                     DecisionKind.RETRY_NEW_STRATEGY,
                     DecisionKind.FAILOVER_RESOURCE,
                     DecisionKind.ESCALATE_CAPABILITY,
                 )
-                is_verify_on_terminal_success = (decision.kind == DecisionKind.VERIFY and terminal_success)
+                is_verify_on_terminal_success = (decision.kind == DecisionKind.VERIFY and liveness.terminal_success)
 
-                if found_liveness and not lease_live and not lease_ambiguous and (is_recovery_decision or is_verify_on_terminal_success):
-                    # Demonstrably non-live lease: admit recovery or verify decision
+                if liveness.found_liveness and not liveness.lease_live and not liveness.lease_ambiguous and (is_recovery_decision or is_verify_on_terminal_success):
+                    # Demonstrably non-live lease: admit recovery, execute, or verify decision
                     pass
-                elif lease_live:
+                elif liveness.lease_live:
                     return GuardVerdict(
                         accepted=False,
                         reason=f"Cannot admit decision {decision.kind.value}: active lease already held by live role {role!r}",
+                        rejection_code="LEASE_ALREADY_ACTIVE",
+                    )
+                elif liveness.lease_ambiguous:
+                    return GuardVerdict(
+                        accepted=False,
+                        reason=f"Cannot admit decision {decision.kind.value}: active lease liveness is ambiguous or contradictory for role {role!r}",
                         rejection_code="LEASE_ALREADY_ACTIVE",
                     )
                 else:

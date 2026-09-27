@@ -185,3 +185,201 @@ class TestP17LeaseAndEffects(unittest.TestCase):
             )
             self.assertTrue(verdict.accepted, f"Expected {kind.value} to be accepted for dead lease: {verdict.reason}")
             self.assertIsNone(verdict.rejection_code)
+
+    def test_dead_lease_with_answered_human_request_emits_and_admits_execute(self) -> None:
+        """Finding 1: Answered human_request on dead lease emits EXECUTE and ActuatorGuard admits it without deadlock."""
+        from dev_orchestrator.convergence.evidence import EvidenceItem
+
+        work_rec = validate_work_record({
+            "schema_version": 1,
+            "project_id": "devorchestrator",
+            "goal_id": "P17",
+            "goal_revision": 1,
+            "goal_spec_digest": "sha256:spec",
+            "predecessor_goal_id": "P16.14",
+            "repository_identity": {"repo_path": "C:\\repo", "branch": "main"},
+            "status": "OPEN",
+            "acceptance": {"kind": "NONE"},
+            "authority_revision": "rev-1",
+            "active_lease": self.active_lease,
+            "human_request": {
+                "question_id": "q-dead-lease-resume",
+                "question_revision": 1,
+                "request_type": "product_choice",
+                "concrete_question": "Resume after worker exit?",
+                "options": [
+                    {"option_id": "opt-resume", "description": "Resume execution", "effect": "resume"}
+                ],
+                "answer": {
+                    "question_id": "q-dead-lease-resume",
+                    "question_revision": 1,
+                    "option_id": "opt-resume",
+                    "owner_id": "owner-1",
+                    "command_id": "cmd-ans-1",
+                    "answered_at": "2026-09-27T00:02:00Z",
+                },
+            },
+        })
+        dead_evidence = EvidenceSnapshot(
+            items=(
+                EvidenceItem(
+                    source="process_probe",
+                    source_id="probe-dead-1",
+                    timestamp="2026-09-27T00:01:00Z",
+                    anchor="head-1",
+                    data={"role": "worker", "alive": False},
+                    digest="sha256:dead",
+                    read_status="OK",
+                ),
+            ),
+            conflicts=(),
+            shared_leases=(),
+            exact_anchors={"head": "head-1"},
+            emergency_pause_asserted=False,
+            metadata={},
+        )
+        policy = build_policy()
+        # 1. Evaluator emits EXECUTE
+        decision = decide(work_rec, dead_evidence, policy)
+        self.assertEqual(decision.kind, DecisionKind.EXECUTE)
+        self.assertIn("HUMAN_REQUEST_DISCHARGEABLE", decision.invariant_citations)
+
+        # 2. ActuatorGuard admits EXECUTE on demonstrably dead lease (no LEASE_ALREADY_ACTIVE deadlock)
+        guard = ActuatorGuard()
+        verdict = guard.validate(decision, work_rec, dead_evidence, expected_anchor_head="head-1")
+        self.assertTrue(verdict.accepted, f"Guard rejected EXECUTE on dead lease: {verdict.reason}")
+        self.assertIsNone(verdict.rejection_code)
+
+    def test_live_lease_with_answered_human_request_emits_noop_and_rejects_execute(self) -> None:
+        """Finding 1: Live lease with answered human_request produces NOOP_ACTIVE and guard rejects EXECUTE."""
+        from dev_orchestrator.convergence.evidence import EvidenceItem
+
+        work_rec = validate_work_record({
+            "schema_version": 1,
+            "project_id": "devorchestrator",
+            "goal_id": "P17",
+            "goal_revision": 1,
+            "goal_spec_digest": "sha256:spec",
+            "predecessor_goal_id": "P16.14",
+            "repository_identity": {"repo_path": "C:\\repo", "branch": "main"},
+            "status": "OPEN",
+            "acceptance": {"kind": "NONE"},
+            "authority_revision": "rev-1",
+            "active_lease": self.active_lease,
+            "human_request": {
+                "question_id": "q-live-lease-resume",
+                "question_revision": 1,
+                "request_type": "product_choice",
+                "concrete_question": "Resume while running?",
+                "options": [
+                    {"option_id": "opt-resume", "description": "Resume execution", "effect": "resume"}
+                ],
+                "answer": {
+                    "question_id": "q-live-lease-resume",
+                    "question_revision": 1,
+                    "option_id": "opt-resume",
+                    "owner_id": "owner-1",
+                    "command_id": "cmd-ans-1",
+                    "answered_at": "2026-09-27T00:02:00Z",
+                },
+            },
+        })
+        live_evidence = EvidenceSnapshot(
+            items=(
+                EvidenceItem(
+                    source="process_probe",
+                    source_id="probe-live-1",
+                    timestamp="2026-09-27T00:01:00Z",
+                    anchor="head-1",
+                    data={"role": "worker", "alive": True},
+                    digest="sha256:live",
+                    read_status="OK",
+                ),
+            ),
+            conflicts=(),
+            shared_leases=(),
+            exact_anchors={"head": "head-1"},
+            emergency_pause_asserted=False,
+            metadata={},
+        )
+        policy = build_policy()
+        # 1. Evaluator emits NOOP_ACTIVE (worker is already live)
+        decision = decide(work_rec, live_evidence, policy)
+        self.assertEqual(decision.kind, DecisionKind.NOOP_ACTIVE)
+        self.assertIn("SINGLE_ACTIVE_LEASE", decision.invariant_citations)
+
+        # 2. Guard rejects raw EXECUTE attempt against live lease
+        guard = ActuatorGuard()
+        exec_decision = Decision(
+            kind=DecisionKind.EXECUTE,
+            reason="Concurrent execution attempt",
+            idempotency_key="idemp-exec-live",
+        )
+        verdict = guard.validate(exec_decision, work_rec, live_evidence, expected_anchor_head="head-1")
+        self.assertFalse(verdict.accepted)
+        self.assertEqual(verdict.rejection_code, "LEASE_ALREADY_ACTIVE")
+
+    def test_contradictory_process_probes_fails_closed_evaluator_and_guard(self) -> None:
+        """Finding 2: Contradictory process_probe rows for same role fail closed to REQUEST_HUMAN in evaluator and are rejected by guard."""
+        from dev_orchestrator.convergence.evidence import EvidenceItem
+
+        work_rec = validate_work_record({
+            "schema_version": 1,
+            "project_id": "devorchestrator",
+            "goal_id": "P17",
+            "goal_revision": 1,
+            "goal_spec_digest": "sha256:spec",
+            "predecessor_goal_id": "P16.14",
+            "repository_identity": {"repo_path": "C:\\repo", "branch": "main"},
+            "status": "OPEN",
+            "acceptance": {"kind": "NONE"},
+            "authority_revision": "rev-1",
+            "active_lease": self.active_lease,
+            "current_problem": {
+                "problem_id": "p-1",
+                "failure_class": "IMPLEMENTATION_DEFECT",
+                "normalized_fingerprint": "fp-1",
+            },
+        })
+        # Two contradictory process_probe rows: one says alive=True, other says alive=False
+        contradictory_evidence = EvidenceSnapshot(
+            items=(
+                EvidenceItem(
+                    source="process_probe",
+                    source_id="probe-1",
+                    timestamp="2026-09-27T00:01:00Z",
+                    anchor="head-1",
+                    data={"role": "worker", "alive": True},
+                    digest="sha256:p1",
+                    read_status="OK",
+                ),
+                EvidenceItem(
+                    source="process_probe",
+                    source_id="probe-2",
+                    timestamp="2026-09-27T00:01:05Z",
+                    anchor="head-1",
+                    data={"role": "worker", "alive": False},
+                    digest="sha256:p2",
+                    read_status="OK",
+                ),
+            ),
+            conflicts=(),
+            shared_leases=(),
+            exact_anchors={"head": "head-1"},
+            emergency_pause_asserted=False,
+            metadata={},
+        )
+        policy = build_policy()
+        # 1. Evaluator fails closed on contradictory authority
+        decision = decide(work_rec, contradictory_evidence, policy)
+        self.assertEqual(decision.kind, DecisionKind.REQUEST_HUMAN)
+        self.assertIn("FAIL_CLOSED_AMBIGUITY", decision.invariant_citations)
+        self.assertEqual(decision.problem_id, "ambiguous_lease_liveness")
+
+        # 2. Guard rejects execution / recovery against ambiguous/contradictory lease
+        guard = ActuatorGuard()
+        for kind in (DecisionKind.EXECUTE, DecisionKind.RETRY_NEW_STRATEGY):
+            d = Decision(kind=kind, reason="attempt", idempotency_key=f"idemp-{kind.value}")
+            verdict = guard.validate(d, work_rec, contradictory_evidence, expected_anchor_head="head-1")
+            self.assertFalse(verdict.accepted)
+            self.assertEqual(verdict.rejection_code, "LEASE_ALREADY_ACTIVE")

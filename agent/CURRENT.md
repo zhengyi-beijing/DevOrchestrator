@@ -7,6 +7,33 @@
 
 Current task: **P17 Single-Authority Goal Convergence Baseline** (Status: **REMEDIATED / READY_FOR_REVIEW**). Previous task: **P16.14 Invariant-Driven Control-Plane Development & Validation** (Status: **COMPLETE**).
 
+P17 Technical Review Round 3 remediation evidence (2026-09-27):
+- Addressed all Technical Review findings from `ai_review:ai_review:ai_review:a04b4803-cc11-41fe-8ccd-38263decfb5d`:
+  1. Finding 1 (Dead lease recovery deadlock with answered human request):
+     - In `effects.py`, implemented `LeaseLiveness` and `resolve_lease_liveness(active_lease, evidence)` to resolve liveness deterministically across all matching probes and effects.
+     - In `actuator_guard.py`, included `DecisionKind.EXECUTE` in `is_recovery_decision`, allowing `ActuatorGuard.validate` to admit `EXECUTE` when an active lease is demonstrably dead (`found_liveness and not lease_live and not lease_ambiguous`).
+     - In `evaluator.py`, reordered active lease liveness evaluation to Section 4 before human request handling in Section 5. Evaluator now checks lease liveness first:
+       - When lease is LIVE, emits `NOOP_ACTIVE` (preventing concurrent execution).
+       - When lease lacks liveness evidence, fails closed to `REQUEST_HUMAN` citing `NO_ORPHAN_OWNER`.
+       - When lease has ambiguous or contradictory liveness, fails closed to `REQUEST_HUMAN` citing `FAIL_CLOSED_AMBIGUITY`.
+       - When lease is demonstrably dead and human request is answered, emits `DecisionKind.EXECUTE`, which `ActuatorGuard` admits without deadlock.
+       - When lease is demonstrably dead, human request is None, and no current problem exists, fails closed to `REQUEST_HUMAN` ("dead lease but no failure problem recorded").
+     - In `invariants.py`, updated `PROGRESS_TOTALITY` to account for `work_record.human_request` when checking dead lease progress totality.
+     - Covered by `tests_py/test_p17_lease_and_effects.py::TestP17LeaseAndEffects::test_dead_lease_with_answered_human_request_emits_and_admits_execute` and `test_live_lease_with_answered_human_request_emits_noop_and_rejects_execute`.
+  2. Finding 2 (Contradictory process_probe and broker_effect liveness resolution):
+     - In `effects.py`, `resolve_lease_liveness` inspects all matching `process_probe` and `broker_effect` items instead of using first-match-wins `break`.
+     - If multiple probes/effects for the same role/execution contradict each other (e.g. one claims `alive: True` and another claims `alive: False`, or differing states), or if any item has an ambiguous state, sets `lease_ambiguous = True`.
+     - In `evaluator.py`, ambiguous/contradictory lease liveness fails closed to `REQUEST_HUMAN` citing `FAIL_CLOSED_AMBIGUITY` with problem `ambiguous_lease_liveness`.
+     - In `actuator_guard.py`, `liveness.lease_ambiguous` triggers rejection with `rejection_code="LEASE_ALREADY_ACTIVE"`.
+     - Covered by `tests_py/test_p17_lease_and_effects.py::TestP17LeaseAndEffects::test_contradictory_process_probes_fails_closed_evaluator_and_guard`.
+- Verification Summary:
+  - All 19 P17 test suites (96 tests): 100% passed.
+  - Full historical incident corpus replay: 26/26 passed (0 failures).
+  - Regression suites (`test_p12_planner_singleflight.py`, `test_p1614_invariant_workflow.py`, `test_p1613_successor_consistency.py`, `test_workflow_policy.py`): 113 passed.
+  - Python AST and syntax compilation: clean (`compileall` 0 errors).
+  - Whitespace check (`git diff --check`): clean.
+  - Knowledge graph updated cleanly via `graphify update .`.
+
 P17 Technical Review Round 2 remediation evidence (2026-09-27):
 - Addressed all 6 Technical Review findings from `ai_review:ai_review:a04b4803-cc11-41fe-8ccd-38263decfb5d`:
   1. Finding 1 (Crash injection simulation honest trace-hash comparison & guard key verification):

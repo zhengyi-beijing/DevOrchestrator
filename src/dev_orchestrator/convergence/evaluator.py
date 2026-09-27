@@ -13,6 +13,7 @@ import hashlib
 import json
 from typing import Any, Mapping
 
+from dev_orchestrator.convergence.effects import resolve_lease_liveness
 from dev_orchestrator.convergence.evidence import EvidenceSnapshot, has_unresolved_ambiguity, snapshot_digest
 from dev_orchestrator.convergence.findings import FindingSeverity
 from dev_orchestrator.convergence.policy import Policy
@@ -196,7 +197,49 @@ def decide(
             invariants=("SINGLE_AUTHORITY",),
         )
 
-    # 4. HUMAN REQUEST OPEN / ANSWERED
+    # 4. ACTIVE LEASE LIVENESS
+    lease = work_record.active_lease
+    if lease is not None:
+        liveness = resolve_lease_liveness(lease, evidence)
+        if liveness.lease_ambiguous:
+            return make_decision(
+                DecisionKind.REQUEST_HUMAN,
+                f"Active execution lease held by role {lease.get('role')!r} has contradictory or ambiguous liveness evidence; failing closed",
+                problem_id="ambiguous_lease_liveness",
+                parameters={
+                    "failure_class": FailureClass.INTEGRITY_OR_IDENTITY_AMBIGUITY.value,
+                    "role": lease.get("role"),
+                },
+                invariants=("FAIL_CLOSED_AMBIGUITY", "HUMAN_TYPED"),
+            )
+        if liveness.lease_live:
+            return make_decision(
+                DecisionKind.NOOP_ACTIVE,
+                f"Active execution lease held by role {lease.get('role')!r} is live",
+                parameters={"role": lease.get("role"), "attempt_id": lease.get("attempt_id")},
+                invariants=("SINGLE_ACTIVE_LEASE", "NOOP_ACTIVE"),
+            )
+        if not liveness.found_liveness:
+            return make_decision(
+                DecisionKind.REQUEST_HUMAN,
+                f"Active execution lease held by role {lease.get('role')!r} lacks liveness evidence; failing closed to prevent orphan ownership",
+                problem_id="unconfirmed_lease",
+                parameters={"failure_class": FailureClass.CONTROL_PLANE_DEFECT.value, "role": lease.get("role")},
+                invariants=("NO_ORPHAN_OWNER", "PROGRESS_TOTALITY", "HUMAN_TYPED"),
+            )
+        # Demonstrably non-live lease (found_liveness and not lease_live and not lease_ambiguous):
+        # If there is a human request (answered or open), defer to human request handling.
+        # Otherwise, if no failure problem is recorded, fail closed:
+        if work_record.human_request is None and not work_record.current_problem:
+            return make_decision(
+                DecisionKind.REQUEST_HUMAN,
+                f"Active execution lease held by role {lease.get('role')!r} is dead but no failure problem recorded",
+                problem_id="dead_lease_no_problem",
+                parameters={"failure_class": FailureClass.CONTROL_PLANE_DEFECT.value, "role": lease.get("role")},
+                invariants=("NO_ORPHAN_OWNER", "PROGRESS_TOTALITY", "HUMAN_TYPED"),
+            )
+
+    # 5. HUMAN REQUEST OPEN / ANSWERED
     hr = work_record.human_request
     if hr is not None:
         answer = hr.get("answer")
@@ -220,7 +263,7 @@ def decide(
                 invariants=("HUMAN_TYPED", "PROGRESS_TOTALITY"),
             )
 
-    # 5. STATUS == NEEDS_HUMAN without active human request
+    # 6. STATUS == NEEDS_HUMAN without active human request
     if work_record.status == "NEEDS_HUMAN":
         if work_record.handoff is None:
             return make_decision(
@@ -233,46 +276,6 @@ def decide(
             "Goal is in NEEDS_HUMAN state with complete structured HANDOFF; awaiting owner action",
             invariants=("COMPLETE_EXHAUSTION",),
         )
-
-    # 6. ACTIVE LEASE LIVENESS
-    lease = work_record.active_lease
-    if lease is not None:
-        found_liveness = False
-        lease_live = False
-        for item in evidence.items:
-            if item.source == "process_probe" and item.data.get("role") == lease.get("role"):
-                found_liveness = True
-                lease_live = bool(item.data.get("alive"))
-                break
-            if item.source == "broker_effect" and item.data.get("execution_id") == lease.get("execution_id"):
-                found_liveness = True
-                lease_live = item.data.get("state") in ("running", "live")
-                break
-
-        if lease_live:
-            return make_decision(
-                DecisionKind.NOOP_ACTIVE,
-                f"Active execution lease held by role {lease.get('role')!r} is live",
-                parameters={"role": lease.get("role"), "attempt_id": lease.get("attempt_id")},
-                invariants=("SINGLE_ACTIVE_LEASE", "NOOP_ACTIVE"),
-            )
-        if not found_liveness:
-            return make_decision(
-                DecisionKind.REQUEST_HUMAN,
-                f"Active execution lease held by role {lease.get('role')!r} lacks liveness evidence; failing closed to prevent orphan ownership",
-                problem_id="unconfirmed_lease",
-                parameters={"failure_class": FailureClass.CONTROL_PLANE_DEFECT.value, "role": lease.get("role")},
-                invariants=("NO_ORPHAN_OWNER", "PROGRESS_TOTALITY", "HUMAN_TYPED"),
-            )
-        # If found_liveness and not lease_live (lease confirmed dead):
-        if not work_record.current_problem:
-            return make_decision(
-                DecisionKind.REQUEST_HUMAN,
-                f"Active execution lease held by role {lease.get('role')!r} is dead but no failure problem recorded",
-                problem_id="dead_lease_no_problem",
-                parameters={"failure_class": FailureClass.CONTROL_PLANE_DEFECT.value, "role": lease.get("role")},
-                invariants=("NO_ORPHAN_OWNER", "PROGRESS_TOTALITY", "HUMAN_TYPED"),
-            )
 
     # 7. BOUNDED WAIT
     wait = work_record.wait

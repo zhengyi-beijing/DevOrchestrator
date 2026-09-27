@@ -137,7 +137,7 @@ def evaluate_convergence_invariants(
                 it.source == "process_probe" and it.data.get("role") == role and not it.data.get("alive")
                 for it in evidence.items
             )
-            if lease_dead and not work_record.current_problem:
+            if lease_dead and not work_record.current_problem and not work_record.human_request:
                 pt_holds = False
                 pt_msg = f"Active execution lease held by role {role!r} is dead with no recovery progress"
         elif not work_record.human_request and not work_record.wait:
