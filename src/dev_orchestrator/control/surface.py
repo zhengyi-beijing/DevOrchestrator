@@ -253,7 +253,7 @@ def project_control_view(
         roles = project_config.get("ai_roles")
         planner_config = roles.get("planner") if isinstance(roles, dict) else None
         planning_ready = isinstance(planner_config, dict) and planner_config.get("enabled") is True
-    planning_start_ready = lifecycle in {"IDLE", "PLAN_FAILED"} and parsed_next_status.is_pending_design() and planning_ready
+    planning_start_ready = lifecycle in {"IDLE", "PLAN_FAILED", "PENDING_DESIGN"} and parsed_next_status.is_pending_design() and planning_ready
     recoverable_plan_gate = (
         isinstance(gate, dict)
         and gate.get("gate_source") == "planner"

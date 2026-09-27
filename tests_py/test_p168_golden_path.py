@@ -109,6 +109,47 @@ class TestP168GoldenPath(unittest.TestCase):
         self.assertIn("exceeding the limit of 24", err.actionable_message)
         self.assertIn("combine or remove 1 item(s)", err.correction)
 
+    def test_authoritative_pending_design_can_start_planner(self):
+        """A coherent authoritative PENDING_DESIGN state must be able to enter planning."""
+        with tempfile.TemporaryDirectory() as td:
+            harness = GoldenPathHarness.create(Path(td), task_id="P17", initial_status="PENDING DESIGN")
+            try:
+                snap = harness.current_snapshot()
+                snap["lifecycle_state"] = "PENDING_DESIGN"
+                project_config = json.loads(harness.config_path.read_text(encoding="utf-8"))["projects"][0]
+
+                surface = project_control_view(
+                    snap,
+                    harness.runtime_path,
+                    project_config=project_config,
+                )
+                controls = {row["action"]: row for row in surface["controls"]}
+                self.assertTrue(controls["continue"]["available"])
+
+                identity = project_identity(snap, harness.runtime_path)
+                submit_control_command(
+                    harness.runtime_path,
+                    project_id=harness.project_id,
+                    action="continue",
+                    command_id="cmd-authority-pending-design",
+                    expected=identity,
+                    source="owner",
+                )
+                harness.coordinator.advance(
+                    harness.config_path,
+                    {"projects": [snap]},
+                    harness.executor,
+                )
+                hist = read_json(
+                    harness.runtime_path / "control" / "history" / "cmd-authority-pending-design.json",
+                    {},
+                )
+                self.assertEqual(hist.get("state"), "accepted")
+                self.assertEqual(hist.get("lifecycle_action"), "plan")
+                self.assertTrue(str(hist.get("plan_id") or "").startswith("ai_plan:"))
+            finally:
+                harness.close()
+
     def test_golden_path_lifecycle_progression_and_terminal_closure(self):
         """Full lifecycle: PENDING_DESIGN -> READY_TO_RUN -> EXECUTING -> WAITING_REVIEW -> DONE -> terminal closure."""
         with tempfile.TemporaryDirectory() as td:

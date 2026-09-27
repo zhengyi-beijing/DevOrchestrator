@@ -689,9 +689,9 @@ class ControlCommandCoordinator:
                     }
                 if lifecycle == "OWNER_GATE":
                     return self._blocked(command_id, project_id, action, resume_reason, now, record)
-            if lifecycle not in {"IDLE", "PLAN_FAILED"}:
+            if lifecycle not in {"IDLE", "PLAN_FAILED", "PENDING_DESIGN"}:
                 return self._blocked(
-                    command_id, project_id, action, "PENDING DESIGN continue requires IDLE or PLAN_FAILED lifecycle", now, record
+                    command_id, project_id, action, "PENDING DESIGN continue requires IDLE, PLAN_FAILED, or PENDING_DESIGN lifecycle", now, record
                 )
             handled, approved_plan_id, approved_reason = self.planner.continue_owner_approved(
                 projects[project_id], snapshot, command_id
