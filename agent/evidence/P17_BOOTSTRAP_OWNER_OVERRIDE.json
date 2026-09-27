@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "record_type": "target-model-fixture",
+  "authoritative_runtime_record": false,
+  "project_id": "devorchestrator",
+  "source_goal_id": "P16.14",
+  "target_goal_id": "P17",
+  "legacy_transition_id": "handoff:46e313795ae5a57ad8ee",
+  "legacy_source_request_id": "recover-handoff:devorchestrator:P16.14:P17:3c895599e394",
+  "observed_legacy_acceptance": null,
+  "acceptance": {
+    "kind": "OWNER_OVERRIDE",
+    "owner_id": "project_owner",
+    "command_id": "p17-bootstrap-owner-override-20260927",
+    "scope": "P16.14 -> P17 migration/bootstrap exception",
+    "reason": "Project owner explicitly accepted bounded P16.14 closure and chose to proceed to P17 despite the absence of a final accepting Reviewer verdict after reviewer infrastructure failures.",
+    "waived_obligations": [
+      "final_accepting_reviewer_verdict_at_P16.14_closure_anchor",
+      "independent_reviewer_reexecution_of_full_claimed_test_suite_at_final_closure_anchor"
+    ]
+  },
+  "anchors": {
+    "bounded_fix": "da699cd7238ed39caf62fb229ba82a2e4f392734",
+    "p16_14_complete": "3c895599e394a61286bc3e5319a62426d288b376",
+    "legacy_p17_activation": "e3eeb29184eb6daadaa5913d1296c66a55f487dd",
+    "architecture_freeze": "adfd6d1"
+  },
+  "observed_legacy_inconsistency": {
+    "execution_handoff_consumed": true,
+    "transition_consumed_at": null,
+    "classification": "historical replay evidence; not target-semantics acceptance"
+  },
+  "constraints": [
+    "This fixture does not fabricate verification evidence.",
+    "This fixture must be replayed as an OWNER_OVERRIDE bootstrap exception, not as a valid VERIFIED transition.",
+    "The target architecture must reject markdown-only completion when acceptance=NONE."
+  ]
+}
