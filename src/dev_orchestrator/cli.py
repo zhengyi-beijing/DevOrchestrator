@@ -211,6 +211,55 @@ def _wait_for_child_ready(
     return None
 
 
+_FIRST_TICK_GRACE_SECONDS = 180.0
+
+
+def _await_first_tick(
+    runtime: Path, pid_path: Path, grace_seconds: float = _FIRST_TICK_GRACE_SECONDS,
+) -> Optional[dict]:
+    """Let an initialized daemon finish a slow first tick instead of killing it.
+
+    A child that published ``starting`` has bound its servers and entered the
+    control loop; it is not hung.  Its first tick is where pending lifecycle
+    work runs after a restart, so terminating it there would interrupt that
+    work mid-transaction.  Returns the ready heartbeat once the first tick
+    completes, the ``starting`` heartbeat if the child is still alive when the
+    grace period ends, or ``None`` when the child never finished initializing
+    or has died -- only that last case warrants termination.
+    """
+    heartbeat_path = runtime / "daemon.json"
+    recorded = _read_pid_file(pid_path)
+    heartbeat = read_json(heartbeat_path)
+    if not (
+        recorded is not None
+        and isinstance(heartbeat, dict)
+        and heartbeat.get("state") == "starting"
+        and _as_int(heartbeat.get("pid"), -1) == recorded
+        and is_pid_alive(recorded)
+    ):
+        return None
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not is_pid_alive(recorded):
+            return None
+        heartbeat = read_json(heartbeat_path)
+        if (
+            isinstance(heartbeat, dict)
+            and heartbeat.get("state") in ("running", "degraded")
+            and _as_int(heartbeat.get("pid"), -1) == recorded
+        ):
+            return heartbeat
+        time.sleep(0.2)
+    heartbeat = read_json(heartbeat_path)
+    if (
+        isinstance(heartbeat, dict)
+        and _as_int(heartbeat.get("pid"), -1) == recorded
+        and is_pid_alive(recorded)
+    ):
+        return heartbeat
+    return None
+
+
 def _pid_file(runtime: Path, name: str) -> Path:
     return runtime / name
 
@@ -983,6 +1032,9 @@ def cmd_start_daemon(args: argparse.Namespace) -> int:
         runtime, "daemon.pid", "daemon.json", ("running", "degraded")
     )
     if heartbeat is None:
+        # An initialized daemon in a slow first tick is not hung; do not kill it.
+        heartbeat = _await_first_tick(runtime, pid_path)
+    if heartbeat is None:
         recorded = _read_pid_file(pid_path)
         terminate_pid(child.pid)
         if recorded is not None and recorded != child.pid:
@@ -990,7 +1042,7 @@ def cmd_start_daemon(args: argparse.Namespace) -> int:
         _fail("Daemon process started but heartbeat was not observed within 8 seconds.")
     _print_json(
         {
-            "state": "running",
+            "state": "running" if heartbeat.get("state") != "starting" else "starting",
             "pid": heartbeat["pid"],
             "listen_address": args.listen,
             "port": args.port,

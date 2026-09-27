@@ -630,6 +630,20 @@ def run_daemon(
         job_recovery_coordinator.recover()
     except Exception:
         pass
+    # Record that initialization finished before the first tick runs.  After a
+    # restart the first tick is exactly where pending lifecycle work (successor
+    # repair, handoff publication, Planner launch) executes, so it can outlast
+    # start-daemon's readiness deadline.  "starting" lets start-daemon tell an
+    # initialized daemon in a slow first tick apart from one hung during init,
+    # instead of killing it mid-transaction.  It is deliberately not a ready
+    # state: readiness still means the first tick has completed.
+    write_json(
+        runtime / "daemon.json",
+        {"state": "starting", "pid": pid, "interval_seconds": interval,
+         "started_at": started_at, "last_tick_at": None, "last_error": None,
+         "listen_address": listen, "port": port,
+         "bridge_listen_address": bridge_listen, "bridge_port": bridge_bound_port},
+    )
     try:
         while True:
             last_error: Optional[str] = None
