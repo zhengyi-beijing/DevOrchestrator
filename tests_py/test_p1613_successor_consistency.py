@@ -1957,5 +1957,130 @@ class TerminalRoadmapSuccessorEndToEndTests(unittest.TestCase):
         self.assertEqual(len(self._handoffs()), 1)
 
 
+def _linked_worktree(root: Path, **kwargs) -> Path:
+    """A linked worktree, as the self-hosted controller actually runs from.
+
+    Every other fixture uses ``git init``, where ``.git`` is a directory.  In a
+    linked worktree ``.git`` is a *file* pointing at the common git directory,
+    which is the layout that broke terminal successor repair in production.
+    """
+    primary = _complete_repo(root / "primary", **kwargs)
+    worktree = root / "worktree"
+    # Check out byte-faithful LF specs, as the live staged specs are.  Staged
+    # claims are hashed byte-for-byte and a CRLF checkout is not a claim.
+    subprocess.run(
+        ["git", "-C", str(primary), "-c", "core.autocrlf=false",
+         "worktree", "add", "-b", "wt-main", str(worktree)],
+        check=True, capture_output=True, text=True,
+    )
+    return worktree
+
+
+class LinkedWorktreeSuccessorRepairTests(unittest.TestCase):
+    """P17 closure defect: successor repair must work from a linked worktree."""
+
+    def test_roadmap_repair_succeeds_from_linked_worktree(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree = _linked_worktree(Path(td), roadmap_target=None)
+            self.assertTrue((worktree / ".git").is_file(), "fixture is not a linked worktree")
+
+            resolution = resolve_successor(worktree, "P1")
+            self.assertEqual(resolution.kind, "inconsistent")
+
+            outcome = reconcile_roadmap_successor(worktree, "P1", resolution)
+
+            self.assertEqual(
+                outcome.status, "applied",
+                f"roadmap repair failed from a linked worktree: {outcome.reason}",
+            )
+            self.assertEqual(resolve_successor(worktree, "P1").kind, "successor")
+            self.assertEqual(_git(worktree, "status", "--porcelain"), "")
+            git_dir = Path(_git(worktree, "rev-parse", "--absolute-git-dir"))
+            self.assertTrue(
+                (git_dir / "devorch-successor.lock").exists(),
+                "the repair lock was not taken in the worktree's real git directory",
+            )
+
+    def test_legacy_settled_next_decision_hands_off_from_linked_worktree(self):
+        """The live P17 -> P18 incident, reproduced end to end.
+
+        The reviewer's NEXT decision for the terminal task was settled as legacy
+        "no next executable task" before a successor was staged; the roadmap
+        names no successor; the successor spec uses the historical
+        ``STAGED / NOT STARTED`` declaration; and the controller runs from a
+        linked worktree.  Decision actuation must repair the roadmap and record
+        exactly one P1 -> P2 handoff instead of aborting the tick.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            worktree = _linked_worktree(root, roadmap_target=None)
+            (worktree / "agent" / "staged" / "P2.md").write_bytes(
+                b"# P2 task\n\nStatus: STAGED / NOT STARTED\nPredecessor: P1\n"
+            )
+            _commit(worktree, "stage P2 with historical declaration")
+            self.assertEqual(resolve_successor(worktree, "P1").kind, "inconsistent")
+
+            runtime = root / "runtime"; runtime.mkdir()
+            truth = read_repository_truth(worktree)
+            project = {
+                "project_id": "p1", "repo_path": str(worktree),
+                "execution": {
+                    "engine": "aibroker", "enabled": True, "owner_authorized": True,
+                    "allowed_next_actions": ["next_task"],
+                },
+            }
+            config = root / "projects.json"
+            config.write_text(json.dumps({"projects": [project]}), encoding="utf-8")
+            decision_id = "ai_review:settled"
+            (runtime / "review-decisions.json").write_text(json.dumps({"version": 1, "decisions": {
+                decision_id: {
+                    "project_id": "p1", "request_id": decision_id, "disposition": "apply",
+                    "decision": "next", "next_action": "next_task",
+                    "reason": "reviewed task complete", "task_id": "P1",
+                    "branch": truth.branch, "head": truth.head,
+                    "review_status_hash": truth.status_hash,
+                    "role": "reviewer", "event": "worker_done",
+                    "consumed_at": "2026-09-26T06:30:00+00:00",
+                },
+            }}), encoding="utf-8")
+            executor = TransitionExecutor(runtime)
+            ledger = executor.state()
+            ledger["executions"][decision_id] = dict(_STALE_SETTLE)
+            executor._save_ledger(ledger)
+
+            def tick():
+                current = read_repository_truth(worktree)
+                snapshot = {
+                    "project_id": "p1", "repo_path": str(worktree), "state": "IDLE",
+                    "next_title": "P1 task", "next_status": "**COMPLETE**",
+                    "telemetry": {"task_id": "P1"},
+                    "git": {"branch": current.branch, "head": current.head,
+                            "dirty": False, "status_hash": current.status_hash},
+                }
+                executor.advance({"projects": [snapshot]}, config,
+                                 decision_summary={"projects": [snapshot]})
+
+            tick()
+
+            rows = [row for row in executor.state()["executions"].values()
+                    if isinstance(row, dict)]
+            handoffs = [row for row in rows if row.get("state") == "handoff"]
+            self.assertEqual(len(handoffs), 1, f"expected one handoff, got {rows}")
+            self.assertEqual(
+                (handoffs[0]["source_task_id"], handoffs[0]["target_task_id"]), ("P1", "P2"),
+            )
+            self.assertEqual(handoffs[0].get("staged_successor"), "P2")
+            self.assertEqual(resolve_successor(worktree, "P1").kind, "successor")
+            self.assertEqual(_git(worktree, "status", "--porcelain"), "")
+
+            # Replayed ticks must not duplicate the handoff or the transition.
+            transitions_before = dict(executor.state()["transitions"])
+            tick(); tick()
+            rows = [row for row in executor.state()["executions"].values()
+                    if isinstance(row, dict)]
+            self.assertEqual(len([r for r in rows if r.get("state") == "handoff"]), 1)
+            self.assertEqual(set(executor.state()["transitions"]), set(transitions_before))
+
+
 if __name__ == "__main__":
     unittest.main()

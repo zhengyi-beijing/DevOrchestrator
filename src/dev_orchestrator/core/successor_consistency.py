@@ -175,6 +175,29 @@ def resolve_successor(repo_path: str | Path, completed_task_id: str) -> Successo
     return SuccessorResolution(kind=roadmap.kind, roadmap=roadmap, reason=roadmap.reason)
 
 
+def _successor_lock_path(repo: Path) -> Path | None:
+    """Return the roadmap-repair lock inside this checkout's real git directory.
+
+    ``repo / ".git"`` is only a directory in a primary checkout.  In a linked
+    worktree it is a *file* pointing at ``<common>/.git/worktrees/<name>``, so
+    creating the lock beneath it fails with ``FileExistsError`` (WinError 183)
+    and the self-hosted controller, which runs from such a worktree, could never
+    repair a successor.  Ask git for the per-worktree git directory instead,
+    which is also where git keeps this worktree's own ``index.lock``.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--absolute-git-dir"],
+            check=False, capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    git_dir = result.stdout.strip()
+    if result.returncode != 0 or not git_dir or not Path(git_dir).is_dir():
+        return None
+    return Path(git_dir) / "devorch-successor.lock"
+
+
 def reconcile_roadmap_successor(
     repo_path: str | Path,
     completed_task_id: str,
@@ -195,7 +218,12 @@ def reconcile_roadmap_successor(
         return ReconcileOutcome(status="rejected", reason="successor reconcile requires a clean repository")
 
     roadmap_path = repo / "agent" / "staged" / "roadmap.json"
-    lock_path = repo / ".git" / "devorch-successor.lock"
+    lock_path = _successor_lock_path(repo)
+    if lock_path is None:
+        return ReconcileOutcome(
+            status="rejected",
+            reason="successor reconcile cannot resolve the repository git directory",
+        )
     with InterProcessFileLock(lock_path):
         original = roadmap_path.read_bytes() if roadmap_path.is_file() else b""
         try:
