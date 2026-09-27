@@ -160,3 +160,56 @@ class TestP17PreflightConstraints(unittest.TestCase):
         self.assertEqual(decision.kind, DecisionKind.REQUEST_HUMAN)
         self.assertIn("missing_required_sources", decision.problem_id)
         self.assertIn("FAIL_CLOSED_AMBIGUITY", decision.invariant_citations)
+
+    def test_required_source_present_with_missing_read_status_fails_closed(self) -> None:
+        """Finding 5: A required source with read_status='MISSING' fails closed to REQUEST_HUMAN."""
+        from dev_orchestrator.convergence.evaluator import DecisionKind, decide
+        from dev_orchestrator.convergence.evidence import EvidenceItem, EvidenceSnapshot
+        from dev_orchestrator.convergence.policy import build_policy
+        from dev_orchestrator.convergence.work_record import validate_work_record
+
+        policy = build_policy(required_sources=("repo_truth", "broker_telemetry"))
+        ev = EvidenceSnapshot(
+            items=(
+                EvidenceItem(
+                    source="repo_truth",
+                    source_id="r1",
+                    timestamp="2026-09-27T00:00:00Z",
+                    anchor="a1",
+                    data={},
+                    digest="d1",
+                    read_status="OK",
+                ),
+                EvidenceItem(
+                    source="broker_telemetry",
+                    source_id="b1",
+                    timestamp="2026-09-27T00:00:00Z",
+                    anchor="a1",
+                    data={},
+                    digest="d2",
+                    read_status="MISSING",
+                ),
+            ),
+            conflicts=(),
+            shared_leases=(),
+            exact_anchors={"head": "h1"},
+            emergency_pause_asserted=False,
+            metadata={},
+        )
+        rec = validate_work_record({
+            "schema_version": 1,
+            "project_id": "p",
+            "goal_id": "P17",
+            "goal_revision": 1,
+            "goal_spec_digest": "s",
+            "predecessor_goal_id": "p0",
+            "repository_identity": {"repo_path": ".", "branch": "main"},
+            "status": "OPEN",
+            "acceptance": {"kind": "NONE"},
+            "authority_revision": "r1",
+        })
+        decision = decide(rec, ev, policy)
+        self.assertEqual(decision.kind, DecisionKind.REQUEST_HUMAN)
+        self.assertEqual(decision.problem_id, "missing_required_sources")
+        self.assertIn("FAIL_CLOSED_AMBIGUITY", decision.invariant_citations)
+        self.assertIn("broker_telemetry", decision.parameters.get("missing_sources", []))

@@ -127,3 +127,61 @@ class TestP17LeaseAndEffects(unittest.TestCase):
             )
             self.assertFalse(verdict.accepted, f"Expected {kind.value} to be rejected while lease active")
             self.assertEqual(verdict.rejection_code, "LEASE_ALREADY_ACTIVE")
+
+    def test_dead_lease_recovery_decision_is_admitted_by_guard(self) -> None:
+        """Finding 2: ActuatorGuard admits recovery decisions when lease is demonstrably dead."""
+        from dev_orchestrator.convergence.evidence import EvidenceItem
+
+        work_rec = validate_work_record({
+            "schema_version": 1,
+            "project_id": "devorchestrator",
+            "goal_id": "P17",
+            "goal_revision": 1,
+            "goal_spec_digest": "sha256:spec",
+            "predecessor_goal_id": "P16.14",
+            "repository_identity": {"repo_path": "C:\\repo", "branch": "main"},
+            "status": "OPEN",
+            "acceptance": {"kind": "NONE"},
+            "authority_revision": "rev-1",
+            "active_lease": self.active_lease,
+        })
+        # Evidence with process_probe reporting alive=False
+        dead_evidence = EvidenceSnapshot(
+            items=(
+                EvidenceItem(
+                    source="process_probe",
+                    source_id="probe-dead-1",
+                    timestamp="2026-09-27T00:01:00Z",
+                    anchor="head-1",
+                    data={"role": "worker", "alive": False},
+                    digest="sha256:dead",
+                    read_status="OK",
+                ),
+            ),
+            conflicts=(),
+            shared_leases=(),
+            exact_anchors={"head": "head-1"},
+            emergency_pause_asserted=False,
+            metadata={},
+        )
+        guard = ActuatorGuard()
+
+        for kind in (
+            DecisionKind.RETRY_NEW_STRATEGY,
+            DecisionKind.RETRY_SAME_STRATEGY,
+            DecisionKind.FAILOVER_RESOURCE,
+            DecisionKind.ESCALATE_CAPABILITY,
+        ):
+            decision = Decision(
+                kind=kind,
+                reason=f"Recovery attempt {kind.value}",
+                idempotency_key=f"idemp-dead-{kind.value}",
+            )
+            verdict = guard.validate(
+                decision,
+                work_rec,
+                dead_evidence,
+                expected_anchor_head="head-1",
+            )
+            self.assertTrue(verdict.accepted, f"Expected {kind.value} to be accepted for dead lease: {verdict.reason}")
+            self.assertIsNone(verdict.rejection_code)

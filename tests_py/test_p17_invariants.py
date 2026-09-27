@@ -143,3 +143,66 @@ class TestP17Invariants(unittest.TestCase):
         self.assertEqual(decision.kind, DecisionKind.REQUEST_HUMAN)
         self.assertIn("FAIL_CLOSED_AMBIGUITY", decision.invariant_citations)
         self.assertIn("ambiguity", decision.reason.lower())
+
+    def test_idempotent_replay_fails_on_volatile_or_mismatched_handoff_key(self) -> None:
+        """Finding 4: IDEMPOTENT_REPLAY evaluates against real idempotency evidence and fails on mismatched key."""
+        import hashlib
+        import json
+        from dev_orchestrator.convergence.successor import compute_handoff_idempotency_key
+
+        acc = {
+            "kind": "VERIFIED",
+            "reviewer_verdict_id": "v-1",
+            "anchor_head": "head-clean",
+        }
+        acc_digest = hashlib.sha256(json.dumps(acc, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        valid_key = compute_handoff_idempotency_key("devorchestrator", "P17", "P18", acc_digest)
+
+        # 1. Record with mismatched/volatile handoff key
+        volatile_record = validate_work_record({
+            **self.work_record.to_dict(),
+            "status": "DONE",
+            "acceptance": acc,
+            "verification": {
+                "verification_id": "v-1",
+                "exact_head": "head-clean",
+                "clean_status_fingerprint": "clean",
+                "acceptance_criterion_results": {"crit-1": True},
+                "executed_checks": [{"command": "pytest", "exit_status": 0}],
+                "reviewer_decision": "ACCEPT",
+                "structured_findings": [],
+            },
+            "successor": {
+                "successor_goal_id": "P18",
+                "successor_spec_digest": "sha256:p18",
+                "publication_state": "PENDING",
+                "handoff_idempotency_key": "volatile-key-123",
+            },
+        })
+        verdicts = evaluate_convergence_invariants(volatile_record, self.evidence, self.policy)
+        self.assertFalse(verdicts["IDEMPOTENT_REPLAY"].holds)
+        self.assertIn("does not match", verdicts["IDEMPOTENT_REPLAY"].details)
+
+        # 2. Record with matching deterministic handoff key
+        valid_record = validate_work_record({
+            **self.work_record.to_dict(),
+            "status": "DONE",
+            "acceptance": acc,
+            "verification": {
+                "verification_id": "v-1",
+                "exact_head": "head-clean",
+                "clean_status_fingerprint": "clean",
+                "acceptance_criterion_results": {"crit-1": True},
+                "executed_checks": [{"command": "pytest", "exit_status": 0}],
+                "reviewer_decision": "ACCEPT",
+                "structured_findings": [],
+            },
+            "successor": {
+                "successor_goal_id": "P18",
+                "successor_spec_digest": "sha256:p18",
+                "publication_state": "PENDING",
+                "handoff_idempotency_key": valid_key,
+            },
+        })
+        valid_verdicts = evaluate_convergence_invariants(valid_record, self.evidence, self.policy)
+        self.assertTrue(valid_verdicts["IDEMPOTENT_REPLAY"].holds)

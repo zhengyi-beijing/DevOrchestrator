@@ -67,7 +67,7 @@
     "schema_version": 1,
     "status": "DONE",
     "successor": {
-      "handoff_idempotency_key": "idemp-crash-replay-26",
+      "handoff_idempotency_key": "a1af4ef5509b8e03e24f99efc5929a08",
       "publication_state": "PENDING",
       "successor_goal_id": "P18",
       "successor_spec_digest": "sha256:p18-spec"

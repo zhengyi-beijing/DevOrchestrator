@@ -1,7 +1,37 @@
 # DevOrchestrator Self-Hosting Result Log
 
-P17 Single-Authority Goal Convergence Baseline (remediated / ready for review 2026-09-27):
-- Addressed all 8 Technical Review findings from `ai_review:a04b4803-cc11-41fe-8ccd-38263decfb5d`:
+P17 Single-Authority Goal Convergence Baseline (remediated round 2 / ready for review 2026-09-27):
+- Addressed all 6 Technical Review findings from `ai_review:ai_review:a04b4803-cc11-41fe-8ccd-38263decfb5d`:
+  1. Finding 1 (Crash injection simulation honest trace-hash comparison & guard key verification):
+     - In `replay.py`, removed conditional assignment fallback (`if c_dec.kind == baseline_decision.kind else baseline_hash`), computing `c_hash = decision_trace_hash([c_dec])` unconditionally.
+     - Seeded ActuatorGuard with the exact deterministic idempotency key (`handoff_idempotency_key` or computed successor key) at post-publish points.
+     - Validated evaluator's actual decision key `c_dec.idempotency_key` through `guard.validate()`, verifying that duplicate execution is rejected by the guard with `rejection_code == "DUPLICATE_IDEMPOTENCY_KEY"` when crash occurs after successor is published, ensuring `duplicate_publications == 0`.
+     - In `tests_py/test_p17_replay_determinism.py`, updated `test_truncated_and_repeated_durable_write_sequences_yield_one_publication` to assert honest divergence on truncated crash points (`before_verification`, `after_verification`, `before_acceptance` -> `EXECUTE`, `after_successor_publish` -> `NOOP_ACTIVE`), honest convergence on prepared points (`after_acceptance`, `before_successor_publish` -> `PUBLISH_SUCCESSOR`), and verified that `after_handoff` evaluates to `PUBLISH_SUCCESSOR` matching baseline trace hash while the guard rejects duplicate publication.
+  2. Finding 2 (ActuatorGuard dead lease recovery deadlock):
+     - In `actuator_guard.py`, made lease uniqueness fence liveness-aware by checking `process_probe` and `broker_effect` in evidence.
+     - When lease is demonstrably dead/terminal (e.g. `process_probe.data['alive'] == False`), admits recovery decisions (`RETRY_NEW_STRATEGY`, `RETRY_SAME_STRATEGY`, `FAILOVER_RESOURCE`, `ESCALATE_CAPABILITY`) and terminal-success `VERIFY`. Rejects on live, missing liveness, and ambiguous effect.
+     - Covered by `tests_py/test_p17_lease_and_effects.py::TestP17LeaseAndEffects::test_dead_lease_recovery_decision_is_admitted_by_guard`.
+  3. Finding 3 (PUBLISH_SUCCESSOR idempotency key stability across churn):
+     - In `evaluator.py`, derived `PUBLISH_SUCCESSOR` idempotency key stably from `work_record.successor["handoff_idempotency_key"]` or `compute_handoff_idempotency_key(project_id, goal_id, successor_goal_id, acceptance_digest)`, and `WRITE_HANDOFF` from stable goal/problem identity, eliminating volatile digests `(w_digest, ev_digest)`.
+     - In `tests_py/test_p17_replay_determinism.py`, added `test_publish_successor_idempotency_key_stable_across_evidence_and_revision_churn` demonstrating that authority revision bump and evidence churn produce identical idempotency key and trigger `DUPLICATE_IDEMPOTENCY_KEY` rejection.
+  4. Finding 4 (IDEMPOTENT_REPLAY invariant enforcement):
+     - In `invariants.py`, hardened `IDEMPOTENT_REPLAY` to verify that `work_record.successor["handoff_idempotency_key"]` matches `compute_handoff_idempotency_key(project_id, goal_id, successor_goal_id, acceptance_digest)` and that `PUBLISHED` state cannot exist on an `OPEN` goal.
+     - Updated corpus fixtures `case_02`, `case_18`, and `case_26` to use exact computed deterministic keys.
+     - Covered by `tests_py/test_p17_invariants.py::TestP17Invariants::test_idempotent_replay_fails_on_volatile_or_mismatched_handoff_key`.
+  5. Finding 5 (Required evidence source read status):
+     - In `evaluator.py`, updated `present_sources` to require `it.read_status == "OK"`. Evidence items with `read_status == "MISSING"` or `"ERROR"` fail closed to `REQUEST_HUMAN` citing `FAIL_CLOSED_AMBIGUITY`.
+     - Covered by `tests_py/test_p17_preflight_constraints.py::TestP17PreflightConstraints::test_required_source_present_with_missing_read_status_fails_closed`.
+  6. Finding 6 (Exact assertion in planner singleflight test):
+     - In `tests_py/test_p12_planner_singleflight.py`, tightened relaxed substring assertion to exact assertion: `"PENDING DESIGN continue requires IDLE, PLAN_FAILED, or PENDING_DESIGN lifecycle"`.
+- Verification Summary:
+  - All 19 P17 test suites (93 tests): 100% passed.
+  - Full historical incident corpus replay: 26/26 passed (0 failures).
+  - Regression suites (`test_p12_planner_singleflight.py`, `test_p1614_invariant_workflow.py`, `test_p1613_successor_consistency.py`, `test_workflow_policy.py`): 113 passed, 10 subtests passed.
+  - Python AST and syntax compilation: clean (`compileall` 0 errors).
+  - Whitespace check (`git diff --check`): clean.
+
+P17 Technical Review Round 1 remediation evidence (2026-09-27):
+- Addressed all 8 Technical Review findings:
   1. Finding 1 (Acceptance-before-advance on DONE status):
      - In `evaluator.py` Section 3, required `is_goal_satisfied(work_record, evidence=evidence)` before allowing `PUBLISH_SUCCESSOR`; fails closed to `REQUEST_HUMAN` citing `ACCEPTANCE_BEFORE_ADVANCE` if acceptance is not verified or overridden.
      - In `work_record.py`, updated `validate_work_record` to reject `status == "DONE"` when `acceptance.kind == "NONE"`.

@@ -37,8 +37,25 @@ class GuardVerdict:
 class ActuatorGuard:
     """Pure, side-effect-free actuator guard that validates decisions before execution."""
 
-    def __init__(self, executed_idempotency_keys: Set[str] | None = None) -> None:
+    def __init__(
+        self,
+        executed_idempotency_keys: Set[str] | None = None,
+        work_record: WorkRecord | Mapping[str, Any] | None = None,
+    ) -> None:
         self._executed_keys = set(executed_idempotency_keys or ())
+        if work_record is not None:
+            self.seed_from_work_record(work_record)
+
+    def seed_from_work_record(self, work_record: WorkRecord | Mapping[str, Any]) -> None:
+        """Seed executed idempotency keys from durable work record state."""
+        succ = getattr(work_record, "successor", None)
+        if succ is None and isinstance(work_record, Mapping):
+            succ = work_record.get("successor")
+        if isinstance(succ, Mapping):
+            pub_state = succ.get("publication_state")
+            key = succ.get("handoff_idempotency_key")
+            if key and pub_state in ("PUBLISHED", "COMMITTED"):
+                self._executed_keys.add(key)
 
     def validate(
         self,
@@ -51,6 +68,14 @@ class ActuatorGuard:
         expected_anchor_head: str | None = None,
     ) -> GuardVerdict:
         """Validate whether a decision can be safely admitted for execution."""
+        # Ensure guard is seeded from durable work record
+        succ = getattr(work_record, "successor", None)
+        if isinstance(succ, Mapping):
+            pub_state = succ.get("publication_state")
+            key = succ.get("handoff_idempotency_key")
+            if key and pub_state in ("PUBLISHED", "COMMITTED"):
+                self._executed_keys.add(key)
+
         # 1. Emergency Pause / Stop check (absolute highest priority safety interlock)
         if evidence.emergency_pause_asserted:
             if decision.kind not in (DecisionKind.NOOP_ACTIVE, DecisionKind.WAIT_UNTIL):
@@ -110,7 +135,7 @@ class ActuatorGuard:
                     rejection_code="ANCHOR_MISMATCH",
                 )
 
-        # 7. Active lease uniqueness check
+        # 7. Active lease uniqueness check (liveness-aware)
         if decision.kind in (
             DecisionKind.EXECUTE,
             DecisionKind.RETRY_SAME_STRATEGY,
@@ -121,11 +146,61 @@ class ActuatorGuard:
         ):
             if work_record.active_lease is not None:
                 role = work_record.active_lease.get("role")
-                return GuardVerdict(
-                    accepted=False,
-                    reason=f"Cannot admit decision {decision.kind.value}: active lease already held by role {role!r}",
-                    rejection_code="LEASE_ALREADY_ACTIVE",
+                exec_id = work_record.active_lease.get("execution_id")
+
+                found_liveness = False
+                lease_live = False
+                lease_ambiguous = False
+                terminal_success = False
+
+                for item in evidence.items:
+                    if item.source == "process_probe" and item.data.get("role") == role:
+                        found_liveness = True
+                        alive = item.data.get("alive")
+                        if alive is True:
+                            lease_live = True
+                        elif alive is False:
+                            lease_live = False
+                        else:
+                            lease_ambiguous = True
+                        break
+                    if item.source == "broker_effect" and item.data.get("execution_id") == exec_id:
+                        found_liveness = True
+                        st = item.data.get("state")
+                        if st in ("running", "live"):
+                            lease_live = True
+                        elif st in ("failed", "cancelled", "terminal"):
+                            lease_live = False
+                        elif st in ("succeeded", "completed"):
+                            lease_live = False
+                            terminal_success = True
+                        else:
+                            lease_ambiguous = True
+                        break
+
+                is_recovery_decision = decision.kind in (
+                    DecisionKind.RETRY_SAME_STRATEGY,
+                    DecisionKind.RETRY_NEW_STRATEGY,
+                    DecisionKind.FAILOVER_RESOURCE,
+                    DecisionKind.ESCALATE_CAPABILITY,
                 )
+                is_verify_on_terminal_success = (decision.kind == DecisionKind.VERIFY and terminal_success)
+
+                if found_liveness and not lease_live and not lease_ambiguous and (is_recovery_decision or is_verify_on_terminal_success):
+                    # Demonstrably non-live lease: admit recovery or verify decision
+                    pass
+                elif lease_live:
+                    return GuardVerdict(
+                        accepted=False,
+                        reason=f"Cannot admit decision {decision.kind.value}: active lease already held by live role {role!r}",
+                        rejection_code="LEASE_ALREADY_ACTIVE",
+                    )
+                else:
+                    return GuardVerdict(
+                        accepted=False,
+                        reason=f"Cannot admit decision {decision.kind.value}: active lease already held by role {role!r}",
+                        rejection_code="LEASE_ALREADY_ACTIVE",
+                    )
 
         # 7. Required human authorization check
         if decision.kind == DecisionKind.REQUEST_HUMAN:

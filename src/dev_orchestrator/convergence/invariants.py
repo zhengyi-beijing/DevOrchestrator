@@ -6,12 +6,15 @@ All invariant identity uses the stable code names.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import Any, Mapping
 
 from dev_orchestrator.convergence.evidence import EvidenceSnapshot, has_unresolved_ambiguity
 from dev_orchestrator.convergence.policy import Policy
 from dev_orchestrator.convergence.preflight import PreflightVerdict, evaluate_preflight
 from dev_orchestrator.convergence.problems import FailureClass
+from dev_orchestrator.convergence.successor import compute_handoff_idempotency_key
 from dev_orchestrator.convergence.verification import is_goal_satisfied, validate_owner_override
 from dev_orchestrator.convergence.work_record import WorkRecord
 
@@ -220,8 +223,35 @@ def evaluate_convergence_invariants(
     verdicts["ANCHOR_BINDING"] = InvariantVerdict("ANCHOR_BINDING", ab_holds, ab_msg)
 
     # 9. IDEMPOTENT_REPLAY
-    ir_holds = bool(work_record.goal_id and work_record.authority_revision)
-    ir_msg = "Decisions produce deterministic idempotency keys" if ir_holds else "Missing goal_id or authority_revision"
+    ir_holds = True
+    ir_msg = "Decisions produce deterministic idempotency keys"
+    if work_record.successor is not None:
+        succ = work_record.successor
+        key = succ.get("handoff_idempotency_key")
+        succ_goal = succ.get("successor_goal_id", "")
+        acc_raw = json.dumps(work_record.acceptance, sort_keys=True, separators=(",", ":"))
+        acc_digest = hashlib.sha256(acc_raw.encode("utf-8")).hexdigest()
+        expected_key = compute_handoff_idempotency_key(
+            work_record.project_id,
+            work_record.goal_id,
+            succ_goal,
+            acc_digest,
+        )
+        if not key or key != expected_key:
+            ir_holds = False
+            ir_msg = f"Successor handoff_idempotency_key {key!r} does not match expected deterministic key {expected_key!r}"
+        elif succ.get("publication_state") == "PUBLISHED" and work_record.status != "DONE":
+            ir_holds = False
+            ir_msg = "Successor marked PUBLISHED on non-terminal goal violates idempotent replay"
+    elif work_record.active_lease is not None:
+        lease = work_record.active_lease
+        if not lease.get("attempt_id") or not lease.get("execution_id"):
+            ir_holds = False
+            ir_msg = "Active lease missing attempt_id or execution_id for idempotent replay"
+    else:
+        if not work_record.goal_id or not work_record.authority_revision:
+            ir_holds = False
+            ir_msg = "Missing goal_id or authority_revision"
     verdicts["IDEMPOTENT_REPLAY"] = InvariantVerdict("IDEMPOTENT_REPLAY", ir_holds, ir_msg)
 
     # 10. STABLE_PROBLEM_IDENTITY

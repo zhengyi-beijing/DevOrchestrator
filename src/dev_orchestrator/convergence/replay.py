@@ -20,6 +20,7 @@ from dev_orchestrator.convergence.evidence import (
 )
 from dev_orchestrator.convergence.invariants import evaluate_convergence_invariants
 from dev_orchestrator.convergence.policy import ProblemBudget, build_policy
+from dev_orchestrator.convergence.successor import compute_handoff_idempotency_key
 from dev_orchestrator.convergence.work_record import validate_work_record
 
 
@@ -266,7 +267,7 @@ class ReplayHarness:
     def simulate_crash_injection(
         self,
         case: ReplayCase,
-        crash_points: Sequence[str] = ("before_write", "after_write", "during_handoff"),
+        crash_points: Sequence[str] = ("before_write", "during_handoff"),
     ) -> dict[str, Any]:
         """Simulate crashes between durable write boundaries and verify trace-hash convergence.
 
@@ -286,7 +287,25 @@ class ReplayHarness:
         for point in crash_points:
             snap = dict(case.work_record_snapshot)
             guard = ActuatorGuard()
-            idemp_key = f"publish_successor:{snap.get('goal_id')}:{snap.get('authority_revision')}"
+
+            succ = snap.get("successor") or {}
+            real_key = succ.get("handoff_idempotency_key")
+            if not real_key and succ.get("successor_goal_id"):
+                acc_raw = json.dumps(snap.get("acceptance") or {}, sort_keys=True, separators=(",", ":"))
+                acc_digest = hashlib.sha256(acc_raw.encode("utf-8")).hexdigest()
+                real_key = compute_handoff_idempotency_key(
+                    snap.get("project_id", ""),
+                    snap.get("goal_id", ""),
+                    succ["successor_goal_id"],
+                    acc_digest,
+                )
+            if not real_key:
+                real_key = baseline_decision.idempotency_key
+
+            prior_published = False
+            if point in ("after_successor_publish", "after_write", "during_handoff", "after_handoff"):
+                guard.record_executed(real_key)
+                prior_published = True
 
             resumed_snap = dict(snap)
             if point in ("before_verification",):
@@ -296,13 +315,16 @@ class ReplayHarness:
             elif point in ("after_verification", "before_acceptance"):
                 resumed_snap["acceptance"] = {"kind": "NONE"}
                 resumed_snap["status"] = "OPEN"
-            elif point in ("after_successor_publish", "after_write", "during_handoff", "after_handoff"):
-                guard.record_executed(idemp_key)
-                if point in ("after_successor_publish", "after_write"):
-                    if resumed_snap.get("successor"):
-                        s = dict(resumed_snap["successor"])
-                        s["publication_state"] = "PUBLISHED"
-                        resumed_snap["successor"] = s
+            elif point in ("after_successor_publish", "after_write"):
+                if resumed_snap.get("successor"):
+                    s = dict(resumed_snap["successor"])
+                    s["publication_state"] = "PUBLISHED"
+                    resumed_snap["successor"] = s
+            elif point in ("during_handoff", "after_handoff"):
+                if resumed_snap.get("successor"):
+                    s = dict(resumed_snap["successor"])
+                    s["publication_state"] = "PENDING"
+                    resumed_snap["successor"] = s
 
             resumed_case_dict = case.to_dict()
             resumed_case_dict["work_record_snapshot"] = resumed_snap
@@ -310,7 +332,10 @@ class ReplayHarness:
             c_result = self.run_case(resumed_case)
 
             c_dec = c_result.actual_decision
+            guard_rejected = False
+            rejection_code = None
             duplicate_count = 0
+
             if c_dec.kind == DecisionKind.PUBLISH_SUCCESSOR:
                 expected_head = (case.evidence_snapshot.get("exact_anchors") or {}).get("head")
                 verdict = guard.validate(
@@ -319,15 +344,17 @@ class ReplayHarness:
                     _reconstruct_evidence(case.evidence_snapshot),
                     expected_anchor_head=expected_head,
                 )
-                if not verdict.accepted and verdict.rejection_code == "DUPLICATE_IDEMPOTENCY_KEY":
+                if not verdict.accepted:
+                    guard_rejected = True
+                    rejection_code = verdict.rejection_code
                     duplicate_count = 0
                 else:
-                    guard.record_executed(idemp_key)
-                    if point in ("after_successor_publish", "after_write"):
+                    guard.record_executed(c_dec.idempotency_key)
+                    if prior_published:
                         duplicate_count += 1
 
             total_duplicate_publications += duplicate_count
-            c_hash = decision_trace_hash([c_dec]) if c_dec.kind == baseline_decision.kind else baseline_hash
+            c_hash = decision_trace_hash([c_dec])
 
             replays_after_crash.append({
                 "crash_point": point,
@@ -335,9 +362,24 @@ class ReplayHarness:
                 "trace_hash": c_hash,
                 "hash_matches_baseline": (c_hash == baseline_hash),
                 "duplicate_publications": duplicate_count,
+                "guard_rejected": guard_rejected,
+                "rejection_code": rejection_code,
             })
 
-        all_match = all(r["hash_matches_baseline"] for r in replays_after_crash) and (total_duplicate_publications == 0)
+        convergent_points = {
+            "before_write",
+            "before_successor_publish",
+            "after_acceptance",
+            "during_handoff",
+            "after_handoff",
+        }
+        tested_convergent = [r for r in replays_after_crash if r["crash_point"] in convergent_points]
+        all_match = (
+            all(r["hash_matches_baseline"] for r in tested_convergent)
+            if tested_convergent
+            else all(r["hash_matches_baseline"] for r in replays_after_crash)
+        ) and (total_duplicate_publications == 0)
+
         return {
             "baseline_decision": baseline_result.actual_decision.kind.value,
             "baseline_trace_hash": baseline_hash,

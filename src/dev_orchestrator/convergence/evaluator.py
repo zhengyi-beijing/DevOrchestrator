@@ -17,6 +17,7 @@ from dev_orchestrator.convergence.evidence import EvidenceSnapshot, has_unresolv
 from dev_orchestrator.convergence.findings import FindingSeverity
 from dev_orchestrator.convergence.policy import Policy
 from dev_orchestrator.convergence.problems import FailureClass, ProblemBudget, ProblemTracker
+from dev_orchestrator.convergence.successor import compute_handoff_idempotency_key
 from dev_orchestrator.convergence.verification import is_goal_satisfied
 from dev_orchestrator.convergence.work_record import WorkRecord, work_record_digest
 
@@ -103,7 +104,24 @@ def decide(
         parameters: dict[str, Any] | None = None,
         invariants: tuple[str, ...] = (),
     ) -> Decision:
-        idemp = _make_idempotency_key(work_record.goal_id, kind, problem_id, w_digest, ev_digest)
+        if kind == DecisionKind.PUBLISH_SUCCESSOR:
+            succ = work_record.successor or {}
+            key = succ.get("handoff_idempotency_key")
+            if not key and succ.get("successor_goal_id"):
+                acc_raw = json.dumps(work_record.acceptance, sort_keys=True, separators=(",", ":"))
+                acc_digest = hashlib.sha256(acc_raw.encode("utf-8")).hexdigest()
+                key = compute_handoff_idempotency_key(
+                    work_record.project_id,
+                    work_record.goal_id,
+                    succ["successor_goal_id"],
+                    acc_digest,
+                )
+            idemp = key or _make_idempotency_key(work_record.goal_id, kind, problem_id, w_digest, ev_digest)
+        elif kind == DecisionKind.WRITE_HANDOFF:
+            raw = f"{work_record.project_id}:{work_record.goal_id}:WRITE_HANDOFF:{problem_id or 'none'}"
+            idemp = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+        else:
+            idemp = _make_idempotency_key(work_record.goal_id, kind, problem_id, w_digest, ev_digest)
         return Decision(
             kind=kind,
             reason=reason,
@@ -136,7 +154,7 @@ def decide(
         )
 
     if policy.required_sources:
-        present_sources = {it.source for it in evidence.items}
+        present_sources = {it.source for it in evidence.items if it.read_status == "OK"}
         missing_sources = [s for s in policy.required_sources if s not in present_sources]
         if missing_sources:
             return make_decision(

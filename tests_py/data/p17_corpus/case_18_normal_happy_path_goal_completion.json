@@ -66,7 +66,7 @@
     "schema_version": 1,
     "status": "DONE",
     "successor": {
-      "handoff_idempotency_key": "idemp-p17-p18",
+      "handoff_idempotency_key": "fb23121e59094fe7e30dd710e34cbf59",
       "publication_state": "PENDING",
       "successor_goal_id": "P18",
       "successor_spec_digest": "sha256:p18-spec"

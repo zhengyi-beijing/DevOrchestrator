@@ -184,7 +184,10 @@ class P12PlannerSingleFlightTests(unittest.TestCase):
             )[0]
             self.assertEqual(result["command_id"], command["command_id"])
             self.assertEqual(result["state"], "blocked")
-            self.assertIn("requires IDLE", result["reason"])
+            self.assertEqual(
+                result["reason"],
+                "PENDING DESIGN continue requires IDLE, PLAN_FAILED, or PENDING_DESIGN lifecycle",
+            )
             self.assertEqual(planner.calls, [])
 
     def test_planner_rejects_second_active_plan_for_same_project(self):
