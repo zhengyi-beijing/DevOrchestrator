@@ -371,7 +371,7 @@ class ControlPlaneGitHistoryTests(unittest.TestCase):
         # Find commit cb1648e or declaration commit in repo
         try:
             log_out = subprocess.check_output(
-                ["git", "-C", str(repo_root), "log", "--oneline", "-n", "10"],
+                ["git", "-C", str(repo_root), "log", "--all", "--oneline", "--grep=declare control-plane impact"],
                 text=True,
             )
             # Check for the declaration-only commit
@@ -1035,6 +1035,32 @@ def record_metric(name: str, value: float) -> None:
             authority["owner_gate"]["gate_id"] = "cp-gate:p-trans:T1:declaration_absent"
             replayable_normal = _is_declaration_gate_replayable(blocked_normal, authority, current_head=head)
             self.assertFalse(replayable_normal)
+
+    def test_transient_declaration_unavailable_does_not_fabricate_review_scope_gap(self):
+        unavailable = ControlPlaneDeclaration(
+            kind="unavailable",
+            source_path="agent/next.md",
+            revision="review-head",
+            content_hash="",
+            invariants=(),
+            transition_boundaries=(),
+            fault_scenarios=(),
+            convergence_evidence="",
+            reason="git show timed out",
+        )
+        diff_result = MagicMock(returncode=0)
+        diff_result.stdout = "src/dev_orchestrator/core/transition_executor.py\n"
+        with unittest.mock.patch(
+            "dev_orchestrator.core.ai_reviewer.subprocess.run",
+            return_value=diff_result,
+        ), unittest.mock.patch(
+            "dev_orchestrator.core.ai_reviewer.load_control_plane_declaration",
+            return_value=unavailable,
+        ):
+            gaps = AIReviewerCoordinator._detect_scope_gaps(
+                "repo", "P16.14", "review-head", "launch-head",
+            )
+        self.assertEqual(gaps, [])
 
     def test_finding5_matches_protected_surface_word_boundaries(self):
         """Substring matching does not falsely match bare symbols like _launch inside worker_launch."""

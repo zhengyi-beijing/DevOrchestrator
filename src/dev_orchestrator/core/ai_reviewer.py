@@ -1891,6 +1891,12 @@ class AIReviewerCoordinator:
             if not changed_files:
                 return []
             decl = load_control_plane_declaration(repo_path, task_id, review_head)
+            # Declaration loading deliberately converts transient git/read
+            # failures into ``unavailable``.  That is not evidence that the
+            # declaration is absent or under-scoped, so review must stay
+            # neutral and let a later evaluation retry it.
+            if decl.kind == "unavailable":
+                return []
             return declared_scope_gap(decl, changed_files)
         except Exception:
             return []

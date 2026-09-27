@@ -9,6 +9,8 @@ from pathlib import Path
 from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
 from dev_orchestrator.ai.execution_port import MANAGED_INTERRUPT_REASON
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
+from dev_orchestrator.control.surface import project_control_view, project_identity
+from dev_orchestrator.core.control_commands import ControlCommandCoordinator, submit_control_command
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.transition_executor import TransitionExecutor, _execution_policy
 
@@ -459,6 +461,124 @@ class AIBrokerTransitionTests(unittest.TestCase):
             self.assertEqual(ledger["owner-continue-reanchor"]["review_decision_id"], decision_id)
             self.assertEqual(len(port.requests), 1)
             self.assertIn("current-head reviewer still requires bounded remediation", port.requests[0].prompt)
+
+    def test_owner_continue_runs_exact_budget_exhausted_review_remediation(self):
+        """The live P16.14 incident uses formal continue without relaxing its fences."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = self.make_repo(root); runtime = root / "runtime"; runtime.mkdir()
+            project = broker_project(repo)
+            project["execution"]["allowed_next_actions"] = ["next_task", "continue_current_stage"]
+            reviewed = read_repository_truth(repo)
+            (repo / "P17.md").write_text("later planning only\n", encoding="utf-8")
+            subprocess.run(["git", "add", "P17.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "plan(P17): descendant planning"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            current = read_repository_truth(repo)
+            source_id = "prior-remediation"
+            gate_id = "ai_review:budget-exhausted"
+            blocking = {
+                "file": "src/dev_orchestrator/core/ai_reviewer.py",
+                "summary": "BLOCKING: transient declaration read fabricated a scope gap",
+                "fix": "Treat unavailable declaration evidence as neutral.",
+                "regression_test": "tests_py/test_p1614_invariant_workflow.py::test_transient",
+            }
+            non_blocking = {
+                "file": "docs/followup.md",
+                "summary": "NON_BLOCKING: broader architecture belongs to P17",
+                "fix": "Document later.",
+                "regression_test": "none",
+            }
+            review = {
+                "review_id": gate_id, "project_id": "p1", "source_request_id": source_id,
+                "task_id": "P1", "repo_path": str(repo), "branch": current.branch,
+                "head": reviewed.head, "review_status_hash": current.status_hash,
+                "state": "completed", "decision": "owner_gate", "next_action": "stop",
+                "reason": "technical review remediation budget exhausted (3 >= 3); unresolved blocking finding requires owner disposition",
+                "remediation_round": 3, "max_remediation_rounds": 3,
+                "remediation_extension_granted": False,
+                "review_findings": [blocking, non_blocking],
+                "started_at": "2026-09-27T00:00:00+00:00",
+                "completed_at": "2026-09-27T00:01:00+00:00",
+            }
+            decision = {
+                "project_id": "p1", "request_id": gate_id, "disposition": "owner_gate",
+                "decision": "owner_gate", "next_action": "stop", "task_id": "P1",
+                "branch": current.branch, "head": reviewed.head,
+                "review_status_hash": current.status_hash, "role": "reviewer",
+                "event": "worker_done", "reason": review["reason"],
+            }
+            (runtime / "ai-reviewer.json").write_text(
+                json.dumps({"version": 1, "reviews": {gate_id: review}}), encoding="utf-8",
+            )
+            (runtime / "review-decisions.json").write_text(
+                json.dumps({"version": 1, "decisions": {gate_id: decision}}), encoding="utf-8",
+            )
+            (runtime / "transition-executor.json").write_text(json.dumps({
+                "version": 2,
+                "executions": {source_id: {
+                    "project_id": "p1", "source_request_id": source_id,
+                    "source_kind": "remediation", "task_id": "P1", "state": "completed",
+                    "branch": current.branch, "head": reviewed.head,
+                }},
+                "lifecycle": {}, "transitions": {},
+            }), encoding="utf-8")
+            config = root / "projects.json"
+            config.write_text(json.dumps({"version": 1, "projects": [project]}), encoding="utf-8")
+            snapshot = {
+                "project_id": "p1", "repo_path": str(repo), "state": "REVIEWING",
+                "lifecycle_state": "REVIEWING", "next_status": "**READY_TO_RUN**",
+                "git": {"branch": current.branch, "head": current.head, "dirty": False,
+                        "status_hash": current.status_hash},
+                "worker": {"state": "not_started", "kind": "none", "process_alive": False},
+                "telemetry": {"task_id": "P1"},
+            }
+            port = FakePort(); executor = TransitionExecutor(runtime, ai_execution_port=port)
+
+            # The narrow escape remains fail-closed on dirty state and task mismatch.
+            (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+            self.assertIsNone(executor.resume_exact_remediation(
+                project, snapshot, "dirty-owner-continue", review_gate_id=gate_id,
+            ))
+            self.assertIn(
+                "clean current worktree",
+                executor.state()["executions"]["dirty-owner-continue"]["reason"],
+            )
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            wrong_task = dict(snapshot)
+            wrong_task["telemetry"] = {"task_id": "P2"}
+            self.assertIsNone(executor.resume_exact_remediation(
+                project, wrong_task, "wrong-task-owner-continue", review_gate_id=gate_id,
+            ))
+            self.assertIn(
+                "task does not match",
+                executor.state()["executions"]["wrong-task-owner-continue"]["reason"],
+            )
+
+            view = project_control_view(snapshot, runtime, project)
+            continue_control = next(row for row in view["controls"] if row["action"] == "continue")
+            self.assertTrue(continue_control["available"])
+            self.assertEqual(continue_control["reason"], "continue exact owner-authorized review remediation")
+
+            command = submit_control_command(
+                runtime, "p1", "continue", command_id="owner-continue-budget-gate",
+                expected=project_identity(snapshot, runtime),
+            )
+            outcomes = ControlCommandCoordinator(runtime).advance(
+                config, {"projects": [snapshot]}, executor,
+            )
+            outcome = next(row for row in outcomes if row.get("command_id") == command["command_id"])
+            self.assertEqual(outcome["state"], "accepted")
+            self.assertEqual(outcome["effect"], "continue_exact_review_remediation")
+            executor._threads[command["command_id"]].join(timeout=2)
+            launched = executor.state()["executions"][command["command_id"]]
+            self.assertEqual(launched["source_kind"], "remediation")
+            self.assertEqual(launched["review_decision_id"], gate_id)
+            self.assertEqual(launched["reviewed_gate_head"], reviewed.head)
+            self.assertEqual(len(port.requests), 1)
+            self.assertIn(blocking["summary"], port.requests[0].prompt)
+            self.assertNotIn(non_blocking["summary"], port.requests[0].prompt)
 
     def test_prior_anchor_remediation_history_does_not_block_later_task(self):
         for with_descendant in (False, True):

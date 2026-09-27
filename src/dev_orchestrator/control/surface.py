@@ -71,6 +71,35 @@ def latest_owner_gate(runtime: Path | str, project_id: str) -> dict[str, Any] | 
 _latest_owner_gate = latest_owner_gate
 
 
+def is_bounded_review_remediation_gate(gate: Any) -> bool:
+    """Identify the one legacy review gate an owner may continue narrowly."""
+    if not isinstance(gate, dict):
+        return False
+    findings = gate.get("review_findings")
+    blocking = [
+        row for row in findings
+        if isinstance(row, dict)
+        and str(row.get("summary") or "").strip().upper().startswith("BLOCKING:")
+    ] if isinstance(findings, list) else []
+    try:
+        remediation_round = int(gate.get("remediation_round") or 0)
+        max_rounds = int(gate.get("max_remediation_rounds") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        gate.get("gate_source") == "reviewer"
+        and gate.get("state") == "completed"
+        and gate.get("decision") == "owner_gate"
+        and gate.get("next_action") == "stop"
+        and str(gate.get("reason") or "").startswith(
+            "technical review remediation budget exhausted ("
+        )
+        and remediation_round >= max_rounds > 0
+        and gate.get("remediation_extension_granted") is not True
+        and len(blocking) == 1
+    )
+
+
 def project_identity(snapshot: dict[str, Any], runtime_root: Path | str) -> dict[str, Any]:
     runtime = Path(runtime_root)
     projected = project_runtime_status(snapshot, runtime)
@@ -237,6 +266,15 @@ def project_control_view(
         and recoverable_plan_gate
         and not bool(identity.get("dirty"))
     )
+    review_recovery_continue_ready = (
+        is_bounded_review_remediation_gate(gate)
+        and execution_ready
+        and active is None
+        and not bool(identity.get("dirty"))
+        and gate.get("project_id") == project_id
+        and gate.get("task_id") == identity.get("task_id")
+        and gate.get("branch") == identity.get("branch")
+    )
     task_terminal = parsed_next_status.is_completed() and (
         lifecycle.upper() in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}
         or str(projected.get("state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}
@@ -244,6 +282,7 @@ def project_control_view(
     eligible_continue = not paused and not task_terminal and (
         (gate is None and ((lifecycle == "READY_TO_RUN" and execution_ready) or planning_start_ready))
         or recovery_continue_ready
+        or review_recovery_continue_ready
     )
     retry_target, retry_reason = resolve_retry_candidate(projected, runtime, project_config)
     safe_retry = retry_target is not None and not task_terminal
@@ -324,7 +363,11 @@ def project_control_view(
                 else (
                     "recover bounded technical plan review"
                     if recovery_continue_ready and eligible_continue
-                    else ("current state can continue" if eligible_continue else "project is paused or not continuable")
+                    else (
+                        "continue exact owner-authorized review remediation"
+                        if review_recovery_continue_ready and eligible_continue
+                        else ("current state can continue" if eligible_continue else "project is paused or not continuable")
+                    )
                 )
             ),
         },

@@ -19,7 +19,12 @@ from dev_orchestrator.control.command_store import (
 from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.control.reconcile import resolve_reconcile_candidate, resolve_retry_candidate
 from dev_orchestrator.control.store import ConversationConflictError, ConversationControlStore
-from dev_orchestrator.control.surface import _active_execution, validate_expected
+from dev_orchestrator.control.surface import (
+    _active_execution,
+    is_bounded_review_remediation_gate,
+    latest_owner_gate,
+    validate_expected,
+)
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.project_status import project_runtime_status
@@ -633,6 +638,39 @@ class ControlCommandCoordinator:
                     "execution_id": (active_exec.get("source_request_id") or active_exec.get("broker_request_id")) if active_exec else worker.get("task_id"),
                     "task_id": current_task_id,
                 }
+
+        if action == "continue":
+            review_gate = latest_owner_gate(self.runtime_root, project_id)
+            gate_id = _nonblank(observed.get("gate_id"))
+            if (
+                is_bounded_review_remediation_gate(review_gate)
+                and gate_id is not None
+                and gate_id == _nonblank(review_gate.get("review_id"))
+            ):
+                resume_exact = getattr(executor, "resume_exact_remediation", None)
+                if not callable(resume_exact):
+                    return self._blocked(
+                        command_id, project_id, action,
+                        "exact review remediation adapter is unavailable", now, record,
+                    )
+                launch = resume_exact(
+                    projects[project_id], snapshot, command_id,
+                    review_gate_id=gate_id,
+                )
+                if launch is not None:
+                    return {
+                        **record, "state": "accepted", "processed_at": now,
+                        "effect": "continue_exact_review_remediation",
+                        "gate_id": gate_id, "task_id": launch.task_id,
+                        "backend_id": launch.backend_id,
+                    }
+                state = executor.state().get("executions", {}).get(command_id, {})
+                reason = state.get("reason") if isinstance(state, dict) else None
+                return self._blocked(
+                    command_id, project_id, action,
+                    str(reason or "exact review remediation was not safely resumable"),
+                    now, record,
+                )
 
         if parse_task_status(snapshot.get("next_status")).is_pending_design():
             lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "")

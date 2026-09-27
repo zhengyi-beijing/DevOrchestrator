@@ -88,6 +88,18 @@ P16.14 Technical Review third-round remediation evidence (2026-09-27):
   - `git diff --check`: 0 errors.
   - `graphify update .`: updated cleanly.
 
+P16.14 final blocker remediation evidence, pending formal live acceptance (2026-09-27):
+- Fixed the sole remaining `BLOCKING` review finding: `AIReviewerCoordinator._detect_scope_gaps` now treats a committed declaration with `kind="unavailable"` as transiently unevaluable and returns no scope gap, while absent, invalid, ambiguous, and under-scoped declarations retain their existing fail-closed findings.
+- Preserved the production review-budget/owner-continue stall as an end-to-end regression. A formal `continue` may reach `resume_exact_remediation` only for the exact latest completed reviewer gate with an exhausted remediation budget, exactly one explicitly `BLOCKING:` finding, matching task/project/branch/clean fingerprint, a current HEAD equal to or descended from the reviewed HEAD, matching completed source-remediation evidence, and no active Worker. Dirty state, task mismatch, non-descendant HEAD, ambiguous findings, and superseded gates remain fenced.
+- The remediation prompt contains only the single blocking finding and explicitly excludes non-blocking/P17 architectural follow-ups. No macro lifecycle state was added. Broader convergence-controller and owner-gate simplification remains in staged P17, including replay of this incident, and P17 remains prohibited from starting except by accepted P16.14 handoff.
+- Verification:
+  - `tests_py/test_p1614_invariant_workflow.py`: 43/43 passed.
+  - Touched control/reviewer/executor suites: 78 passed with 14 subtests.
+  - Full repository suite with isolated basetemp: 1,365 passed with 102 subtests in 562.67s.
+  - `python ops/p1614_evidence.py`: fault registry valid (10 scenarios).
+  - `python -m compileall -q src ops tests_py`: 0 errors.
+  - `git diff --check`: 0 errors.
+
 
 P16.13 final closure evidence (2026-09-26):
 - Restarted the canonical daemon from stale PID 26264 onto the committed

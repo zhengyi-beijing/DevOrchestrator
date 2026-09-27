@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -68,6 +69,7 @@ from dev_orchestrator.core.execution_lifecycle import (
 from dev_orchestrator.core.project_status import write_execution_status
 from dev_orchestrator.core.websol import NextAction, WebSolEvent, WebSolRole
 from dev_orchestrator.monitor.telemetry import extract_task_id
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
 ACTUATION_FILE = "transition-executor.json"
@@ -1434,7 +1436,7 @@ class TransitionExecutor:
         expected_branch: str, expected_head: str,
     ) -> str:
         """Check recovery truth without relabelling a reviewed task as next.md."""
-        if snapshot.get("state") not in ("READY_TO_RUN", "WAITING_REVIEW", "IDLE"):
+        if snapshot.get("state") not in ("READY_TO_RUN", "WAITING_REVIEW", "REVIEWING", "IDLE"):
             return "project state is not eligible for exact remediation"
         if _external_worker_active(snapshot):
             return "an external task Worker is already active"
@@ -3833,6 +3835,7 @@ class TransitionExecutor:
 
     def resume_exact_remediation(
         self, project: dict[str, Any], snapshot: dict[str, Any], source_request_id: str,
+        *, review_gate_id: str | None = None,
     ) -> Optional[ActuationLaunch]:
         """Let owner resume recover only the exact safe remediation shape.
 
@@ -3844,6 +3847,11 @@ class TransitionExecutor:
         truth = read_repository_truth(project.get("repo_path") or "")
         if policy is None or not truth.valid:
             return None
+        if review_gate_id is not None:
+            return self._resume_budget_exhausted_review_gate(
+                project, snapshot, source_request_id, review_gate_id,
+                policy=policy, truth=truth,
+            )
         decisions = self._load_decisions()
         with self._lock:
             failed, decision, fingerprint_evidence, error = self._pre_execution_remediation_retry(
@@ -3855,6 +3863,165 @@ class TransitionExecutor:
             return None
         return self.start_control(
             project, snapshot, source_request_id, exact_remediation_only=True,
+        )
+
+    def _resume_budget_exhausted_review_gate(
+        self,
+        project: dict[str, Any],
+        snapshot: dict[str, Any],
+        source_request_id: str,
+        review_gate_id: str,
+        *,
+        policy: dict[str, Any],
+        truth: Any,
+    ) -> Optional[ActuationLaunch]:
+        """Continue one exact localized review finding after its legacy budget gate."""
+        project_id = str(project.get("project_id") or "")
+        task_id = _current_task_id(snapshot)
+        reviews_raw = read_json(self.runtime_root / "ai-reviewer.json", {})
+        reviews = reviews_raw.get("reviews") if isinstance(reviews_raw, dict) else None
+        review = reviews.get(review_gate_id) if isinstance(reviews, dict) else None
+        decision = self._load_decisions().get(review_gate_id)
+
+        error = "technical review owner gate is not an exact bounded remediation"
+        blocking: list[dict[str, Any]] = []
+        if isinstance(review, dict):
+            findings = review.get("review_findings")
+            if isinstance(findings, list):
+                blocking = [
+                    copy.deepcopy(row) for row in findings
+                    if isinstance(row, dict)
+                    and str(row.get("summary") or "").strip().upper().startswith("BLOCKING:")
+                ]
+        try:
+            remediation_round = int(review.get("remediation_round") or 0) if isinstance(review, dict) else 0
+            max_rounds = int(review.get("max_remediation_rounds") or 0) if isinstance(review, dict) else 0
+        except (TypeError, ValueError):
+            remediation_round = max_rounds = 0
+
+        if not isinstance(review, dict) or not isinstance(decision, dict):
+            error = "technical review owner gate evidence is unavailable"
+        elif not (
+            review.get("review_id") == review_gate_id
+            and review.get("state") == "completed"
+            and review.get("decision") == "owner_gate"
+            and review.get("next_action") == "stop"
+            and str(review.get("reason") or "").startswith(
+                "technical review remediation budget exhausted ("
+            )
+            and remediation_round >= max_rounds > 0
+            and review.get("remediation_extension_granted") is not True
+            and len(blocking) == 1
+        ):
+            error = "technical review owner gate is not a single localized exhausted-budget finding"
+        elif not (
+            decision.get("request_id") == review_gate_id
+            and decision.get("disposition") == "owner_gate"
+            and decision.get("decision") == "owner_gate"
+            and decision.get("next_action") == "stop"
+            and decision.get("role") == WebSolRole.REVIEWER.value
+            and decision.get("event") == WebSolEvent.WORKER_DONE.value
+        ):
+            error = "technical review owner gate decision evidence does not match"
+        elif task_id is None or review.get("task_id") != task_id or decision.get("task_id") != task_id:
+            error = "technical review owner gate task does not match current task"
+        elif review.get("project_id") != project_id or decision.get("project_id") != project_id:
+            error = "technical review owner gate project does not match"
+        elif truth.dirty:
+            error = "exact review remediation requires a clean current worktree"
+        elif review.get("branch") != truth.branch or decision.get("branch") != truth.branch:
+            error = "technical review owner gate branch does not match current branch"
+        elif review.get("review_status_hash") != truth.status_hash or decision.get("review_status_hash") != truth.status_hash:
+            error = "technical review owner gate dirty fingerprint does not match current worktree"
+        elif NextAction.CONTINUE_CURRENT_STAGE.value not in policy["allowed_next_actions"]:
+            error = "review-driven remediation is not owner-authorized by project execution policy"
+        else:
+            review_head = _non_blank_config(review.get("head"))
+            decision_head = _non_blank_config(decision.get("head"))
+            if review_head is None or review_head != decision_head:
+                error = "technical review owner gate HEAD evidence is incomplete"
+            elif review_head != truth.head:
+                try:
+                    ancestry = subprocess.run(
+                        ["git", "-C", str(project.get("repo_path") or ""),
+                         "merge-base", "--is-ancestor", review_head, truth.head],
+                        capture_output=True, timeout=15, **hidden_subprocess_kwargs(),
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    error = "exhausted review gate ancestry is temporarily unavailable"
+                else:
+                    if ancestry.returncode != 0:
+                        error = "current HEAD is not a descendant of the exhausted review gate"
+                    else:
+                        error = ""
+            else:
+                error = ""
+
+        source_execution_id = _non_blank_config(review.get("source_request_id")) if isinstance(review, dict) else None
+        with self._lock:
+            ledger = self._load_ledger()
+            source_execution = ledger.get("executions", {}).get(source_execution_id or "")
+            if not error and self._active_project(ledger, project_id):
+                error = "another managed Worker is already active"
+            if not error and not (
+                source_execution_id is not None
+                and isinstance(source_execution, dict)
+                and source_execution.get("project_id") == project_id
+                and source_execution.get("task_id") == task_id
+                and source_execution.get("source_kind") == "remediation"
+                and source_execution.get("state") == "completed"
+            ):
+                error = "technical review owner gate source remediation evidence does not match"
+            if not error:
+                later = [
+                    row for rid, row in (reviews or {}).items()
+                    if rid != review_gate_id
+                    and isinstance(row, dict)
+                    and row.get("project_id") == project_id
+                    and row.get("task_id") == task_id
+                    and str(row.get("started_at") or "") > str(review.get("started_at") or "")
+                ]
+                if later:
+                    error = "technical review owner gate has been superseded"
+
+        if error:
+            self._record_blocked(
+                source_request_id, project_id, error,
+                task_id=task_id, source_kind="remediation",
+            )
+            return None
+
+        guard_error = self._recovery_fresh_guard(
+            project, snapshot, expected_branch=truth.branch, expected_head=truth.head,
+        )
+        if guard_error:
+            self._record_blocked(
+                source_request_id, project_id, guard_error,
+                task_id=task_id, source_kind="remediation",
+            )
+            return None
+        bounded_evidence = copy.deepcopy(decision)
+        bounded_evidence["decision"] = "remediate"
+        bounded_evidence["next_action"] = NextAction.CONTINUE_CURRENT_STAGE.value
+        bounded_evidence["findings"] = blocking
+        prompt = (
+            str(policy["remediation_prompt"])
+            + f"\nOwner authorized only the single blocking finding from exhausted review gate {review_gate_id}. "
+              "Do not address non-blocking follow-ups or broaden lifecycle architecture.\n\n"
+            + self._review_evidence(bounded_evidence)
+        )
+        return self._launch(
+            project, source_request_id=source_request_id, source_kind="remediation",
+            task_id=str(task_id), source_task_id=str(task_id),
+            branch=truth.branch, head=truth.head, worker_prompt=prompt, policy=policy,
+            lineage={
+                "recovery_of": source_execution_id,
+                "review_decision_id": review_gate_id,
+                "owner_gate_review_id": review_gate_id,
+                "recovery_reason": "owner continue for exact exhausted-review remediation",
+                "review_status_hash": truth.status_hash,
+                "reviewed_gate_head": review.get("head"),
+            },
         )
 
     def _advance_completed_predecessor_handoffs(

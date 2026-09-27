@@ -52,6 +52,12 @@ P16.14 Invariant-Driven Control-Plane Development & Validation (complete 2026-09
   - Python compilation and `git diff --check` clean.
   - Knowledge graph updated via `graphify update .`.
 
+P16.14 final blocker remediation, pending formal live acceptance (2026-09-27):
+- Review-time declaration/scope-gap detection now treats `kind="unavailable"` as transient evidence and cannot fabricate `CONTROL_PLANE_SCOPE_GAP`; genuine absent, malformed, ambiguous, and under-scoped declarations remain enforced.
+- Added the negative transient-read regression and preserved the live budget-exhausted owner-continue incident as a formal-control regression. The narrow continuation reuses `resume_exact_remediation`, permits only one explicitly blocking finding, and retains task, project, branch, clean fingerprint, descendant-HEAD, source-remediation, supersession, and active-ownership fences.
+- No new macro lifecycle state was introduced. The broader legacy-control-plane simplification remains explicitly deferred to staged P17, whose normal successor handoff is still required.
+- Verification: 43 focused P16.14 tests; 78 touched control/reviewer/executor tests plus 14 subtests; full suite 1,365 tests plus 102 subtests in 562.67s; evidence registry valid; compileall and diff checks clean.
+
 P16.12 Web Sol Persistent Pairing & Truthful Availability (complete 2026-09-25):
 - Implemented persistent pairing, truthful multi-signal availability, probe lifecycle, and failover:
   1. Capability Security Hardening (`src/dev_orchestrator/control/security.py`):
