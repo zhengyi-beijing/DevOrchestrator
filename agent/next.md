@@ -1,133 +1,76 @@
-# P16.14 Invariant-Driven Control-Plane Development & Validation
+# P17 - Backlog Reconciliation & Simplified Convergence Controller Baseline
 
-Status: **COMPLETE**
+Status: **PENDING DESIGN**
 
-Predecessor: P16.13
+Predecessor: P16.14
 
-## Goal
-Institutionalize the invariant-driven control-plane engineering method proven during P16.13 so future lifecycle changes are designed, tested, reviewed, and accepted against explicit invariants rather than accumulated incident-specific patches.
 
-P16.14 is the sole closing objective currently defined for P16. Do not predefine P16.15 or P16.16.
+## Objective
+Reconcile the DevOrchestrator backlog against implementation after P1-P16.14, then design and validate a simpler top-level Goal Convergence Controller. Do not extend the legacy lifecycle state machine merely to cover additional state combinations.
 
-## Scope
-- Make invariant-first planning a required control-plane design step.
-- Require an explicit transition/fault model for lifecycle-affecting changes.
-- Turn relevant historical lifecycle failures into durable fault-injection scenarios.
-- Require adversarial review against invariants and transition boundaries, not only happy-path functional review.
-- Define measurable recovery/convergence evidence for autonomous recovery paths.
-- Reuse the P16.13 authoritative lifecycle, transition journal, centralized invariant evaluator, and zero-touch recovery mechanisms rather than creating a parallel control plane.
-- Preserve fail-closed OWNER_GATE behavior when ownership or recovery evidence is ambiguous.
+## Architectural hypothesis to validate
+The top-level controller should reason primarily about: (1) is the current goal satisfied, (2) if not, is there active progress, and (3) if not, is a true human decision required.
+Target loop: Goal -> Execute -> Verify -> Diagnose -> Retry/Failover or capability escalation -> Verify. When the current problem is solved, advance to the next goal. When a bounded per-problem attempt limit is exhausted, write a complete HANDOFF and wait for human handling.
 
-## Acceptance
-1. A control-plane task can declare the invariants and transition boundaries it may affect before implementation starts.
-2. Its validation plan includes normal-path tests plus fault injection for the declared transition/failure model.
-3. Review explicitly checks invariant preservation, idempotence, restart/replay behavior, and fail-closed boundaries.
-4. Recovery tests record evidence that the system converges to one authoritative lifecycle owner without manual continue when evidence is unambiguous.
-5. Repeated ticks/restarts do not duplicate handoffs, Workers, Reviews, remediation, or recovery actions.
-6. Ambiguous ownership, contradictory authority, or non-converging recovery fails closed instead of creating autonomous work.
-7. At least one representative post-P16.13 control-plane change is exercised through the invariant-first workflow end-to-end.
-8. Full regression remains green and the resulting method is documented as the default control-plane development/validation contract.
+Detailed lifecycle/provider/reviewer states remain telemetry and safety evidence where useful; they should not unnecessarily multiply top-level control-flow states.
 
-## Relationship to P16.13
-P16.13 repaired and validated successor consistency and zero-touch handoff recovery. P16.14 does not reopen that incident. It generalizes the engineering method used there—explicit invariants, transition/fault modeling, fault injection, adversarial review, and convergence evidence—so the same class of lifecycle defects is prevented or detected systematically.
+## Owner-gate policy hypothesis
+Owner gate should be reserved for genuine human input: ambiguous requirements/value choices, irreversible or high-risk actions, missing human-only information/credentials/permissions, explicit resource/cost authorization, or safety policy.
+Technical failures such as test failure, reviewer blocker, provider quota/unavailability, process death, handoff loss, transient git failure, retry-budget exhaustion, or no-active-progress should normally drive diagnosis/retry/failover/escalation rather than owner gate when a safe next action exists.
 
-## Planning constraint
-Start through the normal roadmap successor/handoff mechanism. Do not manually launch a Worker merely to bypass lifecycle planning. P16.14 must itself exercise the P16.13 successor path.
+## Simplified controller prototype
+Define an independent ConvergenceController v0 rather than replacing the existing controller immediately.
+Use per-problem/failure-fingerprint attempt budgets, not a task-wide remediation counter. Infrastructure failures should retry/fail over at the same capability tier; repeated reasoning/implementation failures may escalate capability tier. Provider/account selection remains an AI Broker responsibility.
+At the per-problem limit, persist Goal, acceptance criteria, attempts/models/strategies/results, current blocker, logs/tests/diffs/reviewer evidence, ruled-out approaches, recommended human action, and resumable checkpoint into HANDOFF.
 
-## Control-Plane Impact
-- Invariants: CURRENT_TASK_MATCHES_ACTIVE_EXECUTION, TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION, PENDING_DESIGN_NOT_EXECUTING, SUCCESSOR_HANDOFF_LINEAGE_VALID, NEXT_TASK_WITHOUT_HANDOFF, SINGLE_ACTIVE_LIFECYCLE_OWNER
-- Transition boundaries: plan_freeze, worker_launch, special_gate_reconciliation, owner_gate_transition, successor_handoff, handoff_publication, authority_reconciliation, watchdog_recovery
-- Fault scenarios: CPF-01, CPF-02, CPF-03, CPF-04, CPF-05, CPF-06, CPF-07, CPF-08, CPF-09, CPF-10
-- Convergence evidence: Unambiguous convergence to a single authoritative owner without manual continue, zero duplicate handoffs or workers, and fail-closed OWNER_GATE on contradictory authority.
+## Stable runtime vs development workspace isolation
+Re-establish an explicit separation between the stable DevOrchestrator runtime/application workspace and the self-development workspace. Validate the intended roles of `C:\work\github\DevOrchestrator` as the stable/runtime application tree and `C:\work\github\DevOrchestrator-dev` as the development tree; do not assume current drift is correct without evidence.
 
-## Approved executable design
+The production/stable controller should orchestrate work against the development tree so Worker/test/Reviewer activity can modify or temporarily break `-dev` without simultaneously mutating the controller that is supervising recovery. Runtime state, daemon ownership, configuration, logs/checkpoints, and promotion boundaries must have one canonical location and must not be ambiguously split across both trees.
 
-Establish an invariant-first contract for lifecycle-affecting tasks using task-level classification, committed declarations, durable fault scenarios, adversarial review, and convergence evidence. Classification is based only on the current task artifact, candidate approved design, and an exact protected runtime-surface inventory; repository identity never classifies all DevOrchestrator work as control-plane. Declaration refusals use the complete authoritative OWNER_GATE representation, and special-gate reconciliation occurs before the generic owner-gate fence so a repaired HEAD can safely resume.
+Define an evidence-backed promotion path: develop/test/review in `DevOrchestrator-dev` -> accepted revision -> promote/update stable `DevOrchestrator` -> controlled runtime restart/health verification. Promotion must be explicit, idempotent, fail closed on dirty/ambiguous HEADs, and preserve rollback/recovery evidence.
 
-### Implementation steps
-- As the Worker's first commit, before changing source, add the P16.14 `## Control-Plane Impact` declaration to `agent/next.md`; include the six existing invariant codes, affected transition boundaries, registered fault-scenario ids, and convergence expectations. This declaration-only commit provides historical evidence that P16.14 declared impact before implementation. Mirror staged content only if successor publication rules permit it.
-- Add `core/control_plane_contract.py` with bounded parsing for exactly one `## Control-Plane Impact` section containing `Invariants:`, `Transition boundaries:`, `Fault scenarios:`, and `Convergence evidence:`. Return deterministic `declared`, `absent`, `invalid`, `ambiguous`, or `unavailable` results; validate invariant codes and transition boundaries against owned registries and never infer valid content from malformed input.
-- Define a task-level `classify_control_plane_task` rule. A task is control-plane only when its declaration explicitly says so, its candidate plan or committed approved design names an exact protected runtime surface, or its task contract explicitly identifies lifecycle authority/transition behavior. Do not inspect repository identity or the mere existence of `lifecycle_authority.py`. Documentation, UI, provider, and benchmark paths are excluded unless their plan also changes a protected runtime surface.
-- Freeze `CONTROL_PLANE_RUNTIME_SURFACES` as exact paths and symbols covering lifecycle authority/invariants, transition publication and launch fencing, successor consistency, owner-gate transitions, and watchdog lifecycle recovery. At plan freeze inspect the structured candidate plan; at Worker launch inspect only the committed approved task artifact at the requested HEAD; at Technical Review additionally inspect changed paths. An explicit ordinary classification conflicting with a protected planned surface is invalid rather than an opt-out.
-- Add bounded committed-artifact loading using `git show <head>:agent/next.md`, with timeout and deterministic unavailable results. The launch check must use the same repository, branch, task id, and HEAD already authenticated by launch truth; it must not accept an in-memory plan or a worktree file as authority.
-- Integrate classification and declaration validation into `AIPlannerCoordinator` before `_render_next` and `_commit_plan`. A control-plane candidate must contain a canonical declaration in its plan interfaces and reference every required fault scenario in validation. Route failures through the existing bounded plan-remediation path without changing the seven-key planner JSON or reviewer decision schemas.
-- Extend `_render_next` to materialize the validated canonical declaration as one `## Control-Plane Impact` section alongside `## Approved executable design`. Ordinary tasks receive no declaration section. This makes future declarations part of the Planner's committed plan artifact before any Worker starts.
-- Create `core/control_plane_faults.py` with stable append-only `CPF-` scenarios for the relevant P16.12/P16.13 failures and P16.14 declaration-gate cases. Each scenario records origin task, invariant codes, transition boundary, expectation, description, and resolvable test reference; provide lookup and required-scenario selection helpers.
-- Implement a complete authoritative gate transition in `lifecycle_authority.py`: opening `CONTROL_PLANE_DECLARATION_REQUIRED` atomically sets both `owner_gate` and `lifecycle_state="OWNER_GATE"`, stores the safe prior resumable state in the gate, leaves lifecycle ownership/generation/transition identity unchanged, and uses a stable gate id. Repeating the same refusal performs no write or timestamp refresh.
-- Add an additive lifecycle-authority schema revision for bounded `resolved_owner_gates` history. Resolving the declaration gate appends its original evidence once, stamps resolution metadata, clears `owner_gate`, and restores only the validated stored resumable state. Existing authority rows are accepted and lazily upgraded when this contract is used; projections must continue treating non-null `owner_gate` and `OWNER_GATE` as one consistent state.
-- Reorder both legacy and AIBroker launch paths so an existing `CONTROL_PLANE_DECLARATION_REQUIRED` gate is evaluated after task/head authentication but before the generic `owner_gate` refusal. If the new committed HEAD has a valid covered declaration, archive and clear only that gate, restore its resumable state, and continue through all existing fences. If it remains invalid, preserve the complete OWNER_GATE state. Every other owner-gate code retains current behavior.
-- Make the repair attempt reachable when the original source request already has a blocked execution row: permit replay only for a row explicitly blocked by this gate, only against a different authenticated HEAD, and only while the matching special gate is authoritative. Preserve the prior block in replay/archive evidence. Same-HEAD retries and all other durable blocked rows remain non-replayable.
-- After special-gate reconciliation, preserve the existing generic owner-gate and PENDING_DESIGN fences. Only after those pass should the launch path classify and validate the task. A new refusal writes the complete OWNER_GATE transition plus the existing blocked-actuation record and creates no launching/running execution or transition-journal row.
-- Add bounded, idempotent contract prompt injection for Planner, Plan Reviewer, Worker/Remediator, and Technical Reviewer. Include declared invariants, boundaries, required scenario ids, and checks for invariant preservation, idempotence, restart/replay, and fail-closed behavior. Add Technical Review scope-gap reporting when the actual diff touches a protected surface not represented by the declaration.
-- Add read-only `convergence_evidence` and `traversal_evidence` projections over the existing authority, transition journal, executions, planner, reviewer, and decision ledgers. Report missing evidence explicitly and include current gate, resolved gate identity, authoritative owner, invariant verdicts, handoffs, transitions, generation, recovery attempts, and manual-intervention status.
-- Add focused tests for parsing, task-level classification, plan rendering/freeze, artifact authentication, prompt injection, fault-registry integrity, scope-gap detection, and ordinary tasks. Include explicit UI, provider, documentation-only, and benchmark plans in this repository and prove they remain ordinary when they do not name protected runtime surfaces.
-- Add real-ledger tests for the complete gate lifecycle: initial refusal produces `OWNER_GATE` plus a matching gate; repeated same-HEAD attempts are byte-stable; generic gates remain fenced; a repaired HEAD reaches reconciliation despite the prior blocked request, archives exactly once, restores the resumable state, and launches exactly one Worker through both execution engines.
-- Add fault-injection and end-to-end tests covering normal execution, lost handoff convergence, restart/replay, ambiguous ownership, contradictory authority, non-converging recovery, and a representative post-P16.13 control-plane task progressing through declaration, plan approval, Worker launch, Technical Review, and final convergence.
-- Document the task-level classification rule, declaration grammar, authoritative gate transition, repair ordering, fault registry, review checklist, and convergence criteria in `docs/CONTROL_PLANE_INVARIANT_METHOD_CONTRACT.md` and a bounded section of `docs/development-workflow.md`. Add a read-only evidence script, record final evidence in `agent/CURRENT.md`, and run `graphify update .` after code and documentation changes.
+P17 must inventory current path usage and runtime drift before changing deployment. The ConvergenceController v0 design must assume this stable-runtime/development-workspace isolation rather than self-modifying its own live source tree.
+## Periodic meta-architecture review
+Add and validate a System Architect / Meta Reviewer role that reviews system evolution rather than only the current patch. It must inspect a bounded cross-task window of incidents, remediations, owner gates, manual-continue events, lifecycle branches/invariants, provider failures, and repeated failure fingerprints, then ask whether repeated local fixes indicate a wrong abstraction or state-space growth.
 
-### Interfaces / contracts
-- `classify_control_plane_task(*, task_text, candidate_plan=None, changed_paths=None) -> ControlPlaneScope` returns `control_plane|ordinary|invalid|unevaluable`, matched protected surfaces, and evidence source. Repository name, project id, and the existence of control-plane files are never classification inputs.
-- `CONTROL_PLANE_RUNTIME_SURFACES` is an exact, reviewed inventory of lifecycle authority/invariant symbols, transition and launch-fence symbols, successor consistency, owner-gate transition helpers, and watchdog lifecycle recovery. Documentation, UI, provider adapters, and benchmark paths are not protected surfaces by themselves.
-- `parse_control_plane_declaration(text, task_id) -> ControlPlaneDeclaration` and `load_control_plane_declaration(repo_path, task_id, head) -> ControlPlaneDeclaration`, with kinds `declared|absent|invalid|ambiguous|unavailable`, source path, revision, content hash, invariants, boundaries, scenarios, and convergence expectations.
-- The canonical declaration grammar is exactly one `## Control-Plane Impact` section with `Invariants:`, `Transition boundaries:`, `Fault scenarios:`, and `Convergence evidence:` lines. Unknown identifiers, duplicates, conflicts, empty fields, oversized content, or unavailable committed bytes fail closed for a task classified as control-plane.
-- `require_control_plane_declaration(project_id, task_id, scope, declaration, plan=None) -> ControlPlaneGate` returns allowed status, reason, stable `gate_id`, required scenarios, and evidence. Its sole lifecycle gate code is `CONTROL_PLANE_DECLARATION_REQUIRED`.
-- Plan-time classification uses the original task plus structured candidate plan. Launch-time classification uses the committed `agent/next.md` at the authenticated launch HEAD, which contains the approved design and rendered declaration. Review-time classification may additionally use the reviewed diff.
-- Authoritative refusal representation: `lifecycle_state` is `OWNER_GATE` whenever `owner_gate` is non-null. The gate contains `state`, `code`, `gate_id`, task/head/hash evidence, `resume_state`, reason, and durable first `recorded_at`. `active_owner`, generation, task identity, transition identity, and recovery epoch inputs do not change.
-- Authoritative repair representation: the resolved gate is appended once to bounded `resolved_owner_gates`, including original evidence, `resolved_at`, and reason; `owner_gate` becomes null; `lifecycle_state` returns to the validated `resume_state` before ordinary fences run. Only `CONTROL_PLANE_DECLARATION_REQUIRED` is automatically resolvable.
-- Launch ordering is task identity/head authentication, replay eligibility for the special blocked row, special declaration-gate reconciliation, generic owner-gate fence, PENDING_DESIGN fence, current declaration evaluation, existing launch barriers/concurrency checks, then execution creation. Other gate semantics are unchanged.
-- Lifecycle authority schema advances additively to represent resolved authoritative gates. Existing records without history remain readable; upgrade occurs only during a gate transition, and history is bounded and deduplicated by `gate_id`. The top-level transition journal remains the existing journal and receives no declaration-gate pseudo-transition.
-- The existing blocked execution row gains structured declaration-gate evidence sufficient to authorize a different-HEAD replay. It remains terminal on the same HEAD, for nonmatching gates, or for any other blocked reason; successful replay records the prior block rather than silently erasing it.
-- `FaultScenario` contains stable scenario id, origin task, invariant codes, transition boundary, expectation, description, and test reference. `fault_scenarios`, `scenarios_for_invariant`, and `required_scenarios_for` are read-only lookups over the append-only registry.
-- `declaration_prompt_block`, `inject_control_plane_contract`, and `declared_scope_gap` produce one bounded canonical prompt fragment and a deterministic review-time gap result without changing existing role response schemas.
-- `convergence_evidence` and `traversal_evidence` are read-only projections. They do not write ledgers, create recovery work, clear gates, or introduce a second lifecycle authority.
+Define measurable trigger candidates such as repeated failures from one family, repeated remediation on one subsystem, repeated human `continue` used only to restart safe progress, or sustained growth in lifecycle transitions/invariants. A trigger starts an architecture review; it must not itself mutate production code or bypass normal acceptance.
 
-### Validation plan
-- Run `python -m pytest tests_py/test_p1614_invariant_workflow.py -q` for the new contract, gate, fault, prompt, evidence, and end-to-end coverage.
-- Classification tests prove P16.14 and candidate plans naming protected runtime surfaces are control-plane, while unrelated UI, provider, documentation-only, and benchmark tasks in the same DevOrchestrator repository remain ordinary. The presence of `lifecycle_authority.py` alone must have no effect.
-- Plan-freeze tests prove a control-plane plan cannot be committed without a valid canonical declaration and coverage of all required scenario ids, while an ordinary plan follows the existing path unchanged. The rendered committed artifact contains exactly one declaration before Worker launch.
-- Git-history validation proves P16.14's declaration-only commit precedes its first source-code change.
-- Artifact tests prove launch evaluation reads committed bytes at the authenticated HEAD, rejects missing/unreadable or mismatched evidence, and does not trust uncommitted worktree changes or caller-supplied plan content.
-- Authority tests assert every declaration refusal has both `lifecycle_state="OWNER_GATE"` and a non-null matching gate. Generation, current task, source task, active transition, active owner, recovery-epoch inputs, and transition rows remain unchanged; no launching/running execution is created.
-- Idempotence tests compare serialized authority and execution ledgers across repeated same-HEAD attempts and require no timestamp or gate-id change. A changed but still invalid HEAD remains fenced without autonomous work.
-- Ordering and repair tests begin with a durable blocked request plus the special gate, commit a valid declaration at a new HEAD, and prove both legacy and AIBroker paths reach reconciliation before the generic fence, archive the gate once, restore the resumable state, and launch exactly one Worker.
-- Generic-gate regression tests prove every non-declaration owner gate still returns at the existing fence and is never archived, cleared, replayed, or reclassified by the new logic.
-- Schema compatibility tests load version-1 authority rows, preserve their behavior byte-for-byte when the new contract is unused, and lazily upgrade only the row undergoing a declaration-gate transition. Current projections must never observe a non-null gate paired with a non-OWNER_GATE lifecycle state.
-- Prompt tests require the adversarial checklist exactly once for each applicable role, bounded output size, explicit declared invariants and scenarios, and a Technical Review scope-gap finding when changed protected surfaces exceed the declaration.
-- Fault-registry tests require unique stable ids, known invariant codes and boundaries, allowed expectations, coverage of every lifecycle invariant, and test references resolving to real tests.
-- Recovery tests record convergence to one authoritative owner without manual continue when evidence is unambiguous; repeated ticks and restart mid-transition must not duplicate handoffs, Workers, Reviews, remediation, gates, archives, or recovery attempts.
-- Fail-closed tests cover ambiguous successor evidence, contradictory ownership, unavailable lifecycle evidence, durably refused transitions, and non-converging recovery, asserting a consistent durable OWNER_GATE and zero autonomous work.
-- The unconditional end-to-end test exercises a representative post-P16.13 control-plane change through classification, declaration, plan freeze, plan review, Worker launch, injected fault scenarios, adversarial Technical Review, and convergence, with traversal evidence reporting real identities for every stage.
-- Run touched regressions for `test_ai_planner.py`, `test_ai_reviewer.py`, `test_p1613_successor_consistency.py`, `test_workflow_policy.py`, `test_lifecycle_projection.py`, `test_staged_handoff.py`, `test_p168_golden_path.py`, `test_p169_watchdog_execution_loss.py`, and `test_p1610_owner_gate_and_attribution.py`.
-- Run `python ops/p1613_lifecycle_smoke.py`, the new read-only P16.14 evidence script, `python -m pytest tests_py -q`, `python -m compileall src`, and `git diff --check`. Execute each as a separate PowerShell statement with explicit `$LASTEXITCODE` handling; do not use `&&` or `||` in Windows PowerShell 5.1 (provenance: seed:p11b:rdc-powershell-5.1).
-- Run `graphify update .` after modifications and record test counts, gate-transition evidence, traversal evidence, and review decisions in `agent/CURRENT.md`.
+The architecture review should explicitly distinguish a local defect from systemic complexity debt and produce evidence-backed simplification proposals. Evaluate Sol/Opus-class reviewers with the historical P12-P16.14 failure corpus and enough longitudinal context to determine whether they identify the Goal/Attempt/Verify/Recover convergence abstraction and owner-gate overuse without being prompted with the expected answer.
 
-### Risks / failure modes
-- Task-level classification could miss a lifecycle change whose plan omits protected paths and symbols. Mitigation: Planner prompts require affected runtime surfaces, Plan Review treats a protected change with absent or conflicting classification as blocking, and Technical Review checks actual changed paths.
-- Overbroad classification could still burden unrelated work. Mitigation: use exact task/plan surface evidence, never repository identity; explicitly test UI, provider, documentation-only, and benchmark tasks as ordinary.
-- A repair could remain unreachable because the prior blocked request is normally terminal. Mitigation: add narrowly scoped different-HEAD replay eligibility tied to both the structured blocked reason and the currently authoritative special gate; all other blocked rows remain terminal.
-- Clearing a gate without restoring coherent lifecycle state could permit unsafe launch. Mitigation: opening the gate stores a validated resumable state, sets `OWNER_GATE`, and resolution atomically archives, clears, and restores before rerunning every ordinary fence.
-- An additive authority schema change could disrupt projections or old ledgers. Mitigation: lazy compatibility, bounded history, focused version-1 fixtures, projection tests, and no top-level journal replacement.
-- Concurrent HEAD or authority changes could create a time-of-check/time-of-use gap. Mitigation: authenticate repository truth before locking, revalidate the exact HEAD used by the declaration inside the serialized launch decision, and abort on mismatch.
-- Automatic resolution could weaken unrelated owner decisions. Mitigation: only the exact `CONTROL_PLANE_DECLARATION_REQUIRED` code with matching gate identity is eligible; every other gate follows existing owner-disposition semantics.
-- Fault-scenario references could become documentation-only assertions. Mitigation: require every registry entry to resolve to an executable test and exercise all scenarios in the representative traversal.
-- Prompt additions could duplicate content or exceed provider limits. Mitigation: canonical markers, idempotent injection, strict size ceilings, and occurrence/size tests for every role.
-- The declaration-only bootstrap commit for P16.14 occurs before the new enforcement code exists. Mitigation: verify ordering in git history and use the unconditional synthetic end-to-end test as executable proof of the completed contract.
-- Real-git and restart tests can be slow or sensitive to Windows file locking. Mitigation: reuse established P16.13 fixtures, isolate repositories, minimize ticks, and use PowerShell-safe command sequencing.
-- The work could drift into another control plane or future roadmap tasks. Mitigation: reuse the current lifecycle authority, transition journal, evaluators, blocked-actuation records, and recovery mechanisms; keep P16.15/P16.16 undefined.
+Track whether the proposed simplification reduces top-level state/transition count, repeated owner intervention, and special-case remediation while preserving safety/fail-closed properties. Architecture-review findings feed backlog/planning; they do not automatically rewrite the control plane.
 
-### Out of scope
-- Classifying every task in DevOrchestrator as control-plane because of repository identity, project configuration, or the presence of `lifecycle_authority.py`.
-- Requiring lifecycle declarations for ordinary UI, provider, documentation-only, benchmark, or unrelated application work that does not change a protected runtime surface.
-- Adding a project-wide declaration-required opt-out or any configuration that can bypass task-level classification and Plan Review.
-- Creating a parallel authority, transition journal, recovery coordinator, or state file.
-- Changing the six existing lifecycle invariant codes or reopening the P16.12-to-P16.13 incident behavior beyond registering its durable fault scenarios.
-- Auto-clearing, replaying, or approving any owner gate other than `CONTROL_PLANE_DECLARATION_REQUIRED`.
-- Changing the closed seven-key Planner response schema or the Plan Reviewer and Technical Reviewer decision schemas.
-- Using implementation diffs as a pre-implementation launch input; diffs are used only for post-implementation scope-gap review.
-- Retrofitting declarations into completed historical tasks or rewriting historical staged specifications.
-- Defining, staging, or planning P16.15, P16.16, or any further roadmap objective.
-- Provider routing, AGY pools, web/mobile UI, benchmark behavior, or unrelated documentation redesign.
-- Manual Worker launch, lifecycle-state edits, or owner-gate edits to bypass the normal P16.13 successor/handoff path.
+## Historical failure corpus
+Mine P12-P16.14 runtime/logs, review decisions, Git history/diffs, task/HANDOFF documents, and tests. Normalize real incidents into a deduplicated failure corpus and map each to an existing regression/fault test or an explicit missing-test gap.
+Preserve existing P16.14 fault tests. Use the historical corpus to evaluate whether ConvergenceController v0 handles failures with fewer special-case transitions.
 
-### Independent plan review
-- Approved: Verified against the repository: the plan's structural claims are accurate and the core contract is pinned tightly enough for a Worker to start without design guessing. Confirmed facts: src/dev_orchestrator/core/lifecycle_authority.py:20 declares AUTHORITY_SCHEMA_VERSION=1 and lines 24-32 hold exactly the six INVARIANT_CODES the declaration grammar will validate against; both launch engines (transition_executor.py:1608-1613 legacy, :1799-1803 AIBroker) already run _transient_remediation_state_block replay eligibility then _lifecycle_launch_guard (:1415-1438) in the order task-mismatch -> owner_gate -> PENDING_DESIGN inside the lock, so the proposed insertion of special-gate reconciliation after head/task authentication and before the generic owner_gate fence is a concrete, reachable edit in both paths rather than a new control plane; existing gate writes (:771, :802-812) already set owner_gate plus lifecycle_state='OWNER_GATE' and already keep recorded_at stable across repeated ticks, so the plan's 'complete authoritative representation + no timestamp refresh' requirement matches established convention instead of inventing one; ai_planner.py:2218-2233 _render_next and :2235 _commit_plan are the real freeze points, and staged_roadmap.py:156 / successor_consistency.py:111 only reject the '## Approved executable design' marker in staged specs, so a separate '## Control-Plane Impact' section does not break successor publication; workflow_policy.py already provides bounded, marker-delimited role injection for planner, plan_reviewer, worker, remediator, adjudicator, and technical_reviewer, so contract injection is additive; every regression target named in validation exists (test_p1613_successor_consistency.py, test_workflow_policy.py, test_lifecycle_projection.py, test_staged_handoff.py, test_p168_golden_path.py, test_p169_watchdog_execution_loss.py, test_p1610_owner_gate_and_attribution.py, ops/p1613_lifecycle_smoke.py). Scope maps 1:1 onto the eight acceptance items, reuses the existing authority/journal/evaluator/blocked-actuation records, adds no parallel state file, does not reopen P16.13, and explicitly excludes defining P16.15/P16.16. The two genuinely sensitive behaviors are bounded rather than open-ended: autonomous gate resolution is restricted to the single CONTROL_PLANE_DECLARATION_REQUIRED code with matching gate identity, archives original evidence once, restores a stored validated resume_state, and re-runs every ordinary fence (acceptance 4 requires exactly this zero-touch convergence on unambiguous evidence, and generic-gate regression tests are required); different-HEAD replay of the durably blocked row is scoped to that structured reason plus the currently authoritative gate, preserving the prior block, mirroring the existing transient-remediation replay precedent. Data-loss risk from the authority schema revision is addressed by additive/lazy upgrade, bounded gate history deduplicated by gate_id, version-1 fixtures, and projection tests. The verification path is unambiguous and self-hosting risk is covered by the declaration-only bootstrap commit, git-history ordering proof, and an unconditional synthetic end-to-end traversal; PowerShell sequencing follows failure memory seed:p11b:rdc-powershell-5.1 (no && or ||, explicit $LASTEXITCODE). NON_BLOCKING findings to carry into Worker work and Technical Review, none of which justify delay: (1) module paths are written as core/control_plane_contract.py and core/control_plane_faults.py but must land under src/dev_orchestrator/core/; (2) the transition-boundary registry contents are not enumerated (only the fail-closed validation rule is), so the Worker must derive it from existing transition states and launch fences and Technical Review should confirm coverage; (3) the plan asserts the invariant 'lifecycle_state is OWNER_GATE whenever owner_gate is non-null' but does not name transition_executor.py:769-818, where per-tick reconciliation recomputes lifecycle_state from active owners and could overwrite the state while a declaration gate is still set, nor :1294 where handoff publication unconditionally nulls owner_gate - both sites need explicit declaration-gate preservation and are already covered by the plan's required projection-consistency and idempotence assertions; (4) classification correctly excludes repository identity, but Technical Review should confirm the scope-gap check actually fires on a diff touching a protected surface absent from the declaration, since that is the only backstop for an under-declared plan.
+## Backlog reconciliation scope
+Classify each retained capability exactly one of IMPLEMENTED, PARTIAL, NOT_IMPLEMENTED, OBSOLETE, MERGED, using current code plus test/runtime evidence. Include provider/model/account routing; quota/retry/failover; lifecycle/handoff; watchdog/activity recovery; invariant/fault injection; post-Worker acceptance continuation; persistent context; API/web management; multi-project; auto-onboarding; DAG/parallel; multi-node; mobile; operating/resource modes; incident-to-regression self-improvement.
+
+## Required outputs
+1. Clean canonical backlog and evidence-backed capability matrix.
+2. Historical production-failure corpus with incident -> reproduction -> fix -> regression mapping and explicit uncovered gaps.
+3. ConvergenceController v0 design and a small executable/testable prototype or simulation harness sufficient to replay representative historical failures.
+4. Comparison of legacy lifecycle handling versus the simplified controller using the same failure corpus: convergence, duplicate execution, fail-closed behavior, human interventions, and attempt count.
+5. Residual risks/debt and candidate P18+ objectives derived only from verified gaps.
+
+## Core invariants for v0
+- GOAL_NOT_SATISFIED + NO_ACTIVE_PROGRESS + NO_TRUE_HUMAN_DECISION_REQUIRED is a control-plane fault and must not silently stall.
+- A goal advances only after acceptance evidence verifies it.
+- Repeated/replayed events are idempotent and cannot duplicate execution.
+- Task/HEAD/ownership ambiguity and unsafe actions fail closed.
+- A single failure fingerprint cannot loop forever.
+- Exhaustion produces a complete resumable HANDOFF, not an opaque diagnosis_unknown owner gate.
+- New production control-plane incidents become regression candidates with traceable evidence.
+
+## Acceptance criteria
+- Evidence-backed reconciliation is complete and stale/duplicate backlog items are rewritten or removed.
+- Representative P12-P16.14 historical failures are replayable against the v0 harness, including P16.14 review-budget/owner-continue stall.
+- v0 demonstrates bounded convergence/escalation/HANDOFF without requiring a distinct top-level transition for every detailed lifecycle-state combination.
+- Existing safety fences are not weakened.
+- No wholesale replacement of the production controller occurs in P17; migration must be evidence-driven and separately planned.
+- P17 MUST NOT automatically invent or start P18.
+
+## Successor policy
+P17 is the explicit successor of P16.14 and must enter only through normal successor handoff after P16.14 reaches accepted terminal completion. Do not manually launch P17.
+
