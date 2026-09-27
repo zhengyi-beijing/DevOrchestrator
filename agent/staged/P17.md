@@ -12,7 +12,7 @@ The target architecture is a single durable Work/Goal authority evolved from the
 
 The target control loop is:
 
-Goal -> Observe Evidence -> Decide -> Act Once -> Verify -> Satisfy / Recover / Ask Human / Handoff
+Goal -> Observe Evidence -> Decide -> Act Once -> Verify -> Satisfy / Recover / Wait / Ask Human / Handoff
 
 Detailed planner, reviewer, provider, watchdog and process states are evidence and telemetry unless explicitly listed as fields of the canonical Work Record. They MUST NOT independently determine lifecycle advancement.
 
@@ -89,6 +89,11 @@ Required fields:
       - scope
       - reason
       - waived_obligations
+- wait, nullable:
+  - not_before
+  - reset_source
+  - reason_code
+  - wakeup_obligation_id
 - verification, nullable:
   - verification_id
   - exact repository anchor
@@ -179,6 +184,7 @@ decide(work_record, evidence_snapshot, policy) -> Decision
 Decision is exactly one typed action such as:
 
 - NOOP_ACTIVE
+- WAIT_UNTIL
 - EXECUTE
 - VERIFY
 - RETRY_SAME_STRATEGY
@@ -237,6 +243,8 @@ P17 defines and tests this execution/effect reconciliation port in the shadow mo
 17. LEARNING_REGRESSION: recurrence of the same normalized failure after an applicable learned rule is loaded is a control-plane defect.
 18. SUCCESSOR_DETERMINISM: successor identity and handoff idempotency key are deterministic from accepted source-goal evidence.
 19. NO_HUMAN_CLOCK: manual continue is never required solely to make an otherwise safe deterministic transition happen.
+20. WAIT_IS_NOT_PROGRESS: WAIT_UNTIL is an explicit bounded deferral with not_before/reset_source and a durable wakeup obligation; it is neither active progress nor exhaustion and consumes no attempt budget.
+21. INVARIANT_CODE_STABILITY: invariant code names are stable identifiers; ordinal numbering is explanatory only and MUST NOT be persisted or referenced as identity.
 
 ## Typed verification and GoalSatisfied
 
@@ -262,6 +270,8 @@ Reviewer findings MUST use typed severity, for example BLOCKING | NON_BLOCKING |
 A repository/markdown COMPLETE while acceptance=NONE is a fail-closed contradiction and is never an advance trigger.
 
 An owner may close/advance without otherwise obtainable verification only through a durable typed OWNER_OVERRIDE command that identifies owner, scope, reason and every waived obligation. The override is acceptance provenance, not fake test/reviewer evidence.
+
+waived_obligations may waive explicitly named evidence/acceptance obligations only. It can never waive: no unresolved BLOCKING finding, no active execution lease, no unresolved integrity/identity ambiguity, emergency-brake enforcement, or explicit safety/irreversible-action authorization.
 
 GoalSatisfied is true only when:
 - acceptance is VERIFIED, or an explicitly policy-permitted OWNER_OVERRIDE exists for the exact goal/scope;
@@ -290,6 +300,7 @@ The normalized problem fingerprint is derived from:
 It MUST exclude volatile values such as:
 - HEAD changes produced while fixing the same problem
 - lifecycle state names
+- daemon restart / execution epoch changes
 - PID
 - timestamps
 - retry/request IDs
@@ -328,6 +339,8 @@ Structured findings/results must use a closed schema including:
 
 Malformed or partially invalid structured output is OUTPUT_INVALID. A rejected finding set and an absent finding set are different typed states. OUTPUT_INVALID receives bounded validator-feedback repair at the same requested capability tier before any reasoning-remediation budget is consumed.
 
+Multiple simultaneous BLOCKING findings do not require a special len(blocking)==1 path. Each distinct normalized criterion/invariant + failure family forms its own problem_id unless the closed-schema target/fingerprint proves they are the same problem. The decider selects the next unresolved problem by deterministic stable ordering; each problem keeps its own budget.
+
 ## Retry, failover, escalation and exhaustion
 
 Budgets are per problem_id, not per whole task and not reset by ordinary HEAD/lifecycle evolution.
@@ -339,7 +352,9 @@ Maintain separate bounded counters for:
 - total attempts
 
 Policy:
-- transient/resource/provider failure:
+- resource/quota failure with a policy-known reset:
+  emit WAIT_UNTIL with typed not_before/reset_source and a durable wakeup obligation; waiting consumes no attempt budget and is re-evaluated automatically at/after not_before.
+- transient/resource/provider failure without a known wait boundary:
   retry or fail over at the same requested capability tier first;
   do not consume reasoning-remediation budget merely because one account/provider failed.
 - OUTPUT_INVALID:
@@ -461,9 +476,11 @@ Promotion target:
 6. health/replay check;
 7. rollback to prior stable SHA on failure without changing durable state identity.
 
-Only one daemon may own the canonical state root.
+Only one daemon may own the canonical state root. Runtime-root resolution without an explicit configured/canonical root must fail closed rather than silently create a fresh state tree. The state-root ownership lock records host, pid and controller code identity.
 
 P17 designs and tests this with isolated fixtures/simulation; production relocation/promotion is a later gated migration.
+
+The migration inventory must explicitly identify retirement/consolidation targets for: execution_intent budgets, reviewer remediation/extension budgets, watchdog lifecycle_recovery_attempts, and label-keyed resolve_progress_obligation escalation tables. P17 does not delete them; M9 cannot claim simplification unless these duplicated decision/budget paths have an evidence-backed retirement disposition.
 
 ## Learned environment constraints
 
@@ -523,6 +540,8 @@ Minimum replay classes:
 22. stable problem budget across fix commits, provider failover and daemon restart.
 23. timed quota reset producing WAIT_UNTIL rather than churn when policy knows the reset.
 24. human question opened before harmless HEAD/projection changes and discharged exactly once afterward.
+25. shared-credential mutual exclusion where one authenticated session/refresh lease must serialize access rather than create retry churn.
+26. crash injection between every pair of durable writes in successor/acceptance/handoff paths, with deterministic replay and trace-hash equality.
 
 Each replay records:
 - legacy result;
@@ -619,6 +638,8 @@ M4 - Architecture acceptance:
 
 P17 STOPS HERE for production authority.
 
+Shadow output uses one named non-authoritative namespace, runtime/p17-shadow/, and every shadow record includes source-evidence digests. A differential test proves deleting/rebuilding the namespace yields the same decision trace hash from the same evidence. No actuator may read this namespace.
+
 Future gated migration, not automatically started by P17:
 
 M5 - external canonical state/config root migration rehearsal.
@@ -679,10 +700,13 @@ P17 is accepted only if:
 - shadow mode performs no production mutation;
 - legacy safety fences are preserved or represented by equivalent/stronger explicit invariants;
 - P17 migration does not pass beyond M4;
+- policy-known timed waits produce WAIT_UNTIL/not_before, consume no attempt budget, and wake without manual continue;
+- invariant code names, not ordinals, are the stable identities;
 - human questions remain dischargeable across harmless HEAD/projection changes;
 - malformed role output is OUTPUT_INVALID and cannot silently become empty evidence;
 - restart reconciliation cannot leave a dead lease as active progress and cannot duplicate an ambiguous external effect;
-- every legacy no-implicit-retry/gating assertion is explicitly classified SAFETY or POLICY with named coverage.
+- every legacy no-implicit-retry/gating assertion is explicitly classified SAFETY or POLICY with named coverage;
+- shadow replay is rebuildable and yields identical decision trace hashes after crash/restart fixtures.
 
 ## Current accidental P17 activation handling
 
