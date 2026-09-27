@@ -44,6 +44,13 @@ class TestP168TaskStatus(unittest.TestCase):
             self.assertFalse(status.is_ready_to_run())
             self.assertFalse(status.is_completed())
 
+    def test_parse_staged_not_started_as_pending_design(self):
+        status = parse_task_status("STAGED / NOT STARTED")
+        self.assertTrue(status.valid)
+        self.assertTrue(status.is_pending_design())
+        self.assertFalse(parse_task_status("STAGED").valid)
+        self.assertFalse(parse_task_status("STAGED / COMPLETE").valid)
+
     def test_parse_ready_to_run_variations(self):
         tokens = [
             "READY_TO_RUN",

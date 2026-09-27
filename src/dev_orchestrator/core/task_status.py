@@ -140,6 +140,19 @@ def parse_task_status(raw: str | None) -> TaskStatus:
             valid=False,
         )
 
+    # Historical staged successors use this exact declaration before they
+    # become current.  Recognize the pair narrowly; a bare STAGED token or a
+    # contradictory STAGED combination remains invalid.
+    if parts == ["STAGED", "NOT STARTED"]:
+        return TaskStatus(
+            raw=raw_str,
+            canonical="pending_design",
+            components=("staged", "not_started"),
+            annotation=annotation,
+            code="OK",
+            valid=True,
+        )
+
     mapped_components: list[str] = []
     for part in parts:
         mapped = LEGACY_COMPONENT_MAP.get(part)

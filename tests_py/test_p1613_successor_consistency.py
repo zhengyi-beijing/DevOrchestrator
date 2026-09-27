@@ -1651,6 +1651,33 @@ class TerminalRoadmapSuccessorInvariantTests(unittest.TestCase):
                 ("P1", "P2", "successor"),
             )
 
+    def test_unique_staged_claim_repairs_null_roadmap_without_human_clock(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td), roadmap_target=None)
+
+            finding = _next_finding(repo, _terminal_state())
+
+            self.assertFalse(finding.holds)
+            self.assertTrue(finding.recoverable)
+            successor = finding.evidence["roadmap_successor"]
+            self.assertEqual((successor["kind"], successor["target_task_id"]),
+                             ("inconsistent", "P2"))
+
+    def test_roadmap_only_successor_without_matching_predecessor_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            spec = repo / "agent" / "staged" / "P2.md"
+            spec.write_bytes(b"# P2 task\n\nStatus: **PENDING DESIGN**\n")
+            _commit(repo, "remove predecessor claim")
+
+            finding = _next_finding(repo, _terminal_state())
+
+            self.assertFalse(finding.holds)
+            self.assertFalse(finding.recoverable)
+            successor = finding.evidence["roadmap_successor"]
+            self.assertEqual(successor["kind"], "invalid")
+            self.assertIn("exactly one valid staged successor", successor["reason"])
+
     def test_existing_or_in_flight_handoff_satisfies_the_obligation(self):
         with tempfile.TemporaryDirectory() as td:
             repo = _complete_repo(Path(td))
@@ -1690,14 +1717,75 @@ class TerminalRoadmapSuccessorInvariantTests(unittest.TestCase):
             self.assertFalse(finding.recoverable)
             self.assertEqual(finding.evidence["roadmap_successor"]["kind"], "invalid")
 
-    def test_end_of_roadmap_stays_settled(self):
+    def test_zero_successors_fails_closed(self):
         with tempfile.TemporaryDirectory() as td:
             repo = _complete_repo(Path(td), roadmap_target=None)
             (repo / "agent" / "staged" / "P2.md").unlink()
             _commit(repo, "no staged successor")
             finding = _next_finding(repo, _terminal_state())
-            self.assertTrue(finding.holds)
-            self.assertNotIn("roadmap_successor", finding.evidence)
+            self.assertFalse(finding.holds)
+            self.assertFalse(finding.recoverable)
+            self.assertEqual(
+                finding.evidence["roadmap_successor"]["kind"], "end_of_roadmap",
+            )
+
+    def test_no_human_clock_uses_terminal_authority_not_markdown_status(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            (repo / "agent" / "next.md").write_bytes(
+                b"# stale projection\n\nStatus: **PENDING DESIGN**\n"
+            )
+            _commit(repo, "stale markdown projection")
+
+            finding = _next_finding(repo, _terminal_state())
+
+            self.assertFalse(finding.holds)
+            self.assertTrue(finding.recoverable)
+            self.assertEqual(
+                finding.evidence["roadmap_successor"]["target_task_id"], "P2",
+            )
+
+    def test_staged_not_started_status_is_a_valid_successor_declaration(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            spec = repo / "agent" / "staged" / "P2.md"
+            spec.write_bytes(
+                b"# P2 task\n\nStatus: STAGED / NOT STARTED\n\nPredecessor: P1\n"
+            )
+            _commit(repo, "stage successor without activating it")
+
+            finding = _next_finding(repo, _terminal_state())
+
+            self.assertFalse(finding.holds)
+            self.assertTrue(finding.recoverable)
+            successor = finding.evidence["roadmap_successor"]
+            self.assertEqual((successor["kind"], successor["target_task_id"]),
+                             ("successor", "P2"))
+
+    def test_successor_determinism_ignores_projection_churn(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            state = _terminal_state()
+            first_snapshot = _repo_summary(repo)["projects"][0]
+            second_snapshot = copy.deepcopy(first_snapshot)
+            second_snapshot.update({
+                "next_title": "unrelated stale title",
+                "next_status": "**READY_TO_RUN**",
+                "telemetry": {"task_id": "STALE"},
+            })
+
+            first = {item.code: item for item in evaluate_lifecycle_invariants(
+                snapshot=first_snapshot, executor_state=state,
+                decisions_state={"decisions": {}},
+            )}["NEXT_TASK_WITHOUT_HANDOFF"]
+            second = {item.code: item for item in evaluate_lifecycle_invariants(
+                snapshot=second_snapshot, executor_state=state,
+                decisions_state={"decisions": {}},
+            )}["NEXT_TASK_WITHOUT_HANDOFF"]
+
+            self.assertEqual(first.evidence["roadmap_successor"],
+                             second.evidence["roadmap_successor"])
+            self.assertEqual(first.recoverable, second.recoverable)
 
     def test_active_ownership_is_not_a_missing_handoff(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1731,7 +1819,9 @@ class TerminalRoadmapSuccessorEndToEndTests(unittest.TestCase):
         root = Path(self._tmp.name)
         self.runtime = root / "runtime"
         self.runtime.mkdir(parents=True, exist_ok=True)
-        self.repo = _complete_repo(root)
+        # Match the P17 closure defect: P18 is uniquely staged with a matching
+        # predecessor while the roadmap still has a null P17 edge.
+        self.repo = _complete_repo(root, roadmap_target=None)
         self.project = {
             "project_id": "p1",
             "repo_path": str(self.repo),
@@ -1812,6 +1902,12 @@ class TerminalRoadmapSuccessorEndToEndTests(unittest.TestCase):
         self.assertEqual((handoffs[0]["source_task_id"], handoffs[0]["target_task_id"]),
                          ("P1", "P2"))
         self.assertTrue(handoffs[0]["source_request_id"].startswith("recover-handoff:p1:P1:P2:"))
+        self.assertTrue(
+            handoffs[0]["source_request_id"].endswith(
+                str(handoffs[0]["staged_spec_sha256"])[:12]
+            ),
+            "recovery identity must derive from stable successor evidence, not HEAD",
+        )
 
         # Tick 2: the normal control plane consumes it and starts the Planner.
         self._tick(planner, controls, watchdog)

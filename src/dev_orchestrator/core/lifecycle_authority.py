@@ -290,20 +290,16 @@ def _roadmap_successor_obligation(
 ) -> dict[str, Any] | None:
     """Return the missing roadmap handoff owed by a terminal authority, if any.
 
-    Only a quiescent terminal authority that repository truth also reports
-    COMPLETE qualifies.  An existing handoff or in-flight transition for the
-    source already owns the successor.  A refused transition, or a roadmap
-    that is ambiguous, inconsistent or invalid, is reported non-recoverable so
-    it gates for the owner instead of being actuated blindly.
+    Only a quiescent terminal authority qualifies.  Repository markdown is a
+    projection and must not be required to confirm the terminal transition.
+    An existing handoff or in-flight transition for the source already owns
+    the successor.  A refused transition, or successor evidence that is zero,
+    ambiguous or invalid, is reported non-recoverable so it fails closed
+    instead of being actuated blindly.
     """
     if not isinstance(authority, dict) or not authority_task:
         return None
     if authority_state not in {"COMPLETE", "SETTLED"} or authority.get("owner_gate") or owners:
-        return None
-    if (
-        advertised_task_id(snapshot) != authority_task
-        or not parse_task_status(snapshot.get("next_status")).is_completed()
-    ):
         return None
     repo_path = snapshot.get("repo_path") or snapshot.get("root")
     if not repo_path:
@@ -334,15 +330,31 @@ def _roadmap_successor_obligation(
         kind, reason = resolution.kind, resolution.reason
     except Exception as exc:  # unreadable evidence gates, never recovers
         resolution, kind, reason = None, "error", str(exc)
-    if kind in {"end_of_roadmap", "absent", "unlisted"}:
-        return None
+    staged_evidence = (
+        resolution.evidence in {"staged_claim", "roadmap+staged_claim"}
+        if resolution is not None else False
+    )
+    if kind == "successor" and not staged_evidence:
+        kind = "invalid"
+        reason = (
+            "terminal closure requires exactly one valid staged successor "
+            f"declaring predecessor {authority_task}"
+        )
     return {
         "source_task_id": authority_task,
         "target_task_id": resolution.successor_task_id if resolution else None,
         "kind": kind,
         "reason": reason,
         "blocked_transitions": blocked_transitions,
-        "recoverable": kind == "successor" and not blocked_transitions,
+        # A unique staged claim may safely repair a null/unlisted roadmap in
+        # the executor before the handoff is recorded.  A roadmap-only edge is
+        # insufficient for terminal closure because it lacks the required
+        # matching predecessor declaration.
+        "recoverable": (
+            kind in {"successor", "inconsistent"}
+            and staged_evidence
+            and not blocked_transitions
+        ),
     }
 
 

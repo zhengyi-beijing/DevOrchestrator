@@ -123,14 +123,17 @@ ownership becomes a durable `OWNER_GATE`.
 The invariant has two evidence sources. An accepted `NEXT_TASK` decision still
 owes a handoff. A **terminal authority** also owes one when no decision
 survives. That applies when the authority is `COMPLETE`/`SETTLED`, has no owner
-gate and no active owner, repository truth reports that same task `COMPLETE`,
-the roadmap names a successor, and no `handoff` row or in-flight transition
-exists for the source. A `settled`/`task_complete` row is terminal history and
-is never treated as a successor handoff: the roadmap may gain the edge after the
-reviewer settled the task. Only a valid, unambiguous roadmap `successor` is
-recoverable. Ambiguous, inconsistent, invalid, or unreadable successor evidence,
-and a refused (`failed`/`owner_gate`/`waiting_recovery`) transition for the
-source, are non-recoverable and gate. The evidence carries
+gate and no active owner, exactly one valid staged task declares that authority
+task as its predecessor, and no `handoff` row or in-flight transition exists
+for the source. Repository markdown completion is a projection and is not an
+additional authority gate. A `settled`/`task_complete` row is terminal history
+and is never treated as a successor handoff: the roadmap may gain the edge after
+the reviewer settled the task. A matching roadmap edge is recoverable directly;
+a null or unlisted roadmap plus the unique staged claim is recoverable through
+the existing clean-worktree roadmap repair. Zero, multiple, mismatched, invalid,
+unsafe, or unreadable successor evidence, and a refused
+(`failed`/`owner_gate`/`waiting_recovery`) transition for the source, are
+non-recoverable and gate. The evidence carries
 `roadmap_successor.source_task_id`, which Watchdog uses as the recovery source
 when `next_decisions` is empty.
 

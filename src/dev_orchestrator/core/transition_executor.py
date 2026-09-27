@@ -2607,7 +2607,7 @@ class TransitionExecutor:
             }
         request_id = (
             f"recover-handoff:{project_id}:{completed_task_id}:"
-            f"{resolution.successor_task_id}:{truth.head[:12]}"
+            f"{resolution.successor_task_id}:{str(resolution.spec_sha256 or '')[:12]}"
         )
         with self._lock:
             existing = self._load_ledger()["executions"].get(request_id)

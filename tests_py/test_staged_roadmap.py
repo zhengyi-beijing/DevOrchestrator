@@ -288,6 +288,28 @@ class TestStagedRoadmap(unittest.TestCase):
             self.assertEqual(result.spec_sha256, hashlib.sha256(raw_spec).hexdigest().lower())
             self.assertEqual(result.spec_text, raw_spec.decode("utf-8"))
 
+    def test_staged_not_started_entry_is_pending_design(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_staged_repo(Path(td))
+            data = {
+                "schema_version": 1,
+                "tasks": [{
+                    "task_id": "P17", "successor": "P18",
+                    "successor_spec_path": "agent/staged/P18.md",
+                }],
+            }
+            (repo / "agent" / "staged" / "roadmap.json").write_text(
+                json.dumps(data), encoding="utf-8",
+            )
+            (repo / "agent" / "staged" / "P18.md").write_bytes(
+                b"# P18 follow-up\n\nStatus: STAGED / NOT STARTED\n\nPredecessor: P17\n"
+            )
+
+            result = read_successor(repo, "P17")
+
+            self.assertEqual(result.kind, "successor")
+            self.assertEqual(result.successor_task_id, "P18")
+
     def test_real_repo_roadmap_links(self):
         checkout_root = Path(__file__).resolve().parent.parent
         res_x = read_successor(checkout_root, "P11x")
