@@ -53,6 +53,11 @@ Required fields:
   - role
   - attempt_id
   - execution_id
+  - effect_id / broker_request_id when an external effect exists
+  - host
+  - pid when local process-backed
+  - epoch
+  - heartbeat_at
   - acquired_at
 - current_problem, nullable:
   - problem_id
@@ -70,6 +75,20 @@ Required fields:
   - output anchor
   - typed outcome
   - evidence references
+- acceptance:
+  - exactly one of:
+    - NONE
+    - VERIFIED:
+      - reviewer_verdict_id
+      - anchor_head
+      - independence
+      - verification_artifact_ids
+    - OWNER_OVERRIDE:
+      - owner_id
+      - command_id
+      - scope
+      - reason
+      - waived_obligations
 - verification, nullable:
   - verification_id
   - exact repository anchor
@@ -83,9 +102,19 @@ Required fields:
   - publication state
   - handoff idempotency key
 - human_request, nullable:
+  - question_id
+  - question_revision
   - request type
   - concrete question/authorization required
+  - options, each naming the exact effect of answering
+  - authorization_scope
+  - resume_checkpoint
   - evidence
+  - answer, nullable:
+    - option_id
+    - owner_id
+    - command_id
+    - at
 - handoff, nullable:
   - complete resumable checkpoint
   - current blocker/problem
@@ -175,6 +204,16 @@ The actuator accepts a Decision only after revalidating:
 
 Each accepted Decision creates at most one idempotent effect and one authority transition.
 
+## Lease liveness and external-effect identity
+
+NO_ORPHAN_OWNER: a lease is active progress only while its bound execution is demonstrably live.
+
+For process-backed work, active_lease carries host, pid, epoch and heartbeat_at. On daemon startup/reconcile, a non-live lease is deterministically converted to exactly one typed outcome; it is never left as active progress.
+
+Autonomous retry/replay after restart is permitted only when the external effect has reconcilable identity and state, such as broker_request_id/effect_id plus a liveness/status probe and conclusive cancel/terminal result. If effect state is ambiguous, fail closed rather than duplicate the effect.
+
+P17 defines and tests this execution/effect reconciliation port in the shadow model. Transport-level implementation that cannot be safely added without broadening P17 is deferred to P18.
+
 ## Core convergence invariants
 
 1. SINGLE_AUTHORITY: exactly one canonical current Work Record per project.
@@ -182,20 +221,22 @@ Each accepted Decision creates at most one idempotent effect and one authority t
 3. PROGRESS_TOTALITY:
    GOAL_NOT_SATISFIED + NO_ACTIVE_PROGRESS + NO_TRUE_HUMAN_DECISION_REQUIRED
    MUST produce a deterministic recovery decision or a typed control-plane fault.
-4. ACCEPTANCE_BEFORE_ADVANCE: no successor can publish without typed GoalSatisfied evidence.
-5. MARKDOWN_NON_AUTHORITY: markdown edits alone cannot change lifecycle authority.
-6. ANCHOR_BINDING: verification/reviewer evidence is bound to exact project/task/branch/HEAD/worktree/test anchors.
-7. IDEMPOTENT_REPLAY: replay of the same event/decision cannot duplicate execution or successor publication.
-8. STABLE_PROBLEM_IDENTITY: normal HEAD/lifecycle/provider changes do not reset an unresolved problem budget.
-9. BOUNDED_PROBLEM: one normalized problem cannot retry forever.
-10. COMPLETE_EXHAUSTION: every exhausted problem writes a resumable structured HANDOFF.
-11. HUMAN_TYPED: human intervention requires a typed reason and a concrete question/authorization.
-12. EMERGENCY_BRAKE: authenticated pause/stop cannot be refused merely because lifecycle/HEAD/CAS changed.
-13. FAIL_CLOSED_AMBIGUITY: conflicting identity/ownership/unsafe evidence blocks side effects.
-14. LEARNED_CONSTRAINT_CONSUMPTION: a known incompatible operation is rejected at preflight before execution.
-15. LEARNING_REGRESSION: recurrence of the same normalized failure after an applicable learned rule is loaded is a control-plane defect.
-16. SUCCESSOR_DETERMINISM: successor identity and handoff idempotency key are deterministic from accepted source-goal evidence.
-17. NO_HUMAN_CLOCK: manual continue is never required solely to make an otherwise safe deterministic transition happen.
+4. ACCEPTANCE_BEFORE_ADVANCE: no successor can publish unless acceptance is VERIFIED or an explicit OWNER_OVERRIDE is durably recorded. acceptance=NONE can never advance.
+5. OWNER_OVERRIDE_EXPLICIT: an owner override never fabricates verification evidence; it records exactly which obligations are waived and the authorization scope.
+6. HUMAN_REQUEST_DISCHARGEABLE: every open human_request has at least one currently acceptable answer option; answering CASes only question_id + question_revision, never HEAD, lifecycle revision, projected gate ID, role, or conversation binding.
+7. MARKDOWN_NON_AUTHORITY: markdown edits alone cannot change lifecycle authority.
+8. ANCHOR_BINDING: verification/reviewer evidence is bound to exact project/task/branch/HEAD/worktree/test anchors.
+9. IDEMPOTENT_REPLAY: replay of the same event/decision cannot duplicate execution or successor publication.
+10. STABLE_PROBLEM_IDENTITY: normal HEAD/lifecycle/provider changes do not reset an unresolved problem budget.
+11. BOUNDED_PROBLEM: one normalized problem cannot retry forever.
+12. COMPLETE_EXHAUSTION: every exhausted problem writes a resumable structured HANDOFF.
+13. HUMAN_TYPED: human intervention requires a typed reason and a concrete question/authorization.
+14. EMERGENCY_BRAKE: authenticated pause/stop cannot be refused merely because lifecycle/HEAD/CAS changed.
+15. FAIL_CLOSED_AMBIGUITY: conflicting identity/ownership/unsafe evidence blocks side effects.
+16. LEARNED_CONSTRAINT_CONSUMPTION: a known incompatible operation is rejected at preflight before execution.
+17. LEARNING_REGRESSION: recurrence of the same normalized failure after an applicable learned rule is loaded is a control-plane defect.
+18. SUCCESSOR_DETERMINISM: successor identity and handoff idempotency key are deterministic from accepted source-goal evidence.
+19. NO_HUMAN_CLOCK: manual continue is never required solely to make an otherwise safe deterministic transition happen.
 
 ## Typed verification and GoalSatisfied
 
@@ -218,8 +259,13 @@ Verification evidence must be structured and include:
 
 Reviewer findings MUST use typed severity, for example BLOCKING | NON_BLOCKING | INFO. Control flow MUST NOT infer severity by searching prose for strings such as "BLOCKING:".
 
+A repository/markdown COMPLETE while acceptance=NONE is a fail-closed contradiction and is never an advance trigger.
+
+An owner may close/advance without otherwise obtainable verification only through a durable typed OWNER_OVERRIDE command that identifies owner, scope, reason and every waived obligation. The override is acceptance provenance, not fake test/reviewer evidence.
+
 GoalSatisfied is true only when:
-- every required acceptance criterion has typed passing evidence;
+- acceptance is VERIFIED, or an explicitly policy-permitted OWNER_OVERRIDE exists for the exact goal/scope;
+- every non-waived required acceptance criterion has typed passing evidence;
 - required tests/checks actually executed and passed;
 - required independent review has an ACCEPT decision at the same accepted anchor;
 - no unresolved BLOCKING finding exists;
@@ -250,6 +296,7 @@ It MUST exclude volatile values such as:
 - provider account unless the root cause is provider-specific
 
 Typed failure classes must include at least:
+- OUTPUT_INVALID
 - RESOURCE_TRANSIENT
 - PROVIDER_UNAVAILABLE
 - AUTH_OR_PERMISSION
@@ -260,6 +307,26 @@ Typed failure classes must include at least:
 - INTEGRITY_OR_IDENTITY_AMBIGUITY
 - SAFETY_OR_IRREVERSIBLE_AUTHORIZATION
 - CONTROL_PLANE_DEFECT
+
+## Structured role output contract
+
+No control decision may parse free-text prose to determine severity, scope, target, blocker identity, retryability or next action.
+
+Structured findings/results must use a closed schema including:
+- finding_id
+- severity
+- failure_class
+- target:
+  - file
+  - symbol, nullable
+  - test_id, nullable
+  - invariant_code, nullable
+  - blocker_code, nullable
+- scope_claim
+- machine-readable reason/code
+- human-readable explanation as non-authoritative text
+
+Malformed or partially invalid structured output is OUTPUT_INVALID. A rejected finding set and an absent finding set are different typed states. OUTPUT_INVALID receives bounded validator-feedback repair at the same requested capability tier before any reasoning-remediation budget is consumed.
 
 ## Retry, failover, escalation and exhaustion
 
@@ -275,6 +342,8 @@ Policy:
 - transient/resource/provider failure:
   retry or fail over at the same requested capability tier first;
   do not consume reasoning-remediation budget merely because one account/provider failed.
+- OUTPUT_INVALID:
+  run bounded schema/validator-feedback repair at the same capability tier; do not silently coerce malformed findings to an empty/absent set and do not charge the first formatting repair against reasoning-remediation budget.
 - implementation/test failure:
   diagnose and try a changed bounded strategy against the same problem_id.
 - repeated reasoning/strategy failure:
@@ -317,6 +386,20 @@ Authenticated pause/stop:
 Resume is also explicit and authenticated but MUST NOT rely on a stale lifecycle identity merely to clear the brake.
 
 Ordinary lifecycle commands continue to use strict identity/CAS checks. Emergency brake semantics are intentionally stronger.
+
+## Human request answer semantics
+
+A human request is subordinate to the single Work Record, not a second gate authority.
+
+- question_id is stable across HEAD changes, provider changes, projected lifecycle labels and conversation rebinding.
+- question_revision changes only when the actual question/options/authorization scope changes.
+- each option names the exact actuator effect authorized by that answer.
+- an answer is accepted by CAS on question_id + question_revision only.
+- current project HEAD, lifecycle revision, projected gate ID, active role and conversation binding are not answer identity.
+- answering durably records owner_id, option_id, command_id and time, then resumes from resume_checkpoint.
+- one canonical finder resolves the current open question; projections may not mint competing gate IDs.
+
+Acceptance replay: open a question, advance through N harmless HEAD/projection changes, answer the original unchanged question, and prove it discharges exactly once without requiring manual continue.
 
 ## Deterministic successor and HANDOFF semantics
 
@@ -434,6 +517,12 @@ Minimum replay classes:
 16. malformed/untyped reviewer finding or severity prose.
 17. exhausted problem requiring complete HANDOFF rather than diagnosis_unknown/continue.
 18. normal happy-path goal completion and deterministic successor publication.
+19. malformed/partial role output whose findings must become OUTPUT_INVALID, never empty evidence.
+20. multiple simultaneous BLOCKING findings under the same stable problem family.
+21. restart during a local or broker effect: live, conclusively dead, conclusively cancelled, and ambiguous external-effect states.
+22. stable problem budget across fix commits, provider failover and daemon restart.
+23. timed quota reset producing WAIT_UNTIL rather than churn when policy knows the reset.
+24. human question opened before harmless HEAD/projection changes and discharged exactly once afterward.
 
 Each replay records:
 - legacy result;
@@ -569,7 +658,8 @@ Include:
 5. Legacy-vs-v0 convergence/safety/human-intervention comparison.
 6. Environment constraint/preflight model and recurrence regression tests.
 7. Stable/dev runtime-root inventory and migration design.
-8. Residual risks/debt and future migration gates.
+8. Legacy contract-amendment matrix classifying every conflicting assertion in TRANSITION_EXECUTOR_CONTRACT, development-workflow and P16.13/P16.14 tests as SAFETY (must remain) or POLICY (may change only at a later migration gate), with named covering tests.
+9. Residual risks/debt and future migration gates.
 
 ## Acceptance criteria
 
@@ -588,11 +678,17 @@ P17 is accepted only if:
 - learned constraints are consumed preflight and recurrence is classified as a control-plane defect;
 - shadow mode performs no production mutation;
 - legacy safety fences are preserved or represented by equivalent/stronger explicit invariants;
-- P17 migration does not pass beyond M4.
+- P17 migration does not pass beyond M4;
+- human questions remain dischargeable across harmless HEAD/projection changes;
+- malformed role output is OUTPUT_INVALID and cannot silently become empty evidence;
+- restart reconciliation cannot leave a dead lease as active progress and cannot duplicate an ambiguous external effect;
+- every legacy no-implicit-retry/gating assertion is explicitly classified SAFETY or POLICY with named coverage.
 
 ## Current accidental P17 activation handling
 
 The local commit e3eeb29 ("lifecycle(P16.14): activate staged successor P17") is preserved as incident evidence; do not erase history merely to make status look cleaner.
+
+The P16.14 -> P17 legacy handoff has acceptance=null/NONE and is therefore recorded in the P17 replay corpus as a known historical ACCEPTANCE_BEFORE_ADVANCE violation, not as evidence that the target architecture permits markdown-only closure. P17 proceeds as an explicitly owner-authorized migration/bootstrap exception; that authorization must be recorded as an OWNER_OVERRIDE fixture/evidence item before the edge is used as a positive target-semantics example.
 
 Before implementation:
 1. keep owner pause asserted;
