@@ -1,0 +1,75 @@
+{
+  "attempt_count": 1,
+  "class_id": 4,
+  "class_name": "stale_reviewer_anchor_after_head_change",
+  "cpf_scenarios": [
+    "CPF-01"
+  ],
+  "duplicate_execution_count": 0,
+  "evidence_snapshot": {
+    "conflicts": [],
+    "emergency_pause_asserted": false,
+    "exact_anchors": {
+      "head": "da699cd7238ed39caf62fb229ba82a2e4f392734"
+    },
+    "items": [],
+    "metadata": {},
+    "shared_leases": []
+  },
+  "expected_invariant_verdicts": {
+    "ACCEPTANCE_BEFORE_ADVANCE": true,
+    "ANCHOR_BINDING": true
+  },
+  "expected_v0_decision": "VERIFY",
+  "human_intervention_count": 0,
+  "legacy_result": "Review conducted at old commit head while repository had advanced",
+  "policy": {
+    "default_budget": {
+      "max_capability_escalations": 2,
+      "max_resource_attempts": 3,
+      "max_strategy_attempts": 2,
+      "max_total_attempts": 5
+    },
+    "problem_budgets": {},
+    "quota_reset_rules": {
+      "rate_limit_exceeded": {
+        "reset_at": "2026-09-27T18:00:00Z"
+      }
+    },
+    "wait_bounds": {
+      "max_seconds": 3600,
+      "min_seconds": 5
+    }
+  },
+  "source_evidence": {
+    "anchor": "da699cd7238ed39caf62fb229ba82a2e4f392734",
+    "historical_incident": "inc-04-stale_reviewer_anchor_after_head_change",
+    "origin_task": "historical"
+  },
+  "work_record_snapshot": {
+    "acceptance": {
+      "kind": "NONE"
+    },
+    "attempts": [
+      {
+        "attempt_id": "att-1",
+        "problem_id": "p1",
+        "strategy_id": "code_mod",
+        "typed_outcome": "done"
+      }
+    ],
+    "authority_revision": "rev-2",
+    "goal_id": "P17",
+    "goal_revision": 1,
+    "goal_spec_digest": "sha256:p17-spec",
+    "predecessor_goal_id": "P16.14",
+    "project_id": "devorchestrator",
+    "repository_identity": {
+      "branch": "main",
+      "repo_path": "C:\\work\\github\\DevOrchestrator-dev"
+    },
+    "schema_version": 1,
+    "status": "OPEN",
+    "verification": null
+  }
+}

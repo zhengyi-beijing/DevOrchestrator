@@ -1,0 +1,76 @@
+{
+  "attempt_count": 1,
+  "class_id": 2,
+  "class_name": "lost_successor_handoff",
+  "cpf_scenarios": [
+    "CPF-02",
+    "CPF-07"
+  ],
+  "duplicate_execution_count": 0,
+  "evidence_snapshot": {
+    "conflicts": [],
+    "emergency_pause_asserted": false,
+    "exact_anchors": {
+      "head": "da699cd7238ed39caf62fb229ba82a2e4f392734"
+    },
+    "items": [],
+    "metadata": {},
+    "shared_leases": []
+  },
+  "expected_invariant_verdicts": {
+    "ACCEPTANCE_BEFORE_ADVANCE": true,
+    "PROGRESS_TOTALITY": true,
+    "SUCCESSOR_DETERMINISM": true
+  },
+  "expected_v0_decision": "PUBLISH_SUCCESSOR",
+  "human_intervention_count": 0,
+  "legacy_result": "Review verdict NEXT emitted but handoff was missing in transition ledger",
+  "policy": {
+    "default_budget": {
+      "max_capability_escalations": 2,
+      "max_resource_attempts": 3,
+      "max_strategy_attempts": 2,
+      "max_total_attempts": 5
+    },
+    "problem_budgets": {},
+    "quota_reset_rules": {
+      "rate_limit_exceeded": {
+        "reset_at": "2026-09-27T18:00:00Z"
+      }
+    },
+    "wait_bounds": {
+      "max_seconds": 3600,
+      "min_seconds": 5
+    }
+  },
+  "source_evidence": {
+    "anchor": "da699cd7238ed39caf62fb229ba82a2e4f392734",
+    "historical_incident": "inc-02-lost_successor_handoff",
+    "origin_task": "historical"
+  },
+  "work_record_snapshot": {
+    "acceptance": {
+      "anchor_head": "c0293ab",
+      "kind": "VERIFIED",
+      "reviewer_verdict_id": "ai_review:p1613-final-exact-head-c0293ab-r4"
+    },
+    "authority_revision": "rev-10",
+    "goal_id": "P16.13",
+    "goal_revision": 1,
+    "goal_spec_digest": "sha256:p1613-spec",
+    "predecessor_goal_id": "P16.12",
+    "project_id": "devorchestrator",
+    "repository_identity": {
+      "branch": "main",
+      "repo_path": "C:\\work\\github\\DevOrchestrator-dev"
+    },
+    "schema_version": 1,
+    "status": "DONE",
+    "successor": {
+      "handoff_idempotency_key": "idemp-p1613-p1614",
+      "publication_state": "PENDING",
+      "successor_goal_id": "P16.14",
+      "successor_spec_digest": "sha256:p1614-spec"
+    }
+  }
+}

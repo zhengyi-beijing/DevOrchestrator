@@ -1,5 +1,40 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P17 Single-Authority Goal Convergence Baseline (implemented / ready for review 2026-09-27):
+- Pre-launch Gate M0 completed under authoritative owner pause: canonical 4-field Control-Plane Impact declaration committed, liveness and bootstrap override verified, stale records reconciled, daemon restarted and reconciled with one coherent P17 authority, and M0 evidence recorded in `agent/evidence/P17_PRELAUNCH_GATE.json` (`pre_resume_status: PASS`). Authenticated resume command `p17-g0-final-resume-20260927` settled accepted against exact clean M0 HEAD.
+- Phase W pure convergence model implemented in `src/dev_orchestrator/convergence/`:
+  - `work_record.py`: Target WorkRecord v0 schema (20 fields/groups, `OPEN` | `NEEDS_HUMAN` | `DONE`, active lease, current problem, attempts, acceptance union, wait, verification, successor, human request, handoff, CAS token), strict validation, sorted-key canonical JSON, sha256 digest, and model-only CAS helper.
+  - `evidence.py`: Immutable `EvidenceSnapshot`, `EvidenceItem`, `ConflictClaim`, `SharedCredentialLease`, typed source lookup, unresolved ambiguity detection, and deterministic snapshot digest.
+  - `policy.py`: Immutable `Policy` and `ProblemBudget` with independent budgets, capability tiers, quota resets, wait bounds, and deterministic policy digest; reads neither configuration nor environment.
+  - `evaluator.py`: Pure side-effect-free `decide()` returning one of 12 frozen `DecisionKind` values with reason, problem ID, parameters, invariant citations, idempotency key, and evidence digests.
+  - `problems.py`: 11 frozen `FailureClass` values, `normalized_problem_fingerprint` rejecting volatile keys (HEAD, lifecycle phase, PID, timestamps, retry IDs), `ProblemTracker`, and deterministic next-problem selection.
+  - `findings.py`: Closed-schema `Finding` model, `FindingSeverity` (`BLOCKING`, `NON_BLOCKING`, `INFO`), `OutputInvalidError`, and strict parser eliminating free-text prose scanning.
+  - `verification.py`: `VerificationRecord`, `is_goal_satisfied` evaluator, and `validate_owner_override` enforcing non-waivable safety obligations (no unresolved blockers, no active lease, no unresolved ambiguity, emergency brake, safety authorization).
+  - `invariants.py`: Stable 21-code convergence invariant registry, pure evaluators, and bidirectional mappings to 6 lifecycle invariants and `CPF-01` through `CPF-10`.
+  - `human_request.py`: Stable question ID derivation, `HumanRequest`, active finder, and answer semantics CASing exclusively on `(question_id, question_revision)`.
+  - `successor.py`: Deterministic successor publication transaction plan (`compute_handoff_idempotency_key`) and structured `build_resumable_handoff`.
+  - `preflight.py`: Deterministic capability preflight (`CapabilityConstraint`) with seeded ZXZ-PC rules including `seed:p11b:rdc-powershell-5.1` (fingerprint `281bf686902bf4aa1cd966a92cab25c5d1a66bfec453323ed171726580c1b82c`), and recurrence classification emitting `LEARNING_REGRESSION` / `CONTROL_PLANE_DEFECT`.
+  - `effects.py` & `actuator_guard.py`: In-memory 5-state effect port (`EffectState`), lease reconciliation enforcing `NO_ORPHAN_OWNER`, and non-writing `ActuatorGuard` revalidating revision, identity, anchor, lease uniqueness, emergency pause, authorization, and idempotency.
+  - `replay.py`: Corpus loader, `ReplayHarness`, aggregate reporting, canonical `decision_trace_hash`, and crash injection between durable write boundaries proving trace-hash equality.
+  - `shadow.py`: `ReadOnlyEvidenceRoot` raising `FenceViolation` on mutation, `validate_shadow_sink` strictly confining output to `runtime/p17-shadow/`, and `ShadowEvaluator` projecting legacy evidence with source digests.
+  - `cli.py` & `__main__.py`: Isolated CLI entry point `python -m dev_orchestrator.convergence` supporting `replay` and `shadow` commands.
+- Corpus and Documentation Deliverables:
+  - `tests_py/data/p17_corpus/`: 26 schema-valid historical replay fixtures covering all required incident classes from P12 through P16.14.
+  - `docs/P17_ARCHITECTURE_CONTRACT.md`: Target architecture, pure control loop, WorkRecord v0, non-waivable safety rules, and legacy vs v0 metrics.
+  - `docs/P17_BACKLOG_RECONCILIATION.md`: Canonical reconciliation matrix covering all 15 backlog capability areas.
+  - `docs/P17_INCIDENT_CORPUS.md`: Deduplicated mapping of all 26 replay classes to CPF scenarios, legacy behavior, expected decisions, and covering regressions.
+  - `docs/P17_LEGACY_CONTRACT_AMENDMENTS.md`: Classification of legacy conflicting assertions as SAFETY vs POLICY, and inventory of 4 duplicated budget paths scheduled for retirement at M9.
+  - `docs/P17_RUNTIME_ROOT_INVENTORY.md`: Complete root inventory, stable/dev deployment architecture, state-root ownership lock, and 7-step promotion protocol.
+  - `docs/P17_MIGRATION_GATES.md`: Full specification of M0-M4 completed gates, P17 authority boundary freeze, and deferred M5-M9 gates.
+- Verification Evidence:
+  - 19 dedicated P17 test suites (78 tests): 100% passed (`test_p17_control_plane_declaration.py`, `test_p17_cpf_scenarios_part1.py`, `test_p17_cpf_scenarios_part2.py`, `test_p17_work_record.py`, `test_p17_evaluator_purity.py`, `test_p17_evidence_and_policy.py`, `test_p17_invariants.py`, `test_p17_acceptance_model.py`, `test_p17_problem_identity.py`, `test_p17_findings_and_output_invalid.py`, `test_p17_retry_wait_escalation.py`, `test_p17_human_and_emergency.py`, `test_p17_lease_and_effects.py`, `test_p17_preflight_constraints.py`, `test_p17_replay_corpus.py`, `test_p17_replay_determinism.py`, `test_p17_shadow_fence.py`, `test_p17_architecture_boundaries.py`, `test_p17_contract_amendments.py`).
+  - Touched regression suites: 102 passed, 10 subtests passed (`test_p1614_invariant_workflow.py`, `test_p1613_successor_consistency.py`, `test_workflow_policy.py`).
+  - Replay CLI (`python -m dev_orchestrator.convergence replay --corpus tests_py/data/p17_corpus`): 26/26 passed, 0 duplicate executions, deterministic trace hash.
+  - Shadow CLI (`python -m dev_orchestrator.convergence shadow --evidence-root . --stdout --json`): Clean decision emission with valid source and policy digests, zero production mutations.
+  - `python -m compileall -q src ops tests_py`: 0 errors.
+  - `git diff --check`: 0 errors.
+  - `graphify update .`: Clean update (7310 nodes, 19986 edges, 310 communities).
+
 P16.14 Invariant-Driven Control-Plane Development & Validation (complete 2026-09-26):
 - Institutionalized invariant-first control plane development, testing, and validation:
   1. Worker's First Commit (`cb1648e`):

@@ -1,0 +1,86 @@
+{
+  "attempt_count": 1,
+  "class_id": 5,
+  "class_name": "replayed_duplicate_command_or_event",
+  "cpf_scenarios": [
+    "CPF-06",
+    "CPF-10"
+  ],
+  "duplicate_execution_count": 0,
+  "evidence_snapshot": {
+    "conflicts": [],
+    "emergency_pause_asserted": false,
+    "exact_anchors": {
+      "head": "head-1"
+    },
+    "items": [
+      {
+        "anchor": "head-1",
+        "data": {
+          "alive": true,
+          "role": "worker"
+        },
+        "digest": "sha256:probe1",
+        "read_status": "OK",
+        "source": "process_probe",
+        "source_id": "probe-1",
+        "timestamp": "2026-09-27T00:01:00Z"
+      }
+    ],
+    "metadata": {},
+    "shared_leases": []
+  },
+  "expected_invariant_verdicts": {
+    "IDEMPOTENT_REPLAY": true,
+    "SINGLE_ACTIVE_LEASE": true
+  },
+  "expected_v0_decision": "NOOP_ACTIVE",
+  "human_intervention_count": 0,
+  "legacy_result": "Same event re-delivered causing duplicate execution",
+  "policy": {
+    "default_budget": {
+      "max_capability_escalations": 2,
+      "max_resource_attempts": 3,
+      "max_strategy_attempts": 2,
+      "max_total_attempts": 5
+    },
+    "problem_budgets": {},
+    "quota_reset_rules": {
+      "rate_limit_exceeded": {
+        "reset_at": "2026-09-27T18:00:00Z"
+      }
+    },
+    "wait_bounds": {
+      "max_seconds": 3600,
+      "min_seconds": 5
+    }
+  },
+  "source_evidence": {
+    "anchor": "da699cd7238ed39caf62fb229ba82a2e4f392734",
+    "historical_incident": "inc-05-replayed_duplicate_command_or_event",
+    "origin_task": "historical"
+  },
+  "work_record_snapshot": {
+    "acceptance": {
+      "kind": "NONE"
+    },
+    "active_lease": {
+      "acquired_at": "2026-09-27T00:00:00Z",
+      "attempt_id": "att-live-1",
+      "execution_id": "exec-live-1",
+      "role": "worker"
+    },
+    "authority_revision": "rev-3",
+    "goal_id": "P17",
+    "goal_revision": 1,
+    "goal_spec_digest": "sha256:p17-spec",
+    "predecessor_goal_id": "P16.14",
+    "project_id": "devorchestrator",
+    "repository_identity": {
+      "branch": "main",
+      "repo_path": "C:\\work\\github\\DevOrchestrator-dev"
+    },
+    "schema_version": 1,
+    "status": "OPEN"
+  }
+}

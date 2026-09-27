@@ -1,0 +1,85 @@
+{
+  "attempt_count": 1,
+  "class_id": 24,
+  "class_name": "human_question_discharged_across_head_change",
+  "cpf_scenarios": [
+    "CPF-09"
+  ],
+  "duplicate_execution_count": 0,
+  "evidence_snapshot": {
+    "conflicts": [],
+    "emergency_pause_asserted": false,
+    "exact_anchors": {
+      "head": "da699cd7238ed39caf62fb229ba82a2e4f392734"
+    },
+    "items": [],
+    "metadata": {},
+    "shared_leases": []
+  },
+  "expected_invariant_verdicts": {
+    "HUMAN_REQUEST_DISCHARGEABLE": true,
+    "PROGRESS_TOTALITY": true
+  },
+  "expected_v0_decision": "EXECUTE",
+  "human_intervention_count": 0,
+  "legacy_result": "Human answer rejected because background commit changed HEAD",
+  "policy": {
+    "default_budget": {
+      "max_capability_escalations": 2,
+      "max_resource_attempts": 3,
+      "max_strategy_attempts": 2,
+      "max_total_attempts": 5
+    },
+    "problem_budgets": {},
+    "quota_reset_rules": {
+      "rate_limit_exceeded": {
+        "reset_at": "2026-09-27T18:00:00Z"
+      }
+    },
+    "wait_bounds": {
+      "max_seconds": 3600,
+      "min_seconds": 5
+    }
+  },
+  "source_evidence": {
+    "anchor": "da699cd7238ed39caf62fb229ba82a2e4f392734",
+    "historical_incident": "inc-24-human_question_discharged_across_head_change",
+    "origin_task": "historical"
+  },
+  "work_record_snapshot": {
+    "acceptance": {
+      "kind": "NONE"
+    },
+    "authority_revision": "rev-4",
+    "goal_id": "P17",
+    "goal_revision": 1,
+    "goal_spec_digest": "sha256:p17-spec",
+    "human_request": {
+      "answer": {
+        "answered_at": "2026-09-27T02:00:00Z",
+        "command_id": "cmd-ans-1",
+        "option_id": "opt-single-auth",
+        "owner_id": "owner"
+      },
+      "concrete_question": "Select architecture?",
+      "options": [
+        {
+          "description": "Single Authority",
+          "effect": "proceed",
+          "option_id": "opt-single-auth"
+        }
+      ],
+      "question_id": "q-design-choice",
+      "question_revision": 1,
+      "request_type": "product_choice"
+    },
+    "predecessor_goal_id": "P16.14",
+    "project_id": "devorchestrator",
+    "repository_identity": {
+      "branch": "main",
+      "repo_path": "C:\\work\\github\\DevOrchestrator-dev"
+    },
+    "schema_version": 1,
+    "status": "OPEN"
+  }
+}

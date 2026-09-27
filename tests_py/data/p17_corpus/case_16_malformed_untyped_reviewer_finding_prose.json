@@ -1,0 +1,72 @@
+{
+  "attempt_count": 1,
+  "class_id": 16,
+  "class_name": "malformed_untyped_reviewer_finding_prose",
+  "cpf_scenarios": [
+    "CPF-08"
+  ],
+  "duplicate_execution_count": 0,
+  "evidence_snapshot": {
+    "conflicts": [],
+    "emergency_pause_asserted": false,
+    "exact_anchors": {
+      "head": "da699cd7238ed39caf62fb229ba82a2e4f392734"
+    },
+    "items": [],
+    "metadata": {},
+    "shared_leases": []
+  },
+  "expected_invariant_verdicts": {
+    "BOUNDED_PROBLEM": true,
+    "PROGRESS_TOTALITY": true
+  },
+  "expected_v0_decision": "RETRY_SAME_STRATEGY",
+  "human_intervention_count": 0,
+  "legacy_result": "Review parsed prose 'BLOCKING:' substring, missed unstructured issues",
+  "policy": {
+    "default_budget": {
+      "max_capability_escalations": 2,
+      "max_resource_attempts": 3,
+      "max_strategy_attempts": 2,
+      "max_total_attempts": 5
+    },
+    "problem_budgets": {},
+    "quota_reset_rules": {
+      "rate_limit_exceeded": {
+        "reset_at": "2026-09-27T18:00:00Z"
+      }
+    },
+    "wait_bounds": {
+      "max_seconds": 3600,
+      "min_seconds": 5
+    }
+  },
+  "source_evidence": {
+    "anchor": "da699cd7238ed39caf62fb229ba82a2e4f392734",
+    "historical_incident": "inc-16-malformed_untyped_reviewer_finding_prose",
+    "origin_task": "historical"
+  },
+  "work_record_snapshot": {
+    "acceptance": {
+      "kind": "NONE"
+    },
+    "attempts": [],
+    "authority_revision": "rev-1",
+    "current_problem": {
+      "failure_class": "OUTPUT_INVALID",
+      "normalized_fingerprint": "fp-malformed-finding",
+      "problem_id": "prob-malformed-finding"
+    },
+    "goal_id": "P17",
+    "goal_revision": 1,
+    "goal_spec_digest": "sha256:p17-spec",
+    "predecessor_goal_id": "P16.14",
+    "project_id": "devorchestrator",
+    "repository_identity": {
+      "branch": "main",
+      "repo_path": "C:\\work\\github\\DevOrchestrator-dev"
+    },
+    "schema_version": 1,
+    "status": "OPEN"
+  }
+}
