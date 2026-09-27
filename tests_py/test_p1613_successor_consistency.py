@@ -25,7 +25,10 @@ from dev_orchestrator.core.successor_consistency import (
     reconcile_roadmap_successor,
     resolve_successor,
 )
-from dev_orchestrator.core.transition_executor import TransitionExecutor
+from dev_orchestrator.core.transition_executor import (
+    _STALE_ANCHOR_HANDOFF_REFUSAL,
+    TransitionExecutor,
+)
 from dev_orchestrator.core.repository import read_repository_truth
 
 
@@ -2080,6 +2083,130 @@ class LinkedWorktreeSuccessorRepairTests(unittest.TestCase):
                     if isinstance(row, dict)]
             self.assertEqual(len([r for r in rows if r.get("state") == "handoff"]), 1)
             self.assertEqual(set(executor.state()["transitions"]), set(transitions_before))
+
+
+class StaleAnchorHandoffTests(unittest.TestCase):
+    """P17 closure defect: a handoff must survive HEAD moving past it.
+
+    The live P17 -> P18 handoff was recorded at the roadmap-repair commit and
+    then refused by the Planner ("repository moved since review") because an
+    unrelated control-plane fix was committed before the next tick consumed it.
+    The refusal made the transition terminal and the Watchdog raised an owner
+    gate, so the no-human-clock defect reappeared one hop later.
+    """
+
+    setUp = ZeroTouchSuccessorHandoffEndToEndTests.setUp
+    tearDown = ZeroTouchSuccessorHandoffEndToEndTests.tearDown
+    _snapshot = ZeroTouchSuccessorHandoffEndToEndTests._snapshot
+    _owner_commands = ZeroTouchSuccessorHandoffEndToEndTests._owner_commands
+
+    def _record_handoff_then_commit(self, path="src_unrelated.py"):
+        recorded_head = _git(self.repo, "rev-parse", "HEAD")
+        outcome = self.executor.reconcile_successor_handoff(
+            self.project, self._snapshot()["projects"][0],
+            completed_task_id="P1", trigger="stale-anchor fixture",
+        )
+        self.assertEqual(outcome["status"], "applied", outcome)
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("moved after the handoff was recorded\n", encoding="utf-8")
+        _commit(self.repo, "commit after the handoff was recorded")
+        return outcome["source_request_id"], recorded_head
+
+    def _controls_tick(self):
+        from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
+        from dev_orchestrator.core.control_commands import ControlCommandCoordinator
+
+        planner = AIPlannerCoordinator(self.runtime, self.port)
+        controls = ControlCommandCoordinator(self.runtime, planner)
+        controls.advance(str(self.config_path), self._snapshot(), self.executor)
+        for thread in getattr(planner, "_threads", {}).values():
+            thread.join(timeout=15.0)
+        return planner
+
+    def _p2_plans(self, planner):
+        return [row for row in planner.state()["plans"].values()
+                if isinstance(row, dict) and row.get("task_id") == "P2"]
+
+    def _assert_advanced_to_p2(self, planner, source_id, recorded_head):
+        plans = self._p2_plans(planner)
+        self.assertEqual(len(plans), 1, "the successor Planner did not start")
+        self.assertEqual(plans[0].get("handoff_anchor_head"), recorded_head)
+        authority = self.executor.state()["lifecycle"]["p1"]
+        self.assertEqual((authority["current_task_id"], authority["source_task_id"]), ("P2", "P1"))
+        record = self.executor.state()["executions"][source_id]
+        self.assertTrue(record.get("handoff_consumed"))
+        transition = self.executor.state()["transitions"][record["lifecycle_transition_id"]]
+        self.assertEqual(transition["state"], "published")
+        self.assertIn("# P2", (self.repo / "agent" / "next.md").read_text(encoding="utf-8"))
+        self.assertEqual(self._owner_commands(), [], "recovery required an owner command")
+
+    def test_unrelated_commit_between_record_and_activation_is_accepted(self):
+        source_id, recorded_head = self._record_handoff_then_commit()
+        planner = self._controls_tick()
+        self._assert_advanced_to_p2(planner, source_id, recorded_head)
+
+    def test_lifecycle_document_change_after_record_still_refuses(self):
+        source_id, _ = self._record_handoff_then_commit(path="agent/notes.md")
+        planner = self._controls_tick()
+        self.assertEqual(self._p2_plans(planner), [], "activated over changed lifecycle documents")
+        record = self.executor.state()["executions"][source_id]
+        self.assertEqual(record["state"], "blocked")
+        self.assertEqual(record["reason"], _STALE_ANCHOR_HANDOFF_REFUSAL)
+        self.assertEqual(self.executor.state()["lifecycle"]["p1"]["current_task_id"], "P1")
+
+    def test_rewritten_history_is_not_accepted_as_a_fast_forward(self):
+        from dev_orchestrator.core.ai_planner import _lifecycle_evidence_unchanged
+
+        anchor = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "src_unrelated.py").write_text("rewritten\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "--amend", "-m", "rewrite"],
+                       check=True, capture_output=True)
+        rewritten = _git(self.repo, "rev-parse", "HEAD")
+        self.assertFalse(_lifecycle_evidence_unchanged(self.repo, anchor, rewritten))
+
+    def test_live_stale_anchor_block_is_reopened_once_and_consumed(self):
+        """The exact live state: blocked by the old HEAD-equality check."""
+        source_id, recorded_head = self._record_handoff_then_commit()
+        self.executor.mark_handoff_blocked(source_id, _STALE_ANCHOR_HANDOFF_REFUSAL)
+        record = self.executor.state()["executions"][source_id]
+        transition = self.executor.state()["transitions"][record["lifecycle_transition_id"]]
+        self.assertEqual((record["state"], transition["state"]), ("blocked", "waiting_recovery"))
+
+        planner = self._controls_tick()
+
+        self._assert_advanced_to_p2(planner, source_id, recorded_head)
+        record = self.executor.state()["executions"][source_id]
+        self.assertTrue(record.get("stale_anchor_reopened_at"))
+        self.assertEqual(record.get("stale_anchor_block_reason"), _STALE_ANCHOR_HANDOFF_REFUSAL)
+
+    def test_reopen_is_bounded_to_one_attempt(self):
+        # A genuine lifecycle change: the re-validated check refuses again.
+        source_id, _ = self._record_handoff_then_commit(path="agent/notes.md")
+        self.executor.mark_handoff_blocked(source_id, _STALE_ANCHOR_HANDOFF_REFUSAL)
+
+        first = self._controls_tick()
+        second = self._controls_tick()
+
+        self.assertEqual(self._p2_plans(first) + self._p2_plans(second), [])
+        record = self.executor.state()["executions"][source_id]
+        self.assertEqual(record["state"], "blocked")
+        self.assertTrue(record.get("stale_anchor_reopened_at"))
+        self.assertFalse(
+            self.executor.reopen_stale_anchor_handoff(source_id),
+            "a handoff was reopened more than once",
+        )
+
+    def test_other_planner_refusals_are_never_reopened(self):
+        source_id, _ = self._record_handoff_then_commit()
+        self.executor.mark_handoff_blocked(
+            source_id, "automatic planner handoff failed: staged spec changed since handoff",
+        )
+        self.assertFalse(self.executor.reopen_stale_anchor_handoff(source_id))
+        planner = self._controls_tick()
+        self.assertEqual(self._p2_plans(planner), [])
+        self.assertEqual(self.executor.state()["executions"][source_id]["state"], "blocked")
 
 
 if __name__ == "__main__":

@@ -74,6 +74,11 @@ from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_is
 
 ACTUATION_FILE = "transition-executor.json"
 _LEDGER_VERSION = 2
+# The exact block ControlCommandCoordinator records when the Planner refuses a
+# staged handoff solely because HEAD moved since it was recorded.
+_STALE_ANCHOR_HANDOFF_REFUSAL = (
+    "automatic planner handoff failed: repository moved since review"
+)
 _ACTIVE_STATES = frozenset({"launching", "running"})
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "explicitly_reconciled"})
 
@@ -1338,6 +1343,46 @@ class TransitionExecutor:
                 authority["updated_at"] = utc_now_iso()
                 authority["recovery_epoch_id"] = epoch_for(authority)
             self._save_ledger(ledger)
+
+    def reopen_stale_anchor_handoff(self, source_request_id: str) -> bool:
+        """Reopen, once, a handoff refused only because HEAD had advanced.
+
+        The Planner used to refuse any HEAD movement between recording and
+        consuming a staged handoff, and that refusal made the transition
+        terminal: an unrelated commit (such as a control-plane fix) turned a
+        valid handoff into an owner gate.  The Planner now accepts a fast-forward
+        that leaves ``agent/`` untouched and re-validates everything else, so a
+        handoff blocked with exactly that refusal may be offered to it again.
+        This happens at most once per handoff: if the re-validated check refuses
+        too, the block stands and stays a genuine owner gate.
+        """
+        with self._lock:
+            ledger = self._load_ledger()
+            record = ledger["executions"].get(source_request_id)
+            if (
+                not isinstance(record, dict)
+                or record.get("state") != "blocked"
+                or record.get("outcome") != "planning_required"
+                or record.get("reason") != _STALE_ANCHOR_HANDOFF_REFUSAL
+                or not record.get("staged_successor")
+                or record.get("stale_anchor_reopened_at")
+            ):
+                return False
+            transition = ledger.setdefault("transitions", {}).get(
+                record.get("lifecycle_transition_id")
+            )
+            if not isinstance(transition, dict) or transition.get("state") != "waiting_recovery":
+                return False
+            now = utc_now_iso()
+            record["state"] = "handoff"
+            record["stale_anchor_reopened_at"] = now
+            record["stale_anchor_block_reason"] = record.get("reason")
+            record["reason"] = "reopened after a stale-anchor planner refusal"
+            transition["state"] = "ready"
+            transition["reason"] = None
+            transition["updated_at"] = now
+            self._save_ledger(ledger)
+            return True
 
     def mark_handoff_blocked(self, source_request_id: str, reason: str) -> None:
         with self._lock:

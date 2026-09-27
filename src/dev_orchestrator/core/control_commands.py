@@ -179,6 +179,17 @@ class ControlCommandCoordinator:
             return []
         outcomes: list[dict[str, Any]] = []
         for source_id, row in sorted(executions.items()):
+            if (
+                isinstance(row, dict)
+                and row.get("state") == "blocked"
+                and row.get("outcome") == "planning_required"
+            ):
+                # A handoff refused only because HEAD advanced is re-offered
+                # once; the executor owns that decision and the ledger write.
+                reopen = getattr(executor, "reopen_stale_anchor_handoff", None)
+                if callable(reopen) and reopen(source_id):
+                    refreshed = executor.state()
+                    row = (refreshed.get("executions") or {}).get(source_id) if isinstance(refreshed, dict) else None
             if not isinstance(row, dict) or row.get("state") != "handoff" or row.get("outcome") != "planning_required":
                 continue
             project_id = _nonblank(row.get("project_id")); next_task_id = _nonblank(row.get("next_task_id"))

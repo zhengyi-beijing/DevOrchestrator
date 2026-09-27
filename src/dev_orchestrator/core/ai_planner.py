@@ -321,6 +321,37 @@ def _parse_plan_review(text: str | None) -> tuple[str, str]:
     return decision, reason
 
 
+def _lifecycle_evidence_unchanged(repo: Path, anchor_head: str, head: str) -> bool:
+    """True when HEAD only fast-forwarded past commits outside ``agent/``.
+
+    A staged handoff is anchored to the HEAD at which it was recorded.  What
+    activation actually depends on is re-validated against current truth just
+    before this check (clean tree, same branch, identical roadmap edge and
+    staged spec bytes); HEAD equality additionally protects the predecessor's
+    lifecycle documents and history.  So an advance is accepted only when the
+    anchor is an ancestor of HEAD (no rewrite) and nothing under ``agent/``
+    changed since it.  Any other movement, or any git failure, still refuses.
+    Without this, an unrelated commit between recording and consuming the
+    handoff -- a control-plane fix, say -- turned a valid handoff into a
+    refused transition and an owner gate.
+    """
+    try:
+        ancestor = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", anchor_head, head],
+            capture_output=True, timeout=15, check=False, **hidden_subprocess_kwargs(),
+        )
+        if ancestor.returncode != 0:
+            return False
+        changed = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only", anchor_head, head, "--", "agent/"],
+            capture_output=True, text=True, timeout=15, check=False,
+            **hidden_subprocess_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return changed.returncode == 0 and not changed.stdout.strip()
+
+
 class AIPlannerCoordinator:
     """Runs one planner and one independent reviewer, then freezes the approved plan."""
 
@@ -603,7 +634,9 @@ class AIPlannerCoordinator:
                     "next_text": rm_res.spec_text,
                 },
             )
-        if truth.head != reviewed_head:
+        if truth.head != reviewed_head and not _lifecycle_evidence_unchanged(
+            repo, reviewed_head, truth.head,
+        ):
             return None, "repository moved since review"
 
         # A deferred handoff used to leave agent/next.md on the predecessor
@@ -632,6 +665,9 @@ class AIPlannerCoordinator:
             "predecessor_task_id": handoff_task_id,
             "predecessor_next_sha256": sha256_bytes(predecessor_bytes),
             "predecessor_settled_at": utc_now_iso(),
+            # The HEAD the handoff was recorded at; differs from the pre-
+            # activation HEAD only when commits outside agent/ fast-forwarded it.
+            "handoff_anchor_head": reviewed_head,
             "activation_commit": activation_head,
             "staged_spec_path": staged_spec_path,
             "staged_spec_sha256": staged_spec_sha256,
