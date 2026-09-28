@@ -1565,6 +1565,207 @@ class WatchdogCoordinator:
             self._save_state(self._cached_state)
             return consumed
 
+    def _recover_cleared_automatic_planning_failure(
+        self,
+        project_config: dict[str, Any],
+        snapshot: dict[str, Any],
+        project_row: dict[str, Any],
+        planner_state: dict[str, Any] | None,
+        policy: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Enqueue one bounded replan after an exact transient automatic failure.
+
+        Lifecycle authority remains the sole task authority.  This method only
+        reserves a durable retry and submits the ordinary guarded ``continue``
+        command after proving that the automatic planner's repository-change
+        failure has cleared at the current authoritative PENDING_DESIGN task.
+        """
+        pid = str(project_config.get("project_id") or project_config.get("id") or "")
+        if not pid or not policy.get("auto_recovery", False):
+            return None
+
+        authority = snapshot.get("authoritative_lifecycle")
+        telemetry = snapshot.get("telemetry")
+        repo_projection = authority.get("repository_projection") if isinstance(authority, dict) else None
+        task_id = str(telemetry.get("task_id") or "") if isinstance(telemetry, dict) else ""
+        authority_task = str(authority.get("current_task_id") or "") if isinstance(authority, dict) else ""
+        authority_state = str(authority.get("lifecycle_state") or "").upper() if isinstance(authority, dict) else ""
+        projected_state = str(snapshot.get("lifecycle_state") or "").upper()
+
+        # Missing or contradictory authority is not evidence that recovery is safe.
+        if (
+            not isinstance(authority, dict)
+            or not isinstance(repo_projection, dict)
+            or authority_state != "PENDING_DESIGN"
+            or projected_state != "PENDING_DESIGN"
+            or not task_id
+            or task_id != authority_task
+            or str(repo_projection.get("task_id") or "") != task_id
+            or str(repo_projection.get("state") or "").upper() != "PENDING_DESIGN"
+            or repo_projection.get("matches_authority") is not True
+            or authority.get("active_owner") is not None
+            or authority.get("owner_gate") is not None
+        ):
+            return None
+
+        plans = planner_state.get("plans") if isinstance(planner_state, dict) else None
+        candidates = [
+            row for row in (plans or {}).values()
+            if isinstance(row, dict) and str(row.get("project_id") or "") == pid
+        ] if isinstance(plans, dict) else []
+        if not candidates:
+            return None
+
+        def _plan_order(row: dict[str, Any]) -> tuple[str, str]:
+            return (
+                str(row.get("completed_at") or row.get("started_at") or ""),
+                str(row.get("plan_id") or ""),
+            )
+
+        failed = max(candidates, key=_plan_order)
+        if (
+            failed.get("state") != "failed"
+            or failed.get("reason") != "repository changed during planning"
+            or str(failed.get("task_id") or "") != task_id
+        ):
+            return None
+
+        failed_command = str(failed.get("command_id") or "")
+        failed_plan_id = str(failed.get("plan_id") or "")
+        history = read_json(
+            self.runtime_root / "control" / "history" / f"{failed_command}.json", None,
+        )
+        automatic_sources = {"automatic_review_handoff", "watchdog_planning_recovery"}
+        if (
+            not failed_command
+            or not failed_plan_id
+            or not isinstance(history, dict)
+            or history.get("project_id") != pid
+            or history.get("plan_id") != failed_plan_id
+            or history.get("source") not in automatic_sources
+        ):
+            return None
+
+        # Owner controls and safety gates are hard fences, independent of the
+        # lifecycle projection above.
+        from dev_orchestrator.control.surface import project_identity
+        identity = project_identity(snapshot, self.runtime_root)
+        if identity.get("gate_id") is not None or identity.get("paused"):
+            return None
+
+        repo_path = str(project_config.get("repo_path") or project_config.get("root") or "")
+        if not repo_path or canonical_path(repo_path) != canonical_path(str(failed.get("repo_path") or "")):
+            return None
+        truth = read_repository_truth(repo_path)
+        git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
+        # Dirty state is a cleared-condition wait.  A stale monitor snapshot is
+        # likewise never used to authorize a retry; a later fresh tick may act.
+        if (
+            not truth.valid
+            or truth.dirty
+            or git.get("dirty") is not False
+            or str(git.get("head") or "") != str(truth.head or "")
+            or str(git.get("branch") or "") != str(truth.branch or "")
+            or str(failed.get("branch") or "") != str(truth.branch or "")
+        ):
+            return {
+                "project_id": pid,
+                "status": "planning_recovery_waiting",
+                "reason": "repository is dirty, invalid, or stale relative to the current tick",
+            }
+
+        # Import lazily: incidents.__init__ reaches adapter registration, which
+        # imports this module's path helpers during process startup.
+        from dev_orchestrator.incidents.fingerprint import incident_fingerprint
+        fingerprint = incident_fingerprint({
+            "failure_class": "RESOURCE_TRANSIENT",
+            "diagnosis_code": "planner_failed",
+            "blocker_code": "repository_changed_during_planning",
+            "lifecycle_class": "automatic_planning",
+            "contract_class": "automatic_planning_progress",
+            "role_class": "planner",
+            "continuation_relation": f"goal:{task_id}",
+            "invariant_identifier": "AUTOMATIC_PLANNING_PROGRESS",
+        })
+        problems = project_row.setdefault("planning_recovery_problems", {})
+        if not isinstance(problems, dict):
+            project_row["planning_recovery_evidence_error"] = "planning_recovery_problems is not an object"
+            return None
+        problem = problems.setdefault(fingerprint, {
+            "problem_id": f"planning-recovery:{fingerprint}",
+            "normalized_fingerprint": fingerprint,
+            "failure_class": "RESOURCE_TRANSIENT",
+            "semantic_error_family": "repository_changed_during_planning",
+            "task_id": task_id,
+            "attempts": [],
+            "state": "open",
+        })
+        attempts = problem.get("attempts")
+        if not isinstance(attempts, list):
+            problem["state"] = "invalid"
+            problem["reason"] = "planning recovery attempts is not a list"
+            return None
+        if any(isinstance(item, dict) and item.get("failed_plan_id") == failed_plan_id for item in attempts):
+            return {"project_id": pid, "status": "planning_recovery_already_reserved"}
+
+        limit = int(policy.get("max_attempts_per_run") or 0)
+        if limit <= 0 or len(attempts) >= limit:
+            problem["state"] = "exhausted"
+            problem["reason"] = f"automatic planning recovery budget exhausted ({limit})"
+            self._save_state(self._cached_state)
+            return {"project_id": pid, "status": "planning_recovery_exhausted"}
+
+        attempt_number = len(attempts) + 1
+        command_id = f"wd-plan-{fingerprint[:16]}-{attempt_number}"
+        attempt = {
+            "attempt": attempt_number,
+            "failed_plan_id": failed_plan_id,
+            "command_id": command_id,
+            "state": "reserved",
+            "reserved_at": utc_now_iso(),
+        }
+        attempts.append(attempt)
+        problem["state"] = "retrying"
+        self._save_state(self._cached_state)
+
+        try:
+            from dev_orchestrator.core.control_commands import submit_control_command
+            submit_control_command(
+                self.runtime_root,
+                pid,
+                "continue",
+                command_id=command_id,
+                expected=identity,
+                source="watchdog_planning_recovery",
+            )
+            attempt["state"] = "requested"
+            attempt["requested_at"] = utc_now_iso()
+            self._save_state(self._cached_state)
+            self._emit_milestone(
+                pid,
+                "RECOVERY_STARTED",
+                task_id=task_id,
+                occurrence_key=f"{problem['problem_id']}:{attempt_number}",
+                details={
+                    "command_id": command_id,
+                    "action": "continue",
+                    "problem_id": problem["problem_id"],
+                    "failed_plan_id": failed_plan_id,
+                },
+            )
+            return {
+                "project_id": pid,
+                "status": "planning_recovery_requested",
+                "command_id": command_id,
+                "problem_id": problem["problem_id"],
+            }
+        except Exception as exc:
+            attempt["state"] = "blocked"
+            attempt["reason"] = f"enqueue failed: {exc}"
+            problem["state"] = "blocked"
+            self._save_state(self._cached_state)
+            return {"project_id": pid, "status": "planning_recovery_blocked", "reason": str(exc)}
+
     def advance(
         self,
         config_path: Path | str,
@@ -1667,6 +1868,21 @@ class WatchdogCoordinator:
                     results.append({"project_id": pid, "status": "skipped", "reason": "degraded_or_quarantined_or_disabled"})
                     continue
 
+                planner_obj = planner or self.planner
+                planner_fn = getattr(planner_obj, "state", None)
+                planner_state_error: str | None = None
+                try:
+                    planner_state = planner_fn() if callable(planner_fn) else None
+                except Exception as exc:
+                    planner_state = None
+                    planner_state_error = f"planner_state_unavailable: {exc}"
+                    prow["last_error"] = planner_state_error
+                planning_recovery = self._recover_cleared_automatic_planning_failure(
+                    pcfg, snapshot, prow, planner_state, policy,
+                )
+                if planning_recovery is not None:
+                    results.append(planning_recovery)
+
                 # P16.13: every lifecycle path consumes the same invariant
                 # evaluator. Watchdog is a validator/recovery actuator, never a
                 # competing task authority.
@@ -1675,9 +1891,7 @@ class WatchdogCoordinator:
                         evaluate_lifecycle_invariants,
                         invariant_payload,
                     )
-                    planner_obj = planner or self.planner
                     reviewer_obj = reviewer or self.reviewer
-                    planner_fn = getattr(planner_obj, "state", None)
                     reviewer_fn = getattr(reviewer_obj, "state", None)
                     decisions_state = read_json(self.runtime_root / "review-decisions.json", {})
                     # Normalize exactly as reconciliation does.  A ledger that
@@ -1703,11 +1917,13 @@ class WatchdogCoordinator:
                         raise _LifecycleEvidenceUnavailable(
                             executor_state_error or "executor_state_unavailable"
                         )
+                    if planner_state_error is not None:
+                        raise _LifecycleEvidenceUnavailable(planner_state_error)
                     prow.pop("lifecycle_evidence_unavailable", None)
                     lifecycle_findings = evaluate_lifecycle_invariants(
                         snapshot=snapshot,
                         executor_state=executor_state or {},
-                        planner_state=planner_fn() if callable(planner_fn) else None,
+                        planner_state=planner_state,
                         reviewer_state=reviewer_fn() if callable(reviewer_fn) else None,
                         decisions_state=decisions_state,
                     )
