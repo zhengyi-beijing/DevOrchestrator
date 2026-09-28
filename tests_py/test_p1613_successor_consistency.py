@@ -1878,6 +1878,79 @@ class TerminalClosureControlPlaneTests(unittest.TestCase):
             self.assertEqual((resolution["kind"], resolution["successor_task_id"]),
                              ("successor", "P2"))
 
+    def test_historical_terminal_closure_does_not_suppress_roadmap_successor_obligation(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            historical_settlement = {
+                **_STALE_SETTLE,
+                "source_request_id": "ai_review:p0-settled",
+                "task_id": "P0",
+            }
+            state = _terminal_state()
+            state["executions"] = {
+                "ai_review:p0-settled": historical_settlement,
+            }
+            decisions = {"decisions": {"ai_review:p0-rereview": {
+                "project_id": "p1", "task_id": "P0",
+                "request_id": "ai_review:p0-rereview",
+                "disposition": "apply", "decision": "next",
+                "next_action": "next_task",
+                "consumed_at": "2026-09-28T07:00:00+00:00",
+            }}}
+
+            finding = _next_finding(repo, state, decisions)
+
+            self.assertEqual(finding.code, "NEXT_TASK_WITHOUT_HANDOFF")
+            self.assertFalse(finding.holds)
+            self.assertTrue(finding.recoverable)
+            self.assertEqual(
+                [row["task_id"] for row in finding.evidence["terminal_closures"]],
+                ["P0"],
+            )
+            self.assertEqual(
+                (finding.evidence["roadmap_successor"]["source_task_id"],
+                 finding.evidence["roadmap_successor"]["target_task_id"]),
+                ("P1", "P2"),
+            )
+
+    def test_handed_off_historical_next_does_not_create_terminal_closure(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+            historical_settlement = {
+                **_STALE_SETTLE,
+                "source_request_id": "ai_review:p0-settled",
+                "task_id": "P0",
+            }
+            state = _terminal_state(executions={
+                "ai_review:p0-settled": historical_settlement,
+                "ai_review:p0-rereview": {
+                    "project_id": "p1", "task_id": "P0",
+                    "source_task_id": "P0", "target_task_id": "P1",
+                    "state": "handoff",
+                },
+                "current-handoff": {
+                    "project_id": "p1", "task_id": "P1",
+                    "source_task_id": "P1", "target_task_id": "P2",
+                    "state": "handoff",
+                },
+            })
+            decisions = {"decisions": {"ai_review:p0-rereview": {
+                "project_id": "p1", "task_id": "P0",
+                "request_id": "ai_review:p0-rereview",
+                "disposition": "apply", "decision": "next",
+                "next_action": "next_task",
+                "consumed_at": "2026-09-28T07:00:00+00:00",
+            }}}
+
+            with patch(
+                "dev_orchestrator.core.lifecycle_authority._successor_resolution_evidence"
+            ) as resolve:
+                finding = _next_finding(repo, state, decisions)
+
+            resolve.assert_not_called()
+            self.assertTrue(finding.holds)
+            self.assertNotIn("terminal_closures", finding.evidence)
+
     def test_ambiguous_and_invalid_successor_evidence_still_fail_closed(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

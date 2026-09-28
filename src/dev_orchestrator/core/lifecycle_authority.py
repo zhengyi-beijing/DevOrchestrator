@@ -468,32 +468,33 @@ def evaluate_lifecycle_invariants(
                     satisfied = True
                     break
         successor_resolution = None
-        terminal_settlements = _task_complete_settlements(
-            executions or {}, project_id, str(row.get("task_id") or ""),
-        )
-        if terminal_settlements:
-            # A technical review may be accepted after the task was already
-            # terminal-settled (for example a rereview of the accepted HEAD).
-            # That historical NEXT_TASK row is not a perpetual demand to invent
-            # a successor.  The settlement satisfies it only while fresh,
-            # authoritative repository evidence still has no executable
-            # successor.  If a successor is staged later, or the evidence is
-            # invalid/ambiguous, the obligation remains live and the ordinary
-            # handoff/fail-closed paths continue to apply.
-            successor_resolution = _successor_resolution_evidence(
-                snapshot, str(row.get("task_id") or ""),
+        if not satisfied:
+            terminal_settlements = _task_complete_settlements(
+                executions or {}, project_id, str(row.get("task_id") or ""),
             )
-            successor_resolution["terminal_settlement_request_ids"] = sorted(
-                str(item.get("source_request_id") or "")
-                for item in terminal_settlements
-            )
-            if successor_resolution.get("kind") in _NO_EXECUTABLE_SUCCESSOR_KINDS:
-                terminal_closures.append({
-                    "request_id": request_id,
-                    "task_id": row.get("task_id"),
-                    "successor_resolution": successor_resolution,
-                })
-                satisfied = True
+            if terminal_settlements:
+                # A technical review may be accepted after the task was already
+                # terminal-settled (for example a rereview of the accepted HEAD).
+                # That historical NEXT_TASK row is not a perpetual demand to invent
+                # a successor.  The settlement satisfies it only while fresh,
+                # authoritative repository evidence still has no executable
+                # successor.  If a successor is staged later, or the evidence is
+                # invalid/ambiguous, the obligation remains live and the ordinary
+                # handoff/fail-closed paths continue to apply.
+                successor_resolution = _successor_resolution_evidence(
+                    snapshot, str(row.get("task_id") or ""),
+                )
+                successor_resolution["terminal_settlement_request_ids"] = sorted(
+                    str(item.get("source_request_id") or "")
+                    for item in terminal_settlements
+                )
+                if successor_resolution.get("kind") in _NO_EXECUTABLE_SUCCESSOR_KINDS:
+                    terminal_closures.append({
+                        "request_id": request_id,
+                        "task_id": row.get("task_id"),
+                        "successor_resolution": successor_resolution,
+                    })
+                    satisfied = True
         if not satisfied:
             next_decisions.append({
                 **row, "request_id": request_id,
@@ -532,7 +533,11 @@ def evaluate_lifecycle_invariants(
     # handoff even when no NEXT review decision survives (for example the
     # roadmap edge was restored after the task was settled task_complete).
     roadmap_successor = None
-    if decisions_available and not next_decisions and not terminal_closures:
+    authority_has_terminal_closure = any(
+        str(row.get("task_id") or "") == authority_task
+        for row in terminal_closures
+    )
+    if decisions_available and not next_decisions and not authority_has_terminal_closure:
         roadmap_successor = _roadmap_successor_obligation(
             snapshot, authority, authority_task, authority_state,
             owners, executions or {}, transitions or {}, project_id,
