@@ -23,6 +23,7 @@ def select_transport(
     hosts_config: TransportHostsConfig,
     policy_digest: Optional[str] = None,
     capabilities: Optional[HostCapabilities] = None,
+    capability_discovery_error: Optional[str] = None,
     pre_dispatch_failures: Optional[Mapping[str, str]] = None,
 ) -> TransportSelection:
     """Deterministically select transport candidate based on host profile, capabilities, and safety fences.
@@ -98,6 +99,13 @@ def select_transport(
             candidate_rejections["ssh"] = "ssh_configuration_missing"
             continue
 
+        if capabilities is None and operation != "capabilities":
+            reason = "capabilities_unknown_or_stale"
+            if capability_discovery_error:
+                reason = f"{reason}: {capability_discovery_error}"
+            candidate_rejections[cand] = reason
+            continue
+
         if capabilities is not None:
             if operation != "capabilities" and not capabilities.jobs_config_valid:
                 candidate_rejections[cand] = "host_jobs_config_invalid"
@@ -118,10 +126,14 @@ def select_transport(
             candidate_rejections=candidate_rejections,
         )
 
+    capabilities_unknown = any(
+        reason.startswith("capabilities_unknown_or_stale")
+        for reason in candidate_rejections.values()
+    )
     return TransportSelection(
         selected_transport="rdc_fallback_required",
         candidate_order=candidate_order,
-        evidence_source="fallback_policy",
-        reason_code="no_native_candidate_available",
+        evidence_source="capability_discovery" if capabilities_unknown else "fallback_policy",
+        reason_code="capabilities_unknown" if capabilities_unknown else "no_native_candidate_available",
         candidate_rejections=candidate_rejections,
     )

@@ -52,6 +52,14 @@ class TestP18SelectorAndSecurity(unittest.TestCase):
             },
             default_host="local",
         )
+        self.local_caps = HostCapabilities(
+            host_id="local",
+            os_family="windows",
+            path_style="windows",
+            helper_version="1.0.0",
+            jobs_config_valid=True,
+            supported_operations=["exec", "spawn", "read_file", "stat", "capabilities"],
+        )
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -75,6 +83,7 @@ class TestP18SelectorAndSecurity(unittest.TestCase):
             command_ref="pinned_cmd",
             policy_digest="sha256:correct_digest",
             hosts_config=self.hosts_cfg,
+            capabilities=self.local_caps,
         )
         self.assertEqual(dec_ok.selected_transport, "local")
 
@@ -87,6 +96,46 @@ class TestP18SelectorAndSecurity(unittest.TestCase):
         )
         self.assertEqual(dec_bad.selected_transport, "rejected")
         self.assertEqual(dec_bad.reason_code, "policy_pin_mismatch")
+
+    def test_selector_treats_missing_or_stale_capabilities_as_not_capable(self):
+        """Missing discovery evidence rejects every non-capability operation with its cause."""
+        decision = select_transport(
+            "exec",
+            hosts_config=self.hosts_cfg,
+            capabilities=None,
+            capability_discovery_error="TimeoutError: capability probe expired",
+        )
+        self.assertEqual(decision.selected_transport, "rdc_fallback_required")
+        self.assertEqual(decision.reason_code, "capabilities_unknown")
+        self.assertEqual(decision.evidence_source, "capability_discovery")
+        self.assertIn("TimeoutError: capability probe expired", decision.candidate_rejections["local"])
+
+        capability_probe = select_transport(
+            "capabilities",
+            hosts_config=self.hosts_cfg,
+            capabilities=None,
+        )
+        self.assertEqual(capability_probe.selected_transport, "local")
+
+    def test_zxz_pc_acceptance_evidence_records_zero_rdc_calls_per_inventory_row(self):
+        """Checked-in ZXZ-PC acceptance evidence is measured, native, and zero-RDC."""
+        repo_root = Path(__file__).resolve().parents[1]
+        evidence_path = repo_root / "docs" / "evidence" / "P18_ZXZ_PC_ZERO_RDC_ACCEPTANCE.json"
+        operations_path = repo_root / "docs" / "evidence" / "P18_ZXZ_PC_TRANSPORT_OPERATIONS.ndjson"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        rows = [json.loads(line) for line in operations_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(evidence["host_identity"], "ZXZ-PC")
+        self.assertEqual(evidence["powershell_version"].split(".")[0], "5")
+        self.assertEqual(evidence["rdc_measurement"]["rdc_calls_during_acceptance"], 0)
+        self.assertEqual(evidence["rdc_measurement"]["historical_baseline"], "unavailable")
+        self.assertTrue(evidence["measurements"])
+        self.assertTrue(all(row["rdc_calls"] == 0 for row in evidence["measurements"]))
+        self.assertTrue(rows)
+        self.assertTrue(all(row["selected_transport"] == "local" for row in rows))
+        self.assertFalse(any(row.get("selected_transport") == "rdc" for row in rows))
+        self.assertEqual(evidence["binary_roundtrip"]["size_bytes"], 14)
+        self.assertTrue(evidence["binary_roundtrip"]["readback_matches"])
 
     def test_selector_read_only_vs_effectful_failover(self):
         """Only read_only operations may fail over; effectful commands return 'ambiguous'."""
@@ -814,6 +863,14 @@ class TestP18SelectorAndSecurity(unittest.TestCase):
                 host_identity="remote1.test",
                 execution_policy_digest=pinned_digest,
             )
+            remote_caps = HostCapabilities(
+                host_id="remote1",
+                os_family="windows",
+                path_style="windows",
+                helper_version="1.0.0",
+                jobs_config_valid=True,
+                supported_operations=["spawn", "capabilities"],
+            )
             headers["X-DevOrch-Nonce"] = "nonce-pin-test-spawn-2"
             req2 = urllib.request.Request(
                 f"http://127.0.0.1:{port}/api/v1/control/transport/spawn",
@@ -821,6 +878,7 @@ class TestP18SelectorAndSecurity(unittest.TestCase):
                 headers=headers,
             )
             with patch("dev_orchestrator.transport.ssh.SSHMachineTransport.resolve", return_value=matching_resolve), \
+                 patch("dev_orchestrator.transport.ssh.SSHMachineTransport.capabilities", return_value=remote_caps), \
                  patch("dev_orchestrator.transport.ssh.SSHMachineTransport.spawn", return_value=mock_spawn_res):
                 with urllib.request.urlopen(req2) as resp:
                     self.assertEqual(resp.status, 202)

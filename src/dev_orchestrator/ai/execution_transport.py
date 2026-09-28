@@ -369,12 +369,20 @@ class SSHTransport:
         timeout_seconds: float,
     ) -> dict[str, Any]:
         from dev_orchestrator.transport.ssh_channel import run_remote_helper_envelope
-        return run_remote_helper_envelope(
+        response = run_remote_helper_envelope(
             self.ssh_config,
             request_envelope,
             timeout_seconds,
             subprocess_module=self._subprocess,
         )
+        if response.get("status") != "success":
+            error = response.get("error") or "remote execution helper failed"
+            raise ExecutionTransportError(
+                f"remote helper error for {request_envelope.get('operation')}: {error}"
+            )
+        if not isinstance(response.get("payload"), dict):
+            raise ExecutionTransportError("remote helper payload must be a JSON object")
+        return response
 
     def dispatch(
         self,

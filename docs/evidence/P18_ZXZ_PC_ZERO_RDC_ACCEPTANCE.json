@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "acceptance": "P18 ZXZ-PC zero-RDC native transport",
+  "observed_at": "2026-09-28T08:26:35.1797806Z",
+  "host_identity": "ZXZ-PC",
+  "powershell_version": "5.1.26100.9444",
+  "sequencing": "PowerShell 5.1-safe semicolon sequencing with explicit status checks; no && or ||",
+  "control_surface": "ephemeral loopback Control API on ZXZ-PC using the current worktree",
+  "canonical_daemon_restarted": false,
+  "canonical_daemon_restart_required": true,
+  "rdc_measurement": {
+    "historical_baseline": "unavailable",
+    "historical_baseline_reason": "execution-report data_status.rdc was unavailable for the selected DevOrchestrator scope",
+    "acceptance_operations": 9,
+    "rdc_calls_during_acceptance": 0
+  },
+  "measurements": [
+    {"inventory_operation": "Daemon Status", "native_operation": "exec", "operation_id": "p18-accept-daemon_status-20260928", "selected_transport": "local", "status": "ok", "exit_code": 0, "rdc_calls": 0},
+    {"inventory_operation": "Daemon Log Inspection", "native_operation": "exec", "operation_id": "p18-accept-daemon_log-20260928", "selected_transport": "local", "status": "ok", "exit_code": 0, "rdc_calls": 0},
+    {"inventory_operation": "git status", "native_operation": "exec", "operation_id": "p18-accept-git_status-20260928", "selected_transport": "local", "status": "ok", "exit_code": 0, "rdc_calls": 0},
+    {"inventory_operation": "git log", "native_operation": "exec", "operation_id": "p18-accept-git_log-20260928", "selected_transport": "local", "status": "ok", "exit_code": 0, "rdc_calls": 0},
+    {"inventory_operation": "Test / Build Execution", "native_operation": "spawn + poll", "operation_id": "job-927222a2d8290076", "selected_transport": "local", "status": "completed", "exit_code": 0, "command_ref": "transport_compileall", "rdc_calls": 0},
+    {"inventory_operation": "File Read", "native_operation": "read_file", "operation_id": "read-84e94349227c", "selected_transport": "local", "status": "ok", "rdc_calls": 0},
+    {"inventory_operation": "File Stat", "native_operation": "stat", "operation_id": "stat-dfbfba504a51", "selected_transport": "local", "status": "ok", "rdc_calls": 0},
+    {"inventory_operation": "Arbitrary Binary Stage", "native_operation": "stage_write", "operation_id": "stage:devorchestrator:sha256:feec999ce6022562110591cd579bf1fd8e009f288c3a0e6c604b5f1b533cc8bf", "selected_transport": "local", "status": "ok", "rdc_calls": 0},
+    {"inventory_operation": "Arbitrary Binary CAS Write Round-Trip", "native_operation": "write_file + read_file", "operation_id": "p18-accept-binary-cas-20260928", "selected_transport": "local", "status": "ok", "rdc_calls": 0}
+  ],
+  "binary_roundtrip": {
+    "path": "runtime/p18-acceptance/binary-roundtrip.bin",
+    "size_bytes": 14,
+    "base64": "AAECDQoff4DI/v9BQkM=",
+    "sha256": "sha256:feec999ce6022562110591cd579bf1fd8e009f288c3a0e6c604b5f1b533cc8bf",
+    "readback_matches": true
+  },
+  "durable_job": {
+    "job_id": "job-927222a2d8290076",
+    "command_ref": "transport_compileall",
+    "outcome": "success",
+    "exit_code": 0,
+    "finished_at": "2026-09-28T08:26:34.536018+00:00"
+  },
+  "transport_operations_evidence": "docs/evidence/P18_ZXZ_PC_TRANSPORT_OPERATIONS.ndjson",
+  "runtime_source_log": "runtime/p18-acceptance-runtime/logs/transport-operations.ndjson"
+}

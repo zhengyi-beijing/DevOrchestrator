@@ -262,10 +262,11 @@ def get_transport_for_host(
     from dev_orchestrator.transport.contracts import TransportRejectedError
     cache = capability_cache or HostCapabilityCache(runtime_root, hosts_config=cfg)
     caps = None
+    capability_discovery_error = None
     try:
         caps = cache.get_capabilities(h_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        capability_discovery_error = f"{type(exc).__name__}: {exc}"
     selection = select_transport(
         operation,
         command_ref=command_ref,
@@ -274,10 +275,13 @@ def get_transport_for_host(
         hosts_config=cfg,
         policy_digest=policy_digest,
         capabilities=caps,
+        capability_discovery_error=capability_discovery_error,
     )
     if selection.selected_transport in ("rejected", "rdc_fallback_required", "ambiguous"):
         raise TransportRejectedError(
-            f"transport selection rejected ({selection.selected_transport}): {selection.reason_code}"
+            f"transport selection rejected ({selection.selected_transport}): "
+            f"{selection.reason_code}; evidence={selection.evidence_source}; "
+            f"candidate_rejections={selection.candidate_rejections}"
         )
     if selection.selected_transport == "local":
         from dev_orchestrator.transport.local import LocalMachineTransport

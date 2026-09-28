@@ -150,6 +150,55 @@ class P13SSHTransportTests(unittest.TestCase):
         transport = SSHTransport(cfg)
         self.assertIsInstance(transport, ExecutionTransport)
 
+    def test_dispatch_remote_helper_error_status_raises_execution_transport_error(self):
+        transport = SSHTransport(SSHTransportConfig(peer="100.64.0.10"))
+        helper_response = {
+            "status": "error",
+            "request_id": "req-helper-error",
+            "host_identity": "100.64.0.10",
+            "error": "remote broker rejected the request",
+            "payload": {},
+        }
+        completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(helper_response).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=completed):
+            with self.assertRaises(ExecutionTransportError) as ctx:
+                transport.dispatch(
+                    make_dummy_request("req-helper-error"),
+                    make_dummy_config(),
+                    {},
+                    60.0,
+                )
+        self.assertIn("remote broker rejected the request", str(ctx.exception))
+
+    def test_dispatch_remote_helper_payload_must_be_dict(self):
+        transport = SSHTransport(SSHTransportConfig(peer="100.64.0.10"))
+        helper_response = {
+            "status": "success",
+            "request_id": "req-helper-payload",
+            "host_identity": "100.64.0.10",
+            "payload": ["not", "an", "object"],
+        }
+        completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(helper_response).encode("utf-8"),
+            stderr=b"",
+        )
+        with patch("subprocess.run", return_value=completed):
+            with self.assertRaises(ExecutionTransportError) as ctx:
+                transport.dispatch(
+                    make_dummy_request("req-helper-payload"),
+                    make_dummy_config(),
+                    {},
+                    60.0,
+                )
+        self.assertIn("payload must be a JSON object", str(ctx.exception))
+
     def test_path_mapping(self):
         cfg = SSHTransportConfig(
             peer="100.64.0.10",

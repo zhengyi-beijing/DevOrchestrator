@@ -18,6 +18,7 @@ from dev_orchestrator.jobs.config import (
 from dev_orchestrator.jobs.models import (
     JobSpec,
     job_id_for,
+    retry_successor_id,
     spec_hash,
 )
 from dev_orchestrator.jobs.transport import SSHJobTransport
@@ -631,6 +632,139 @@ class TestP18Transports(unittest.TestCase):
                 })
             except Exception:
                 pass
+            if old_env is None:
+                os.environ.pop("DEVORCH_JOBS_CONFIG", None)
+            else:
+                os.environ["DEVORCH_JOBS_CONFIG"] = old_env
+
+    def test_remote_helper_job_start_accepts_chained_retry_successor_job_id(self):
+        """job_start folds every retry segment when authorizing a chained successor id."""
+        import os
+        from dev_orchestrator.ai.remote_helper import execute_request
+        from dev_orchestrator.storage.json_store import write_json
+
+        cfg_file = self.root / "projects_chained_job_start.json"
+        write_json(
+            cfg_file,
+            {
+                "runtime_root": str(self.root),
+                "projects": {
+                    "p1": {
+                        "repo_path": str(self.repo_dir),
+                        "commands": {
+                            "ro": {
+                                "argv": ["python", "-c", "print('ok')"],
+                                "cwd": ".",
+                                "effect_class": "read_only",
+                            }
+                        },
+                    }
+                },
+            },
+        )
+        old_env = os.environ.get("DEVORCH_JOBS_CONFIG")
+        os.environ["DEVORCH_JOBS_CONFIG"] = str(cfg_file)
+        try:
+            base_key = "chain-job-start"
+            first_request = "retry-request-1"
+            second_request = "retry-request-2"
+            chained_key = f"{base_key}:retry:{first_request}:retry:{second_request}"
+            base_id = job_id_for({"project_id": "p1", "idempotency_key": base_key})
+            first_id = retry_successor_id(base_id, first_request)
+            chained_id = retry_successor_id(first_id, second_request)
+            spec = JobSpec(
+                project_id="p1",
+                command_ref="ro",
+                idempotency_key=chained_key,
+            )
+            with patch(
+                "dev_orchestrator.jobs.transport.LocalJobTransport.job_start",
+                return_value={"status": "started"},
+            ):
+                result = execute_request({
+                    "operation": "job_start",
+                    "request_id": "req-chain-job-start",
+                    "job_id": chained_id,
+                    "job_spec": spec.to_canonical_dict(),
+                    "controller_spec_hash": spec_hash(spec),
+                })
+            self.assertEqual(result["job_id"], chained_id)
+            self.assertEqual(result["status"], "started")
+        finally:
+            if old_env is None:
+                os.environ.pop("DEVORCH_JOBS_CONFIG", None)
+            else:
+                os.environ["DEVORCH_JOBS_CONFIG"] = old_env
+
+    def test_remote_helper_op_spawn_accepts_chained_retry_and_explicit_retry_precedence(self):
+        """op_spawn folds chained retries while explicit retry identity remains authoritative."""
+        import os
+        from dev_orchestrator.ai.remote_helper import execute_request
+        from dev_orchestrator.storage.json_store import write_json
+
+        cfg_file = self.root / "projects_chained_op_spawn.json"
+        write_json(
+            cfg_file,
+            {
+                "runtime_root": str(self.root),
+                "projects": {
+                    "p1": {
+                        "repo_path": str(self.repo_dir),
+                        "commands": {
+                            "ro": {
+                                "argv": ["python", "-c", "print('ok')"],
+                                "cwd": ".",
+                                "effect_class": "read_only",
+                            }
+                        },
+                    }
+                },
+            },
+        )
+        old_env = os.environ.get("DEVORCH_JOBS_CONFIG")
+        os.environ["DEVORCH_JOBS_CONFIG"] = str(cfg_file)
+        try:
+            base_key = "chain-op-spawn"
+            first_request = "retry-request-a"
+            second_request = "retry-request-b"
+            chained_key = f"{base_key}:retry:{first_request}:retry:{second_request}"
+            base_id = job_id_for({"project_id": "p1", "idempotency_key": base_key})
+            first_id = retry_successor_id(base_id, first_request)
+            chained_id = retry_successor_id(first_id, second_request)
+            spec = JobSpec(
+                project_id="p1",
+                command_ref="ro",
+                idempotency_key=chained_key,
+            )
+            with patch(
+                "dev_orchestrator.jobs.transport.LocalJobTransport.job_start",
+                return_value={"status": "started"},
+            ):
+                chained_result = execute_request({
+                    "operation": "op_spawn",
+                    "request_id": "req-chain-op-spawn",
+                    "job_id": chained_id,
+                    "job_spec": spec.to_canonical_dict(),
+                    "controller_spec_hash": spec_hash(spec),
+                })
+                explicit_id = retry_successor_id(chained_id, "explicit-retry")
+                explicit_spec = JobSpec(
+                    project_id="p1",
+                    command_ref="ro",
+                    idempotency_key="not-the-explicit-retry-identity",
+                )
+                explicit_result = execute_request({
+                    "operation": "op_spawn",
+                    "request_id": "req-explicit-op-spawn",
+                    "job_id": explicit_id,
+                    "job_spec": explicit_spec.to_canonical_dict(),
+                    "controller_spec_hash": spec_hash(explicit_spec),
+                    "retry_of": chained_id,
+                    "retry_request_id": "explicit-retry",
+                })
+            self.assertEqual(chained_result["job_id"], chained_id)
+            self.assertEqual(explicit_result["job_id"], explicit_id)
+        finally:
             if old_env is None:
                 os.environ.pop("DEVORCH_JOBS_CONFIG", None)
             else:

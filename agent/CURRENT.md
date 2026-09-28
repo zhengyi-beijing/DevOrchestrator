@@ -7,6 +7,17 @@
 
 Current task: **P18 Native Execution Transport & RDC Dependency Reduction** (Status: **REMEDIATION_COMPLETE**). Previous task: **P17 Single-Authority Goal Convergence Baseline** (Status: **COMPLETE**).
 
+P18 Owner-Authorized Technical Review Remediation Evidence (2026-09-28):
+- Addressed exactly the four remaining blockers from Claude Opus review `ai_review:ai_review:ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute` at `d3ecdb9` without reopening planning:
+  1. Restored fail-closed AI SSH helper validation in `execution_transport.py`: every non-`success` helper envelope raises `ExecutionTransportError` with the remote error and every payload must be a JSON object. Added the named P13 regression `test_dispatch_remote_helper_error_status_raises_execution_transport_error` plus payload-shape coverage.
+  2. Fixed `remote_helper.py` authorization for chained retries in both `op_spawn` and `job_start` by folding every `:retry:` request segment through `retry_successor_id`, while retaining explicit `retry_of` / `retry_request_id` precedence. Added chained and explicit-precedence regressions.
+  3. Made missing/stale capabilities unknown-not-capable for every operation except `capabilities`. Capability-discovery exceptions now enter selection evidence and the rejection message instead of being silently discarded. Added the named selector regression.
+  4. Completed the ZXZ-PC zero-RDC exercise through the current native loopback Control API with PowerShell 5.1-safe sequencing. Status/log/git reads used read-only exec; durable job `job-927222a2d8290076` ran `compileall` and completed with exit `0`; `read_file` and `stat` succeeded; a 14-byte arbitrary binary payload was staged, CAS-written, and read back with digest `sha256:feec999ce6022562110591cd579bf1fd8e009f288c3a0e6c604b5f1b533cc8bf`. All 14 captured rows selected `local`; observed RDC calls were `0`. Historical RDC accounting was unavailable and is recorded as such rather than inferred.
+- Directly adjacent non-blocking correction: `op_write_file` now returns its resolved `target_path`. Broader scope-default policy and additional matrix/fault suites remain closure notes rather than expanding this remediation.
+- Acceptance evidence: `docs/evidence/P18_ZXZ_PC_ZERO_RDC_ACCEPTANCE.json`; verbatim rows: `docs/evidence/P18_ZXZ_PC_TRANSPORT_OPERATIONS.ndjson`; runtime source log: `runtime/p18-acceptance-runtime/logs/transport-operations.ndjson`.
+- Verification: consolidated P18/P13/P14/P14.5 regression set passed `253` tests plus `35` subtests; `compileall -q src ops tests_py` passed; evidence JSON/NDJSON parsed cleanly; `git diff --check` passed.
+- Runtime note: the canonical daemon on port 8770 was deliberately not restarted during remediation and still has the pre-P18 modules loaded. One DevO daemon restart is required after this commit to activate the remediated native routes in the canonical process.
+
 P18 Technical Review Round 3 Remediation Evidence (2026-09-28):
 - Addressed all 5 Technical Review findings from `runtime/ai-reviewer.json` (`ai_review:ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute`):
   1. Finding 1 (HostCapabilityCache recursion cycle on remote hosts):

@@ -113,6 +113,21 @@ def _resolve_project_target_path(jobs_cfg: Any, project_id: str, path_str: str) 
     raise ValueError(f"path {path_str!r} escapes project containment")
 
 
+def _retry_chain_job_id(
+    project_id: str,
+    idempotency_key: str,
+    *,
+    job_id_for: Any,
+    retry_successor_id: Any,
+) -> str:
+    """Derive a chained retry job id by folding every retry request segment."""
+    parts = idempotency_key.split(":retry:")
+    job_id = job_id_for({"project_id": project_id, "idempotency_key": parts[0]})
+    for retry_request_id in parts[1:]:
+        job_id = retry_successor_id(job_id, retry_request_id)
+    return job_id
+
+
 def execute_request(req: dict[str, Any]) -> dict[str, Any]:
     operation = req.get("operation")
     req_id = req.get("request_id")
@@ -347,13 +362,19 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             if is_retry:
                 expected_jid = retry_successor_id(str(req["retry_of"]), str(req["retry_request_id"]))
             elif spec is not None and ":retry:" in (spec.idempotency_key or ""):
-                base_idem, retry_req_id = spec.idempotency_key.split(":retry:", 1)
-                pred_jid = job_id_for({"project_id": spec.project_id, "idempotency_key": base_idem})
-                expected_jid = retry_successor_id(pred_jid, retry_req_id)
+                expected_jid = _retry_chain_job_id(
+                    spec.project_id,
+                    spec.idempotency_key,
+                    job_id_for=job_id_for,
+                    retry_successor_id=retry_successor_id,
+                )
             elif idem_key and ":retry:" in str(idem_key):
-                base_idem, retry_req_id = str(idem_key).split(":retry:", 1)
-                pred_jid = job_id_for({"project_id": proj_id, "idempotency_key": base_idem})
-                expected_jid = retry_successor_id(pred_jid, retry_req_id)
+                expected_jid = _retry_chain_job_id(
+                    str(proj_id),
+                    str(idem_key),
+                    job_id_for=job_id_for,
+                    retry_successor_id=retry_successor_id,
+                )
             else:
                 expected_jid = job_id_for(spec) if spec is not None else job_id_for({"project_id": proj_id, "idempotency_key": str(idem_key)})
             wire_jid = req.get("job_id")
@@ -538,6 +559,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             res_dict = dataclasses.asdict(f_res)
             if "content_bytes" in res_dict:
                 del res_dict["content_bytes"]
+            res_dict["target_path"] = f_res.path
             return res_dict
 
         if operation == "op_stat":
@@ -716,13 +738,19 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             if is_retry:
                 expected_jid = retry_successor_id(str(req["retry_of"]), str(req["retry_request_id"]))
             elif spec is not None and ":retry:" in (spec.idempotency_key or ""):
-                base_idem, retry_req_id = spec.idempotency_key.split(":retry:", 1)
-                pred_jid = job_id_for({"project_id": spec.project_id, "idempotency_key": base_idem})
-                expected_jid = retry_successor_id(pred_jid, retry_req_id)
+                expected_jid = _retry_chain_job_id(
+                    spec.project_id,
+                    spec.idempotency_key,
+                    job_id_for=job_id_for,
+                    retry_successor_id=retry_successor_id,
+                )
             elif idem_key and ":retry:" in str(idem_key):
-                base_idem, retry_req_id = str(idem_key).split(":retry:", 1)
-                pred_jid = job_id_for({"project_id": proj_id, "idempotency_key": base_idem})
-                expected_jid = retry_successor_id(pred_jid, retry_req_id)
+                expected_jid = _retry_chain_job_id(
+                    str(proj_id),
+                    str(idem_key),
+                    job_id_for=job_id_for,
+                    retry_successor_id=retry_successor_id,
+                )
             else:
                 expected_jid = job_id_for(spec) if spec is not None else job_id_for({"project_id": proj_id, "idempotency_key": str(idem_key)})
             wire_jid = req.get("job_id")

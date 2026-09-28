@@ -1,5 +1,16 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P18 Native Execution Transport & RDC Dependency Reduction (owner-authorized final remediation / ready for review 2026-09-28):
+- Closed the four remaining Claude Opus blockers at `d3ecdb9` without reopening planning:
+  1. AI `SSHTransport` once again rejects non-success remote-helper envelopes with `ExecutionTransportError` containing the helper error and rejects non-object payloads. Added `test_dispatch_remote_helper_error_status_raises_execution_transport_error` and payload-shape coverage.
+  2. `remote_helper` now authorizes retry-of-retry job IDs for both `job_start` and `op_spawn` by folding all `:retry:` segments through `retry_successor_id`; explicit `retry_of` / `retry_request_id` remains highest precedence. Added regression coverage for both entry points and precedence.
+  3. Transport selection now treats missing/stale capability evidence as unknown-not-capable except for capability discovery itself. Discovery exceptions are preserved in selection evidence and rejection diagnostics. Added `test_selector_treats_missing_or_stale_capabilities_as_not_capable`.
+  4. Performed the ZXZ-PC acceptance exercise through the current native loopback Control API using PowerShell `5.1.26100.9444`, semicolon sequencing, and explicit status checks. Four read-only status/log/git execs succeeded; durable compileall job `job-927222a2d8290076` completed with exit `0`; `read_file` and `stat` succeeded; 14 arbitrary binary bytes were staged, CAS-written, and read back byte-for-byte with SHA-256 `feec999ce6022562110591cd579bf1fd8e009f288c3a0e6c604b5f1b533cc8bf`. All 14 evidence rows selected `local`; acceptance RDC calls were `0`. The historical RDC baseline was unavailable in the accounting report and was not fabricated.
+- Fixed the directly adjacent `op_write_file` response-path omission by returning the resolved `target_path`. The remaining non-blocking scope-default and matrix/fault-test observations were not used to broaden remediation.
+- Evidence paths: `docs/evidence/P18_ZXZ_PC_ZERO_RDC_ACCEPTANCE.json`, `docs/evidence/P18_ZXZ_PC_TRANSPORT_OPERATIONS.ndjson`, and runtime source `runtime/p18-acceptance-runtime/logs/transport-operations.ndjson`.
+- Verification passed: `253` focused P18/P13/P14/P14.5 tests plus `35` subtests; `python -m compileall -q src ops tests_py`; evidence JSON/NDJSON parse checks; `git diff --check`.
+- The canonical daemon on port 8770 still has pre-P18 code loaded because it was not restarted during remediation. Restart is required after commit to load the remediated native routes.
+
 P18 Native Execution Transport & RDC Dependency Reduction (remediated round 3 / ready for review 2026-09-28):
 - Addressed all 5 Technical Review findings from `runtime/ai-reviewer.json` (`ai_review:ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute`):
   1. Finding 1 (HostCapabilityCache recursion cycle on remote hosts):
