@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import tempfile
 import unittest
 
 from dev_orchestrator.jobs.models import (
+    JobCorruptionError,
     JobRecord,
     JobSpec,
     job_id_for,
     spec_hash,
 )
+from dev_orchestrator.jobs.store import ExecutionJobStore
 
 
 class TestP18CanonicalIdentity(unittest.TestCase):
@@ -123,6 +127,50 @@ class TestP18CanonicalIdentity(unittest.TestCase):
         self.assertEqual(rec2.parameters_digest, "p_digest")
         self.assertEqual(rec2.execution_policy_digest, "e_digest")
         self.assertEqual(rec2.resolution_digest, "r_digest")
+
+    def test_job_store_submission_spec_validation_and_corruption(self):
+        """ExecutionJobStore validates submission_spec against spec_hash and raises JobCorruptionError on tamper."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = ExecutionJobStore(tmp_dir)
+            spec = JobSpec(
+                project_id="proj_val",
+                command_ref="build",
+                idempotency_key="key-canon-store-1",
+                kind="validation",
+                transport="local",
+            )
+            jid = job_id_for(spec)
+            shash = spec_hash(spec)
+            rec = JobRecord(
+                job_id=jid,
+                idempotency_key="key-canon-store-1",
+                spec_hash=shash,
+                kind="validation",
+                project_id="proj_val",
+                command_ref="build",
+                resolved_argv=["python", "-m", "build"],
+                working_directory=".",
+                transport="local",
+                host_identity="local",
+                duration_class="short",
+                submission_spec=spec.to_canonical_dict(),
+            )
+            store.save(rec)
+
+            # Legitimate read succeeds
+            read_rec = store.get(jid)
+            self.assertIsNotNone(read_rec)
+            self.assertEqual(read_rec.spec_hash, shash)
+            self.assertEqual(read_rec.submission_spec, spec.to_canonical_dict())
+
+            # Tampering with submission_spec on disk causes JobCorruptionError on get()
+            jfile = Path(tmp_dir) / "jobs" / jid / "job.json"
+            data = json.loads(jfile.read_text(encoding="utf-8"))
+            data["submission_spec"]["command_ref"] = "tampered_cmd"
+            jfile.write_text(json.dumps(data), encoding="utf-8")
+
+            with self.assertRaises(JobCorruptionError):
+                store.get(jid)
 
 
 if __name__ == "__main__":

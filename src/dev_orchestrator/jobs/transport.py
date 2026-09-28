@@ -24,7 +24,7 @@ from dev_orchestrator.platform.process import (
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
 from .logs import BoundedNDJSONLog
-from .models import JobSpec, job_id_for
+from .models import JobSpec, job_id_for, spec_hash
 
 
 @runtime_checkable
@@ -184,6 +184,8 @@ class SSHJobTransport:
     ) -> dict[str, Any]:
         req_id = f"job-start-{uuid4().hex[:12]}"
         actual_job_id = job_id or (job_dir.name if job_dir is not None else job_id_for(spec))
+        c_spec_hash = spec_hash(spec)
+        canon_spec = spec.to_canonical_dict()
         envelope = {
             "operation": "job_start",
             "request_id": req_id,
@@ -192,6 +194,19 @@ class SSHJobTransport:
             "command_ref": spec.command_ref,
             "idempotency_key": spec.idempotency_key,
         }
+        params = spec.metadata.get("parameters") if isinstance(spec.metadata, dict) else None
+        has_p18_fields = bool(
+            spec.transport == "ssh"
+            or spec.parameters_digest
+            or spec.execution_policy_digest
+            or spec.resolution_digest
+            or (isinstance(spec.metadata, dict) and spec.metadata.get("parameters"))
+        )
+        if has_p18_fields:
+            envelope["job_spec"] = canon_spec
+            envelope["controller_spec_hash"] = c_spec_hash
+            if params is not None:
+                envelope["parameters"] = params
         if spec.expected_working_directory:
             envelope["expected_working_directory"] = spec.expected_working_directory
         if spec.input_digest:

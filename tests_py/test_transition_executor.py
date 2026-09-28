@@ -548,6 +548,7 @@ class TransitionExecutorActuationTests(unittest.TestCase):
             (repo / "agent" / "next.md").write_text(
                 "# P12.7 Web Control Surface Visual Refresh\nStatus: **READY_TO_RUN**\n",
                 encoding="utf-8",
+                newline="\n",
             )
             staged = repo / "agent" / "staged"; staged.mkdir(parents=True)
             (staged / "roadmap.json").write_text(json.dumps({
@@ -556,11 +557,12 @@ class TransitionExecutorActuationTests(unittest.TestCase):
                     "task_id": "P12.6", "successor": "P12.7",
                     "successor_spec_path": "agent/staged/P12.7.md",
                 }],
-            }), encoding="utf-8")
+            }), encoding="utf-8", newline="\n")
             (staged / "P12.7.md").write_text(
                 "# P12.7 Web Control Surface Visual Refresh\n\n"
                 "Status: **PENDING DESIGN**\n",
                 encoding="utf-8",
+                newline="\n",
             )
             subprocess.run(["git", "-C", str(repo), "add", "agent/"], check=True)
             subprocess.run(

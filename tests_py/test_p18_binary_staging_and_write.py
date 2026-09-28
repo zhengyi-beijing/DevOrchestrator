@@ -467,6 +467,27 @@ class TestP18BinaryStagingAndWrite(unittest.TestCase):
         self.assertEqual(saved.get("state"), "applied")
         self.assertEqual(saved.get("applied_at"), orig_applied_at)
 
+    def test_write_rejects_mismatched_host_identity(self):
+        """apply_file_write rejects request when request.host_id does not match host_identity."""
+        content = b"host mismatch payload"
+        content_sha = "sha256:" + hashlib.sha256(content).hexdigest()
+        staged = self.store.stage_content(WriteContentUpload("p1", "remote_box", base64.b64encode(content).decode("ascii"), len(content), content_sha))
+        target_file = self.root / "mismatch.txt"
+
+        req = FileWriteRequest(
+            project_id="p1",
+            host_id="remote_box",
+            target_path=str(target_file),
+            idempotency_key="mismatch-key-1",
+            content_ref=staged.content_ref,
+            content_sha256=content_sha,
+            decoded_size_bytes=len(content),
+            if_absent=True,
+        )
+
+        with self.assertRaises(TransportRejectedError):
+            self.store.apply_file_write(req, [str(self.root)], host_identity="local_box")
+
 
 if __name__ == "__main__":
     unittest.main()

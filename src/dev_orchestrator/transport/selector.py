@@ -61,7 +61,7 @@ def select_transport(
     pre_failures = dict(pre_dispatch_failures or {})
 
     # Check approved policy pin if configured
-    if policy_digest and command_ref and profile.approved_policy_pins:
+    if command_ref and profile.approved_policy_pins:
         pinned = profile.approved_policy_pins.get(command_ref) or profile.approved_policy_pins.get("*")
         if pinned and pinned != policy_digest:
             return TransportSelection(
@@ -99,7 +99,7 @@ def select_transport(
             continue
 
         if capabilities is not None:
-            if not capabilities.jobs_config_valid:
+            if operation != "capabilities" and not capabilities.jobs_config_valid:
                 candidate_rejections[cand] = "host_jobs_config_invalid"
                 continue
             if operation not in capabilities.supported_operations:

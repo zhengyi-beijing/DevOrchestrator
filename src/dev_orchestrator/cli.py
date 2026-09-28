@@ -1255,7 +1255,14 @@ def cmd_transport_exec(args: argparse.Namespace) -> int:
         timeout_seconds=getattr(args, "timeout", None),
     )
     try:
-        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        transport = get_transport_for_host(
+            runtime,
+            host_id=host_id,
+            config_path=getattr(args, "config", None),
+            operation="exec",
+            command_ref=args.command_ref,
+            effect_class="read_only",
+        )
         res = transport.exec(op)
     except Exception as exc:
         raise CliError(str(exc)) from exc
@@ -1285,7 +1292,14 @@ def cmd_transport_spawn(args: argparse.Namespace) -> int:
         timeout_seconds=getattr(args, "timeout", None),
     )
     try:
-        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        transport = get_transport_for_host(
+            runtime,
+            host_id=host_id,
+            config_path=getattr(args, "config", None),
+            operation="spawn",
+            command_ref=args.command_ref,
+            effect_class="effectful",
+        )
         res = transport.spawn(op)
     except Exception as exc:
         raise CliError(str(exc)) from exc
@@ -1299,7 +1313,13 @@ def cmd_transport_poll(args: argparse.Namespace) -> int:
     import dataclasses
     host_id = getattr(args, "host_id", None) or "local"
     try:
-        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        transport = get_transport_for_host(
+            runtime,
+            host_id=host_id,
+            config_path=getattr(args, "config", None),
+            operation="poll",
+            effect_class="read_only",
+        )
         res = transport.poll(args.operation_id, host_id=host_id)
     except Exception as exc:
         raise CliError(str(exc)) from exc
@@ -1314,7 +1334,13 @@ def cmd_transport_cancel(args: argparse.Namespace) -> int:
     host_id = getattr(args, "host_id", None) or "local"
     reason = getattr(args, "reason", "cancelled") or "cancelled"
     try:
-        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        transport = get_transport_for_host(
+            runtime,
+            host_id=host_id,
+            config_path=getattr(args, "config", None),
+            operation="cancel",
+            effect_class="effectful",
+        )
         res = transport.cancel(args.operation_id, host_id=host_id, reason=reason)
     except Exception as exc:
         raise CliError(str(exc)) from exc
@@ -1336,7 +1362,13 @@ def cmd_transport_read(args: argparse.Namespace) -> int:
         offset_bytes=getattr(args, "offset_bytes", 0) or 0,
     )
     try:
-        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        transport = get_transport_for_host(
+            runtime,
+            host_id=host_id,
+            config_path=getattr(args, "config", None),
+            operation="read_file",
+            effect_class="read_only",
+        )
         res = transport.read_file(req)
     except Exception as exc:
         raise CliError(str(exc)) from exc
@@ -1391,7 +1423,13 @@ def cmd_transport_stage_write(args: argparse.Namespace) -> int:
         content_sha256=sha,
     )
     try:
-        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        transport = get_transport_for_host(
+            runtime,
+            host_id=host_id,
+            config_path=getattr(args, "config", None),
+            operation="stage_write_content",
+            effect_class="effectful",
+        )
         res = transport.stage_write_content(upload)
     except Exception as exc:
         raise CliError(str(exc)) from exc
@@ -1417,7 +1455,13 @@ def cmd_transport_write(args: argparse.Namespace) -> int:
         expected_file_policy_digest=getattr(args, "expected_file_policy_digest", None),
     )
     try:
-        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        transport = get_transport_for_host(
+            runtime,
+            host_id=host_id,
+            config_path=getattr(args, "config", None),
+            operation="write_file",
+            effect_class="effectful",
+        )
         res = transport.write_file(req)
     except Exception as exc:
         raise CliError(str(exc)) from exc
@@ -1434,7 +1478,13 @@ def cmd_transport_stat(args: argparse.Namespace) -> int:
     import dataclasses
     host_id = getattr(args, "host_id", None) or "local"
     try:
-        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        transport = get_transport_for_host(
+            runtime,
+            host_id=host_id,
+            config_path=getattr(args, "config", None),
+            operation="stat",
+            effect_class="read_only",
+        )
         res = transport.stat(args.path, host_id=host_id, project_id=getattr(args, "project_id", None))
     except Exception as exc:
         raise CliError(str(exc)) from exc
@@ -1448,7 +1498,12 @@ def cmd_transport_capabilities(args: argparse.Namespace) -> int:
     import dataclasses
     host_id = getattr(args, "host_id", None) or "local"
     try:
-        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        transport = get_transport_for_host(
+            runtime,
+            host_id=host_id,
+            config_path=getattr(args, "config", None),
+            operation="capabilities",
+        )
         res = transport.capabilities(host_id=host_id)
     except Exception as exc:
         raise CliError(str(exc)) from exc
@@ -1467,6 +1522,57 @@ def cmd_transport_hosts(args: argparse.Namespace) -> int:
     }
     sys.stdout.write(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
     return 0
+
+
+def cmd_transport_capability_create(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.control.security import create_transport_capability
+    raw_ops = getattr(args, "operations", None) or getattr(args, "ops", "")
+    if isinstance(raw_ops, list):
+        ops = raw_ops
+    else:
+        ops = [op.strip() for op in str(raw_ops).split(",") if op.strip()]
+    if not ops:
+        raise CliError("--operations is required (comma-separated list, e.g. 'exec,spawn')")
+    raw_cmds = getattr(args, "commands", None)
+    cmds = [c.strip() for c in str(raw_cmds).split(",") if c.strip()] if raw_cmds else None
+    raw_roots = getattr(args, "roots", None)
+    roots = [r.strip() for r in str(raw_roots).split(",") if r.strip()] if raw_roots else None
+    try:
+        cap = create_transport_capability(
+            project_id=getattr(args, "project_id", "*") or "*",
+            host_id=getattr(args, "host_id", "local") or "local",
+            allowed_operations=ops,
+            allowed_commands=cmds,
+            allowed_roots=roots,
+            ttl_seconds=int(getattr(args, "ttl", 3600)),
+            label=getattr(args, "label", "") or "",
+            runtime_root=runtime,
+        )
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(cap, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_transport_capability_list(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.control.security import list_transport_capabilities
+    project_id = getattr(args, "project_id", None)
+    caps = list_transport_capabilities(project_id=project_id, runtime_root=runtime)
+    sys.stdout.write(json.dumps({"capabilities": caps, "count": len(caps)}, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_transport_capability_revoke(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.control.security import revoke_transport_capability
+    cap_id = getattr(args, "cap_id_opt", None) or getattr(args, "capability_id", None)
+    if not cap_id:
+        raise CliError("capability ID is required")
+    res = revoke_transport_capability(str(cap_id), runtime_root=runtime)
+    sys.stdout.write(json.dumps(res, indent=2, ensure_ascii=False) + "\n")
+    return 0 if res.get("revoked") else 1
 
 
 def cmd_review_submit(args: argparse.Namespace) -> int:
@@ -2268,6 +2374,25 @@ def build_parser() -> argparse.ArgumentParser:
     t_hosts.add_argument("--config", default=None, help="path to config")
     t_hosts.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
+    t_cap_create = sub.add_parser("transport-capability-create", help="mint a scoped transport capability token")
+    t_cap_create.add_argument("--operations", "--ops", required=True, help="comma-separated allowed operations")
+    t_cap_create.add_argument("--project-id", default="*", help="scoped project ID or *")
+    t_cap_create.add_argument("--host-id", default="local", help="target host ID")
+    t_cap_create.add_argument("--commands", default=None, help="optional comma-separated allowed command refs")
+    t_cap_create.add_argument("--roots", default=None, help="optional comma-separated allowed file roots")
+    t_cap_create.add_argument("--ttl", type=int, default=3600, help="time-to-live in seconds")
+    t_cap_create.add_argument("--label", default="", help="human-readable label")
+    t_cap_create.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_cap_list = sub.add_parser("transport-capability-list", help="list non-secret transport capability metadata")
+    t_cap_list.add_argument("--project-id", default=None, help="filter by project ID")
+    t_cap_list.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_cap_revoke = sub.add_parser("transport-capability-revoke", help="revoke a transport capability by ID")
+    t_cap_revoke.add_argument("capability_id", nargs="?", default=None, help="capability ID to revoke")
+    t_cap_revoke.add_argument("--capability-id", "--id", dest="cap_id_opt", default=None, help="capability ID to revoke")
+    t_cap_revoke.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     review_submit = sub.add_parser("review-submit", help="submit a review session")
     review_submit.add_argument("--project-id", required=True, help="project ID")
     review_submit.add_argument("--task-id", default=None, help="task ID")
@@ -2401,6 +2526,9 @@ _COMMANDS = {
     "transport-stat": cmd_transport_stat,
     "transport-capabilities": cmd_transport_capabilities,
     "transport-hosts": cmd_transport_hosts,
+    "transport-capability-create": cmd_transport_capability_create,
+    "transport-capability-list": cmd_transport_capability_list,
+    "transport-capability-revoke": cmd_transport_capability_revoke,
     "review-submit": cmd_review_submit,
     "review-status": cmd_review_status,
     "review-reconcile": cmd_review_reconcile,

@@ -7,6 +7,39 @@
 
 Current task: **P18 Native Execution Transport & RDC Dependency Reduction** (Status: **REMEDIATION_COMPLETE**). Previous task: **P17 Single-Authority Goal Convergence Baseline** (Status: **COMPLETE**).
 
+P18 Technical Review Round 2 Remediation Evidence (2026-09-28):
+- Addressed all 5 Technical Review findings from `runtime/ai-reviewer.json` (`ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute`):
+  1. Finding 1 (Wire job_id validation, controller_spec_hash enforcement, and JobRecord submission_spec persistence):
+     - In `src/dev_orchestrator/ai/remote_helper.py`, verified canonical `job_spec`, enforced `controller_spec_hash` match, validated wire-supplied `job_id` against `job_id_for(spec)` (or `retry_successor_id` for retries), rejecting tampered wire IDs with `ValueError("unauthorized job_id ...")`.
+     - In `src/dev_orchestrator/jobs/transport.py`, `SSHJobTransport.job_start` transmits canonical `job_spec`, `controller_spec_hash`, and `parameters` when P18 fields are present, while preserving the closed legacy P14 envelope for legacy jobs.
+     - In `src/dev_orchestrator/jobs/service.py`, `claim_or_get` populates `submission_spec=spec.to_canonical_dict()`, `parameters`, `parameters_digest`, `execution_policy_digest`, and `resolution_digest`.
+     - In `src/dev_orchestrator/jobs/store.py`, `_read_record_unlocked` verifies `spec_hash(rec.submission_spec) == rec.spec_hash`, raising `JobCorruptionError` on tamper or corruption.
+     - Added covering regression tests in `tests_py/test_p18_canonical_identity.py` and `tests_py/test_p18_transports.py`.
+  2. Finding 2 (FileWriteRequest host_identity validation):
+     - In `src/dev_orchestrator/transport/write_store.py`, `apply_file_write` rejects mismatched `request.host_id` vs host identity with `TransportRejectedError`.
+     - Added covering regression test `test_write_rejects_mismatched_host_identity` in `tests_py/test_p18_binary_staging_and_write.py`.
+  3. Finding 3 (HostCapabilityCache and transport selector routing):
+     - In `src/dev_orchestrator/transport/hosts.py`, `HostCapabilityCache.__init__` supports `(runtime_root=None, *, hosts_config=None, ttl_seconds=...)` with backward compatibility, and cached `get_capabilities` routes through `get_transport_for_host(..., operation="capabilities")`.
+     - In `src/dev_orchestrator/transport/hosts.py`, `get_transport_for_host` accepts and validates `operation`, `command_ref`, `effect_class`, `policy_digest`, invokes `select_transport`, fails closed with `TransportRejectedError` on rejection/fallback, and records `.last_selection` on transport.
+     - In `src/dev_orchestrator/transport/selector.py`, enforced `approved_policy_pins.get(command_ref) != policy_digest -> reject`, and candidate loop skips job configuration check when `operation == "capabilities"`.
+     - In `src/dev_orchestrator/cli.py`, passed `operation`, `command_ref`, `effect_class` to `get_transport_for_host`.
+     - Added covering regression tests in `tests_py/test_p18_selector_and_security.py`.
+  4. Finding 4 (Owner-only capability minting/listing/revocation and unlisted POST routes):
+     - In `src/dev_orchestrator/web/server.py`, capability minting, listing, and revocation (`/api/v1/control/transport-capabilities` and `/transport/capabilities/<id>/revoke`) strictly require owner authorization (`_owner_authorized()`).
+     - In `src/dev_orchestrator/web/server.py`, unlisted POST routes under `/api/v1/control/transport/` require owner authorization (401).
+     - In `src/dev_orchestrator/cli.py`, added CLI commands `transport-capability-create`, `transport-capability-list`, and `transport-capability-revoke`.
+     - Added covering regression tests in `tests_py/test_p18_selector_and_security.py`.
+  5. Finding 5 (Observability project_id and stat logging):
+     - In `src/dev_orchestrator/transport/observability.py`, added `project_id: Optional[str] = None` to `log_transport_operation`, emitted into `logs/transport-operations.ndjson`.
+     - In `src/dev_orchestrator/web/server.py`, all transport routes (including `stat`) pass `project_id`, `capability_id`, `selected_transport`, and `candidate_reasons` to `log_transport_operation`.
+     - Added covering regression tests in `tests_py/test_p18_selector_and_security.py`.
+- Full Regression Verification Summary:
+  - Focused P18 test suites: 54/54 tests passed (`test_p18_binary_staging_and_write.py`, `test_p18_canonical_identity.py`, `test_p18_config_and_parameters.py`, `test_p18_selector_and_security.py`, `test_p18_transports.py`).
+  - Full test suite: 1572 passed, 107 subtests passed (0 failures).
+  - Python AST and syntax compilation clean (`compileall src ops tests_py`).
+  - `git diff --check` clean with 0 warnings or whitespace errors.
+  - Knowledge graph updated cleanly via `graphify update .`.
+
 P18 Technical Review Round 1 Remediation Evidence (2026-09-28):
 - Addressed all 9 Technical Review findings from `runtime/ai-reviewer.json`:
   1. Finding 1 (Remote helper poll signature): Updated `op_poll` in `src/dev_orchestrator/ai/remote_helper.py` to call `store.get(job_id)` instead of non-existent `store.get_record(job_id)`.

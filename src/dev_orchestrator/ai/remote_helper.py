@@ -143,7 +143,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
         _ALLOWED_MACHINE_OP_FIELDS = {
             "op_resolve": frozenset({"operation", "request_id", "project_id", "command_ref", "parameters", "expected_working_directory"}),
             "op_exec": frozenset({"operation", "request_id", "project_id", "command_ref", "parameters", "expected_working_directory", "timeout_seconds"}),
-            "op_spawn": frozenset({"operation", "request_id", "project_id", "command_ref", "parameters", "expected_working_directory", "idempotency_key", "job_id", "input_payload", "input_digest", "job_spec"}),
+            "op_spawn": frozenset({"operation", "request_id", "project_id", "command_ref", "parameters", "expected_working_directory", "idempotency_key", "job_id", "input_payload", "input_digest", "job_spec", "controller_spec_hash", "retry_of", "retry_request_id"}),
             "op_poll": frozenset({"operation", "request_id", "job_id"}),
             "op_cancel": frozenset({"operation", "request_id", "job_id", "reason"}),
             "op_read_file": frozenset({"operation", "request_id", "project_id", "path", "max_bytes", "offset_bytes"}),
@@ -162,7 +162,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             resolve_execution_policy,
             resolve_remote_jobs_config_path,
         )
-        from dev_orchestrator.jobs.models import JobRecord, JobSpec, job_id_for
+        from dev_orchestrator.jobs.models import JobRecord, JobSpec, job_id_for, retry_successor_id, spec_hash
         from dev_orchestrator.jobs.store import ExecutionJobStore
         from dev_orchestrator.jobs.transport import LocalJobTransport
         from dev_orchestrator.storage.json_store import utc_now_iso
@@ -281,16 +281,36 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 }
 
         if operation == "op_spawn":
-            proj_id = req.get("project_id")
-            cmd_ref = req.get("command_ref")
-            if not proj_id or not cmd_ref:
-                raise ValueError("project_id and command_ref are required for op_spawn")
-            expected_cwd = req.get("expected_working_directory")
+            incoming_spec = req.get("job_spec")
+            if isinstance(incoming_spec, dict):
+                spec = JobSpec.from_dict(incoming_spec)
+                if incoming_spec != spec.to_canonical_dict():
+                    raise ValueError("job_spec must match canonical dictionary byte-for-byte")
+                computed_shash = spec_hash(spec)
+                c_spec_hash = req.get("controller_spec_hash") or req.get("spec_hash")
+                if c_spec_hash and c_spec_hash != computed_shash:
+                    raise ValueError(f"controller_spec_hash mismatch ({c_spec_hash} != {computed_shash})")
+                proj_id = spec.project_id
+                cmd_ref = spec.command_ref
+                idem_key = spec.idempotency_key
+                expected_cwd = spec.expected_working_directory
+            else:
+                proj_id = req.get("project_id")
+                cmd_ref = req.get("command_ref")
+                if not proj_id or not cmd_ref:
+                    raise ValueError("project_id and command_ref are required for op_spawn")
+                expected_cwd = req.get("expected_working_directory")
+                idem_key = req.get("idempotency_key") or req.get("job_id")
+                if not idem_key:
+                    raise ValueError("job_id or idempotency_key is required")
+                spec = None
+
+            params = req.get("parameters")
             ok, failure_kind, resolved = resolve_execution_policy(
                 jobs_cfg,
                 proj_id,
                 cmd_ref,
-                parameters=req.get("parameters"),
+                parameters=params,
                 expected_working_directory=expected_cwd,
             )
             if not ok:
@@ -301,30 +321,44 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             if resolved.effect_class == "hardware":
                 raise ValueError("hardware_execution_not_supported_in_p18")
 
-            incoming_spec = req.get("job_spec")
-            if isinstance(incoming_spec, dict):
+            if spec is not None:
                 if (
-                    incoming_spec.get("parameters_digest") != resolved.parameters_digest
-                    or incoming_spec.get("execution_policy_digest") != resolved.execution_policy_digest
-                    or incoming_spec.get("resolution_digest") != resolved.resolution_digest
+                    spec.parameters_digest and spec.parameters_digest != resolved.parameters_digest
+                    or spec.execution_policy_digest and spec.execution_policy_digest != resolved.execution_policy_digest
+                    or spec.resolution_digest and spec.resolution_digest != resolved.resolution_digest
                 ):
-                    raise ValueError("tampered job_spec digest mismatch")
+                    raise ValueError("tampered job_spec digest mismatch with host-local policy")
+            else:
+                input_digest = req.get("input_digest")
+                spec = JobSpec(
+                    project_id=proj_id,
+                    command_ref=cmd_ref,
+                    idempotency_key=str(idem_key),
+                    expected_working_directory=expected_cwd,
+                    input_digest=str(input_digest) if input_digest else None,
+                    parameters_digest=resolved.parameters_digest,
+                    execution_policy_digest=resolved.execution_policy_digest,
+                    resolution_digest=resolved.resolution_digest,
+                )
 
-            idem_key = req.get("idempotency_key") or req.get("job_id")
-            if not idem_key:
-                raise ValueError("job_id or idempotency_key is required")
-            input_digest = req.get("input_digest")
-            spec = JobSpec(
-                project_id=proj_id,
-                command_ref=cmd_ref,
-                idempotency_key=str(idem_key),
-                expected_working_directory=expected_cwd,
-                input_digest=str(input_digest) if input_digest else None,
-                parameters_digest=resolved.parameters_digest,
-                execution_policy_digest=resolved.execution_policy_digest,
-                resolution_digest=resolved.resolution_digest,
-            )
-            target_job_id = req.get("job_id") or job_id_for(spec)
+            is_retry = bool(req.get("retry_of") and req.get("retry_request_id"))
+            if is_retry:
+                expected_jid = retry_successor_id(str(req["retry_of"]), str(req["retry_request_id"]))
+            elif spec is not None and ":retry:" in (spec.idempotency_key or ""):
+                base_idem, retry_req_id = spec.idempotency_key.split(":retry:", 1)
+                pred_jid = job_id_for({"project_id": spec.project_id, "idempotency_key": base_idem})
+                expected_jid = retry_successor_id(pred_jid, retry_req_id)
+            elif idem_key and ":retry:" in str(idem_key):
+                base_idem, retry_req_id = str(idem_key).split(":retry:", 1)
+                pred_jid = job_id_for({"project_id": proj_id, "idempotency_key": base_idem})
+                expected_jid = retry_successor_id(pred_jid, retry_req_id)
+            else:
+                expected_jid = job_id_for(spec) if spec is not None else job_id_for({"project_id": proj_id, "idempotency_key": str(idem_key)})
+            wire_jid = req.get("job_id")
+            if wire_jid and wire_jid != expected_jid:
+                raise ValueError(f"unauthorized job_id {wire_jid!r}, expected {expected_jid!r}")
+            target_job_id = expected_jid
+
             store = ExecutionJobStore(jobs_cfg.runtime_root)
             local_transport = LocalJobTransport()
 
@@ -341,18 +375,24 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                     command_ref=spec.command_ref,
                     resolved_argv=resolved_argv,
                     working_directory=str(resolved.resolved_cwd),
-                    transport="local",
+                    transport=spec.transport,
                     host_identity=socket.gethostname(),
                     duration_class=resolved.duration_class,
                     max_runtime_seconds=resolved.max_runtime_seconds,
                     heartbeat_interval_seconds=resolved.heartbeat_interval_seconds,
                     log_caps=dict(jobs_cfg.log_caps),
                     input_digest=spec.input_digest,
+                    submission_spec=spec.to_canonical_dict(),
                     parameters=resolved.canonical_parameters,
                     parameters_digest=resolved.parameters_digest,
                     execution_policy_digest=resolved.execution_policy_digest,
                     resolution_digest=resolved.resolution_digest,
                     state="queued",
+                    task_id=spec.task_id,
+                    stage_run_id=spec.stage_run_id,
+                    role_run_id=spec.role_run_id,
+                    source_request_id=spec.source_request_id,
+                    broker_request_id=spec.broker_request_id,
                     timestamps={"created_at": now, "queued_at": now, "updated_at": now},
                 )
 
@@ -572,6 +612,9 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             "parameters",
             "job_spec",
             "spec_hash",
+            "controller_spec_hash",
+            "retry_of",
+            "retry_request_id",
             "parameters_digest",
             "execution_policy_digest",
             "resolution_digest",
@@ -586,7 +629,13 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             resolve_remote_jobs_config_path,
             validate_and_resolve_execution,
         )
-        from dev_orchestrator.jobs.models import JobRecord, JobSpec, job_id_for
+        from dev_orchestrator.jobs.models import (
+            JobRecord,
+            JobSpec,
+            job_id_for,
+            retry_successor_id,
+            spec_hash,
+        )
         from dev_orchestrator.jobs.store import ExecutionJobStore
         from dev_orchestrator.jobs.transport import LocalJobTransport
         from dev_orchestrator.storage.json_store import utc_now_iso
@@ -602,10 +651,30 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
         if operation == "job_start":
             proj_id = req.get("project_id")
             cmd_ref = req.get("command_ref")
-            if not proj_id or not cmd_ref:
-                raise ValueError("project_id and command_ref are required for job_start")
-            expected_cwd = req.get("expected_working_directory")
-            params = req.get("parameters")
+            idem_key = req.get("idempotency_key") or req.get("job_id")
+            incoming_spec = req.get("job_spec")
+            controller_hash = req.get("controller_spec_hash")
+            spec = None
+            if incoming_spec is not None:
+                if not isinstance(incoming_spec, dict):
+                    raise ValueError("job_spec must be a JSON object")
+                spec = JobSpec.from_dict(incoming_spec)
+                if incoming_spec != spec.to_canonical_dict():
+                    raise ValueError("job_spec was modified in transit or not in canonical form")
+                calc_hash = spec_hash(spec)
+                if controller_hash and controller_hash != calc_hash:
+                    raise ValueError(f"controller_spec_hash mismatch: expected {calc_hash}, got {controller_hash}")
+                proj_id = spec.project_id
+                cmd_ref = spec.command_ref
+                idem_key = spec.idempotency_key
+                expected_cwd = spec.expected_working_directory
+                params = spec.metadata.get("parameters") or req.get("parameters")
+            else:
+                if not proj_id or not cmd_ref:
+                    raise ValueError("project_id and command_ref are required for job_start")
+                expected_cwd = req.get("expected_working_directory")
+                params = req.get("parameters")
+
             ok, failure_kind, resolved = resolve_execution_policy(
                 jobs_cfg, proj_id, cmd_ref, parameters=params, expected_working_directory=expected_cwd
             )
@@ -617,30 +686,45 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             if resolved.effect_class == "hardware":
                 raise ValueError("hardware_execution_not_supported_in_p18")
 
-            incoming_spec = req.get("job_spec")
-            if isinstance(incoming_spec, dict):
+            if spec is not None:
                 if (
-                    incoming_spec.get("parameters_digest") != resolved.parameters_digest
-                    or incoming_spec.get("execution_policy_digest") != resolved.execution_policy_digest
-                    or incoming_spec.get("resolution_digest") != resolved.resolution_digest
+                    spec.parameters_digest and spec.parameters_digest != resolved.parameters_digest
+                    or spec.execution_policy_digest and spec.execution_policy_digest != resolved.execution_policy_digest
+                    or spec.resolution_digest and spec.resolution_digest != resolved.resolution_digest
                 ):
-                    raise ValueError("tampered job_spec digest mismatch")
+                    raise ValueError("tampered job_spec digest mismatch with host-local policy")
+            else:
+                if not idem_key:
+                    raise ValueError("job_id or idempotency_key is required")
+                input_digest = req.get("input_digest")
+                spec = JobSpec(
+                    project_id=proj_id,
+                    command_ref=cmd_ref,
+                    idempotency_key=str(idem_key),
+                    expected_working_directory=expected_cwd,
+                    input_digest=str(input_digest) if input_digest else None,
+                    parameters_digest=resolved.parameters_digest,
+                    execution_policy_digest=resolved.execution_policy_digest,
+                    resolution_digest=resolved.resolution_digest,
+                )
 
-            idem_key = req.get("idempotency_key") or req.get("job_id")
-            if not idem_key:
-                raise ValueError("job_id or idempotency_key is required")
-            input_digest = req.get("input_digest")
-            spec = JobSpec(
-                project_id=proj_id,
-                command_ref=cmd_ref,
-                idempotency_key=str(idem_key),
-                expected_working_directory=expected_cwd,
-                input_digest=str(input_digest) if input_digest else None,
-                parameters_digest=resolved.parameters_digest,
-                execution_policy_digest=resolved.execution_policy_digest,
-                resolution_digest=resolved.resolution_digest,
-            )
-            target_job_id = req.get("job_id") or job_id_for(spec)
+            is_retry = bool(req.get("retry_of") and req.get("retry_request_id"))
+            if is_retry:
+                expected_jid = retry_successor_id(str(req["retry_of"]), str(req["retry_request_id"]))
+            elif spec is not None and ":retry:" in (spec.idempotency_key or ""):
+                base_idem, retry_req_id = spec.idempotency_key.split(":retry:", 1)
+                pred_jid = job_id_for({"project_id": spec.project_id, "idempotency_key": base_idem})
+                expected_jid = retry_successor_id(pred_jid, retry_req_id)
+            elif idem_key and ":retry:" in str(idem_key):
+                base_idem, retry_req_id = str(idem_key).split(":retry:", 1)
+                pred_jid = job_id_for({"project_id": proj_id, "idempotency_key": base_idem})
+                expected_jid = retry_successor_id(pred_jid, retry_req_id)
+            else:
+                expected_jid = job_id_for(spec) if spec is not None else job_id_for({"project_id": proj_id, "idempotency_key": str(idem_key)})
+            wire_jid = req.get("job_id")
+            if wire_jid and wire_jid != expected_jid:
+                raise ValueError(f"unauthorized job_id {wire_jid!r}, expected {expected_jid!r}")
+            target_job_id = expected_jid
 
             def _factory(jid: str, shash: str) -> JobRecord:
                 now = utc_now_iso()
@@ -655,18 +739,24 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                     command_ref=spec.command_ref,
                     resolved_argv=resolved_argv,
                     working_directory=str(resolved.resolved_cwd),
-                    transport="local",
+                    transport=spec.transport,
                     host_identity=socket.gethostname(),
                     duration_class=resolved.duration_class,
                     max_runtime_seconds=resolved.max_runtime_seconds,
                     heartbeat_interval_seconds=resolved.heartbeat_interval_seconds,
                     log_caps=dict(jobs_cfg.log_caps),
                     input_digest=spec.input_digest,
+                    submission_spec=spec.to_canonical_dict(),
                     parameters=resolved.canonical_parameters,
                     parameters_digest=resolved.parameters_digest,
                     execution_policy_digest=resolved.execution_policy_digest,
                     resolution_digest=resolved.resolution_digest,
                     state="queued",
+                    task_id=spec.task_id,
+                    stage_run_id=spec.stage_run_id,
+                    role_run_id=spec.role_run_id,
+                    source_request_id=spec.source_request_id,
+                    broker_request_id=spec.broker_request_id,
                     timestamps={"created_at": now, "queued_at": now, "updated_at": now},
                 )
 

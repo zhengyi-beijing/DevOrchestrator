@@ -197,6 +197,7 @@ class LocalMachineTransport:
                 heartbeat_interval_seconds=resolved.heartbeat_interval_seconds,
                 log_caps=dict(self.jobs_cfg.log_caps),
                 input_digest=spec.input_digest,
+                submission_spec=spec.to_canonical_dict(),
                 parameters=resolved.canonical_parameters,
                 parameters_digest=resolved.parameters_digest,
                 execution_policy_digest=resolved.execution_policy_digest,

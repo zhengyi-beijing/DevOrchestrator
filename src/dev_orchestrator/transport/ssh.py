@@ -24,6 +24,7 @@ from dev_orchestrator.transport.contracts import (
     TransportUnavailableError,
     WriteContentUpload,
 )
+from dev_orchestrator.jobs.models import JobSpec, job_id_for, spec_hash
 from dev_orchestrator.transport.hosts import TransportHostProfile
 from dev_orchestrator.transport.ssh_channel import (
     DEFAULT_MAX_SSH_RESPONSE_BYTES,
@@ -117,9 +118,23 @@ class SSHMachineTransport:
 
     def spawn(self, request: MachineOperation) -> MachineOperationResult:
         req_id = request.idempotency_key or str(uuid.uuid4())
+        spec = JobSpec(
+            project_id=request.project_id,
+            command_ref=request.command_ref,
+            idempotency_key=request.idempotency_key,
+            expected_working_directory=request.expected_working_directory,
+            input_digest=request.input_digest,
+            transport="ssh",
+        )
+        c_spec_hash = spec_hash(spec)
+        canon_spec = spec.to_canonical_dict()
+        expected_jid = job_id_for(spec)
         req_env = {
             "operation": "op_spawn",
             "request_id": req_id,
+            "job_id": expected_jid,
+            "job_spec": canon_spec,
+            "controller_spec_hash": c_spec_hash,
             "project_id": request.project_id,
             "command_ref": request.command_ref,
             "idempotency_key": request.idempotency_key,

@@ -43,7 +43,22 @@ class TestP17ControlPlaneDeclaration(unittest.TestCase):
         self.assertTrue(next_md.exists(), "agent/next.md missing")
         self.assertTrue(staged_md.exists(), "agent/staged/P17.md missing")
 
-        decl_next = parse_control_plane_declaration(next_md.read_text(encoding="utf-8"))
+        next_text = next_md.read_text(encoding="utf-8")
+        if not next_text.strip().startswith("# P17"):
+            import subprocess
+            proc = subprocess.run(
+                ["git", "-C", str(self.repo_root), "log", "-1", "--format=%H", "--grep=close(P17)"],
+                capture_output=True, text=True, check=False,
+            )
+            p17_commit = proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else "9188611"
+            show_proc = subprocess.run(
+                ["git", "-C", str(self.repo_root), "show", f"{p17_commit}:agent/next.md"],
+                capture_output=True, text=True, check=False,
+            )
+            if show_proc.returncode == 0 and show_proc.stdout.strip():
+                next_text = show_proc.stdout
+
+        decl_next = parse_control_plane_declaration(next_text)
         decl_staged = parse_control_plane_declaration(staged_md.read_text(encoding="utf-8"))
 
         self.assertEqual(decl_next.kind, "declared")
@@ -66,12 +81,22 @@ class TestP17ControlPlaneDeclaration(unittest.TestCase):
         self.assertTrue(bool(decl_staged.convergence_evidence.strip()))
 
     def test_evaluate_launch_declaration_at_current_head(self) -> None:
-        """Validate launch declaration at current repository HEAD."""
+        """Validate launch declaration for P17 at its committed HEAD."""
+        import subprocess
+        next_md = self.repo_root / "agent" / "next.md"
+        head = "HEAD"
+        if next_md.exists() and not next_md.read_text(encoding="utf-8").strip().startswith("# P17"):
+            proc = subprocess.run(
+                ["git", "-C", str(self.repo_root), "log", "-1", "--format=%H", "--grep=close(P17)"],
+                capture_output=True, text=True, check=False,
+            )
+            head = proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else "9188611"
+
         scope, declaration, gate_eval = evaluate_launch_declaration(
             project_id="devorchestrator",
             repo_path=str(self.repo_root),
             task_id="P17",
-            head="HEAD",
+            head=head,
         )
         self.assertEqual(scope.kind, "control_plane")
         self.assertEqual(declaration.kind, "declared")

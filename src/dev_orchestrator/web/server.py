@@ -73,6 +73,7 @@ _CONTROL_JOB_LOGS_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)/
 _CONTROL_JOB_PATH_RE = re.compile(r"^/api/v1/control/jobs/([A-Za-z0-9_-]+)$")
 _PAIRING_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/adapter-pairings/([A-Za-z0-9_-]+)/revoke$")
 _CAPABILITY_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/web-bridge-capabilities/([A-Za-z0-9_-]+)/revoke$")
+_TRANSPORT_CAPABILITY_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/(?:transport-capabilities|transport/capabilities)/([A-Za-z0-9_-]+)/revoke$")
 _MOBILE_DEVICE_REVOKE_PATH_RE = re.compile(r"^/api/v1/control/mobile/devices/([A-Za-z0-9_-]+)/revoke$")
 _CONTROL_REVIEWS_PATH_RE = re.compile(r"^/api/v1/control/reviews$")
 _CONTROL_REVIEW_SESSION_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_:-]+)$")
@@ -85,19 +86,34 @@ _CONTROL_ALLOW_HEADER = "GET, HEAD, POST, OPTIONS"
 _MAX_CONTROL_BODY = 64 * 1024
 _MAX_STAGE_WRITE_BODY = 16 * 1024 * 1024
 
+_SELF_AUTHENTICATING_TRANSPORT_PATHS = {
+    "/api/v1/control/transport/exec",
+    "/api/v1/control/transport/spawn",
+    "/api/v1/control/transport/poll",
+    "/api/v1/control/transport/cancel",
+    "/api/v1/control/transport/stage-write",
+    "/api/v1/control/transport/write",
+}
 
-def _get_transport_for_host(runtime_root: Path, host_id: Optional[str] = None):
-    h_id = host_id or "local"
-    from dev_orchestrator.transport.hosts import load_transport_hosts_config
-    cfg = load_transport_hosts_config(runtime_root)
-    if h_id == "local":
-        from dev_orchestrator.transport.local import LocalMachineTransport
-        return LocalMachineTransport(jobs_config_path=runtime_root / "execution-jobs.json", host_id="local")
-    profile = cfg.hosts.get(h_id)
-    if profile is None:
-        raise ValueError(f"unknown transport host: {h_id}")
-    from dev_orchestrator.transport.ssh import SSHMachineTransport
-    return SSHMachineTransport(profile)
+
+def _get_transport_for_host(
+    runtime_root: Path,
+    host_id: Optional[str] = None,
+    *,
+    operation: str = "read_file",
+    command_ref: Optional[str] = None,
+    effect_class: str = "read_only",
+    policy_digest: Optional[str] = None,
+):
+    from dev_orchestrator.transport.hosts import get_transport_for_host
+    return get_transport_for_host(
+        runtime_root=runtime_root,
+        host_id=host_id,
+        operation=operation,
+        command_ref=command_ref,
+        effect_class=effect_class,
+        policy_digest=policy_digest,
+    )
 
 
 def monitor_payload(runtime_root: Path | str) -> dict[str, Any]:
@@ -915,26 +931,43 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     for h_id, prof in hosts_cfg.hosts.items()
                 },
             })
+        elif path == "/api/v1/control/transport-capabilities":
+            if not self._authorized_control_read():
+                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            from dev_orchestrator.control.security import list_transport_capabilities
+            q_params = parse_qs(parsed.query)
+            proj_id = q_params.get("project_id", [None])[0]
+            caps = list_transport_capabilities(project_id=proj_id, runtime_root=runtime)
+            payload = _control_envelope({"items": caps, "capabilities": caps, "count": len(caps)})
         elif path == "/api/v1/control/transport/capabilities":
             if not self._authorized_control_read():
                 self._error(401, "Unauthorized", "valid control authorization required", head_only); return
-            from dev_orchestrator.transport.hosts import HostCapabilityCache, load_transport_hosts_config
             q_params = parse_qs(parsed.query)
-            host_id = q_params.get("host_id", ["local"])[0]
-            hosts_cfg = load_transport_hosts_config(runtime)
-            cache = HostCapabilityCache(runtime, hosts_config=hosts_cfg)
-            caps = cache.get_capabilities(host_id)
-            payload = _control_envelope({
-                "host_id": caps.host_id,
-                "os_family": caps.os_family,
-                "path_style": caps.path_style,
-                "helper_version": caps.helper_version,
-                "jobs_config_valid": caps.jobs_config_valid,
-                "approved_policy_pins": caps.approved_policy_pins,
-                "response_limits": caps.response_limits,
-                "supported_operations": caps.supported_operations,
-                "probed_at": caps.probed_at,
-            })
+            if "list" in q_params or "tokens" in q_params or ("project_id" in q_params and "host_id" not in q_params):
+                from dev_orchestrator.control.security import list_transport_capabilities
+                proj_id = q_params.get("project_id", [None])[0]
+                caps = list_transport_capabilities(project_id=proj_id, runtime_root=runtime)
+                payload = _control_envelope({"items": caps, "capabilities": caps, "count": len(caps)})
+            else:
+                from dev_orchestrator.transport.hosts import HostCapabilityCache, load_transport_hosts_config
+                host_id = q_params.get("host_id", ["local"])[0]
+                hosts_cfg = load_transport_hosts_config(runtime)
+                cache = HostCapabilityCache(runtime, hosts_config=hosts_cfg)
+                try:
+                    caps = cache.get_capabilities(host_id)
+                except ValueError as exc:
+                    self._error(404, "Not Found", str(exc), head_only); return
+                payload = _control_envelope({
+                    "host_id": caps.host_id,
+                    "os_family": caps.os_family,
+                    "path_style": caps.path_style,
+                    "helper_version": caps.helper_version,
+                    "jobs_config_valid": caps.jobs_config_valid,
+                    "approved_policy_pins": caps.approved_policy_pins,
+                    "response_limits": caps.response_limits,
+                    "supported_operations": caps.supported_operations,
+                    "probed_at": caps.probed_at,
+                })
         elif path == "/api/v1/control/transport/operations":
             if not self._authorized_control_read():
                 self._error(401, "Unauthorized", "valid control authorization required", head_only); return
@@ -951,10 +984,17 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             path_param = q_params.get("path", [""])[0]
             project_id = q_params.get("project_id", [None])[0]
             host_id = q_params.get("host_id", ["local"])[0]
-            if not self._authorized_control_read(operation="stat", project_id=project_id or "", host_id=host_id, path=path_param):
-                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            auth_ok, auth_err, _, cap_id = self._validate_transport_auth(
+                operation="stat",
+                project_id=project_id or "",
+                host_id=host_id,
+                path=path_param,
+                require_nonce=False,
+            )
+            if not auth_ok:
+                self._error(401, "Unauthorized", auth_err or "valid control authorization required", head_only); return
             try:
-                transport = _get_transport_for_host(runtime, host_id)
+                transport = _get_transport_for_host(runtime, host_id, operation="stat", effect_class="read_only")
                 stat_res = transport.stat(path_param, host_id=host_id, project_id=project_id)
                 payload = _control_envelope({
                     "status": stat_res.status,
@@ -970,19 +1010,43 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 })
             except Exception as exc:
                 self._error(400, "Bad Request", str(exc), head_only); return
+
+            try:
+                from dev_orchestrator.transport.observability import log_transport_operation
+                log_transport_operation(
+                    runtime,
+                    operation_id=f"stat-{uuid4().hex[:12]}",
+                    operation="stat",
+                    host_id=host_id,
+                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
+                    status=stat_res.status,
+                    project_id=project_id,
+                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
+                    capability_id=cap_id,
+                    error=stat_res.error,
+                )
+            except Exception:
+                pass
         elif path == "/api/v1/control/transport/read":
             q_params = parse_qs(parsed.query)
             project_id = q_params.get("project_id", [""])[0]
             path_param = q_params.get("path", [""])[0]
             host_id = q_params.get("host_id", ["local"])[0]
-            if not self._authorized_control_read(operation="read_file", project_id=project_id, host_id=host_id, path=path_param):
-                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            auth_ok, auth_err, _, cap_id = self._validate_transport_auth(
+                operation="read_file",
+                project_id=project_id,
+                host_id=host_id,
+                path=path_param,
+                require_nonce=False,
+            )
+            if not auth_ok:
+                self._error(401, "Unauthorized", auth_err or "valid control authorization required", head_only); return
             import base64
             from dev_orchestrator.transport.contracts import FileReadRequest
             max_bytes = int(q_params.get("max_bytes", [10 * 1024 * 1024])[0])
             offset_bytes = int(q_params.get("offset_bytes", [0])[0])
             try:
-                transport = _get_transport_for_host(runtime, host_id)
+                transport = _get_transport_for_host(runtime, host_id, operation="read_file", effect_class="read_only")
                 file_res = transport.read_file(FileReadRequest(project_id=project_id, path=path_param, host_id=host_id, max_bytes=max_bytes, offset_bytes=offset_bytes))
                 b64_str = base64.b64encode(file_res.content_bytes).decode("ascii") if file_res.content_bytes else None
                 payload = _control_envelope({
@@ -996,6 +1060,23 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 })
             except Exception as exc:
                 self._error(400, "Bad Request", str(exc), head_only); return
+
+            try:
+                from dev_orchestrator.transport.observability import log_transport_operation
+                log_transport_operation(
+                    runtime,
+                    operation_id=f"read-{uuid4().hex[:12]}",
+                    operation="read_file",
+                    host_id=host_id,
+                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
+                    status=file_res.status,
+                    project_id=project_id,
+                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
+                    capability_id=cap_id,
+                    error=file_res.error,
+                )
+            except Exception:
+                pass
 
         elif path == "/api/monitor":
             payload = monitor_payload(runtime)
@@ -1066,6 +1147,41 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self.headers.get("Cookie"), self.headers.get("X-DevOrch-CSRF")
         )
 
+    def _validate_transport_auth(
+        self,
+        *,
+        operation: str,
+        project_id: str = "",
+        host_id: str = "local",
+        command_ref: Optional[str] = None,
+        path: Optional[str] = None,
+        require_nonce: bool = True,
+    ) -> tuple[bool, Optional[str], Optional[dict[str, Any]], Optional[str]]:
+        if self._owner_authorized():
+            return True, None, None, None
+        security = self.server.control_security
+        if security is None or not self._client_is_loopback():
+            return False, "control security unavailable or non-loopback", None, None
+        auth_header = self.headers.get("Authorization")
+        if not auth_header:
+            return False, "missing authorization header", None, None
+        token = auth_header.split()[-1] if " " in auth_header else auth_header
+        ok, reason, row = security.validate_transport_capability(
+            token,
+            project_id=project_id,
+            host_id=host_id,
+            operation=operation,
+            command_ref=command_ref,
+            path=path,
+        )
+        if not ok or not row:
+            return False, f"transport capability unauthorized: {reason}", None, None
+        if require_nonce:
+            nonce = self.headers.get("X-DevOrch-Nonce")
+            if not nonce or not security.consume_request_nonce(row["capability_id"], nonce):
+                return False, "transport capability request nonce invalid or replayed", None, None
+        return True, None, row, row.get("capability_id")
+
     def _authorized_control_read(
         self,
         operation: Optional[str] = None,
@@ -1077,19 +1193,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return True
         if operation is None:
             return False
-        security = self.server.control_security
-        if security is None or not self._client_is_loopback():
-            return False
-        auth_header = self.headers.get("Authorization")
-        if not auth_header:
-            return False
-        token = auth_header.split()[-1] if " " in auth_header else auth_header
-        ok, _, _ = security.validate_transport_capability(
-            token,
+        ok, _, _, _ = self._validate_transport_auth(
+            operation=operation,
             project_id=project_id,
             host_id=host_id,
-            operation=operation,
             path=path,
+            require_nonce=False,
         )
         return ok
 
@@ -1305,8 +1414,36 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             envelope = result if (isinstance(result, dict) and "data" in result and ("schema_version" in result or "version" in result)) else _control_envelope(result)
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(envelope), False, cors_header)
             return
-        if not path.startswith("/api/v1/control/transport/") and not self._owner_authorized():
+        if path not in _SELF_AUTHENTICATING_TRANSPORT_PATHS and not self._owner_authorized():
             self._error(401, "Unauthorized", "valid control authorization required", False); return
+        if path in ("/api/v1/control/transport-capabilities", "/api/v1/control/transport/capabilities"):
+            value = self._read_control_json()
+            if value is None: return
+            try:
+                allowed_ops = value.get("allowed_operations")
+                if not isinstance(allowed_ops, list):
+                    raise ValueError("allowed_operations must be a list of strings")
+                cap = security.create_transport_capability(
+                    project_id=str(value.get("project_id", "*")),
+                    host_id=str(value.get("host_id", "local")),
+                    allowed_operations=allowed_ops,
+                    allowed_commands=value.get("allowed_commands"),
+                    allowed_roots=value.get("allowed_roots"),
+                    ttl_seconds=int(value.get("ttl_seconds", 3600)),
+                    label=str(value.get("label", "")),
+                )
+            except (ValueError, TypeError) as exc:
+                self._error(400, "Bad Request", str(exc), False); return
+            self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(cap)), False); return
+        revoke_tc = _TRANSPORT_CAPABILITY_REVOKE_PATH_RE.fullmatch(path)
+        if revoke_tc:
+            try:
+                res = security.revoke_transport_capability(revoke_tc.group(1))
+            except ValueError as exc:
+                self._error(404, "Not Found", str(exc), False); return
+            if not res.get("revoked") and res.get("error") == "not_found":
+                self._error(404, "Not Found", "capability not found", False); return
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(res)), False); return
         if path == "/api/v1/control/adapter-pairings":
             self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(security.create_pairing())), False); return
         if path == "/api/v1/control/web-bridge-capabilities":
@@ -1381,26 +1518,45 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             command_ref = value.get("command_ref")
             host_id = value.get("host_id", "local")
             idem_key = value.get("idempotency_key") or str(uuid4())
-            auth_header = self.headers.get("Authorization")
-            if not security.bearer_authorized(auth_header):
-                token = auth_header.split()[-1] if auth_header and " " in auth_header else auth_header
-                nonce = self.headers.get("X-DevOrch-Nonce")
-                try:
-                    ok, reason, row = security.validate_transport_capability(
-                        token,
-                        project_id=project_id,
-                        host_id=host_id,
-                        operation="exec",
-                        command_ref=command_ref,
-                    )
-                    if not ok or not row:
-                        self._error(403, "Forbidden", f"transport capability unauthorized: {reason}", False); return
-                    if not nonce or not security.consume_request_nonce(row["capability_id"], nonce):
-                        self._error(403, "Forbidden", "transport capability request nonce invalid or replayed", False); return
-                except Exception as exc:
-                    self._error(403, "Forbidden", f"authorization failed: {exc}", False); return
+            auth_ok, auth_err, cap_row, cap_id = self._validate_transport_auth(
+                operation="exec",
+                project_id=project_id,
+                host_id=host_id,
+                command_ref=command_ref,
+                require_nonce=True,
+            )
+            if not auth_ok:
+                self._error(403, "Forbidden", auth_err or "forbidden", False); return
+
+            from dev_orchestrator.jobs.config import load_jobs_config, resolve_execution_policy
+            jobs_cfg = load_jobs_config(runtime / "execution-jobs.json")
+            p_digest = None
+            ep_digest = None
+            res_digest = None
+            effect_cls = "read_only"
+            if jobs_cfg and project_id and command_ref:
+                ok_pol, _, resolved = resolve_execution_policy(
+                    jobs_cfg,
+                    project_id,
+                    command_ref,
+                    parameters=value.get("parameters"),
+                    expected_working_directory=value.get("expected_working_directory"),
+                )
+                if ok_pol and resolved:
+                    p_digest = resolved.parameters_digest
+                    ep_digest = resolved.execution_policy_digest
+                    res_digest = resolved.resolution_digest
+                    effect_cls = resolved.effect_class
+
             try:
-                transport = _get_transport_for_host(runtime, host_id)
+                transport = _get_transport_for_host(
+                    runtime,
+                    host_id,
+                    operation="exec",
+                    command_ref=command_ref,
+                    effect_class=effect_cls,
+                    policy_digest=ep_digest,
+                )
                 from dev_orchestrator.transport.contracts import MachineOperation
                 import dataclasses
                 op = MachineOperation(
@@ -1422,13 +1578,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     operation_id=getattr(res, "operation_id", idem_key),
                     operation="exec",
                     host_id=host_id,
-                    selected_transport="local",
+                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
                     status=res.status,
+                    project_id=project_id,
                     command_ref=command_ref,
                     parameters_names=sorted((value.get("parameters") or {}).keys()),
-                    parameters_digest=getattr(res, "parameters_digest", None),
-                    execution_policy_digest=getattr(res, "execution_policy_digest", None),
-                    resolution_digest=getattr(res, "resolution_digest", None),
+                    parameters_digest=getattr(res, "parameters_digest", p_digest),
+                    execution_policy_digest=getattr(res, "execution_policy_digest", ep_digest),
+                    resolution_digest=getattr(res, "resolution_digest", res_digest),
+                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
+                    capability_id=cap_id,
                     duration_seconds=res.duration_seconds,
                     exit_code=res.exit_code,
                     error=res.error,
@@ -1446,26 +1605,45 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             command_ref = value.get("command_ref")
             host_id = value.get("host_id", "local")
             idem_key = value.get("idempotency_key") or str(uuid4())
-            auth_header = self.headers.get("Authorization")
-            if not security.bearer_authorized(auth_header):
-                token = auth_header.split()[-1] if auth_header and " " in auth_header else auth_header
-                nonce = self.headers.get("X-DevOrch-Nonce")
-                try:
-                    ok, reason, row = security.validate_transport_capability(
-                        token,
-                        project_id=project_id,
-                        host_id=host_id,
-                        operation="spawn",
-                        command_ref=command_ref,
-                    )
-                    if not ok or not row:
-                        self._error(403, "Forbidden", f"transport capability unauthorized: {reason}", False); return
-                    if not nonce or not security.consume_request_nonce(row["capability_id"], nonce):
-                        self._error(403, "Forbidden", "transport capability request nonce invalid or replayed", False); return
-                except Exception as exc:
-                    self._error(403, "Forbidden", f"authorization failed: {exc}", False); return
+            auth_ok, auth_err, cap_row, cap_id = self._validate_transport_auth(
+                operation="spawn",
+                project_id=project_id,
+                host_id=host_id,
+                command_ref=command_ref,
+                require_nonce=True,
+            )
+            if not auth_ok:
+                self._error(403, "Forbidden", auth_err or "forbidden", False); return
+
+            from dev_orchestrator.jobs.config import load_jobs_config, resolve_execution_policy
+            jobs_cfg = load_jobs_config(runtime / "execution-jobs.json")
+            p_digest = None
+            ep_digest = None
+            res_digest = None
+            effect_cls = "effectful"
+            if jobs_cfg and project_id and command_ref:
+                ok_pol, _, resolved = resolve_execution_policy(
+                    jobs_cfg,
+                    project_id,
+                    command_ref,
+                    parameters=value.get("parameters"),
+                    expected_working_directory=value.get("expected_working_directory"),
+                )
+                if ok_pol and resolved:
+                    p_digest = resolved.parameters_digest
+                    ep_digest = resolved.execution_policy_digest
+                    res_digest = resolved.resolution_digest
+                    effect_cls = resolved.effect_class
+
             try:
-                transport = _get_transport_for_host(runtime, host_id)
+                transport = _get_transport_for_host(
+                    runtime,
+                    host_id,
+                    operation="spawn",
+                    command_ref=command_ref,
+                    effect_class=effect_cls,
+                    policy_digest=ep_digest,
+                )
                 from dev_orchestrator.transport.contracts import MachineOperation
                 import dataclasses
                 op = MachineOperation(
@@ -1487,13 +1665,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     operation_id=getattr(res, "operation_id", idem_key),
                     operation="spawn",
                     host_id=host_id,
-                    selected_transport="local",
+                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
                     status=res.status,
+                    project_id=project_id,
                     command_ref=command_ref,
                     parameters_names=sorted((value.get("parameters") or {}).keys()),
-                    parameters_digest=getattr(res, "parameters_digest", None),
-                    execution_policy_digest=getattr(res, "execution_policy_digest", None),
-                    resolution_digest=getattr(res, "resolution_digest", None),
+                    parameters_digest=getattr(res, "parameters_digest", p_digest),
+                    execution_policy_digest=getattr(res, "execution_policy_digest", ep_digest),
+                    resolution_digest=getattr(res, "resolution_digest", res_digest),
+                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
+                    capability_id=cap_id,
                     duration_seconds=getattr(res, "duration_seconds", None),
                     exit_code=getattr(res, "exit_code", None),
                     error=res.error,
@@ -1510,30 +1691,41 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             op_id = value.get("operation_id")
             host_id = value.get("host_id", "local")
             project_id = value.get("project_id") or ""
-            auth_header = self.headers.get("Authorization")
-            if not security.bearer_authorized(auth_header):
-                token = auth_header.split()[-1] if auth_header and " " in auth_header else auth_header
-                nonce = self.headers.get("X-DevOrch-Nonce")
-                try:
-                    ok, reason, row = security.validate_transport_capability(
-                        token,
-                        project_id=project_id,
-                        host_id=host_id,
-                        operation="poll",
-                    )
-                    if not ok or not row:
-                        self._error(403, "Forbidden", f"transport capability unauthorized: {reason}", False); return
-                    if not nonce or not security.consume_request_nonce(row["capability_id"], nonce):
-                        self._error(403, "Forbidden", "transport capability request nonce invalid or replayed", False); return
-                except Exception as exc:
-                    self._error(403, "Forbidden", f"authorization failed: {exc}", False); return
+            auth_ok, auth_err, cap_row, cap_id = self._validate_transport_auth(
+                operation="poll",
+                project_id=project_id,
+                host_id=host_id,
+                require_nonce=True,
+            )
+            if not auth_ok:
+                self._error(403, "Forbidden", auth_err or "forbidden", False); return
+
             try:
-                transport = _get_transport_for_host(runtime, host_id)
+                transport = _get_transport_for_host(runtime, host_id, operation="poll", effect_class="read_only")
                 import dataclasses
                 res = transport.poll(op_id, host_id=host_id)
-                self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(dataclasses.asdict(res))), False)
             except Exception as exc:
-                self._error(400, "Bad Request", str(exc), False)
+                self._error(400, "Bad Request", str(exc), False); return
+
+            try:
+                from dev_orchestrator.transport.observability import log_transport_operation
+                log_transport_operation(
+                    runtime,
+                    operation_id=str(op_id),
+                    operation="poll",
+                    host_id=host_id,
+                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
+                    status=res.status,
+                    project_id=project_id,
+                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
+                    capability_id=cap_id,
+                    exit_code=res.exit_code,
+                    error=res.error,
+                )
+            except Exception:
+                pass
+
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(dataclasses.asdict(res))), False)
             return
 
         if path == "/api/v1/control/transport/cancel":
@@ -1543,30 +1735,40 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             host_id = value.get("host_id", "local")
             project_id = value.get("project_id") or ""
             reason = value.get("reason", "cancelled")
-            auth_header = self.headers.get("Authorization")
-            if not security.bearer_authorized(auth_header):
-                token = auth_header.split()[-1] if auth_header and " " in auth_header else auth_header
-                nonce = self.headers.get("X-DevOrch-Nonce")
-                try:
-                    ok, reason_err, row = security.validate_transport_capability(
-                        token,
-                        project_id=project_id,
-                        host_id=host_id,
-                        operation="cancel",
-                    )
-                    if not ok or not row:
-                        self._error(403, "Forbidden", f"transport capability unauthorized: {reason_err}", False); return
-                    if not nonce or not security.consume_request_nonce(row["capability_id"], nonce):
-                        self._error(403, "Forbidden", "transport capability request nonce invalid or replayed", False); return
-                except Exception as exc:
-                    self._error(403, "Forbidden", f"authorization failed: {exc}", False); return
+            auth_ok, auth_err, cap_row, cap_id = self._validate_transport_auth(
+                operation="cancel",
+                project_id=project_id,
+                host_id=host_id,
+                require_nonce=True,
+            )
+            if not auth_ok:
+                self._error(403, "Forbidden", auth_err or "forbidden", False); return
+
             try:
-                transport = _get_transport_for_host(runtime, host_id)
+                transport = _get_transport_for_host(runtime, host_id, operation="cancel", effect_class="effectful")
                 import dataclasses
                 res = transport.cancel(op_id, host_id=host_id, reason=reason)
-                self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(dataclasses.asdict(res))), False)
             except Exception as exc:
-                self._error(400, "Bad Request", str(exc), False)
+                self._error(400, "Bad Request", str(exc), False); return
+
+            try:
+                from dev_orchestrator.transport.observability import log_transport_operation
+                log_transport_operation(
+                    runtime,
+                    operation_id=str(op_id),
+                    operation="cancel",
+                    host_id=host_id,
+                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
+                    status=res.status,
+                    project_id=project_id,
+                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
+                    capability_id=cap_id,
+                    error=res.error,
+                )
+            except Exception:
+                pass
+
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(dataclasses.asdict(res))), False)
             return
 
         if path == "/api/v1/control/transport/stage-write":
@@ -1574,25 +1776,17 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if value is None: return
             project_id = value.get("project_id") or ""
             host_id = value.get("host_id", "local")
-            auth_header = self.headers.get("Authorization")
-            if not security.bearer_authorized(auth_header):
-                token = auth_header.split()[-1] if auth_header and " " in auth_header else auth_header
-                nonce = self.headers.get("X-DevOrch-Nonce")
-                try:
-                    ok, reason_err, row = security.validate_transport_capability(
-                        token,
-                        project_id=project_id,
-                        host_id=host_id,
-                        operation="stage_write",
-                    )
-                    if not ok or not row:
-                        self._error(403, "Forbidden", f"transport capability unauthorized: {reason_err}", False); return
-                    if not nonce or not security.consume_request_nonce(row["capability_id"], nonce):
-                        self._error(403, "Forbidden", "transport capability request nonce invalid or replayed", False); return
-                except Exception as exc:
-                    self._error(403, "Forbidden", f"authorization failed: {exc}", False); return
+            auth_ok, auth_err, cap_row, cap_id = self._validate_transport_auth(
+                operation="stage_write",
+                project_id=project_id,
+                host_id=host_id,
+                require_nonce=True,
+            )
+            if not auth_ok:
+                self._error(403, "Forbidden", auth_err or "forbidden", False); return
+
             try:
-                transport = _get_transport_for_host(runtime, host_id)
+                transport = _get_transport_for_host(runtime, host_id, operation="stage_write_content", effect_class="effectful")
                 from dev_orchestrator.transport.contracts import WriteContentUpload
                 import dataclasses
                 upload = WriteContentUpload(
@@ -1613,8 +1807,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     operation_id=staged.content_ref,
                     operation="stage_write",
                     host_id=host_id,
-                    selected_transport="local",
+                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
                     status="ok",
+                    project_id=project_id,
+                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
+                    capability_id=cap_id,
                 )
             except Exception:
                 pass
@@ -1628,26 +1825,18 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             project_id = value.get("project_id") or ""
             host_id = value.get("host_id", "local")
             target_path = value.get("target_path") or ""
-            auth_header = self.headers.get("Authorization")
-            if not security.bearer_authorized(auth_header):
-                token = auth_header.split()[-1] if auth_header and " " in auth_header else auth_header
-                nonce = self.headers.get("X-DevOrch-Nonce")
-                try:
-                    ok, reason_err, row = security.validate_transport_capability(
-                        token,
-                        project_id=project_id,
-                        host_id=host_id,
-                        operation="write_file",
-                        path=target_path,
-                    )
-                    if not ok or not row:
-                        self._error(403, "Forbidden", f"transport capability unauthorized: {reason_err}", False); return
-                    if not nonce or not security.consume_request_nonce(row["capability_id"], nonce):
-                        self._error(403, "Forbidden", "transport capability request nonce invalid or replayed", False); return
-                except Exception as exc:
-                    self._error(403, "Forbidden", f"authorization failed: {exc}", False); return
+            auth_ok, auth_err, cap_row, cap_id = self._validate_transport_auth(
+                operation="write_file",
+                project_id=project_id,
+                host_id=host_id,
+                path=target_path,
+                require_nonce=True,
+            )
+            if not auth_ok:
+                self._error(403, "Forbidden", auth_err or "forbidden", False); return
+
             try:
-                transport = _get_transport_for_host(runtime, host_id)
+                transport = _get_transport_for_host(runtime, host_id, operation="write_file", effect_class="effectful")
                 from dev_orchestrator.transport.contracts import FileWriteRequest
                 import dataclasses
                 write_req = FileWriteRequest(
@@ -1673,8 +1862,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     operation_id=write_req.idempotency_key,
                     operation="write_file",
                     host_id=host_id,
-                    selected_transport="local",
+                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
                     status=f_res.status,
+                    project_id=project_id,
+                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
+                    capability_id=cap_id,
                     error=f_res.error,
                 )
             except Exception:

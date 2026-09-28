@@ -138,8 +138,21 @@ def load_transport_hosts_config(
 class HostCapabilityCache:
     """In-memory cache for discovered host capabilities with TTL bounding."""
 
-    def __init__(self, ttl_seconds: float = DEFAULT_CAPABILITY_TTL_SECONDS) -> None:
-        self.ttl_seconds = ttl_seconds
+    def __init__(
+        self,
+        runtime_root: Path | str | None = None,
+        *,
+        hosts_config: Optional[TransportHostsConfig] = None,
+        ttl_seconds: float = DEFAULT_CAPABILITY_TTL_SECONDS,
+    ) -> None:
+        if isinstance(runtime_root, (int, float)):
+            self.ttl_seconds = float(runtime_root)
+            self.runtime_root = None
+            self.hosts_config = hosts_config
+        else:
+            self.runtime_root = Path(runtime_root) if runtime_root else None
+            self.hosts_config = hosts_config
+            self.ttl_seconds = ttl_seconds
         self._cache: dict[str, tuple[float, HostCapabilities]] = {}
 
     def get(self, host_id: str) -> Optional[HostCapabilities]:
@@ -158,6 +171,22 @@ class HostCapabilityCache:
             self._cache.pop(host_id, None)
         else:
             self._cache.clear()
+
+    def get_capabilities(self, host_id: str) -> HostCapabilities:
+        cached = self.get(host_id)
+        if cached is not None:
+            return cached
+        h_cfg = self.hosts_config or load_transport_hosts_config(self.runtime_root)
+        profile = h_cfg.hosts.get(host_id)
+        if host_id == "local":
+            caps = discover_local_capabilities(self.runtime_root or ".", profile=profile, host_id=host_id)
+        else:
+            if profile is None:
+                raise ValueError(f"unknown host_id: {host_id}")
+            transport = get_transport_for_host(self.runtime_root, host_id=host_id)
+            caps = transport.capabilities(host_id)
+        self.put(host_id, caps)
+        return caps
 
 
 def discover_local_capabilities(
@@ -218,17 +247,47 @@ def get_transport_for_host(
     runtime_root: Path | str | None = None,
     host_id: Optional[str] = None,
     config_path: Path | str | None = None,
+    *,
+    operation: str = "read_file",
+    command_ref: Optional[str] = None,
+    effect_class: str = "read_only",
+    policy_digest: Optional[str] = None,
 ):
-    """Retrieve an initialized MachineTransport instance for the specified host."""
+    """Retrieve an initialized MachineTransport instance for the specified host after selection."""
     h_id = host_id or "local"
     cfg = load_transport_hosts_config(runtime_root, config_path)
-    if h_id == "local":
+    from dev_orchestrator.transport.selector import select_transport
+    from dev_orchestrator.transport.contracts import TransportRejectedError
+    cache = HostCapabilityCache(runtime_root, hosts_config=cfg)
+    caps = None
+    try:
+        caps = cache.get_capabilities(h_id)
+    except Exception:
+        pass
+    selection = select_transport(
+        operation,
+        command_ref=command_ref,
+        effect_class=effect_class,
+        target_host_id=h_id,
+        hosts_config=cfg,
+        policy_digest=policy_digest,
+        capabilities=caps,
+    )
+    if selection.selected_transport in ("rejected", "rdc_fallback_required", "ambiguous"):
+        raise TransportRejectedError(
+            f"transport selection rejected ({selection.selected_transport}): {selection.reason_code}"
+        )
+    if selection.selected_transport == "local":
         from dev_orchestrator.transport.local import LocalMachineTransport
         rt = Path(runtime_root) if runtime_root else None
         cfg_p = (rt / "execution-jobs.json") if rt else None
-        return LocalMachineTransport(jobs_config_path=cfg_p, host_id="local")
+        t = LocalMachineTransport(jobs_config_path=cfg_p, host_id="local")
+        t.last_selection = selection
+        return t
     profile = cfg.hosts.get(h_id)
     if profile is None:
         raise ValueError(f"unknown transport host: {h_id}")
     from dev_orchestrator.transport.ssh import SSHMachineTransport
-    return SSHMachineTransport(profile)
+    t = SSHMachineTransport(profile)
+    t.last_selection = selection
+    return t

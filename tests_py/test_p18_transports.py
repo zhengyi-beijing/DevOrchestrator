@@ -15,6 +15,12 @@ from dev_orchestrator.jobs.config import (
     JobProjectConfig,
     JobsConfig,
 )
+from dev_orchestrator.jobs.models import (
+    JobSpec,
+    job_id_for,
+    spec_hash,
+)
+from dev_orchestrator.jobs.transport import SSHJobTransport
 from dev_orchestrator.transport.contracts import (
     FileReadRequest,
     FileWriteRequest,
@@ -34,7 +40,7 @@ class TestP18Transports(unittest.TestCase):
     """Verifies LocalMachineTransport, SSHMachineTransport, and RDCTransport behavior."""
 
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self.temp_dir.name).resolve()
         self.repo_dir = self.root / "repo"
         self.repo_dir.mkdir(parents=True, exist_ok=True)
@@ -70,7 +76,10 @@ class TestP18Transports(unittest.TestCase):
         self.local_transport = LocalMachineTransport(jobs_config=self.cfg)
 
     def tearDown(self):
-        self.temp_dir.cleanup()
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
 
     def test_local_exec_read_only_success(self):
         """LocalMachineTransport.exec runs read_only command synchronously."""
@@ -463,6 +472,194 @@ class TestP18Transports(unittest.TestCase):
                 os.environ.pop("DEVORCH_JOBS_CONFIG", None)
             else:
                 os.environ["DEVORCH_JOBS_CONFIG"] = old_env
+
+    def test_remote_helper_spawn_validates_canonical_spec_and_controller_hash(self):
+        """remote_helper op_spawn rejects wire-supplied job_id mismatch and controller_spec_hash mismatch."""
+        import os
+        from dev_orchestrator.ai.remote_helper import execute_request
+        from dev_orchestrator.jobs.store import ExecutionJobStore
+        from dev_orchestrator.storage.json_store import write_json
+
+        cfg_file = self.root / "projects_spawn.json"
+        write_json(
+            cfg_file,
+            {
+                "runtime_root": str(self.root),
+                "projects": {
+                    "p1": {
+                        "repo_path": str(self.repo_dir),
+                        "commands": {
+                            "ro": {"argv": ["python", "-c", "print('ok')"], "cwd": ".", "effect_class": "read_only"}
+                        },
+                    }
+                },
+            },
+        )
+        old_env = os.environ.get("DEVORCH_JOBS_CONFIG")
+        os.environ["DEVORCH_JOBS_CONFIG"] = str(cfg_file)
+        try:
+            spec = JobSpec(
+                project_id="p1",
+                command_ref="ro",
+                idempotency_key="canon-spawn-key-1",
+                kind="validation",
+                transport="local",
+            )
+            canon_spec = spec.to_canonical_dict()
+            correct_shash = spec_hash(spec)
+            correct_jid = job_id_for(spec)
+
+            # 1. Reject wire-supplied job_id mismatch
+            with self.assertRaises(ValueError) as ctx:
+                execute_request({
+                    "operation": "op_spawn",
+                    "request_id": "req-spawn-err-1",
+                    "job_spec": canon_spec,
+                    "controller_spec_hash": correct_shash,
+                    "job_id": "tampered-job-id-12345",
+                })
+            self.assertIn("unauthorized job_id", str(ctx.exception))
+
+            # 2. Reject controller_spec_hash mismatch
+            with self.assertRaises(ValueError) as ctx:
+                execute_request({
+                    "operation": "op_spawn",
+                    "request_id": "req-spawn-err-2",
+                    "job_spec": canon_spec,
+                    "controller_spec_hash": "sha256:" + "0" * 64,
+                    "job_id": correct_jid,
+                })
+            self.assertIn("controller_spec_hash mismatch", str(ctx.exception))
+
+            # 3. Legitimate spawn succeeds and saves submission_spec in JobRecord
+            res = execute_request({
+                "operation": "op_spawn",
+                "request_id": "req-spawn-ok",
+                "job_spec": canon_spec,
+                "controller_spec_hash": correct_shash,
+                "job_id": correct_jid,
+            })
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(res["job_id"], correct_jid)
+
+            store = ExecutionJobStore(self.root)
+            saved = store.get(correct_jid)
+            self.assertIsNotNone(saved)
+            self.assertEqual(saved.submission_spec, canon_spec)
+        finally:
+            try:
+                execute_request({
+                    "operation": "op_cancel",
+                    "request_id": "req-spawn-clean",
+                    "job_id": correct_jid,
+                })
+            except Exception:
+                pass
+            if old_env is None:
+                os.environ.pop("DEVORCH_JOBS_CONFIG", None)
+            else:
+                os.environ["DEVORCH_JOBS_CONFIG"] = old_env
+
+    def test_remote_helper_job_start_validates_canonical_spec_and_controller_hash(self):
+        """remote_helper job_start rejects wire job_id mismatch and populates submission_spec."""
+        import os
+        from dev_orchestrator.ai.remote_helper import execute_request
+        from dev_orchestrator.jobs.store import ExecutionJobStore
+        from dev_orchestrator.storage.json_store import write_json
+
+        cfg_file = self.root / "projects_job_start.json"
+        write_json(
+            cfg_file,
+            {
+                "runtime_root": str(self.root),
+                "projects": {
+                    "p1": {
+                        "repo_path": str(self.repo_dir),
+                        "commands": {
+                            "ro": {"argv": ["python", "-c", "print('ok')"], "cwd": ".", "effect_class": "read_only"}
+                        },
+                    }
+                },
+            },
+        )
+        old_env = os.environ.get("DEVORCH_JOBS_CONFIG")
+        os.environ["DEVORCH_JOBS_CONFIG"] = str(cfg_file)
+        try:
+            spec = JobSpec(
+                project_id="p1",
+                command_ref="ro",
+                idempotency_key="canon-jobstart-key-1",
+                kind="validation",
+                transport="local",
+            )
+            canon_spec = spec.to_canonical_dict()
+            correct_shash = spec_hash(spec)
+            correct_jid = job_id_for(spec)
+
+            # Reject wire job_id mismatch
+            with self.assertRaises(ValueError) as ctx:
+                execute_request({
+                    "operation": "job_start",
+                    "request_id": "req-js-err-1",
+                    "job_spec": canon_spec,
+                    "controller_spec_hash": correct_shash,
+                    "job_id": "tampered-wire-jid",
+                })
+            self.assertIn("unauthorized job_id", str(ctx.exception))
+
+            # Legitimate job_start succeeds
+            res = execute_request({
+                "operation": "job_start",
+                "request_id": "req-js-ok",
+                "job_spec": canon_spec,
+                "controller_spec_hash": correct_shash,
+                "job_id": correct_jid,
+            })
+            self.assertEqual(res["status"], "started")
+            self.assertEqual(res["job_id"], correct_jid)
+
+            store = ExecutionJobStore(self.root)
+            saved = store.get(correct_jid)
+            self.assertIsNotNone(saved)
+            self.assertEqual(saved.submission_spec, canon_spec)
+        finally:
+            try:
+                execute_request({
+                    "operation": "job_cancel",
+                    "request_id": "req-js-clean",
+                    "job_id": correct_jid,
+                })
+            except Exception:
+                pass
+            if old_env is None:
+                os.environ.pop("DEVORCH_JOBS_CONFIG", None)
+            else:
+                os.environ["DEVORCH_JOBS_CONFIG"] = old_env
+
+    def test_ssh_job_transport_sends_canonical_job_spec_and_controller_hash(self):
+        """SSHJobTransport.job_start sends complete job_spec, controller_spec_hash, and parameters."""
+        mock_run = MagicMock(return_value={
+            "status": "success",
+            "payload": {"status": "started", "job_id": "job-mock-1"},
+        })
+        transport = SSHJobTransport(MagicMock())
+        transport._delegate._run_remote_helper = mock_run
+        spec = JobSpec(
+            project_id="p1",
+            command_ref="build",
+            idempotency_key="key-ssh-job-1",
+            kind="validation",
+            transport="ssh",
+            metadata={"parameters": {"env": "prod"}},
+        )
+        res = transport.job_start(spec)
+        self.assertEqual(res["status"], "started")
+        mock_run.assert_called_once()
+        envelope = mock_run.call_args[0][0]
+        self.assertEqual(envelope["operation"], "job_start")
+        self.assertEqual(envelope["job_spec"], spec.to_canonical_dict())
+        self.assertEqual(envelope["controller_spec_hash"], spec_hash(spec))
+        self.assertEqual(envelope["parameters"], {"env": "prod"})
 
 
 if __name__ == "__main__":

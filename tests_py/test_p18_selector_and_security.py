@@ -426,6 +426,262 @@ class TestP18SelectorAndSecurity(unittest.TestCase):
         finally:
             server.shutdown()
 
+    def test_transport_capabilities_route_success_and_404(self):
+        """GET /api/v1/control/transport/capabilities returns capabilities on valid host and 404 on unknown host."""
+        import urllib.request
+        import urllib.error
+
+        server = self._start_server()
+        port = server.server_address[1]
+        try:
+            headers = {"Authorization": f"Bearer {server.control_security.token()}"}
+
+            # 1. Success for local host
+            req_ok = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/capabilities?host_id=local",
+                headers=headers,
+            )
+            with urllib.request.urlopen(req_ok) as resp:
+                self.assertEqual(resp.status, 200)
+                body = json.loads(resp.read().decode("utf-8"))
+                caps = body["data"]
+                self.assertEqual(caps["host_id"], "local")
+                self.assertIn("jobs_config_valid", caps)
+                self.assertIn("supported_operations", caps)
+                self.assertIn("approved_policy_pins", caps)
+                self.assertIn("response_limits", caps)
+
+            # 2. 404 for unknown host
+            req_unknown = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/capabilities?host_id=unknown_host_xyz",
+                headers=headers,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_unknown)
+            self.assertEqual(ctx.exception.code, 404)
+        finally:
+            server.shutdown()
+
+    def test_owner_only_capability_mint_list_revoke(self):
+        """Owner-only transport capability mint, list, and revoke HTTP endpoints."""
+        import urllib.request
+        import urllib.error
+
+        server = self._start_server()
+        port = server.server_address[1]
+        try:
+            owner_headers = {
+                "Authorization": f"Bearer {server.control_security.token()}",
+                "Content-Type": "application/json",
+            }
+            mint_data = json.dumps({
+                "project_id": "p1",
+                "host_id": "local",
+                "allowed_operations": ["exec", "spawn"],
+            }).encode("utf-8")
+
+            # 1. Mint without auth -> 401
+            req_no_auth = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport-capabilities",
+                data=mint_data,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_no_auth)
+            self.assertEqual(ctx.exception.code, 401)
+
+            # 2. Mint with owner auth -> 201
+            req_mint = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport-capabilities",
+                data=mint_data,
+                headers=owner_headers,
+            )
+            with urllib.request.urlopen(req_mint) as resp:
+                self.assertEqual(resp.status, 201)
+                mint_body = json.loads(resp.read().decode("utf-8"))
+                tok = mint_body["data"]["token"]
+                cap_id = mint_body["data"]["capability_id"]
+                self.assertTrue(tok)
+                self.assertTrue(cap_id)
+
+            # 3. List with owner auth -> 200
+            req_list = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport-capabilities",
+                headers={"Authorization": f"Bearer {server.control_security.token()}"},
+            )
+            with urllib.request.urlopen(req_list) as resp:
+                self.assertEqual(resp.status, 200)
+                list_body = json.loads(resp.read().decode("utf-8"))
+                caps_list = list_body["data"]["capabilities"]
+                self.assertTrue(any(c.get("capability_id") == cap_id for c in caps_list))
+
+            # 4. Revoke without owner auth -> 401
+            req_rev_no_auth = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport-capabilities/{cap_id}/revoke",
+                data=b"{}",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_rev_no_auth)
+            self.assertEqual(ctx.exception.code, 401)
+
+            # 5. Revoke with owner auth -> 200
+            req_rev = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport-capabilities/{cap_id}/revoke",
+                data=b"{}",
+                headers=owner_headers,
+            )
+            with urllib.request.urlopen(req_rev) as resp:
+                self.assertEqual(resp.status, 200)
+                rev_body = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(rev_body["data"]["revoked"])
+
+            # 6. Verify token is now revoked
+            ok_val, reason, _ = validate_transport_capability(
+                tok, project_id="p1", host_id="local", operation="exec", runtime_root=self.root
+            )
+            self.assertFalse(ok_val)
+            self.assertIn("revoked", str(reason))
+        finally:
+            server.shutdown()
+
+    def test_unlisted_transport_post_path_requires_owner_authorization(self):
+        """Unlisted POST paths under /api/v1/control/transport require owner authorization (401)."""
+        import urllib.request
+        import urllib.error
+
+        server = self._start_server()
+        port = server.server_address[1]
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/custom-non-self-auth",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertEqual(ctx.exception.code, 401)
+        finally:
+            server.shutdown()
+
+    def test_cli_transport_capability_verbs(self):
+        """CLI verbs 'transport-capability-create', 'transport-capability-list', and 'transport-capability-revoke' succeed."""
+        # 1. Create capability
+        buf_create = io.StringIO()
+        with patch("sys.stdout", buf_create):
+            code_create = main([
+                "transport-capability-create",
+                "--project-id", "p1",
+                "--host-id", "local",
+                "--operations", "exec,spawn",
+                "--runtime-root", str(self.root),
+            ])
+        self.assertEqual(code_create, 0)
+        res_create = json.loads(buf_create.getvalue())
+        cap_id = res_create["capability_id"]
+        token = res_create["token"]
+        self.assertTrue(cap_id)
+        self.assertTrue(token)
+
+        # 2. List capabilities
+        buf_list = io.StringIO()
+        with patch("sys.stdout", buf_list):
+            code_list = main(["transport-capability-list", "--runtime-root", str(self.root)])
+        self.assertEqual(code_list, 0)
+        res_list = json.loads(buf_list.getvalue())
+        self.assertTrue(any(c.get("capability_id") == cap_id for c in res_list.get("capabilities", [])))
+
+        # 3. Revoke capability
+        buf_revoke = io.StringIO()
+        with patch("sys.stdout", buf_revoke):
+            code_rev = main([
+                "transport-capability-revoke",
+                "--capability-id", cap_id,
+                "--runtime-root", str(self.root),
+            ])
+        self.assertEqual(code_rev, 0)
+        res_rev = json.loads(buf_revoke.getvalue())
+        self.assertTrue(res_rev.get("revoked"))
+
+        # 4. Verify revoked
+        ok, reason, _ = validate_transport_capability(
+            token, project_id="p1", host_id="local", operation="exec", runtime_root=self.root
+        )
+        self.assertFalse(ok)
+        self.assertIn("revoked", str(reason))
+
+    def test_transport_policy_pin_enforcement_via_server(self):
+        """Server rejects exec request when policy digest mismatches host profile approved_policy_pins."""
+        import urllib.request
+        import urllib.error
+        from dev_orchestrator.storage.json_store import write_json
+
+        server = self._start_server()
+        port = server.server_address[1]
+        try:
+            # Overwrite transport-hosts.json with a policy pin for 'ro' command that won't match
+            write_json(
+                self.root / "transport-hosts.json",
+                {
+                    "default_host": "local",
+                    "hosts": {
+                        "local": {
+                            "host_id": "local",
+                            "candidate_order": ["local"],
+                            "approved_policy_pins": {"ro": "sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+                        }
+                    },
+                },
+            )
+            cap = create_transport_capability(
+                project_id="p1",
+                host_id="local",
+                allowed_operations=["exec"],
+                runtime_root=self.root,
+            )
+            req_data = json.dumps({
+                "project_id": "p1",
+                "command_ref": "ro",
+                "host_id": "local",
+            }).encode("utf-8")
+            headers = {
+                "Authorization": f"Bearer {cap['token']}",
+                "X-DevOrch-Nonce": "nonce-pin-test-1",
+                "Content-Type": "application/json",
+            }
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/exec",
+                data=req_data,
+                headers=headers,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req)
+            self.assertIn(ctx.exception.code, (400, 403))
+        finally:
+            server.shutdown()
+
+    def test_transport_stat_logging_includes_metadata(self):
+        """GET /api/v1/control/transport/stat logs operation with project_id and transport metadata."""
+        import urllib.request
+
+        server = self._start_server()
+        port = server.server_address[1]
+        try:
+            headers = {"Authorization": f"Bearer {server.control_security.token()}"}
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/stat?project_id=p1&path=.",
+                headers=headers,
+            )
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+
+            log_file = self.root / "logs" / "transport-operations.ndjson"
+            self.assertTrue(log_file.is_file())
+            content = log_file.read_text(encoding="utf-8")
+            self.assertIn('"operation": "stat"', content)
+            self.assertIn('"project_id": "p1"', content)
+            self.assertIn('"selected_transport": "local"', content)
+        finally:
+            server.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

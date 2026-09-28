@@ -74,7 +74,16 @@ class ExecutionJobStore:
         if not isinstance(data, dict):
             raise JobCorruptionError(f"corrupt job record at {jfile}")
         try:
-            return JobRecord.from_dict(data)
+            rec = JobRecord.from_dict(data)
+            if rec.submission_spec is not None:
+                computed_shash = spec_hash(rec.submission_spec)
+                if computed_shash != rec.spec_hash:
+                    raise JobCorruptionError(
+                        f"submission_spec hash mismatch on job {job_id}: {computed_shash} != {rec.spec_hash}"
+                    )
+            return rec
+        except JobCorruptionError:
+            raise
         except Exception as exc:
             raise JobCorruptionError(f"invalid job record schema at {jfile}: {exc}") from exc
 

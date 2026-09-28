@@ -190,6 +190,16 @@ class WriteStagingStore:
         host_identity: str = "",
     ) -> FileResult:
         """Apply a compare-and-swap file write under canonical path lock."""
+        # 0. Host identity check
+        import socket
+        resolved_local = host_identity or socket.gethostname()
+        req_host = request.host_id or "local"
+        valid_hosts = {"local", resolved_local, socket.gethostname()}
+        if req_host not in valid_hosts:
+            raise TransportRejectedError(
+                f"write request host_id {req_host!r} does not match local host identity {resolved_local!r}"
+            )
+
         # 1. Precondition validation: exactly one precondition must be specified
         has_if_absent = request.if_absent is not None and bool(request.if_absent)
         has_expected_sha = bool(request.expected_sha256 and request.expected_sha256.strip())
