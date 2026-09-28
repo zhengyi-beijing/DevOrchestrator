@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
+from dev_orchestrator.control.surface import project_control_view
 from dev_orchestrator.daemon import _run_orchestration_tick
 from dev_orchestrator.core.lifecycle_authority import (
     active_owners,
@@ -2075,6 +2076,175 @@ class TerminalClosureControlPlaneTests(unittest.TestCase):
                 row for row in TransitionExecutor(runtime).state()["executions"].values()
                 if isinstance(row, dict) and row.get("state") == "handoff"
             ], [])
+
+
+class TerminalSettlementAuthorityRegressionTests(unittest.TestCase):
+    """The accepted P18 settlement outranks stale READY_TO_RUN projection."""
+
+    _SETTLEMENT_ID = "ai_review:rereview:p18-failopen-fix-rereview-20260929"
+
+    def _incident(self, root: Path) -> tuple[Path, Path, TransitionExecutor, dict]:
+        repo = _repo(root, roadmap_target=None, current="P18")
+        (repo / "agent" / "staged" / "P2.md").unlink()
+        (repo / "agent" / "staged" / "roadmap.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "tasks": [{
+                    "task_id": "P18", "successor": None,
+                    "successor_spec_path": None,
+                }],
+            }) + "\n",
+            encoding="utf-8",
+        )
+        (repo / "agent" / "next.md").write_text(
+            "# P18 task\n\nStatus: **READY_TO_RUN**\n", encoding="utf-8",
+        )
+        _commit(repo, "stale ready projection after accepted P18 review")
+
+        runtime = root / "runtime"
+        executor = TransitionExecutor(runtime)
+        ledger = executor.state()
+        ledger["executions"][self._SETTLEMENT_ID] = {
+            "project_id": "p1",
+            "source_request_id": self._SETTLEMENT_ID,
+            "source_kind": "decision",
+            "task_id": "P18",
+            "state": "settled",
+            "outcome": "task_complete",
+            "reason": (
+                "review accepted current READY_TO_RUN task and no next "
+                "executable task is advertised"
+            ),
+            "recorded_at": "2026-09-29T00:00:00+00:00",
+        }
+        # Exact regressed on-disk authority at current HEAD: reconciliation
+        # had copied READY_TO_RUN back from agent/next.md.
+        ledger["lifecycle"]["p1"] = {
+            "schema_version": 1,
+            "project_id": "p1",
+            "generation": 0,
+            "current_task_id": "P18",
+            "lifecycle_state": "READY_TO_RUN",
+            "source_task_id": None,
+            "active_transition_id": None,
+            "active_owner": None,
+            "owner_gate": None,
+        }
+        executor._save_ledger(ledger)
+        return repo, runtime, executor, _repo_summary(repo)
+
+    def test_settlement_dominates_ready_projection_across_reconcile_and_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, runtime, executor, summary = self._incident(Path(td))
+            snapshot = summary["projects"][0]
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {
+                    "engine": "aibroker", "enabled": True,
+                    "owner_authorized": True,
+                },
+            }
+
+            # Status/control projection is safe even before the first daemon
+            # reconciliation after restart.
+            view = project_control_view(snapshot, runtime, project)
+            continue_control = next(
+                row for row in view["controls"] if row["action"] == "continue"
+            )
+            self.assertEqual(view["lifecycle_state"], "COMPLETE")
+            self.assertFalse(continue_control["available"])
+            self.assertIn("terminal", continue_control["reason"])
+
+            first = executor.reconcile_lifecycle_authority(summary)
+            authority = first["lifecycle"]["p1"]
+            self.assertEqual(
+                (authority["current_task_id"], authority["lifecycle_state"]),
+                ("P18", "COMPLETE"),
+            )
+            self.assertIsNone(authority["active_owner"])
+            self.assertIsNone(authority["owner_gate"])
+
+            restarted = TransitionExecutor(runtime)
+            second = restarted.reconcile_lifecycle_authority(summary)
+            replay = restarted.reconcile_lifecycle_authority(summary)
+            for state in (second, replay):
+                row = state["lifecycle"]["p1"]
+                self.assertEqual(
+                    (row["current_task_id"], row["lifecycle_state"]),
+                    ("P18", "COMPLETE"),
+                )
+                self.assertIsNone(row["active_owner"])
+                self.assertIsNone(row["owner_gate"])
+            self.assertEqual(
+                [key for key in replay["executions"] if key == self._SETTLEMENT_ID],
+                [self._SETTLEMENT_ID],
+            )
+            _, launch_error = restarted._lifecycle_launch_guard(
+                replay, "p1", "P18", None,
+            )
+            self.assertEqual(
+                launch_error, "authoritative lifecycle task is terminally settled",
+            )
+
+    def test_later_real_successor_hands_off_once_without_rerunning_p18(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, runtime, executor, summary = self._incident(Path(td))
+            executor.reconcile_lifecycle_authority(summary)
+
+            staged = repo / "agent" / "staged"
+            (staged / "P2.md").write_bytes(
+                b"# P2 task\n\nStatus: **PENDING DESIGN**\n\nPredecessor: P18\n"
+            )
+            (staged / "roadmap.json").write_text(json.dumps({
+                "schema_version": 1,
+                "tasks": [{
+                    "task_id": "P18", "successor": "P2",
+                    "successor_spec_path": "agent/staged/P2.md",
+                }],
+            }) + "\n", encoding="utf-8")
+            _commit(repo, "stage real successor after terminal settlement")
+            snapshot = _repo_summary(repo)["projects"][0]
+            project = {"project_id": "p1", "repo_path": str(repo)}
+
+            first = executor.reconcile_successor_handoff(
+                project, snapshot, completed_task_id="P18", trigger="test",
+            )
+            restarted = TransitionExecutor(runtime)
+            replay = restarted.reconcile_successor_handoff(
+                project, snapshot, completed_task_id="P18", trigger="test replay",
+            )
+            self.assertEqual((first["status"], replay["status"]), ("applied", "noop"))
+
+            handoffs = [
+                row for row in restarted.state()["executions"].values()
+                if isinstance(row, dict) and row.get("state") == "handoff"
+                and row.get("source_task_id") == "P18"
+                and row.get("target_task_id") == "P2"
+            ]
+            self.assertEqual(len(handoffs), 1)
+            self.assertEqual([
+                row for row in restarted.state()["executions"].values()
+                if isinstance(row, dict) and row.get("task_id") == "P18"
+                and row.get("state") in {"launching", "running"}
+            ], [])
+
+            # Consume the ordinary durable handoff and prove the task-scoped
+            # settlement does not tombstone the roadmap or pin authority to P18.
+            (repo / "agent" / "next.md").write_text(
+                "# P2 task\n\nStatus: **PENDING DESIGN**\n", encoding="utf-8",
+            )
+            _commit(repo, "activate staged successor")
+            restarted.mark_handoff_consumed(
+                first["source_request_id"], "continue-p2", "plan-p2",
+            )
+            after = restarted.reconcile_lifecycle_authority(_repo_summary(repo))
+            self.assertEqual(after["lifecycle"]["p1"]["current_task_id"], "P2")
+            self.assertEqual(len([
+                row for row in after["executions"].values()
+                if isinstance(row, dict) and row.get("source_task_id") == "P18"
+                and row.get("target_task_id") == "P2"
+                and row.get("state") == "handoff"
+            ]), 1)
 
 
 class TerminalRoadmapSuccessorEndToEndTests(unittest.TestCase):

@@ -28,8 +28,9 @@ from dev_orchestrator.control.surface import (
 )
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
-from dev_orchestrator.core.project_status import project_runtime_status
+from dev_orchestrator.core.lifecycle_authority import TERMINAL_LIFECYCLE_STATES
 from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lifecycle
+from dev_orchestrator.core.project_status import project_runtime_status
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
@@ -598,7 +599,23 @@ class ControlCommandCoordinator:
             parsed_status = parse_task_status(snapshot.get("next_status"))
             lifecycle = str(observed.get("lifecycle_state") or snapshot.get("lifecycle_state") or snapshot.get("state") or "").upper()
             snap_state = str(snapshot.get("state") or "").upper()
-            if parsed_status.is_completed() and (lifecycle in {"IDLE", "COMPLETED", "TERMINAL", "DONE"} or snap_state in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}):
+            authority = snapshot.get("authoritative_lifecycle")
+            authority_state = (
+                str(authority.get("lifecycle_state") or "").upper()
+                if isinstance(authority, dict) else ""
+            )
+            terminal = (
+                lifecycle in TERMINAL_LIFECYCLE_STATES
+                or authority_state in TERMINAL_LIFECYCLE_STATES
+                or (
+                    parsed_status.is_completed()
+                    and (
+                        lifecycle in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}
+                        or snap_state in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}
+                    )
+                )
+            )
+            if terminal:
                 return self._blocked(
                     command_id, project_id, action,
                     "current task is terminal; stale review/continue is audit history only",

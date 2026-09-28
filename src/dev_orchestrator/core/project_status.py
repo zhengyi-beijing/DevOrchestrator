@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dev_orchestrator.core.git_paths import resolve_git_path
+from dev_orchestrator.core.lifecycle_authority import task_has_terminal_settlement
 from dev_orchestrator.storage.json_store import (
     parse_utc,
     read_json,
@@ -665,12 +666,23 @@ def project_runtime_status(snapshot: dict[str, Any], runtime_root: Path | str) -
     lifecycle_rows = actuation_data.get("lifecycle") if isinstance(actuation_data, dict) else None
     authority = lifecycle_rows.get(project_id) if isinstance(lifecycle_rows, dict) else None
     if isinstance(authority, dict):
-        projected["authoritative_lifecycle"] = copy.deepcopy(authority)
+        projected_authority = copy.deepcopy(authority)
+        authority_task = str(projected_authority.get("current_task_id") or "")
+        if (
+            authority_task
+            and task_has_terminal_settlement(actuation_data, project_id, authority_task)
+        ):
+            # Project terminal authority immediately from the durable executor
+            # row even before the first post-restart reconciliation tick.
+            projected_authority["active_owner"] = None
+            if not projected_authority.get("owner_gate"):
+                projected_authority["lifecycle_state"] = "COMPLETE"
+        projected["authoritative_lifecycle"] = projected_authority
         telemetry = projected.get("telemetry") if isinstance(projected.get("telemetry"), dict) else {}
         telemetry = copy.deepcopy(telemetry)
-        telemetry["task_id"] = authority.get("current_task_id")
+        telemetry["task_id"] = projected_authority.get("current_task_id")
         projected["telemetry"] = telemetry
-        lifecycle_state = str(authority.get("lifecycle_state") or "UNKNOWN")
+        lifecycle_state = str(projected_authority.get("lifecycle_state") or "UNKNOWN")
         projected["lifecycle_state"] = lifecycle_state
         if lifecycle_state == "EXECUTING":
             projected["state"] = "WORKER_RUNNING"

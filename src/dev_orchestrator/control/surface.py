@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from dev_orchestrator.core.lifecycle_authority import TERMINAL_LIFECYCLE_STATES
 from dev_orchestrator.core.lifecycle_projection import _latest
 from dev_orchestrator.core.project_status import project_runtime_status
 from dev_orchestrator.core.task_status import parse_task_status
@@ -275,9 +276,19 @@ def project_control_view(
         and gate.get("task_id") == identity.get("task_id")
         and gate.get("branch") == identity.get("branch")
     )
-    task_terminal = parsed_next_status.is_completed() and (
-        lifecycle.upper() in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}
-        or str(projected.get("state") or "").upper() in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}
+    authoritative = projected.get("authoritative_lifecycle")
+    authoritative_state = (
+        str(authoritative.get("lifecycle_state") or "").upper()
+        if isinstance(authoritative, dict) else ""
+    )
+    task_terminal = (
+        authoritative_state in TERMINAL_LIFECYCLE_STATES
+        or lifecycle.upper() in TERMINAL_LIFECYCLE_STATES
+        or (parsed_next_status.is_completed() and (
+            lifecycle.upper() in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}
+            or str(projected.get("state") or "").upper()
+            in {"IDLE", "COMPLETED", "TERMINAL", "DONE"}
+        ))
     )
     eligible_continue = not paused and not task_terminal and (
         (gate is None and ((lifecycle == "READY_TO_RUN" and execution_ready) or planning_start_ready))

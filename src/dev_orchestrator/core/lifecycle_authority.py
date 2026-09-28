@@ -22,6 +22,7 @@ AUTHORITY_SCHEMA_VERSION = 1
 ACTIVE_EXECUTION_STATES = frozenset({"launching", "running"})
 ACTIVE_PLAN_STATES = frozenset({"planning", "reviewing", "remediating", "applying"})
 ACTIVE_REVIEW_STATES = frozenset({"launching", "running"})
+TERMINAL_LIFECYCLE_STATES = frozenset({"COMPLETE", "SETTLED"})
 INVARIANT_CODES = (
     "CURRENT_TASK_MATCHES_ACTIVE_EXECUTION",
     "TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION",
@@ -292,6 +293,19 @@ def _task_complete_settlements(
         and row.get("state") == "settled"
         and row.get("outcome") == "task_complete"
     ]
+
+
+def task_has_terminal_settlement(
+    executor_state: dict[str, Any], project_id: str, task_id: str,
+) -> bool:
+    """Whether durable executor history terminally settled this exact task.
+
+    This evidence outranks repository/readiness projections for the same task.
+    It is deliberately task-scoped so a predecessor settlement cannot turn a
+    later, authoritatively handed-off successor into a terminal task.
+    """
+    executions = executor_state.get("executions") if isinstance(executor_state, dict) else {}
+    return bool(_task_complete_settlements(executions or {}, project_id, task_id))
 
 
 def _successor_resolution_evidence(

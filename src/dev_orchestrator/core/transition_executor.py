@@ -40,6 +40,7 @@ from dev_orchestrator.core.successor_consistency import (
     resolve_successor,
 )
 from dev_orchestrator.core.lifecycle_authority import (
+    TERMINAL_LIFECYCLE_STATES,
     active_owners,
     advertised_task_id,
     epoch_for,
@@ -50,6 +51,7 @@ from dev_orchestrator.core.lifecycle_authority import (
     open_declaration_gate,
     resolve_declaration_gate,
     source_ownership_blockers,
+    task_has_terminal_settlement,
     transition_id_for,
 )
 from dev_orchestrator.core.control_plane_contract import (
@@ -892,7 +894,23 @@ class TransitionExecutor:
                     })
 
                 current_task = str(authority.get("current_task_id") or repo_task)
-                if len(owner_tasks) > 1:
+                terminally_settled = (
+                    repo_task == current_task
+                    and task_has_terminal_settlement(
+                        ledger, project_id, current_task,
+                    )
+                )
+                if terminally_settled:
+                    # A settled task_complete row is durable terminal evidence.
+                    # Markdown/readiness can lag (the live P18 incident) and
+                    # must never resurrect the same authoritative task.  A
+                    # future successor remains possible: once its handoff is
+                    # consumed, current_task_id changes and this task-scoped
+                    # fence no longer applies.
+                    authority["active_owner"] = None
+                    if not authority.get("owner_gate"):
+                        authority["lifecycle_state"] = "COMPLETE"
+                elif len(owner_tasks) > 1:
                     authority["owner_gate"] = {
                         "code": "SINGLE_ACTIVE_LIFECYCLE_OWNER",
                         "reason": "active lifecycle ownership spans multiple tasks",
@@ -1239,6 +1257,19 @@ class TransitionExecutor:
                 "recorded_at": utc_now_iso(),
                 **({"legacy_reconciled_from": existing} if existing is not None else {}),
             }
+            if outcome == "task_complete" and task_id:
+                lifecycle = ledger.setdefault("lifecycle", {})
+                authority = lifecycle.get(project_id)
+                if not isinstance(authority, dict):
+                    authority = new_authority(project_id, task_id, "COMPLETE")
+                    lifecycle[project_id] = authority
+                if authority.get("current_task_id") in (None, task_id):
+                    authority["current_task_id"] = task_id
+                    authority["active_owner"] = None
+                    if not authority.get("owner_gate"):
+                        authority["lifecycle_state"] = "COMPLETE"
+                    authority["updated_at"] = utc_now_iso()
+                    authority["recovery_epoch_id"] = epoch_for(authority)
             self._save_ledger(ledger)
         if self._progress_channel is not None:
             self._progress_channel.emit(
@@ -1602,7 +1633,13 @@ class TransitionExecutor:
             )
         if authority.get("owner_gate"):
             return source_task_id, "authoritative lifecycle is stopped at OWNER_GATE"
-        if str(authority.get("lifecycle_state") or "").upper() == "PENDING_DESIGN":
+        authority_state = str(authority.get("lifecycle_state") or "").upper()
+        if (
+            authority_state in TERMINAL_LIFECYCLE_STATES
+            or task_has_terminal_settlement(ledger, project_id, task_id)
+        ):
+            return source_task_id, "authoritative lifecycle task is terminally settled"
+        if authority_state == "PENDING_DESIGN":
             return source_task_id, "PENDING_DESIGN task cannot launch a Worker"
         lineage_source = _non_blank_config(source_task_id)
         if lineage_source is None:
