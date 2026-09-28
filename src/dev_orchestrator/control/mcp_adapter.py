@@ -23,7 +23,7 @@ MCP_PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "devorchestrator-control"
 SERVER_VERSION = "1.0.0"
 
-_TOOLS = [
+_CORE_TOOLS = [
     {
         "name": "devorch_status",
         "description": "Inspect authoritative DevOrchestrator state (overview or specific project).",
@@ -118,7 +118,50 @@ _TOOLS = [
     },
 ]
 
-_TOOL_NAMES = {t["name"] for t in _TOOLS}
+_TRANSPORT_TOOLS = [
+    {
+        "name": "devorch_transport_hosts",
+        "description": "Inspect configured execution transport hosts and their profiles.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "devorch_transport_capabilities",
+        "description": "Inspect discovered capabilities, approved policy pins, and limits for an execution host.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host_id": {
+                    "type": "string",
+                    "description": "Optional host identifier (defaults to local host).",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "devorch_transport_operations",
+        "description": "Inspect recent sanitized machine execution operations and status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of recent operations to return (1-100, default 50).",
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+]
+
+_TOOLS = _CORE_TOOLS
+_TOOL_NAMES = {t["name"] for t in _CORE_TOOLS}
 
 
 class MCPAdapter:
@@ -129,10 +172,15 @@ class MCPAdapter:
         client: ControlAdapterClient,
         stdin: IO[str] | None = None,
         stdout: IO[str] | None = None,
+        *,
+        enable_transport_tools: bool = False,
     ) -> None:
         self.client = client
         self.stdin = stdin or sys.stdin
         self.stdout = stdout or sys.stdout
+        self.enable_transport_tools = enable_transport_tools
+        self.tools = list(_CORE_TOOLS + _TRANSPORT_TOOLS if enable_transport_tools else _CORE_TOOLS)
+        self.tool_names = {t["name"] for t in self.tools}
 
     def handle_message(self, raw_line: str) -> str | None:
         raw_line = raw_line.strip()
@@ -188,7 +236,7 @@ class MCPAdapter:
                 return json.dumps({
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "result": {"tools": _TOOLS},
+                    "result": {"tools": self.tools},
                 })
             if method == "tools/call":
                 return self._handle_tools_call(req_id, params)
@@ -224,7 +272,7 @@ class MCPAdapter:
         name = params.get("name")
         args = params.get("arguments") or {}
 
-        if not isinstance(name, str) or name not in _TOOL_NAMES:
+        if not isinstance(name, str) or name not in self.tool_names:
             return json.dumps({
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -253,6 +301,12 @@ class MCPAdapter:
                 return self._call_control(req_id, args)
             if name == "devorch_command_status":
                 return self._call_command_status(req_id, args)
+            if name == "devorch_transport_hosts":
+                return self._call_transport_hosts(req_id, args)
+            if name == "devorch_transport_capabilities":
+                return self._call_transport_capabilities(req_id, args)
+            if name == "devorch_transport_operations":
+                return self._call_transport_operations(req_id, args)
         except Exception as exc:  # noqa: BLE001
             return json.dumps({
                 "jsonrpc": "2.0",
@@ -332,6 +386,30 @@ class MCPAdapter:
             raise ValueError("devorch_command_status requires nonblank 'command_id'")
 
         result = self.client.command_status(command_id.strip())
+        return self._format_tool_result(req_id, result)
+
+    def _call_transport_hosts(self, req_id: Any, args: dict[str, Any]) -> str:
+        if args:
+            raise ValueError(f"Unknown arguments for devorch_transport_hosts: {', '.join(sorted(args))}")
+        result = self.client.transport_hosts()
+        return self._format_tool_result(req_id, result)
+
+    def _call_transport_capabilities(self, req_id: Any, args: dict[str, Any]) -> str:
+        allowed = {"host_id"}
+        unknown = sorted(set(args) - allowed)
+        if unknown:
+            raise ValueError(f"Unknown arguments for devorch_transport_capabilities: {', '.join(unknown)}")
+        host_id = args.get("host_id")
+        result = self.client.transport_capabilities(host_id=host_id)
+        return self._format_tool_result(req_id, result)
+
+    def _call_transport_operations(self, req_id: Any, args: dict[str, Any]) -> str:
+        allowed = {"limit"}
+        unknown = sorted(set(args) - allowed)
+        if unknown:
+            raise ValueError(f"Unknown arguments for devorch_transport_operations: {', '.join(unknown)}")
+        limit = int(args.get("limit", 50))
+        result = self.client.transport_operations(limit=limit)
         return self._format_tool_result(req_id, result)
 
     @staticmethod

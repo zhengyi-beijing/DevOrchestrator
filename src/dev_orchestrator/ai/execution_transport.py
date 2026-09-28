@@ -356,115 +356,25 @@ class SSHTransport:
 
     @staticmethod
     def _host_identities_match(expected: str, actual: str) -> bool:
-        if expected == actual:
-            return True
-        # If both contain dots (e.g. both are FQDNs or IP addresses), they must match exactly
-        if "." in expected and "." in actual:
-            return False
-        # If one is an unqualified short name (no dots), it can match the first DNS label of a FQDN
-        # provided neither is an IP address
-        try:
-            ipaddress.ip_address(expected)
-            return False
-        except ValueError:
-            pass
-        try:
-            ipaddress.ip_address(actual)
-            return False
-        except ValueError:
-            pass
-
-        if "." not in expected and actual.split(".")[0] == expected:
-            return True
-        if "." not in actual and expected.split(".")[0] == actual:
-            return True
-        return False
+        from dev_orchestrator.transport.ssh_channel import host_identities_match
+        return host_identities_match(expected, actual)
 
     def _build_ssh_argv(self) -> list[str]:
-        cfg = self.ssh_config
-        argv = [
-            cfg.ssh_executable,
-            "-o", "BatchMode=yes",
-            "-o", f"StrictHostKeyChecking={cfg.strict_host_key_checking}",
-            "-o", f"ConnectTimeout={int(cfg.connect_timeout_seconds)}",
-        ]
-        if cfg.port != 22:
-            argv.extend(["-p", str(cfg.port)])
-        if cfg.identity_file is not None:
-            argv.extend(["-i", str(cfg.identity_file)])
-        if cfg.known_hosts_file is not None:
-            argv.extend(["-o", f"UserKnownHostsFile={cfg.known_hosts_file}"])
-
-        target = f"{cfg.user}@{cfg.peer}" if cfg.user else cfg.peer
-        argv.append(target)
-        argv.extend([cfg.remote_python, "-m", cfg.remote_helper_module])
-        return argv
+        from dev_orchestrator.transport.ssh_channel import build_ssh_argv
+        return build_ssh_argv(self.ssh_config)
 
     def _run_remote_helper(
         self,
         request_envelope: dict[str, Any],
         timeout_seconds: float,
     ) -> dict[str, Any]:
-        argv = self._build_ssh_argv()
-        req_bytes = json.dumps(request_envelope, ensure_ascii=False).encode("utf-8")
-
-        try:
-            completed = self._subprocess.run(
-                argv,
-                input=req_bytes,
-                capture_output=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ExecutionTransportError(f"SSH transport timed out after {timeout_seconds}s") from exc
-        except OSError as exc:
-            raise ExecutionTransportError(f"SSH invocation failed: {exc}") from exc
-
-        if completed.returncode != 0:
-            stderr_text = (completed.stderr.decode("utf-8", errors="replace") if isinstance(completed.stderr, bytes) else str(completed.stderr or "")).strip()
-            stdout_text = (completed.stdout.decode("utf-8", errors="replace") if isinstance(completed.stdout, bytes) else str(completed.stdout or "")).strip()
-            detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
-            raise ExecutionTransportError(f"SSH transport failed (exit {completed.returncode}): {detail}")
-
-        try:
-            raw_stdout = completed.stdout.decode("utf-8") if isinstance(completed.stdout, bytes) else str(completed.stdout)
-            resp = json.loads(raw_stdout)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ExecutionTransportError("SSH remote helper returned invalid JSON response") from exc
-
-        if not isinstance(resp, dict):
-            raise ExecutionTransportError("SSH remote helper response must be a JSON object")
-
-        # Result correlation check
-        sent_req_id = request_envelope.get("request_id")
-        returned_req_id = resp.get("request_id")
-        if sent_req_id != returned_req_id:
-            raise ExecutionTransportError(
-                f"SSH result correlation mismatch: sent {sent_req_id!r}, received {returned_req_id!r}"
-            )
-
-        # Host identity validation
-        returned_host_id = resp.get("host_identity")
-        if not returned_host_id or not isinstance(returned_host_id, str):
-            raise ExecutionTransportError("SSH remote helper response missing valid host_identity")
-
-        expected_host = (self.ssh_config.expected_host_identity or self.ssh_config.peer).strip().lower()
-        actual_host = returned_host_id.strip().lower()
-        if not self._host_identities_match(expected_host, actual_host):
-            raise ExecutionTransportError(
-                f"SSH host identity mismatch: expected {expected_host!r}, received {actual_host!r}"
-            )
-
-        if resp.get("status") != "success":
-            err_msg = str(resp.get("error") or "remote helper execution failed")
-            raise ExecutionTransportError(f"SSH remote helper reported error: {err_msg}")
-
-        payload = resp.get("payload")
-        if not isinstance(payload, dict):
-            raise ExecutionTransportError("SSH remote helper payload must be a JSON object")
-
-        return resp
+        from dev_orchestrator.transport.ssh_channel import run_remote_helper_envelope
+        return run_remote_helper_envelope(
+            self.ssh_config,
+            request_envelope,
+            timeout_seconds,
+            subprocess_module=self._subprocess,
+        )
 
     def dispatch(
         self,

@@ -639,3 +639,36 @@ class ExecutionJobStore:
                 except OSError:
                     pass
         return results
+
+    @property
+    def write_store(self) -> Any:
+        from dev_orchestrator.transport.write_store import WriteStagingStore
+        return WriteStagingStore(self.runtime_root)
+
+    def stage_write_content(self, upload: Any, *, max_bytes: int = 8 * 1024 * 1024) -> Any:
+        """Stage verified arbitrary binary content for durable file writes."""
+        from dev_orchestrator.transport.write_store import WriteStagingStore
+        store = WriteStagingStore(self.runtime_root)
+        return store.stage_content(upload, max_bytes=max_bytes)
+
+    def get_staged_bytes(self, project_id: str, sha256_digest: str) -> Optional[bytes]:
+        """Read and verify staged blob bytes."""
+        from dev_orchestrator.transport.write_store import WriteStagingStore
+        store = WriteStagingStore(self.runtime_root)
+        return store.get_staged_bytes(project_id, sha256_digest)
+
+    def apply_file_write(
+        self, request: Any, allowed_roots: list[str], *, host_identity: str = ""
+    ) -> Any:
+        """Apply a CAS file write under canonical path lock."""
+        from dev_orchestrator.transport.write_store import WriteStagingStore
+        store = WriteStagingStore(self.runtime_root)
+        return store.apply_file_write(request, allowed_roots, host_identity=host_identity)
+
+    def reconcile_file_write(
+        self, project_id: str, idempotency_key: str, *, host_identity: str = ""
+    ) -> Any:
+        """Reconcile ambiguous or unconfirmed durable write intent."""
+        from dev_orchestrator.transport.write_store import WriteStagingStore
+        store = WriteStagingStore(self.runtime_root)
+        return store.reconcile_file_write(project_id, idempotency_key, host_identity=host_identity)

@@ -1,5 +1,36 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P18 Native Execution Transport & RDC Dependency Reduction (implemented 2026-09-28):
+- Authoritative RDC Dependency Inventory: `docs/P18_RDC_DEPENDENCY_INVENTORY.md` published with complete operation classification and hardware boundary rejection rules.
+- Canonical Job Identity & Digest Derivation:
+  - `src/dev_orchestrator/jobs/models.py`: Added optional `parameters_digest`, `execution_policy_digest`, and `resolution_digest` to `JobSpec` (omitted in canonical dict when None to guarantee byte-identical SHA-256 legacy hash stability) and `JobRecord`.
+  - `src/dev_orchestrator/jobs/config.py`: Parameter schemas (`enum`, `integer`, `path_within_repo`), whole-element parameter substitution in argv, digest derivation functions (`compute_parameters_digest`, `compute_execution_policy_digest`, `compute_resolution_digest`), and `resolve_execution_policy` returning dual attribute/item access `ResolvedExecutionPolicy`.
+- Machine Transport Contracts & Implementations:
+  - `src/dev_orchestrator/transport/contracts.py`: Dataclasses, `MachineTransport` protocol, typed error hierarchy (`TransportError`, `TransportUnavailableError`, `TransportRejectedError`, `TransportAmbiguousError`).
+  - `src/dev_orchestrator/transport/local.py`: `LocalMachineTransport` implementing synchronous exec (read_only only), spawn, poll, cancel, read_file, stage_write_content, write_file, stat, and capabilities.
+  - `src/dev_orchestrator/transport/ssh.py`: `SSHMachineTransport` delegating to remote helper envelope over OpenSSH with host identity verification.
+  - `src/dev_orchestrator/transport/rdc.py`: `RDCTransport` fallback descriptor indicating interactive escalation requirement.
+  - `src/dev_orchestrator/transport/hosts.py`: `TransportHostProfile`, `TransportHostsConfig`, `load_transport_hosts_config`, `discover_local_capabilities`, `get_transport_for_host`.
+  - `src/dev_orchestrator/transport/selector.py`: `select_transport()` enforcing candidate ordering, approved policy pins, hardware rejection, and failover boundaries.
+- Binary Staging Store & CAS Writes:
+  - `src/dev_orchestrator/transport/write_store.py`: `WriteStagingStore` enforcing RFC 4648 Base64 strict validation, size limit (`MAX_FILE_WRITE_BYTES = 8 MiB`), SHA-256 validation, atomic tempfile replacement, path locking, and CAS write intent execution (`if_absent`, `expected_sha256`).
+  - `src/dev_orchestrator/jobs/store.py`: Integrated file staging and CAS write delegation with `write_store` property.
+- Remote Helper Wire Authority & Containment:
+  - `src/dev_orchestrator/ai/remote_helper.py`: Added closed `_MACHINE_OPERATIONS`, rejecting client-supplied authority (`argv`, `cwd`, `env`, etc.) with `wire_authority_violation`.
+- Control Plane Security & Nonce Replay Protection:
+  - `src/dev_orchestrator/control/security.py`: Added capability token management (`create_transport_capability`, `validate_transport_capability`, `revoke_transport_capability`) and single-use `consume_request_nonce` replay protection.
+- Control Adapters, Web API, and CLI:
+  - `src/dev_orchestrator/control/adapter.py`: Added `transport_hosts()`, `transport_capabilities()`, `transport_operations()`.
+  - `src/dev_orchestrator/control/mcp_adapter.py`: Added MCP tools `devorch_transport_hosts`, `devorch_transport_capabilities`, `devorch_transport_operations` (enabled via `enable_transport_tools`).
+  - `src/dev_orchestrator/web/server.py`: Added `/api/v1/control/transport/*` endpoints (exec, spawn, poll, cancel, read, stage-write, write, stat, capabilities, hosts).
+  - `src/dev_orchestrator/cli.py`: Added 10 CLI verbs (`transport-exec`, `transport-spawn`, `transport-poll`, `transport-cancel`, `transport-read`, `transport-stage-write`, `transport-write`, `transport-stat`, `transport-capabilities`, `transport-hosts`).
+- Verification Summary:
+  - 5 dedicated P18 test suites (34 tests): 100% passed in 0.79s.
+  - Related P13/P14 regression suites (70 tests): 100% passed in 10.68s.
+  - Full test suite: 1549 tests passed.
+  - `graphify update .` completed cleanly.
+  - `git diff --check` clean with 0 warnings/errors.
+
 P17 Single-Authority Goal Convergence Baseline (remediated round 5 / ready for review 2026-09-27):
 - Addressed both Technical Review findings from review `ai_review:rereview:p17-final-rereview-20260927` at commit `5975a1a`:
   1. Finding 1 (Durable Intent/Authority Transition & Restart Idempotence):

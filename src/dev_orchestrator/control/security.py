@@ -148,6 +148,7 @@ class ControlSecurity:
             "mobile_pairings": {},
             "mobile_devices": {},
             "mobile_revocation_generation": 0,
+            "transport_capabilities": {},
         }
 
     def _load_canonical_pairings(self, *, for_mutation: bool = False) -> dict[str, Any] | None:
@@ -172,6 +173,7 @@ class ControlSecurity:
             "mobile_pairings": val.get("mobile_pairings") if isinstance(val.get("mobile_pairings"), dict) else {},
             "mobile_devices": val.get("mobile_devices") if isinstance(val.get("mobile_devices"), dict) else {},
             "mobile_revocation_generation": int(val.get("mobile_revocation_generation", 0)),
+            "transport_capabilities": val.get("transport_capabilities") if isinstance(val.get("transport_capabilities"), dict) else {},
         }
 
     def _pairings(self) -> dict[str, Any]:
@@ -737,6 +739,218 @@ class ControlSecurity:
             pass
         return 0
 
+    def create_transport_capability(
+        self,
+        *,
+        project_id: str,
+        host_id: str,
+        allowed_operations: list[str],
+        allowed_commands: Optional[list[str]] = None,
+        allowed_roots: Optional[list[str]] = None,
+        ttl_seconds: int = 3600,
+        label: str = "",
+    ) -> dict[str, Any]:
+        """Mint a scoped transport capability. Returns token once."""
+        cap_id = "tc-" + secrets.token_urlsafe(16)
+        raw_secret = f"tc_{secrets.token_urlsafe(32)}"
+        token_hash = _digest(raw_secret)
+        now = time.time()
+        now_iso = utc_now_iso()
+        expires_at_epoch = now + ttl_seconds
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+
+        row = {
+            "capability_id": cap_id,
+            "token_hash": token_hash,
+            "project_id": project_id,
+            "host_id": host_id,
+            "allowed_operations": sorted(allowed_operations),
+            "allowed_commands": sorted(allowed_commands or []),
+            "allowed_roots": sorted(allowed_roots or []),
+            "label": label,
+            "created_at": now_iso,
+            "expires_at": expires_at,
+            "expires_at_epoch": expires_at_epoch,
+            "revoked": False,
+            "revoked_at": None,
+        }
+
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_canonical_pairings(for_mutation=True)
+            if not isinstance(data, dict):
+                raise ValueError("cannot access canonical capability state")
+            t_caps = data.setdefault("transport_capabilities", {})
+            t_caps[cap_id] = row
+            write_json(self.pairings_path, data, indent=2)
+
+        return {
+            "capability_id": cap_id,
+            "token": raw_secret,  # disclosed only once upon creation
+            "project_id": project_id,
+            "host_id": host_id,
+            "allowed_operations": sorted(allowed_operations),
+            "allowed_commands": sorted(allowed_commands or []),
+            "allowed_roots": sorted(allowed_roots or []),
+            "expires_at": expires_at,
+        }
+
+    def list_transport_capabilities(self, project_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """List non-secret metadata for transport capabilities."""
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if not isinstance(data, dict):
+                return []
+            t_caps = data.get("transport_capabilities", {})
+            results = []
+            for row in t_caps.values():
+                if isinstance(row, dict):
+                    if project_id and row.get("project_id") != "*" and row.get("project_id") != project_id:
+                        continue
+                    results.append({
+                        "capability_id": row.get("capability_id"),
+                        "project_id": row.get("project_id"),
+                        "host_id": row.get("host_id"),
+                        "allowed_operations": row.get("allowed_operations", []),
+                        "allowed_commands": row.get("allowed_commands", []),
+                        "allowed_roots": row.get("allowed_roots", []),
+                        "label": row.get("label", ""),
+                        "created_at": row.get("created_at"),
+                        "expires_at": row.get("expires_at"),
+                        "revoked": bool(row.get("revoked")),
+                        "revoked_at": row.get("revoked_at"),
+                    })
+            return sorted(results, key=lambda x: str(x.get("created_at") or ""))
+        except Exception:
+            return []
+
+    def revoke_transport_capability(self, capability_id: str) -> dict[str, Any]:
+        """Revoke a transport capability by ID."""
+        clean_id = capability_id.strip()
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_canonical_pairings(for_mutation=True)
+            if not isinstance(data, dict):
+                raise ValueError("cannot access canonical capability state")
+            t_caps = data.setdefault("transport_capabilities", {})
+            row = t_caps.get(clean_id)
+            if not isinstance(row, dict):
+                return {"capability_id": clean_id, "revoked": False, "error": "not_found"}
+            row["revoked"] = True
+            row["revoked_at"] = utc_now_iso()
+            write_json(self.pairings_path, data, indent=2)
+            return {"capability_id": clean_id, "revoked": True}
+
+    def validate_transport_capability(
+        self,
+        token_or_header: Optional[str],
+        *,
+        project_id: str,
+        host_id: str,
+        operation: str,
+        command_ref: Optional[str] = None,
+        path: Optional[str] = None,
+    ) -> tuple[bool, str, Optional[dict[str, Any]]]:
+        """Validate token and scope for a transport operation."""
+        if not token_or_header:
+            return False, "missing_capability_token", None
+        tok = token_or_header[7:].strip() if token_or_header.startswith("Bearer ") else token_or_header.strip()
+        if not tok:
+            return False, "empty_capability_token", None
+
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if data is None:
+                return False, "capability_store_missing", None
+        except Exception as exc:
+            return False, f"capability_store_unreadable: {exc}", None
+
+        t_caps = data.get("transport_capabilities")
+        if not isinstance(t_caps, dict):
+            return False, "no_transport_capabilities_registered", None
+
+        t_digest = _digest(tok)
+        now = time.time()
+        for row in t_caps.values():
+            if not isinstance(row, dict):
+                continue
+            if not hmac.compare_digest(str(row.get("token_hash") or ""), t_digest):
+                continue
+            if row.get("revoked"):
+                return False, "capability_revoked", None
+            if float(row.get("expires_at_epoch", 0)) <= now:
+                return False, "capability_expired", None
+
+            # Project scope check
+            cap_proj = row.get("project_id")
+            if cap_proj and cap_proj != "*" and cap_proj != project_id:
+                return False, f"capability_project_mismatch ({project_id} != {cap_proj})", None
+
+            # Host scope check
+            cap_host = row.get("host_id")
+            if cap_host and cap_host != "*" and cap_host != host_id:
+                return False, f"capability_host_mismatch ({host_id} != {cap_host})", None
+
+            # Operation scope check
+            allowed_ops = row.get("allowed_operations", [])
+            if allowed_ops and "*" not in allowed_ops and operation not in allowed_ops:
+                return False, f"operation_{operation}_not_allowed_by_capability", None
+
+            # Command scope check
+            if command_ref:
+                allowed_cmds = row.get("allowed_commands", [])
+                if allowed_cmds and "*" not in allowed_cmds and command_ref not in allowed_cmds:
+                    return False, f"command_{command_ref}_not_allowed_by_capability", None
+
+            # Path / roots scope check
+            if path:
+                allowed_roots = row.get("allowed_roots", [])
+                if allowed_roots and "*" not in allowed_roots:
+                    from dev_orchestrator.jobs.config import canonical_path, is_path_contained
+                    c_path = canonical_path(path)
+                    is_ok = any(is_path_contained(r, c_path) for r in allowed_roots)
+                    if not is_ok:
+                        return False, "path_not_within_capability_roots", None
+
+            return True, "valid", row
+
+        return False, "invalid_or_revoked_capability_token", None
+
+    def consume_request_nonce(
+        self, capability_id: str, nonce: str, *, max_age_seconds: float = 300.0
+    ) -> bool:
+        """Atomically validate and consume a single-use request nonce.
+
+        Rejects previously seen nonces for this capability within max_age_seconds window.
+        """
+        clean_cap = capability_id.strip()
+        clean_nonce = nonce.strip()
+        if not clean_cap or not clean_nonce:
+            return False
+
+        nonce_file = self.root / "nonces.json"
+        now = time.time()
+        with InterProcessFileLock(self.lock_path):
+            data = read_json(nonce_file, {"nonces": {}})
+            if not isinstance(data, dict):
+                data = {"nonces": {}}
+            nonces = data.setdefault("nonces", {})
+
+            # Clean expired nonces
+            active_nonces: dict[str, float] = {}
+            for n_key, ts in nonces.items():
+                if isinstance(ts, (int, float)) and now - ts < max_age_seconds:
+                    active_nonces[n_key] = float(ts)
+
+            full_key = f"{clean_cap}:{clean_nonce}"
+            if full_key in active_nonces:
+                # Replay detected!
+                return False
+
+            active_nonces[full_key] = now
+            data["nonces"] = active_nonces
+            data["updated_at"] = utc_now_iso()
+            write_json(nonce_file, data, indent=2)
+            return True
+
 
 def capability_state(pairing_id: str, runtime_root: Path | str | None = None) -> CapabilityVerdict:
     return ControlSecurity(runtime_root=runtime_root).capability_state(pairing_id)
@@ -762,4 +976,72 @@ def renew_session_capability(
 ) -> tuple[bool, str, dict[str, Any] | None]:
     return ControlSecurity(runtime_root=runtime_root).renew_session_capability(
         header_or_token, grace_period_seconds=grace_period_seconds
+    )
+
+
+def create_transport_capability(
+    *,
+    project_id: str,
+    host_id: str,
+    allowed_operations: list[str],
+    allowed_commands: Optional[list[str]] = None,
+    allowed_roots: Optional[list[str]] = None,
+    ttl_seconds: int = 3600,
+    label: str = "",
+    runtime_root: Path | str | None = None,
+) -> dict[str, Any]:
+    return ControlSecurity(runtime_root=runtime_root).create_transport_capability(
+        project_id=project_id,
+        host_id=host_id,
+        allowed_operations=allowed_operations,
+        allowed_commands=allowed_commands,
+        allowed_roots=allowed_roots,
+        ttl_seconds=ttl_seconds,
+        label=label,
+    )
+
+
+def list_transport_capabilities(
+    project_id: Optional[str] = None,
+    runtime_root: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    return ControlSecurity(runtime_root=runtime_root).list_transport_capabilities(project_id=project_id)
+
+
+def revoke_transport_capability(
+    capability_id: str,
+    runtime_root: Path | str | None = None,
+) -> dict[str, Any]:
+    return ControlSecurity(runtime_root=runtime_root).revoke_transport_capability(capability_id)
+
+
+def validate_transport_capability(
+    token_or_header: Optional[str],
+    *,
+    project_id: str,
+    host_id: str,
+    operation: str,
+    command_ref: Optional[str] = None,
+    path: Optional[str] = None,
+    runtime_root: Path | str | None = None,
+) -> tuple[bool, str, Optional[dict[str, Any]]]:
+    return ControlSecurity(runtime_root=runtime_root).validate_transport_capability(
+        token_or_header,
+        project_id=project_id,
+        host_id=host_id,
+        operation=operation,
+        command_ref=command_ref,
+        path=path,
+    )
+
+
+def consume_request_nonce(
+    capability_id: str,
+    nonce: str,
+    *,
+    max_age_seconds: float = 300.0,
+    runtime_root: Path | str | None = None,
+) -> bool:
+    return ControlSecurity(runtime_root=runtime_root).consume_request_nonce(
+        capability_id, nonce, max_age_seconds=max_age_seconds
     )

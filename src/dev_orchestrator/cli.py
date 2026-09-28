@@ -1234,6 +1234,241 @@ def cmd_job_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_transport_exec(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.transport import MachineOperation, get_transport_for_host
+    import dataclasses
+    host_id = getattr(args, "host_id", None) or "local"
+    params = None
+    if getattr(args, "parameters", None):
+        try:
+            params = json.loads(args.parameters)
+        except Exception as exc:
+            raise CliError(f"invalid JSON in --parameters: {exc}") from exc
+    op = MachineOperation(
+        project_id=args.project_id,
+        command_ref=args.command_ref,
+        idempotency_key=getattr(args, "idempotency_key", None) or str(uuid4()),
+        parameters=params,
+        host_id=host_id,
+        expected_working_directory=getattr(args, "expected_working_directory", None),
+        timeout_seconds=getattr(args, "timeout", None),
+    )
+    try:
+        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        res = transport.exec(op)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(dataclasses.asdict(res), indent=2, ensure_ascii=False) + "\n")
+    return 0 if res.status == "ok" else 1
+
+
+def cmd_transport_spawn(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.transport import MachineOperation, get_transport_for_host
+    import dataclasses
+    host_id = getattr(args, "host_id", None) or "local"
+    params = None
+    if getattr(args, "parameters", None):
+        try:
+            params = json.loads(args.parameters)
+        except Exception as exc:
+            raise CliError(f"invalid JSON in --parameters: {exc}") from exc
+    op = MachineOperation(
+        project_id=args.project_id,
+        command_ref=args.command_ref,
+        idempotency_key=getattr(args, "idempotency_key", None) or str(uuid4()),
+        parameters=params,
+        host_id=host_id,
+        expected_working_directory=getattr(args, "expected_working_directory", None),
+        input_digest=getattr(args, "input_digest", None),
+        timeout_seconds=getattr(args, "timeout", None),
+    )
+    try:
+        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        res = transport.spawn(op)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(dataclasses.asdict(res), indent=2, ensure_ascii=False) + "\n")
+    return 0 if res.status in ("ok", "queued", "running") else 1
+
+
+def cmd_transport_poll(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.transport import get_transport_for_host
+    import dataclasses
+    host_id = getattr(args, "host_id", None) or "local"
+    try:
+        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        res = transport.poll(args.operation_id, host_id=host_id)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(dataclasses.asdict(res), indent=2, ensure_ascii=False) + "\n")
+    return 0 if res.status in ("ok", "queued", "running") else 1
+
+
+def cmd_transport_cancel(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.transport import get_transport_for_host
+    import dataclasses
+    host_id = getattr(args, "host_id", None) or "local"
+    reason = getattr(args, "reason", "cancelled") or "cancelled"
+    try:
+        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        res = transport.cancel(args.operation_id, host_id=host_id, reason=reason)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(dataclasses.asdict(res), indent=2, ensure_ascii=False) + "\n")
+    return 0 if res.status in ("ok", "cancelled") else 1
+
+
+def cmd_transport_read(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.transport import FileReadRequest, get_transport_for_host
+    import dataclasses
+    import base64
+    host_id = getattr(args, "host_id", None) or "local"
+    req = FileReadRequest(
+        project_id=args.project_id,
+        path=args.path,
+        host_id=host_id,
+        max_bytes=getattr(args, "max_bytes", 10 * 1024 * 1024) or (10 * 1024 * 1024),
+        offset_bytes=getattr(args, "offset_bytes", 0) or 0,
+    )
+    try:
+        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        res = transport.read_file(req)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+
+    out_file = getattr(args, "output", None)
+    if out_file and res.content_bytes is not None:
+        try:
+            Path(out_file).write_bytes(res.content_bytes)
+        except OSError as exc:
+            raise CliError(f"failed to write output file {out_file}: {exc}") from exc
+
+    d = dataclasses.asdict(res)
+    if d.get("content_bytes") is not None:
+        d["content_base64"] = base64.b64encode(d.pop("content_bytes")).decode("ascii")
+    sys.stdout.write(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
+    return 0 if res.status == "ok" else 1
+
+
+def cmd_transport_stage_write(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.transport import WriteContentUpload, get_transport_for_host
+    import dataclasses
+    import hashlib
+    import base64
+    host_id = getattr(args, "host_id", None) or "local"
+
+    content_b64 = getattr(args, "content_base64", None)
+    file_path = getattr(args, "file", None)
+    if file_path:
+        p = Path(file_path)
+        if not p.is_file():
+            raise CliError(f"file not found: {file_path}")
+        data = p.read_bytes()
+        content_b64 = base64.b64encode(data).decode("ascii")
+        size = len(data)
+        sha = hashlib.sha256(data).hexdigest()
+    elif content_b64:
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except Exception as exc:
+            raise CliError(f"invalid base64 content: {exc}") from exc
+        size = len(data)
+        sha = hashlib.sha256(data).hexdigest()
+    else:
+        raise CliError("either --file or --content-base64 is required")
+
+    upload = WriteContentUpload(
+        project_id=args.project_id,
+        host_id=host_id,
+        content_base64=content_b64,
+        decoded_size_bytes=size,
+        content_sha256=sha,
+    )
+    try:
+        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        res = transport.stage_write_content(upload)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(dataclasses.asdict(res), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_transport_write(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.transport import FileWriteRequest, get_transport_for_host
+    import dataclasses
+    host_id = getattr(args, "host_id", None) or "local"
+    req = FileWriteRequest(
+        project_id=args.project_id,
+        host_id=host_id,
+        target_path=args.target_path,
+        idempotency_key=getattr(args, "idempotency_key", None) or str(uuid4()),
+        content_ref=args.content_ref,
+        content_sha256=args.content_sha256,
+        decoded_size_bytes=int(args.decoded_size_bytes),
+        if_absent=getattr(args, "if_absent", None),
+        expected_sha256=getattr(args, "expected_sha256", None),
+        expected_file_policy_digest=getattr(args, "expected_file_policy_digest", None),
+    )
+    try:
+        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        res = transport.write_file(req)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    d = dataclasses.asdict(res)
+    if "content_bytes" in d:
+        del d["content_bytes"]
+    sys.stdout.write(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
+    return 0 if res.status in ("ok", "applied") else 1
+
+
+def cmd_transport_stat(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.transport import get_transport_for_host
+    import dataclasses
+    host_id = getattr(args, "host_id", None) or "local"
+    try:
+        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        res = transport.stat(args.path, host_id=host_id, project_id=getattr(args, "project_id", None))
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(dataclasses.asdict(res), indent=2, ensure_ascii=False) + "\n")
+    return 0 if res.status == "ok" else 1
+
+
+def cmd_transport_capabilities(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.transport import get_transport_for_host
+    import dataclasses
+    host_id = getattr(args, "host_id", None) or "local"
+    try:
+        transport = get_transport_for_host(runtime, host_id=host_id, config_path=getattr(args, "config", None))
+        res = transport.capabilities(host_id=host_id)
+    except Exception as exc:
+        raise CliError(str(exc)) from exc
+    sys.stdout.write(json.dumps(dataclasses.asdict(res), indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_transport_hosts(args: argparse.Namespace) -> int:
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.transport import load_transport_hosts_config
+    import dataclasses
+    cfg = load_transport_hosts_config(runtime, getattr(args, "config", None))
+    out = {
+        "default_host": cfg.default_host,
+        "hosts": {hid: dataclasses.asdict(p) for hid, p in cfg.hosts.items()},
+    }
+    sys.stdout.write(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
 def cmd_review_submit(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
     from dev_orchestrator.review.models import ReviewRequest
@@ -1949,6 +2184,90 @@ def build_parser() -> argparse.ArgumentParser:
     job_reconcile.add_argument("job_id", help="job ID to reconcile")
     job_reconcile.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
+    t_exec = sub.add_parser("transport-exec", help="execute a read-only command via native machine transport")
+    t_exec.add_argument("--project-id", required=True, help="project ID")
+    t_exec.add_argument("--command-ref", required=True, help="command reference")
+    t_exec.add_argument("--host-id", default="local", help="target execution host (default: local)")
+    t_exec.add_argument("--parameters", default=None, help="JSON-encoded parameters object")
+    t_exec.add_argument("--expected-working-directory", default=None, help="expected working directory assertion")
+    t_exec.add_argument("--timeout", type=float, default=None, help="timeout in seconds")
+    t_exec.add_argument("--idempotency-key", default=None, help="idempotency key")
+    t_exec.add_argument("--config", default=None, help="path to projects.json / transport-hosts.json")
+    t_exec.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_spawn = sub.add_parser("transport-spawn", help="spawn a durable operation via native machine transport")
+    t_spawn.add_argument("--project-id", required=True, help="project ID")
+    t_spawn.add_argument("--command-ref", required=True, help="command reference")
+    t_spawn.add_argument("--host-id", default="local", help="target execution host (default: local)")
+    t_spawn.add_argument("--parameters", default=None, help="JSON-encoded parameters object")
+    t_spawn.add_argument("--expected-working-directory", default=None, help="expected working directory assertion")
+    t_spawn.add_argument("--input-digest", default=None, help="client-asserted input digest")
+    t_spawn.add_argument("--timeout", type=float, default=None, help="timeout in seconds")
+    t_spawn.add_argument("--idempotency-key", default=None, help="idempotency key")
+    t_spawn.add_argument("--config", default=None, help="path to projects.json / transport-hosts.json")
+    t_spawn.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_poll = sub.add_parser("transport-poll", help="poll status of a spawned durable operation")
+    t_poll.add_argument("operation_id", help="operation or job ID")
+    t_poll.add_argument("--host-id", default="local", help="target execution host (default: local)")
+    t_poll.add_argument("--config", default=None, help="path to config")
+    t_poll.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_cancel = sub.add_parser("transport-cancel", help="cancel an active spawned durable operation")
+    t_cancel.add_argument("operation_id", help="operation or job ID")
+    t_cancel.add_argument("--host-id", default="local", help="target execution host (default: local)")
+    t_cancel.add_argument("--reason", default="cancelled", help="cancellation reason")
+    t_cancel.add_argument("--config", default=None, help="path to config")
+    t_cancel.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_read = sub.add_parser("transport-read", help="read a scoped file via native machine transport")
+    t_read.add_argument("--project-id", required=True, help="project ID")
+    t_read.add_argument("--path", required=True, help="target path relative to file roots")
+    t_read.add_argument("--host-id", default="local", help="target execution host (default: local)")
+    t_read.add_argument("--max-bytes", type=int, default=10 * 1024 * 1024, help="maximum bytes to read")
+    t_read.add_argument("--offset-bytes", type=int, default=0, help="byte offset to start reading from")
+    t_read.add_argument("--output", default=None, help="optional local file to write read bytes")
+    t_read.add_argument("--config", default=None, help="path to config")
+    t_read.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_stage = sub.add_parser("transport-stage-write", help="stage binary content for CAS write")
+    t_stage.add_argument("--project-id", required=True, help="project ID")
+    t_stage.add_argument("--host-id", default="local", help="target execution host (default: local)")
+    t_stage.add_argument("--file", default=None, help="path to local file to stage")
+    t_stage.add_argument("--content-base64", default=None, help="RFC 4648 Base64 encoded payload")
+    t_stage.add_argument("--config", default=None, help="path to config")
+    t_stage.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_write = sub.add_parser("transport-write", help="commit staged binary content via CAS write")
+    t_write.add_argument("--project-id", required=True, help="project ID")
+    t_write.add_argument("--target-path", required=True, help="target file path")
+    t_write.add_argument("--content-ref", required=True, help="staged content ref")
+    t_write.add_argument("--content-sha256", required=True, help="expected staged content SHA-256")
+    t_write.add_argument("--decoded-size-bytes", type=int, required=True, help="decoded payload byte size")
+    t_write.add_argument("--host-id", default="local", help="target execution host (default: local)")
+    t_write.add_argument("--idempotency-key", default=None, help="idempotency key")
+    t_write.add_argument("--if-absent", action="store_true", default=None, help="require target file to not exist")
+    t_write.add_argument("--expected-sha256", default=None, help="expected existing file SHA-256 before overwrite")
+    t_write.add_argument("--expected-file-policy-digest", default=None, help="expected policy digest")
+    t_write.add_argument("--config", default=None, help="path to config")
+    t_write.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_stat = sub.add_parser("transport-stat", help="stat a scoped path via native machine transport")
+    t_stat.add_argument("--path", required=True, help="path to inspect")
+    t_stat.add_argument("--host-id", default="local", help="target execution host (default: local)")
+    t_stat.add_argument("--project-id", default=None, help="optional project ID")
+    t_stat.add_argument("--config", default=None, help="path to config")
+    t_stat.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_caps = sub.add_parser("transport-capabilities", help="query execution host capabilities")
+    t_caps.add_argument("--host-id", default="local", help="target execution host (default: local)")
+    t_caps.add_argument("--config", default=None, help="path to config")
+    t_caps.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    t_hosts = sub.add_parser("transport-hosts", help="list configured execution transport hosts")
+    t_hosts.add_argument("--config", default=None, help="path to config")
+    t_hosts.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
     review_submit = sub.add_parser("review-submit", help="submit a review session")
     review_submit.add_argument("--project-id", required=True, help="project ID")
     review_submit.add_argument("--task-id", default=None, help="task ID")
@@ -2072,6 +2391,16 @@ _COMMANDS = {
     "job-cancel": cmd_job_cancel,
     "job-retry": cmd_job_retry,
     "job-reconcile": cmd_job_reconcile,
+    "transport-exec": cmd_transport_exec,
+    "transport-spawn": cmd_transport_spawn,
+    "transport-poll": cmd_transport_poll,
+    "transport-cancel": cmd_transport_cancel,
+    "transport-read": cmd_transport_read,
+    "transport-stage-write": cmd_transport_stage_write,
+    "transport-write": cmd_transport_write,
+    "transport-stat": cmd_transport_stat,
+    "transport-capabilities": cmd_transport_capabilities,
+    "transport-hosts": cmd_transport_hosts,
     "review-submit": cmd_review_submit,
     "review-status": cmd_review_status,
     "review-reconcile": cmd_review_reconcile,

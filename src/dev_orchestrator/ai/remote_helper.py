@@ -8,6 +8,9 @@ Prohibits arbitrary shell commands or path operations.
 
 from __future__ import annotations
 
+import base64
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import socket
@@ -90,11 +93,437 @@ def _service_call(
         raise RuntimeError(f"broker service returned invalid JSON for {safe_target}") from exc
 
 
+def _resolve_project_target_path(jobs_cfg: Any, project_id: str, path_str: str) -> tuple[Path, Path]:
+    proj = jobs_cfg.projects.get(project_id)
+    if proj is None:
+        raise ValueError(f"unknown project_id: {project_id!r}")
+    from dev_orchestrator.jobs.config import is_path_contained
+    target = Path(path_str)
+    allowed_roots = [proj.repo_path] + list(proj.file_roots)
+    if target.is_absolute():
+        for root in allowed_roots:
+            if is_path_contained(root, target):
+                return target, root
+    else:
+        cand = (proj.repo_path / target).resolve()
+        for root in allowed_roots:
+            if is_path_contained(root, cand):
+                return cand, root
+    raise ValueError(f"path {path_str!r} escapes project containment")
+
+
 def execute_request(req: dict[str, Any]) -> dict[str, Any]:
     operation = req.get("operation")
     req_id = req.get("request_id")
     if not operation or not req_id:
         raise ValueError("operation and request_id are required")
+
+    _MACHINE_OPERATIONS = frozenset({
+        "op_resolve",
+        "op_exec",
+        "op_spawn",
+        "op_poll",
+        "op_cancel",
+        "op_read_file",
+        "op_stage_write",
+        "op_write_file",
+        "op_stat",
+        "op_capabilities",
+    })
+    _JOB_OPERATIONS = frozenset({"job_start", "job_status", "job_logs", "job_cancel", "job_artifact"})
+
+    if operation in _MACHINE_OPERATIONS or operation in _JOB_OPERATIONS:
+        FORBIDDEN_WIRE_KEYS = frozenset({"argv", "cwd", "env", "shell", "effect_class", "file_roots"})
+        forbidden = sorted(FORBIDDEN_WIRE_KEYS & set(req.keys()))
+        if forbidden:
+            raise ValueError(f"forbidden wire authority parameter in request: {forbidden}")
+
+    if operation in _MACHINE_OPERATIONS:
+        _ALLOWED_MACHINE_OP_FIELDS = {
+            "op_resolve": frozenset({"operation", "request_id", "project_id", "command_ref", "parameters", "expected_working_directory"}),
+            "op_exec": frozenset({"operation", "request_id", "project_id", "command_ref", "parameters", "expected_working_directory", "timeout_seconds"}),
+            "op_spawn": frozenset({"operation", "request_id", "project_id", "command_ref", "parameters", "expected_working_directory", "idempotency_key", "job_id", "input_payload", "input_digest", "job_spec"}),
+            "op_poll": frozenset({"operation", "request_id", "job_id"}),
+            "op_cancel": frozenset({"operation", "request_id", "job_id", "reason"}),
+            "op_read_file": frozenset({"operation", "request_id", "project_id", "path", "max_bytes", "offset_bytes"}),
+            "op_stage_write": frozenset({"operation", "request_id", "project_id", "content_base64", "decoded_size_bytes", "content_sha256"}),
+            "op_write_file": frozenset({"operation", "request_id", "project_id", "target_path", "idempotency_key", "content_ref", "content_sha256", "decoded_size_bytes", "if_absent", "expected_sha256", "expected_file_policy_digest"}),
+            "op_stat": frozenset({"operation", "request_id", "path", "project_id"}),
+            "op_capabilities": frozenset({"operation", "request_id"}),
+        }
+        unknown = sorted(set(req.keys()) - _ALLOWED_MACHINE_OP_FIELDS[operation])
+        if unknown:
+            raise ValueError(f"unknown fields in remote operation {operation}: {unknown}")
+
+        from dev_orchestrator.jobs.config import (
+            is_path_contained,
+            load_jobs_config,
+            resolve_execution_policy,
+            resolve_remote_jobs_config_path,
+        )
+        from dev_orchestrator.jobs.models import JobRecord, JobSpec, job_id_for
+        from dev_orchestrator.jobs.store import ExecutionJobStore
+        from dev_orchestrator.jobs.transport import LocalJobTransport
+        from dev_orchestrator.storage.json_store import utc_now_iso
+
+        cfg_path = resolve_remote_jobs_config_path()
+        jobs_cfg = load_jobs_config(cfg_path)
+        if jobs_cfg is None and operation != "op_capabilities":
+            raise RuntimeError(f"host-local jobs configuration absent or disabled at {cfg_path}")
+
+        if operation == "op_capabilities":
+            from dev_orchestrator.transport.hosts import discover_local_capabilities
+            caps = discover_local_capabilities(jobs_cfg)
+            return {
+                "status": "ok",
+                "capabilities": {
+                    "host_id": caps.host_id,
+                    "os_family": caps.os_family,
+                    "path_style": caps.path_style,
+                    "helper_version": caps.helper_version,
+                    "jobs_config_valid": caps.jobs_config_valid,
+                    "approved_policy_pins": caps.approved_policy_pins,
+                    "response_limits": caps.response_limits,
+                    "supported_operations": caps.supported_operations,
+                    "probed_at": caps.probed_at,
+                },
+            }
+
+        assert jobs_cfg is not None
+
+        if operation == "op_resolve":
+            proj_id = req.get("project_id")
+            cmd_ref = req.get("command_ref")
+            if not proj_id or not cmd_ref:
+                raise ValueError("project_id and command_ref are required for op_resolve")
+            ok, failure_kind, resolved = resolve_execution_policy(
+                jobs_cfg,
+                proj_id,
+                cmd_ref,
+                parameters=req.get("parameters"),
+                expected_working_directory=req.get("expected_working_directory"),
+            )
+            if not ok:
+                if failure_kind and "hardware" in failure_kind:
+                    raise ValueError("hardware_execution_not_supported_in_p18")
+                raise ValueError(f"execution resolution failed: {failure_kind}")
+            assert resolved is not None
+            if resolved.effect_class == "hardware":
+                raise ValueError("hardware_execution_not_supported_in_p18")
+            return {
+                "status": "ok",
+                "project_id": proj_id,
+                "command_ref": cmd_ref,
+                "effect_class": resolved.effect_class,
+                "duration_class": resolved.duration_class,
+                "max_runtime_seconds": resolved.max_runtime_seconds,
+                "heartbeat_interval_seconds": resolved.heartbeat_interval_seconds,
+                "resolved_cwd": str(resolved.resolved_cwd),
+                "resolved_argv": resolved.resolved_argv,
+                "parameters_digest": resolved.parameters_digest,
+                "execution_policy_digest": resolved.execution_policy_digest,
+                "resolution_digest": resolved.resolution_digest,
+            }
+
+        if operation == "op_exec":
+            proj_id = req.get("project_id")
+            cmd_ref = req.get("command_ref")
+            if not proj_id or not cmd_ref:
+                raise ValueError("project_id and command_ref are required for op_exec")
+            ok, failure_kind, resolved = resolve_execution_policy(
+                jobs_cfg,
+                proj_id,
+                cmd_ref,
+                parameters=req.get("parameters"),
+                expected_working_directory=req.get("expected_working_directory"),
+            )
+            if not ok:
+                if failure_kind and "hardware" in failure_kind:
+                    raise ValueError("hardware_execution_not_supported_in_p18")
+                raise ValueError(f"execution resolution failed: {failure_kind}")
+            assert resolved is not None
+            if resolved.effect_class == "hardware":
+                raise ValueError("hardware_execution_not_supported_in_p18")
+            if resolved.effect_class != "read_only":
+                raise ValueError(f"op_exec only supports read_only commands, found effect_class: {resolved.effect_class!r}")
+
+            timeout = float(req.get("timeout_seconds") or resolved.max_runtime_seconds)
+            try:
+                completed = subprocess.run(
+                    resolved.resolved_argv,
+                    cwd=resolved.resolved_cwd,
+                    timeout=timeout,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                return {
+                    "status": "ok" if completed.returncode == 0 else "failed",
+                    "exit_code": completed.returncode,
+                    "stdout": completed.stdout,
+                    "stderr": completed.stderr,
+                    "parameters_digest": resolved.parameters_digest,
+                    "execution_policy_digest": resolved.execution_policy_digest,
+                    "resolution_digest": resolved.resolution_digest,
+                }
+            except subprocess.TimeoutExpired as exc:
+                return {
+                    "status": "timeout",
+                    "exit_code": -1,
+                    "stdout": exc.stdout if isinstance(exc.stdout, str) else "",
+                    "stderr": exc.stderr if isinstance(exc.stderr, str) else "",
+                    "error": f"command timed out after {timeout} seconds",
+                    "parameters_digest": resolved.parameters_digest,
+                    "execution_policy_digest": resolved.execution_policy_digest,
+                    "resolution_digest": resolved.resolution_digest,
+                }
+
+        if operation == "op_spawn":
+            proj_id = req.get("project_id")
+            cmd_ref = req.get("command_ref")
+            if not proj_id or not cmd_ref:
+                raise ValueError("project_id and command_ref are required for op_spawn")
+            expected_cwd = req.get("expected_working_directory")
+            ok, failure_kind, resolved = resolve_execution_policy(
+                jobs_cfg,
+                proj_id,
+                cmd_ref,
+                parameters=req.get("parameters"),
+                expected_working_directory=expected_cwd,
+            )
+            if not ok:
+                if failure_kind and "hardware" in failure_kind:
+                    raise ValueError("hardware_execution_not_supported_in_p18")
+                raise ValueError(f"execution resolution failed: {failure_kind}")
+            assert resolved is not None
+            if resolved.effect_class == "hardware":
+                raise ValueError("hardware_execution_not_supported_in_p18")
+
+            incoming_spec = req.get("job_spec")
+            if isinstance(incoming_spec, dict):
+                if (
+                    incoming_spec.get("parameters_digest") != resolved.parameters_digest
+                    or incoming_spec.get("execution_policy_digest") != resolved.execution_policy_digest
+                    or incoming_spec.get("resolution_digest") != resolved.resolution_digest
+                ):
+                    raise ValueError("tampered job_spec digest mismatch")
+
+            idem_key = req.get("idempotency_key") or req.get("job_id")
+            if not idem_key:
+                raise ValueError("job_id or idempotency_key is required")
+            input_digest = req.get("input_digest")
+            spec = JobSpec(
+                project_id=proj_id,
+                command_ref=cmd_ref,
+                idempotency_key=str(idem_key),
+                expected_working_directory=expected_cwd,
+                input_digest=str(input_digest) if input_digest else None,
+                parameters_digest=resolved.parameters_digest,
+                execution_policy_digest=resolved.execution_policy_digest,
+                resolution_digest=resolved.resolution_digest,
+            )
+            target_job_id = req.get("job_id") or job_id_for(spec)
+            store = ExecutionJobStore(jobs_cfg.runtime_root)
+            local_transport = LocalJobTransport()
+
+            def _factory(jid: str, shash: str) -> JobRecord:
+                now = utc_now_iso()
+                jdir = store._job_dir(jid)
+                resolved_argv = [arg.replace("{job_dir}", str(jdir)) for arg in resolved.resolved_argv]
+                return JobRecord(
+                    job_id=jid,
+                    idempotency_key=spec.idempotency_key,
+                    spec_hash=shash,
+                    kind=spec.kind,
+                    project_id=spec.project_id,
+                    command_ref=spec.command_ref,
+                    resolved_argv=resolved_argv,
+                    working_directory=str(resolved.resolved_cwd),
+                    transport="local",
+                    host_identity=socket.gethostname(),
+                    duration_class=resolved.duration_class,
+                    max_runtime_seconds=resolved.max_runtime_seconds,
+                    heartbeat_interval_seconds=resolved.heartbeat_interval_seconds,
+                    log_caps=dict(jobs_cfg.log_caps),
+                    input_digest=spec.input_digest,
+                    parameters=resolved.canonical_parameters,
+                    parameters_digest=resolved.parameters_digest,
+                    execution_policy_digest=resolved.execution_policy_digest,
+                    resolution_digest=resolved.resolution_digest,
+                    state="queued",
+                    timestamps={"created_at": now, "queued_at": now, "updated_at": now},
+                )
+
+            record, is_new = store.claim_or_get(spec, _factory, target_job_id=target_job_id)
+            if is_new:
+                input_payload = req.get("input_payload")
+                if input_payload is not None:
+                    store.save_input_artifact(record.job_id, input_payload)
+                start_res = local_transport.job_start(spec, store._job_dir(record.job_id))
+                sup_pid = start_res.get("supervisor_pid") if isinstance(start_res, dict) else None
+                if isinstance(sup_pid, int) and sup_pid > 0:
+                    def _record_pid(rec: JobRecord) -> None:
+                        rec.supervisor["pid"] = sup_pid
+                    store.update(record.job_id, _record_pid)
+
+            return {
+                "status": "ok",
+                "job_id": record.job_id,
+                "already_exists": not is_new,
+                "parameters_digest": resolved.parameters_digest,
+                "execution_policy_digest": resolved.execution_policy_digest,
+                "resolution_digest": resolved.resolution_digest,
+            }
+
+        if operation == "op_poll":
+            job_id = req.get("job_id")
+            if not job_id:
+                raise ValueError("job_id is required for op_poll")
+            store = ExecutionJobStore(jobs_cfg.runtime_root)
+            local_transport = LocalJobTransport()
+            record = store.get_record(job_id)
+            status_res = local_transport.job_status(job_id, store._job_dir(job_id))
+            return {
+                "status": "ok",
+                "job_id": job_id,
+                "state": record.state if record else status_res.get("status", "unknown"),
+                "exit_code": record.exit_code if record else None,
+                "parameters_digest": record.parameters_digest if record else None,
+                "execution_policy_digest": record.execution_policy_digest if record else None,
+                "resolution_digest": record.resolution_digest if record else None,
+                "details": status_res,
+            }
+
+        if operation == "op_cancel":
+            job_id = req.get("job_id")
+            if not job_id:
+                raise ValueError("job_id is required for op_cancel")
+            reason = str(req.get("reason") or "cancelled")
+            store = ExecutionJobStore(jobs_cfg.runtime_root)
+            local_transport = LocalJobTransport()
+            cancel_res = local_transport.job_cancel(job_id, store._job_dir(job_id), reason=reason)
+            return {
+                "status": "ok",
+                "job_id": job_id,
+                "reason": reason,
+                "details": cancel_res,
+            }
+
+        if operation == "op_read_file":
+            proj_id = req.get("project_id")
+            path_str = req.get("path")
+            if not proj_id or not path_str:
+                raise ValueError("project_id and path are required for op_read_file")
+            resolved, _ = _resolve_project_target_path(jobs_cfg, proj_id, path_str)
+            if not resolved.is_file():
+                return {"status": "failed", "path": path_str, "error": f"file not found: {path_str}"}
+            max_bytes = int(req.get("max_bytes") or 10 * 1024 * 1024)
+            offset_bytes = int(req.get("offset_bytes") or 0)
+            with open(resolved, "rb") as f:
+                if offset_bytes:
+                    f.seek(offset_bytes)
+                data = f.read(max_bytes)
+            sha = hashlib.sha256(data).hexdigest()
+            return {
+                "status": "ok",
+                "path": str(resolved),
+                "size_bytes": len(data),
+                "sha256": sha,
+                "content_base64": base64.b64encode(data).decode("ascii"),
+            }
+
+        if operation == "op_stage_write":
+            proj_id = req.get("project_id")
+            b64_str = req.get("content_base64")
+            sha = req.get("content_sha256")
+            size_b = int(req.get("decoded_size_bytes") or 0)
+            if not proj_id or not b64_str or not sha:
+                raise ValueError("project_id, content_base64, and content_sha256 are required for op_stage_write")
+            store = ExecutionJobStore(jobs_cfg.runtime_root)
+            staged = store.stage_write_content(proj_id, b64_str, sha, size_b)
+            return {
+                "status": "ok",
+                "content_ref": staged.content_ref,
+                "content_sha256": staged.content_sha256,
+                "decoded_size_bytes": staged.decoded_size_bytes,
+                "project_id": staged.project_id,
+                "host_id": socket.gethostname(),
+                "staged_at": staged.staged_at,
+                "expires_at": staged.expires_at,
+            }
+
+        if operation == "op_write_file":
+            proj_id = req.get("project_id")
+            target_p = req.get("target_path")
+            content_ref = req.get("content_ref")
+            if not proj_id or not target_p or not content_ref:
+                raise ValueError("project_id, target_path, and content_ref are required for op_write_file")
+            resolved, root = _resolve_project_target_path(jobs_cfg, proj_id, target_p)
+            store = ExecutionJobStore(jobs_cfg.runtime_root)
+            return store.apply_file_write(
+                project_id=proj_id,
+                relative_path=str(resolved),
+                staging_token=content_ref,
+                expected_sha256=req.get("expected_sha256"),
+                must_create=req.get("if_absent"),
+                base_dir=root,
+            )
+
+        if operation == "op_stat":
+            path_str = req.get("path")
+            if not path_str:
+                raise ValueError("path is required for op_stat")
+            proj_id = req.get("project_id")
+            allowed_roots = []
+            if proj_id:
+                proj = jobs_cfg.projects.get(proj_id)
+                if proj is None:
+                    raise ValueError(f"unknown project_id: {proj_id!r}")
+                allowed_roots = [proj.repo_path] + list(proj.file_roots)
+            else:
+                for p in jobs_cfg.projects.values():
+                    allowed_roots.append(p.repo_path)
+                    allowed_roots.extend(p.file_roots)
+
+            cand = Path(path_str)
+            resolved_cand = None
+            if cand.is_absolute():
+                for root in allowed_roots:
+                    if is_path_contained(root, cand):
+                        resolved_cand = cand
+                        break
+            else:
+                for root in allowed_roots:
+                    c = (root / cand).resolve()
+                    if is_path_contained(root, c):
+                        resolved_cand = c
+                        break
+
+            if resolved_cand is None:
+                raise ValueError(f"path {path_str!r} escapes allowed roots containment")
+
+            if not resolved_cand.exists():
+                return {"status": "ok", "path": path_str, "exists": False}
+
+            is_f = resolved_cand.is_file()
+            is_d = resolved_cand.is_dir()
+            st = resolved_cand.stat()
+            mtime_iso = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()
+            sha_val = None
+            if is_f and st.st_size <= 10 * 1024 * 1024:
+                sha_val = hashlib.sha256(resolved_cand.read_bytes()).hexdigest()
+
+            return {
+                "status": "ok",
+                "path": str(resolved_cand),
+                "exists": True,
+                "is_file": is_f,
+                "is_dir": is_d,
+                "size_bytes": st.st_size if is_f else None,
+                "modified_at": mtime_iso,
+                "sha256": sha_val,
+            }
 
     _JOB_OPERATIONS = frozenset({"job_start", "job_status", "job_logs", "job_cancel", "job_artifact"})
     if operation in _JOB_OPERATIONS:
@@ -112,6 +541,12 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             "artifact_name",
             "input_payload",
             "input_digest",
+            "parameters",
+            "job_spec",
+            "spec_hash",
+            "parameters_digest",
+            "execution_policy_digest",
+            "resolution_digest",
         })
         unknown = sorted(set(req.keys()) - _ALLOWED_JOB_FIELDS)
         if unknown:
@@ -119,6 +554,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
 
         from dev_orchestrator.jobs.config import (
             load_jobs_config,
+            resolve_execution_policy,
             resolve_remote_jobs_config_path,
             validate_and_resolve_execution,
         )
@@ -141,11 +577,26 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             if not proj_id or not cmd_ref:
                 raise ValueError("project_id and command_ref are required for job_start")
             expected_cwd = req.get("expected_working_directory")
-            ok, failure_kind, resolved_cwd, cmd_cfg = validate_and_resolve_execution(
-                jobs_cfg, proj_id, cmd_ref, expected_working_directory=expected_cwd
+            params = req.get("parameters")
+            ok, failure_kind, resolved = resolve_execution_policy(
+                jobs_cfg, proj_id, cmd_ref, parameters=params, expected_working_directory=expected_cwd
             )
             if not ok:
+                if failure_kind and "hardware" in failure_kind:
+                    raise ValueError("hardware_execution_not_supported_in_p18")
                 raise ValueError(f"execution validation failed: {failure_kind}")
+            assert resolved is not None
+            if resolved.effect_class == "hardware":
+                raise ValueError("hardware_execution_not_supported_in_p18")
+
+            incoming_spec = req.get("job_spec")
+            if isinstance(incoming_spec, dict):
+                if (
+                    incoming_spec.get("parameters_digest") != resolved.parameters_digest
+                    or incoming_spec.get("execution_policy_digest") != resolved.execution_policy_digest
+                    or incoming_spec.get("resolution_digest") != resolved.resolution_digest
+                ):
+                    raise ValueError("tampered job_spec digest mismatch")
 
             idem_key = req.get("idempotency_key") or req.get("job_id")
             if not idem_key:
@@ -157,13 +608,16 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 idempotency_key=str(idem_key),
                 expected_working_directory=expected_cwd,
                 input_digest=str(input_digest) if input_digest else None,
+                parameters_digest=resolved.parameters_digest,
+                execution_policy_digest=resolved.execution_policy_digest,
+                resolution_digest=resolved.resolution_digest,
             )
             target_job_id = req.get("job_id") or job_id_for(spec)
 
             def _factory(jid: str, shash: str) -> JobRecord:
                 now = utc_now_iso()
                 jdir = store._job_dir(jid)
-                resolved_argv = [arg.replace("{job_dir}", str(jdir)) for arg in cmd_cfg.argv]
+                resolved_argv = [arg.replace("{job_dir}", str(jdir)) for arg in resolved.resolved_argv]
                 return JobRecord(
                     job_id=jid,
                     idempotency_key=spec.idempotency_key,
@@ -172,14 +626,18 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                     project_id=spec.project_id,
                     command_ref=spec.command_ref,
                     resolved_argv=resolved_argv,
-                    working_directory=str(resolved_cwd),
+                    working_directory=str(resolved.resolved_cwd),
                     transport="local",
                     host_identity=socket.gethostname(),
-                    duration_class=cmd_cfg.duration_class,
-                    max_runtime_seconds=cmd_cfg.max_runtime_seconds,
-                    heartbeat_interval_seconds=cmd_cfg.heartbeat_interval_seconds,
+                    duration_class=resolved.duration_class,
+                    max_runtime_seconds=resolved.max_runtime_seconds,
+                    heartbeat_interval_seconds=resolved.heartbeat_interval_seconds,
                     log_caps=dict(jobs_cfg.log_caps),
                     input_digest=spec.input_digest,
+                    parameters=resolved.canonical_parameters,
+                    parameters_digest=resolved.parameters_digest,
+                    execution_policy_digest=resolved.execution_policy_digest,
+                    resolution_digest=resolved.resolution_digest,
                     state="queued",
                     timestamps={"created_at": now, "queued_at": now, "updated_at": now},
                 )

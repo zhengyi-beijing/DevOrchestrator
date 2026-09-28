@@ -242,3 +242,18 @@ class ControlAdapterClient:
                     f"cross-project access denied: command {command_id!r} belongs to project {cmd_project!r}, not {project_id!r}"
                 )
         return result
+
+    def transport_hosts(self) -> dict[str, Any]:
+        """Fetch configured transport hosts."""
+        return self._request("GET", "/api/v1/control/transport/hosts")
+
+    def transport_capabilities(self, host_id: str | None = None) -> dict[str, Any]:
+        """Fetch host capabilities."""
+        path = "/api/v1/control/transport/capabilities"
+        if host_id:
+            path += f"?host_id={urllib.parse.quote(host_id)}"
+        return self._request("GET", path)
+
+    def transport_operations(self, limit: int = 50) -> dict[str, Any]:
+        """Fetch recent transport operations."""
+        return self._request("GET", f"/api/v1/control/transport/operations?limit={limit}")

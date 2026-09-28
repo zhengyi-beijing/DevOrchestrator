@@ -75,6 +75,9 @@ class JobSpec:
     transport: str = "local"
     expected_working_directory: Optional[str] = None
     input_digest: Optional[str] = None
+    parameters_digest: Optional[str] = None
+    execution_policy_digest: Optional[str] = None
+    resolution_digest: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -101,6 +104,12 @@ class JobSpec:
         }
         if self.input_digest is not None:
             d["input_digest"] = self.input_digest
+        if self.parameters_digest is not None:
+            d["parameters_digest"] = self.parameters_digest
+        if self.execution_policy_digest is not None:
+            d["execution_policy_digest"] = self.execution_policy_digest
+        if self.resolution_digest is not None:
+            d["resolution_digest"] = self.resolution_digest
         return d
 
     @classmethod
@@ -118,6 +127,9 @@ class JobSpec:
             "transport",
             "expected_working_directory",
             "input_digest",
+            "parameters_digest",
+            "execution_policy_digest",
+            "resolution_digest",
             "metadata",
         }
         filtered = {k: data[k] for k in allowed if k in data and data[k] is not None}
@@ -223,6 +235,12 @@ class JobRecord:
         "evidence": None,
     })
     input_digest: Optional[str] = None
+    submission_spec: Optional[dict[str, Any]] = None
+    parameters: Optional[dict[str, Any]] = None
+    parameters_digest: Optional[str] = None
+    execution_policy_digest: Optional[str] = None
+    resolution_digest: Optional[str] = None
+    write_intent: Optional[dict[str, Any]] = None
     artifacts: dict[str, Any] = field(default_factory=dict)
 
     def transition_to(
