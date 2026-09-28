@@ -231,6 +231,201 @@ class TestP18SelectorAndSecurity(unittest.TestCase):
         output_caps = json.loads(buf_caps.getvalue())
         self.assertEqual(output_caps["host_id"], "local")
 
+    def _start_server(self):
+        (self.root / "daemon.token").write_text("master-test-token\n", encoding="utf-8")
+        cfg_file = self.root / "execution-jobs.json"
+        from dev_orchestrator.storage.json_store import write_json, utc_now_iso
+        write_json(
+            cfg_file,
+            {
+                "runtime_root": str(self.root),
+                "projects": {
+                    "p1": {
+                        "repo_path": str(self.root),
+                        "file_roots": [str(self.root)],
+                        "commands": {
+                            "ro": {"argv": ["python", "-c", "import sys; sys.stdout.write('ok')"], "cwd": ".", "effect_class": "read_only"},
+                            "mut": {"argv": ["python", "-c", "import sys; sys.stdout.write('mut_ok')"], "cwd": ".", "effect_class": "effectful"},
+                        },
+                    }
+                },
+            },
+        )
+        write_json(
+            self.root / "transport-hosts.json",
+            {
+                "default_host": "local",
+                "hosts": {
+                    "local": {
+                        "host_id": "local",
+                        "candidate_order": ["local"],
+                    }
+                },
+            },
+        )
+        from dev_orchestrator.web.server import DevOrchestratorHTTPServer
+        import threading
+        server = DevOrchestratorHTTPServer(
+            ("127.0.0.1", 0),
+            runtime_root=self.root,
+            web_root=self.root,
+            listen_label="127.0.0.1",
+            started_at=utc_now_iso(),
+            enable_control=True,
+            config_path=cfg_file,
+        )
+        t = threading.Thread(target=server.serve_forever)
+        t.daemon = True
+        t.start()
+        return server
+
+    def test_transport_http_routes_enforce_capability_scope_and_nonce_replay(self):
+        """HTTP transport routes enforce capability scope and reject missing/replayed nonces with 403."""
+        import urllib.request
+        import urllib.error
+
+        server = self._start_server()
+        port = server.server_address[1]
+        try:
+            cap = create_transport_capability(
+                project_id="p1",
+                host_id="local",
+                allowed_operations=["exec"],
+                runtime_root=self.root,
+            )
+            tok = cap["token"]
+
+            req_data = json.dumps({
+                "project_id": "p1",
+                "command_ref": "ro",
+                "host_id": "local",
+            }).encode("utf-8")
+
+            # 1. Valid request with nonce succeeds
+            headers_ok = {
+                "Authorization": f"Bearer {tok}",
+                "X-DevOrch-Nonce": "nonce-fresh-1",
+                "Content-Type": "application/json",
+            }
+            req_ok = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/exec",
+                data=req_data,
+                headers=headers_ok,
+            )
+            with urllib.request.urlopen(req_ok) as resp:
+                self.assertEqual(resp.status, 200)
+                body = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(body["data"]["status"], "ok")
+
+            # 2. Replay of same nonce is rejected with 403
+            req_replay = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/exec",
+                data=req_data,
+                headers=headers_ok,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_replay)
+            self.assertEqual(ctx.exception.code, 403)
+
+            # 3. Missing nonce is rejected with 403
+            headers_no_nonce = {
+                "Authorization": f"Bearer {tok}",
+                "Content-Type": "application/json",
+            }
+            req_no_nonce = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/exec",
+                data=req_data,
+                headers=headers_no_nonce,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_no_nonce)
+            self.assertEqual(ctx.exception.code, 403)
+
+            # 4. Out of scope operation (spawn on exec-only token) is rejected with 403
+            headers_spawn = {
+                "Authorization": f"Bearer {tok}",
+                "X-DevOrch-Nonce": "nonce-fresh-2",
+                "Content-Type": "application/json",
+            }
+            req_spawn = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/spawn",
+                data=req_data,
+                headers=headers_spawn,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_spawn)
+            self.assertEqual(ctx.exception.code, 403)
+        finally:
+            server.shutdown()
+
+    def test_transport_spawn_route_logs_operation_and_returns_success(self):
+        """POST /api/v1/control/transport/spawn logs operation and returns 202."""
+        import urllib.request
+
+        server = self._start_server()
+        port = server.server_address[1]
+        try:
+            req_data = json.dumps({
+                "project_id": "p1",
+                "command_ref": "mut",
+                "host_id": "local",
+            }).encode("utf-8")
+            headers = {
+                "Authorization": f"Bearer {server.control_security.token()}",
+                "Content-Type": "application/json",
+            }
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/spawn",
+                data=req_data,
+                headers=headers,
+            )
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 202)
+                body = json.loads(resp.read().decode("utf-8"))
+                self.assertIn(body["data"]["status"], ("ok", "queued", "running"))
+                self.assertIsNotNone(body["data"]["job_id"])
+
+            log_file = self.root / "logs" / "transport-operations.ndjson"
+            self.assertTrue(log_file.is_file())
+            content = log_file.read_text(encoding="utf-8")
+            self.assertIn('"operation": "spawn"', content)
+            self.assertIn('"command_ref": "mut"', content)
+        finally:
+            server.shutdown()
+
+    def test_transport_operations_route_returns_logged_rows(self):
+        """GET /api/v1/control/transport/operations returns logged rows via read_transport_operations."""
+        import urllib.request
+        from dev_orchestrator.transport.observability import log_transport_operation
+
+        log_transport_operation(
+            self.root,
+            operation_id="op-audit-12345",
+            operation="exec",
+            host_id="local",
+            selected_transport="local",
+            status="ok",
+            command_ref="ro",
+        )
+
+        server = self._start_server()
+        port = server.server_address[1]
+        try:
+            headers = {
+                "Authorization": f"Bearer {server.control_security.token()}",
+            }
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/operations?limit=10",
+                headers=headers,
+            )
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+                body = json.loads(resp.read().decode("utf-8"))
+                ops = body["data"]["operations"]
+                self.assertTrue(any(row.get("operation_id") == "op-audit-12345" for row in ops))
+        finally:
+            server.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -280,6 +280,193 @@ class TestP18BinaryStagingAndWrite(unittest.TestCase):
             self.store.apply_file_write(req, [str(self.repo_dir)])
         self.assertIn("escapes configured file roots", str(ctx.exception))
 
+    def test_crash_after_replace_before_applied_record_reconciles_to_applied(self):
+        """If a crash happens after atomic replace but before record is marked applied, next apply reconciles to applied."""
+        initial_payload = b"before write\n"
+        target_file = self.repo_dir / "crash_test.txt"
+        target_file.write_bytes(initial_payload)
+        pre_sha = "sha256:" + hashlib.sha256(initial_payload).hexdigest()
+
+        new_payload = b"after write replaced\n"
+        b64_str = base64.b64encode(new_payload).decode("ascii")
+        post_sha = "sha256:" + hashlib.sha256(new_payload).hexdigest()
+
+        staged = self.store.stage_content(WriteContentUpload("p1", "local", b64_str, len(new_payload), post_sha))
+
+        idem_key = "crash-rec-1"
+        from dev_orchestrator.jobs.config import canonical_path
+        from dev_orchestrator.storage.json_store import write_json, read_json, utc_now_iso
+        write_id = self.store.derive_write_id("p1", idem_key)
+        intent_file = self.store._intent_path(write_id)
+        intent_file.parent.mkdir(parents=True, exist_ok=True)
+        c_target = canonical_path(target_file)
+        canonical_intent = {
+            "write_id": write_id,
+            "project_id": "p1",
+            "host_id": "local",
+            "target_path": c_target,
+            "idempotency_key": idem_key,
+            "content_ref": staged.content_ref,
+            "content_sha256": post_sha,
+            "decoded_size_bytes": len(new_payload),
+            "precondition": {"expected_sha256": pre_sha},
+            "file_policy_digest": None,
+        }
+        import json
+        intent_digest = "sha256:" + hashlib.sha256(
+            json.dumps(canonical_intent, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        # Simulate state="claimed" recorded before the atomic replace
+        write_json(
+            intent_file,
+            {
+                **canonical_intent,
+                "intent_digest": intent_digest,
+                "state": "claimed",
+                "pre_digest": pre_sha,
+                "created_at": utc_now_iso(),
+                "updated_at": utc_now_iso(),
+            },
+        )
+        # Target file has been replaced on disk with new_payload
+        target_file.write_bytes(new_payload)
+
+        # Call apply_file_write
+        req = FileWriteRequest(
+            project_id="p1",
+            host_id="local",
+            target_path=str(target_file),
+            idempotency_key=idem_key,
+            content_ref=staged.content_ref,
+            content_sha256=post_sha,
+            decoded_size_bytes=len(new_payload),
+            expected_sha256=pre_sha,
+        )
+        res = self.store.apply_file_write(req, [str(self.repo_dir)])
+        self.assertEqual(res.status, "ok")
+        self.assertEqual(res.pre_digest, pre_sha)
+        self.assertEqual(res.post_digest, post_sha)
+
+        saved_intent = read_json(intent_file, {})
+        self.assertEqual(saved_intent.get("state"), "applied")
+        self.assertEqual(saved_intent.get("pre_digest"), pre_sha)
+        self.assertEqual(saved_intent.get("post_digest"), post_sha)
+
+    def test_read_digest_is_accepted_as_write_precondition(self):
+        """Read digest format with sha256: prefix is accepted by CAS write without mismatch."""
+        from dev_orchestrator.jobs.config import JobProjectConfig, JobsConfig
+        from dev_orchestrator.transport.local import LocalMachineTransport
+        from dev_orchestrator.transport.contracts import FileReadRequest
+
+        target_file = self.repo_dir / "precond_test.txt"
+        initial_data = b"version 1 data\n"
+        target_file.write_bytes(initial_data)
+
+        cfg = JobsConfig(
+            runtime_root=self.root,
+            enabled=True,
+            projects={
+                "p1": JobProjectConfig(
+                    repo_path=self.repo_dir,
+                    file_roots=[self.repo_dir],
+                    commands={},
+                )
+            },
+        )
+        transport = LocalMachineTransport(jobs_config=cfg)
+
+        read_res = transport.read_file(FileReadRequest(
+            project_id="p1",
+            path=str(target_file),
+            host_id="local",
+        ))
+        self.assertEqual(read_res.status, "ok")
+        self.assertTrue(read_res.content_sha256.startswith("sha256:"))
+
+        # Stage version 2
+        v2_data = b"version 2 updated data\n"
+        v2_b64 = base64.b64encode(v2_data).decode("ascii")
+        v2_sha = "sha256:" + hashlib.sha256(v2_data).hexdigest()
+        staged = transport.stage_write_content(WriteContentUpload(
+            project_id="p1",
+            host_id="local",
+            content_base64=v2_b64,
+            decoded_size_bytes=len(v2_data),
+            content_sha256=v2_sha,
+        ))
+
+        # Use read_res.content_sha256 directly as expected_sha256
+        write_req = FileWriteRequest(
+            project_id="p1",
+            host_id="local",
+            target_path=str(target_file),
+            idempotency_key="write-cas-read-precond",
+            content_ref=staged.content_ref,
+            content_sha256=v2_sha,
+            decoded_size_bytes=len(v2_data),
+            expected_sha256=read_res.content_sha256,
+        )
+        write_res = transport.write_file(write_req)
+        self.assertEqual(write_res.status, "ok")
+        self.assertEqual(write_res.pre_digest, read_res.content_sha256)
+        self.assertEqual(target_file.read_bytes(), v2_data)
+
+    def test_concurrent_reconcile_does_not_clobber_terminal_intent(self):
+        """Reconciliation reads intent under lock and does not clobber terminal applied state."""
+        target_file = self.repo_dir / "term_test.txt"
+        content = b"terminal state content\n"
+        target_file.write_bytes(content)
+        content_sha = "sha256:" + hashlib.sha256(content).hexdigest()
+
+        staged = self.store.stage_content(WriteContentUpload("p1", "local", base64.b64encode(content).decode("ascii"), len(content), content_sha))
+
+        req = FileWriteRequest(
+            project_id="p1",
+            host_id="local",
+            target_path=str(target_file),
+            idempotency_key="concurrent-term-1",
+            content_ref=staged.content_ref,
+            content_sha256=content_sha,
+            decoded_size_bytes=len(content),
+            expected_sha256=content_sha,
+        )
+
+        from dev_orchestrator.storage.json_store import write_json, read_json
+        write_id = self.store.derive_write_id(req.project_id, req.idempotency_key)
+        intent_file = self.store._intent_path(write_id)
+        intent_file.parent.mkdir(parents=True, exist_ok=True)
+        orig_applied_at = "2026-09-28T10:00:00Z"
+        write_json(
+            intent_file,
+            {
+                "write_id": write_id,
+                "idempotency_key": req.idempotency_key,
+                "project_id": "p1",
+                "host_id": "local",
+                "target_path": str(target_file.resolve()),
+                "content_ref": staged.content_ref,
+                "content_sha256": content_sha,
+                "decoded_size_bytes": len(content),
+                "expected_sha256": content_sha,
+                "if_absent": None,
+                "state": "applied",
+                "pre_digest": content_sha,
+                "post_digest": content_sha,
+                "applied_at": orig_applied_at,
+                "created_at": orig_applied_at,
+                "updated_at": orig_applied_at,
+            },
+        )
+
+        rec_res = self.store.reconcile_file_write(req.project_id, req.idempotency_key)
+        self.assertEqual(rec_res.status, "ok")
+        self.assertEqual(rec_res.applied_at, orig_applied_at)
+
+        # Ensure intent file was not overwritten with altered state
+        saved = read_json(intent_file, {})
+        self.assertEqual(saved.get("state"), "applied")
+        self.assertEqual(saved.get("applied_at"), orig_applied_at)
+
 
 if __name__ == "__main__":
     unittest.main()

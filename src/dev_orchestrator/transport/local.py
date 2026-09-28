@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timezone
 import hashlib
 import os
@@ -296,7 +297,7 @@ class LocalMachineTransport:
                 f.seek(request.offset_bytes)
             data = f.read(request.max_bytes)
 
-        sha = hashlib.sha256(data).hexdigest()
+        sha = "sha256:" + hashlib.sha256(data).hexdigest()
         return FileResult(
             status="ok",
             path=str(resolved_target),
@@ -308,12 +309,9 @@ class LocalMachineTransport:
 
     def stage_write_content(self, upload: WriteContentUpload) -> StagedWriteContent:
         """Stage arbitrary binary content and return an opaque digest-verified content ref."""
-        return self.store.stage_write_content(
-            upload.project_id,
-            upload.content_base64,
-            upload.content_sha256,
-            upload.decoded_size_bytes,
-        )
+        proj = self.jobs_cfg.projects.get(upload.project_id)
+        max_bytes = proj.max_file_write_bytes if proj else 8 * 1024 * 1024
+        return self.store.stage_write_content(upload, max_bytes=max_bytes)
 
     def write_file(self, request: FileWriteRequest) -> FileResult:
         """Commit a staged binary write under CAS preconditions and canonical path locking."""
@@ -340,25 +338,11 @@ class LocalMachineTransport:
         if resolved_target is None or target_root is None:
             raise TransportRejectedError(f"target path {request.target_path!r} escapes project containment")
 
-        res_dict = self.store.apply_file_write(
-            project_id=request.project_id,
-            relative_path=str(resolved_target),
-            staging_token=request.content_ref,
-            expected_sha256=request.expected_sha256,
-            must_create=request.if_absent,
-            base_dir=target_root,
-        )
-        return FileResult(
-            status=res_dict.get("status", "ok"),
-            path=res_dict.get("target_path", request.target_path),
-            content_sha256=res_dict.get("content_sha256"),
-            size_bytes=res_dict.get("size_bytes"),
-            pre_digest=res_dict.get("pre_digest"),
-            post_digest=res_dict.get("post_digest"),
-            applied_at=res_dict.get("applied_at"),
+        req = dataclasses.replace(request, target_path=str(resolved_target))
+        return self.store.apply_file_write(
+            req,
+            [str(r) for r in allowed_roots],
             host_identity=socket.gethostname(),
-            error=res_dict.get("error"),
-            raw_evidence=res_dict,
         )
 
     def stat(
@@ -414,7 +398,7 @@ class LocalMachineTransport:
         mtime_iso = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()
         sha: Optional[str] = None
         if is_file and st.st_size <= 10 * 1024 * 1024:
-            sha = hashlib.sha256(resolved_cand.read_bytes()).hexdigest()
+            sha = "sha256:" + hashlib.sha256(resolved_cand.read_bytes()).hexdigest()
 
         return StatResult(
             status="ok",

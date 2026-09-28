@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
 from dev_orchestrator.ai.execution_transport import ExecutionTransportError
+
+
+def canonical_sha256(digest_or_bytes: str | bytes) -> str:
+    """Return a canonical 'sha256:' prefixed lowercase hex digest."""
+    if isinstance(digest_or_bytes, bytes):
+        return "sha256:" + hashlib.sha256(digest_or_bytes).hexdigest().lower()
+    if not isinstance(digest_or_bytes, str):
+        raise TypeError(f"expected str or bytes, got {type(digest_or_bytes).__name__}")
+    val = digest_or_bytes.strip()
+    if val.startswith("sha256:"):
+        return "sha256:" + val[7:].lower()
+    return "sha256:" + val.lower()
 
 
 class TransportError(ExecutionTransportError):

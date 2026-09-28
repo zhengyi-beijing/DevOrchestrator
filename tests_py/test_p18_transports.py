@@ -265,6 +265,205 @@ class TestP18Transports(unittest.TestCase):
         with self.assertRaises(TransportRejectedError):
             rdc.stage_write_content(WriteContentUpload("p1", "rdc", "aGVsbG8=", 5, "sha256:123"))
 
+    def test_local_stage_write_and_cas_write_end_to_end(self):
+        """LocalMachineTransport stages binary content and executes CAS write intent."""
+        from dev_orchestrator.transport.contracts import canonical_sha256
+        import base64
+
+        data = b"Hello from local CAS write!\n"
+        b64_data = base64.b64encode(data).decode("ascii")
+        sha_data = canonical_sha256(data)
+
+        # 1. Stage content
+        upload = WriteContentUpload(
+            project_id="p1",
+            host_id="local",
+            content_base64=b64_data,
+            decoded_size_bytes=len(data),
+            content_sha256=sha_data,
+        )
+        staged = self.local_transport.stage_write_content(upload)
+        self.assertTrue(staged.content_ref.startswith("stage:p1:sha256:"))
+        self.assertEqual(staged.content_sha256, sha_data)
+
+        # 2. Write file if_absent
+        target_rel = "src/cas_file.txt"
+        write_req = FileWriteRequest(
+            project_id="p1",
+            host_id="local",
+            target_path=target_rel,
+            idempotency_key="write-cas-1",
+            content_ref=staged.content_ref,
+            content_sha256=sha_data,
+            decoded_size_bytes=len(data),
+            if_absent=True,
+        )
+        res = self.local_transport.write_file(write_req)
+        self.assertEqual(res.status, "ok")
+        self.assertEqual(res.content_sha256, sha_data)
+        self.assertTrue((self.repo_dir / target_rel).is_file())
+        self.assertEqual((self.repo_dir / target_rel).read_bytes(), data)
+
+        # 3. Overwrite with expected_sha256 precondition
+        new_data = b"Updated content!\n"
+        new_b64 = base64.b64encode(new_data).decode("ascii")
+        new_sha = canonical_sha256(new_data)
+        staged_new = self.local_transport.stage_write_content(
+            WriteContentUpload(
+                project_id="p1",
+                host_id="local",
+                content_base64=new_b64,
+                decoded_size_bytes=len(new_data),
+                content_sha256=new_sha,
+            )
+        )
+        write_update = FileWriteRequest(
+            project_id="p1",
+            host_id="local",
+            target_path=target_rel,
+            idempotency_key="write-cas-2",
+            content_ref=staged_new.content_ref,
+            content_sha256=new_sha,
+            decoded_size_bytes=len(new_data),
+            expected_sha256=sha_data,
+        )
+        res_update = self.local_transport.write_file(write_update)
+        self.assertEqual(res_update.status, "ok")
+        self.assertEqual((self.repo_dir / target_rel).read_bytes(), new_data)
+
+        # 4. Conflicting expected_sha256 fails precondition
+        write_bad = FileWriteRequest(
+            project_id="p1",
+            host_id="local",
+            target_path=target_rel,
+            idempotency_key="write-cas-3",
+            content_ref=staged.content_ref,
+            content_sha256=sha_data,
+            decoded_size_bytes=len(data),
+            expected_sha256="sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        res_bad = self.local_transport.write_file(write_bad)
+        self.assertEqual(res_bad.status, "failed")
+
+    def test_remote_helper_stage_write_and_write_file_operations(self):
+        """remote_helper execute_request op_stage_write and op_write_file work end-to-end."""
+        import os
+        from dev_orchestrator.ai.remote_helper import execute_request
+        from dev_orchestrator.storage.json_store import write_json
+
+        # Write jobs config for remote_helper
+        cfg_file = self.root / "projects.json"
+        write_json(
+            cfg_file,
+            {
+                "runtime_root": str(self.root),
+                "projects": {
+                    "p1": {
+                        "repo_path": str(self.repo_dir),
+                        "file_roots": [str(self.repo_dir)],
+                        "commands": {
+                            "ro": {"argv": ["python", "-c", "print('ok')"], "cwd": ".", "effect_class": "read_only"}
+                        },
+                    }
+                },
+            },
+        )
+        old_env = os.environ.get("DEVORCH_JOBS_CONFIG")
+        os.environ["DEVORCH_JOBS_CONFIG"] = str(cfg_file)
+        try:
+            from dev_orchestrator.transport.contracts import canonical_sha256
+            raw_bytes = b"Hello from remote_helper wire!\n"
+            b64_str = base64.b64encode(raw_bytes).decode("ascii")
+            sha_val = canonical_sha256(raw_bytes)
+
+            stage_req = {
+                "operation": "op_stage_write",
+                "request_id": "req-stage-1",
+                "project_id": "p1",
+                "content_base64": b64_str,
+                "decoded_size_bytes": len(raw_bytes),
+                "content_sha256": sha_val,
+            }
+            stage_res = execute_request(stage_req)
+            self.assertEqual(stage_res["status"], "ok")
+            c_ref = stage_res["content_ref"]
+            self.assertTrue(c_ref.startswith("stage:p1:sha256:"))
+
+            write_req = {
+                "operation": "op_write_file",
+                "request_id": "req-write-1",
+                "project_id": "p1",
+                "target_path": "src/remote_written.txt",
+                "idempotency_key": "write-remote-1",
+                "content_ref": c_ref,
+                "content_sha256": sha_val,
+                "decoded_size_bytes": len(raw_bytes),
+                "if_absent": True,
+            }
+            write_res = execute_request(write_req)
+            self.assertEqual(write_res["status"], "ok")
+            self.assertEqual(write_res["content_sha256"], sha_val)
+            self.assertNotIn("content_bytes", write_res)
+            self.assertTrue((self.repo_dir / "src" / "remote_written.txt").is_file())
+            self.assertEqual((self.repo_dir / "src" / "remote_written.txt").read_bytes(), raw_bytes)
+        finally:
+            if old_env is None:
+                os.environ.pop("DEVORCH_JOBS_CONFIG", None)
+            else:
+                os.environ["DEVORCH_JOBS_CONFIG"] = old_env
+
+    def test_remote_helper_op_poll_returns_record_state(self):
+        """remote_helper op_poll returns record state using ExecutionJobStore.get."""
+        import os
+        from dev_orchestrator.ai.remote_helper import execute_request
+        from dev_orchestrator.storage.json_store import write_json
+
+        cfg_file = self.root / "projects.json"
+        write_json(
+            cfg_file,
+            {
+                "runtime_root": str(self.root),
+                "projects": {
+                    "p1": {
+                        "repo_path": str(self.repo_dir),
+                        "commands": {
+                            "ro": {"argv": ["python", "-c", "print('ok')"], "cwd": ".", "effect_class": "read_only"}
+                        },
+                    }
+                },
+            },
+        )
+        old_env = os.environ.get("DEVORCH_JOBS_CONFIG")
+        os.environ["DEVORCH_JOBS_CONFIG"] = str(cfg_file)
+        try:
+            spawn_req = {
+                "operation": "op_spawn",
+                "request_id": "req-spawn-1",
+                "project_id": "p1",
+                "command_ref": "ro",
+                "idempotency_key": "poll-test-1",
+            }
+            spawn_res = execute_request(spawn_req)
+            self.assertEqual(spawn_res["status"], "ok")
+            job_id = spawn_res["job_id"]
+
+            poll_req = {
+                "operation": "op_poll",
+                "request_id": "req-poll-1",
+                "job_id": job_id,
+            }
+            poll_res = execute_request(poll_req)
+            self.assertEqual(poll_res["status"], "ok")
+            self.assertEqual(poll_res["job_id"], job_id)
+            self.assertIn(poll_res["state"], ("queued", "running", "completed"))
+            self.assertIsNotNone(poll_res["execution_policy_digest"])
+            self.assertIsNotNone(poll_res["resolution_digest"])
+        finally:
+            if old_env is None:
+                os.environ.pop("DEVORCH_JOBS_CONFIG", None)
+            else:
+                os.environ["DEVORCH_JOBS_CONFIG"] = old_env
+
 
 if __name__ == "__main__":
     unittest.main()

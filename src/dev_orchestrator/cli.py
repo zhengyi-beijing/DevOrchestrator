@@ -1357,7 +1357,7 @@ def cmd_transport_read(args: argparse.Namespace) -> int:
 
 def cmd_transport_stage_write(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
-    from dev_orchestrator.transport import WriteContentUpload, get_transport_for_host
+    from dev_orchestrator.transport import WriteContentUpload, canonical_sha256, get_transport_for_host
     import dataclasses
     import hashlib
     import base64
@@ -1372,14 +1372,14 @@ def cmd_transport_stage_write(args: argparse.Namespace) -> int:
         data = p.read_bytes()
         content_b64 = base64.b64encode(data).decode("ascii")
         size = len(data)
-        sha = hashlib.sha256(data).hexdigest()
+        sha = canonical_sha256(data)
     elif content_b64:
         try:
             data = base64.b64decode(content_b64, validate=True)
         except Exception as exc:
             raise CliError(f"invalid base64 content: {exc}") from exc
         size = len(data)
-        sha = hashlib.sha256(data).hexdigest()
+        sha = canonical_sha256(data)
     else:
         raise CliError("either --file or --content-base64 is required")
 
@@ -1401,7 +1401,7 @@ def cmd_transport_stage_write(args: argparse.Namespace) -> int:
 
 def cmd_transport_write(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
-    from dev_orchestrator.transport import FileWriteRequest, get_transport_for_host
+    from dev_orchestrator.transport import FileWriteRequest, canonical_sha256, get_transport_for_host
     import dataclasses
     host_id = getattr(args, "host_id", None) or "local"
     req = FileWriteRequest(
@@ -1410,10 +1410,10 @@ def cmd_transport_write(args: argparse.Namespace) -> int:
         target_path=args.target_path,
         idempotency_key=getattr(args, "idempotency_key", None) or str(uuid4()),
         content_ref=args.content_ref,
-        content_sha256=args.content_sha256,
+        content_sha256=canonical_sha256(args.content_sha256) if args.content_sha256 else "",
         decoded_size_bytes=int(args.decoded_size_bytes),
         if_absent=getattr(args, "if_absent", None),
-        expected_sha256=getattr(args, "expected_sha256", None),
+        expected_sha256=canonical_sha256(args.expected_sha256) if getattr(args, "expected_sha256", None) else None,
         expected_file_policy_digest=getattr(args, "expected_file_policy_digest", None),
     )
     try:

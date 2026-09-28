@@ -5,38 +5,30 @@
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P18 Native Execution Transport & RDC Dependency Reduction** (Status: **IMPLEMENTATION_COMPLETE**). Previous task: **P17 Single-Authority Goal Convergence Baseline** (Status: **COMPLETE**).
+Current task: **P18 Native Execution Transport & RDC Dependency Reduction** (Status: **REMEDIATION_COMPLETE**). Previous task: **P17 Single-Authority Goal Convergence Baseline** (Status: **COMPLETE**).
 
-P18 Native Execution Transport & RDC Dependency Reduction evidence (2026-09-28):
-- Authoritative RDC Dependency Inventory: `docs/P18_RDC_DEPENDENCY_INVENTORY.md` published with complete operation classification and hardware boundary rejection rules.
-- Canonical Job Identity & Digest Derivation:
-  - `src/dev_orchestrator/jobs/models.py`: Added optional `parameters_digest`, `execution_policy_digest`, and `resolution_digest` to `JobSpec` (omitted in canonical dict when None to guarantee byte-identical SHA-256 legacy hash stability) and `JobRecord`.
-  - `src/dev_orchestrator/jobs/config.py`: Parameter schemas (`enum`, `integer`, `path_within_repo`), whole-element parameter substitution in argv, digest derivation functions (`compute_parameters_digest`, `compute_execution_policy_digest`, `compute_resolution_digest`), and `resolve_execution_policy` returning dual attribute/item access `ResolvedExecutionPolicy`.
-- Machine Transport Contracts & Implementations:
-  - `src/dev_orchestrator/transport/contracts.py`: Dataclasses, `MachineTransport` protocol, typed error hierarchy (`TransportError`, `TransportUnavailableError`, `TransportRejectedError`, `TransportAmbiguousError`).
-  - `src/dev_orchestrator/transport/local.py`: `LocalMachineTransport` implementing synchronous exec (read_only only), spawn, poll, cancel, read_file, stage_write_content, write_file, stat, and capabilities.
-  - `src/dev_orchestrator/transport/ssh.py`: `SSHMachineTransport` delegating to remote helper envelope over OpenSSH with host identity verification.
-  - `src/dev_orchestrator/transport/rdc.py`: `RDCTransport` fallback descriptor indicating interactive escalation requirement.
-  - `src/dev_orchestrator/transport/hosts.py`: `TransportHostProfile`, `TransportHostsConfig`, `load_transport_hosts_config`, `discover_local_capabilities`, `get_transport_for_host`.
-  - `src/dev_orchestrator/transport/selector.py`: `select_transport()` enforcing candidate ordering, approved policy pins, hardware rejection, and failover boundaries.
-- Binary Staging Store & CAS Writes:
-  - `src/dev_orchestrator/transport/write_store.py`: `WriteStagingStore` enforcing RFC 4648 Base64 strict validation, size limit (`MAX_FILE_WRITE_BYTES = 8 MiB`), SHA-256 validation, atomic tempfile replacement, path locking, and CAS write intent execution (`if_absent`, `expected_sha256`).
-  - `src/dev_orchestrator/jobs/store.py`: Integrated file staging and CAS write delegation with `write_store` property.
-- Remote Helper Wire Authority & Containment:
-  - `src/dev_orchestrator/ai/remote_helper.py`: Added closed `_MACHINE_OPERATIONS`, rejecting client-supplied authority (`argv`, `cwd`, `env`, etc.) with `wire_authority_violation`.
-- Control Plane Security & Nonce Replay Protection:
-  - `src/dev_orchestrator/control/security.py`: Added capability token management (`create_transport_capability`, `validate_transport_capability`, `revoke_transport_capability`) and single-use `consume_request_nonce` replay protection.
-- Control Adapters, Web API, and CLI:
-  - `src/dev_orchestrator/control/adapter.py`: Added `transport_hosts()`, `transport_capabilities()`, `transport_operations()`.
-  - `src/dev_orchestrator/control/mcp_adapter.py`: Added MCP tools `devorch_transport_hosts`, `devorch_transport_capabilities`, `devorch_transport_operations` (enabled via `enable_transport_tools`).
-  - `src/dev_orchestrator/web/server.py`: Added `/api/v1/control/transport/*` endpoints (exec, spawn, poll, cancel, read, stage-write, write, stat, capabilities, hosts).
-  - `src/dev_orchestrator/cli.py`: Added 10 CLI verbs (`transport-exec`, `transport-spawn`, `transport-poll`, `transport-cancel`, `transport-read`, `transport-stage-write`, `transport-write`, `transport-stat`, `transport-capabilities`, `transport-hosts`).
+P18 Technical Review Round 1 Remediation Evidence (2026-09-28):
+- Addressed all 9 Technical Review findings from `runtime/ai-reviewer.json`:
+  1. Finding 1 (Remote helper poll signature): Updated `op_poll` in `src/dev_orchestrator/ai/remote_helper.py` to call `store.get(job_id)` instead of non-existent `store.get_record(job_id)`.
+  2. Finding 2 (validate_transport_capability argument mismatch): In `src/dev_orchestrator/web/server.py`, called `security.validate_transport_capability` using keyword arguments (`project_id`, `host_id`, `operation`, `command_ref`, `path`) and separated nonce verification.
+  3. Finding 3 (stage_write_content signature mismatch): In `src/dev_orchestrator/transport/local.py` and `remote_helper.py`, passed `WriteContentUpload` instance as first positional argument to `store.stage_write_content(upload, max_bytes=max_bytes)`.
+  4. Finding 4 (write_file argument and target path forwarding): In `src/dev_orchestrator/transport/local.py` and `remote_helper.py`, constructed `FileWriteRequest` with resolved `target_path`, passed `allowed_roots=[str(r) for r in allowed_roots]`, passed `host_identity`, and excluded raw `content_bytes` from API response payloads.
+  5. Finding 5 (Re-evaluation of claimed state write intents): In `src/dev_orchestrator/transport/write_store.py`, inspected target file digest when intent is `claimed`; if matching content digest (post-atomic replace crash), promotes intent to `applied`, records post-digest, preserves `pre_digest`, and returns successful result. If matching pre-digest, proceeds with write; if matching neither, marks `ambiguous_requires_human`.
+  6. Finding 6 (Missing single-use nonce validation): In `src/dev_orchestrator/web/server.py` POST transport routes, validated capability token and called `security.consume_request_nonce(row["capability_id"], nonce)` returning 403 Forbidden on missing or replayed nonces.
+  7. Finding 7 (sha256 digest format normalization): Introduced `canonical_sha256(digest_or_bytes)` in `src/dev_orchestrator/transport/contracts.py` ensuring `"sha256:"` lowercase hex prefix across read, stat, staging, and CAS writes in `local.py`, `remote_helper.py`, `write_store.py`, and `cli.py`.
+  8. Finding 8 (read_transport_operations signature and NDJSON logging): In `src/dev_orchestrator/web/server.py`, invoked `read_transport_operations(runtime, cursor=cursor, limit=limit)`. In `src/dev_orchestrator/transport/observability.py`, serialized records directly as NDJSON with secret redaction and bounded log compaction.
+  9. Finding 9 (Race condition in reconcile_file_write): In `src/dev_orchestrator/transport/write_store.py`, read intent under `InterProcessFileLock(lock_file)` before evaluating or mutating state to prevent clobbering concurrent terminal writes.
+- HTTP Transport Route Authorization:
+  - In `src/dev_orchestrator/web/server.py`, exempted `/api/v1/control/transport/*` endpoints from master-only `_owner_authorized()` gate, allowing transport capability tokens with single-use nonces while preserving loopback requirement and master bearer token authorization.
+  - Added missing `from uuid import uuid4` import and implemented `_authorized_control_read` on `_DashboardHandler` supporting both master authorization and scoped capability tokens.
+- Acceptance Readiness:
+  - Codebase is fully prepared for live Windows acceptance exercise for ZXZ-PC without RDC/GUI. Routine command, file read/write/stat, job spawn/poll/cancel operations run native without Remote Desktop escalation.
 - Verification Summary:
-  - 5 dedicated P18 test suites (34 tests): 100% passed in 0.79s.
-  - Related P13/P14 regression suites (70 tests): 100% passed in 10.68s.
-  - Full test suite: 1549 tests passed.
-  - `graphify update .` completed cleanly.
-  - `git diff --check` clean with 0 warnings/errors.
+  - 43/43 P18 tests passed across all 5 test suites (`test_p18_binary_staging_and_write.py`, `test_p18_canonical_identity.py`, `test_p18_config_and_parameters.py`, `test_p18_selector_and_security.py`, `test_p18_transports.py`).
+  - 210/210 regression tests passed in P13, P14, P145 suites (0 failures).
+  - Python AST and syntax compilation clean (`compileall src ops tests_py`).
+  - `git diff --check` clean with 0 warnings or whitespace errors.
+  - Knowledge graph updated cleanly via `graphify update .`.
      - Added `consumed_idempotency_keys: tuple[str, ...]` to `WorkRecord` dataclass, canonical serialization (`to_dict` serialized conditionally when non-empty to preserve digest stability for existing fixtures), and `validate_work_record()`.
      - Implemented `model_durable_decision_transition(record, decision, now=...)` in `work_record.py` applying CAS updates for mutative decisions (`EXECUTE`, `RETRY_*`, `FAILOVER_RESOURCE`, `ESCALATE_CAPABILITY`, `VERIFY`, `PUBLISH_SUCCESSOR`, `SATISFY_GOAL`, `WRITE_HANDOFF`), recording active lease with idempotency key, appending consumed idempotency keys, and advancing authority revision.
      - Updated `ActuatorGuard.seed_from_work_record()` to restore consumed keys comprehensively from `successor.handoff_idempotency_key`, `active_lease["idempotency_key"]`, `attempts[*]["idempotency_key"]`, `handoff["idempotency_key"]`, and `consumed_idempotency_keys`.

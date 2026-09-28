@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 from dev_orchestrator.ai.aibroker_subprocess import (
@@ -382,7 +383,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("job_id is required for op_poll")
             store = ExecutionJobStore(jobs_cfg.runtime_root)
             local_transport = LocalJobTransport()
-            record = store.get_record(job_id)
+            record = store.get(job_id)
             status_res = local_transport.job_status(job_id, store._job_dir(job_id))
             return {
                 "status": "ok",
@@ -424,7 +425,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 if offset_bytes:
                     f.seek(offset_bytes)
                 data = f.read(max_bytes)
-            sha = hashlib.sha256(data).hexdigest()
+            sha = "sha256:" + hashlib.sha256(data).hexdigest()
             return {
                 "status": "ok",
                 "path": str(resolved),
@@ -440,8 +441,18 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             size_b = int(req.get("decoded_size_bytes") or 0)
             if not proj_id or not b64_str or not sha:
                 raise ValueError("project_id, content_base64, and content_sha256 are required for op_stage_write")
+            from dev_orchestrator.transport.contracts import WriteContentUpload
+            upload = WriteContentUpload(
+                project_id=proj_id,
+                host_id=req.get("host_id") or socket.gethostname(),
+                content_base64=b64_str,
+                decoded_size_bytes=size_b,
+                content_sha256=sha,
+            )
             store = ExecutionJobStore(jobs_cfg.runtime_root)
-            staged = store.stage_write_content(proj_id, b64_str, sha, size_b)
+            proj = jobs_cfg.projects.get(proj_id)
+            max_bytes = proj.max_file_write_bytes if proj else 8 * 1024 * 1024
+            staged = store.stage_write_content(upload, max_bytes=max_bytes)
             return {
                 "status": "ok",
                 "content_ref": staged.content_ref,
@@ -460,15 +471,32 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             if not proj_id or not target_p or not content_ref:
                 raise ValueError("project_id, target_path, and content_ref are required for op_write_file")
             resolved, root = _resolve_project_target_path(jobs_cfg, proj_id, target_p)
-            store = ExecutionJobStore(jobs_cfg.runtime_root)
-            return store.apply_file_write(
+            proj = jobs_cfg.projects.get(proj_id)
+            allowed_roots = ([proj.repo_path] + list(proj.file_roots)) if proj else [root]
+            from dev_orchestrator.transport.contracts import FileWriteRequest
+            import dataclasses
+            write_req = FileWriteRequest(
                 project_id=proj_id,
-                relative_path=str(resolved),
-                staging_token=content_ref,
+                host_id=req.get("host_id") or socket.gethostname(),
+                target_path=str(resolved),
+                idempotency_key=str(req.get("idempotency_key") or uuid4()),
+                content_ref=content_ref,
+                content_sha256=req.get("content_sha256") or "",
+                decoded_size_bytes=int(req.get("decoded_size_bytes") or 0),
+                if_absent=req.get("if_absent"),
                 expected_sha256=req.get("expected_sha256"),
-                must_create=req.get("if_absent"),
-                base_dir=root,
+                expected_file_policy_digest=req.get("expected_file_policy_digest"),
             )
+            store = ExecutionJobStore(jobs_cfg.runtime_root)
+            f_res = store.apply_file_write(
+                write_req,
+                [str(r) for r in allowed_roots],
+                host_identity=socket.gethostname(),
+            )
+            res_dict = dataclasses.asdict(f_res)
+            if "content_bytes" in res_dict:
+                del res_dict["content_bytes"]
+            return res_dict
 
         if operation == "op_stat":
             path_str = req.get("path")
@@ -512,7 +540,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             mtime_iso = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()
             sha_val = None
             if is_f and st.st_size <= 10 * 1024 * 1024:
-                sha_val = hashlib.sha256(resolved_cand.read_bytes()).hexdigest()
+                sha_val = "sha256:" + hashlib.sha256(resolved_cand.read_bytes()).hexdigest()
 
             return {
                 "status": "ok",

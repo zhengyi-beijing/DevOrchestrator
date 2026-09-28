@@ -16,6 +16,7 @@ from .contracts import (
     TransportSelection,
     TransportUnavailableError,
     WriteContentUpload,
+    canonical_sha256,
 )
 from .hosts import (
     HostCapabilityCache,
@@ -52,6 +53,7 @@ __all__ = [
     "TransportSelection",
     "TransportUnavailableError",
     "WriteContentUpload",
+    "canonical_sha256",
     "discover_local_capabilities",
     "get_transport_for_host",
     "load_transport_hosts_config",

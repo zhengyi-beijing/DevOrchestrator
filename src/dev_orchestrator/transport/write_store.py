@@ -31,6 +31,7 @@ from dev_orchestrator.transport.contracts import (
     StagedWriteContent,
     TransportRejectedError,
     WriteContentUpload,
+    canonical_sha256,
 )
 
 _STRICT_B64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
@@ -77,8 +78,9 @@ def validate_and_decode_base64(
             f"decoded content size {len(decoded)} exceeds maximum limit {max_bytes}"
         )
 
-    actual_digest = "sha256:" + hashlib.sha256(decoded).hexdigest()
-    if actual_digest != declared_sha256:
+    actual_digest = canonical_sha256(decoded)
+    expected_digest = canonical_sha256(declared_sha256)
+    if actual_digest != expected_digest:
         raise TransportRejectedError(
             f"decoded content SHA-256 {actual_digest} does not match declared digest {declared_sha256}"
         )
@@ -105,7 +107,7 @@ class WriteStagingStore:
         return p
 
     def _blob_path(self, project_id: str, sha256_digest: str) -> Path:
-        clean_digest = sha256_digest.replace("sha256:", "").replace(":", "_")
+        clean_digest = canonical_sha256(sha256_digest).replace("sha256:", "").replace(":", "_")
         return self._project_staging_dir(project_id) / f"{clean_digest}.blob"
 
     def _intent_path(self, write_id: str) -> Path:
@@ -125,25 +127,26 @@ class WriteStagingStore:
         self, upload: WriteContentUpload, *, max_bytes: int = MAX_FILE_WRITE_BYTES
     ) -> StagedWriteContent:
         """Atomically persist decoded binary content and return an opaque reference."""
+        canonical_content_sha = canonical_sha256(upload.content_sha256)
         decoded = validate_and_decode_base64(
             upload.content_base64,
             upload.decoded_size_bytes,
-            upload.content_sha256,
+            canonical_content_sha,
             max_bytes=max_bytes,
         )
 
-        blob_path = self._blob_path(upload.project_id, upload.content_sha256)
-        content_ref = f"stage:{upload.project_id}:{upload.content_sha256}"
+        blob_path = self._blob_path(upload.project_id, canonical_content_sha)
+        content_ref = f"stage:{upload.project_id}:{canonical_content_sha}"
 
         if blob_path.is_file():
             # Idempotent re-upload: verify existing blob
             existing_bytes = blob_path.read_bytes()
             if len(existing_bytes) == upload.decoded_size_bytes:
-                existing_digest = "sha256:" + hashlib.sha256(existing_bytes).hexdigest()
-                if existing_digest == upload.content_sha256:
+                existing_digest = canonical_sha256(existing_bytes)
+                if existing_digest == canonical_content_sha:
                     return StagedWriteContent(
                         content_ref=content_ref,
-                        content_sha256=upload.content_sha256,
+                        content_sha256=canonical_content_sha,
                         decoded_size_bytes=upload.decoded_size_bytes,
                         project_id=upload.project_id,
                         host_id=upload.host_id,
@@ -160,7 +163,7 @@ class WriteStagingStore:
 
         return StagedWriteContent(
             content_ref=content_ref,
-            content_sha256=upload.content_sha256,
+            content_sha256=canonical_content_sha,
             decoded_size_bytes=upload.decoded_size_bytes,
             project_id=upload.project_id,
             host_id=upload.host_id,
@@ -169,12 +172,13 @@ class WriteStagingStore:
 
     def get_staged_bytes(self, project_id: str, sha256_digest: str) -> Optional[bytes]:
         """Read and verify staged blob bytes."""
-        blob_path = self._blob_path(project_id, sha256_digest)
+        canonical_digest = canonical_sha256(sha256_digest)
+        blob_path = self._blob_path(project_id, canonical_digest)
         if not blob_path.is_file():
             return None
         data = blob_path.read_bytes()
-        actual_digest = "sha256:" + hashlib.sha256(data).hexdigest()
-        if actual_digest != sha256_digest:
+        actual_digest = canonical_sha256(data)
+        if actual_digest != canonical_digest:
             return None
         return data
 
@@ -187,7 +191,7 @@ class WriteStagingStore:
     ) -> FileResult:
         """Apply a compare-and-swap file write under canonical path lock."""
         # 1. Precondition validation: exactly one precondition must be specified
-        has_if_absent = request.if_absent is not None
+        has_if_absent = request.if_absent is not None and bool(request.if_absent)
         has_expected_sha = bool(request.expected_sha256 and request.expected_sha256.strip())
         if (has_if_absent and has_expected_sha) or (not has_if_absent and not has_expected_sha):
             raise TransportRejectedError(
@@ -211,6 +215,9 @@ class WriteStagingStore:
         write_id = self.derive_write_id(request.project_id, request.idempotency_key)
         intent_file = self._intent_path(write_id)
 
+        canonical_content_sha = canonical_sha256(request.content_sha256) if request.content_sha256 else ""
+        canonical_expected_sha = canonical_sha256(request.expected_sha256) if has_expected_sha else None
+
         canonical_intent = {
             "write_id": write_id,
             "project_id": request.project_id,
@@ -218,9 +225,9 @@ class WriteStagingStore:
             "target_path": c_target,
             "idempotency_key": request.idempotency_key,
             "content_ref": request.content_ref,
-            "content_sha256": request.content_sha256,
+            "content_sha256": canonical_content_sha,
             "decoded_size_bytes": request.decoded_size_bytes,
-            "precondition": {"if_absent": True} if request.if_absent else {"expected_sha256": request.expected_sha256},
+            "precondition": {"if_absent": True} if has_if_absent else {"expected_sha256": canonical_expected_sha},
             "file_policy_digest": request.expected_file_policy_digest,
         }
         intent_digest = "sha256:" + hashlib.sha256(
@@ -230,6 +237,7 @@ class WriteStagingStore:
         with InterProcessFileLock(lock_file):
             # Check existing intent record
             existing_intent = read_json(intent_file, None)
+            recorded_pre_digest: Optional[str] = None
             if isinstance(existing_intent, dict):
                 # Verify intent identity
                 if existing_intent.get("intent_digest") != intent_digest:
@@ -255,56 +263,108 @@ class WriteStagingStore:
                         host_identity=host_identity,
                         error=existing_intent.get("error", "precondition_failed"),
                     )
+                if existing_intent.get("state") == "ambiguous_requires_human":
+                    return FileResult(
+                        status="ambiguous",
+                        path=c_target,
+                        pre_digest=existing_intent.get("pre_digest"),
+                        post_digest=existing_intent.get("post_digest"),
+                        host_identity=host_identity,
+                        error=existing_intent.get("error", "ambiguous_requires_human"),
+                    )
+
+                if existing_intent.get("state") == "claimed":
+                    # Finding 5: Reconcile before re-evaluating
+                    curr_digest: Optional[str] = None
+                    if target_file.is_file():
+                        curr_digest = canonical_sha256(target_file.read_bytes())
+                    rec_pre = existing_intent.get("pre_digest")
+                    exp_post = existing_intent.get("content_sha256")
+
+                    if curr_digest == exp_post:
+                        applied_at = utc_now_iso()
+                        existing_intent["state"] = "applied"
+                        existing_intent["post_digest"] = curr_digest
+                        existing_intent["applied_at"] = applied_at
+                        existing_intent["updated_at"] = applied_at
+                        write_json(intent_file, existing_intent, indent=2)
+                        return FileResult(
+                            status="ok",
+                            path=c_target,
+                            content_sha256=curr_digest,
+                            size_bytes=request.decoded_size_bytes,
+                            pre_digest=rec_pre,
+                            post_digest=curr_digest,
+                            applied_at=applied_at,
+                            host_identity=host_identity,
+                        )
+                    if curr_digest == rec_pre:
+                        recorded_pre_digest = rec_pre
+                    else:
+                        existing_intent["state"] = "ambiguous_requires_human"
+                        existing_intent["error"] = f"target_digest_mismatch ({curr_digest} matches neither pre nor post)"
+                        existing_intent["updated_at"] = utc_now_iso()
+                        write_json(intent_file, existing_intent, indent=2)
+                        return FileResult(
+                            status="ambiguous",
+                            path=c_target,
+                            pre_digest=rec_pre,
+                            post_digest=curr_digest,
+                            host_identity=host_identity,
+                            error="ambiguous_requires_human",
+                        )
 
             # Re-read and verify staged bytes
-            staged_bytes = self.get_staged_bytes(request.project_id, request.content_sha256)
+            staged_bytes = self.get_staged_bytes(request.project_id, canonical_content_sha)
             if staged_bytes is None or len(staged_bytes) != request.decoded_size_bytes:
                 raise TransportRejectedError(
                     f"staged content {request.content_ref} missing or digest mismatch in staging"
                 )
 
             # Evaluate precondition against current target
-            pre_digest: Optional[str] = None
-            if target_file.is_file():
-                raw_target = target_file.read_bytes()
-                pre_digest = "sha256:" + hashlib.sha256(raw_target).hexdigest()
+            if recorded_pre_digest is not None:
+                pre_digest = recorded_pre_digest
+            else:
+                pre_digest = None
+                if target_file.is_file():
+                    pre_digest = canonical_sha256(target_file.read_bytes())
 
-            if request.if_absent:
-                if target_file.exists():
-                    intent_data = {
-                        **canonical_intent,
-                        "intent_digest": intent_digest,
-                        "state": "failed",
-                        "error": "precondition_failed: file already exists",
-                        "pre_digest": pre_digest,
-                        "updated_at": utc_now_iso(),
-                    }
-                    write_json(intent_file, intent_data, indent=2)
-                    return FileResult(
-                        status="failed",
-                        path=c_target,
-                        pre_digest=pre_digest,
-                        host_identity=host_identity,
-                        error="precondition_failed: target file already exists",
-                    )
-            elif request.expected_sha256:
-                if not target_file.is_file() or pre_digest != request.expected_sha256:
-                    intent_data = {
-                        **canonical_intent,
-                        "intent_digest": intent_digest,
-                        "state": "failed",
-                        "error": f"precondition_failed: digest mismatch ({pre_digest} != {request.expected_sha256})",
-                        "pre_digest": pre_digest,
-                        "updated_at": utc_now_iso(),
-                    }
-                    write_json(intent_file, intent_data, indent=2)
-                    return FileResult(
-                        status="failed",
-                        path=c_target,
-                        pre_digest=pre_digest,
-                        host_identity=host_identity,
-                        error=f"precondition_failed: target digest {pre_digest} != {request.expected_sha256}",
-                    )
+                if has_if_absent:
+                    if target_file.exists():
+                        intent_data = {
+                            **canonical_intent,
+                            "intent_digest": intent_digest,
+                            "state": "failed",
+                            "error": "precondition_failed: file already exists",
+                            "pre_digest": pre_digest,
+                            "updated_at": utc_now_iso(),
+                        }
+                        write_json(intent_file, intent_data, indent=2)
+                        return FileResult(
+                            status="failed",
+                            path=c_target,
+                            pre_digest=pre_digest,
+                            host_identity=host_identity,
+                            error="precondition_failed: target file already exists",
+                        )
+                elif has_expected_sha:
+                    if not target_file.is_file() or pre_digest != canonical_expected_sha:
+                        intent_data = {
+                            **canonical_intent,
+                            "intent_digest": intent_digest,
+                            "state": "failed",
+                            "error": f"precondition_failed: digest mismatch ({pre_digest} != {canonical_expected_sha})",
+                            "pre_digest": pre_digest,
+                            "updated_at": utc_now_iso(),
+                        }
+                        write_json(intent_file, intent_data, indent=2)
+                        return FileResult(
+                            status="failed",
+                            path=c_target,
+                            pre_digest=pre_digest,
+                            host_identity=host_identity,
+                            error=f"precondition_failed: target digest {pre_digest} != {canonical_expected_sha}",
+                        )
 
             # Record intent as claimed before mutating
             intent_data = {
@@ -312,7 +372,7 @@ class WriteStagingStore:
                 "intent_digest": intent_digest,
                 "state": "claimed",
                 "pre_digest": pre_digest,
-                "claimed_at": utc_now_iso(),
+                "claimed_at": existing_intent.get("claimed_at", utc_now_iso()) if isinstance(existing_intent, dict) else utc_now_iso(),
                 "updated_at": utc_now_iso(),
             }
             write_json(intent_file, intent_data, indent=2)
@@ -328,8 +388,8 @@ class WriteStagingStore:
 
             # Verify post-digest of target file
             post_bytes = target_file.read_bytes()
-            post_digest = "sha256:" + hashlib.sha256(post_bytes).hexdigest()
-            if post_digest != request.content_sha256:
+            post_digest = canonical_sha256(post_bytes)
+            if post_digest != canonical_content_sha:
                 intent_data["state"] = "ambiguous_requires_human"
                 intent_data["error"] = "post_digest_verification_failed"
                 intent_data["updated_at"] = utc_now_iso()
@@ -380,8 +440,8 @@ class WriteStagingStore:
                 error="write_intent_not_found",
             )
 
-        intent = read_json(intent_file, {})
-        if not isinstance(intent, dict):
+        prelim_intent = read_json(intent_file, {})
+        if not isinstance(prelim_intent, dict):
             return FileResult(
                 status="ambiguous",
                 path="",
@@ -389,10 +449,33 @@ class WriteStagingStore:
                 error="corrupt_write_intent",
             )
 
-        c_target = intent.get("target_path", "")
+        c_target = prelim_intent.get("target_path", "")
+        if not c_target:
+            return FileResult(
+                status="ambiguous",
+                path="",
+                host_identity=host_identity,
+                error="corrupt_write_intent: missing target_path",
+            )
         lock_file = self._lock_for_path(c_target)
 
         with InterProcessFileLock(lock_file):
+            intent = read_json(intent_file, {})
+            if not isinstance(intent, dict):
+                return FileResult(
+                    status="ambiguous",
+                    path=c_target,
+                    host_identity=host_identity,
+                    error="corrupt_write_intent",
+                )
+            if intent.get("target_path") != c_target:
+                return FileResult(
+                    status="ambiguous",
+                    path=c_target,
+                    host_identity=host_identity,
+                    error="intent_target_path_mismatch",
+                )
+
             state = intent.get("state")
             if state == "applied":
                 return FileResult(
@@ -417,7 +500,7 @@ class WriteStagingStore:
             target_file = Path(c_target)
             curr_digest: Optional[str] = None
             if target_file.is_file():
-                curr_digest = "sha256:" + hashlib.sha256(target_file.read_bytes()).hexdigest()
+                curr_digest = canonical_sha256(target_file.read_bytes())
 
             expected_post = intent.get("content_sha256")
             expected_pre = intent.get("pre_digest")

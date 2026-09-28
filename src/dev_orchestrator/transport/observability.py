@@ -5,14 +5,61 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from dev_orchestrator.jobs.logs import BoundedNDJSONLog
+from dev_orchestrator.control.logs import redact_secrets
 from dev_orchestrator.storage.json_store import utc_now_iso
 
 MAX_TRANSPORT_LOG_LINES = 5000
 MAX_TRANSPORT_LOG_BYTES = 5 * 1024 * 1024  # 5 MiB
+
+
+def _compact_transport_log(log_file: Path) -> None:
+    try:
+        if not log_file.is_file():
+            return
+        lines: list[str] = []
+        with log_file.open("r", encoding="utf-8-sig", errors="replace") as handle:
+            lines = [l for l in handle if l.strip()]
+        if len(lines) <= MAX_TRANSPORT_LOG_LINES:
+            return
+        head_count = 500
+        tail_count = max(0, MAX_TRANSPORT_LOG_LINES - head_count)
+        head = lines[:head_count]
+        tail = lines[-tail_count:] if tail_count > 0 else []
+        marker_entry = {
+            "timestamp": utc_now_iso(),
+            "operation": "log_compaction",
+            "status": "compacted",
+            "truncated_lines": len(lines) - len(head) - len(tail),
+        }
+        marker_line = json.dumps(marker_entry, ensure_ascii=False) + "\n"
+
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".tmp-compact-", suffix=".ndjson", dir=str(log_file.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                for l in head:
+                    handle.write(l.strip() + "\n")
+                handle.write(marker_line)
+                for l in tail:
+                    handle.write(l.strip() + "\n")
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp_name, log_file)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 def normalize_failure_fingerprint(error: Optional[str]) -> Optional[str]:
@@ -91,14 +138,21 @@ def log_transport_operation(
     }
 
     # Bounded file write
-    logger = BoundedNDJSONLog(
-        log_file,
-        max_job_bytes=MAX_TRANSPORT_LOG_BYTES,
-        max_line_bytes=4096,
-        head_lines=500,
-        tail_lines=MAX_TRANSPORT_LOG_LINES,
-    )
-    logger.append(record)
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with log_file.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(line)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+
+    try:
+        if log_file.stat().st_size > MAX_TRANSPORT_LOG_BYTES:
+            _compact_transport_log(log_file)
+    except OSError:
+        pass
+
     return record
 
 
@@ -112,7 +166,43 @@ def read_transport_operations(
     rt = Path(runtime_root)
     log_file = rt / "logs" / "transport-operations.ndjson"
     if not log_file.is_file():
-        return {"items": [], "total_lines": 0, "cursor": 0, "next_cursor": None}
+        return {
+            "items": [],
+            "operations": [],
+            "count": 0,
+            "total_lines": 0,
+            "cursor": 0,
+            "next_cursor": None,
+        }
 
-    logger = BoundedNDJSONLog(log_file)
-    return logger.read_paginated(cursor=cursor, limit=limit)
+    records: list[dict[str, Any]] = []
+    try:
+        with log_file.open("r", encoding="utf-8-sig", errors="replace") as handle:
+            for line in handle:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                try:
+                    item = json.loads(line_str)
+                    if isinstance(item, dict):
+                        records.append(item)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    except OSError:
+        pass
+
+    total = len(records)
+    safe_cursor = max(0, int(cursor))
+    safe_limit = max(1, min(500, int(limit)))
+    sliced = records[safe_cursor : safe_cursor + safe_limit]
+    redacted = [redact_secrets(row) for row in sliced]
+    next_cursor = safe_cursor + len(redacted) if safe_cursor + len(redacted) < total else None
+
+    return {
+        "items": redacted,
+        "operations": redacted,
+        "count": len(redacted),
+        "total_lines": total,
+        "cursor": safe_cursor,
+        "next_cursor": next_cursor,
+    }
