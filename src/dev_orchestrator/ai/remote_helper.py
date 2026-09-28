@@ -30,6 +30,7 @@ from dev_orchestrator.ai.aibroker_subprocess import (
     sanitize_url,
     validate_loopback_url,
 )
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 
 
 def _build_env(broker_repo: str | None) -> dict[str, str]:
@@ -273,6 +274,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    **hidden_subprocess_kwargs(),
                 )
                 return {
                     "status": "ok" if completed.returncode == 0 else "failed",
@@ -930,6 +932,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 errors="replace",
                 capture_output=True,
                 check=False,
+                **hidden_subprocess_kwargs(),
             )
 
         if completed.returncode not in (0, 1):
@@ -966,6 +969,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             encoding="utf-8",
             errors="replace",
             check=False,
+            **hidden_subprocess_kwargs(),
         )
         if completed.returncode not in (0, 1):
             detail = (completed.stderr or completed.stdout).strip()
@@ -1002,6 +1006,7 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
             encoding="utf-8",
             errors="replace",
             check=False,
+            **hidden_subprocess_kwargs(),
         )
         if completed.returncode not in (0, 1):
             detail = (completed.stderr or completed.stdout).strip()

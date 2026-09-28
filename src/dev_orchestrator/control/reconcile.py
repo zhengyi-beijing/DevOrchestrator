@@ -9,6 +9,7 @@ from dev_orchestrator.core.repository import is_git_ancestor, read_repository_tr
 from dev_orchestrator.core.staged_roadmap import read_successor
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.core.transition_executor import is_pre_provider_worktree_unsafe_failure
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import read_json
 
 
@@ -239,7 +240,14 @@ def resolve_reconcile_candidate(
 def _git_distance(repo_path: str, ancestor: str, descendant: str) -> int | None:
     import subprocess
     try:
-        out = subprocess.run(["git", "rev-list", "--count", f"{ancestor}..{descendant}"], cwd=repo_path, capture_output=True, text=True, timeout=5)
+        out = subprocess.run(
+            ["git", "rev-list", "--count", f"{ancestor}..{descendant}"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            **hidden_subprocess_kwargs(),
+        )
         return int(out.stdout.strip()) if out.returncode == 0 else None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None

@@ -12,6 +12,7 @@ import subprocess
 from typing import TYPE_CHECKING, Any, Optional
 
 from dev_orchestrator.ai.execution_transport import ExecutionTransportError
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.transport.contracts import (
     TransportAmbiguousError,
     TransportUnavailableError,
@@ -97,6 +98,7 @@ def run_remote_helper_envelope(
             capture_output=True,
             timeout=timeout_seconds,
             check=False,
+            **hidden_subprocess_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         raise TransportAmbiguousError(

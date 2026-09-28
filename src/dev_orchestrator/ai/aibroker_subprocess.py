@@ -19,6 +19,7 @@ from .execution_transport import (
     ExecutionTransportError,
     LocalTransport,
 )
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 
 if TYPE_CHECKING:
     from dev_orchestrator.accounting.events import ExecutionRecorder
@@ -334,6 +335,7 @@ class AIBrokerExecutionPort:
                 argv, cwd=str(self.config.broker_repo), env=env, text=True,
                 encoding="utf-8", errors="replace", capture_output=True,
                 timeout=min(self.config.process_timeout_seconds, 60.0), check=False,
+                **hidden_subprocess_kwargs(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AIBrokerInvocationError(f"broker reconciliation failed: {exc}") from exc

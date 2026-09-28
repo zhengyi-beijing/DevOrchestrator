@@ -23,6 +23,7 @@ from dev_orchestrator.jobs.config import (
 from dev_orchestrator.jobs.models import JobRecord, JobSpec, job_id_for
 from dev_orchestrator.jobs.store import ExecutionJobStore
 from dev_orchestrator.jobs.transport import LocalJobTransport
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import utc_now_iso
 from dev_orchestrator.transport.contracts import (
     FileReadRequest,
@@ -99,6 +100,7 @@ class LocalMachineTransport:
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout,
+                **hidden_subprocess_kwargs(),
             )
             duration = time.monotonic() - start_t
             status = "ok" if completed.returncode == 0 else "failed"

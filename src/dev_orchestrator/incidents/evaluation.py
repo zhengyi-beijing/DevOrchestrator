@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dev_orchestrator.incidents.store import load_incident_store
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso
 
 EVALUATOR_SCHEMA_VERSION = 1
@@ -148,6 +149,7 @@ def run_executable_candidate_gates(
             capture_output=True,
             text=True,
             env=env_failing,
+            **hidden_subprocess_kwargs(),
         )
         reproduced = proc_failing.returncode != 0
         repro_evidence = (proc_failing.stderr + proc_failing.stdout).strip()
@@ -166,6 +168,7 @@ def run_executable_candidate_gates(
             capture_output=True,
             text=True,
             env=env_corrected,
+            **hidden_subprocess_kwargs(),
         )
         discriminated = proc_corrected.returncode == 0
         discrim_evidence = (proc_corrected.stdout + proc_corrected.stderr).strip()
@@ -185,6 +188,7 @@ def run_executable_candidate_gates(
                     capture_output=True,
                     text=True,
                     env=env_corrected,
+                    **hidden_subprocess_kwargs(),
                 )
                 stability_outputs.append(proc_st.returncode)
                 if proc_st.returncode != 0:

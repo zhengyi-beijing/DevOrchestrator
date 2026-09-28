@@ -139,17 +139,23 @@ def terminate_process_tree(pid: Any) -> bool:
         return False
 
 
-def hidden_subprocess_kwargs() -> dict[str, int]:
+def hidden_subprocess_kwargs() -> dict[str, Any]:
     """Return Popen kwargs that suppress console windows on Windows.
 
     Background monitor/backend child processes must never create a visible
     console or steal focus from the interactive desktop. POSIX needs no extra
     flags, so callers can safely splat the returned mapping into run/Popen.
+    ``CREATE_NO_WINDOW`` prevents console allocation for ordinary console
+    executables, while ``SW_HIDE`` also covers launcher/shim behavior used by
+    tools such as Git for Windows.
     """
     if os.name != "nt":
         return {}
     flag = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    return {"creationflags": int(flag)}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return {"creationflags": int(flag), "startupinfo": startupinfo}
 
 
 def spawn_detached(
@@ -173,9 +179,11 @@ def spawn_detached(
         "close_fds": True,
     }
     if os.name == "nt":  # pragma: no cover - Windows
-        flags = 0x00000008  # DETACHED_PROCESS
+        hidden_kwargs = hidden_subprocess_kwargs()
+        flags = hidden_kwargs["creationflags"]
+        flags |= 0x00000008  # DETACHED_PROCESS
         flags |= 0x00000200  # CREATE_NEW_PROCESS_GROUP
-        flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        kwargs.update(hidden_kwargs)
         kwargs["creationflags"] = flags
     else:  # pragma: no cover - POSIX
         kwargs["start_new_session"] = True

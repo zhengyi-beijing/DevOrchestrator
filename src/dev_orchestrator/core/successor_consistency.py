@@ -20,6 +20,7 @@ from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.staged_roadmap import RoadmapResult, read_successor
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.monitor.telemetry import extract_task_id
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import write_json
 
 
@@ -340,12 +341,14 @@ def reconcile_roadmap_successor(
             subprocess.run(
                 ["git", "-C", str(repo), "add", "--", "agent/staged/roadmap.json"],
                 check=True, capture_output=True, text=True,
+                **hidden_subprocess_kwargs(),
             )
             commit = subprocess.run(
                 ["git", "-C", str(repo), "commit", "-m",
                  f"lifecycle({completed_task_id}): reconcile successor {resolved.successor_task_id}",
                  "--", "agent/staged/roadmap.json"],
                 check=False, capture_output=True, text=True,
+                **hidden_subprocess_kwargs(),
             )
             if commit.returncode != 0:
                 raise RuntimeError("git commit failed: " + (commit.stderr or commit.stdout).strip())
@@ -362,6 +365,7 @@ def reconcile_roadmap_successor(
                 subprocess.run(
                     ["git", "-C", str(repo), "add", "--", "agent/staged/roadmap.json"],
                     check=False, capture_output=True, text=True,
+                    **hidden_subprocess_kwargs(),
                 )
             else:
                 # The roadmap did not exist before this attempt, so leaving the
@@ -372,5 +376,6 @@ def reconcile_roadmap_successor(
                     ["git", "-C", str(repo), "rm", "--cached", "--quiet", "--ignore-unmatch",
                      "--", "agent/staged/roadmap.json"],
                     check=False, capture_output=True, text=True,
+                    **hidden_subprocess_kwargs(),
                 )
             return ReconcileOutcome(status="rejected", reason=str(exc))

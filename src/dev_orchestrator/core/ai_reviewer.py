@@ -965,6 +965,7 @@ class AIReviewerCoordinator:
         diff = subprocess.run(
             ["git", "-C", repo_path, "diff", "--name-only", launch_head, review_head],
             check=False, capture_output=True, text=True,
+            **hidden_subprocess_kwargs(),
         )
         if diff.returncode != 0:
             return False, "reviewed diff is unavailable", ()

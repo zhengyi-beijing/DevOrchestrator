@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 
+from dev_orchestrator.platform.process import hidden_subprocess_kwargs
 from dev_orchestrator.storage.json_store import utc_now_iso
 
 
@@ -133,6 +134,7 @@ class LocalTransport:
                     capture_output=True,
                     timeout=timeout_seconds,
                     check=False,
+                    **hidden_subprocess_kwargs(),
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ExecutionTransportError(f"local broker invocation failed: {exc}") from exc
@@ -225,6 +227,7 @@ class LocalTransport:
                 capture_output=True,
                 timeout=min(config.process_timeout_seconds, 60.0),
                 check=False,
+                **hidden_subprocess_kwargs(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ExecutionTransportError(f"broker reconciliation failed: {exc}") from exc

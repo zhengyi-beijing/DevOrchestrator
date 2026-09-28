@@ -181,7 +181,9 @@ class TestP18Transports(unittest.TestCase):
         mock_subproc = MagicMock()
 
         # Mock successful exec response envelope
-        def mock_run(argv, input, capture_output, timeout, check):
+        def mock_run(argv, input, capture_output, timeout, check, **process_kwargs):
+            expected_flag = int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+            self.assertEqual(process_kwargs.get("creationflags"), expected_flag)
             req = json.loads(input.decode("utf-8"))
             resp = {
                 "request_id": req.get("request_id"),
