@@ -276,6 +276,43 @@ def source_ownership_blockers(
 
 
 _BLOCKED_TRANSITION_STATES = frozenset({"failed", "owner_gate", "waiting_recovery"})
+_NO_EXECUTABLE_SUCCESSOR_KINDS = frozenset({"absent", "end_of_roadmap", "unlisted"})
+_INVALID_SUCCESSOR_KINDS = frozenset({"ambiguous", "error", "invalid"})
+
+
+def _task_complete_settlements(
+    executions: dict[str, Any], project_id: str, task_id: str,
+) -> list[dict[str, Any]]:
+    """Return durable terminal settlements for one reviewed task."""
+    return [
+        row for row in executions.values()
+        if isinstance(row, dict)
+        and row.get("project_id") == project_id
+        and row.get("task_id") == task_id
+        and row.get("state") == "settled"
+        and row.get("outcome") == "task_complete"
+    ]
+
+
+def _successor_resolution_evidence(
+    snapshot: dict[str, Any], task_id: str,
+) -> dict[str, Any]:
+    """Resolve current successor truth without converting errors into absence."""
+    repo_path = snapshot.get("repo_path") or snapshot.get("root")
+    if not repo_path:
+        return {"kind": "error", "reason": "repository path unavailable"}
+    from dev_orchestrator.core.successor_consistency import resolve_successor
+
+    try:
+        resolution = resolve_successor(repo_path, task_id)
+    except Exception as exc:  # unreadable evidence must fail closed
+        return {"kind": "error", "reason": str(exc)}
+    return {
+        "kind": resolution.kind,
+        "reason": resolution.reason,
+        "successor_task_id": resolution.successor_task_id,
+        "evidence": resolution.evidence,
+    }
 
 
 def _roadmap_successor_obligation(
@@ -390,6 +427,7 @@ def evaluate_lifecycle_invariants(
     decisions_available = isinstance(decisions_state, dict)
     decisions = decisions_state.get("decisions") if decisions_available else {}
     next_decisions: list[dict[str, Any]] = []
+    terminal_closures: list[dict[str, Any]] = []
     for decision_id, row in (decisions or {}).items():
         if not isinstance(row, dict) or row.get("project_id") != project_id:
             continue
@@ -429,10 +467,39 @@ def evaluate_lifecycle_invariants(
                 if decision_at is None or candidate_at is None or candidate_at >= decision_at:
                     satisfied = True
                     break
+        successor_resolution = None
+        terminal_settlements = _task_complete_settlements(
+            executions or {}, project_id, str(row.get("task_id") or ""),
+        )
+        if terminal_settlements:
+            # A technical review may be accepted after the task was already
+            # terminal-settled (for example a rereview of the accepted HEAD).
+            # That historical NEXT_TASK row is not a perpetual demand to invent
+            # a successor.  The settlement satisfies it only while fresh,
+            # authoritative repository evidence still has no executable
+            # successor.  If a successor is staged later, or the evidence is
+            # invalid/ambiguous, the obligation remains live and the ordinary
+            # handoff/fail-closed paths continue to apply.
+            successor_resolution = _successor_resolution_evidence(
+                snapshot, str(row.get("task_id") or ""),
+            )
+            successor_resolution["terminal_settlement_request_ids"] = sorted(
+                str(item.get("source_request_id") or "")
+                for item in terminal_settlements
+            )
+            if successor_resolution.get("kind") in _NO_EXECUTABLE_SUCCESSOR_KINDS:
+                terminal_closures.append({
+                    "request_id": request_id,
+                    "task_id": row.get("task_id"),
+                    "successor_resolution": successor_resolution,
+                })
+                satisfied = True
         if not satisfied:
             next_decisions.append({
                 **row, "request_id": request_id,
                 "actuation_blocked": actuation_blocked,
+                **({"successor_resolution": successor_resolution}
+                   if successor_resolution is not None else {}),
             })
 
     current_holds = not worker_owners or all(str(owner.get("task_id") or "") == authority_task for owner in worker_owners)
@@ -465,7 +532,7 @@ def evaluate_lifecycle_invariants(
     # handoff even when no NEXT review decision survives (for example the
     # roadmap edge was restored after the task was settled task_complete).
     roadmap_successor = None
-    if decisions_available and not next_decisions:
+    if decisions_available and not next_decisions and not terminal_closures:
         roadmap_successor = _roadmap_successor_obligation(
             snapshot, authority, authority_task, authority_state,
             owners, executions or {}, transitions or {}, project_id,
@@ -480,7 +547,15 @@ def evaluate_lifecycle_invariants(
     if not decisions_available:
         next_recoverable = False
     elif next_decisions:
-        next_recoverable = any(not row.get("actuation_blocked") for row in next_decisions)
+        invalid_successor_evidence = any(
+            (row.get("successor_resolution") or {}).get("kind")
+            in _INVALID_SUCCESSOR_KINDS
+            for row in next_decisions
+        )
+        next_recoverable = (
+            not invalid_successor_evidence
+            and any(not row.get("actuation_blocked") for row in next_decisions)
+        )
     elif roadmap_successor is not None:
         next_recoverable = bool(roadmap_successor.get("recoverable"))
     else:
@@ -508,11 +583,15 @@ def evaluate_lifecycle_invariants(
                          "decisions ledger unavailable: NEXT_TASK_WITHOUT_HANDOFF is unevaluable",
                          {"next_decisions": [
                               {"request_id": row.get("request_id"), "task_id": row.get("task_id"),
-                               "actuation_blocked": bool(row.get("actuation_blocked"))}
+                               "actuation_blocked": bool(row.get("actuation_blocked")),
+                               **({"successor_resolution": row.get("successor_resolution")}
+                                  if row.get("successor_resolution") is not None else {})}
                               for row in next_decisions
                           ], "handoffs": len(handoffs),
                           "transitions": len(transitions or {}),
                           "evidence_unavailable": not decisions_available,
+                          **({"terminal_closures": terminal_closures}
+                             if terminal_closures else {}),
                           **({"roadmap_successor": roadmap_successor}
                              if roadmap_successor is not None else {})}),
         InvariantFinding("SINGLE_ACTIVE_LIFECYCLE_OWNER", single_owner_holds, False,

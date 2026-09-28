@@ -1637,6 +1637,30 @@ def _next_finding(repo: Path, executor_state: dict, decisions=None):
     }["NEXT_TASK_WITHOUT_HANDOFF"]
 
 
+def _accepted_next_decision(request_id: str = "ai_review:rereview") -> dict:
+    return {"decisions": {request_id: {
+        "project_id": "p1", "task_id": "P1", "request_id": request_id,
+        "disposition": "apply", "decision": "next", "next_action": "next_task",
+        "consumed_at": "2026-09-28T07:00:00+00:00",
+    }}}
+
+
+def _terminal_without_successor(root: Path) -> Path:
+    """P18-shaped truth: the current task is not followed by an executable task."""
+    repo = _complete_repo(root, roadmap_target=None)
+    (repo / "agent" / "staged" / "P2.md").unlink()
+    # Historical malformed metadata is attributable to another predecessor and
+    # must not poison the current task's otherwise terminal successor set.
+    (repo / "agent" / "staged" / "P9.md").write_bytes(
+        b"# P9 old task\n\nStatus: STAGED AFTER P8\n\nPredecessor: P8\n"
+    )
+    (repo / "agent" / "staged" / "roadmap.json").write_text(
+        json.dumps({"schema_version": 1, "tasks": []}) + "\n", encoding="utf-8",
+    )
+    _commit(repo, "terminal roadmap")
+    return repo
+
+
 class TerminalRoadmapSuccessorInvariantTests(unittest.TestCase):
     """P16.13 -> P16.14 live incident: COMPLETE authority, valid roadmap
     successor, no surviving NEXT decision and no durable handoff."""
@@ -1812,6 +1836,172 @@ class TerminalRoadmapSuccessorInvariantTests(unittest.TestCase):
             self.assertTrue(finding.recoverable)
             self.assertEqual([row["request_id"] for row in finding.evidence["next_decisions"]], ["d"])
             self.assertNotIn("roadmap_successor", finding.evidence)
+
+
+class TerminalClosureControlPlaneTests(unittest.TestCase):
+    """P18 terminal closure must not turn NEXT_TASK wording into a phantom task."""
+
+    def _rereview_state(self, *, blocked: bool = True) -> dict:
+        executions = {}
+        if blocked:
+            executions["ai_review:rereview"] = {
+                "project_id": "p1", "source_request_id": "ai_review:rereview",
+                "source_kind": "decision", "task_id": "P1", "state": "blocked",
+                "reason": "reviewed task repository truth changed before terminal settle",
+                "recorded_at": "2026-09-28T07:00:01+00:00",
+            }
+        return _terminal_state(executions=executions)
+
+    def test_p18_style_accepted_blocked_rereview_is_satisfied_by_terminal_settlement(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _terminal_without_successor(Path(td))
+            self.assertEqual(resolve_successor(repo, "P1").kind, "unlisted")
+
+            finding = _next_finding(
+                repo, self._rereview_state(), _accepted_next_decision(),
+            )
+
+            self.assertTrue(finding.holds)
+            self.assertEqual(finding.evidence["next_decisions"], [])
+
+    def test_real_successor_still_requires_a_durable_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td))
+
+            finding = _next_finding(
+                repo, self._rereview_state(blocked=False), _accepted_next_decision(),
+            )
+
+            self.assertFalse(finding.holds)
+            self.assertTrue(finding.recoverable)
+            resolution = finding.evidence["next_decisions"][0]["successor_resolution"]
+            self.assertEqual((resolution["kind"], resolution["successor_task_id"]),
+                             ("successor", "P2"))
+
+    def test_ambiguous_and_invalid_successor_evidence_still_fail_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ambiguous = _complete_repo(root / "ambiguous", roadmap_target="P3")
+            invalid = _complete_repo(root / "invalid")
+            (invalid / "agent" / "staged" / "roadmap.json").write_text(
+                "{bad json", encoding="utf-8",
+            )
+            _commit(invalid, "invalidate roadmap")
+
+            for expected, repo in (("ambiguous", ambiguous), ("invalid", invalid)):
+                with self.subTest(expected=expected):
+                    finding = _next_finding(
+                        repo, self._rereview_state(blocked=False),
+                        _accepted_next_decision(),
+                    )
+                    self.assertFalse(finding.holds)
+                    self.assertFalse(finding.recoverable)
+                    self.assertEqual(
+                        finding.evidence["next_decisions"][0]
+                        ["successor_resolution"]["kind"],
+                        expected,
+                    )
+
+    def test_successor_added_after_settlement_hands_off_once_across_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _terminal_without_successor(root)
+            runtime = root / "runtime"
+            executor = TransitionExecutor(runtime)
+            executor._record_settled(
+                "ai_review:settled", "p1", "terminal end of roadmap",
+                task_id="P1", outcome="task_complete",
+            )
+            ledger = executor.state()
+            ledger["lifecycle"]["p1"] = {
+                "project_id": "p1", "current_task_id": "P1",
+                "lifecycle_state": "COMPLETE", "owner_gate": None,
+            }
+            executor._save_ledger(ledger)
+
+            staged = repo / "agent" / "staged"
+            (staged / "P2.md").write_bytes(
+                b"# P2 task\n\nStatus: **PENDING DESIGN**\n\nPredecessor: P1\n"
+            )
+            (staged / "roadmap.json").write_text(json.dumps({
+                "schema_version": 1,
+                "tasks": [{
+                    "task_id": "P1", "successor": "P2",
+                    "successor_spec_path": "agent/staged/P2.md",
+                }],
+            }) + "\n", encoding="utf-8")
+            _commit(repo, "add real successor")
+            snapshot = _repo_summary(repo)["projects"][0]
+            project = {"project_id": "p1", "repo_path": str(repo)}
+
+            first = executor.reconcile_successor_handoff(
+                project, snapshot, completed_task_id="P1", trigger="test",
+            )
+            restarted = TransitionExecutor(runtime)
+            replay = restarted.reconcile_successor_handoff(
+                project, snapshot, completed_task_id="P1", trigger="test replay",
+            )
+
+            self.assertEqual((first["status"], replay["status"]), ("applied", "noop"))
+            handoffs = [
+                row for row in restarted.state()["executions"].values()
+                if isinstance(row, dict) and row.get("state") == "handoff"
+                and row.get("source_task_id") == "P1"
+                and row.get("target_task_id") == "P2"
+            ]
+            self.assertEqual(len(handoffs), 1)
+
+    def test_watchdog_restart_resolves_historical_terminal_closure_gate(self):
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _terminal_without_successor(root)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            config_path = root / "projects.json"
+            config_path.write_text(json.dumps({"projects": [{
+                "project_id": "p1", "repo_path": str(repo),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            }]}), encoding="utf-8")
+            (runtime / "review-decisions.json").write_text(
+                json.dumps(_accepted_next_decision()), encoding="utf-8",
+            )
+            executor = TransitionExecutor(runtime)
+            executor._save_ledger(self._rereview_state())
+            snapshot = _repo_summary(repo)
+
+            seed = WatchdogCoordinator(runtime)
+            seed.advance(str(config_path), snapshot, executor=executor)
+            state = seed.state()
+            row = state["projects"]["p1"]
+            row["owner_gate"] = {
+                "state": "owner_gate", "code": "NEXT_TASK_WITHOUT_HANDOFF",
+                "gate_id": "lifecycle:NEXT_TASK_WITHOUT_HANDOFF:142808db0dbe7d28",
+                "recorded_at": "2026-09-28T07:01:00+00:00",
+            }
+            row["unresolved_invariants"] = ["NEXT_TASK_WITHOUT_HANDOFF"]
+            seed._save_state(state)
+
+            restarted = WatchdogCoordinator(runtime)
+            restarted.advance(str(config_path), snapshot, executor=TransitionExecutor(runtime))
+            restarted.advance(str(config_path), snapshot, executor=TransitionExecutor(runtime))
+            after = restarted.state()["projects"]["p1"]
+
+            self.assertNotIn(
+                "NEXT_TASK_WITHOUT_HANDOFF", after.get("unresolved_invariants") or [],
+            )
+            self.assertIsNone(after.get("owner_gate"))
+            resolved = [
+                gate for gate in after.get("resolved_lifecycle_owner_gates") or []
+                if gate.get("gate_id")
+                == "lifecycle:NEXT_TASK_WITHOUT_HANDOFF:142808db0dbe7d28"
+            ]
+            self.assertEqual(len(resolved), 1)
+            self.assertEqual([
+                row for row in TransitionExecutor(runtime).state()["executions"].values()
+                if isinstance(row, dict) and row.get("state") == "handoff"
+            ], [])
 
 
 class TerminalRoadmapSuccessorEndToEndTests(unittest.TestCase):

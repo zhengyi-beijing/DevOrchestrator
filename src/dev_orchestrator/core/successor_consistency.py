@@ -211,10 +211,16 @@ def resolve_successor(repo_path: str | Path, completed_task_id: str) -> Successo
         claim for claim in scan.claims
         if claim.predecessor_task_id == completed_task_id
     ]
-    # Any malformed or unreadable staged metadata makes the successor set
-    # unknowable.  Do not scope defects only after parsing a predecessor: the
-    # malformed bytes may be exactly what prevents that attribution.
-    defects = list(scan.defects)
+    # A malformed or unreadable spec is relevant when it names this completed
+    # task, or when the defect itself prevented predecessor attribution.  Once
+    # a different predecessor was parsed successfully, however, the defect is
+    # authoritative evidence about that other lineage and cannot contaminate
+    # this task's successor set forever.  Unknown attribution still fails
+    # closed because the malformed bytes may be exactly what hid the link.
+    defects = [
+        defect for defect in scan.defects
+        if defect.predecessor_task_id in {None, completed_task_id}
+    ]
     if defects:
         # A staged spec that names this task as its predecessor but cannot be
         # read as a claim must never be dropped: dropping it makes the task look
