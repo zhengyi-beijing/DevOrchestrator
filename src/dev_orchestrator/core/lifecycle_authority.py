@@ -344,9 +344,10 @@ def _roadmap_successor_obligation(
     Only a quiescent terminal authority qualifies.  Repository markdown is a
     projection and must not be required to confirm the terminal transition.
     An existing handoff or in-flight transition for the source already owns
-    the successor.  A refused transition, or successor evidence that is zero,
-    ambiguous or invalid, is reported non-recoverable so it fails closed
-    instead of being actuated blindly.
+    the successor.  Authoritative absence, end-of-roadmap, or an unlisted
+    completed task is a successful terminal closure.  A refused transition,
+    or ambiguous/error/invalid successor evidence, is reported
+    non-recoverable so it fails closed instead of being actuated blindly.
     """
     if not isinstance(authority, dict) or not authority_task:
         return None
@@ -381,6 +382,8 @@ def _roadmap_successor_obligation(
         kind, reason = resolution.kind, resolution.reason
     except Exception as exc:  # unreadable evidence gates, never recovers
         resolution, kind, reason = None, "error", str(exc)
+    if kind in _NO_EXECUTABLE_SUCCESSOR_KINDS:
+        return None
     staged_evidence = (
         resolution.evidence in {"staged_claim", "roadmap+staged_claim"}
         if resolution is not None else False

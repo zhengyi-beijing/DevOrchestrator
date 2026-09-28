@@ -22,6 +22,10 @@ from dev_orchestrator.core.lifecycle_authority import (
     evaluate_lifecycle_invariants,
     source_ownership_blockers,
 )
+from dev_orchestrator.core.project_status import (
+    build_project_status,
+    project_runtime_status,
+)
 from dev_orchestrator.core.successor_consistency import (
     reconcile_roadmap_successor,
     resolve_successor,
@@ -1746,17 +1750,27 @@ class TerminalRoadmapSuccessorInvariantTests(unittest.TestCase):
             self.assertFalse(finding.recoverable)
             self.assertEqual(finding.evidence["roadmap_successor"]["kind"], "invalid")
 
-    def test_zero_successors_fails_closed(self):
+    def test_zero_successors_is_successful_terminal_closure(self):
         with tempfile.TemporaryDirectory() as td:
             repo = _complete_repo(Path(td), roadmap_target=None)
             (repo / "agent" / "staged" / "P2.md").unlink()
             _commit(repo, "no staged successor")
             finding = _next_finding(repo, _terminal_state())
-            self.assertFalse(finding.holds)
-            self.assertFalse(finding.recoverable)
-            self.assertEqual(
-                finding.evidence["roadmap_successor"]["kind"], "end_of_roadmap",
-            )
+            self.assertTrue(finding.holds)
+            self.assertNotIn("roadmap_successor", finding.evidence)
+
+    def test_absent_roadmap_is_successful_terminal_closure(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _complete_repo(Path(td), roadmap_target=None)
+            (repo / "agent" / "staged" / "P2.md").unlink()
+            (repo / "agent" / "staged" / "roadmap.json").unlink()
+            _commit(repo, "no roadmap or staged successor")
+            self.assertEqual(resolve_successor(repo, "P1").kind, "absent")
+
+            finding = _next_finding(repo, _terminal_state())
+
+            self.assertTrue(finding.holds)
+            self.assertNotIn("roadmap_successor", finding.evidence)
 
     def test_no_human_clock_uses_terminal_authority_not_markdown_status(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2185,6 +2199,70 @@ class TerminalSettlementAuthorityRegressionTests(unittest.TestCase):
             self.assertEqual(
                 launch_error, "authoritative lifecycle task is terminally settled",
             )
+
+    def test_p18_unlisted_terminal_closure_projects_no_owner_gate(self):
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _terminal_without_successor(root)
+            (repo / "agent" / "next.md").write_bytes(
+                b"# P18 task\n\nStatus: **COMPLETE**\n"
+            )
+            _commit(repo, "represent live P18 terminal closure")
+            self.assertEqual(resolve_successor(repo, "P18").kind, "unlisted")
+            runtime = root / "runtime"
+            runtime.mkdir()
+            config_path = root / "projects.json"
+            config_path.write_text(json.dumps({"projects": [{
+                "project_id": "p1", "repo_path": str(repo),
+                "watchdog": {"enabled": True, "auto_recovery": True},
+            }]}), encoding="utf-8")
+            settlement_id = self._SETTLEMENT_ID
+            decisions = _accepted_next_decision(settlement_id)
+            decisions["decisions"][settlement_id]["task_id"] = "P18"
+            (runtime / "review-decisions.json").write_text(
+                json.dumps(decisions), encoding="utf-8",
+            )
+            state = _terminal_state()
+            state["executions"] = {
+                settlement_id: {
+                    **_STALE_SETTLE,
+                    "source_request_id": settlement_id,
+                    "task_id": "P18",
+                },
+            }
+            state["lifecycle"]["p1"].update({
+                "current_task_id": "P18",
+                "active_owner": None,
+                "owner_gate": None,
+            })
+            executor = TransitionExecutor(runtime)
+            executor._save_ledger(state)
+            summary = _repo_summary(repo)
+            snapshot = summary["projects"][0]
+
+            finding = _next_finding(repo, state, decisions)
+            self.assertTrue(finding.holds)
+            self.assertEqual(finding.evidence["next_decisions"], [])
+            self.assertNotIn("roadmap_successor", finding.evidence)
+
+            watchdog = WatchdogCoordinator(runtime)
+            watchdog.advance(str(config_path), summary, executor=executor)
+            watchdog_row = watchdog.state()["projects"]["p1"]
+            self.assertIsNone(watchdog_row.get("owner_gate"))
+            self.assertNotIn(
+                "NEXT_TASK_WITHOUT_HANDOFF",
+                watchdog_row.get("unresolved_invariants") or [],
+            )
+
+            projected = project_runtime_status(snapshot, runtime)
+            status = build_project_status(
+                projected, runtime, phase="monitor", daemon_state="running", pid=123,
+            )
+            self.assertEqual(projected["lifecycle_state"], "COMPLETE")
+            self.assertNotEqual(status.get("status"), "OWNER_GATE")
+            self.assertNotEqual((status.get("watchdog") or {}).get("state"), "owner_gate")
 
     def test_later_real_successor_hands_off_once_without_rerunning_p18(self):
         with tempfile.TemporaryDirectory() as td:
