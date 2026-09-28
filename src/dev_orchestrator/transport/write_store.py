@@ -12,7 +12,7 @@ import hashlib
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 from uuid import uuid4
@@ -34,6 +34,7 @@ from dev_orchestrator.transport.contracts import (
     canonical_sha256,
 )
 
+DEFAULT_STAGING_TTL_SECONDS = 3600.0
 _STRICT_B64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
 
@@ -52,11 +53,29 @@ def validate_and_decode_base64(
     if not isinstance(content_b64, str):
         raise TransportRejectedError("content_base64 must be a string")
 
+    if content_b64 == "":
+        if declared_size != 0:
+            raise TransportRejectedError(
+                f"declared size {declared_size} does not match empty content (expected 0)"
+            )
+        empty_digest = canonical_sha256(b"")
+        if canonical_sha256(declared_sha256) != empty_digest:
+            raise TransportRejectedError(
+                f"decoded content SHA-256 {empty_digest} does not match declared digest {declared_sha256}"
+            )
+        return b""
+
     # Strict character set and padding check
     if len(content_b64) % 4 != 0 or not _STRICT_B64_RE.match(content_b64):
         raise TransportRejectedError("content_base64 is not valid RFC 4648 standard Base64")
 
-    # Early ceiling check before decoding
+    # Early rejection before decoding when encoded length implies decoded size above max_bytes
+    min_possible_decoded = (len(content_b64) // 4) * 3 - 2
+    if min_possible_decoded > max_bytes:
+        raise TransportRejectedError(
+            f"encoded payload implies minimum decoded size {min_possible_decoded} exceeds maximum allowed ({max_bytes})"
+        )
+
     derived_max_decoded = (len(content_b64) // 4) * 3
     if declared_size > derived_max_decoded or declared_size > max_bytes:
         raise TransportRejectedError(
@@ -124,7 +143,11 @@ class WriteStagingStore:
         return "write-" + hashlib.sha256(raw).hexdigest()[:24]
 
     def stage_content(
-        self, upload: WriteContentUpload, *, max_bytes: int = MAX_FILE_WRITE_BYTES
+        self,
+        upload: WriteContentUpload,
+        *,
+        max_bytes: int = MAX_FILE_WRITE_BYTES,
+        ttl_seconds: Optional[float] = None,
     ) -> StagedWriteContent:
         """Atomically persist decoded binary content and return an opaque reference."""
         canonical_content_sha = canonical_sha256(upload.content_sha256)
@@ -136,7 +159,14 @@ class WriteStagingStore:
         )
 
         blob_path = self._blob_path(upload.project_id, canonical_content_sha)
+        meta_path = blob_path.with_suffix(".meta.json")
         content_ref = f"stage:{upload.project_id}:{canonical_content_sha}"
+
+        ttl = float(ttl_seconds if ttl_seconds is not None else DEFAULT_STAGING_TTL_SECONDS)
+        now_dt = datetime.now(timezone.utc)
+        exp_dt = now_dt + timedelta(seconds=ttl)
+        staged_at = now_dt.isoformat()
+        expires_at = exp_dt.isoformat()
 
         if blob_path.is_file():
             # Idempotent re-upload: verify existing blob
@@ -144,13 +174,24 @@ class WriteStagingStore:
             if len(existing_bytes) == upload.decoded_size_bytes:
                 existing_digest = canonical_sha256(existing_bytes)
                 if existing_digest == canonical_content_sha:
+                    existing_staged_at = staged_at
+                    existing_expires_at = expires_at
+                    if meta_path.is_file():
+                        try:
+                            m_data = read_json(meta_path)
+                            if isinstance(m_data, dict):
+                                existing_staged_at = m_data.get("staged_at", staged_at)
+                                existing_expires_at = m_data.get("expires_at", expires_at)
+                        except Exception:
+                            pass
                     return StagedWriteContent(
                         content_ref=content_ref,
                         content_sha256=canonical_content_sha,
                         decoded_size_bytes=upload.decoded_size_bytes,
                         project_id=upload.project_id,
                         host_id=upload.host_id,
-                        staged_at=utc_now_iso(),
+                        staged_at=existing_staged_at,
+                        expires_at=existing_expires_at,
                     )
 
         # Atomic write to temporary file then replace
@@ -161,14 +202,108 @@ class WriteStagingStore:
             os.fsync(f.fileno())
         tmp_blob.replace(blob_path)
 
+        meta_data = {
+            "content_ref": content_ref,
+            "content_sha256": canonical_content_sha,
+            "decoded_size_bytes": upload.decoded_size_bytes,
+            "project_id": upload.project_id,
+            "host_id": upload.host_id,
+            "staged_at": staged_at,
+            "expires_at": expires_at,
+        }
+        tmp_meta = meta_path.parent / f"{meta_path.name}.tmp.{uuid4().hex}"
+        write_json(tmp_meta, meta_data, indent=2)
+        tmp_meta.replace(meta_path)
+
         return StagedWriteContent(
             content_ref=content_ref,
             content_sha256=canonical_content_sha,
             decoded_size_bytes=upload.decoded_size_bytes,
             project_id=upload.project_id,
             host_id=upload.host_id,
-            staged_at=utc_now_iso(),
+            staged_at=staged_at,
+            expires_at=expires_at,
         )
+
+    def collect_expired_staged_content(
+        self,
+        *,
+        now: Optional[str] = None,
+    ) -> list[str]:
+        """Collect expired unreferenced staged blobs.
+
+        Skips any blob referenced by a non-terminal write intent and deletes
+        only expired unreferenced blobs.
+        """
+        now_dt = datetime.fromisoformat(now) if now else datetime.now(timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+
+        # 1. Identify active (non-terminal) intent blob references
+        active_refs: set[tuple[str, str]] = set()  # (project_id, clean_digest)
+        terminal_states = {"applied", "failed", "ambiguous_requires_human"}
+        if self.intents_root.is_dir():
+            for intent_file in self.intents_root.glob("*.json"):
+                try:
+                    data = read_json(intent_file)
+                    if isinstance(data, dict):
+                        state = data.get("state")
+                        if state not in terminal_states:
+                            proj = data.get("project_id")
+                            c_sha = data.get("content_sha256")
+                            if proj and c_sha:
+                                clean_sha = canonical_sha256(c_sha).replace("sha256:", "").replace(":", "_")
+                                active_refs.add((proj, clean_sha))
+                except Exception:
+                    pass
+
+        # 2. Iterate staging directories and delete expired unreferenced blobs
+        deleted: list[str] = []
+        if self.staging_root.is_dir():
+            for proj_dir in self.staging_root.iterdir():
+                if not proj_dir.is_dir():
+                    continue
+                proj_id = proj_dir.name
+                for blob_file in proj_dir.glob("*.blob"):
+                    clean_sha = blob_file.stem
+                    if (proj_id, clean_sha) in active_refs:
+                        # Retain referenced blobs regardless of expiration
+                        continue
+
+                    meta_file = blob_file.with_suffix(".meta.json")
+                    is_expired = False
+                    content_ref = f"stage:{proj_id}:sha256:{clean_sha}"
+
+                    if meta_file.is_file():
+                        try:
+                            meta = read_json(meta_file)
+                            if isinstance(meta, dict):
+                                exp_str = meta.get("expires_at")
+                                if exp_str:
+                                    exp_dt = datetime.fromisoformat(exp_str)
+                                    if exp_dt.tzinfo is None:
+                                        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                                    if exp_dt <= now_dt:
+                                        is_expired = True
+                                if meta.get("content_ref"):
+                                    content_ref = meta["content_ref"]
+                        except Exception:
+                            pass
+                    else:
+                        mtime_dt = datetime.fromtimestamp(blob_file.stat().st_mtime, tz=timezone.utc)
+                        if (now_dt - mtime_dt).total_seconds() > DEFAULT_STAGING_TTL_SECONDS:
+                            is_expired = True
+
+                    if is_expired:
+                        try:
+                            blob_file.unlink(missing_ok=True)
+                            if meta_file.is_file():
+                                meta_file.unlink(missing_ok=True)
+                            deleted.append(content_ref)
+                        except Exception:
+                            pass
+
+        return deleted
 
     def get_staged_bytes(self, project_id: str, sha256_digest: str) -> Optional[bytes]:
         """Read and verify staged blob bytes."""

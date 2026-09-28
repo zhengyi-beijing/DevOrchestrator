@@ -251,18 +251,19 @@ class TestP18SelectorAndSecurity(unittest.TestCase):
                 },
             },
         )
-        write_json(
-            self.root / "transport-hosts.json",
-            {
-                "default_host": "local",
-                "hosts": {
-                    "local": {
-                        "host_id": "local",
-                        "candidate_order": ["local"],
-                    }
+        if not (self.root / "transport-hosts.json").exists():
+            write_json(
+                self.root / "transport-hosts.json",
+                {
+                    "default_host": "local",
+                    "hosts": {
+                        "local": {
+                            "host_id": "local",
+                            "candidate_order": ["local"],
+                        }
+                    },
                 },
-            },
-        )
+            )
         from dev_orchestrator.web.server import DevOrchestratorHTTPServer
         import threading
         server = DevOrchestratorHTTPServer(
@@ -679,6 +680,153 @@ class TestP18SelectorAndSecurity(unittest.TestCase):
             self.assertIn('"operation": "stat"', content)
             self.assertIn('"project_id": "p1"', content)
             self.assertIn('"selected_transport": "local"', content)
+        finally:
+            server.shutdown()
+
+    def test_host_capability_cache_remote_host_does_not_recurse(self):
+        """HostCapabilityCache.get_capabilities does not infinitely recurse for remote hosts."""
+        from unittest.mock import patch
+        from dev_orchestrator.transport.hosts import (
+            HostCapabilityCache,
+            TransportHostProfile,
+            TransportHostsConfig,
+        )
+        from dev_orchestrator.transport.contracts import HostCapabilities
+
+        mock_caps = HostCapabilities(
+            host_id="remote1",
+            os_family="linux",
+            path_style="posix",
+            helper_version="1.0.0",
+            jobs_config_valid=True,
+            approved_policy_pins={},
+            response_limits={"max_response_bytes": 1024, "max_file_write_bytes": 1024},
+            supported_operations=["exec", "spawn", "capabilities"],
+            probed_at="2026-09-28T00:00:00Z",
+        )
+
+        cfg = TransportHostsConfig(
+            default_host="local",
+            hosts={
+                "remote1": TransportHostProfile(
+                    host_id="remote1",
+                    candidate_order=["ssh"],
+                    ssh={"peer": "remote1.test"},
+                )
+            },
+        )
+        cache = HostCapabilityCache(runtime_root=self.root, hosts_config=cfg)
+
+        with patch("dev_orchestrator.transport.ssh.SSHMachineTransport.capabilities", return_value=mock_caps) as mock_ssh_caps:
+            caps = cache.get_capabilities("remote1")
+            self.assertEqual(caps.host_id, "remote1")
+            self.assertEqual(caps.os_family, "linux")
+            mock_ssh_caps.assert_called_once_with("remote1")
+
+        # Second call hits cache, doesn't call SSHMachineTransport again
+        with patch("dev_orchestrator.transport.ssh.SSHMachineTransport.capabilities") as mock_ssh_caps2:
+            cached_caps = cache.get_capabilities("remote1")
+            self.assertEqual(cached_caps.host_id, "remote1")
+            mock_ssh_caps2.assert_not_called()
+
+    def test_spawn_route_compares_remote_reported_policy_digest_against_pin(self):
+        """The spawn route compares remote reported policy digest against the host profile pin."""
+        import urllib.request
+        import urllib.error
+        from unittest.mock import patch
+        from dev_orchestrator.transport.contracts import MachineOperationResult
+        from dev_orchestrator.storage.json_store import write_json
+
+        pinned_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        different_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+
+        write_json(
+            self.root / "transport-hosts.json",
+            {
+                "default_host": "local",
+                "hosts": {
+                    "remote1": {
+                        "host_id": "remote1",
+                        "candidate_order": ["ssh"],
+                        "ssh": {"peer": "remote1.test"},
+                        "approved_policy_pins": {"cmd_pin": pinned_digest},
+                    }
+                },
+            },
+        )
+
+        cap = create_transport_capability(
+            project_id="p1",
+            host_id="remote1",
+            allowed_operations=["spawn"],
+            runtime_root=self.root,
+        )
+
+        server = self._start_server()
+        port = server.server_address[1]
+        try:
+            # 1. When remote resolve reports mismatched policy digest, request fails closed with 400
+            mismatched_resolve = {
+                "status": "ok",
+                "project_id": "p1",
+                "command_ref": "cmd_pin",
+                "effect_class": "effectful",
+                "execution_policy_digest": different_digest,
+                "resolution_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                "parameters_digest": None,
+            }
+            req_data = json.dumps({
+                "project_id": "p1",
+                "command_ref": "cmd_pin",
+                "host_id": "remote1",
+            }).encode("utf-8")
+            headers = {
+                "Authorization": f"Bearer {cap['token']}",
+                "X-DevOrch-Nonce": "nonce-pin-test-spawn-1",
+                "Content-Type": "application/json",
+            }
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/spawn",
+                data=req_data,
+                headers=headers,
+            )
+
+            with patch("dev_orchestrator.transport.ssh.SSHMachineTransport.resolve", return_value=mismatched_resolve):
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req)
+                self.assertEqual(ctx.exception.code, 400)
+
+            # 2. When remote resolve reports matching policy digest, request succeeds
+            matching_resolve = {
+                "status": "ok",
+                "project_id": "p1",
+                "command_ref": "cmd_pin",
+                "effect_class": "effectful",
+                "execution_policy_digest": pinned_digest,
+                "resolution_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                "parameters_digest": None,
+            }
+            mock_spawn_res = MachineOperationResult(
+                operation_id="remote-op-1",
+                command_ref="cmd_pin",
+                status="ok",
+                job_id="job-remote-1",
+                host_identity="remote1.test",
+                execution_policy_digest=pinned_digest,
+            )
+            headers["X-DevOrch-Nonce"] = "nonce-pin-test-spawn-2"
+            req2 = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/v1/control/transport/spawn",
+                data=req_data,
+                headers=headers,
+            )
+            with patch("dev_orchestrator.transport.ssh.SSHMachineTransport.resolve", return_value=matching_resolve), \
+                 patch("dev_orchestrator.transport.ssh.SSHMachineTransport.spawn", return_value=mock_spawn_res):
+                with urllib.request.urlopen(req2) as resp:
+                    self.assertEqual(resp.status, 202)
+                    body = json.loads(resp.read().decode("utf-8"))
+                    data = body.get("data", body)
+                    self.assertEqual(data.get("job_id"), "job-remote-1")
         finally:
             server.shutdown()
 

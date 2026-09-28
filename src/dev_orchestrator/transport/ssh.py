@@ -42,6 +42,7 @@ class SSHMachineTransport:
         subprocess_module: Any = None,
     ) -> None:
         if isinstance(config, TransportHostProfile):
+            self.profile: Optional[TransportHostProfile] = config
             ssh_dict = config.ssh or {}
             self.host_id = config.host_id
             self.ssh_cfg = SSHTransportConfig(
@@ -59,6 +60,7 @@ class SSHMachineTransport:
             )
             self.max_response_bytes = config.response_limits.get("max_response_bytes", DEFAULT_MAX_SSH_RESPONSE_BYTES)
         else:
+            self.profile = None
             self.host_id = config.peer
             self.ssh_cfg = config
             self.max_response_bytes = DEFAULT_MAX_SSH_RESPONSE_BYTES
@@ -81,6 +83,9 @@ class SSHMachineTransport:
                 or "escapes" in err_msg
                 or "validation failed" in err_msg
                 or "only supports read_only" in err_msg
+                or "mismatch" in err_msg
+                or "tampered" in err_msg
+                or "unauthorized" in err_msg
             ):
                 raise TransportRejectedError(err_msg)
             raise TransportError(err_msg)
@@ -88,6 +93,18 @@ class SSHMachineTransport:
         if not isinstance(payload, dict):
             raise TransportError("remote helper returned non-dict payload")
         return payload
+
+    def resolve(self, request: MachineOperation) -> dict[str, Any]:
+        req_id = str(uuid.uuid4())
+        req_env = {
+            "operation": "op_resolve",
+            "request_id": req_id,
+            "project_id": request.project_id,
+            "command_ref": request.command_ref,
+            "parameters": request.parameters,
+            "expected_working_directory": request.expected_working_directory,
+        }
+        return self._call_helper(req_env, timeout_seconds=self.ssh_cfg.connect_timeout_seconds + 15.0)
 
     def exec(self, request: MachineOperation) -> MachineOperationResult:
         req_id = request.idempotency_key or str(uuid.uuid4())
@@ -118,6 +135,18 @@ class SSHMachineTransport:
 
     def spawn(self, request: MachineOperation) -> MachineOperationResult:
         req_id = request.idempotency_key or str(uuid.uuid4())
+        resolved_info = self.resolve(request)
+        exec_policy_digest = resolved_info.get("execution_policy_digest")
+        params_digest = resolved_info.get("parameters_digest")
+        res_digest = resolved_info.get("resolution_digest")
+
+        pins = self.profile.approved_policy_pins if self.profile else {}
+        pinned_digest = pins.get(request.command_ref)
+        if pinned_digest and pinned_digest != exec_policy_digest:
+            raise TransportRejectedError(
+                f"remote_policy_mismatch: pinned {pinned_digest} != reported {exec_policy_digest}"
+            )
+
         spec = JobSpec(
             project_id=request.project_id,
             command_ref=request.command_ref,
@@ -125,6 +154,9 @@ class SSHMachineTransport:
             expected_working_directory=request.expected_working_directory,
             input_digest=request.input_digest,
             transport="ssh",
+            parameters_digest=params_digest,
+            execution_policy_digest=exec_policy_digest,
+            resolution_digest=res_digest,
         )
         c_spec_hash = spec_hash(spec)
         canon_spec = spec.to_canonical_dict()
@@ -149,9 +181,9 @@ class SSHMachineTransport:
             status=payload.get("status", "ok"),
             job_id=payload.get("job_id"),
             host_identity=self.ssh_cfg.expected_host_identity or self.ssh_cfg.peer,
-            parameters_digest=payload.get("parameters_digest"),
-            execution_policy_digest=payload.get("execution_policy_digest"),
-            resolution_digest=payload.get("resolution_digest"),
+            parameters_digest=payload.get("parameters_digest", params_digest),
+            execution_policy_digest=payload.get("execution_policy_digest", exec_policy_digest),
+            resolution_digest=payload.get("resolution_digest", res_digest),
             raw_evidence=payload,
         )
 

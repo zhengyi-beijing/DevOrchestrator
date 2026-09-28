@@ -488,6 +488,101 @@ class TestP18BinaryStagingAndWrite(unittest.TestCase):
         with self.assertRaises(TransportRejectedError):
             self.store.apply_file_write(req, [str(self.root)], host_identity="local_box")
 
+    def test_staging_rejects_oversized_encoded_payload_before_decode_and_allows_empty_content(self):
+        """Allows empty content Base64 with size 0, and rejects oversized encoded payload before decoding."""
+        # 1. Empty content allowed
+        empty_sha = "sha256:" + hashlib.sha256(b"").hexdigest()
+        upload_empty = WriteContentUpload(
+            project_id="test-proj",
+            host_id="local",
+            content_base64="",
+            decoded_size_bytes=0,
+            content_sha256=empty_sha,
+        )
+        staged_empty = self.store.stage_content(upload_empty)
+        self.assertEqual(staged_empty.decoded_size_bytes, 0)
+        self.assertEqual(self.store.get_staged_bytes("test-proj", empty_sha), b"")
+
+        # Empty content with non-zero declared size rejects
+        with self.assertRaises(TransportRejectedError):
+            validate_and_decode_base64("", declared_size=5, declared_sha256=empty_sha)
+
+        # 2. Oversized encoded payload rejected before decoding
+        # If max_bytes is 50, an encoded string implying > 50 bytes decoded must be rejected even with declared_size=10
+        oversized_b64 = "AAAA" * 50  # 200 chars -> min decoded is (200//4)*3 - 2 = 148 bytes > 50
+        with self.assertRaises(TransportRejectedError) as ctx:
+            validate_and_decode_base64(
+                oversized_b64,
+                declared_size=10,
+                declared_sha256="sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                max_bytes=50,
+            )
+        self.assertIn("exceeds maximum allowed", str(ctx.exception))
+
+    def test_expired_unreferenced_staged_blobs_collected_active_intent_blobs_retained(self):
+        """Garbage collection removes expired unreferenced blobs and preserves active-intent referenced blobs."""
+        from datetime import datetime, timedelta, timezone
+        from dev_orchestrator.storage.json_store import write_json
+
+        now = datetime.now(timezone.utc)
+        t_base = now.isoformat()
+
+        # Blob A: Short TTL (10s), unreferenced
+        bytes_a = b"content blob a"
+        sha_a = "sha256:" + hashlib.sha256(bytes_a).hexdigest()
+        staged_a = self.store.stage_content(
+            WriteContentUpload("p1", "local", base64.b64encode(bytes_a).decode("ascii"), len(bytes_a), sha_a),
+            ttl_seconds=10.0,
+        )
+
+        # Blob B: Short TTL (10s), referenced by non-terminal (claimed) intent
+        bytes_b = b"content blob b"
+        sha_b = "sha256:" + hashlib.sha256(bytes_b).hexdigest()
+        staged_b = self.store.stage_content(
+            WriteContentUpload("p1", "local", base64.b64encode(bytes_b).decode("ascii"), len(bytes_b), sha_b),
+            ttl_seconds=10.0,
+        )
+        intent_b_path = self.store.intents_root / "write-b.json"
+        write_json(
+            intent_b_path,
+            {
+                "write_id": "write-b",
+                "project_id": "p1",
+                "content_sha256": sha_b,
+                "content_ref": staged_b.content_ref,
+                "state": "claimed",
+            },
+        )
+
+        # Blob C: Long TTL (3600s), unreferenced
+        bytes_c = b"content blob c"
+        sha_c = "sha256:" + hashlib.sha256(bytes_c).hexdigest()
+        staged_c = self.store.stage_content(
+            WriteContentUpload("p1", "local", base64.b64encode(bytes_c).decode("ascii"), len(bytes_c), sha_c),
+            ttl_seconds=3600.0,
+        )
+
+        # Check all 3 exist initially
+        self.assertIsNotNone(self.store.get_staged_bytes("p1", sha_a))
+        self.assertIsNotNone(self.store.get_staged_bytes("p1", sha_b))
+        self.assertIsNotNone(self.store.get_staged_bytes("p1", sha_c))
+
+        # Advance time by 30 seconds
+        future_now = (now + timedelta(seconds=30)).isoformat()
+        deleted = self.store.collect_expired_staged_content(now=future_now)
+
+        # Blob A is expired and unreferenced -> deleted
+        self.assertIn(staged_a.content_ref, deleted)
+        self.assertIsNone(self.store.get_staged_bytes("p1", sha_a))
+
+        # Blob B is expired but referenced by claimed intent -> retained
+        self.assertNotIn(staged_b.content_ref, deleted)
+        self.assertIsNotNone(self.store.get_staged_bytes("p1", sha_b))
+
+        # Blob C is not expired -> retained
+        self.assertNotIn(staged_c.content_ref, deleted)
+        self.assertIsNotNone(self.store.get_staged_bytes("p1", sha_c))
+
 
 if __name__ == "__main__":
     unittest.main()

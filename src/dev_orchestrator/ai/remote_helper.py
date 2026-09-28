@@ -322,6 +322,8 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("hardware_execution_not_supported_in_p18")
 
             if spec is not None:
+                if (params or req.get("parameters")) and not spec.parameters_digest:
+                    raise ValueError("supplied parameters but job_spec missing parameters_digest")
                 if (
                     spec.parameters_digest and spec.parameters_digest != resolved.parameters_digest
                     or spec.execution_policy_digest and spec.execution_policy_digest != resolved.execution_policy_digest
@@ -687,6 +689,8 @@ def execute_request(req: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("hardware_execution_not_supported_in_p18")
 
             if spec is not None:
+                if (params or req.get("parameters")) and not spec.parameters_digest:
+                    raise ValueError("supplied parameters but job_spec missing parameters_digest")
                 if (
                     spec.parameters_digest and spec.parameters_digest != resolved.parameters_digest
                     or spec.execution_policy_digest and spec.execution_policy_digest != resolved.execution_policy_digest

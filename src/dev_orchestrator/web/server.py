@@ -1528,25 +1528,51 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if not auth_ok:
                 self._error(403, "Forbidden", auth_err or "forbidden", False); return
 
-            from dev_orchestrator.jobs.config import load_jobs_config, resolve_execution_policy
-            jobs_cfg = load_jobs_config(runtime / "execution-jobs.json")
+            from dev_orchestrator.transport.hosts import load_transport_hosts_config
+            h_cfg = load_transport_hosts_config(runtime)
+            is_local = (host_id == "local")
             p_digest = None
             ep_digest = None
             res_digest = None
             effect_cls = "read_only"
-            if jobs_cfg and project_id and command_ref:
-                ok_pol, _, resolved = resolve_execution_policy(
-                    jobs_cfg,
-                    project_id,
-                    command_ref,
+            if not is_local:
+                profile = h_cfg.hosts.get(host_id)
+                if profile is None:
+                    self._error(400, "Bad Request", f"unknown host_id: {host_id}", False); return
+                from dev_orchestrator.transport.ssh import SSHMachineTransport
+                from dev_orchestrator.transport.contracts import MachineOperation
+                ssh_t = SSHMachineTransport(profile)
+                op_probe = MachineOperation(
+                    project_id=project_id,
+                    command_ref=command_ref,
+                    idempotency_key=f"resolve-{idem_key}",
                     parameters=value.get("parameters"),
                     expected_working_directory=value.get("expected_working_directory"),
                 )
-                if ok_pol and resolved:
-                    p_digest = resolved.parameters_digest
-                    ep_digest = resolved.execution_policy_digest
-                    res_digest = resolved.resolution_digest
-                    effect_cls = resolved.effect_class
+                try:
+                    resolved_info = ssh_t.resolve(op_probe)
+                except Exception as exc:
+                    self._error(400, "Bad Request", f"remote resolution failed: {exc}", False); return
+                ep_digest = resolved_info.get("execution_policy_digest")
+                res_digest = resolved_info.get("resolution_digest")
+                p_digest = resolved_info.get("parameters_digest")
+                effect_cls = resolved_info.get("effect_class", "read_only")
+            else:
+                from dev_orchestrator.jobs.config import load_jobs_config, resolve_execution_policy
+                jobs_cfg = load_jobs_config(runtime / "execution-jobs.json")
+                if jobs_cfg and project_id and command_ref:
+                    ok_pol, _, resolved = resolve_execution_policy(
+                        jobs_cfg,
+                        project_id,
+                        command_ref,
+                        parameters=value.get("parameters"),
+                        expected_working_directory=value.get("expected_working_directory"),
+                    )
+                    if ok_pol and resolved:
+                        p_digest = resolved.parameters_digest
+                        ep_digest = resolved.execution_policy_digest
+                        res_digest = resolved.resolution_digest
+                        effect_cls = resolved.effect_class
 
             try:
                 transport = _get_transport_for_host(
@@ -1615,25 +1641,51 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if not auth_ok:
                 self._error(403, "Forbidden", auth_err or "forbidden", False); return
 
-            from dev_orchestrator.jobs.config import load_jobs_config, resolve_execution_policy
-            jobs_cfg = load_jobs_config(runtime / "execution-jobs.json")
+            from dev_orchestrator.transport.hosts import load_transport_hosts_config
+            h_cfg = load_transport_hosts_config(runtime)
+            is_local = (host_id == "local")
             p_digest = None
             ep_digest = None
             res_digest = None
             effect_cls = "effectful"
-            if jobs_cfg and project_id and command_ref:
-                ok_pol, _, resolved = resolve_execution_policy(
-                    jobs_cfg,
-                    project_id,
-                    command_ref,
+            if not is_local:
+                profile = h_cfg.hosts.get(host_id)
+                if profile is None:
+                    self._error(400, "Bad Request", f"unknown host_id: {host_id}", False); return
+                from dev_orchestrator.transport.ssh import SSHMachineTransport
+                from dev_orchestrator.transport.contracts import MachineOperation
+                ssh_t = SSHMachineTransport(profile)
+                op_probe = MachineOperation(
+                    project_id=project_id,
+                    command_ref=command_ref,
+                    idempotency_key=f"resolve-{idem_key}",
                     parameters=value.get("parameters"),
                     expected_working_directory=value.get("expected_working_directory"),
                 )
-                if ok_pol and resolved:
-                    p_digest = resolved.parameters_digest
-                    ep_digest = resolved.execution_policy_digest
-                    res_digest = resolved.resolution_digest
-                    effect_cls = resolved.effect_class
+                try:
+                    resolved_info = ssh_t.resolve(op_probe)
+                except Exception as exc:
+                    self._error(400, "Bad Request", f"remote resolution failed: {exc}", False); return
+                ep_digest = resolved_info.get("execution_policy_digest")
+                res_digest = resolved_info.get("resolution_digest")
+                p_digest = resolved_info.get("parameters_digest")
+                effect_cls = resolved_info.get("effect_class", "effectful")
+            else:
+                from dev_orchestrator.jobs.config import load_jobs_config, resolve_execution_policy
+                jobs_cfg = load_jobs_config(runtime / "execution-jobs.json")
+                if jobs_cfg and project_id and command_ref:
+                    ok_pol, _, resolved = resolve_execution_policy(
+                        jobs_cfg,
+                        project_id,
+                        command_ref,
+                        parameters=value.get("parameters"),
+                        expected_working_directory=value.get("expected_working_directory"),
+                    )
+                    if ok_pol and resolved:
+                        p_digest = resolved.parameters_digest
+                        ep_digest = resolved.execution_policy_digest
+                        res_digest = resolved.resolution_digest
+                        effect_cls = resolved.effect_class
 
             try:
                 transport = _get_transport_for_host(

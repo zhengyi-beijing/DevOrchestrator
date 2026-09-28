@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from dev_orchestrator.jobs.config import (
     JobCommandConfig,
@@ -660,6 +660,110 @@ class TestP18Transports(unittest.TestCase):
         self.assertEqual(envelope["job_spec"], spec.to_canonical_dict())
         self.assertEqual(envelope["controller_spec_hash"], spec_hash(spec))
         self.assertEqual(envelope["parameters"], {"env": "prod"})
+
+    def test_ssh_spawn_pins_policy_and_resolution_digests_and_rejects_drift(self):
+        """SSHMachineTransport.spawn pins digests from op_resolve and rejects policy mismatch or drift."""
+        import os
+        from dev_orchestrator.transport.ssh import SSHMachineTransport
+        from dev_orchestrator.transport.hosts import TransportHostProfile
+        from dev_orchestrator.transport.contracts import MachineOperation, TransportRejectedError
+        from dev_orchestrator.ai.remote_helper import execute_request
+        from dev_orchestrator.storage.json_store import write_json
+
+        pinned_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        different_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+
+        profile = TransportHostProfile(
+            host_id="remote1",
+            candidate_order=["ssh"],
+            ssh={"peer": "remote1.test"},
+            approved_policy_pins={"cmd1": pinned_digest},
+        )
+        transport = SSHMachineTransport(profile)
+
+        op = MachineOperation(
+            project_id="p1",
+            command_ref="cmd1",
+            idempotency_key="ssh-spawn-key-1",
+            parameters={"param1": "val1"},
+        )
+
+        # 1. op_resolve reports mismatched execution_policy_digest -> raises TransportRejectedError
+        with patch.object(transport, "resolve", return_value={
+            "status": "ok",
+            "execution_policy_digest": different_digest,
+            "parameters_digest": "sha256:4444",
+            "resolution_digest": "sha256:5555",
+        }):
+            with self.assertRaises(TransportRejectedError) as ctx:
+                transport.spawn(op)
+            self.assertIn("remote_policy_mismatch", str(ctx.exception))
+
+        # 2. op_resolve reports matching policy pin -> JobSpec is built with all three digests and sent
+        mock_call = MagicMock(return_value={"status": "ok", "job_id": "job-spawned-1"})
+        with patch.object(transport, "resolve", return_value={
+            "status": "ok",
+            "execution_policy_digest": pinned_digest,
+            "parameters_digest": "sha256:4444",
+            "resolution_digest": "sha256:5555",
+        }), patch.object(transport, "_call_helper", mock_call):
+            res = transport.spawn(op)
+            self.assertEqual(res.status, "ok")
+            self.assertEqual(res.job_id, "job-spawned-1")
+            mock_call.assert_called_once()
+            env = mock_call.call_args[0][0]
+            self.assertEqual(env["operation"], "op_spawn")
+            sent_spec = env["job_spec"]
+            self.assertEqual(sent_spec["execution_policy_digest"], pinned_digest)
+            self.assertEqual(sent_spec["parameters_digest"], "sha256:4444")
+            self.assertEqual(sent_spec["resolution_digest"], "sha256:5555")
+
+        # 3. In remote_helper: reject spawn that supplies parameters while spec carries no parameters_digest
+        cfg_file = self.root / "projects_drift.json"
+        write_json(
+            cfg_file,
+            {
+                "runtime_root": str(self.root),
+                "projects": {
+                    "p1": {
+                        "repo_path": str(self.repo_dir),
+                        "commands": {
+                            "cmd_with_param": {
+                                "argv": ["python", "-c", "print('ok')"],
+                                "cwd": ".",
+                                "effect_class": "read_only",
+                                "parameters": {"env": {"type": "enum", "allowed_values": ["dev", "prod"]}},
+                            }
+                        },
+                    }
+                },
+            },
+        )
+        old_env = os.environ.get("DEVORCH_JOBS_CONFIG")
+        os.environ["DEVORCH_JOBS_CONFIG"] = str(cfg_file)
+        try:
+            spec_no_p_digest = JobSpec(
+                project_id="p1",
+                command_ref="cmd_with_param",
+                idempotency_key="key-no-p-digest",
+                transport="ssh",
+                execution_policy_digest="sha256:0000",
+                resolution_digest="sha256:0000",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                execute_request({
+                    "operation": "op_spawn",
+                    "request_id": "req-no-p",
+                    "job_spec": spec_no_p_digest.to_canonical_dict(),
+                    "controller_spec_hash": spec_hash(spec_no_p_digest),
+                    "parameters": {"env": "prod"},
+                })
+            self.assertIn("missing parameters_digest", str(ctx.exception))
+        finally:
+            if old_env is None:
+                os.environ.pop("DEVORCH_JOBS_CONFIG", None)
+            else:
+                os.environ["DEVORCH_JOBS_CONFIG"] = old_env
 
 
 if __name__ == "__main__":

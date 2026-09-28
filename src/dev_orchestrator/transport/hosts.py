@@ -183,7 +183,8 @@ class HostCapabilityCache:
         else:
             if profile is None:
                 raise ValueError(f"unknown host_id: {host_id}")
-            transport = get_transport_for_host(self.runtime_root, host_id=host_id)
+            from dev_orchestrator.transport.ssh import SSHMachineTransport
+            transport = SSHMachineTransport(profile)
             caps = transport.capabilities(host_id)
         self.put(host_id, caps)
         return caps
@@ -252,13 +253,14 @@ def get_transport_for_host(
     command_ref: Optional[str] = None,
     effect_class: str = "read_only",
     policy_digest: Optional[str] = None,
+    capability_cache: Optional[HostCapabilityCache] = None,
 ):
     """Retrieve an initialized MachineTransport instance for the specified host after selection."""
     h_id = host_id or "local"
     cfg = load_transport_hosts_config(runtime_root, config_path)
     from dev_orchestrator.transport.selector import select_transport
     from dev_orchestrator.transport.contracts import TransportRejectedError
-    cache = HostCapabilityCache(runtime_root, hosts_config=cfg)
+    cache = capability_cache or HostCapabilityCache(runtime_root, hosts_config=cfg)
     caps = None
     try:
         caps = cache.get_capabilities(h_id)

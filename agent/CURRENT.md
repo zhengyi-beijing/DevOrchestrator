@@ -7,6 +7,38 @@
 
 Current task: **P18 Native Execution Transport & RDC Dependency Reduction** (Status: **REMEDIATION_COMPLETE**). Previous task: **P17 Single-Authority Goal Convergence Baseline** (Status: **COMPLETE**).
 
+P18 Technical Review Round 3 Remediation Evidence (2026-09-28):
+- Addressed all 5 Technical Review findings from `runtime/ai-reviewer.json` (`ai_review:ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute`):
+  1. Finding 1 (HostCapabilityCache recursion cycle on remote hosts):
+     - In `src/dev_orchestrator/transport/hosts.py`, `HostCapabilityCache.get_capabilities` previously called `get_transport_for_host(..., operation="capabilities")`, which re-invoked `cache.get_capabilities(h_id)`, leading to unbounded recursion for remote hosts.
+     - Resolved by constructing `SSHMachineTransport(profile)` directly for remote hosts inside `HostCapabilityCache.get_capabilities` and querying `transport.capabilities()` directly without recursing into `get_transport_for_host`. Added optional `capability_cache` injection to `get_transport_for_host`.
+     - Added covering regression test `test_host_capability_cache_remote_host_does_not_recurse` in `tests_py/test_p18_selector_and_security.py`.
+  2. Finding 2 (SSHMachineTransport policy drift check, digest pinning, and parameters_digest validation):
+     - In `src/dev_orchestrator/transport/ssh.py`, stored profile as `self.profile = config if isinstance(config, TransportHostProfile) else None`.
+     - Implemented `resolve(self, request: MachineOperation) -> dict[str, Any]` querying remote `op_resolve` and raising `TransportRejectedError` on error, mismatch, or authorization issues.
+     - In `SSHMachineTransport.spawn`, calls `self.resolve(request)` first, compares returned `execution_policy_digest` against `self.profile.approved_policy_pins.get(request.command_ref)` (raising `TransportRejectedError("remote_policy_mismatch")` if drifted), and populates `parameters_digest`, `execution_policy_digest`, and `resolution_digest` into the `JobSpec` sent over the wire via `op_spawn`.
+     - In `src/dev_orchestrator/ai/remote_helper.py`, enforced in `op_spawn` and `job_start` that if parameters are supplied, `spec.parameters_digest` must be present.
+     - Added covering regression test `test_ssh_spawn_pins_policy_and_resolution_digests_and_rejects_drift` in `tests_py/test_p18_transports.py`.
+  3. Finding 3 (Spawn and exec routes compare remote reported policy digest against pins):
+     - In `src/dev_orchestrator/web/server.py`, in `/api/v1/control/transport/spawn` and `/api/v1/control/transport/exec`, for remote hosts (`host_id != "local"`), probes remote `op_resolve` via `SSHMachineTransport(profile).resolve(op_probe)` with `idempotency_key=f"resolve-{idem_key}"` to obtain remote `execution_policy_digest`, `resolution_digest`, `parameters_digest`, and `effect_class`, ensuring transport selection validates policy pins against remote authority rather than local `execution-jobs.json`.
+     - Added covering regression test `test_spawn_route_compares_remote_reported_policy_digest_against_pin` in `tests_py/test_p18_selector_and_security.py`.
+  4. Finding 4 (Pre-decode Base64 ceiling validation and empty content support):
+     - In `src/dev_orchestrator/transport/write_store.py`, `validate_and_decode_base64` permits empty content (`content_base64 == ""`) with declared size 0 and digest matching `canonical_sha256(b"")`, returning `b""`.
+     - Evaluates minimum possible decoded size before decoding (`(len(content_b64) // 4) * 3 - 2 > max_bytes`), failing closed with `TransportRejectedError` before allocating decoded memory if the encoded payload guarantees an oversized file.
+     - Added covering regression test `test_staging_rejects_oversized_encoded_payload_before_decode_and_allows_empty_content` in `tests_py/test_p18_binary_staging_and_write.py`.
+  5. Finding 5 (Staged content expiration and GC retaining active write intents):
+     - In `src/dev_orchestrator/transport/write_store.py`, defined `DEFAULT_STAGING_TTL_SECONDS = 3600.0`.
+     - In `stage_content`, persists sidecar `<digest>.meta.json` recording `staged_at` and `expires_at`, sets `expires_at` on returned `StagedWriteContent`, and preserves expiration on idempotent re-uploads.
+     - Implemented `collect_expired_staged_content(now=...)`: scans non-terminal intents in `write-intents/` (treating `applied`, `failed`, `ambiguous_requires_human` as terminal), preserves all blobs referenced by active intents, and unlinks expired unreferenced staged blobs and sidecar metadata.
+     - Added covering regression test `test_expired_unreferenced_staged_blobs_collected_active_intent_blobs_retained` in `tests_py/test_p18_binary_staging_and_write.py`.
+- Full Regression Verification Summary:
+  - Focused P18 test suites: 59/59 tests passed (`test_p18_binary_staging_and_write.py`, `test_p18_canonical_identity.py`, `test_p18_config_and_parameters.py`, `test_p18_selector_and_security.py`, `test_p18_transports.py`).
+  - Full test suite: 1577 passed, 107 subtests passed (0 failures).
+  - P13/P14 transport regressions: 47 passed (`test_p13_execution_transport.py`, `test_p14_job_transport.py`, `test_p14_durable_jobs.py`).
+  - Python AST and syntax compilation clean (`compileall src ops tests_py`).
+  - `git diff --check` clean with 0 warnings or whitespace errors.
+  - Knowledge graph updated cleanly via `graphify update .`.
+
 P18 Technical Review Round 2 Remediation Evidence (2026-09-28):
 - Addressed all 5 Technical Review findings from `runtime/ai-reviewer.json` (`ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute`):
   1. Finding 1 (Wire job_id validation, controller_spec_hash enforcement, and JobRecord submission_spec persistence):
