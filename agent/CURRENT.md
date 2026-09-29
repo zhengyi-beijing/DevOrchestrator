@@ -1,5 +1,16 @@
 # DevOrchestrator Self-Hosted Development State
 
+P19 Remote HTTP/HTTPS Gateway + Web UI implementation & acceptance (2026-09-29):
+- Status: **IMPLEMENTATION_COMPLETE** (Ready for Technical Review). Executed bounded task P19.1 from `agent/next.md` without modifying lifecycle authority or fabricating successors.
+- Implementation commits: `62020f1` (`feat(P19): implement web native operations console and browser session control`) and `88e3ca6` (`test(P19): record live web console zero-RDC acceptance evidence`).
+- Same-origin browser console added at `/web/index.html` (`#operations-section`) and `web/app.js` with session reconnect, textContent-only sanitization, confirmation gates for spawn/cancel/write, and bounded form builders.
+- Method-scoped read exception added to `src/dev_orchestrator/web/server.py` allowing same-origin browser GET/HEAD reads without Origin header when `Sec-Fetch-Site: same-origin`, while retaining strict valid-Origin enforcement for mutating POST requests.
+- Added owner-only command catalog endpoint `GET /api/v1/control/transport/commands` registered as external operation `transport_commands`, excluding argv/cwd/env and marking hardware commands non-selectable.
+- Live ZXZ-PC acceptance passed: 17 native transport operations executed against loopback daemon on port 8770; all operations selected `local`; zero RDC calls recorded; durable job `job-56d31673e0cc6873` completed with exit 0; job `job-ce9c0932ac41c66d` cancelled; binary staged create/readback and CAS update verified with matching digests; CAS conflict precondition failure tested and rejected with HTTP 400.
+- Acceptance evidence: `docs/evidence/P19_WEB_CONSOLE_ACCEPTANCE.json` and `docs/evidence/P19_WEB_CONSOLE_OPERATIONS.ndjson`.
+- Verification: 23/23 focused tests passed (`test_p19_web_console.py`, `test_p19_web_console_ui.py`, `test_p135_sidebar_nav.py`); 70/70 P18 tests passed; 92/92 job/transport/dashboard tests passed; 163/163 lifecycle/control-plane tests passed; `compileall`, `node --check web/app.js`, `git diff --check`, and `graphify update .` all passed.
+- Diff hygiene: untouched `agent/next.md`, `agent/HANDOFF.md`, `agent/staged/*`, and `runtime/transition-executor.json`.
+
 P18 External Control Entrypoint closeout (2026-09-29):
 - Status: **COMPLETE**. The authoritative P18 lifecycle is terminal with `outcome = task_complete`; `active_execution = null`, `owner_gate = null`, and no successor was fabricated.
 - Final implementation commit: `e948bec2dde1f43ba37dbb0b6360cd68f23c4ccc` (`feat(control-api): add native external control entrypoint`). Not pushed.
@@ -16,7 +27,7 @@ P18 External Control Entrypoint closeout (2026-09-29):
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P18 Native Execution Transport & RDC Dependency Reduction** (Status: **REMEDIATION_COMPLETE**). Previous task: **P17 Single-Authority Goal Convergence Baseline** (Status: **COMPLETE**).
+Current task: **P19 Remote HTTP/HTTPS Gateway + Web UI** (Status: **IMPLEMENTATION_COMPLETE**). Previous task: **P18 External Control Entrypoint** (Status: **COMPLETE**).
 
 P18 Owner-Authorized Technical Review Remediation Evidence (2026-09-28):
 - Addressed exactly the four remaining blockers from Claude Opus review `ai_review:ai_review:ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute` at `d3ecdb9` without reopening planning:
