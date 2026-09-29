@@ -19,6 +19,7 @@ DEFAULT_HEAD_LINES = 1000
 DEFAULT_TAIL_LINES = 1000
 DEFAULT_MAX_JOBS_RETENTION = 100
 DEFAULT_MAX_AGE_DAYS = 7
+DEFAULT_MAX_CONCURRENT_JOBS = 4
 
 EFFECT_CLASSES = frozenset({"read_only", "idempotent", "effectful", "hardware"})
 PARAMETER_TYPES = frozenset({"enum", "integer", "path_within_repo"})
@@ -81,6 +82,7 @@ class JobsConfig:
     projects: dict[str, JobProjectConfig] = field(default_factory=dict)
     ssh: Optional[dict[str, Any]] = None
     max_file_write_bytes: int = MAX_FILE_WRITE_BYTES
+    max_concurrent_jobs: int = DEFAULT_MAX_CONCURRENT_JOBS
 
 
 def resolve_local_jobs_config_path(runtime_root: Path | str) -> Path:
@@ -195,6 +197,7 @@ def load_jobs_config(config_path: Path | str | None) -> JobsConfig | None:
         projects=projects,
         ssh=ssh_dict,
         max_file_write_bytes=global_max_write,
+        max_concurrent_jobs=max(1, min(64, int(raw.get("max_concurrent_jobs", DEFAULT_MAX_CONCURRENT_JOBS)))),
     )
 
 

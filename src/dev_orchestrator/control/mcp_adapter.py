@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
+import base64
 from typing import Any, IO, Mapping
 
 from dev_orchestrator.control.adapter import (
@@ -155,6 +156,117 @@ _TRANSPORT_TOOLS = [
                     "maximum": 100,
                 },
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "devorch_exec",
+        "description": "Run one host-allowlisted command synchronously through LocalTransport or SSHTransport.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"}, "command_ref": {"type": "string"},
+                "idempotency_key": {"type": "string"}, "host_id": {"type": "string"},
+                "parameters": {"type": "object"}, "expected_working_directory": {"type": "string"},
+                "timeout_seconds": {"type": "number", "minimum": 0.1}, "request_id": {"type": "string"},
+            },
+            "required": ["project_id", "command_ref", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "devorch_spawn",
+        "description": "Start one durable host-allowlisted background job and return its stable job ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"}, "command_ref": {"type": "string"},
+                "idempotency_key": {"type": "string"}, "host_id": {"type": "string"},
+                "parameters": {"type": "object"}, "expected_working_directory": {"type": "string"},
+                "input_digest": {"type": "string"}, "request_id": {"type": "string"},
+            },
+            "required": ["project_id", "command_ref", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "devorch_poll",
+        "description": "Poll one exact durable job and return bounded output and terminal status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "operation_id": {"type": "string"}, "project_id": {"type": "string"},
+                "host_id": {"type": "string"}, "request_id": {"type": "string"},
+            },
+            "required": ["operation_id", "project_id"], "additionalProperties": False,
+        },
+    },
+    {
+        "name": "devorch_cancel",
+        "description": "Idempotently cancel one exact durable job without cross-job cancellation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "operation_id": {"type": "string"}, "project_id": {"type": "string"},
+                "host_id": {"type": "string"}, "reason": {"type": "string"},
+                "request_id": {"type": "string"},
+            },
+            "required": ["operation_id", "project_id"], "additionalProperties": False,
+        },
+    },
+    {
+        "name": "devorch_read_file",
+        "description": "Read bounded binary content from a configured project file root.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"}, "path": {"type": "string"},
+                "host_id": {"type": "string"}, "max_bytes": {"type": "integer", "minimum": 1},
+                "offset_bytes": {"type": "integer", "minimum": 0}, "request_id": {"type": "string"},
+            },
+            "required": ["project_id", "path"], "additionalProperties": False,
+        },
+    },
+    {
+        "name": "devorch_stat",
+        "description": "Inspect one path within a configured project file root.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"}, "path": {"type": "string"},
+                "host_id": {"type": "string"}, "request_id": {"type": "string"},
+            },
+            "required": ["project_id", "path"], "additionalProperties": False,
+        },
+    },
+    {
+        "name": "devorch_stage_write",
+        "description": "Stage digest-verified binary content before a CAS file write.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"}, "content_base64": {"type": "string"},
+                "content_sha256": {"type": "string"}, "host_id": {"type": "string"},
+                "request_id": {"type": "string"},
+            },
+            "required": ["project_id", "content_base64", "content_sha256"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "devorch_write",
+        "description": "Apply staged content with create-only or expected-hash CAS semantics.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"}, "target_path": {"type": "string"},
+                "idempotency_key": {"type": "string"}, "content_ref": {"type": "string"},
+                "content_sha256": {"type": "string"}, "decoded_size_bytes": {"type": "integer", "minimum": 0},
+                "host_id": {"type": "string"}, "if_absent": {"type": "boolean"},
+                "expected_sha256": {"type": "string"}, "expected_file_policy_digest": {"type": "string"},
+                "request_id": {"type": "string"},
+            },
+            "required": ["project_id", "target_path", "idempotency_key", "content_ref", "content_sha256", "decoded_size_bytes"],
             "additionalProperties": False,
         },
     },
@@ -307,6 +419,22 @@ class MCPAdapter:
                 return self._call_transport_capabilities(req_id, args)
             if name == "devorch_transport_operations":
                 return self._call_transport_operations(req_id, args)
+            if name == "devorch_exec":
+                return self._call_exec(req_id, args)
+            if name == "devorch_spawn":
+                return self._call_spawn(req_id, args)
+            if name == "devorch_poll":
+                return self._call_poll(req_id, args)
+            if name == "devorch_cancel":
+                return self._call_cancel(req_id, args)
+            if name == "devorch_read_file":
+                return self._call_read_file(req_id, args)
+            if name == "devorch_stat":
+                return self._call_stat(req_id, args)
+            if name == "devorch_stage_write":
+                return self._call_stage_write(req_id, args)
+            if name == "devorch_write":
+                return self._call_write(req_id, args)
         except Exception as exc:  # noqa: BLE001
             return json.dumps({
                 "jsonrpc": "2.0",
@@ -333,7 +461,10 @@ class MCPAdapter:
             raise ValueError(f"Unknown arguments for devorch_status: {', '.join(unknown)}")
 
         project_id = args.get("project_id")
-        result = self.client.status(project_id)
+        if self.enable_transport_tools and hasattr(self.client, "external_status"):
+            result = self.client.external_status(project_id)
+        else:
+            result = self.client.status(project_id)
         return self._format_tool_result(req_id, result)
 
     def _call_logs(self, req_id: Any, args: dict[str, Any]) -> str:
@@ -413,6 +544,61 @@ class MCPAdapter:
         return self._format_tool_result(req_id, result)
 
     @staticmethod
+    def _checked_args(args: dict[str, Any], allowed: set[str], required: tuple[str, ...]) -> None:
+        unknown = sorted(set(args) - allowed)
+        if unknown:
+            raise ValueError(f"Unknown arguments: {', '.join(unknown)}")
+        for name in required:
+            if name not in args or args[name] is None or (isinstance(args[name], str) and not args[name].strip()):
+                raise ValueError(f"missing required argument: {name}")
+
+    def _call_exec(self, req_id: Any, args: dict[str, Any]) -> str:
+        allowed = {"project_id", "command_ref", "idempotency_key", "host_id", "parameters", "expected_working_directory", "timeout_seconds", "request_id"}
+        self._checked_args(args, allowed, ("project_id", "command_ref", "idempotency_key"))
+        result = self.client.transport_exec(**args)
+        return self._format_tool_result(req_id, result)
+
+    def _call_spawn(self, req_id: Any, args: dict[str, Any]) -> str:
+        allowed = {"project_id", "command_ref", "idempotency_key", "host_id", "parameters", "expected_working_directory", "input_digest", "request_id"}
+        self._checked_args(args, allowed, ("project_id", "command_ref", "idempotency_key"))
+        result = self.client.transport_spawn(**args)
+        return self._format_tool_result(req_id, result)
+
+    def _call_poll(self, req_id: Any, args: dict[str, Any]) -> str:
+        self._checked_args(args, {"operation_id", "project_id", "host_id", "request_id"}, ("operation_id", "project_id"))
+        return self._format_tool_result(req_id, self.client.transport_poll(**args))
+
+    def _call_cancel(self, req_id: Any, args: dict[str, Any]) -> str:
+        self._checked_args(args, {"operation_id", "project_id", "host_id", "reason", "request_id"}, ("operation_id", "project_id"))
+        return self._format_tool_result(req_id, self.client.transport_cancel(**args))
+
+    def _call_read_file(self, req_id: Any, args: dict[str, Any]) -> str:
+        self._checked_args(args, {"project_id", "path", "host_id", "max_bytes", "offset_bytes", "request_id"}, ("project_id", "path"))
+        return self._format_tool_result(req_id, self.client.transport_read_file(**args))
+
+    def _call_stat(self, req_id: Any, args: dict[str, Any]) -> str:
+        self._checked_args(args, {"project_id", "path", "host_id", "request_id"}, ("project_id", "path"))
+        return self._format_tool_result(req_id, self.client.transport_stat(**args))
+
+    def _call_stage_write(self, req_id: Any, args: dict[str, Any]) -> str:
+        self._checked_args(args, {"project_id", "content_base64", "content_sha256", "host_id", "request_id"}, ("project_id", "content_base64", "content_sha256"))
+        try:
+            content = base64.b64decode(str(args["content_base64"]), validate=True)
+        except Exception as exc:
+            raise ValueError(f"content_base64 is invalid: {exc}") from exc
+        values = dict(args)
+        values.pop("content_base64")
+        values["content"] = content
+        return self._format_tool_result(req_id, self.client.transport_stage_write(**values))
+
+    def _call_write(self, req_id: Any, args: dict[str, Any]) -> str:
+        allowed = {"project_id", "target_path", "idempotency_key", "content_ref", "content_sha256", "decoded_size_bytes", "host_id", "if_absent", "expected_sha256", "expected_file_policy_digest", "request_id"}
+        self._checked_args(args, allowed, ("project_id", "target_path", "idempotency_key", "content_ref", "content_sha256", "decoded_size_bytes"))
+        if args.get("if_absent") is not True and not args.get("expected_sha256"):
+            raise ValueError("devorch_write requires if_absent=true or expected_sha256")
+        return self._format_tool_result(req_id, self.client.transport_write_file(**args))
+
+    @staticmethod
     def _format_tool_result(req_id: Any, result: Any, is_error: bool = False) -> str:
         rendered = json.dumps(result, ensure_ascii=False, indent=2)
         # Bound output to max 64KB per call
@@ -440,9 +626,10 @@ def run_mcp_adapter(
     base_url: str | None = None,
     token: str | None = None,
     runtime_root: str | None = None,
+    enable_transport_tools: bool = False,
 ) -> int:
     client = ControlAdapterClient(base_url=base_url, token=token, runtime_root=runtime_root)
-    adapter = MCPAdapter(client)
+    adapter = MCPAdapter(client, enable_transport_tools=enable_transport_tools)
     adapter.run()
     return 0
 

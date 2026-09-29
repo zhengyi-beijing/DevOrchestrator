@@ -656,6 +656,7 @@ def cmd_mcp_adapter(args: argparse.Namespace) -> int:
         base_url=getattr(args, "base_url", None),
         token=getattr(args, "token", None),
         runtime_root=str(runtime),
+        enable_transport_tools=bool(getattr(args, "enable_transport_tools", False)),
     )
 
 
@@ -2152,6 +2153,11 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_adapter.add_argument("--base-url", default=None, help="DevOrchestrator control HTTP base URL")
     mcp_adapter.add_argument("--token", default=None, help="control bearer token")
     mcp_adapter.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+    mcp_adapter.add_argument(
+        "--enable-transport-tools",
+        action="store_true",
+        help="explicitly expose privileged native exec/job/file MCP tools",
+    )
 
     create_cap = sub.add_parser("create-web-bridge-capability", help="issue a scoped web bridge capability token")
     create_cap.add_argument("project_id", help="target project ID")

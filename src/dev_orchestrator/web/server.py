@@ -23,6 +23,7 @@ import json
 import os
 import re
 import threading
+import time
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -95,6 +96,23 @@ _SELF_AUTHENTICATING_TRANSPORT_PATHS = {
     "/api/v1/control/transport/write",
 }
 
+_EXTERNAL_OPERATION_PATHS = {
+    "/api/v1/control/external/status": "status",
+    "/api/v1/control/logs": "logs",
+    "/api/v1/control/transport/hosts": "transport_hosts",
+    "/api/v1/control/transport/capabilities": "transport_capabilities",
+    "/api/v1/control/transport/operations": "transport_operations",
+    "/api/v1/control/transport/exec": "exec",
+    "/api/v1/control/transport/spawn": "spawn",
+    "/api/v1/control/transport/poll": "poll",
+    "/api/v1/control/transport/cancel": "cancel",
+    "/api/v1/control/transport/stage-write": "stage_write",
+    "/api/v1/control/transport/write": "write_file",
+    "/api/v1/control/transport/read": "read_file",
+    "/api/v1/control/transport/stat": "stat",
+}
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
 
 def _get_transport_for_host(
     runtime_root: Path,
@@ -114,6 +132,24 @@ def _get_transport_for_host(
         effect_class=effect_class,
         policy_digest=policy_digest,
     )
+
+
+def _selected_transport_name(transport: Any) -> str:
+    return str(getattr(getattr(transport, "last_selection", None), "selected_transport", "local"))
+
+
+def _local_job_belongs_to_project(runtime_root: Path, operation_id: Any, project_id: Any) -> tuple[bool, str]:
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        return False, "operation_id is required"
+    if not isinstance(project_id, str) or not project_id.strip():
+        return False, "project_id is required"
+    from dev_orchestrator.jobs.store import ExecutionJobStore
+    record = ExecutionJobStore(runtime_root, read_only=True).get(operation_id.strip())
+    if record is None:
+        return False, "job not found"
+    if record.project_id != project_id.strip():
+        return False, "job does not belong to requested project"
+    return True, "ok"
 
 
 def monitor_payload(runtime_root: Path | str) -> dict[str, Any]:
@@ -363,6 +399,90 @@ def _control_envelope(data: Any, *, warnings: list[str] | None = None, sources: 
     }
 
 
+def external_status_payload(
+    runtime_root: Path | str,
+    config_path: Path | str | None = None,
+    bridge_store: Any | None = None,
+    *,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Return the bounded external-client status projection.
+
+    Lifecycle facts are copied from the existing daemon projection; this helper
+    never reads or writes lifecycle ledgers directly.
+    """
+    runtime = Path(runtime_root)
+    overview = control_overview_payload(runtime, config_path, bridge_store)
+    overview_data = overview.get("data") if isinstance(overview, dict) else {}
+    projects = overview_data.get("projects") if isinstance(overview_data, dict) else []
+    projects = projects if isinstance(projects, list) else []
+    project_summaries = [
+        {
+            "project_id": row.get("project_id") or row.get("id"),
+            "name": row.get("name"),
+            "repo_path": row.get("repo_path") or row.get("root"),
+            "state": row.get("state"),
+            "lifecycle_state": row.get("lifecycle_state"),
+            "git": row.get("git"),
+            "active_roles": row.get("active_roles") if isinstance(row.get("active_roles"), list) else [],
+            "owner_gate": row.get("gate") or row.get("owner_gate"),
+        }
+        for row in projects if isinstance(row, dict)
+    ]
+    selected = None
+    if project_id:
+        selected = next((
+            row for row in projects
+            if isinstance(row, dict)
+            and str(row.get("project_id") or row.get("id") or "") == project_id
+        ), None)
+    elif len(projects) == 1:
+        selected = projects[0]
+
+    daemon = read_json(runtime / "daemon.json", {})
+    daemon = dict(daemon) if isinstance(daemon, dict) else {}
+    daemon_pid = daemon.get("pid")
+    try:
+        daemon["process_alive"] = bool(int(daemon_pid) > 0 and is_pid_alive(int(daemon_pid)))
+    except (TypeError, ValueError):
+        daemon["process_alive"] = False
+
+    if project_id and not isinstance(selected, dict):
+        raise KeyError(project_id)
+
+    project = selected if isinstance(selected, dict) else None
+    project_status = None
+    if project is not None:
+        project_status = {
+            "project_id": project.get("project_id") or project.get("id"),
+            "name": project.get("name"),
+            "repo_path": project.get("repo_path") or project.get("root"),
+            "state": project.get("state"),
+            "lifecycle_state": project.get("lifecycle_state"),
+            "readiness": project.get("readiness"),
+            "blockers": project.get("blockers") if isinstance(project.get("blockers"), list) else [],
+        }
+    return _control_envelope(
+        {
+            "daemon": daemon,
+            "project": project_status,
+            "projects": project_summaries if project is None else None,
+            "authoritative_lifecycle": project.get("authoritative_lifecycle") if project else None,
+            "owner_gate": (project.get("gate") or project.get("owner_gate")) if project else None,
+            "active_execution": project.get("active_execution") if project else None,
+            "active_ai_roles": project.get("active_roles") if project else [],
+            "git": project.get("git") if project else None,
+            "latest_activity": (
+                {"at": project.get("last_activity_at"), "activity": project.get("activity")}
+                if project else None
+            ),
+            "control_health": overview_data.get("control_health") if isinstance(overview_data, dict) else None,
+        },
+        warnings=list(overview.get("warnings") or []) if isinstance(overview, dict) else [],
+        sources=list(overview.get("sources") or []) if isinstance(overview, dict) else [],
+    )
+
+
 def _control_project_configs(config_path: Path | str | None) -> dict[str, dict[str, Any]]:
     if config_path is None:
         return {}
@@ -506,12 +626,18 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     # -- entry points -----------------------------------------------------
     def do_GET(self) -> None:
+        if not self._begin_external_request():
+            return
         self._dispatch(head_only=False)
 
     def do_HEAD(self) -> None:
+        if not self._begin_external_request():
+            return
         self._dispatch(head_only=True)
 
     def do_POST(self) -> None:
+        if not self._begin_external_request():
+            return
         if not self.server.control_enabled:
             self._dispatch_method_not_allowed()
             return
@@ -564,6 +690,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         head_only: bool,
         extra_headers: Optional[dict] = None,
     ) -> None:
+        self._response_status = status
+        response_headers = dict(extra_headers or {})
+        request_id = getattr(self, "_external_request_id", None)
+        if request_id:
+            response_headers.setdefault("X-DevOrch-Request-ID", request_id)
+            self._audit_external_request(status)
         self.send_response(status, reason)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -571,11 +703,54 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'")
-        for key, value in (extra_headers or {}).items():
+        for key, value in response_headers.items():
             self.send_header(key, value)
         self.end_headers()
         if not head_only and body:
             self.wfile.write(body)
+
+    def _begin_external_request(self) -> bool:
+        path = urlsplit(self.path).path
+        operation = _EXTERNAL_OPERATION_PATHS.get(path)
+        self._external_operation = operation
+        self._external_audit_emitted = False
+        self._external_request_started = time.monotonic()
+        self._external_request_id = None
+        if operation is None:
+            return True
+        supplied = str(self.headers.get("X-DevOrch-Request-ID") or "").strip()
+        if supplied and not _REQUEST_ID_RE.fullmatch(supplied):
+            self._external_request_id = "req-" + uuid4().hex
+            self._error(400, "Bad Request", "invalid X-DevOrch-Request-ID", self.command == "HEAD")
+            self._touch_after_request()
+            return False
+        self._external_request_id = supplied or ("req-" + uuid4().hex)
+        return True
+
+    def _audit_external_request(self, status: int) -> None:
+        if getattr(self, "_external_audit_emitted", False):
+            return
+        operation = getattr(self, "_external_operation", None)
+        request_id = getattr(self, "_external_request_id", None)
+        if not operation or not request_id:
+            return
+        self._external_audit_emitted = True
+        elapsed = max(0.0, time.monotonic() - getattr(self, "_external_request_started", time.monotonic()))
+        try:
+            self.server.command_store.audit("external_operation", {
+                "request_id": request_id,
+                "operation": operation,
+                "method": self.command,
+                "path": urlsplit(self.path).path,
+                "status_code": int(status),
+                "result": "accepted" if int(status) < 400 else "rejected",
+                "duration_seconds": round(elapsed, 4),
+                "client_loopback": self._client_is_loopback(),
+            })
+        except Exception:
+            # Transport operations keep their own durable evidence. Audit failure
+            # must never leak credentials or turn an error response into a crash.
+            pass
 
     def _error(
         self,
@@ -650,7 +825,21 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
 
         runtime = self.server.runtime_root
-        if path == "/api/v1/control/overview":
+        if path == "/api/v1/control/external/status":
+            if not self._owner_authorized():
+                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            q_params = parse_qs(parsed.query)
+            project_id = q_params.get("project_id", [None])[0]
+            try:
+                payload = external_status_payload(
+                    runtime,
+                    self.server.config_path,
+                    self.server.bridge_store,
+                    project_id=project_id,
+                )
+            except KeyError:
+                self._error(404, "Not Found", "project snapshot not found", head_only); return
+        elif path == "/api/v1/control/overview":
             payload = control_overview_payload(runtime, self.server.config_path, self.server.bridge_store)
             payload["data"]["control_enabled"] = self.server.control_enabled
             for project in payload["data"]["projects"]:
@@ -1007,6 +1196,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     "sha256": stat_res.sha256,
                     "host_identity": stat_res.host_identity,
                     "error": stat_res.error,
+                    "selected_transport": _selected_transport_name(transport),
                 })
             except Exception as exc:
                 self._error(400, "Bad Request", str(exc), head_only); return
@@ -1016,6 +1206,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 log_transport_operation(
                     runtime,
                     operation_id=f"stat-{uuid4().hex[:12]}",
+                    request_id=getattr(self, "_external_request_id", None),
                     operation="stat",
                     host_id=host_id,
                     selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
@@ -1043,8 +1234,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._error(401, "Unauthorized", auth_err or "valid control authorization required", head_only); return
             import base64
             from dev_orchestrator.transport.contracts import FileReadRequest
-            max_bytes = int(q_params.get("max_bytes", [10 * 1024 * 1024])[0])
-            offset_bytes = int(q_params.get("offset_bytes", [0])[0])
+            try:
+                max_bytes = max(1, min(10 * 1024 * 1024, int(q_params.get("max_bytes", [10 * 1024 * 1024])[0])))
+                offset_bytes = max(0, int(q_params.get("offset_bytes", [0])[0]))
+            except (TypeError, ValueError):
+                self._error(400, "Bad Request", "max_bytes and offset_bytes must be integers", head_only); return
             try:
                 transport = _get_transport_for_host(runtime, host_id, operation="read_file", effect_class="read_only")
                 file_res = transport.read_file(FileReadRequest(project_id=project_id, path=path_param, host_id=host_id, max_bytes=max_bytes, offset_bytes=offset_bytes))
@@ -1057,6 +1251,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     "content_base64": b64_str,
                     "host_identity": file_res.host_identity,
                     "error": file_res.error,
+                    "selected_transport": _selected_transport_name(transport),
                 })
             except Exception as exc:
                 self._error(400, "Bad Request", str(exc), head_only); return
@@ -1066,6 +1261,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 log_transport_operation(
                     runtime,
                     operation_id=f"read-{uuid4().hex[:12]}",
+                    request_id=getattr(self, "_external_request_id", None),
                     operation="read_file",
                     host_id=host_id,
                     selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
@@ -1602,6 +1798,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 log_transport_operation(
                     runtime,
                     operation_id=getattr(res, "operation_id", idem_key),
+                    request_id=getattr(self, "_external_request_id", None),
                     operation="exec",
                     host_id=host_id,
                     selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
@@ -1621,7 +1818,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-            self._send(200 if res.status == "ok" else 400, "OK" if res.status == "ok" else "Bad Request", "application/json; charset=utf-8", _json_bytes(_control_envelope(dataclasses.asdict(res))), False)
+            res_data = dataclasses.asdict(res)
+            res_data["selected_transport"] = _selected_transport_name(transport)
+            # A non-zero command exit is a completed transport result, not an
+            # HTTP protocol failure. Callers need its stderr and exit code.
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(res_data)), False)
             return
 
         if path == "/api/v1/control/transport/spawn":
@@ -1715,6 +1916,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 log_transport_operation(
                     runtime,
                     operation_id=getattr(res, "operation_id", idem_key),
+                    request_id=getattr(self, "_external_request_id", None),
                     operation="spawn",
                     host_id=host_id,
                     selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
@@ -1734,7 +1936,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-            self._send(202 if res.status in ("ok", "queued", "running") else 400, "Accepted" if res.status in ("ok", "queued", "running") else "Bad Request", "application/json; charset=utf-8", _json_bytes(_control_envelope(dataclasses.asdict(res))), False)
+            res_data = dataclasses.asdict(res)
+            res_data["selected_transport"] = _selected_transport_name(transport)
+            self._send(202 if res.status in ("ok", "queued", "running") else 400, "Accepted" if res.status in ("ok", "queued", "running") else "Bad Request", "application/json; charset=utf-8", _json_bytes(_control_envelope(res_data)), False)
             return
 
         if path == "/api/v1/control/transport/poll":
@@ -1751,6 +1955,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             )
             if not auth_ok:
                 self._error(403, "Forbidden", auth_err or "forbidden", False); return
+            if host_id == "local":
+                belongs, reason = _local_job_belongs_to_project(runtime, op_id, project_id)
+                if not belongs:
+                    self._error(404 if reason == "job not found" else 403, "Not Found" if reason == "job not found" else "Forbidden", reason, False); return
 
             try:
                 transport = _get_transport_for_host(runtime, host_id, operation="poll", effect_class="read_only")
@@ -1764,6 +1972,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 log_transport_operation(
                     runtime,
                     operation_id=str(op_id),
+                    request_id=getattr(self, "_external_request_id", None),
                     operation="poll",
                     host_id=host_id,
                     selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
@@ -1777,7 +1986,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(dataclasses.asdict(res))), False)
+            res_data = dataclasses.asdict(res)
+            res_data["selected_transport"] = _selected_transport_name(transport)
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(res_data)), False)
             return
 
         if path == "/api/v1/control/transport/cancel":
@@ -1795,6 +2006,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             )
             if not auth_ok:
                 self._error(403, "Forbidden", auth_err or "forbidden", False); return
+            if host_id == "local":
+                belongs, owner_reason = _local_job_belongs_to_project(runtime, op_id, project_id)
+                if not belongs:
+                    self._error(404 if owner_reason == "job not found" else 403, "Not Found" if owner_reason == "job not found" else "Forbidden", owner_reason, False); return
 
             try:
                 transport = _get_transport_for_host(runtime, host_id, operation="cancel", effect_class="effectful")
@@ -1808,6 +2023,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 log_transport_operation(
                     runtime,
                     operation_id=str(op_id),
+                    request_id=getattr(self, "_external_request_id", None),
                     operation="cancel",
                     host_id=host_id,
                     selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
@@ -1820,7 +2036,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(dataclasses.asdict(res))), False)
+            res_data = dataclasses.asdict(res)
+            res_data["selected_transport"] = _selected_transport_name(transport)
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(res_data)), False)
             return
 
         if path == "/api/v1/control/transport/stage-write":
@@ -1857,6 +2075,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 log_transport_operation(
                     runtime,
                     operation_id=staged.content_ref,
+                    request_id=getattr(self, "_external_request_id", None),
                     operation="stage_write",
                     host_id=host_id,
                     selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
@@ -1868,7 +2087,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-            self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(dataclasses.asdict(staged))), False)
+            staged_data = dataclasses.asdict(staged)
+            staged_data["selected_transport"] = _selected_transport_name(transport)
+            self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(staged_data)), False)
             return
 
         if path == "/api/v1/control/transport/write":
@@ -1912,6 +2133,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 log_transport_operation(
                     runtime,
                     operation_id=write_req.idempotency_key,
+                    request_id=getattr(self, "_external_request_id", None),
                     operation="write_file",
                     host_id=host_id,
                     selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
@@ -1928,6 +2150,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             res_dict = dataclasses.asdict(f_res)
             if "content_bytes" in res_dict:
                 del res_dict["content_bytes"]
+            res_dict["selected_transport"] = _selected_transport_name(transport)
             self._send(st_code, "OK" if st_code == 200 else "Bad Request", "application/json; charset=utf-8", _json_bytes(_control_envelope(res_dict)), False)
             return
 

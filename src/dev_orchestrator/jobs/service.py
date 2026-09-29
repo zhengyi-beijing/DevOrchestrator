@@ -200,7 +200,12 @@ class JobService:
             )
             return rec
 
-        record, is_new = self.store.claim_or_get(spec, _factory, target_job_id=target_job_id)
+        record, is_new = self.store.claim_or_get(
+            spec,
+            _factory,
+            target_job_id=target_job_id,
+            max_active_jobs=self.config.max_concurrent_jobs,
+        )
         if is_new:
             if input_payload is not None:
                 self.store.save_input_artifact(record.job_id, input_payload)

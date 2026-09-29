@@ -77,6 +77,12 @@ Default surfaces:
 - dashboard: `http://127.0.0.1:8770/`
 - Browser Bridge: `http://127.0.0.1:8765/`
 
+The daemon also owns the authenticated P18 external-control API and an opt-in
+stdio MCP adapter for bounded Local/SSH exec, durable jobs, scoped file reads,
+and staged CAS writes without RDC. See
+[`docs/P18_EXTERNAL_CONTROL_API.md`](docs/P18_EXTERNAL_CONTROL_API.md) for the
+security model, Windows scripts, and ChatGPT/MCP connection command.
+
 The daemon-hosted dashboard is the normal observation and control surface.
 Its buttons come from server-advertised capabilities and every mutation is
 revalidated by the daemon. To publish ChatGPT conversation presence, click

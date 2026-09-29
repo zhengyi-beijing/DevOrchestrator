@@ -116,6 +116,7 @@ class ExecutionJobStore:
         spec: JobSpec,
         record_factory: Callable[[str, str], JobRecord],
         target_job_id: Optional[str] = None,
+        max_active_jobs: Optional[int] = None,
     ) -> tuple[JobRecord, bool]:
         """Claim a new job or return existing record if already submitted.
         
@@ -134,6 +135,23 @@ class ExecutionJobStore:
                         f"({existing.spec_hash} != {expected_spec_hash})"
                     )
                 return existing, False
+
+            if max_active_jobs is not None:
+                limit = max(1, int(max_active_jobs))
+                index_data = read_json(self.index_path, None)
+                if self.index_path.exists() and not isinstance(index_data, dict):
+                    raise JobCorruptionError("cannot enforce concurrency limit: job index is corrupt")
+                jobs_map = index_data.get("jobs", {}) if isinstance(index_data, dict) else {}
+                if not isinstance(jobs_map, dict):
+                    raise JobCorruptionError("cannot enforce concurrency limit: job index schema is invalid")
+                active_count = sum(
+                    1 for row in jobs_map.values()
+                    if isinstance(row, dict) and row.get("state") in {"queued", "running", "unknown_recovery"}
+                )
+                if active_count >= limit:
+                    raise JobConflictError(
+                        f"maximum concurrent jobs reached ({active_count}/{limit})"
+                    )
 
             # Create new job
             record = record_factory(actual_job_id, expected_spec_hash)

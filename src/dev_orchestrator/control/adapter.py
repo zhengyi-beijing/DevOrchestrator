@@ -12,6 +12,7 @@ import http.client
 import ipaddress
 import json
 import urllib.parse
+from base64 import b64encode
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -120,6 +121,7 @@ class ControlAdapterClient:
             conn.request(method, path, body=encoded_body, headers=req_headers)
             response = conn.getresponse()
             raw_bytes = response.read()
+            response_request_id = response.getheader("X-DevOrch-Request-ID")
         except OSError as exc:
             raise ControlAdapterError(f"Control API request to {path} failed: {exc}") from exc
         finally:
@@ -132,12 +134,14 @@ class ControlAdapterClient:
 
         if not isinstance(payload, dict):
             raise ControlAdapterError(f"Control API response must be a JSON object from {path}")
+        if response_request_id and "request_id" not in payload:
+            payload["request_id"] = response_request_id
 
         status = response.status
         if status in (200, 201, 202):
             return payload
 
-        error_msg = str(payload.get("error") or payload.get("message") or f"HTTP {status}")
+        error_msg = str(payload.get("message") or payload.get("error") or f"HTTP {status}")
         if status in (401, 403):
             raise ControlAdapterAuthError(error_msg)
         if status == 404:
@@ -152,6 +156,13 @@ class ControlAdapterClient:
             safe_id = urllib.parse.quote(project_id.strip(), safe="")
             return self._request("GET", f"/api/v1/control/projects/{safe_id}")
         return self._request("GET", "/api/v1/control/overview")
+
+    def external_status(self, project_id: str | None = None) -> dict[str, Any]:
+        """Inspect the authenticated, bounded external-control status view."""
+        path = "/api/v1/control/external/status"
+        if project_id:
+            path += "?" + urllib.parse.urlencode({"project_id": project_id.strip()})
+        return self._request("GET", path)
 
     def logs(
         self,
@@ -257,3 +268,151 @@ class ControlAdapterClient:
     def transport_operations(self, limit: int = 50) -> dict[str, Any]:
         """Fetch recent transport operations."""
         return self._request("GET", f"/api/v1/control/transport/operations?limit={limit}")
+
+    @staticmethod
+    def _request_headers(request_id: str | None = None) -> dict[str, str] | None:
+        if request_id is None:
+            return None
+        value = request_id.strip()
+        if not value:
+            raise ValueError("request_id must be nonblank when supplied")
+        return {"X-DevOrch-Request-ID": value}
+
+    def transport_exec(
+        self,
+        *,
+        project_id: str,
+        command_ref: str,
+        idempotency_key: str,
+        host_id: str = "local",
+        parameters: dict[str, Any] | None = None,
+        expected_working_directory: str | None = None,
+        timeout_seconds: float | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "project_id": project_id,
+            "command_ref": command_ref,
+            "idempotency_key": idempotency_key,
+            "host_id": host_id,
+        }
+        if parameters is not None:
+            body["parameters"] = parameters
+        if expected_working_directory is not None:
+            body["expected_working_directory"] = expected_working_directory
+        if timeout_seconds is not None:
+            body["timeout_seconds"] = timeout_seconds
+        return self._request("POST", "/api/v1/control/transport/exec", body, self._request_headers(request_id))
+
+    def transport_spawn(
+        self,
+        *,
+        project_id: str,
+        command_ref: str,
+        idempotency_key: str,
+        host_id: str = "local",
+        parameters: dict[str, Any] | None = None,
+        expected_working_directory: str | None = None,
+        input_digest: str | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "project_id": project_id,
+            "command_ref": command_ref,
+            "idempotency_key": idempotency_key,
+            "host_id": host_id,
+        }
+        if parameters is not None:
+            body["parameters"] = parameters
+        if expected_working_directory is not None:
+            body["expected_working_directory"] = expected_working_directory
+        if input_digest is not None:
+            body["input_digest"] = input_digest
+        return self._request("POST", "/api/v1/control/transport/spawn", body, self._request_headers(request_id))
+
+    def transport_poll(
+        self, *, operation_id: str, project_id: str, host_id: str = "local",
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST", "/api/v1/control/transport/poll",
+            {"operation_id": operation_id, "project_id": project_id, "host_id": host_id},
+            self._request_headers(request_id),
+        )
+
+    def transport_cancel(
+        self, *, operation_id: str, project_id: str, host_id: str = "local",
+        reason: str = "cancelled", request_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST", "/api/v1/control/transport/cancel",
+            {"operation_id": operation_id, "project_id": project_id, "host_id": host_id, "reason": reason},
+            self._request_headers(request_id),
+        )
+
+    def transport_read_file(
+        self, *, project_id: str, path: str, host_id: str = "local",
+        max_bytes: int = 10 * 1024 * 1024, offset_bytes: int = 0,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        query = urllib.parse.urlencode({
+            "project_id": project_id, "path": path, "host_id": host_id,
+            "max_bytes": int(max_bytes), "offset_bytes": int(offset_bytes),
+        })
+        return self._request(
+            "GET", "/api/v1/control/transport/read?" + query,
+            headers=self._request_headers(request_id),
+        )
+
+    def transport_stat(
+        self, *, project_id: str, path: str, host_id: str = "local",
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        query = urllib.parse.urlencode({"project_id": project_id, "path": path, "host_id": host_id})
+        return self._request(
+            "GET", "/api/v1/control/transport/stat?" + query,
+            headers=self._request_headers(request_id),
+        )
+
+    def transport_stage_write(
+        self, *, project_id: str, content: bytes, host_id: str = "local",
+        content_sha256: str, request_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST", "/api/v1/control/transport/stage-write",
+            {
+                "project_id": project_id,
+                "host_id": host_id,
+                "content_base64": b64encode(content).decode("ascii"),
+                "decoded_size_bytes": len(content),
+                "content_sha256": content_sha256,
+            },
+            self._request_headers(request_id),
+        )
+
+    def transport_write_file(
+        self, *, project_id: str, target_path: str, idempotency_key: str,
+        content_ref: str, content_sha256: str, decoded_size_bytes: int,
+        host_id: str = "local", if_absent: bool | None = None,
+        expected_sha256: str | None = None, expected_file_policy_digest: str | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "project_id": project_id,
+            "host_id": host_id,
+            "target_path": target_path,
+            "idempotency_key": idempotency_key,
+            "content_ref": content_ref,
+            "content_sha256": content_sha256,
+            "decoded_size_bytes": int(decoded_size_bytes),
+        }
+        if if_absent is not None:
+            body["if_absent"] = if_absent
+        if expected_sha256 is not None:
+            body["expected_sha256"] = expected_sha256
+        if expected_file_policy_digest is not None:
+            body["expected_file_policy_digest"] = expected_file_policy_digest
+        return self._request(
+            "POST", "/api/v1/control/transport/write", body,
+            self._request_headers(request_id),
+        )

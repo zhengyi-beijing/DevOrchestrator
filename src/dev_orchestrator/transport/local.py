@@ -89,7 +89,10 @@ class LocalMachineTransport:
                 f"LocalMachineTransport.exec only supports read_only commands, found effect_class: {resolved.effect_class!r}"
             )
 
-        timeout = request.timeout_seconds or resolved.max_runtime_seconds
+        requested_timeout = request.timeout_seconds
+        if requested_timeout is not None and float(requested_timeout) <= 0:
+            raise TransportRejectedError("timeout_seconds must be positive")
+        timeout = min(float(requested_timeout), resolved.max_runtime_seconds) if requested_timeout is not None else resolved.max_runtime_seconds
         start_t = time.monotonic()
         try:
             completed = subprocess.run(
@@ -104,24 +107,45 @@ class LocalMachineTransport:
             )
             duration = time.monotonic() - start_t
             status = "ok" if completed.returncode == 0 else "failed"
+            max_output_bytes = max(128, min(2 * 1024 * 1024, int(self.jobs_cfg.log_caps.get("max_job_bytes", 2 * 1024 * 1024))))
+            stdout_raw = completed.stdout.encode("utf-8", errors="replace")
+            stderr_raw = completed.stderr.encode("utf-8", errors="replace")
+            stdout_budget = min(len(stdout_raw), max_output_bytes)
+            stderr_budget = min(len(stderr_raw), max(0, max_output_bytes - stdout_budget))
+            stdout = stdout_raw[:stdout_budget].decode("utf-8", errors="ignore")
+            stderr = stderr_raw[:stderr_budget].decode("utf-8", errors="ignore")
+            truncated_bytes = (len(stdout_raw) - stdout_budget) + (len(stderr_raw) - stderr_budget)
             return MachineOperationResult(
                 operation_id=request.idempotency_key or str(uuid.uuid4()),
                 command_ref=request.command_ref,
                 status=status,
                 exit_code=completed.returncode,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
+                stdout=stdout,
+                stderr=stderr,
                 host_identity=socket.gethostname(),
                 duration_seconds=duration,
                 parameters_digest=resolved.parameters_digest,
                 execution_policy_digest=resolved.execution_policy_digest,
                 resolution_digest=resolved.resolution_digest,
-                raw_evidence={"cwd": str(resolved.resolved_cwd)},
+                raw_evidence={
+                    "cwd": str(resolved.resolved_cwd),
+                    "output_truncated": truncated_bytes > 0,
+                    "truncated_bytes": truncated_bytes,
+                    "output_limit_bytes": max_output_bytes,
+                },
             )
         except subprocess.TimeoutExpired as exc:
             duration = time.monotonic() - start_t
             stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            max_output_bytes = max(128, min(2 * 1024 * 1024, int(self.jobs_cfg.log_caps.get("max_job_bytes", 2 * 1024 * 1024))))
+            stdout_raw = stdout.encode("utf-8", errors="replace")
+            stderr_raw = stderr.encode("utf-8", errors="replace")
+            stdout_budget = min(len(stdout_raw), max_output_bytes)
+            stderr_budget = min(len(stderr_raw), max(0, max_output_bytes - stdout_budget))
+            stdout = stdout_raw[:stdout_budget].decode("utf-8", errors="ignore")
+            stderr = stderr_raw[:stderr_budget].decode("utf-8", errors="ignore")
+            truncated_bytes = (len(stdout_raw) - stdout_budget) + (len(stderr_raw) - stderr_budget)
             return MachineOperationResult(
                 operation_id=request.idempotency_key or str(uuid.uuid4()),
                 command_ref=request.command_ref,
@@ -135,6 +159,12 @@ class LocalMachineTransport:
                 parameters_digest=resolved.parameters_digest,
                 execution_policy_digest=resolved.execution_policy_digest,
                 resolution_digest=resolved.resolution_digest,
+                raw_evidence={
+                    "cwd": str(resolved.resolved_cwd),
+                    "output_truncated": truncated_bytes > 0,
+                    "truncated_bytes": truncated_bytes,
+                    "output_limit_bytes": max_output_bytes,
+                },
             )
         except Exception as exc:
             duration = time.monotonic() - start_t
@@ -208,7 +238,12 @@ class LocalMachineTransport:
                 timestamps={"created_at": now, "queued_at": now, "updated_at": now},
             )
 
-        record, is_new = self.store.claim_or_get(spec, _factory, target_job_id=target_job_id)
+        record, is_new = self.store.claim_or_get(
+            spec,
+            _factory,
+            target_job_id=target_job_id,
+            max_active_jobs=self.jobs_cfg.max_concurrent_jobs,
+        )
         if is_new:
             start_res = self.local_job_transport.job_start(spec, self.store._job_dir(record.job_id))
             sup_pid = start_res.get("supervisor_pid") if isinstance(start_res, dict) else None
@@ -256,14 +291,31 @@ class LocalMachineTransport:
         record = self.store.get(operation_id)
         if record is None:
             raise TransportRejectedError(f"job {operation_id!r} not found")
-        cancel_res = self.local_job_transport.job_cancel(operation_id, self.store._job_dir(operation_id), reason=reason)
+        if record.state not in ("completed", "failed", "cancelled"):
+            self.local_job_transport.job_cancel(
+                operation_id, self.store._job_dir(operation_id), reason=reason
+            )
+
+            def _mark_cancelled(current: JobRecord) -> None:
+                if current.state in ("completed", "failed", "cancelled"):
+                    return
+                current.transition_to(
+                    "cancelled",
+                    reason=reason,
+                    failure_kind="cancelled",
+                    timestamp=utc_now_iso(),
+                )
+                current.terminal["outcome"] = "cancelled"
+                current.terminal["error"] = reason
+
+            record = self.store.update(operation_id, _mark_cancelled)
         return MachineOperationResult(
             operation_id=operation_id,
             command_ref=record.command_ref,
-            status=cancel_res.get("status", "cancelled"),
+            status=record.state,
             host_identity=record.host_identity or socket.gethostname(),
             job_id=operation_id,
-            raw_evidence=cancel_res,
+            raw_evidence={"job_id": operation_id, "status": record.state, "reason": reason},
         )
 
     def read_file(self, request: FileReadRequest) -> FileResult:

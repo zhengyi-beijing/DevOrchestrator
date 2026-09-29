@@ -335,6 +335,17 @@ class ControlCommandStore:
             "reason": value.get("reason"),
             "effect": value.get("effect"),
         }
+        if event == "external_operation":
+            row.update({
+                "request_id": value.get("request_id"),
+                "operation": value.get("operation"),
+                "method": value.get("method"),
+                "path": value.get("path"),
+                "status_code": value.get("status_code"),
+                "result": value.get("result"),
+                "duration_seconds": value.get("duration_seconds"),
+                "client_loopback": value.get("client_loopback"),
+            })
         with self.audit_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
             handle.flush()

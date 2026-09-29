@@ -97,6 +97,7 @@ def log_transport_operation(
     host_id: str,
     selected_transport: str,
     status: str,
+    request_id: Optional[str] = None,
     project_id: Optional[str] = None,
     command_ref: Optional[str] = None,
     parameters_names: Optional[list[str]] = None,
@@ -122,6 +123,7 @@ def log_transport_operation(
     record = {
         "timestamp": utc_now_iso(),
         "operation_id": operation_id,
+        "request_id": request_id,
         "operation": operation,
         "project_id": project_id,
         "command_ref": command_ref,
