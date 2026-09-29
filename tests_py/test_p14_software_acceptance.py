@@ -89,6 +89,7 @@ class P14SoftwareAcceptanceTests(unittest.TestCase):
         self.jobs_cfg = JobsConfig(
             runtime_root=self.runtime,
             enabled=True,
+            max_concurrent_jobs=8,
             projects={
                 self.project_id: JobProjectConfig(
                     repo_path=self.repo,

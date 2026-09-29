@@ -24,6 +24,7 @@
         <a href="#accounting-section" class="nav-item">Usage &amp; Accounting</a>
         <a href="#logs-section" class="nav-item">Logs</a>
         <a href="#system-section" class="nav-item">System</a>
+        <a href="#operations-section" class="nav-item">Operations</a>
       </div>
       <div class="sidebar-footer">
         <div class="sidebar-meta">Loopback Control Plane</div>
@@ -209,6 +210,151 @@
           <footer class="system-footer">
             Loopback unified observation and guarded owner control · no arbitrary prompts, shell, file, or hardware controls
           </footer>
+        </section>
+
+        <section id="operations-section" class="view-section" aria-labelledby="operations-heading" hidden>
+          <div class="section-heading"><h2 id="operations-heading" tabindex="-1">Operations</h2><span>bounded native transport console</span></div>
+
+          <div class="hero-grid">
+            <article class="panel">
+              <div class="section-title">Session State</div>
+              <div class="ops-bar">
+                <span id="opsSessionState" class="badge">Checking session...</span>
+                <button id="opsReconnect" type="button" class="btn btn-sm">Reconnect</button>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="section-title">Target &amp; Identity</div>
+              <div class="form-grid">
+                <div class="form-group">
+                  <label for="opsProject" class="form-label">Project ID</label>
+                  <input id="opsProject" type="text" class="form-input" placeholder="e.g. devorchestrator">
+                </div>
+                <div class="form-group">
+                  <label for="opsHost" class="form-label">Host ID</label>
+                  <input id="opsHost" type="text" class="form-input" value="local">
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <div class="split-grid section-spaced">
+            <article class="panel">
+              <div class="section-heading"><h3>Command Execution (Exec / Spawn)</h3></div>
+              <div class="form-stack">
+                <div class="form-group">
+                  <label for="opsCommandRef" class="form-label">Command Reference</label>
+                  <input id="opsCommandRef" type="text" class="form-input" list="opsCommandCatalog" placeholder="e.g. git_status">
+                  <datalist id="opsCommandCatalog"></datalist>
+                </div>
+                <div class="form-group">
+                  <label for="opsParameters" class="form-label">Parameters (JSON Object)</label>
+                  <textarea id="opsParameters" class="form-input form-textarea" rows="2" placeholder="{}"></textarea>
+                </div>
+                <div class="form-grid">
+                  <div class="form-group">
+                    <label for="opsWorkingDirectory" class="form-label">Working Directory</label>
+                    <input id="opsWorkingDirectory" type="text" class="form-input" placeholder="." value=".">
+                  </div>
+                  <div class="form-group">
+                    <label for="opsTimeout" class="form-label">Timeout (seconds)</label>
+                    <input id="opsTimeout" type="number" class="form-input" placeholder="300" value="300">
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label for="opsIdempotencyKey" class="form-label">Idempotency Key (Optional)</label>
+                  <input id="opsIdempotencyKey" type="text" class="form-input" placeholder="Auto-generated if empty">
+                </div>
+                <div class="control-actions">
+                  <button id="opsExec" type="button" class="btn btn-sm">Exec</button>
+                  <button id="opsSpawn" type="button" class="btn btn-sm">Spawn Job</button>
+                </div>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="section-heading"><h3>Job Management (Poll / Cancel)</h3></div>
+              <div class="form-stack">
+                <div class="form-group">
+                  <label for="opsJobId" class="form-label">Job / Operation ID</label>
+                  <input id="opsJobId" type="text" class="form-input" placeholder="e.g. job-...">
+                </div>
+                <div class="control-actions">
+                  <button id="opsPoll" type="button" class="btn btn-sm">Poll Job</button>
+                  <button id="opsCancel" type="button" class="btn btn-sm">Cancel Job</button>
+                </div>
+              </div>
+
+              <div class="section-heading section-spaced"><h3>File Read &amp; Stat</h3></div>
+              <div class="form-stack">
+                <div class="form-group">
+                  <label for="opsPath" class="form-label">File Path (Relative to Root)</label>
+                  <input id="opsPath" type="text" class="form-input" placeholder="e.g. README.md">
+                </div>
+                <div class="form-grid">
+                  <div class="form-group">
+                    <label for="opsOffset" class="form-label">Offset (Bytes)</label>
+                    <input id="opsOffset" type="number" class="form-input" value="0">
+                  </div>
+                  <div class="form-group">
+                    <label for="opsMaxBytes" class="form-label">Max Bytes</label>
+                    <input id="opsMaxBytes" type="number" class="form-input" value="65536">
+                  </div>
+                </div>
+                <div class="control-actions">
+                  <button id="opsRead" type="button" class="btn btn-sm">Read File</button>
+                  <button id="opsStat" type="button" class="btn btn-sm">Stat</button>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <div class="split-grid section-spaced">
+            <article class="panel">
+              <div class="section-heading"><h3>Staged Binary Upload &amp; CAS Write</h3></div>
+              <div class="form-stack">
+                <div class="form-group">
+                  <label for="opsFile" class="form-label">Choose Binary File</label>
+                  <input id="opsFile" type="file" class="form-input">
+                </div>
+                <div class="control-actions">
+                  <button id="opsStageWrite" type="button" class="btn btn-sm">Stage Upload</button>
+                </div>
+                <div class="form-group section-spaced">
+                  <label for="opsTargetPath" class="form-label">Target Path (Relative)</label>
+                  <input id="opsTargetPath" type="text" class="form-input" placeholder="e.g. scratch/test.bin">
+                </div>
+                <div class="form-group">
+                  <label class="form-label-checkbox">
+                    <input id="opsIfAbsent" type="checkbox">
+                    <span>Create only (if absent)</span>
+                  </label>
+                </div>
+                <div class="form-group">
+                  <label for="opsExpectedSha256" class="form-label">Expected SHA-256 (CAS update)</label>
+                  <input id="opsExpectedSha256" type="text" class="form-input" placeholder="sha256:...">
+                </div>
+                <div class="control-actions">
+                  <button id="opsCommitWrite" type="button" class="btn btn-sm">Commit Write</button>
+                </div>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="section-heading"><h3>Operation Result</h3></div>
+              <div id="opsResult" class="timeline"></div>
+            </article>
+          </div>
+
+          <div class="section-spaced">
+            <article class="panel">
+              <div class="section-heading">
+                <h3>Transport Operations Evidence</h3>
+                <button id="opsRefreshEvidence" type="button" class="btn btn-sm">Refresh Evidence</button>
+              </div>
+              <div id="opsEvidence" class="timeline"></div>
+            </article>
+          </div>
         </section>
       </main>
     </div>

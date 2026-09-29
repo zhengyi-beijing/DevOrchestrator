@@ -654,15 +654,763 @@ function renderWatchdogDiagnostics(payload) {
 let controlCsrf = null;
 let activePairingId = null;
 
-async function ensureControlSession() {
+function resetControlSession() {
+  controlCsrf = null;
+}
+
+async function ensureControlSession(options = {}) {
+  const force = Boolean(options && options.force);
+  if (force) {
+    controlCsrf = null;
+  }
   if (controlCsrf) return controlCsrf;
   const response = await fetch('/api/v1/control/browser-sessions', {
-    method: 'POST', credentials: 'same-origin', headers: {'Sec-Fetch-Site': 'same-origin'}
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Sec-Fetch-Site': 'same-origin' }
   });
   if (!response.ok) throw new Error(`control session: HTTP ${response.status}`);
   const payload = await response.json();
   controlCsrf = payload.data.csrf_token;
   return controlCsrf;
+}
+
+function updateOpsSessionUI(connected, message) {
+  if (typeof document === 'undefined') return;
+  const stateEl = (typeof document.getElementById === 'function') ? document.getElementById('opsSessionState') : null;
+  if (stateEl) {
+    stateEl.textContent = message || (connected ? 'Connected (active)' : 'Disconnected');
+    if (stateEl.classList && typeof stateEl.classList.add === 'function') {
+      if (connected) {
+        stateEl.classList.remove('bad', 'unknown');
+        stateEl.classList.add('ok');
+      } else {
+        stateEl.classList.remove('ok');
+        stateEl.classList.add('bad');
+      }
+    }
+  }
+}
+
+async function controlFetch(path, options = {}) {
+  const method = String(options.method || 'GET').toUpperCase();
+  const headers = Object.assign({}, options.headers || {});
+  let body = options.body;
+
+  const csrf = await ensureControlSession();
+  headers['X-DevOrch-CSRF'] = csrf;
+  headers['Sec-Fetch-Site'] = 'same-origin';
+  if (!headers['X-DevOrch-Request-ID']) {
+    headers['X-DevOrch-Request-ID'] = `req-ui-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+  }
+  if (body !== undefined && body !== null && typeof body === 'object' && !(body instanceof FormData) && !(body instanceof Blob) && !(body instanceof ArrayBuffer)) {
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify(body);
+  }
+
+  const fetchOptions = {
+    ...options,
+    method,
+    headers,
+    body,
+    credentials: 'same-origin',
+  };
+
+  const response = await fetch(path, fetchOptions);
+
+  if (response.status === 401 || response.status === 403) {
+    resetControlSession();
+    try {
+      const newCsrf = await ensureControlSession({ force: true });
+      headers['X-DevOrch-CSRF'] = newCsrf;
+      const retryResponse = await fetch(path, {
+        ...fetchOptions,
+        headers,
+      });
+      if (retryResponse.status === 401 || retryResponse.status === 403) {
+        updateOpsSessionUI(false, 'Session expired / unauthorized. Please reconnect.');
+      } else if (retryResponse.ok) {
+        updateOpsSessionUI(true, 'Connected (active)');
+      }
+      return retryResponse;
+    } catch (err) {
+      updateOpsSessionUI(false, 'Session expired. Please reconnect.');
+      throw err;
+    }
+  }
+
+  if (response.ok) {
+    updateOpsSessionUI(true, 'Connected (active)');
+  }
+
+  return response;
+}
+
+const OPERATION_KINDS = [
+  'exec',
+  'spawn',
+  'poll',
+  'cancel',
+  'read',
+  'stat',
+  'stage_write',
+  'write',
+];
+
+function buildTransportRequest(kind, form = {}) {
+  if (!OPERATION_KINDS.includes(kind)) {
+    throw new Error(`unknown operation kind: ${kind}`);
+  }
+  const f = form || {};
+  const hostId = f.host_id || 'local';
+  const projectId = f.project_id || '';
+  const idemKey = f.idempotency_key || `ui-${kind.replace(/_/g, '-')}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+
+  if (kind === 'exec' || kind === 'spawn') {
+    let parameters = {};
+    if (f.parameters !== undefined && f.parameters !== null && f.parameters !== '') {
+      if (typeof f.parameters === 'string') {
+        try {
+          parameters = JSON.parse(f.parameters);
+        } catch (e) {
+          throw new Error('parameters must be a JSON object');
+        }
+      } else if (typeof f.parameters === 'object' && !Array.isArray(f.parameters)) {
+        parameters = f.parameters;
+      } else {
+        throw new Error('parameters must be a JSON object');
+      }
+      if (typeof parameters !== 'object' || parameters === null || Array.isArray(parameters)) {
+        throw new Error('parameters must be a JSON object');
+      }
+    }
+    const timeout = (f.timeout_seconds !== undefined && f.timeout_seconds !== null && f.timeout_seconds !== '')
+      ? Number(f.timeout_seconds)
+      : 300;
+    const cwd = (f.expected_working_directory !== undefined && f.expected_working_directory !== null)
+      ? String(f.expected_working_directory)
+      : '.';
+    const body = {
+      project_id: projectId,
+      host_id: hostId,
+      command_ref: String(f.command_ref || ''),
+      parameters,
+      expected_working_directory: cwd,
+      timeout_seconds: timeout,
+      idempotency_key: idemKey,
+    };
+    return {
+      method: 'POST',
+      url: `/api/v1/control/transport/${kind}`,
+      body,
+    };
+  }
+
+  if (kind === 'poll') {
+    const opId = String(f.operation_id || f.job_id || '');
+    return {
+      method: 'POST',
+      url: '/api/v1/control/transport/poll',
+      body: {
+        project_id: projectId,
+        host_id: hostId,
+        operation_id: opId,
+      },
+    };
+  }
+
+  if (kind === 'cancel') {
+    const opId = String(f.operation_id || f.job_id || '');
+    const reason = String(f.reason || 'cancelled by user');
+    return {
+      method: 'POST',
+      url: '/api/v1/control/transport/cancel',
+      body: {
+        project_id: projectId,
+        host_id: hostId,
+        operation_id: opId,
+        reason,
+      },
+    };
+  }
+
+  if (kind === 'read') {
+    const filePath = String(f.path || '');
+    const offset = parseInt(f.offset_bytes || 0, 10) || 0;
+    let maxBytes = parseInt(f.max_bytes || 65536, 10) || 65536;
+    if (maxBytes > 10 * 1024 * 1024) maxBytes = 10 * 1024 * 1024;
+    if (maxBytes < 1) maxBytes = 1;
+    const params = new URLSearchParams({
+      project_id: projectId,
+      path: filePath,
+      host_id: hostId,
+      offset_bytes: String(offset),
+      max_bytes: String(maxBytes),
+    });
+    return {
+      method: 'GET',
+      url: `/api/v1/control/transport/read?${params.toString()}`,
+      body: null,
+    };
+  }
+
+  if (kind === 'stat') {
+    const filePath = String(f.path || '');
+    const params = new URLSearchParams({
+      project_id: projectId,
+      path: filePath,
+      host_id: hostId,
+    });
+    return {
+      method: 'GET',
+      url: `/api/v1/control/transport/stat?${params.toString()}`,
+      body: null,
+    };
+  }
+
+  if (kind === 'stage_write') {
+    const b64 = String(f.content_base64 || '');
+    const decodedSize = parseInt(f.decoded_size_bytes || 0, 10) || 0;
+    if (b64.length > 16 * 1024 * 1024 || decodedSize > 16 * 1024 * 1024) {
+      throw new Error('upload exceeds maximum size (16 MiB ceiling)');
+    }
+    return {
+      method: 'POST',
+      url: '/api/v1/control/transport/stage-write',
+      body: {
+        project_id: projectId,
+        host_id: hostId,
+        content_base64: b64,
+        decoded_size_bytes: decodedSize,
+        content_sha256: String(f.content_sha256 || ''),
+      },
+    };
+  }
+
+  if (kind === 'write') {
+    const hasIfAbsent = Boolean(f.if_absent === true || f.if_absent === 'true');
+    const hasExpectedSha = Boolean(f.expected_sha256 && String(f.expected_sha256).trim());
+    if (hasIfAbsent && hasExpectedSha) {
+      throw new Error('write requires exactly one precondition (if_absent or expected_sha256), not both');
+    }
+    if (!hasIfAbsent && !hasExpectedSha) {
+      throw new Error('write requires exactly one precondition: if_absent=true or expected_sha256');
+    }
+    const body = {
+      project_id: projectId,
+      host_id: hostId,
+      target_path: String(f.target_path || ''),
+      content_ref: String(f.content_ref || ''),
+      idempotency_key: idemKey,
+    };
+    if (f.content_sha256) body.content_sha256 = String(f.content_sha256);
+    if (f.decoded_size_bytes !== undefined && f.decoded_size_bytes !== null) {
+      body.decoded_size_bytes = Number(f.decoded_size_bytes);
+    }
+    if (hasIfAbsent) {
+      body.if_absent = true;
+    } else {
+      body.expected_sha256 = String(f.expected_sha256).trim();
+    }
+    return {
+      method: 'POST',
+      url: '/api/v1/control/transport/write',
+      body,
+    };
+  }
+
+  throw new Error(`unsupported operation kind: ${kind}`);
+}
+
+function confirmOperationPrompt(kind, form = {}) {
+  const f = form || {};
+  if (kind === 'spawn') {
+    return `Confirm spawn job: project=${f.project_id || ''}, host=${f.host_id || 'local'}, command=${f.command_ref || ''}`;
+  }
+  if (kind === 'cancel') {
+    return `Confirm cancel job: project=${f.project_id || ''}, host=${f.host_id || 'local'}, operation_id=${f.operation_id || f.job_id || ''}`;
+  }
+  if (kind === 'write') {
+    const isAbsent = Boolean(f.if_absent === true || f.if_absent === 'true');
+    const prec = isAbsent ? 'if_absent=true' : `expected_sha256=${f.expected_sha256 || ''}`;
+    return `Confirm write commit: project=${f.project_id || ''}, host=${f.host_id || 'local'}, target=${f.target_path || ''}, precondition=${prec}`;
+  }
+  return null;
+}
+
+function renderOperationResult(container, result, options = {}) {
+  if (!container || typeof document === 'undefined') return;
+  if (typeof container.replaceChildren === 'function') {
+    container.replaceChildren();
+  } else {
+    while (container.firstChild) container.removeChild(container.firstChild);
+  }
+  if (!result) return;
+
+  const card = document.createElement('div');
+  card.className = 'event-card';
+
+  const title = document.createElement('div');
+  title.className = 'event-title';
+  const op = options.operation || result.operation || 'Operation Result';
+  title.textContent = op;
+  card.appendChild(title);
+
+  const grid = document.createElement('div');
+  grid.className = 'kv-grid';
+
+  const addKv = (key, val, mono = false) => {
+    if (val === undefined || val === null || val === '') return;
+    const item = document.createElement('div');
+    item.className = 'kv';
+    const k = document.createElement('div');
+    k.className = 'k';
+    k.textContent = key;
+    const v = document.createElement('div');
+    v.className = mono ? 'v mono' : 'v';
+    v.textContent = String(val);
+    item.appendChild(k);
+    item.appendChild(v);
+    grid.appendChild(item);
+  };
+
+  const reqId = result.request_id || options.request_id;
+  if (reqId) addKv('Request ID', reqId, true);
+  if (result.selected_transport) addKv('Transport', result.selected_transport);
+  if (result.status) addKv('Status', result.status);
+  if (result.exit_code !== undefined && result.exit_code !== null) addKv('Exit Code', result.exit_code, true);
+  const jobId = result.job_id || result.operation_id;
+  if (jobId) addKv('Job ID', jobId, true);
+  if (result.content_ref) addKv('Content Ref', result.content_ref, true);
+  if (result.content_sha256 || result.sha256) addKv('SHA-256', result.content_sha256 || result.sha256, true);
+  const size = result.size_bytes ?? result.decoded_size_bytes;
+  if (size !== undefined && size !== null) addKv('Size (Bytes)', size);
+  if (result.path) addKv('Path', result.path, true);
+  if (result.pre_digest) addKv('Pre Digest', result.pre_digest, true);
+  if (result.post_digest) addKv('Post Digest', result.post_digest, true);
+  if (result.generated_at || result.timestamp) addKv('Time', result.generated_at || result.timestamp);
+  if (result.error || result.message) addKv('Error', result.error || result.message);
+
+  card.appendChild(grid);
+
+  const addTextPreview = (label, textContent) => {
+    if (!textContent) return;
+    const heading = document.createElement('div');
+    heading.className = 'event-title';
+    heading.textContent = label;
+    card.appendChild(heading);
+
+    const pre = document.createElement('pre');
+    pre.className = 'event-detail mono';
+    const maxLen = 4000;
+    const clamped = textContent.length > maxLen ? textContent.slice(0, maxLen) + '\n... [truncated]' : textContent;
+    pre.textContent = clamped;
+    card.appendChild(pre);
+  };
+
+  addTextPreview('Stdout', result.stdout);
+  addTextPreview('Stderr', result.stderr);
+
+  if (result.content_base64) {
+    const rawPreview = `[Binary content: ${size ?? result.content_base64.length} bytes, sha256: ${result.content_sha256 || 'unknown'}]`;
+    addTextPreview('File Content', rawPreview);
+  }
+
+  container.appendChild(card);
+}
+
+function renderTransportEvidence(container, evidenceData) {
+  if (!container || typeof document === 'undefined') return;
+  if (typeof container.replaceChildren === 'function') {
+    container.replaceChildren();
+  } else {
+    while (container.firstChild) container.removeChild(container.firstChild);
+  }
+  const items = (evidenceData && (evidenceData.operations || evidenceData.items)) || [];
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No transport operations recorded.';
+    container.appendChild(empty);
+    return;
+  }
+  for (const item of items) {
+    const card = document.createElement('div');
+    card.className = 'event-card';
+
+    const header = document.createElement('div');
+    header.className = 'event-title';
+    header.textContent = `${item.operation || 'operation'} · ${item.status || 'unknown'}`;
+    card.appendChild(header);
+
+    const grid = document.createElement('div');
+    grid.className = 'kv-grid';
+
+    const addKv = (key, val, mono = false) => {
+      if (val === undefined || val === null || val === '') return;
+      const kv = document.createElement('div');
+      kv.className = 'kv';
+      const k = document.createElement('div');
+      k.className = 'k';
+      k.textContent = key;
+      const v = document.createElement('div');
+      v.className = mono ? 'v mono' : 'v';
+      v.textContent = String(val);
+      kv.appendChild(k);
+      kv.appendChild(v);
+      grid.appendChild(kv);
+    };
+
+    if (item.request_id) addKv('Request ID', item.request_id, true);
+    if (item.selected_transport) addKv('Transport', item.selected_transport);
+    if (item.project_id) addKv('Project', item.project_id);
+    if (item.exit_code !== undefined && item.exit_code !== null) addKv('Exit Code', item.exit_code, true);
+    if (item.error) addKv('Error', item.error);
+    if (item.timestamp || item.generated_at) addKv('Time', item.timestamp || item.generated_at);
+
+    card.appendChild(grid);
+    container.appendChild(card);
+  }
+}
+
+async function bufferToBase64AndSha256(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  const base64 = typeof btoa === 'function' ? btoa(binary) : Buffer.from(buffer).toString('base64');
+
+  let sha256Hex = '';
+  if (typeof crypto !== 'undefined' && crypto.subtle && typeof crypto.subtle.digest === 'function') {
+    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    sha256Hex = 'sha256:' + hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  } else if (typeof require === 'function') {
+    try {
+      const nodeCrypto = require('crypto');
+      sha256Hex = 'sha256:' + nodeCrypto.createHash('sha256').update(Buffer.from(buffer)).digest('hex');
+    } catch (e) {}
+  }
+  return { base64, sha256Hex, size: bytes.length };
+}
+
+async function loadCommandCatalog(projectId, hostId) {
+  try {
+    const params = new URLSearchParams({
+      project_id: projectId || '',
+      host_id: hostId || 'local',
+    });
+    const res = await controlFetch(`/api/v1/control/transport/commands?${params.toString()}`);
+    if (!res.ok) return;
+    const envelope = await res.json();
+    const data = envelope.data || {};
+    const commands = data.commands || [];
+    const datalist = (typeof document !== 'undefined') ? document.getElementById('opsCommandCatalog') : null;
+    if (datalist && typeof datalist.replaceChildren === 'function') {
+      datalist.replaceChildren();
+      for (const cmd of commands) {
+        if (cmd.selectable === false) continue;
+        const opt = document.createElement('option');
+        opt.value = cmd.command_ref;
+        opt.textContent = `${cmd.command_ref} (${cmd.effect_class})`;
+        datalist.appendChild(opt);
+      }
+    }
+  } catch (e) {}
+}
+
+function initOperationsConsole() {
+  if (typeof document === 'undefined') return;
+  const $el = (id) => (typeof document.getElementById === 'function' ? document.getElementById(id) : null);
+
+  const resultContainer = $el('opsResult');
+  const evidenceContainer = $el('opsEvidence');
+  const projectInput = $el('opsProject');
+  const hostInput = $el('opsHost');
+
+  let stagedContentRef = null;
+  let stagedContentSha256 = null;
+  let stagedDecodedSize = 0;
+
+  const getForm = (extra = {}) => ({
+    project_id: projectInput ? projectInput.value.trim() : '',
+    host_id: hostInput ? hostInput.value.trim() : 'local',
+    ...extra,
+  });
+
+  const displayResult = (data, operation, reqId) => {
+    if (resultContainer) {
+      renderOperationResult(resultContainer, data, { operation, request_id: reqId });
+    }
+  };
+
+  const refreshEvidence = async () => {
+    try {
+      const res = await controlFetch('/api/v1/control/transport/operations?limit=50');
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        if (evidenceContainer) renderTransportEvidence(evidenceContainer, { items: [], error: err.message });
+        return;
+      }
+      const data = await res.json();
+      if (evidenceContainer) {
+        renderTransportEvidence(evidenceContainer, data.data || data);
+      }
+    } catch (e) {
+      if (evidenceContainer) renderTransportEvidence(evidenceContainer, { items: [] });
+    }
+  };
+
+  const checkSessionAndStatus = async () => {
+    try {
+      const res = await controlFetch('/api/v1/control/external/status');
+      if (res.ok) {
+        updateOpsSessionUI(true, 'Connected (active)');
+      } else {
+        updateOpsSessionUI(false, 'Disconnected');
+      }
+    } catch (e) {
+      updateOpsSessionUI(false, 'Disconnected');
+    }
+    const proj = projectInput ? projectInput.value.trim() : '';
+    const host = hostInput ? hostInput.value.trim() : 'local';
+    loadCommandCatalog(proj, host);
+  };
+
+  const reconnectBtn = $el('opsReconnect');
+  if (reconnectBtn) {
+    reconnectBtn.addEventListener('click', async () => {
+      try {
+        await ensureControlSession({ force: true });
+        await checkSessionAndStatus();
+      } catch (e) {
+        updateOpsSessionUI(false, 'Reconnect failed');
+      }
+    });
+  }
+
+  const refreshEvidenceBtn = $el('opsRefreshEvidence');
+  if (refreshEvidenceBtn) {
+    refreshEvidenceBtn.addEventListener('click', () => refreshEvidence());
+  }
+
+  const execBtn = $el('opsExec');
+  if (execBtn) {
+    execBtn.addEventListener('click', async () => {
+      try {
+        const form = getForm({
+          command_ref: $el('opsCommandRef') ? $el('opsCommandRef').value.trim() : '',
+          parameters: $el('opsParameters') ? $el('opsParameters').value.trim() : '',
+          expected_working_directory: $el('opsWorkingDirectory') ? $el('opsWorkingDirectory').value.trim() : '.',
+          timeout_seconds: $el('opsTimeout') ? $el('opsTimeout').value : 300,
+          idempotency_key: $el('opsIdempotencyKey') ? $el('opsIdempotencyKey').value.trim() : '',
+        });
+        const req = buildTransportRequest('exec', form);
+        const res = await controlFetch(req.url, { method: req.method, body: req.body });
+        const envelope = await res.json();
+        displayResult(envelope.data || envelope, 'Exec', res.headers ? res.headers.get('X-DevOrch-Request-ID') : null);
+      } catch (err) {
+        displayResult({ error: err.message }, 'Exec Failed');
+      }
+    });
+  }
+
+  const spawnBtn = $el('opsSpawn');
+  if (spawnBtn) {
+    spawnBtn.addEventListener('click', async () => {
+      try {
+        const form = getForm({
+          command_ref: $el('opsCommandRef') ? $el('opsCommandRef').value.trim() : '',
+          parameters: $el('opsParameters') ? $el('opsParameters').value.trim() : '',
+          expected_working_directory: $el('opsWorkingDirectory') ? $el('opsWorkingDirectory').value.trim() : '.',
+          timeout_seconds: $el('opsTimeout') ? $el('opsTimeout').value : 300,
+          idempotency_key: $el('opsIdempotencyKey') ? $el('opsIdempotencyKey').value.trim() : '',
+        });
+        const prompt = confirmOperationPrompt('spawn', form);
+        if (prompt && typeof window !== 'undefined' && typeof window.confirm === 'function') {
+          if (!window.confirm(prompt)) return;
+        }
+        const req = buildTransportRequest('spawn', form);
+        const res = await controlFetch(req.url, { method: req.method, body: req.body });
+        const envelope = await res.json();
+        const resData = envelope.data || envelope;
+        displayResult(resData, 'Spawn', res.headers ? res.headers.get('X-DevOrch-Request-ID') : null);
+        if (resData.job_id || resData.operation_id) {
+          const jobInput = $el('opsJobId');
+          if (jobInput) jobInput.value = resData.job_id || resData.operation_id;
+        }
+      } catch (err) {
+        displayResult({ error: err.message }, 'Spawn Failed');
+      }
+    });
+  }
+
+  const pollBtn = $el('opsPoll');
+  if (pollBtn) {
+    pollBtn.addEventListener('click', async () => {
+      try {
+        const form = getForm({
+          operation_id: $el('opsJobId') ? $el('opsJobId').value.trim() : '',
+        });
+        const req = buildTransportRequest('poll', form);
+        const res = await controlFetch(req.url, { method: req.method, body: req.body });
+        const envelope = await res.json();
+        displayResult(envelope.data || envelope, 'Poll', res.headers ? res.headers.get('X-DevOrch-Request-ID') : null);
+      } catch (err) {
+        displayResult({ error: err.message }, 'Poll Failed');
+      }
+    });
+  }
+
+  const cancelBtn = $el('opsCancel');
+  if (cancelBtn) {
+    cancelBtn.addEventListener('click', async () => {
+      try {
+        const form = getForm({
+          operation_id: $el('opsJobId') ? $el('opsJobId').value.trim() : '',
+        });
+        const prompt = confirmOperationPrompt('cancel', form);
+        if (prompt && typeof window !== 'undefined' && typeof window.confirm === 'function') {
+          if (!window.confirm(prompt)) return;
+        }
+        const req = buildTransportRequest('cancel', form);
+        const res = await controlFetch(req.url, { method: req.method, body: req.body });
+        const envelope = await res.json();
+        displayResult(envelope.data || envelope, 'Cancel', res.headers ? res.headers.get('X-DevOrch-Request-ID') : null);
+      } catch (err) {
+        displayResult({ error: err.message }, 'Cancel Failed');
+      }
+    });
+  }
+
+  const readBtn = $el('opsRead');
+  if (readBtn) {
+    readBtn.addEventListener('click', async () => {
+      try {
+        const form = getForm({
+          path: $el('opsPath') ? $el('opsPath').value.trim() : '',
+          offset_bytes: $el('opsOffset') ? $el('opsOffset').value : 0,
+          max_bytes: $el('opsMaxBytes') ? $el('opsMaxBytes').value : 65536,
+        });
+        const req = buildTransportRequest('read', form);
+        const res = await controlFetch(req.url, { method: req.method });
+        const envelope = await res.json();
+        displayResult(envelope.data || envelope, 'Read File', res.headers ? res.headers.get('X-DevOrch-Request-ID') : null);
+      } catch (err) {
+        displayResult({ error: err.message }, 'Read Failed');
+      }
+    });
+  }
+
+  const statBtn = $el('opsStat');
+  if (statBtn) {
+    statBtn.addEventListener('click', async () => {
+      try {
+        const form = getForm({
+          path: $el('opsPath') ? $el('opsPath').value.trim() : '',
+        });
+        const req = buildTransportRequest('stat', form);
+        const res = await controlFetch(req.url, { method: req.method });
+        const envelope = await res.json();
+        displayResult(envelope.data || envelope, 'Stat', res.headers ? res.headers.get('X-DevOrch-Request-ID') : null);
+      } catch (err) {
+        displayResult({ error: err.message }, 'Stat Failed');
+      }
+    });
+  }
+
+  const stageBtn = $el('opsStageWrite');
+  if (stageBtn) {
+    stageBtn.addEventListener('click', async () => {
+      try {
+        const fileInput = $el('opsFile');
+        const file = (fileInput && fileInput.files && fileInput.files[0]) ? fileInput.files[0] : null;
+        if (!file) {
+          throw new Error('Please select a file to stage');
+        }
+        if (file.size > 12 * 1024 * 1024) {
+          throw new Error('upload exceeds maximum size (16 MiB ceiling)');
+        }
+        const buffer = await file.arrayBuffer();
+        const { base64, sha256Hex, size } = await bufferToBase64AndSha256(buffer);
+        const form = getForm({
+          content_base64: base64,
+          decoded_size_bytes: size,
+          content_sha256: sha256Hex,
+        });
+        const req = buildTransportRequest('stage_write', form);
+        const res = await controlFetch(req.url, { method: req.method, body: req.body });
+        const envelope = await res.json();
+        const data = envelope.data || envelope;
+        if (data.content_ref) {
+          stagedContentRef = data.content_ref;
+          stagedContentSha256 = data.content_sha256;
+          stagedDecodedSize = data.decoded_size_bytes;
+        }
+        displayResult(data, 'Stage Write Content', res.headers ? res.headers.get('X-DevOrch-Request-ID') : null);
+      } catch (err) {
+        displayResult({ error: err.message }, 'Stage Write Failed');
+      }
+    });
+  }
+
+  const commitBtn = $el('opsCommitWrite');
+  if (commitBtn) {
+    commitBtn.addEventListener('click', async () => {
+      try {
+        if (!stagedContentRef) {
+          throw new Error('No staged content. Stage a file first.');
+        }
+        const targetPath = $el('opsTargetPath') ? $el('opsTargetPath').value.trim() : '';
+        const ifAbsentBox = $el('opsIfAbsent');
+        const isAbsent = ifAbsentBox ? ifAbsentBox.checked : false;
+        const expectedSha = $el('opsExpectedSha256') ? $el('opsExpectedSha256').value.trim() : '';
+        const form = getForm({
+          target_path: targetPath,
+          content_ref: stagedContentRef,
+          content_sha256: stagedContentSha256,
+          decoded_size_bytes: stagedDecodedSize,
+          if_absent: isAbsent,
+          expected_sha256: expectedSha || undefined,
+        });
+        const prompt = confirmOperationPrompt('write', form);
+        if (prompt && typeof window !== 'undefined' && typeof window.confirm === 'function') {
+          if (!window.confirm(prompt)) return;
+        }
+        const req = buildTransportRequest('write', form);
+        const res = await controlFetch(req.url, { method: req.method, body: req.body });
+        const envelope = await res.json();
+        stagedContentRef = null;
+        stagedContentSha256 = null;
+        stagedDecodedSize = 0;
+        displayResult(envelope.data || envelope, 'Commit Write', res.headers ? res.headers.get('X-DevOrch-Request-ID') : null);
+      } catch (err) {
+        stagedContentRef = null;
+        stagedContentSha256 = null;
+        stagedDecodedSize = 0;
+        displayResult({ error: err.message }, 'Commit Write Failed');
+      }
+    });
+  }
+
+  if (projectInput) {
+    projectInput.addEventListener('change', () => {
+      const proj = projectInput.value.trim();
+      const host = hostInput ? hostInput.value.trim() : 'local';
+      loadCommandCatalog(proj, host);
+    });
+  }
+  if (hostInput) {
+    hostInput.addEventListener('change', () => {
+      const proj = projectInput ? projectInput.value.trim() : '';
+      const host = hostInput.value.trim();
+      loadCommandCatalog(proj, host);
+    });
+  }
+
+  checkSessionAndStatus();
 }
 
 async function pollControlCommand(commandId, attempts = 20) {
@@ -1109,6 +1857,7 @@ const VIEW_IDS = new Set([
   'accounting-section',
   'logs-section',
   'system-section',
+  'operations-section',
 ]);
 
 const LEGACY_HASH_ALIASES = {
@@ -1263,6 +2012,16 @@ if (typeof module !== 'undefined' && module.exports) {
     initNavigation,
     VIEW_IDS,
     LEGACY_HASH_ALIASES,
+    // P19 exports
+    buildTransportRequest,
+    OPERATION_KINDS,
+    confirmOperationPrompt,
+    renderOperationResult,
+    renderTransportEvidence,
+    controlFetch,
+    ensureControlSession,
+    resetControlSession,
+    initOperationsConsole,
   };
 }
 
@@ -1278,6 +2037,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   const refreshBtn = $('refreshBtn');
   if (refreshBtn) refreshBtn.addEventListener('click', () => refresh());
   initNavigation();
+  initOperationsConsole();
   refresh();
   setInterval(refresh, 10000);
 }

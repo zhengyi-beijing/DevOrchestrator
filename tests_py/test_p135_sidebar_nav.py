@@ -35,7 +35,7 @@ class P135SidebarNavigationTests(unittest.TestCase):
         # Top-tab section-nav markup must be completely removed
         self.assertNotIn("section-nav", html_content, "Old section-nav top-tab markup must be deleted")
 
-    def test_sidebar_has_exactly_six_links_resolving_to_views_and_one_to_one_mapping(self):
+    def test_sidebar_has_exactly_seven_links_resolving_to_views_and_one_to_one_mapping(self):
         html_content = INDEX_HTML.read_text(encoding="utf-8")
 
         # Extract links in sidebar
@@ -44,7 +44,7 @@ class P135SidebarNavigationTests(unittest.TestCase):
         sidebar_html = sidebar_match.group(1)
 
         links = re.findall(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', sidebar_html, re.DOTALL)
-        self.assertEqual(len(links), 6, f"Sidebar nav must have exactly 6 links, found {len(links)}: {links}")
+        self.assertEqual(len(links), 7, f"Sidebar nav must have exactly 7 links, found {len(links)}: {links}")
 
         hrefs = [href for href, _ in links]
         expected_hrefs = [
@@ -54,6 +54,7 @@ class P135SidebarNavigationTests(unittest.TestCase):
             "#accounting-section",
             "#logs-section",
             "#system-section",
+            "#operations-section",
         ]
         self.assertEqual(hrefs, expected_hrefs, f"Sidebar links must be in exact order: {expected_hrefs}")
 
@@ -66,6 +67,7 @@ class P135SidebarNavigationTests(unittest.TestCase):
             "accounting-section",
             "logs-section",
             "system-section",
+            "operations-section",
         ]
         self.assertEqual(sorted(section_ids), sorted(expected_view_ids))
 
@@ -180,6 +182,8 @@ const testCases = [
   {{ input: 'logs-section', expected: 'logs-section' }},
   {{ input: '#system-section', expected: 'system-section' }},
   {{ input: 'system-section', expected: 'system-section' }},
+  {{ input: '#operations-section', expected: 'operations-section' }},
+  {{ input: 'operations-section', expected: 'operations-section' }},
 
   // 4 legacy aliases (with and without hash)
   {{ input: '#controls', expected: 'projects-section' }},
@@ -241,7 +245,7 @@ class Element {{
   focus() {{ this.focused = true; }}
 }}
 
-const viewIds = ['overview', 'projects-section', 'resources-section', 'accounting-section', 'logs-section', 'system-section'];
+const viewIds = ['overview', 'projects-section', 'resources-section', 'accounting-section', 'logs-section', 'system-section', 'operations-section'];
 const sections = viewIds.map(id => new Element('section', id));
 const headings = viewIds.map(id => new Element('h2', id + '-heading'));
 const links = viewIds.map(id => {{
@@ -505,6 +509,8 @@ const testCases = [
   {{ input: 'logs-section', expected: true }},
   {{ input: '#system-section', expected: true }},
   {{ input: 'system-section', expected: true }},
+  {{ input: '#operations-section', expected: true }},
+  {{ input: 'operations-section', expected: true }},
 
   // 4 legacy aliases (with and without hash)
   {{ input: '#controls', expected: true }},
@@ -579,7 +585,7 @@ class MockElement {{
   }}
 }}
 
-const viewIds = ['overview', 'projects-section', 'resources-section', 'accounting-section', 'logs-section', 'system-section'];
+const viewIds = ['overview', 'projects-section', 'resources-section', 'accounting-section', 'logs-section', 'system-section', 'operations-section'];
 const sections = viewIds.map(id => new MockElement('section', id, 'view-section'));
 const headings = viewIds.map(id => new MockElement('h2', id + '-heading'));
 const links = viewIds.map(id => {{

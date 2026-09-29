@@ -110,6 +110,7 @@ _EXTERNAL_OPERATION_PATHS = {
     "/api/v1/control/transport/write": "write_file",
     "/api/v1/control/transport/read": "read_file",
     "/api/v1/control/transport/stat": "stat",
+    "/api/v1/control/transport/commands": "transport_commands",
 }
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
@@ -1120,6 +1121,41 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     for h_id, prof in hosts_cfg.hosts.items()
                 },
             })
+        elif path == "/api/v1/control/transport/commands":
+            if not self._owner_authorized():
+                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            q_params = parse_qs(parsed.query)
+            proj_id = q_params.get("project_id", [""])[0]
+            host_id = q_params.get("host_id", ["local"])[0]
+            from dev_orchestrator.jobs.config import load_jobs_config
+            jobs_cfg = load_jobs_config(runtime / "execution-jobs.json")
+            commands = []
+            is_local = (host_id == "local")
+            if is_local and jobs_cfg is not None:
+                project_cfg = jobs_cfg.projects.get(proj_id)
+                if project_cfg is not None:
+                    for cref, cmd in project_cfg.commands.items():
+                        param_types = {}
+                        if isinstance(cmd.parameters, dict):
+                            for pname, pdef in cmd.parameters.items():
+                                if isinstance(pdef, dict):
+                                    param_types[pname] = pdef.get("type", "unknown")
+                                else:
+                                    param_types[pname] = str(pdef)
+                        commands.append({
+                            "command_ref": cref,
+                            "effect_class": cmd.effect_class,
+                            "max_runtime_seconds": cmd.max_runtime_seconds,
+                            "parameters": param_types,
+                            "selectable": cmd.effect_class != "hardware",
+                        })
+                    commands.sort(key=lambda x: x["command_ref"])
+            payload = _control_envelope({
+                "host_id": host_id,
+                "project_id": proj_id,
+                "host_local": is_local,
+                "commands": commands,
+            })
         elif path == "/api/v1/control/transport-capabilities":
             if not self._authorized_control_read():
                 self._error(401, "Unauthorized", "valid control authorization required", head_only); return
@@ -1332,6 +1368,13 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         value = self.headers.get("Sec-Fetch-Site")
         return value is None or value in {"same-origin", "none"}
 
+    def _browser_read_context_ok(self) -> bool:
+        return (
+            self.command in ("GET", "HEAD")
+            and self.headers.get("Origin") is None
+            and self.headers.get("Sec-Fetch-Site") == "same-origin"
+        )
+
     def _owner_authorized(self) -> bool:
         security = self.server.control_security
         if security is None or not self._client_is_loopback():
@@ -1339,7 +1382,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         bearer = security.bearer_authorized(self.headers.get("Authorization"))
         if bearer:
             return self.headers.get("Origin") is None or self._same_origin()
-        return self._same_origin() and self._fetch_metadata_ok() and security.browser_authorized(
+        browser_origin_ok = (self._same_origin() and self._fetch_metadata_ok()) or self._browser_read_context_ok()
+        return browser_origin_ok and security.browser_authorized(
             self.headers.get("Cookie"), self.headers.get("X-DevOrch-CSRF")
         )
 

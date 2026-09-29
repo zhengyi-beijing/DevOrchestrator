@@ -97,6 +97,7 @@ token in an MCP config file or command line.
 Send `Authorization: Bearer <token>` and JSON bodies to the following routes:
 
 - `GET /api/v1/control/external/status?project_id=devorchestrator`
+- `GET /api/v1/control/transport/commands?project_id=devorchestrator&host_id=local`
 - `POST /api/v1/control/transport/exec`
 - `POST /api/v1/control/transport/spawn`
 - `POST /api/v1/control/transport/poll`
@@ -109,6 +110,21 @@ Send `Authorization: Bearer <token>` and JSON bodies to the following routes:
 Exec/spawn/write require a caller-chosen `idempotency_key`. MCP writes also
 require `if_absent=true` or `expected_sha256`. API responses report
 `selected_transport` for every native machine operation.
+
+## Browser session authorization
+
+P19 also exposes these routes through the loopback dashboard without revealing
+the master token. Create a browser session with a same-origin
+`POST /api/v1/control/browser-sessions`, then send the returned HttpOnly cookie
+and `X-DevOrch-CSRF` value on Control API calls. Mutations require a valid
+same-origin `Origin`; GET/HEAD reads may omit `Origin` only when
+`Sec-Fetch-Site` is exactly `same-origin`.
+
+The owner-only `transport/commands` route returns safe command metadata for the
+console and deliberately excludes argv, cwd, environment, and executable data.
+Scoped transport capabilities cannot enumerate it. See
+[`P19_WEB_CONSOLE_DESIGN.md`](P19_WEB_CONSOLE_DESIGN.md) for the complete browser
+boundary and staged/CAS workflow.
 
 ## Token rotation
 

@@ -75,6 +75,7 @@ python -m dev_orchestrator start-daemon `
 Default surfaces:
 
 - dashboard: `http://127.0.0.1:8770/`
+- native Operations console: `http://127.0.0.1:8770/#operations-section`
 - Browser Bridge: `http://127.0.0.1:8765/`
 
 The daemon also owns the authenticated P18 external-control API and an opt-in
@@ -82,6 +83,9 @@ stdio MCP adapter for bounded Local/SSH exec, durable jobs, scoped file reads,
 and staged CAS writes without RDC. See
 [`docs/P18_EXTERNAL_CONTROL_API.md`](docs/P18_EXTERNAL_CONTROL_API.md) for the
 security model, Windows scripts, and ChatGPT/MCP connection command.
+The dashboard Operations console uses the same bounded P18 transport API through
+a same-origin browser session; see
+[`docs/P19_WEB_CONSOLE_DESIGN.md`](docs/P19_WEB_CONSOLE_DESIGN.md).
 
 The daemon-hosted dashboard is the normal observation and control surface.
 Its buttons come from server-advertised capabilities and every mutation is
