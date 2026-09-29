@@ -270,3 +270,92 @@ Goal: treat the three near-zero marginal-cost AGY accounts as a quota/time-windo
 Acceptance: produce reproducible AGY-pool benchmark evidence and a machine-readable routing recommendation that states which DevO roles/task classes support AGY-first execution and when heterogeneous escalation is required.
 
 Sequence: P16.7 -> P16.8 -> P16.9 -> P16.10 -> P16.11.
+
+## P19 staged roadmap - Remote client interfaces
+
+P19 is split into two explicit protocol-facing sub-goals over one shared DevO
+control/service layer:
+
+```text
+P18 Native ExecutionTransport
+  -> P19.1 Remote HTTP/HTTPS Gateway + Web UI (lifecycle task ID P19)
+  -> P19.2 Remote MCP Interface / Adapter
+```
+
+P19.1 remains the existing browser-oriented work. It provides the REST/Web
+adapter and operations console while preserving P18 LocalTransport/SSHTransport,
+durable-job, file/CAS, capability, safety, and observability behavior. Its
+already-activated lifecycle task ID remains `P19`; renaming lifecycle state is
+unnecessary and would disturb the P18 handoff. P19.1 must keep shared operations
+below the HTTP adapter so it can complete independently and hand off normally.
+
+### P19.2 - Remote MCP Interface
+
+Status: **STAGED AFTER P19 / P19.1**
+
+Goal: expose a deliberately small, standards-compliant remote MCP surface for
+authenticated ChatGPT and other MCP-capable AI clients by adding an MCP adapter
+over the same DevO control/service layer used by P19.1. Use an official or
+well-maintained MCP SDK and prefer current Streamable HTTP semantics. Do not
+hand-roll a pseudo-MCP protocol without a strong documented reason.
+
+Initial tools:
+
+- `devo_status`
+- `devo_start_task`
+- `devo_job_status`
+- `devo_cancel_job`
+- `devo_read_log`
+- `devo_read_file`
+
+Discovery, invocation, schemas, structured results/errors, request IDs, audit,
+and long-running handoff through stable DevO job IDs are required. Status reads
+authoritative DevO state; starts use existing orchestration and policy;
+cancellation is bounded and idempotent; file/log access uses canonicalized
+allowed roots, source allowlists, and size/output limits. Normal operation does
+not require a generic unrestricted shell tool.
+
+Authentication is mandatory and the service fails closed. Secrets stay outside
+tracked files and logs. No tool may provide arbitrary filesystem access,
+lifecycle-ledger mutation, owner-gate bypass, successor fabrication, transport
+capability bypass, silent RDC fallback, or automatic real X-ray/conveyor/other
+hardware actuation without existing explicit human authorization. Concurrency,
+timeouts, output, paths, and mutations remain bounded and auditable.
+
+A loopback-only `127.0.0.1` endpoint is not reachable by an external ChatGPT
+service. Remote deployment therefore uses a separately configured authenticated
+HTTPS reverse proxy, secure tunnel, or supported MCP tunnel; raw unauthenticated
+router port forwarding is unsupported and network exposure grants no lifecycle
+authority.
+
+P19.2 is complete only when:
+
+1. A standards-compliant remote MCP endpoint exists.
+2. MCP tool discovery succeeds.
+3. All six initial tools work with valid structured schemas and results.
+4. MCP and P19.1 REST/Web paths use the same DevO control/service layer.
+5. No duplicate lifecycle authority exists.
+6. No generic unrestricted shell MCP tool is required for normal operation.
+7. Authentication is mandatory.
+8. Secrets are neither committed nor logged.
+9. File access is constrained to allowed roots.
+10. Long-running work uses stable durable job IDs.
+11. Lifecycle and owner-gate policy cannot be bypassed.
+12. Real hardware safety authorization remains intact.
+13. Normal MCP operations use LocalTransport or SSHTransport and do not silently
+    route through RDC.
+14. Zero-RDC acceptance is demonstrated for representative MCP operations.
+15. Security, restart, replay, and idempotency regressions pass.
+16. Documentation explains connection, authentication, startup,
+    tunnel/exposure, supported tools, limitations, and rollback.
+
+The future test plan covers discovery/schema validation; missing, invalid, and
+valid authentication plus secret non-disclosure; authoritative status and stale
+owner-gate prevention; harmless start/poll across restart and duplicate replay;
+idempotent cancellation; allowed, traversal, outside-root, and oversized
+file/log reads; owner-gate, ledger, successor, transport, RDC, and hardware
+safety fences; and P19.1/P18/lifecycle regression. The detailed executable
+scope and scenarios are staged in `agent/staged/P19.2.md`.
+
+Sequence: P18 -> P19/P19.1 -> P19.2. P19.2 does not block P19.1 completion unless
+P19.1 would otherwise compromise the required shared-service architecture.

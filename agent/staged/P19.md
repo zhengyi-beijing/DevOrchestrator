@@ -1,9 +1,9 @@
-# P19 — Web Native Operations Console
+# P19 — P19.1 Remote HTTP/HTTPS Gateway + Web UI
 
 Status: **PENDING DESIGN**
 
 Predecessor: P18
-Successor: TBD
+Successor: P19.2
 
 ## Objective
 
@@ -13,19 +13,28 @@ transport selector, durable job service, staged-write/CAS path, audit trail, and
 lifecycle authority. It must not create a second controller or expose an
 unrestricted shell or filesystem.
 
+This staged task retains the lifecycle ID `P19` for compatibility with the
+already-activated successor handoff from P18; conceptually it is **P19.1**.
+P19.2 is the separately staged Remote MCP Interface and follows P19.1 without
+expanding or delaying P19.1 except where preserving the shared service boundary
+requires it.
+
 ## Architecture boundary
 
 ```text
 same-origin browser UI
   -> existing short-lived browser session + CSRF authorization
   -> existing /api/v1/control/transport/* routes
-  -> existing transport selector
+  -> shared DevO control/service layer
+  -> existing transport selector / ExecutionTransport
   -> LocalTransport or SSHTransport
 ```
 
 - Never disclose or send `runtime/control/api-token` to browser JavaScript.
 - Reuse the P18 route implementations; do not duplicate execution, job, file,
   CAS, policy, capability, lifecycle, or audit logic in the UI.
+- Keep shared DevO operations below protocol adapters so the later P19.2 MCP
+  adapter and this REST/Web adapter can call the same control/service layer.
 - This task does not change lifecycle authority, transition execution, successor
   rules, owner gates, invariant evaluation, or watchdog recovery.
 - RDC remains outside the normal request path and must never be selected
@@ -114,5 +123,7 @@ same-origin browser UI
 - No normal browser operation selects RDC, mutates a lifecycle ledger, bypasses
   an owner gate, fabricates a successor, or authorizes real hardware.
 - The existing dashboard and P18 MCP/API clients remain compatible.
-- P19 begins only through the normal P18 successor handoff and completes with a
-  clean, committed, unpushed worktree.
+- P19.1 begins only through the normal P18 successor handoff, can complete
+  without implementing P19.2, and hands off to the separately staged P19.2
+  specification through the normal successor mechanism.
+- P19.1 completes with a clean, committed, unpushed worktree.
