@@ -2658,6 +2658,46 @@ class StaleAnchorHandoffTests(unittest.TestCase):
         planner = self._controls_tick()
         self._assert_advanced_to_p2(planner, source_id, recorded_head)
 
+    def test_terminal_status_projection_catches_up_after_handoff(self):
+        next_path = self.repo / "agent" / "next.md"
+        next_path.write_bytes(b"# P1 task\n\nStatus: **READY_TO_RUN**\n")
+        _commit(self.repo, "leave terminal authority projection stale")
+        recorded_head = _git(self.repo, "rev-parse", "HEAD")
+        outcome = self.executor.reconcile_successor_handoff(
+            self.project, self._snapshot()["projects"][0],
+            completed_task_id="P1", trigger="terminal projection catch-up fixture",
+        )
+        self.assertEqual(outcome["status"], "applied", outcome)
+        next_path.write_bytes(b"# P1 task\n\nStatus: **COMPLETE**\n")
+        _commit(self.repo, "align terminal repository projection")
+
+        planner = self._controls_tick()
+
+        self._assert_advanced_to_p2(planner, outcome["source_request_id"], recorded_head)
+
+    def test_dirty_handoff_reopens_only_after_repository_is_clean(self):
+        recorded_head = _git(self.repo, "rev-parse", "HEAD")
+        outcome = self.executor.reconcile_successor_handoff(
+            self.project, self._snapshot()["projects"][0],
+            completed_task_id="P1", trigger="transient dirty fixture",
+        )
+        source_id = outcome["source_request_id"]
+        dirty_path = self.repo / "untracked.txt"
+        dirty_path.write_text("dirty\n", encoding="utf-8")
+
+        first = self._controls_tick()
+        self.assertEqual(self._p2_plans(first), [])
+        self.assertEqual(
+            self.executor.state()["executions"][source_id]["reason"],
+            "automatic planner handoff failed: planner requires a clean repository",
+        )
+        dirty_path.unlink()
+
+        second = self._controls_tick()
+        self._assert_advanced_to_p2(second, source_id, recorded_head)
+        record = self.executor.state()["executions"][source_id]
+        self.assertTrue(record.get("transient_dirty_reopened_at"))
+
     def test_lifecycle_document_change_after_record_still_refuses(self):
         source_id, _ = self._record_handoff_then_commit(path="agent/notes.md")
         planner = self._controls_tick()

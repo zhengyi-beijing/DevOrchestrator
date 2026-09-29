@@ -86,6 +86,9 @@ _LEDGER_VERSION = 2
 _STALE_ANCHOR_HANDOFF_REFUSAL = (
     "automatic planner handoff failed: repository moved since review"
 )
+_TRANSIENT_DIRTY_HANDOFF_REFUSAL = (
+    "automatic planner handoff failed: planner requires a clean repository"
+)
 _ACTIVE_STATES = frozenset({"launching", "running"})
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "explicitly_reconciled"})
 
@@ -1460,8 +1463,10 @@ class TransitionExecutor:
                 authority["recovery_epoch_id"] = epoch_for(authority)
             self._save_ledger(ledger)
 
-    def reopen_stale_anchor_handoff(self, source_request_id: str) -> bool:
-        """Reopen, once, a handoff refused only because HEAD had advanced.
+    def reopen_stale_anchor_handoff(
+        self, source_request_id: str, *, allow_transient_dirty: bool = False,
+    ) -> bool:
+        """Reopen a bounded, revalidated transient handoff refusal once.
 
         The Planner used to refuse any HEAD movement between recording and
         consuming a staged handoff, and that refusal made the transition
@@ -1475,13 +1480,23 @@ class TransitionExecutor:
         with self._lock:
             ledger = self._load_ledger()
             record = ledger["executions"].get(source_request_id)
+            reason = record.get("reason") if isinstance(record, dict) else None
+            stale_anchor = reason == _STALE_ANCHOR_HANDOFF_REFUSAL
+            transient_dirty = (
+                reason == _TRANSIENT_DIRTY_HANDOFF_REFUSAL and allow_transient_dirty
+            )
+            already_reopened = (
+                record.get("stale_anchor_reopened_at") if stale_anchor and isinstance(record, dict)
+                else record.get("transient_dirty_reopened_at") if isinstance(record, dict)
+                else None
+            )
             if (
                 not isinstance(record, dict)
                 or record.get("state") != "blocked"
                 or record.get("outcome") != "planning_required"
-                or record.get("reason") != _STALE_ANCHOR_HANDOFF_REFUSAL
+                or not (stale_anchor or transient_dirty)
                 or not record.get("staged_successor")
-                or record.get("stale_anchor_reopened_at")
+                or already_reopened
             ):
                 return False
             transition = ledger.setdefault("transitions", {}).get(
@@ -1491,9 +1506,14 @@ class TransitionExecutor:
                 return False
             now = utc_now_iso()
             record["state"] = "handoff"
-            record["stale_anchor_reopened_at"] = now
-            record["stale_anchor_block_reason"] = record.get("reason")
-            record["reason"] = "reopened after a stale-anchor planner refusal"
+            if stale_anchor:
+                record["stale_anchor_reopened_at"] = now
+                record["stale_anchor_block_reason"] = reason
+                record["reason"] = "reopened after a stale-anchor planner refusal"
+            else:
+                record["transient_dirty_reopened_at"] = now
+                record["transient_dirty_block_reason"] = reason
+                record["reason"] = "reopened after repository became clean"
             transition["state"] = "ready"
             transition["reason"] = None
             transition["updated_at"] = now

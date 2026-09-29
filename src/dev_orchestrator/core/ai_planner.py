@@ -321,7 +321,53 @@ def _parse_plan_review(text: str | None) -> tuple[str, str]:
     return decision, reason
 
 
-def _lifecycle_evidence_unchanged(repo: Path, anchor_head: str, head: str) -> bool:
+def _terminal_status_promotion_only(
+    repo: Path, anchor_head: str, head: str, expected_task_id: str | None,
+) -> bool:
+    """Allow only READY_TO_RUN -> COMPLETE for the same predecessor spec.
+
+    Terminal authority can legitimately settle before the repository status
+    projection catches up.  A later real successor may therefore be recorded
+    against the stale READY_TO_RUN bytes and consumed after the projection is
+    corrected.  No other lifecycle-document change is compatible.
+    """
+    if not expected_task_id:
+        return False
+    try:
+        values: list[str] = []
+        for revision in (anchor_head, head):
+            shown = subprocess.run(
+                ["git", "-C", str(repo), "show", f"{revision}:agent/next.md"],
+                capture_output=True, text=True, timeout=15, check=False,
+                **hidden_subprocess_kwargs(),
+            )
+            if shown.returncode != 0:
+                return False
+            values.append(shown.stdout)
+        from dev_orchestrator.monitor.telemetry import extract_task_id
+
+        normalized: list[str] = []
+        states = []
+        for value in values:
+            line_index, raw_status = require_single_status_line(value)
+            states.append(parse_task_status(raw_status))
+            lines = value.splitlines()
+            if extract_task_id(lines[0] if lines else "") != expected_task_id:
+                return False
+            lines[line_index] = "Status: **<TERMINAL_PROJECTION>**"
+            normalized.append("\n".join(lines))
+        return (
+            states[0].is_ready_to_run()
+            and states[1].is_completed()
+            and normalized[0] == normalized[1]
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+def _lifecycle_evidence_unchanged(
+    repo: Path, anchor_head: str, head: str, *, expected_task_id: str | None = None,
+) -> bool:
     """True when HEAD only fast-forwarded past commits outside ``agent/``.
 
     A staged handoff is anchored to the HEAD at which it was recorded.  What
@@ -349,7 +395,14 @@ def _lifecycle_evidence_unchanged(repo: Path, anchor_head: str, head: str) -> bo
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return changed.returncode == 0 and not changed.stdout.strip()
+    if changed.returncode != 0:
+        return False
+    paths = [line.strip().replace("\\", "/") for line in changed.stdout.splitlines() if line.strip()]
+    if not paths:
+        return True
+    return paths == ["agent/next.md"] and _terminal_status_promotion_only(
+        repo, anchor_head, head, expected_task_id,
+    )
 
 
 class AIPlannerCoordinator:
@@ -635,7 +688,7 @@ class AIPlannerCoordinator:
                 },
             )
         if truth.head != reviewed_head and not _lifecycle_evidence_unchanged(
-            repo, reviewed_head, truth.head,
+            repo, reviewed_head, truth.head, expected_task_id=handoff_task_id,
         ):
             return None, "repository moved since review"
 

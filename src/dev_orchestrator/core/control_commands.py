@@ -31,6 +31,7 @@ from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.lifecycle_authority import TERMINAL_LIFECYCLE_STATES
 from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lifecycle
 from dev_orchestrator.core.project_status import project_runtime_status
+from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
 
@@ -253,7 +254,12 @@ class ControlCommandCoordinator:
             # A handoff refused only because HEAD advanced is re-offered
             # once; the executor owns that decision and the ledger write.
             reopen = getattr(executor, "reopen_stale_anchor_handoff", None)
-            if callable(reopen) and reopen(source_id):
+            blocked_project = projects.get(_nonblank(row.get("project_id")) or "")
+            clean_now = False
+            if isinstance(blocked_project, dict):
+                truth = read_repository_truth(blocked_project.get("repo_path") or "")
+                clean_now = bool(truth.valid and not truth.dirty)
+            if callable(reopen) and reopen(source_id, allow_transient_dirty=clean_now):
                 refreshed = executor.state()
                 row = (refreshed.get("executions") or {}).get(source_id) if isinstance(refreshed, dict) else None
         if not isinstance(row, dict) or row.get("state") != "handoff" or row.get("outcome") != "planning_required":
