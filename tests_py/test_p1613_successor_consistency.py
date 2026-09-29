@@ -2692,11 +2692,13 @@ class StaleAnchorHandoffTests(unittest.TestCase):
             "automatic planner handoff failed: planner requires a clean repository",
         )
         dirty_path.unlink()
+        clean_retry_head = _git(self.repo, "rev-parse", "HEAD")
 
         second = self._controls_tick()
         self._assert_advanced_to_p2(second, source_id, recorded_head)
         record = self.executor.state()["executions"][source_id]
         self.assertTrue(record.get("transient_dirty_reopened_at"))
+        self.assertEqual(record.get("transient_dirty_reopened_head"), clean_retry_head)
 
     def test_lifecycle_document_change_after_record_still_refuses(self):
         source_id, _ = self._record_handoff_then_commit(path="agent/notes.md")

@@ -1465,6 +1465,7 @@ class TransitionExecutor:
 
     def reopen_stale_anchor_handoff(
         self, source_request_id: str, *, allow_transient_dirty: bool = False,
+        current_head: str | None = None,
     ) -> bool:
         """Reopen a bounded, revalidated transient handoff refusal once.
 
@@ -1487,8 +1488,12 @@ class TransitionExecutor:
             )
             already_reopened = (
                 record.get("stale_anchor_reopened_at") if stale_anchor and isinstance(record, dict)
-                else record.get("transient_dirty_reopened_at") if isinstance(record, dict)
-                else None
+                else (
+                    record.get("transient_dirty_reopened_head") == current_head
+                    if isinstance(record, dict) and current_head
+                    else record.get("transient_dirty_reopened_at") if isinstance(record, dict)
+                    else None
+                )
             )
             if (
                 not isinstance(record, dict)
@@ -1512,6 +1517,7 @@ class TransitionExecutor:
                 record["reason"] = "reopened after a stale-anchor planner refusal"
             else:
                 record["transient_dirty_reopened_at"] = now
+                record["transient_dirty_reopened_head"] = current_head
                 record["transient_dirty_block_reason"] = reason
                 record["reason"] = "reopened after repository became clean"
             transition["state"] = "ready"

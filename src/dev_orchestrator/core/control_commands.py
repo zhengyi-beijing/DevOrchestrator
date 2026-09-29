@@ -259,7 +259,11 @@ class ControlCommandCoordinator:
             if isinstance(blocked_project, dict):
                 truth = read_repository_truth(blocked_project.get("repo_path") or "")
                 clean_now = bool(truth.valid and not truth.dirty)
-            if callable(reopen) and reopen(source_id, allow_transient_dirty=clean_now):
+            if callable(reopen) and reopen(
+                source_id,
+                allow_transient_dirty=clean_now,
+                current_head=truth.head if clean_now else None,
+            ):
                 refreshed = executor.state()
                 row = (refreshed.get("executions") or {}).get(source_id) if isinstance(refreshed, dict) else None
         if not isinstance(row, dict) or row.get("state") != "handoff" or row.get("outcome") != "planning_required":
