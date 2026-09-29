@@ -1,6 +1,6 @@
 # P18 — Native Execution Transport & RDC Dependency Reduction
 
-Status: **READY_TO_RUN**
+Status: **COMPLETE**
 Predecessor: P17
 Successor: TBD
 
