@@ -25,4 +25,3 @@ if ($status.process_alive) {
 $resultText = & $launcher start-daemon --listen 127.0.0.1 --port $Port --interval $IntervalSeconds --runtime-root $runtime
 if ($LASTEXITCODE -ne 0) { throw 'DevOrchestrator daemon failed to start.' }
 $resultText
-

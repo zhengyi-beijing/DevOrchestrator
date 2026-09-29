@@ -9,4 +9,3 @@ $launcher = Join-Path $PSScriptRoot 'devorch.cmd'
 $result = & $launcher stop-daemon --runtime-root $runtime
 if ($LASTEXITCODE -ne 0) { throw 'DevOrchestrator daemon failed to stop.' }
 $result
-

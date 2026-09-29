@@ -1,106 +1,67 @@
-# P18 Handoff - Native Execution Transport & RDC Dependency Reduction
+# P18 Handoff - External Control Entrypoint
 
-Last updated: 2026-09-28 17:29 +08:00.
+Last updated: 2026-09-29 09:25 +08:00.
 Branch: `main`.
-Accepted implementation/remediation anchor: `4a7c98a364341ed1a19e764f4ec992df3a869873`.
+Final implementation commit: `e948bec2dde1f43ba37dbb0b6360cd68f23c4ccc`.
+Push status: not pushed.
 
-Status: **IMPLEMENTATION + OWNER-AUTHORIZED FINAL REMEDIATION COMPLETE; REREVIEW CONSUMED; TERMINAL CLOSURE BLOCKED BY LIFECYCLE HANDOFF INVARIANT**.
+## Outcome
 
-## 1. Current Executive State
+P18 is **COMPLETE**. Its authoritative lifecycle outcome is `task_complete`; there is no active execution, owner gate, Worker, Reviewer, or unresolved active finding. P18 has no declared successor, and no P19 was fabricated.
 
-P18 implementation is no longer waiting on code remediation. The owner-authorized repair at `4a7c98a` closed the four remaining Claude Opus technical-review blockers without reopening planning.
+The repository now has a bounded external control entrypoint that reuses the unified daemon, its control/service layer, native transport selector, durable job store, and existing authority model. It does not expose direct lifecycle-ledger mutation or bypass owner gates.
 
-Current runtime facts:
-- DevO daemon PID: `24808`, port `8770`, healthy, `last_error = null`.
-- Rereview command: `p18-owner-fix-rereview-20260928`.
-- Rereview target: `ai_review:ai_review:ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute`.
-- Rereview control state: `accepted`.
-- Rereview effect: `rereview_technical_review_no_worker_started`.
-- DevO activity disposition: `terminal_success`.
-- No active Worker and no active Reviewer execution.
-- `agent/staged/P18.md` still declares `Successor: TBD`.
-- No staged P19 exists.
+## Live service
 
-The remaining blocker is a lifecycle closure / successor-publication defect, not an unresolved P18 implementation defect.
-## 2. Final Owner-Authorized Remediation
+- URL: `http://127.0.0.1:8770`
+- Unified daemon: PID `55436`, healthy, `last_error = null`
+- Bind: loopback only; non-loopback control is disabled
+- Authentication: bearer token in untracked `runtime/control/api-token`; never copy it into source or MCP configuration
+- AIBroker diagnostics: PID `54324`, loopback port `8875`
 
-The final Claude Opus review after remediation round 3 found four bounded issues and exhausted the configured automatic remediation budget. Owner authorization was then used for one targeted Codex Sol remediation.
+Start, inspect, or stop with:
 
-Codex execution:
-- Model: `gpt-5.6-sol`
-- Reasoning effort: Medium
-- Session: `01a0e718-1def-7372-8b7d-89cb89dda582`
-- Commit: `4a7c98a fix(p18): close native transport review blockers`
-- Not pushed.
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ops/start_devo_control_api.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File ops/status_devo_control_api.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File ops/stop_devo_control_api.ps1
+```
 
-Resolved blockers:
-1. AI SSH transport fail-closed restoration.
-   - Non-`success` helper envelopes now raise `ExecutionTransportError` with remote error evidence.
-   - Non-object payloads are rejected.
-   - P13 regression coverage added.
-2. Chained retry job-id authorization.
-   - `job_start` and `op_spawn` fold every `:retry:` segment through `retry_successor_id`.
-   - Explicit `retry_of` / `retry_request_id` remains highest precedence.
-3. Capability discovery fail-closed.
-   - Missing/stale capabilities are unknown-not-capable for all operations except capability discovery.
-   - Discovery exceptions are preserved in selection evidence.
-4. ZXZ-PC zero-RDC acceptance evidence.
-   - Status/log/git reads, durable spawn, `read_file`, `stat`, staged binary write, CAS write, and readback succeeded through native transport.
-   - 14 captured transport-operation rows selected `local`.
-   - RDC calls during acceptance: **0**.
-   - 14-byte binary round-trip SHA-256: `feec999ce6022562110591cd579bf1fd8e009f288c3a0e6c604b5f1b533cc8bf`.
+Stopping this API deliberately stops the unified daemon because the endpoint is daemon-owned.
 
-Adjacent correctness fix:
-- `op_write_file` now returns its resolved `target_path`.
-## 3. Validation and Evidence
+## Exact next ChatGPT connection action
 
-Validation after `4a7c98a`:
-- P18/P13/P14/P14.5 regression set: **253 tests passed + 35 subtests**.
-- `python -m compileall -q src ops tests_py`: passed.
-- Evidence JSON/NDJSON parsing: passed.
-- `git diff --check`: passed.
-- `git show --check HEAD`: passed.
-- `graphify update .`: completed.
+Register this local stdio MCP server in ChatGPT, then restart/reconnect that MCP integration:
 
-Acceptance evidence:
-- `docs/evidence/P18_ZXZ_PC_ZERO_RDC_ACCEPTANCE.json`
-- `docs/evidence/P18_ZXZ_PC_TRANSPORT_OPERATIONS.ndjson`
-- Runtime source log: `runtime/p18-acceptance-runtime/logs/transport-operations.ndjson`
-- Updated inventory: `docs/P18_RDC_DEPENDENCY_INVENTORY.md`
-- Detailed history: `agent/result.md`
-- Current task evidence: `agent/CURRENT.md`
+```text
+command: C:\work\github\DevOrchestrator-dev\ops\devorch.cmd
+args: mcp-adapter --runtime-root C:\work\github\DevOrchestrator-dev\runtime --enable-transport-tools
+cwd: C:\work\github\DevOrchestrator-dev
+```
 
-Historical RDC baseline was unavailable and was explicitly recorded as unavailable rather than inferred.
+Do not add the bearer token to the configuration. The local adapter reads it from the runtime directory. After connecting, call `devorch_status` with `project_id = devorchestrator` before issuing operations.
 
-## 4. Current Lifecycle Blocker
+## Evidence and verification
 
-After rereview was consumed, DevO reached `terminal_success` disposition but retained an accepted `NEXT_TASK` decision without a durable successor handoff.
+- Acceptance summary: `docs/evidence/P18_EXTERNAL_CONTROL_ZERO_RDC_ACCEPTANCE.json`
+- Verbatim operation rows: `docs/evidence/P18_EXTERNAL_CONTROL_OPERATIONS.ndjson`
+- Operator/API guide: `docs/P18_EXTERNAL_CONTROL_API.md`
+- Implementation decision note: `docs/P18_EXTERNAL_CONTROL_IMPLEMENTATION_NOTE.md`
+- Result: PASS; 19 native machine operations selected `local`; RDC call count 0
+- Completed job: `job-be03619939a7088d`, exit 0
+- Cancelled job: `job-0e76a41e4fd95663`, durably terminal
+- Binary create SHA-256: `0e18b2456ca0105f08884d5090345c340c5a3036304135a54f1c00411834f3cd`
+- Binary final SHA-256: `d0388d4b8a672e40329f564bd8300d7e1d27dde3e471a7d66d3a8a4146874fc7`
+- Regression: 441 tests passed in 187.597 seconds
+- Static verification: `python -m compileall -q src tests_py ops`, `git diff --check`, and `graphify update .` passed
+- MCP smoke: 15 tools advertised; authenticated `devorch_status` returned valid JSON, a request ID, P18 `COMPLETE`, and null owner gate/active execution
 
-Failing invariant:
-- Code: `NEXT_TASK_WITHOUT_HANDOFF`
-- Reason: `accepted NEXT_TASK must have a durable handoff`
-- Gate ID: `lifecycle:NEXT_TASK_WITHOUT_HANDOFF:142808db0dbe7d28`
-- Accepted next decision: `ai_review:rereview:p18-owner-fix-rereview-20260928`
-- `actuation_blocked = true`
-- No active execution and no active AI role.
-Because P18 has `Successor: TBD` and no staged P19, do not fabricate a successor solely to satisfy the invariant.
+## Security and operational limits
 
-Expected reconciliation direction:
-- If P18 truly has no successor, terminal acceptance should settle as `task_complete` / end-of-roadmap and must not create an accepted `NEXT_TASK` obligation.
-- If a real successor is later defined by the owner, stage it explicitly and publish a normal durable successor handoff.
-- Do not reopen P18 implementation or rerun remediation merely because the closure invariant is broken.
-- Preserve the single-authority lifecycle model and fail closed on ambiguous successor identity.
-
-## 5. Operational Notes for the Next Session
-
-1. Inspect live ZXZ-PC state first; do not infer execution state from this handoff alone.
-2. Confirm daemon state, HEAD, worktree cleanliness, current gate, and whether `NEXT_TASK_WITHOUT_HANDOFF` has changed.
-3. Treat `4a7c98a` as the accepted P18 implementation/remediation anchor. A later handoff-only documentation commit must not be mistaken for a new P18 code revision requiring another technical review cycle.
-4. Diagnose/fix terminal closure semantics rather than manually inventing P19.
-5. Do not push unless explicitly requested.
-6. RDC is now fallback/bootstrap/GUI/emergency only for routine DevO operations; prefer native Local/SSH transport where supported.
-7. Real X-ray source or conveyor actions remain explicitly human-authorized only.
-
-## 6. Historical Anchor
-
-P17 Single-Authority Goal Convergence Baseline is complete and review-accepted. P18 was activated through the normal P17 successor handoff. P17 implementation details remain available in repository history, `agent/CURRENT.md`, and `agent/result.md`.
+- Commands remain allowlisted by `runtime/execution-jobs.json`; arbitrary shell commands are not accepted.
+- Writes require staged content plus create-only or expected-digest CAS semantics. Paths remain scoped by transport policy.
+- Requests, output, reads, timeouts, and job concurrency are bounded. Audits exclude bearer tokens and file contents.
+- Remote SSH behavior is covered by regression tests but was not exercised against a second live host in this acceptance.
+- `external_control_sleep` exists only in the local ignored runtime command configuration to exercise durable cancellation; it is not a tracked production policy.
+- Real X-ray source or conveyor actions remain explicitly human-authorized. This entrypoint does not weaken hardware interlocks or safety policy.
+- RDC remains available only as fallback/bootstrap/GUI/emergency infrastructure and was not invoked during acceptance.

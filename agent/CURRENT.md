@@ -1,5 +1,16 @@
 # DevOrchestrator Self-Hosted Development State
 
+P18 External Control Entrypoint closeout (2026-09-29):
+- Status: **COMPLETE**. The authoritative P18 lifecycle is terminal with `outcome = task_complete`; `active_execution = null`, `owner_gate = null`, and no successor was fabricated.
+- Final implementation commit: `e948bec2dde1f43ba37dbb0b6360cd68f23c4ccc` (`feat(control-api): add native external control entrypoint`). Not pushed.
+- The unified daemon exposes the authenticated, loopback-only external status and bounded native transport API at `http://127.0.0.1:8770`; its bearer token remains untracked at `runtime/control/api-token`.
+- ChatGPT/MCP entrypoint: `ops\devorch.cmd mcp-adapter --runtime-root C:\work\github\DevOrchestrator-dev\runtime --enable-transport-tools`, with working directory `C:\work\github\DevOrchestrator-dev`.
+- Live acceptance passed with 19 native machine operations, all selecting `local`, zero RDC calls, durable completion and cancellation, bounded reads, stat, staged binary content, create-only write, CAS update, and verified readback.
+- Evidence: `docs/evidence/P18_EXTERNAL_CONTROL_ZERO_RDC_ACCEPTANCE.json` and `docs/evidence/P18_EXTERNAL_CONTROL_OPERATIONS.ndjson`.
+- Verification: 441 required regression tests passed; `python -m compileall -q src tests_py ops`, `git diff --check`, and `graphify update .` passed.
+- Current daemon observation: PID `55436`, loopback port `8770`, `control_enabled = true`, `token_present = true`, `last_error = null`; AIBroker PID `54324` listens on loopback port `8875`.
+- Limits: remote SSH transport was covered by regression tests but not exercised against a second live host in this acceptance; real X-ray/conveyor actions remain human-authorized; direct non-loopback publication stays disabled.
+
 - Canonical worktree: C:\work\github\DevOrchestrator-dev.
 - Canonical branch: main.
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.

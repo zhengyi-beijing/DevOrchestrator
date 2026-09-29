@@ -1,5 +1,15 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P18 External Control Entrypoint (complete 2026-09-29):
+- Added an authenticated, loopback-only external status projection and bounded native exec/spawn/poll/cancel/read/stat/stage/write routes on the existing unified daemon. No lifecycle ledger mutation route or duplicate authority was introduced.
+- Added opt-in full MCP transport tools behind `--enable-transport-tools`, request-ID propagation, sanitized external-operation audit events, transport-selection evidence, output/read/timeout limits, atomic job concurrency enforcement, and durable terminal cancellation.
+- Added PowerShell 5.1 start/status/stop wrappers, operator documentation, a repeatable zero-RDC acceptance script, and focused security/behavior regression coverage.
+- Live ZXZ-PC acceptance passed: P18 remained `COMPLETE`, owner gate and active execution remained null, 19 machine operations selected `local`, RDC calls were zero, job `job-be03619939a7088d` completed with exit 0, and job `job-0e76a41e4fd95663` persisted as cancelled. Binary create/readback and CAS update hashes matched.
+- MCP subprocess smoke test advertised all 15 tools and returned a parseable authenticated `devorch_status` result with a request ID and the same terminal lifecycle state.
+- Evidence: `docs/evidence/P18_EXTERNAL_CONTROL_ZERO_RDC_ACCEPTANCE.json` and `docs/evidence/P18_EXTERNAL_CONTROL_OPERATIONS.ndjson`.
+- Verification: 441 required regression tests passed in 187.597 seconds; focused suites passed throughout; compileall, whitespace checks, evidence parsing, and Graphify refresh passed.
+- Final implementation commit: `e948bec2dde1f43ba37dbb0b6360cd68f23c4ccc`. No push performed.
+
 P18 Native Execution Transport & RDC Dependency Reduction (owner-authorized final remediation / ready for review 2026-09-28):
 - Closed the four remaining Claude Opus blockers at `d3ecdb9` without reopening planning:
   1. AI `SSHTransport` once again rejects non-success remote-helper envelopes with `ExecutionTransportError` containing the helper error and rejects non-object payloads. Added `test_dispatch_remote_helper_error_status_raises_execution_transport_error` and payload-shape coverage.
