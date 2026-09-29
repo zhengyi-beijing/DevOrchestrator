@@ -2660,7 +2660,7 @@ class StaleAnchorHandoffTests(unittest.TestCase):
 
     def test_terminal_status_projection_catches_up_after_handoff(self):
         next_path = self.repo / "agent" / "next.md"
-        next_path.write_bytes(b"# P1 task\n\nStatus: **READY_TO_RUN**\n")
+        next_path.write_text("# P1 — task\n\nStatus: **READY_TO_RUN**\n", encoding="utf-8")
         _commit(self.repo, "leave terminal authority projection stale")
         recorded_head = _git(self.repo, "rev-parse", "HEAD")
         outcome = self.executor.reconcile_successor_handoff(
@@ -2668,7 +2668,7 @@ class StaleAnchorHandoffTests(unittest.TestCase):
             completed_task_id="P1", trigger="terminal projection catch-up fixture",
         )
         self.assertEqual(outcome["status"], "applied", outcome)
-        next_path.write_bytes(b"# P1 task\n\nStatus: **COMPLETE**\n")
+        next_path.write_text("# P1 — task\n\nStatus: **COMPLETE**\n", encoding="utf-8")
         _commit(self.repo, "align terminal repository projection")
 
         planner = self._controls_tick()

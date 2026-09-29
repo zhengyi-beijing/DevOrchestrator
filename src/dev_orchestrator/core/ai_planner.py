@@ -338,10 +338,10 @@ def _terminal_status_promotion_only(
         for revision in (anchor_head, head):
             shown = subprocess.run(
                 ["git", "-C", str(repo), "show", f"{revision}:agent/next.md"],
-                capture_output=True, text=True, timeout=15, check=False,
+                capture_output=True, text=True, encoding="utf-8", timeout=15, check=False,
                 **hidden_subprocess_kwargs(),
             )
-            if shown.returncode != 0:
+            if shown.returncode != 0 or not isinstance(shown.stdout, str):
                 return False
             values.append(shown.stdout)
         from dev_orchestrator.monitor.telemetry import extract_task_id
@@ -361,7 +361,7 @@ def _terminal_status_promotion_only(
             and states[1].is_completed()
             and normalized[0] == normalized[1]
         )
-    except (OSError, subprocess.SubprocessError, ValueError):
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
         return False
 
 
