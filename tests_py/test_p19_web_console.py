@@ -437,6 +437,17 @@ class P19WebConsoleTests(unittest.TestCase):
         )
         self.assertIn(status, (401, 403))
 
+        # Sec-Fetch-Site same-site on GET -> 401/403
+        status, _, _ = self._browser_request(
+            "/api/v1/control/external/status?project_id=p19",
+            method="GET",
+            cookie=c2,
+            csrf=cs2,
+            origin=None,
+            sec_fetch_site="same-site",
+        )
+        self.assertIn(status, (401, 403))
+
         # Origin absent and Sec-Fetch-Site absent on GET -> 401
         status, _, _ = self._browser_request(
             "/api/v1/control/external/status?project_id=p19",
@@ -592,7 +603,59 @@ class P19WebConsoleTests(unittest.TestCase):
         self.assertFalse(res_remote["data"]["host_local"])
         self.assertEqual(res_remote["data"]["commands"], [])
 
+    def test_acceptance_evidence_records_request_id_per_operation(self) -> None:
+        evidence_path = ROOT / "docs" / "evidence" / "P19_WEB_CONSOLE_ACCEPTANCE.json"
+        operations_path = ROOT / "docs" / "evidence" / "P19_WEB_CONSOLE_OPERATIONS.ndjson"
+        self.assertTrue(evidence_path.is_file(), f"missing {evidence_path}")
+        self.assertTrue(operations_path.is_file(), f"missing {operations_path}")
+
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        operations = evidence.get("operations")
+        self.assertIsInstance(operations, list)
+        self.assertGreater(len(operations), 0)
+
+        import re
+        request_id_pattern = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+        for op in operations:
+            req_id = op.get("request_id")
+            self.assertIsNotNone(req_id, f"operation {op.get('operation')} has null request_id in acceptance JSON")
+            self.assertIsInstance(req_id, str)
+            self.assertTrue(bool(request_id_pattern.fullmatch(req_id)), f"invalid request_id format: {req_id!r}")
+
+        ndjson_lines = [line.strip() for line in operations_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(ndjson_lines), len(operations))
+        for line in ndjson_lines:
+            row = json.loads(line)
+            req_id = row.get("request_id")
+            self.assertIsNotNone(req_id, f"row {row.get('operation')} has null request_id in NDJSON")
+            self.assertIsInstance(req_id, str)
+            self.assertTrue(bool(request_id_pattern.fullmatch(req_id)), f"invalid NDJSON request_id format: {req_id!r}")
+
+    def test_acceptance_evidence_rdc_count_is_derived_not_literal(self) -> None:
+        evidence_path = ROOT / "docs" / "evidence" / "P19_WEB_CONSOLE_ACCEPTANCE.json"
+        self.assertTrue(evidence_path.is_file())
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+
+        operations = evidence.get("operations", [])
+        measured_rdc = len([
+            row for row in operations
+            if "rdc" in str(row.get("selected_transport") or "").lower()
+        ])
+        self.assertEqual(evidence.get("rdc_call_count"), measured_rdc)
+        self.assertEqual(evidence.get("rdc_call_count"), 0)
+        if "observed_rdc_selections" in evidence:
+            self.assertEqual(evidence["observed_rdc_selections"], measured_rdc)
+
+    def test_p19_diff_whitespace_check_clean(self) -> None:
+        acceptance_script = ROOT / "ops" / "p19_web_console_acceptance.py"
+        test_file = ROOT / "tests_py" / "test_p19_web_console.py"
+
+        for p in (acceptance_script, test_file):
+            content = p.read_text(encoding="utf-8")
+            self.assertTrue(content.endswith("\n"), f"{p.name} must end with newline")
+            self.assertFalse(content.endswith("\n\n") or content.endswith("\r\n\r\n"), f"{p.name} must not have extra blank line at EOF")
+
 
 if __name__ == "__main__":
     unittest.main()
-

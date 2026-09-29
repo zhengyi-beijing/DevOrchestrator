@@ -68,18 +68,25 @@ def main() -> int:
     if not cookie.startswith("devorch_control=") or not csrf_token:
         raise RuntimeError(f"invalid session credentials: cookie={cookie}, csrf={csrf_token}")
 
+    request_seq = 0
+
     def browser_request(
         path: str,
         *,
         method: str = "GET",
         body: dict[str, Any] | None = None,
         allow_error: bool = False,
-    ) -> tuple[int, dict[str, Any]]:
+        request_id: str | None = None,
+    ) -> tuple[int, dict[str, Any], str]:
+        nonlocal request_seq
+        request_seq += 1
+        req_id = request_id or f"p19-web-{run_tag}-req-{request_seq:03d}"
         headers: dict[str, str] = {
             "Host": host_header,
             "Cookie": cookie,
             "X-DevOrch-CSRF": csrf_token,
             "Sec-Fetch-Site": "same-origin",
+            "X-DevOrch-Request-ID": req_id,
         }
         if method == "POST":
             headers["Origin"] = origin_header
@@ -93,19 +100,24 @@ def main() -> int:
         try:
             with urllib.request.urlopen(req) as r:
                 r_bytes = r.read().decode("utf-8")
-                return r.status, json.loads(r_bytes) if r_bytes else {}
+                resp_req_id = r.headers.get("X-DevOrch-Request-ID") or req_id
+                return r.status, json.loads(r_bytes) if r_bytes else {}, resp_req_id
         except urllib.error.HTTPError as exc:
             if not allow_error:
                 raise RuntimeError(f"HTTP {exc.code} for {method} {path}: {exc.read().decode('utf-8')}") from exc
             err_bytes = exc.read().decode("utf-8")
-            return exc.code, json.loads(err_bytes) if err_bytes else {}
+            resp_req_id = exc.headers.get("X-DevOrch-Request-ID") or req_id
+            return exc.code, json.loads(err_bytes) if err_bytes else {}, resp_req_id
 
-    def record(name: str, response: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    def record(name: str, response: dict[str, Any], req_id: str | None = None, **extra: Any) -> dict[str, Any]:
         body = data(response)
+        resolved_req_id = req_id or response.get("request_id")
+        if not resolved_req_id:
+            raise RuntimeError(f"operation {name} missing request ID")
         row = {
             "timestamp": now_iso(),
             "operation": name,
-            "request_id": response.get("request_id"),
+            "request_id": resolved_req_id,
             "selected_transport": body.get("selected_transport"),
             "status": body.get("status", "ok"),
             **extra,
@@ -114,21 +126,27 @@ def main() -> int:
         return body
 
     # 1. Authoritative status via browser session
-    _, status_resp = browser_request(f"/api/v1/control/external/status?project_id={args.project_id}")
-    status_body = record("status", status_resp)
+    _, status_resp, status_req_id = browser_request(
+        f"/api/v1/control/external/status?project_id={args.project_id}",
+        request_id=f"p19-web-{run_tag}-status",
+    )
+    status_body = record("status", status_resp, status_req_id)
     rows[-1]["lifecycle_state"] = (status_body.get("authoritative_lifecycle") or {}).get("lifecycle_state")
     rows[-1]["active_execution"] = status_body.get("active_execution")
     rows[-1]["owner_gate"] = status_body.get("owner_gate")
 
     # 2. Command catalog discovery via browser session
-    _, cmds_resp = browser_request(f"/api/v1/control/transport/commands?project_id={args.project_id}&host_id=local")
-    cmds_body = record("command_catalog", cmds_resp, command_count=len(data(cmds_resp).get("commands") or []))
+    _, cmds_resp, cmds_req_id = browser_request(
+        f"/api/v1/control/transport/commands?project_id={args.project_id}&host_id=local",
+        request_id=f"p19-web-{run_tag}-commands",
+    )
+    cmds_body = record("command_catalog", cmds_resp, cmds_req_id, command_count=len(data(cmds_resp).get("commands") or []))
     available_commands = {c["command_ref"] for c in cmds_body.get("commands") or []}
     if "git_status" not in available_commands:
         raise RuntimeError("git_status not found in discovered commands catalog")
 
     # 3. Synchronous exec via browser session
-    _, exec_resp = browser_request(
+    _, exec_resp, exec_req_id = browser_request(
         "/api/v1/control/transport/exec",
         method="POST",
         body={
@@ -137,13 +155,14 @@ def main() -> int:
             "command_ref": "git_status",
             "idempotency_key": f"p19-web-{run_tag}-git-status",
         },
+        request_id=f"p19-web-{run_tag}-exec-git-status",
     )
-    exec_body = record("git_status", exec_resp, exit_code=data(exec_resp).get("exit_code"))
+    exec_body = record("git_status", exec_resp, exec_req_id, exit_code=data(exec_resp).get("exit_code"))
     if exec_body.get("status") != "ok":
         raise RuntimeError(f"git_status failed: {exec_body.get('error')}")
 
     # 4. Asynchronous spawn via browser session
-    _, spawn_resp = browser_request(
+    _, spawn_resp, spawn_req_id = browser_request(
         "/api/v1/control/transport/spawn",
         method="POST",
         body={
@@ -151,8 +170,9 @@ def main() -> int:
             "command_ref": args.completion_command,
             "idempotency_key": f"p19-web-{run_tag}-spawn-complete",
         },
+        request_id=f"p19-web-{run_tag}-spawn-complete",
     )
-    spawned = record("spawn", spawn_resp, command_ref=args.completion_command)
+    spawned = record("spawn", spawn_resp, spawn_req_id, command_ref=args.completion_command)
     complete_job_id = str(spawned.get("job_id") or spawned.get("operation_id"))
     rows[-1]["job_id"] = complete_job_id
 
@@ -162,15 +182,16 @@ def main() -> int:
     poll_index = 0
     while time.monotonic() < deadline:
         poll_index += 1
-        _, poll_resp = browser_request(
+        _, poll_resp, poll_req_id = browser_request(
             "/api/v1/control/transport/poll",
             method="POST",
             body={
                 "project_id": args.project_id,
                 "operation_id": complete_job_id,
             },
+            request_id=f"p19-web-{run_tag}-poll-{poll_index}",
         )
-        completed = record("poll", poll_resp, job_id=complete_job_id, exit_code=data(poll_resp).get("exit_code"))
+        completed = record("poll", poll_resp, poll_req_id, job_id=complete_job_id, exit_code=data(poll_resp).get("exit_code"))
         if completed.get("status") in {"completed", "failed", "cancelled"}:
             break
         time.sleep(0.2)
@@ -178,11 +199,17 @@ def main() -> int:
         raise RuntimeError(f"completion job did not succeed: {completed}")
 
     # 6. File read & stat via browser session
-    _, read_resp = browser_request(f"/api/v1/control/transport/read?project_id={args.project_id}&path=README.md&max_bytes=4096")
-    read_data = record("read_file", read_resp, content_sha256=data(read_resp).get("content_sha256"))
+    _, read_resp, read_req_id = browser_request(
+        f"/api/v1/control/transport/read?project_id={args.project_id}&path=README.md&max_bytes=4096",
+        request_id=f"p19-web-{run_tag}-read-file",
+    )
+    read_data = record("read_file", read_resp, read_req_id, content_sha256=data(read_resp).get("content_sha256"))
 
-    _, stat_resp = browser_request(f"/api/v1/control/transport/stat?project_id={args.project_id}&path=README.md")
-    record("stat", stat_resp, sha256=data(stat_resp).get("sha256"), size_bytes=data(stat_resp).get("size_bytes"))
+    _, stat_resp, stat_req_id = browser_request(
+        f"/api/v1/control/transport/stat?project_id={args.project_id}&path=README.md",
+        request_id=f"p19-web-{run_tag}-stat",
+    )
+    record("stat", stat_resp, stat_req_id, sha256=data(stat_resp).get("sha256"), size_bytes=data(stat_resp).get("size_bytes"))
 
     # 7. Binary staging, CAS create, CAS update, and CAS conflict via browser session
     target = f"runtime/p19-web-console/roundtrip-{run_tag}.bin"
@@ -190,7 +217,7 @@ def main() -> int:
     first_hash = "sha256:" + hashlib.sha256(first).hexdigest()
     first_b64 = base64.b64encode(first).decode("ascii")
 
-    _, staged_resp = browser_request(
+    _, staged_resp, staged_req_id = browser_request(
         "/api/v1/control/transport/stage-write",
         method="POST",
         body={
@@ -199,10 +226,11 @@ def main() -> int:
             "content_sha256": first_hash,
             "decoded_size_bytes": len(first),
         },
+        request_id=f"p19-web-{run_tag}-stage-create",
     )
-    staged_data = record("stage_write", staged_resp, content_sha256=first_hash)
+    staged_data = record("stage_write", staged_resp, staged_req_id, content_sha256=first_hash)
 
-    _, created_resp = browser_request(
+    _, created_resp, created_req_id = browser_request(
         "/api/v1/control/transport/write",
         method="POST",
         body={
@@ -214,14 +242,15 @@ def main() -> int:
             "decoded_size_bytes": len(first),
             "if_absent": True,
         },
+        request_id=f"p19-web-{run_tag}-write-create",
     )
-    record("write_create", created_resp, pre_digest=data(created_resp).get("pre_digest"), post_digest=data(created_resp).get("post_digest"))
+    record("write_create", created_resp, created_req_id, pre_digest=data(created_resp).get("pre_digest"), post_digest=data(created_resp).get("post_digest"))
 
     second = b"P19-web-console-updated-payload\x00\x42"
     second_hash = "sha256:" + hashlib.sha256(second).hexdigest()
     second_b64 = base64.b64encode(second).decode("ascii")
 
-    _, staged2_resp = browser_request(
+    _, staged2_resp, staged2_req_id = browser_request(
         "/api/v1/control/transport/stage-write",
         method="POST",
         body={
@@ -230,10 +259,11 @@ def main() -> int:
             "content_sha256": second_hash,
             "decoded_size_bytes": len(second),
         },
+        request_id=f"p19-web-{run_tag}-stage-update",
     )
-    staged2_data = record("stage_write_update", staged2_resp, content_sha256=second_hash)
+    staged2_data = record("stage_write_update", staged2_resp, staged2_req_id, content_sha256=second_hash)
 
-    _, updated_resp = browser_request(
+    _, updated_resp, updated_req_id = browser_request(
         "/api/v1/control/transport/write",
         method="POST",
         body={
@@ -245,11 +275,12 @@ def main() -> int:
             "decoded_size_bytes": len(second),
             "expected_sha256": first_hash,
         },
+        request_id=f"p19-web-{run_tag}-cas-update",
     )
-    record("cas_update", updated_resp, pre_digest=data(updated_resp).get("pre_digest"), post_digest=data(updated_resp).get("post_digest"))
+    record("cas_update", updated_resp, updated_req_id, pre_digest=data(updated_resp).get("pre_digest"), post_digest=data(updated_resp).get("post_digest"))
 
     # Test CAS conflict
-    conflict_status, conflict_resp = browser_request(
+    conflict_status, conflict_resp, conflict_req_id = browser_request(
         "/api/v1/control/transport/write",
         method="POST",
         body={
@@ -262,24 +293,32 @@ def main() -> int:
             "expected_sha256": first_hash,  # stale hash, file is now second_hash
         },
         allow_error=True,
+        request_id=f"p19-web-{run_tag}-cas-conflict",
     )
     if conflict_status not in (400, 409):
         raise RuntimeError(f"expected CAS conflict (400/409), got status {conflict_status}")
+    if not conflict_req_id:
+        raise RuntimeError("missing request ID for cas_conflict")
     rows.append({
         "timestamp": now_iso(),
         "operation": "cas_conflict",
+        "request_id": conflict_req_id,
+        "selected_transport": None,
         "status": "conflict_rejected",
         "expected_code": conflict_status,
     })
 
     # Readback verified
-    _, readback_resp = browser_request(f"/api/v1/control/transport/read?project_id={args.project_id}&path={target}")
-    record("readback", readback_resp, content_sha256=data(readback_resp).get("content_sha256"))
+    _, readback_resp, readback_req_id = browser_request(
+        f"/api/v1/control/transport/read?project_id={args.project_id}&path={target}",
+        request_id=f"p19-web-{run_tag}-readback",
+    )
+    record("readback", readback_resp, readback_req_id, content_sha256=data(readback_resp).get("content_sha256"))
     if data(readback_resp).get("content_sha256") != second_hash:
         raise RuntimeError("binary CAS readback hash mismatch")
 
     # 8. Spawn and Cancel via browser session
-    _, long_spawn_resp = browser_request(
+    _, long_spawn_resp, long_spawn_req_id = browser_request(
         "/api/v1/control/transport/spawn",
         method="POST",
         body={
@@ -287,12 +326,13 @@ def main() -> int:
             "command_ref": args.cancel_command,
             "idempotency_key": f"p19-web-{run_tag}-spawn-cancel",
         },
+        request_id=f"p19-web-{run_tag}-spawn-cancel",
     )
-    long_data = record("spawn_cancel_target", long_spawn_resp, command_ref=args.cancel_command)
+    long_data = record("spawn_cancel_target", long_spawn_resp, long_spawn_req_id, command_ref=args.cancel_command)
     cancel_job_id = str(long_data.get("job_id") or long_data.get("operation_id"))
     rows[-1]["job_id"] = cancel_job_id
 
-    _, cancel_resp = browser_request(
+    _, cancel_resp, cancel_req_id = browser_request(
         "/api/v1/control/transport/cancel",
         method="POST",
         body={
@@ -300,16 +340,25 @@ def main() -> int:
             "operation_id": cancel_job_id,
             "reason": "P19 harmless web console acceptance cancellation",
         },
+        request_id=f"p19-web-{run_tag}-cancel",
     )
-    record("cancel", cancel_resp, job_id=cancel_job_id)
+    record("cancel", cancel_resp, cancel_req_id, job_id=cancel_job_id)
 
     # 9. Audit operations read
-    _, ops_resp = browser_request("/api/v1/control/transport/operations?limit=10")
-    record("operations_read", ops_resp, count=len(data(ops_resp).get("operations") or []))
+    _, ops_resp, ops_req_id = browser_request(
+        "/api/v1/control/transport/operations?limit=10",
+        request_id=f"p19-web-{run_tag}-ops-read",
+    )
+    record("operations_read", ops_resp, ops_req_id, count=len(data(ops_resp).get("operations") or []))
+
+    missing_req_ids = [row for row in rows if not row.get("request_id")]
+    if missing_req_ids:
+        raise RuntimeError(f"one or more rows lack request_id: {missing_req_ids}")
 
     # Transport audit validation
     native_rows = [row for row in rows if row.get("selected_transport")]
-    rdc_rows = [row for row in native_rows if "rdc" in str(row.get("selected_transport") or "").lower()]
+    rdc_rows = [row for row in rows if "rdc" in str(row.get("selected_transport") or "").lower()]
+    rdc_call_count = len(rdc_rows)
     bad_rows = [row for row in native_rows if row.get("selected_transport") not in {"local", "ssh"}]
     if rdc_rows or bad_rows:
         raise RuntimeError(f"non-native transport observed: {rdc_rows or bad_rows}")
@@ -325,7 +374,8 @@ def main() -> int:
         "result": "PASS",
         "native_transport_operation_count": len(native_rows),
         "selected_transports": sorted({str(row["selected_transport"]) for row in native_rows}),
-        "rdc_call_count": 0,
+        "rdc_call_count": rdc_call_count,
+        "observed_rdc_selections": rdc_call_count,
         "complete_job_id": complete_job_id,
         "cancel_job_id": cancel_job_id,
         "binary_create_sha256": first_hash,
@@ -346,4 +396,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
