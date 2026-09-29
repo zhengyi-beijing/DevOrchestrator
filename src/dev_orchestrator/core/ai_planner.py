@@ -287,8 +287,33 @@ def _validate_plan_schema(payload: dict[str, Any]) -> None:
                 correction=f"combine or remove {excess} item(s)",
                 actionable_message=f"Field '{key}' has {count} items, exceeding the limit of 24. Combine or remove {excess} item(s).",
             )
-        if any(not isinstance(item, str) or len(item) > 1000 for item in value):
-            raise PlannerProtocolError("schema", f"planner {key} entries must be bounded strings")
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                raise PlannerProtocolError(
+                    "schema",
+                    f"planner {key}[{index}] must be a string; got {type(item).__name__}",
+                    field=f"{key}[{index}]",
+                    expected="a string of at most 1000 characters",
+                    actual=type(item).__name__,
+                    correction="replace the entry with one bounded string",
+                    actionable_message=(
+                        f"Field '{key}[{index}]' is a {type(item).__name__}; "
+                        "replace it with one string of at most 1000 characters."
+                    ),
+                )
+            if len(item) > 1000:
+                raise PlannerProtocolError(
+                    "schema",
+                    f"planner {key}[{index}] exceeds 1000 characters; got {len(item)}",
+                    field=f"{key}[{index}]",
+                    expected="at most 1000 characters",
+                    actual=f"{len(item)} characters",
+                    correction="split or shorten this entry while preserving the executable intent",
+                    actionable_message=(
+                        f"Field '{key}[{index}]' has {len(item)} characters, exceeding the "
+                        "1000-character limit. Split or shorten that entry."
+                    ),
+                )
 
 
 
@@ -1249,6 +1274,7 @@ class AIPlannerCoordinator:
         semantic_failures = 0
         format_repairs = 0
         failed_resource_ids: set[str] = set()
+        protocol_failures_by_resource: dict[str, int] = {}
         recovery_excluded_resource_ids = set(initial_excluded_resource_ids)
         planner_result = None
         plan = None
@@ -1402,6 +1428,20 @@ class AIPlannerCoordinator:
                 classification = getattr(attempt_result, "failure_classification", None)
                 if protocol_stage is not None:
                     classification = f"planner_{protocol_stage}_error"
+                protocol_resource = (
+                    attempt_result.resource_context
+                    if attempt_result is not None and attempt_result.resource_context is not None
+                    else None
+                )
+                protocol_resource_id = (
+                    protocol_resource.resource_id
+                    if protocol_resource is not None and protocol_resource.resource_id
+                    else None
+                )
+                if protocol_stage in {"extract", "schema"} and protocol_resource_id is not None:
+                    protocol_failures_by_resource[protocol_resource_id] = (
+                        protocol_failures_by_resource.get(protocol_resource_id, 0) + 1
+                    )
                 artifact_violation = None
                 if isinstance(exc, PlannerProtocolError) and (exc.field or exc.correction):
                     artifact_violation = {
@@ -1438,6 +1478,33 @@ class AIPlannerCoordinator:
                         previous_attempt_resource = attempt_result.resource_context
                     failure_reason = (
                         f"{protocol_stage} format/schema repair required: {attempt_reason}{artifact_block}"
+                    )
+                    continue
+                repeated_protocol_failure = (
+                    protocol_stage in {"extract", "schema"}
+                    and protocol_resource_id is not None
+                    and protocol_failures_by_resource.get(protocol_resource_id, 0) >= max_attempts
+                    and protocol_resource_id not in failed_resource_ids
+                    and len(failed_resource_ids) < max_resource_failovers
+                    and attempt < max_dispatches
+                )
+                if repeated_protocol_failure:
+                    self._record_planner_attempt(
+                        plan_id,
+                        attempt,
+                        planner_request,
+                        attempt_result,
+                        attempt_reason,
+                        classification=f"planner_{protocol_stage}_resource_failover",
+                        round_no=round_no,
+                    )
+                    failed_resource_ids.add(protocol_resource_id)
+                    previous_attempt_resource = protocol_resource
+                    failure_reason = (
+                        f"{protocol_stage} contract failed "
+                        f"{protocol_failures_by_resource[protocol_resource_id]} times on resource "
+                        f"{protocol_resource_id}; retry on a different resource: "
+                        f"{attempt_reason}{artifact_block}"
                     )
                     continue
                 self._record_planner_attempt(

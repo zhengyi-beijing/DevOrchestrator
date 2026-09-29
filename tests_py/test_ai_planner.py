@@ -93,6 +93,20 @@ class PlanParserCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(PlannerProtocolError, r"at most 24 items; got 25; combine or remove 1 item"):
             _parse_plan(json.dumps(payload), "P15")
 
+    def test_oversized_entry_reports_exact_field_length_and_correction(self):
+        payload = {
+            "task_id": "P15", "summary": "bounded",
+            "implementation_steps": ["x" * 1001],
+            "interfaces": ["stable"], "validation": ["tests"],
+            "risks": ["bounded"], "out_of_scope": ["unrelated"],
+        }
+        with self.assertRaises(PlannerProtocolError) as ctx:
+            _parse_plan(json.dumps(payload), "P15")
+        self.assertEqual(ctx.exception.stage, "schema")
+        self.assertEqual(ctx.exception.field, "implementation_steps[0]")
+        self.assertEqual(ctx.exception.actual, "1001 characters")
+        self.assertIn("Split or shorten", ctx.exception.actionable_message)
+
     def test_schema_and_semantic_failures_are_distinct(self):
         base = {
             "task_id": "P14.6", "summary": "bounded",
@@ -278,6 +292,35 @@ class LateQuotaPlannerFailoverPort(FakePort):
             request_id=request.request_id, role_run_id=request.role_run_id,
             status="succeeded", output=json.dumps(payload),
             resource_context=ResourceContext("planner-codex", "codex", "default", "sol"),
+        )
+
+
+class RepeatedSchemaPlannerFailoverPort(FakePort):
+    """One resource repeats invalid schema; the excluded fallback succeeds."""
+
+    def execute(self, request):
+        if request.role != "planner":
+            return super().execute(request)
+        self.requests.append(request)
+        if "planner-opus" not in request.excluded_resource_ids:
+            payload = {
+                "task_id": request.task_run_id, "summary": "Too verbose",
+                "implementation_steps": ["x" * 1001], "interfaces": ["i"],
+                "validation": ["v"], "risks": ["r"], "out_of_scope": ["o"],
+            }
+            resource = ResourceContext("planner-opus", "anthropic", "default", "opus")
+        else:
+            payload = {
+                "task_id": request.task_run_id, "summary": "Recovered",
+                "implementation_steps": ["Step 1"], "interfaces": ["Interface 1"],
+                "validation": ["Validation 1"], "risks": ["Risk 1"],
+                "out_of_scope": ["Scope 1"],
+            }
+            resource = ResourceContext("planner-codex", "codex", "default", "sol")
+        return AIRoleResult(
+            request_id=request.request_id, role_run_id=request.role_run_id,
+            status="succeeded", output=json.dumps(payload),
+            resource_context=resource,
         )
 
 
@@ -987,6 +1030,36 @@ class AIPlannerTests(unittest.TestCase):
             self.assertEqual(planners[3].excluded_resource_ids, ("planner-opus",))
             self.assertEqual(row["planner_resource"]["resource_id"], "planner-codex")
             self.assertEqual(row["planner_attempts"][2]["failure_classification"], "quota_exhausted")
+
+    def test_repeated_schema_failure_excludes_resource_and_fails_over(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo)
+            port = RepeatedSchemaPlannerFailoverPort()
+            coordinator = AIPlannerCoordinator(runtime, port)
+            project = {
+                "project_id": "p1", "repo_path": str(repo),
+                "execution": {"engine": "aibroker"},
+                "ai_roles": {"planner": {
+                    "enabled": True, "review_independence": "provider", "max_attempts": 3,
+                }},
+            }
+            snapshot = {
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**PENDING DESIGN**", "telemetry": {"task_id": "P14"},
+            }
+            plan_id, _ = coordinator.start(project, snapshot, "command-schema-failover")
+            row = wait_terminal(coordinator, plan_id)
+
+            self.assertEqual(row["state"], "ready", row)
+            planners = [request for request in port.requests if request.role == "planner"]
+            self.assertEqual(len(planners), 4)
+            self.assertEqual(planners[3].excluded_resource_ids, ("planner-opus",))
+            self.assertEqual(
+                row["planner_attempts"][2]["failure_classification"],
+                "planner_schema_resource_failover",
+            )
+            self.assertEqual(row["planner_resource"]["resource_id"], "planner-codex")
 
     def test_planner_failure_retries_and_recovers_without_new_control(self):
         with tempfile.TemporaryDirectory() as td:
