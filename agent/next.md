@@ -1,180 +1,118 @@
-# P18 — Native Execution Transport & RDC Dependency Reduction
+# P19 — Web Native Operations Console
 
-Status: **COMPLETE**
-Predecessor: P17
+Status: **PENDING DESIGN**
+
+Predecessor: P18
 Successor: TBD
 
 ## Objective
 
-Build a first-class DevOrchestrator execution transport layer so routine machine operations no longer depend on Remote Desktop Commander (RDC). RDC becomes an optional bootstrap / GUI / emergency fallback rather than the normal control path.
+Add a production-quality, loopback web console for the bounded native machine
+operations delivered by P18. The browser UI must reuse the existing Control API,
+transport selector, durable job service, staged-write/CAS path, audit trail, and
+lifecycle authority. It must not create a second controller or expose an
+unrestricted shell or filesystem.
 
-## Target abstraction
+## Architecture boundary
 
-Define an ExecutionTransport-style contract for at least:
-- exec
-- spawn
-- poll/status
-- cancel
-- read_file
-- write_file
-- stat / capability discovery
+```text
+same-origin browser UI
+  -> existing short-lived browser session + CSRF authorization
+  -> existing /api/v1/control/transport/* routes
+  -> existing transport selector
+  -> LocalTransport or SSHTransport
+```
 
-Provide implementations or adapters for:
-- LocalTransport
-- SSHTransport
-- RDCTransport (fallback only)
-
-Prefer DevO MCP / Control API -> ExecutionTransport -> Local/SSH for routine automation.
+- Never disclose or send `runtime/control/api-token` to browser JavaScript.
+- Reuse the P18 route implementations; do not duplicate execution, job, file,
+  CAS, policy, capability, lifecycle, or audit logic in the UI.
+- This task does not change lifecycle authority, transition execution, successor
+  rules, owner gates, invariant evaluation, or watchdog recovery.
+- RDC remains outside the normal request path and must never be selected
+  implicitly.
+- Real X-ray, conveyor, detector-board, serial-device, or other hardware actions
+  remain unavailable without the existing explicit human safety authorization.
 
 ## Scope
 
-1. Inventory current RDC-dependent operations and classify which genuinely require GUI/desktop interaction.
-2. Recover and reconcile prior ExecutionTransport/SSH design work rather than re-inventing it.
-3. Implement capability discovery and host profiles so transport selection is evidence-based.
-4. Route routine git, process, log, file, test, build, Codex/Claude invocation, and DevO status operations through Local/SSH transports where possible.
-5. Preserve RDC for bootstrap, GUI-only workflows, emergency recovery, and unsupported hosts.
-6. Add transport failover with explicit safety and identity fences; do not silently move unsafe hardware actions between transports.
-7. Add observability: selected transport, fallback reason, command identity, host, duration, exit status, and failure fingerprint.
-8. Add regression tests for transport selection, SSH loss/recovery, duplicate/replay behavior, timeout/cancel, and fallback.
-9. Validate Windows and Linux paths relevant to the current DevO environment.
-10. Document deployment and credentials/host-key handling without embedding secrets.
+1. Add an Operations destination to the existing dashboard navigation and an
+   accessible, responsive native-operations workspace.
+2. Establish/reuse the existing same-origin browser session and attach its CSRF
+   token to every privileged transport request. Fail closed on expired or
+   missing sessions and allow the operator to reconnect without reloading.
+3. Provide bounded forms for:
+   - `exec` with project, host, allowlisted command reference, JSON parameters,
+     working directory, timeout, and idempotency key;
+   - `spawn`, returning a stable durable job ID;
+   - `poll` and `cancel`, scoped to the selected project and exact job ID;
+   - `read_file` with allowed-root path, offset, and byte limit;
+   - `stat`;
+   - staged binary upload followed by create-only or expected-digest CAS write.
+4. Present request ID, selected transport, status, exit code, job ID, hashes,
+   bounded stdout/stderr/output, timestamps, and actionable errors without
+   rendering untrusted output as HTML.
+5. Require explicit confirmation for effectful spawn, cancel, and write commit.
+   Do not store operation history, file contents, secrets, or tokens in browser
+   persistent storage.
+6. Show recent sanitized transport-operation evidence from the existing P18
+   observability endpoint and provide an explicit refresh control.
+7. Keep command entry at the `command_ref` level. Do not add arbitrary argv,
+   shell, environment-variable, executable-path, or raw filesystem authority.
+8. Keep all existing dashboard observation and guarded lifecycle controls
+   functional and visually consistent.
+9. Document browser usage, security boundaries, session recovery, supported
+   operations, RDC verification, and rollback.
+
+## Security and failure behavior
+
+- The console is available only from the loopback-bound unified daemon.
+- Same-origin, fetch-metadata, HttpOnly cookie, SameSite=Strict, and CSRF checks
+  remain mandatory for browser authority.
+- All request bodies, timeouts, output, reads, writes, paths, concurrency, and
+  job identity remain bounded by the existing P18 server and transport policy.
+- Mutating requests use caller-visible idempotency keys. Writes require staged
+  content plus exactly one precondition: `if_absent=true` or
+  `expected_sha256`.
+- A browser refresh must not replay a mutation. The UI may retain only
+  in-memory form/result state for the active page.
+- Authentication, policy, stale capability, path, CAS, job ownership, timeout,
+  and transport failures must be shown as failures; never fall back to RDC.
+- Output and file previews use text nodes/textContent only. Binary readback must
+  be represented safely and remain bounded.
+
+## Verification
+
+- Focused server tests prove browser-session/CSRF acceptance and rejection for
+  every operation family while bearer and scoped-capability behavior remains
+  unchanged.
+- UI contract tests cover required controls, no inline script/style regression,
+  no master-token exposure, safe text rendering, confirmation gates, request ID
+  display, and staged/CAS write sequencing.
+- Browser-level acceptance exercises status/exec/spawn/poll/cancel/read/stat and
+  staged/CAS write against the live loopback daemon from the rendered page.
+- Acceptance evidence records request IDs, selected transports, job IDs, exit
+  codes, hashes, and RDC call count. All machine operations must select Local or
+  SSH; RDC call count must be zero.
+- Run P19 focused tests plus P18 external-control/transport, P13/P14 job,
+  dashboard, successor/lifecycle, transition-executor, watchdog, project-status,
+  and control-plane invariant regressions; run `python -m compileall -q src
+  tests_py ops`, JavaScript syntax checking, `git diff --check`, and
+  `graphify update .`.
 
 ## Acceptance
 
-- Routine DevO self-development/status/log/test/git operations on ZXZ-PC can execute without RDC.
-- Supported remote hosts can use SSHTransport for non-GUI operations.
-- RDC usage is measurably reduced and is not the default for routine command/file operations.
-- Transport failures do not corrupt lifecycle ownership or cause duplicate execution.
-- Existing safety policy remains intact, including explicit human authorization for real X-ray source/conveyor actions.
-- Stable/runtime and development-workspace separation established in P17 is preserved.
-- P18 starts only through the normal P17 successor handoff; do not manually launch it.
-
-## Approved executable design
-
-Add a first-class Local/SSH machine-operation transport so routine DevOrchestrator command, process, log, and file work no longer defaults to RDC. Preserve the existing AI and durable-job transports, use host-local execution-jobs.json as executable authority, exchange the complete canonical controller JobSpec plus pinned policy/resolution digests for remote durable identity, and implement arbitrary-binary file writes through a bounded content-staging API followed by a durable compare-and-swap write intent. Effectful work remains durable and non-replayable after ambiguity; hardware operations remain rejected; RDC remains a non-executing escalation fallback.
-
-### Implementation steps
-- Inventory current RDC-dependent operations in docs/P18_RDC_DEPENDENCY_INVENTORY.md, classifying routine Local/SSH candidates, GUI-only work, and bootstrap/emergency work. Record target transport, effect class, durable-path requirement, and measurable before/after RDC usage.
-- Preserve ai/execution_transport.py and jobs/transport.py public interfaces. Add the machine-operation layer under src/dev_orchestrator/transport/ above the existing SSH channel and P14 durable job store; do not rename existing P13/P14 symbols or alter their established behavior.
-- Extend authoritative host-local execution-jobs.json with effect_class, closed parameter declarations, file_roots, max_file_write_bytes, and command policy metadata. Local and remote execution must resolve argv, cwd, parameter substitution, effect class, and path roots only through jobs/config.py; missing authority fails closed.
-- Implement named parameters as whole-argv-element substitutions with types enum, integer, or path_within_repo. Reject unknown/missing/invalid parameters, shell-like fields, splitting or concatenation, and path traversal. Compute parameters_digest from canonical validated values; command refs declaring no parameters accept none.
-- Define identity ownership explicitly: the controller-created JobSpec.to_canonical_dict() is the authoritative submission and idempotency identity, while the executing host's execution-jobs.json is the authoritative execution policy. JobRecord gains an optional immutable submission_spec containing that exact canonical dictionary so controller and remote records can verify the same spec_hash even though their operational transport fields differ.
-- Add optional parameters_digest, execution_policy_digest, and resolution_digest to JobSpec canonical identity, emitted only when present so legacy hashes remain unchanged. execution_policy_digest is SHA-256 of canonical JSON containing the host-local project/command policy: canonical repo/cwd, argv template, effect class, parameter schema, runtime limits, and applicable file roots. resolution_digest is SHA-256 of canonical JSON containing command_ref, validated parameters_digest, final resolved argv, final cwd, effect class, and target job_id.
-- Add a read-only remote resolve operation that returns only execution_policy_digest and resolution_digest plus host identity, never argv or cwd. The controller compares execution_policy_digest with the host profile's approved pin, then places both digests in JobSpec. At job_start the remote re-resolves from current host-local config and rejects any digest mismatch, detecting policy or resolved-argv drift without accepting executable wire data.
-- Replace the partial job_start fields with job_spec equal to the complete JobSpec.to_canonical_dict(), controller_spec_hash, validated parameters, target job_id, and no argv/cwd/env/shell fields. The remote reconstructs JobSpec, requires its canonical dictionary and hash to match byte-for-byte, recomputes parameters/policy/resolution digests, verifies job_id_for unless an authorized retry target is supplied, then calls claim_or_get using that exact spec. Canonical transport='ssh' remains unchanged in submission_spec; the helper's local supervisor dispatch is operational metadata, not a rewritten identity.
-- Persist submission_spec, parameters, all three digests, and resolved_argv in new records. Recovery recomputes spec_hash from submission_spec and re-resolves policy/argv; disagreement fails closed. Records and envelopes lacking all new optional fields retain legacy behavior, but P18 parameterized machine operations require the new identity fields.
-- Allow direct exec only for read_only command refs. Route idempotent and effectful commands through JobService with an idempotency key. A post-dispatch disconnect returns ambiguous and permits only poll/reconcile, never replay or transport failover; conflicting identity under one key remains JobConflictError.
-- Add an explicit binary content-staging interface before write_file. WriteContentUpload carries project_id, host_id, content_base64 using strict RFC 4648 standard Base64, decoded_size_bytes, and content_sha256. Reject malformed encoding, size disagreement, digest disagreement, encoded input exceeding the derived Base64 ceiling, or decoded data above MAX_FILE_WRITE_BYTES=8 MiB; host configuration may only lower that limit.
-- Persist verified decoded bytes atomically under the resolved runtime root in a project/host-scoped, digest-addressed write-staging namespace and return an opaque content_ref. Re-upload of identical bytes is idempotent. Never route write bytes through input.json, get_input_artifact, UTF-8 decoding, JSON normalization, logs, argv, or command parameters. Retain blobs referenced by nonterminal intents; garbage-collect only unreferenced expired blobs.
-- Define FileWriteRequest with project_id, host_id, target path, idempotency_key, content_ref, content_sha256, decoded_size_bytes, exactly one precondition (if_absent or expected_sha256), and the approved file-policy digest. Before claiming an intent, re-read and hash the staged bytes. The durable intent stores this complete canonical identity and content_ref atomically, making the intent the authoritative handoff from staging to mutation.
-- Apply writes on the owning host under a canonical-path InterProcessFileLock: verify file-root authority and staged bytes, evaluate the precondition, write and fsync a same-directory temporary file, atomically replace, fsync the directory where supported, verify the target digest, and durably record pre_digest, post_digest, applied_at, and terminal result before releasing the lock. Replays return the recorded result; conflicting intent identities reject.
-- Reconcile ambiguous writes from the owning host's durable intent and current target digest. Recorded applied means applied; an unclaimed/absent intent means not applied; pending with the pre-digest means safe only for an explicit re-request using the same identity; a target matching neither pre nor post becomes ambiguous_requires_human. Automatic resend or cross-host write failover is forbidden.
-- Add transport/contracts.py with MachineTransport operations exec, spawn, poll, cancel, read_file, stage_write_content, write_file, stat, and capabilities; frozen request/result models; statuses ok, failed, timeout, cancelled, ambiguous, unavailable, and rejected; and typed unavailable, rejected, and ambiguous errors.
-- Extract the SSH argv builder, stdin JSON envelope round-trip, request correlation, host-identity check, and response caps into transport/ssh_channel.py. Reuse it from existing AI/Job transports and the new SSHMachineTransport without changing BatchMode, host-key verification, fixed remote-helper invocation, or current imports.
-- Implement LocalMachineTransport and SSHMachineTransport using the shared resolver and durable services. Extend remote_helper with a closed operation set for resolve, exec, spawn, poll, cancel, read, stage-write, write, stat, and capabilities. Reject unknown fields and wire-supplied execution authority; verify request ID, expected host identity, payload digests, and response caps on every SSH call.
-- Add host profiles and TTL-bounded capability discovery containing connectivity, OS/path style, helper version, jobs-config validity, approved policy-digest pins, response limits, and supported operations. Selection is deterministic; only read-only operations may fail over after an unambiguous pre-dispatch failure. RDC is never automatically selected and returns rdc_fallback_required.
-- Classify real X-ray source, conveyor/VFD, detector-board, and serial-device actions as hardware and reject them unconditionally in Local, SSH, and remote-helper paths with hardware_execution_not_supported_in_p18 plus escalation evidence. P18 adds no programmatic record capable of authorizing hardware execution.
-- Add owner-minted transport capabilities scoped by project, host, operation, command refs, and file roots. Keep request nonce and operation idempotency key separate: a nonce is single-use, while an idempotency key is deliberately reusable for reconciliation. Validate capability and scope before consuming the nonce, then validate request identity and durable claim.
-- Expose owner-only capability create/list/revoke routes and scoped transport routes for hosts, capabilities, operations, exec/spawn/poll/cancel, read, stage-write, write, and stat, with matching JSON CLI verbs. MCP receives read-only host/capability/operation observability only; it gains no exec, cancel, staging, write, or filesystem tool.
-- Record one bounded transport-operations.ndjson row per operation with command_ref, parameter names and digest, policy/resolution digests, host, selected transport, candidate reasons, capability ID/scope, duration, exit status, status, and normalized failure fingerprint. Exclude content bytes, parameter values, paths outside required identity, credentials, tokens, and capability secrets; leave accounting/events.EVENT_TYPES unchanged.
-- Route routine DevO status/log/git reads through read-only Local/SSH exec and tests/builds/CLI invocations with possible effects through durable spawn. Document host configuration, policy-pin rotation, SSH credential handling, staging retention, ambiguity recovery, RDC escalation, and the MCP boundary. Add P18 tests, run focused, regression, and full suites plus the ZXZ-PC no-RDC acceptance exercise using PowerShell 5.1-safe sequencing per seed:p11b:rdc-powershell-5.1, then run graphify update .
-
-### Interfaces / contracts
-- jobs/models.py: JobSpec gains optional parameters_digest, execution_policy_digest, and resolution_digest. to_canonical_dict emits each only when non-None; metadata remains non-authoritative. JobRecord gains optional submission_spec, parameters, the three digests, and write-related records without invalidating legacy records.
-- Remote job_start envelope: {operation, request_id, job_id, job_spec, controller_spec_hash, parameters}. job_spec must exactly equal the controller's complete canonical JobSpec dictionary, including kind, correlation IDs, transport, expected cwd, input digest, and new optional digests. argv, cwd, env, shell, effect_class, and file roots are prohibited.
-- jobs/config.py: canonicalize_parameters(...), resolve_execution_policy(...), execution_policy_digest(...), and resolution_digest(...) share one local/remote implementation. The policy digest covers canonical repo/cwd, argv template, effect class, parameter schema, runtime limits, and applicable roots; the resolution digest covers final argv/cwd, parameters digest, effect class, command_ref, and job_id.
-- transport/contracts.py: MachineTransport Protocol with exec, spawn, poll, cancel, read_file, stage_write_content, write_file, stat, and capabilities; MachineOperation, MachineOperationResult, FileReadRequest, WriteContentUpload, StagedWriteContent, FileWriteRequest, FileResult, StatResult, HostCapabilities, and TransportSelection.
-- WriteContentUpload: project_id, host_id, content_base64, decoded_size_bytes, and content_sha256. Encoding is strict standard Base64; decoded content is arbitrary bytes; maximum decoded size is 8 MiB and may only be lowered by host policy.
-- StagedWriteContent: opaque content_ref, content_sha256, decoded_size_bytes, project_id, host_id, staged_at, and expires_at. The opaque reference grants no path authority and is usable only with a matching scoped capability and write intent.
-- FileWriteRequest: project_id, host_id, target path, idempotency_key, content_ref, content_sha256, decoded_size_bytes, exactly one of if_absent or expected_sha256, and expected_file_policy_digest. It contains no decoded text, implicit encoding, input-artifact reference, or caller-supplied filesystem root.
-- Durable write-intent record: write_id=sha256(project_id:idempotency_key), canonical intent digest, owner host, canonical target, content_ref/digest/size, precondition, policy digest, state, pre_digest, post_digest, applied_at, terminal result, and reconciliation evidence. Identical claims return the record; conflicting claims reject.
-- jobs/store.py: retain existing input.json behavior for legacy structured job inputs, but add binary-safe staging methods that return bytes or descriptors without decoding. Staging uses atomic write/fsync/replace, digest re-verification, bounded retention, and protection for blobs referenced by active intents.
-- transport/hosts.py: TransportHostProfile and TransportHostsConfig load transport-hosts.json containing candidate order, SSH path settings, expected host identity, response limits, and approved policy-digest pins. It contains no executable argv, cwd, effect class, parameter schema, or file-root authority.
-- transport/ssh_channel.py: shared fixed-command SSH channel with stdin JSON, timeout and output caps, request-ID correlation, expected host-identity verification, strict host-key defaults, and typed pre-dispatch versus ambiguous post-dispatch failures.
-- transport/local.py and transport/ssh.py: LocalMachineTransport and SSHMachineTransport implement the contract, enforce effect/durability fences, and use binary staging plus durable write intents. SSH envelopes never contain executable argv or raw filesystem authority.
-- ai/remote_helper.py: closed operations op_resolve, op_exec, op_spawn, op_poll, op_cancel, op_read_file, op_stage_write, op_write_file, op_stat, and op_capabilities, plus compatible existing job operations. Every operation reloads or validates host-local policy and rejects unknown fields.
-- transport/selector.py: select_transport returns selected transport, candidate order, evidence source, reason code, and per-candidate rejection reasons. It enforces identity, capability freshness, policy pins, effect class, write owner, ambiguity, and no-automatic-RDC fences.
-- control/security.py: create/list/validate/revoke transport capabilities and consume_request_nonce. Creation returns the secret once and stores only a salted digest; only master bearer over loopback or an authenticated browser session with CSRF may mint.
-- HTTP and CLI: separate stage-write and write-commit operations; the HTTP staging body carries Base64 plus declared decoded size/digest, while CLI transport-write reads a local file as bytes, stages it, then commits the returned content_ref. Secrets and content are never logged.
-- MCP: read-only transport host, capability-status, and recent-operation tools only. No exec, spawn, cancel, read-file, stage-write, or write-file tool is exposed.
-- Preserved interfaces: ai.execution_transport.ExecutionTransport, LocalTransport, SSHTransport, SSHTransportConfig, ExecutionTransportResult, and ExecutionTransportError; jobs.transport.JobTransport, LocalJobTransport, and SSHJobTransport; existing JobService call signatures; accounting.events.EVENT_TYPES.
-
-### Validation plan
-- Canonical identity tests use hard-coded legacy hashes to prove JobSpec without new fields hashes byte-identically. New digests alter spec_hash but not job_id_for; identical replay returns the existing record and any changed canonical field conflicts.
-- Full-envelope tests assert job_start carries the exact complete canonical JobSpec and controller_spec_hash. Tampering with kind, correlation IDs, transport, expected cwd, input digest, parameters digest, policy digest, or resolution digest is rejected before claim.
-- Remote transport tests assert canonical transport='ssh' is retained in submission_spec and spec_hash while the remote helper dispatches the supervisor locally through separate operational metadata; the remote never constructs a reduced replacement JobSpec.
-- Policy tests change argv template, cwd, repo path, effect class, parameter schema, runtime limit, or file roots and prove execution_policy_digest changes. Parameter or final argv/cwd changes alter resolution_digest. A stale approved pin or a resolve/start race fails remote_policy_mismatch before claim.
-- Wire-authority tests prove argv, cwd, env, shell, effect_class, parameter schema, and file roots are rejected if supplied. Remote execution always uses current host-local config, and differing resolved argv is detected through resolution_digest without transmitting argv.
-- Parameter tests cover canonical ordering, enum/integer/path validation, missing and unknown values, injection characters, traversal and symlink escape, whole-element substitution, stable digesting, and idempotency conflict for different parameter sets.
-- Binary staging round-trips fixtures containing NUL bytes, every byte value, invalid UTF-8, and CRLF without alteration. The retrieved staged bytes and committed file must exactly match the original SHA-256 and size; get_input_artifact is never called.
-- Staging rejects malformed/non-canonical Base64, declared-size mismatch, digest mismatch, encoded payload above its ceiling, and decoded payload above 8 MiB before durable intent creation. Host configuration can lower but not raise the bound.
-- Staging durability tests inject failure before temp write, before fsync, and before replace; no partial blob becomes addressable. Identical upload is idempotent, mismatched metadata conflicts, active-intent blobs survive retention, and expired unreferenced blobs are collectible.
-- Write handoff tests prove write_file accepts only a verified content_ref; missing, expired, wrong-project, wrong-host, wrong-size, or corrupted staged content is rejected before intent claim. The durable intent stores the exact staged descriptor before target mutation.
-- Concurrent write tests show two writers serialize on the canonical path lock, exactly one qualifying CAS applies, and the other receives precondition_failed. if_absent, expected_sha256, Windows case aliases, traversal, symlink escape, and wrong-owner-host cases are covered.
-- Write crash-injection tests cover after intent claim, after temp fsync, after replace, and before terminal-record persistence. Reconcile reports applied, not-applied, or ambiguous_requires_human from durable evidence and current digest, never by blindly resending bytes.
-- Replay tests show identical write identity returns the recorded result without changing content or mtime; the same idempotency key with a different target, content digest/size, precondition, owner, or policy digest is rejected as a conflict.
-- Durability tests reject direct exec for idempotent/effectful refs, permit retry only for read-only pre-dispatch failure, return ambiguous for durable post-dispatch loss, prohibit cross-transport failover, and reconcile through durable remote evidence.
-- SSH fault tests inject connection refusal, timeout, mid-request loss, malformed/oversized JSON, request-ID mismatch, host-identity mismatch, digest mismatch, and helper failure. No case causes duplicate effectful execution or write application.
-- Capability and nonce tests prove authorization/scope checks occur before nonce consumption, nonce replay is rejected, a fresh nonce with the same idempotency key returns existing durable evidence, secrets are returned once, and non-owner principals cannot mint.
-- Hardware tests prove Local, SSH, selection, and remote helper reject hardware refs regardless of authorization-looking fields and emit escalation evidence without dispatch.
-- Selector tests cover deterministic ordering, missing/stale capabilities as unknown, approved policy-pin mismatch, response limits, OS/path requirements, read-only failover, no effectful/write failover, and RDC exclusion from automatic selection.
-- Observability tests assert exactly one bounded record per operation with required identity and failure fields while excluding content bytes/Base64, parameter values, private keys, tokens, and capability secrets.
-- Regression runs keep P13/P14/P14.5, control, mobile, and web-bridge suites unchanged and green; accounting EVENT_TYPES remains unchanged; legacy configs, envelopes, and records without optional P18 fields retain established behavior.
-- Windows/Linux path tests cover drive-letter mapping, POSIX mapping, case normalization, containment, file-root digesting, and lock-key equivalence. PowerShell commands use semicolons and explicit $LASTEXITCODE checks, never direct && or ||, per provenance seed:p11b:rdc-powershell-5.1.
-- ZXZ-PC acceptance proves status/log/git reads use Local/SSH read-only execution, tests/builds use durable jobs, arbitrary binary write staging works, routine operations use zero RDC calls, and operation logs quantify RDC reduction against the inventory.
-- Run python -m pytest tests_py -q -k p18, the named P13/P14/P14.5 regression suites, and python -m pytest tests_py -q; then run graphify update . and confirm no transport state or staged bytes were written into the repository tree or stable runtime from a development run.
-
-### Risks / failure modes
-- Remote identity previously reconstructed a smaller local spec, allowing controller and remote spec_hash disagreement. Mitigation: transmit and persist the exact canonical submission_spec, verify controller_spec_hash before claim, and separate immutable submission identity from operational supervisor transport.
-- A host-policy change under an existing idempotency key could silently reuse or execute different argv. Mitigation: policy and final resolution digests are canonical JobSpec fields; approved pins and start-time recomputation detect drift and force a conflict or rejection.
-- A policy digest originating only from the executing host would not express controller expectation. Mitigation: transport-hosts.json carries owner-approved pins; remote discovery reports current digests, selection compares them, and execution requires the pinned value in canonical identity.
-- Policy resolution and job start have a time-of-check/time-of-use gap. Mitigation: job_start reloads host-local policy and recomputes both digests immediately before claim; mismatch fails closed without dispatch.
-- Arbitrary file bytes would be corrupted by the existing input-artifact text fallback. Mitigation: a separate strict-Base64 staging channel writes and reads raw bytes only, with size and SHA-256 checks at upload, durable handoff, and application.
-- Large Base64 payloads can exhaust memory or SSH limits. Mitigation: reject from encoded length before decoding, cap decoded writes at 8 MiB, enforce response/request caps, and leave larger artifact transfer outside P18.
-- A staged blob could be deleted before an ambiguous write is reconciled. Mitigation: durable intents reference immutable blobs, active references prevent garbage collection, and retention deletes only expired unreferenced content.
-- File writes carry data-loss risk if precondition checking and replacement are not one serialized operation. Mitigation: canonical-path locking encloses staging verification, precondition evaluation, atomic replacement, post-digest verification, and durable result recording.
-- A crash after atomic replace but before recording completion may remain genuinely ambiguous. Mitigation: preserve pre/post digests and intent evidence, reconcile against target content, and escalate mismatches rather than guessing or replaying.
-- Confusing request nonce with idempotency identity could either reject valid reconciliation or enable duplicate effects. Mitigation: nonce is single-use authorization evidence; idempotency key is stable operation identity; validation order and replay behavior are tested.
-- Extraction of the existing private SSH channel could change P13/P14 behavior. Mitigation: keep the extraction mechanical, preserve imports/config defaults, and treat any required change to existing tests as evidence of unintended drift.
-- Host capability caches and policy pins may become stale. Mitigation: TTL-bound capabilities, unknown-not-capable defaults, explicit pin mismatch reasons, and an owner-controlled documented pin-rotation procedure.
-- Allowing effectful direct exec or post-dispatch failover would duplicate work. Mitigation: hard durable-path checks, a distinct ambiguous status, and no automatic replay/failover for idempotent, effectful, write, or hardware operations.
-- Transport capabilities introduce new secrets and privilege paths. Mitigation: owner-only minting, one-time secret disclosure, salted digest storage, scoped validation, nonce replay protection, revocation, and secret-free logs.
-- Hardware safety could regress if generic authorization were treated as sufficient. Mitigation: hardware refs are unconditionally rejected by this layer; P18 defines no satisfiable hardware authorization record.
-- Windows and Linux path semantics may diverge, especially case normalization and symlink containment. Mitigation: reuse canonical_path/map_path, key locks by canonical case-normalized paths, and test both path families.
-- RDC has no programmatic execution channel in the repository. Mitigation: implement RDCTransport only as an explicit non-executing escalation descriptor; any request for real GUI/RDC automation requires a separate owner-approved task.
-- Transport files written under the wrong root would violate P17 stable/development separation. Mitigation: all config, cache, staging, intent, and logs resolve through the fail-closed runtime-root contract, with workspace-separation tests.
-- Lifecycle activation is outside implementation authority. Mitigation: P18 starts only through the normal P17 successor handoff; no manual launch or lifecycle-state edit is part of this task.
-
-### Out of scope
-- Caller-supplied argv, cwd, environment, shell fragments, effect classifications, parameter schemas, or filesystem roots.
-- Using input.json, output-artifact text decoding, command parameters, argv, logs, or environment variables to transfer file-write bytes.
-- Writes larger than 8 MiB, streaming/chunked uploads, resumable transfer, delta transfer, compression, or external object-store integration.
-- Executing a file write without a verified staged content_ref and durable write intent.
-- Blindly resending or automatically failing over an ambiguous effectful operation or file write.
-- Distributed or cross-host locking; every target has one configured owning host, and owner mismatch is rejected.
-- Changing job_id_for, retry_successor_id, or claim_or_get conflict semantics, or rehashing legacy records.
-- Removing legacy input-artifact behavior for existing structured job workflows; P18 adds a separate binary-safe path.
-- Defining or honoring any programmatic authorization for real X-ray source, conveyor/VFD, detector, or serial hardware actions.
-- Exposing exec, spawn, cancel, read-file, content-staging, or write-file operations through MCP.
-- Allowing adapter pairings, mobile clients, web-bridge capabilities, or transport capabilities to mint or widen transport capabilities.
-- Removing RDC, RDC evidence import/classification, or documented GUI/bootstrap/emergency procedures.
-- Implementing programmatic RDC, GUI, desktop, window, or visual automation.
-- Changing lifecycle authority, invariant ownership, successor fencing, or adding a production lifecycle-state writer.
-- Changing AIBroker provider routing, model selection, independence policy, or aibroker-execution.json semantics beyond behavior-preserving SSH-channel reuse.
-- Renaming or relocating existing AI ExecutionTransport and JobTransport public symbols.
-- Changing accounting/events.EVENT_TYPES or the P11 accounting contract.
-- Provisioning real SSH credentials, private keys, secrets, host keys, or production host configuration in committed files.
-- Persistent SSH multiplexing, performance tuning, or connection pooling.
-- Refactoring P14 supervisor, retention, recovery, and retry architecture beyond additive identity fields and the bounded write-intent/staging namespaces.
-- Live validation against an unprovided second physical host; remote behavior may use injected SSH/helper tests plus a documented operator procedure.
-- Manually launching P18; activation remains the responsibility of the normal P17 successor handoff.
-
-### Independent plan review
-- Approved: Verified against the repository (src/dev_orchestrator/ai/execution_transport.py, jobs/{models,config,transport,store,service}.py, ai/remote_helper.py, control/security.py, accounting/events.py EVENT_TYPES, docs/P17_RUNTIME_ROOT_INVENTORY.md) and against agent/staged/P18.md; the plan's factual premises hold (LocalTransport/SSHTransport/JobTransport symbols exist as claimed, remote_helper.job_start today rebuilds a reduced JobSpec with transport='local', JobSpec.to_canonical_dict omits None-valued optional fields so additive digests preserve legacy hashes, InterProcessFileLock and canonical_path/is_path_contained already exist, no programmatic RDC or hardware-actuation code exists in src/ so RDC-as-escalation and unconditional hardware rejection remove nothing). Execution readiness is met: the core contract a Worker could otherwise guess wrong is settled explicitly - submission identity is the controller's complete canonical JobSpec while execution authority is host-local execution-jobs.json, wire-supplied argv/cwd/env/shell/effect_class/file_roots are rejected, drift is caught by execution_policy_digest/resolution_digest with re-resolution immediately before claim_or_get, and data-loss surfaces are serialized (staged digest-verified bytes -> durable CAS write intent -> canonical-path lock -> atomic replace -> post-digest -> terminal record -> reconcile-or-escalate, never blind resend or cross-host/cross-transport failover). Interfaces are named concretely (transport/{contracts,ssh_channel,local,ssh,hosts,selector}.py, WriteContentUpload/StagedWriteContent/FileWriteRequest fields, envelope shape, statuses and typed errors, owner-only capability routes, read-only MCP surface), preserved public symbols are enumerated, and the verification path is runnable (focused p18 suite, named P13/P14/P14.5 regressions, full tests_py, ZXZ-PC zero-RDC acceptance, graphify update .) with the PowerShell 5.1 lesson correctly applied via semicolons plus $LASTEXITCODE checks, preserving provenance seed:p11b:rdc-powershell-5.1. Scope stays inside the staged task: additions (closed parameter schema, binary staging channel, owner-minted capabilities/nonces) each serve a task scope item - write_file over an existing text/JSON-only input-artifact path, evidence-based transport selection, and a new privileged execution surface - and out_of_scope explicitly protects lifecycle authority, successor fencing, job_id_for/claim_or_get semantics, accounting EVENT_TYPES, AIBroker routing, and legacy input-artifact behavior, so no control-plane declaration gate is triggered. NON_BLOCKING findings to carry into acceptance notes and Technical Review, none of which justify delay: (1) MCP is limited to read-only observability although the task names 'DevO MCP / Control API' as the preferred path - acceptance is still reachable through the Control API and CLI, and read-only is the conservative security direction, so confirm the no-RDC acceptance exercise is demonstrated over those surfaces; (2) replacing the partial job_start envelope with a full job_spec is a controller/remote-helper wire change, so verify version skew fails closed pre-claim and that host-profile helper_version makes skew diagnosable; (3) live SSH validation is deferred to injected subprocess/helper tests plus a documented operator procedure because no second physical host is provided - consistent with existing P13/P14 practice but should be stated in acceptance evidence; (4) resolve_runtime_root in config.py still has a default fallback rather than the strictly fail-closed P17 target, so the new staging/intent/log/cache namespaces must be anchored to the host-local JobsConfig.runtime_root and covered by the workspace-separation test; (5) MAX_FILE_WRITE_BYTES=8 MiB, staging retention/GC timing, and parameter type set are local policy details the Worker may tune with tests.
-
-
-## Control-Plane Impact
-- Invariants: NEXT_TASK_WITHOUT_HANDOFF, SUCCESSOR_HANDOFF_LINEAGE_VALID
-- Transition boundaries: authority_reconciliation, successor_handoff, handoff_publication
-- Fault scenarios: CPF-02, CPF-03, CPF-04, CPF-05, CPF-07
-- Convergence evidence: P18 terminal acceptance with no executable successor settles task_complete and retires historical NEXT_TASK handoff debt; an exactly-one real successor still requires one durable handoff, ambiguous or invalid successor evidence remains fail-closed, and restart/replay remains idempotent.
+- An authorized local operator can perform every requested native operation
+  from the web page without learning the master bearer token.
+- An unauthenticated, cross-origin, missing-CSRF, expired-session, out-of-scope,
+  or replayed request fails closed.
+- Exec/spawn accept only configured command references; read/stat/write remain
+  inside configured roots; existing output/read/write/concurrency limits hold.
+- Poll/cancel cannot cross project or job identity boundaries.
+- Existing staged-write and CAS conflict semantics are preserved, including an
+  arbitrary-binary round trip.
+- Every operation exposes a request ID and durable sanitized audit evidence.
+- No normal browser operation selects RDC, mutates a lifecycle ledger, bypasses
+  an owner gate, fabricates a successor, or authorizes real hardware.
+- The existing dashboard and P18 MCP/API clients remain compatible.
+- P19 begins only through the normal P18 successor handoff and completes with a
+  clean, committed, unpushed worktree.
