@@ -1,7 +1,20 @@
 # DevOrchestrator Self-Hosted Development State
 
+P19.2 Remote MCP Interface implementation & acceptance (2026-09-30):
+- Status: **IMPLEMENTATION_COMPLETE** (Ready for Technical Review). Executed bounded task P19.2 from `agent/next.md` without modifying lifecycle authority or fabricating successors.
+- Implementation commit: `0d0b688` (`feat(P19.2): implement remote MCP interface over streamable HTTP and record zero-RDC evidence`).
+- Added authenticated remote Model Context Protocol endpoint at `POST /mcp` (and `DELETE /mcp` for session termination) inside unified daemon (`src/dev_orchestrator/web/server.py`), exposing exactly six bounded tools (`devo_status`, `devo_start_task`, `devo_job_status`, `devo_cancel_job`, `devo_read_log`, `devo_read_file`) via JSON-RPC 2.0 and Streamable HTTP.
+- Extracted shared service operations core `src/dev_orchestrator/control/operations.py` (`spawn_job`, `poll_job`, `cancel_job`, `read_file`), unifying REST routes and MCP adapter over the exact same control/service layer while retaining all P18 transport fences, capability verification, and fail-closed RDC rejections.
+- Implemented `src/dev_orchestrator/control/mcp_http.py` handling JSON-RPC protocol negotiation (2025-06-18, 2025-03-26, 2024-11-05), Accept content negotiation (application/json and text/event-stream), in-memory session tracking with Mcp-Session-Id and TTL, and 64KB bounded tool results.
+- Added revocable scoped MCP capability tokens in `src/dev_orchestrator/control/security.py` and CLI commands `dev-orchestrator mcp-token {mint,list,revoke}` in `src/dev_orchestrator/cli.py`.
+- Enforced strict Origin validation, mandatory bearer authentication, loopback-first binding, and zero-RDC safety.
+- Acceptance evidence: `docs/evidence/P19_2_REMOTE_MCP_ACCEPTANCE.json` and `docs/evidence/P19_2_REMOTE_MCP_OPERATIONS.ndjson` (12 operations, zero RDC calls, all native operations selected `local`).
+- Design and SDK exception documentation: `docs/P19_2_REMOTE_MCP_DESIGN.md`.
+- Verification: 12/12 focused tests passed (`test_p19_2_remote_mcp.py`); 26/26 P19 web console tests passed; 70/70 P18 transport tests passed; 49/49 durable job & transport tests passed; 167/167 lifecycle and control plane tests passed; `compileall`, `node --check web/app.js`, `git diff --check`, and `graphify update .` all passed.
+- Diff hygiene: untouched `agent/next.md`, `agent/HANDOFF.md`, `agent/staged/*`, and `runtime/transition-executor.json`.
+
 P19 Remote HTTP/HTTPS Gateway + Web UI implementation & acceptance (2026-09-29):
-- Status: **IMPLEMENTATION_COMPLETE** (Ready for Technical Review). Executed bounded task P19.1 from `agent/next.md` without modifying lifecycle authority or fabricating successors.
+- Status: **COMPLETE**. Executed bounded task P19.1 from `agent/next.md` without modifying lifecycle authority or fabricating successors.
 - Implementation commits: `62020f1` (`feat(P19): implement web native operations console and browser session control`) and `88e3ca6` (`test(P19): record live web console zero-RDC acceptance evidence`).
 - Same-origin browser console added at `/web/index.html` (`#operations-section`) and `web/app.js` with session reconnect, textContent-only sanitization, confirmation gates for spawn/cancel/write, and bounded form builders.
 - Method-scoped read exception added to `src/dev_orchestrator/web/server.py` allowing same-origin browser GET/HEAD reads without Origin header when `Sec-Fetch-Site: same-origin`, while retaining strict valid-Origin enforcement for mutating POST requests.
@@ -28,7 +41,7 @@ P18 External Control Entrypoint closeout (2026-09-29):
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P19 Remote HTTP/HTTPS Gateway + Web UI** (Status: **IMPLEMENTATION_COMPLETE**). Previous task: **P18 External Control Entrypoint** (Status: **COMPLETE**).
+Current task: **P19.2 Remote MCP Interface** (Status: **IMPLEMENTATION_COMPLETE**). Previous task: **P19 Remote HTTP/HTTPS Gateway + Web UI** (Status: **COMPLETE**).
 
 P18 Owner-Authorized Technical Review Remediation Evidence (2026-09-28):
 - Addressed exactly the four remaining blockers from Claude Opus review `ai_review:ai_review:ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute` at `d3ecdb9` without reopening planning:

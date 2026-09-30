@@ -1,5 +1,16 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P19.2 Remote MCP Interface (implementation & acceptance complete 2026-09-30):
+- Implemented a standards-compliant, authenticated remote Model Context Protocol endpoint at `POST /mcp` (with `DELETE /mcp` for session teardown) inside the unified daemon (`src/dev_orchestrator/web/server.py`), exposing exactly six bounded tools (`devo_status`, `devo_start_task`, `devo_job_status`, `devo_cancel_job`, `devo_read_log`, `devo_read_file`) via JSON-RPC 2.0 and Streamable HTTP.
+- Factored the shared service operations core into `src/dev_orchestrator/control/operations.py` (`spawn_job`, `poll_job`, `cancel_job`, `read_file`), unifying REST routes and MCP adapter over the exact same control/service layer with zero duplication of lifecycle authority or job state machines.
+- Implemented JSON-RPC 2.0 engine in `src/dev_orchestrator/control/mcp_http.py` supporting protocol version negotiation (2025-06-18, 2025-03-26, 2024-11-05), Accept content negotiation (application/json and text/event-stream), in-memory session management with TTL and Mcp-Session-Id, and 64KB bounded tool results.
+- Added revocable scoped MCP capability tokens in `src/dev_orchestrator/control/security.py` and CLI commands `dev-orchestrator mcp-token {mint,list,revoke}` in `src/dev_orchestrator/cli.py`.
+- Preserved loopback-first binding, mandatory bearer authentication, strict Origin header validation, and fail-closed zero-RDC guarantees.
+- Live ZXZ-PC acceptance passed: 12 operations executed, 5 native transport operations selecting `local`, zero RDC calls recorded, durable job `job-9b593fe04ad8c7a3` completed, job `job-97d864a242d12bf2` cancelled, bounded file and log reads verified, SSE content negotiation verified.
+- Evidence: `docs/evidence/P19_2_REMOTE_MCP_ACCEPTANCE.json` and `docs/evidence/P19_2_REMOTE_MCP_OPERATIONS.ndjson`.
+- Verification: 12 focused tests passed (`test_p19_2_remote_mcp.py`), 26 P19 web console tests passed, 70 P18 transport tests passed, 49 job & transport tests passed, 167 lifecycle and control plane tests passed; compileall, git diff check, and Graphify update clean.
+- Commit history: `0d0b688` (implementation and acceptance evidence).
+
 P19 Remote HTTP/HTTPS Gateway + Web UI (implementation & acceptance complete 2026-09-29):
 - Added a production-quality, loopback web console for bounded native machine operations delivered by P18, reusing existing Control API, transport selector, durable job service, staged-write/CAS path, audit trail, and lifecycle authority.
 - Implemented method-scoped browser read exception in `src/dev_orchestrator/web/server.py` (`_browser_read_context_ok`) allowing same-origin browser GET/HEAD reads without Origin header when `Sec-Fetch-Site: same-origin` is present, while strictly requiring valid `Origin` for all mutating requests.
