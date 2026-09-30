@@ -2,9 +2,10 @@
 
 The accepted read-only dashboard stays GET/HEAD-only on its own listener, so
 the bridge gets a dedicated local listener (default ``127.0.0.1:8765``) with
-exactly four adapter-facing endpoints:
+adapter-facing endpoints:
 
 - ``GET /v1/health``
+- ``GET /v1/progress`` with ``adapter`` and ``binding_id``
 - ``POST /v1/claim`` with ``{adapter, binding_id}`` -> 200 envelope or 204
   when the binding queue is empty
 - ``POST /v1/renew`` with
@@ -14,15 +15,18 @@ exactly four adapter-facing endpoints:
 - ``POST /v1/response`` with
   ``{adapter, binding_id, request_id, nonce, claim_token, response_text}``
   -> accepted/rejected acknowledgement
+- ``POST /v1/progress`` with ``{adapter, binding_id}``
+
+And P19.3 ChatGPT Plus Browser Control Bridge endpoints:
+- ``GET /v1/control/health`` -> 200 browser control health check
+- ``POST /v1/control/action`` -> execute structured DEVORCH_ACTION_V1 action
+- ``OPTIONS /v1/control/action`` -> CORS preflight for https://chatgpt.com
 
 Claim and renew envelopes expose ``lease_expires_at`` (UTC ISO-8601) so an
 adapter can reason only about transport authority (when to renew, when a stale
 claim must be abandoned).
 
-No generic prompt endpoint, arbitrary shell/Worker endpoint, or
-workflow-transition endpoint is exposed. The server is transport only: it
-hands requests to the ``BrowserBridgeStore`` and never interprets response
-content.
+No generic prompt endpoint or arbitrary shell/Worker execution is exposed.
 """
 
 from __future__ import annotations
@@ -30,12 +34,29 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from dev_orchestrator.bridge.store import BridgeConflictError, BrowserBridgeStore
+from dev_orchestrator.control.browser_control import (
+    BrowserControlConflictError,
+    BrowserControlConfirmationRequiredError,
+    BrowserControlError,
+    BrowserControlService,
+    MAX_REQUEST_BYTES,
+)
+from dev_orchestrator.control.security import validate_browser_control_capability
 
-_ALLOW = "GET, POST"
+_ALLOW = "GET, POST, OPTIONS"
+
+ALLOWED_CONTROL_ORIGIN_PREFIXES = (
+    "https://chatgpt.com",
+    "http://localhost:",
+    "http://127.0.0.1:",
+    "http://localhost",
+    "http://127.0.0.1",
+)
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -48,13 +69,32 @@ class BridgeHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address: tuple, store: BrowserBridgeStore) -> None:
+    def __init__(
+        self,
+        server_address: tuple,
+        store: BrowserBridgeStore,
+        runtime_root: Optional[Path | str] = None,
+        config_path: Optional[Path | str] = None,
+    ) -> None:
         self.store = store
+        self.runtime_root = Path(runtime_root) if runtime_root else Path(store.root).parent
+        self.config_path = Path(config_path) if config_path else None
+        self._browser_control_service: Optional[BrowserControlService] = None
         super().__init__(server_address, _BridgeHandler)
+
+    @property
+    def browser_control_service(self) -> BrowserControlService:
+        if self._browser_control_service is None:
+            self._browser_control_service = BrowserControlService(
+                runtime_root=self.runtime_root,
+                config_path=self.config_path,
+                bridge_store=self.store,
+            )
+        return self._browser_control_service
 
 
 class _BridgeHandler(BaseHTTPRequestHandler):
-    """Minimal bridge handler: exactly the four v1 endpoints above."""
+    """Minimal bridge handler: v1 Web Sol endpoints + v1 control action endpoints."""
 
     protocol_version = "HTTP/1.1"
     server_version = "DevOrchestratorBridge/1.0"
@@ -69,16 +109,49 @@ class _BridgeHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._route_post()
 
+    def do_OPTIONS(self) -> None:
+        path = self._path()
+        if path == "/v1/control/action":
+            allowed, origin = self._is_origin_allowed()
+            if not allowed:
+                self._error(403, "Forbidden", f"Origin '{origin}' not allowed")
+                return
+            headers = self._cors_headers(origin)
+            self._send(204, "No Content", b"", extra_headers=headers)
+            return
+        self._unsupported()
+
     def _unsupported(self) -> None:
-        self._error(405, "Method Not Allowed", "bridge supports GET and POST only", {"Allow": _ALLOW})
+        self._error(405, "Method Not Allowed", "bridge supports GET, POST, and OPTIONS only", {"Allow": _ALLOW})
 
     do_HEAD = _unsupported
     do_PUT = _unsupported
     do_DELETE = _unsupported
     do_PATCH = _unsupported
-    do_OPTIONS = _unsupported
     do_TRACE = _unsupported
     do_CONNECT = _unsupported
+
+    # -- CORS helpers -----------------------------------------------------
+    def _is_origin_allowed(self) -> tuple[bool, Optional[str]]:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True, None
+        for prefix in ALLOWED_CONTROL_ORIGIN_PREFIXES:
+            if origin == prefix or origin.startswith(prefix):
+                return True, origin
+        return False, origin
+
+    def _cors_headers(self, origin: Optional[str]) -> dict[str, str]:
+        if not origin:
+            return {}
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-DevOrch-Client, X-DevOrch-Request-ID",
+            "Access-Control-Max-Age": "86400",
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        }
 
     # -- plumbing ---------------------------------------------------------
     def _send(
@@ -121,6 +194,23 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 _json_bytes({"state": "ok", "surface": "v1"}),
             )
             return
+        if path == "/v1/control/health":
+            allowed, origin = self._is_origin_allowed()
+            if not allowed:
+                self._error(403, "Forbidden", f"Origin '{origin}' not allowed")
+                return
+            headers = self._cors_headers(origin)
+            self._send(
+                200,
+                "OK",
+                _json_bytes({
+                    "status": "ok",
+                    "service": "browser_control_bridge",
+                    "version": "DEVORCH_ACTION_V1",
+                }),
+                extra_headers=headers,
+            )
+            return
         if path == "/v1/progress":
             query = urlsplit(self.path).query
             params = parse_qs(query, keep_blank_values=True)
@@ -143,6 +233,9 @@ class _BridgeHandler(BaseHTTPRequestHandler):
 
     def _route_post(self) -> None:
         path = self._path()
+        if path == "/v1/control/action":
+            self._handle_control_action()
+            return
         if path not in ("/v1/claim", "/v1/renew", "/v1/response", "/v1/progress"):
             self._error(404, "Not Found", "route not found")
             return
@@ -164,12 +257,12 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         except (ValueError, TypeError) as exc:
             self._error(400, "Bad Request", str(exc))
 
-    def _read_payload(self) -> Optional[dict]:
+    def _read_payload(self, max_bytes: int = 1024 * 1024) -> Optional[dict]:
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
             return None
-        if length <= 0 or length > 1024 * 1024:
+        if length <= 0 or length > max_bytes:
             return None
         try:
             raw = self.rfile.read(length)
@@ -248,7 +341,65 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             _json_bytes({"notifications": notifs, "claimed": notifs, "count": len(notifs)}),
         )
 
+    def _handle_control_action(self) -> None:
+        allowed, origin = self._is_origin_allowed()
+        if not allowed:
+            self._error(403, "Forbidden", f"Origin '{origin}' not allowed")
+            return
+        cors = self._cors_headers(origin)
 
-def make_bridge_server(host: str, port: int, store: BrowserBridgeStore) -> BridgeHTTPServer:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self._error(400, "Bad Request", "invalid Content-Length header", extra_headers=cors)
+            return
+        if length <= 0 or length > MAX_REQUEST_BYTES:
+            self._error(400, "Bad Request", f"payload size {length} out of bounds (max {MAX_REQUEST_BYTES} bytes)", extra_headers=cors)
+            return
+
+        payload = self._read_payload(max_bytes=MAX_REQUEST_BYTES)
+        if payload is None or not isinstance(payload, dict):
+            self._error(400, "Bad Request", "request body must be valid JSON object", extra_headers=cors)
+            return
+
+        auth_header = self.headers.get("Authorization")
+        project_id = payload.get("project_id") or "devorchestrator"
+        action = payload.get("action")
+        auth_ok, auth_reason, cap_row = validate_browser_control_capability(
+            auth_header,
+            project_id=str(project_id) if project_id else None,
+            action=str(action) if action else None,
+            runtime_root=self.server.runtime_root,
+        )
+        if not auth_ok:
+            self._error(401, "Unauthorized", f"browser control unauthorized: {auth_reason}", extra_headers=cors)
+            return
+
+        cap_id = cap_row.get("capability_id", "unknown") if cap_row else "unknown"
+        service = self.server.browser_control_service
+        try:
+            res = service.execute_action(
+                payload,
+                host_id="bridge-local",
+                capability_id=cap_id,
+            )
+            self._send(200, "OK", _json_bytes(res), extra_headers=cors)
+        except BrowserControlConfirmationRequiredError as exc:
+            self._send(400, "Confirmation Required", _json_bytes(exc.to_dict()), extra_headers=cors)
+        except BrowserControlConflictError as exc:
+            self._send(409, "Conflict", _json_bytes(exc.to_dict()), extra_headers=cors)
+        except BrowserControlError as exc:
+            self._send(exc.status_code, exc.reason, _json_bytes(exc.to_dict()), extra_headers=cors)
+        except Exception as exc:
+            self._send(500, "Internal Server Error", _json_bytes({"error": "internal_error", "message": str(exc)}), extra_headers=cors)
+
+
+def make_bridge_server(
+    host: str,
+    port: int,
+    store: BrowserBridgeStore,
+    runtime_root: Optional[Path | str] = None,
+    config_path: Optional[Path | str] = None,
+) -> BridgeHTTPServer:
     """Create (and bind) the bridge server owning ``store``."""
-    return BridgeHTTPServer((host, port), store)
+    return BridgeHTTPServer((host, port), store, runtime_root=runtime_root, config_path=config_path)

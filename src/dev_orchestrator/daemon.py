@@ -599,7 +599,13 @@ def run_daemon(
         server.conversation_store = conversation_store
         bridge_store = BrowserBridgeStore(runtime / "bridge", require_live_binding=True)
         server.bridge_store = bridge_store
-        bridge_server = make_bridge_server(bridge_listen, bridge_port, bridge_store)
+        bridge_server = make_bridge_server(
+            bridge_listen,
+            bridge_port,
+            bridge_store,
+            runtime_root=runtime,
+            config_path=config,
+        )
     except Exception:
         # Never leave a live-looking pid file behind when a bind fails.
         try:

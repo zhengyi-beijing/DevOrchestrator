@@ -1243,6 +1243,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             proj_id = q_params.get("project_id", [None])[0]
             caps = list_transport_capabilities(project_id=proj_id, runtime_root=runtime)
             payload = _control_envelope({"items": caps, "capabilities": caps, "count": len(caps)})
+        elif path == "/api/v1/control/browser-control-capabilities":
+            if not self._authorized_control_read():
+                self._error(401, "Unauthorized", "valid control authorization required", head_only); return
+            caps = security.list_browser_control_capabilities()
+            payload = _control_envelope({"items": caps, "capabilities": caps, "count": len(caps)})
         elif path == "/api/v1/control/transport/capabilities":
             if not self._authorized_control_read():
                 self._error(401, "Unauthorized", "valid control authorization required", head_only); return
@@ -1828,6 +1833,59 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             except (ValueError, TypeError) as exc:
                 self._error(400, "Bad Request", str(exc), False); return
             self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(cap)), False); return
+        if path == "/api/v1/control/browser-control-capabilities":
+            value = self._read_control_json()
+            if value is None: return
+            try:
+                cap = security.create_browser_control_capability(
+                    project_id=str(value.get("project_id", "devorchestrator")),
+                    allowed_actions=value.get("allowed_actions"),
+                    label=str(value.get("label", "")),
+                    ttl_seconds=int(value.get("ttl_seconds", 86400 * 30)),
+                )
+            except (ValueError, TypeError) as exc:
+                self._error(400, "Bad Request", str(exc), False); return
+            self._send(201, "Created", "application/json; charset=utf-8", _json_bytes(_control_envelope(cap)), False); return
+        if path == "/api/v1/control/browser-control/action":
+            payload = self._read_control_json()
+            if payload is None: return
+            auth_header = self.headers.get("Authorization")
+            project_id = payload.get("project_id") or "devorchestrator"
+            action = payload.get("action")
+            auth_ok, auth_reason, cap_row = security.validate_browser_control_capability(
+                auth_header,
+                project_id=str(project_id) if project_id else None,
+                action=str(action) if action else None,
+            )
+            if not auth_ok:
+                self._error(401, "Unauthorized", f"browser control unauthorized: {auth_reason}", False); return
+            from dev_orchestrator.control.browser_control import (
+                BrowserControlService,
+                BrowserControlError,
+                BrowserControlConfirmationRequiredError,
+                BrowserControlConflictError,
+            )
+            cap_id = cap_row.get("capability_id", "unknown") if cap_row else "unknown"
+            service = BrowserControlService(
+                runtime_root=runtime,
+                config_path=self.server.config_path,
+                bridge_store=self.server.bridge_store,
+            )
+            try:
+                res = service.execute_action(
+                    payload,
+                    host_id="web-local",
+                    capability_id=cap_id,
+                )
+                self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(res)), False); return
+            except BrowserControlConfirmationRequiredError as exc:
+                self._send(400, "Confirmation Required", "application/json; charset=utf-8", _json_bytes(_control_envelope(exc.to_dict())), False); return
+            except BrowserControlConflictError as exc:
+                self._send(409, "Conflict", "application/json; charset=utf-8", _json_bytes(_control_envelope(exc.to_dict())), False); return
+            except BrowserControlError as exc:
+                self._send(exc.status_code, exc.reason, "application/json; charset=utf-8", _json_bytes(_control_envelope(exc.to_dict())), False); return
+            except Exception as exc:
+                self._error(500, "Internal Server Error", str(exc), False); return
         revoke_wb = _CAPABILITY_REVOKE_PATH_RE.fullmatch(path)
         if revoke_wb:
             try:

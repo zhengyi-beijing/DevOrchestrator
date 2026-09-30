@@ -1,5 +1,29 @@
 # DevOrchestrator Self-Hosted Development State
 
+P19.3 ChatGPT Plus Browser Control Bridge (2026-09-30):
+- Status: **COMPLETE** (Zero-RDC Acceptance Verified).
+- Delivered secure, browser-based control bridge enabling desktop Chrome ChatGPT Plus conversations to inspect and operate local DevOrchestrator over Tampermonkey (`browser/chatgpt-web-adapter.user.js`), port 8765 bridge, and port 8770 control plane with zero RDC calls, no OpenAI API billing, no Business workspace, no public exposure, without weakening or replacing P19.2 (remote MCP).
+- Architecture & Boundaries:
+  - Transport/adapter only: userscript and bridge port 8765 maintain strict isolation from lifecycle authority and state machines.
+  - Channel isolation: control requests (`[DEVORCH_ACTION_V1]`) and responses (`[DEVORCH_ACTION_RESULT_V1]`) are strictly isolated from the Web Sol inference queue (`/v1/claim`, `/v1/response`).
+  - Structured protocol: enforces typed JSON action envelopes; arbitrary shell execution is prohibited.
+  - Confirmation policy: read-only actions (`status`, `job_status`, `read_log`, `read_file`, `commands_catalog`) execute automatically with valid capability token; effectful actions (`start_task`, `cancel_job`) strictly require visible DOM modal confirmation (`showEffectfulConfirmationModal`) before execution.
+  - Hardware safety: hardware commands in `commands_catalog` are non-selectable and fail closed.
+  - Path traversal fail-closed: `read_file` prevents repo root escapes.
+- Implementation:
+  - `src/dev_orchestrator/control/security.py`: browser control capability store, token creation, HMAC verification, scoping, revocation.
+  - `src/dev_orchestrator/cli.py`: `dev-orchestrator browser-token {mint,list,revoke}` CLI.
+  - `src/dev_orchestrator/control/browser_control.py`: protocol parser/formatter, `BrowserControlRequestStore` (locking, replay idempotency, conflict detection), `BrowserControlService` dispatching to shared operations layer (`operations.py`).
+  - `src/dev_orchestrator/bridge/server.py`: `OPTIONS /v1/control/action` (CORS preflight for `https://chatgpt.com`), `GET /v1/control/health`, `POST /v1/control/action` endpoints with capability token auth.
+  - `src/dev_orchestrator/daemon.py`: wired bridge server with runtime_root and config_path.
+  - `src/dev_orchestrator/web/server.py`: registered browser control web endpoints (`POST /api/v1/control/browser-control/action` and GET/POST `/api/v1/control/browser-control-capabilities`).
+  - `browser/chatgpt-web-adapter.user.js`: pairing/token management, action scanning, DOM confirmation modal, dispatch, auto-submission into `#prompt-textarea`.
+- Verification & Acceptance:
+  - Acceptance script: `python ops/p19_3_browser_control_acceptance.py` passed all 18 steps against live bridge (:8765) and daemon (:8770).
+  - Acceptance evidence: `docs/evidence/P19_3_BROWSER_CONTROL_ACCEPTANCE.json` and `docs/evidence/P19_3_BROWSER_CONTROL_OPERATIONS.ndjson` (result PASS, 6 native operations, 100% `local`, 0 RDC calls, confirmation gate enforced, channel isolation enforced).
+  - Test suites: 18/18 passed in `tests_py/test_p19_3_browser_control.py`; 15/15 passed in `tests_py/test_p19_2_remote_mcp.py`; 9/9 passed in `tests_py/test_p19_web_console.py`; 7/7 passed in `tests_py/test_p18_external_control.py`; 3/3 passed in `tests_py/test_bridge_http.py`; 14/14 passed in `tests_py/test_chatgpt_web_adapter.py`; `node --check browser/chatgpt-web-adapter.user.js` clean; `compileall` clean; `git diff --check` clean; `graphify update .` clean.
+- Design documentation: `docs/P19_3_BROWSER_CONTROL_DESIGN.md`.
+
 P19.2 Remote MCP Interface remediation & acceptance (2026-09-30):
 - Status: **REMEDIATION_COMPLETE** (Ready for Technical Review verification). Remediated bounded task P19.2 without modifying lifecycle authority or fabricating successors.
 - Implementation commits: `0d0b688` (`feat(P19.2): implement remote MCP interface over streamable HTTP and record zero-RDC evidence`), `9e0b3e7`, and `15be804` (`fix(p19.2): remediate technical review findings for tools allowlist, CORS origin, and logs filtering`).
@@ -45,7 +69,7 @@ P18 External Control Entrypoint closeout (2026-09-29):
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P19.2 Remote MCP Interface** (Status: **IMPLEMENTATION_COMPLETE**). Previous task: **P19 Remote HTTP/HTTPS Gateway + Web UI** (Status: **COMPLETE**).
+Current task: **P19.3 ChatGPT Plus Browser Control Bridge** (Status: **COMPLETE**). Previous task: **P19.2 Remote MCP Interface** (Status: **REMEDIATION_COMPLETE**).
 
 P18 Owner-Authorized Technical Review Remediation Evidence (2026-09-28):
 - Addressed exactly the four remaining blockers from Claude Opus review `ai_review:ai_review:ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute` at `d3ecdb9` without reopening planning:

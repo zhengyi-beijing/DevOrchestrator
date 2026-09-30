@@ -41,6 +41,16 @@
   var CAPABILITY_STORAGE_KEY = "devorch:control:heartbeat-capability";
   var TAB_INSTANCE_STORAGE_KEY = "devorch:control:tab-instance";
   var LAST_URGENT_NOTIFICATION_KEY = "devorch:progress:last-urgent";
+  var BROWSER_CONTROL_ACTION_PATH = "/v1/control/action";
+  var BROWSER_CONTROL_TOKEN_STORAGE_KEY = "devorch:control:browser-control-capability";
+  var BROWSER_CONTROL_PROCESSED_STORAGE_KEY = "devorch:control:processed-actions";
+  var DEVORCH_ACTION_V1 = "DEVORCH_ACTION_V1";
+  var DEVORCH_ACTION_RESULT_V1 = "DEVORCH_ACTION_RESULT_V1";
+  var READ_ONLY_ACTIONS = ["status", "job_status", "read_log", "read_file", "commands_catalog"];
+  var EFFECTFUL_ACTIONS = ["start_task", "cancel_job"];
+  var ACTION_ENVELOPE_RE = /(?:\[DEVORCH_ACTION_V1\]?|```(?:devorch_action|json:devorch_action|action))\s*(\{[\s\S]*?\})\s*(?:\[\/DEVORCH_ACTION_V1\]|\]|```)/i;
+  var FALLBACK_ACTION_RE = /DEVORCH_ACTION_V1\s*(\{[\s\S]*?\})/i;
+  var ACTION_RESULT_HEAD = "[DEVORCH_ACTION_RESULT_V1 ";
   var CONTROL_HEARTBEAT_MS = 15000;
   var controlHeartbeatTimer = null;
   var POLL_MS = 1500;
@@ -312,6 +322,152 @@
     if (typeof GM_deleteValue === "function") {
       GM_deleteValue(CAPABILITY_STORAGE_KEY);
     }
+  }
+
+  function storedBrowserControlToken() {
+    try {
+      if (typeof GM_getValue !== "function") { return ""; }
+      var val = GM_getValue(BROWSER_CONTROL_TOKEN_STORAGE_KEY, "");
+      return typeof val === "string" ? val.trim() : "";
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function saveBrowserControlToken(token) {
+    if (typeof GM_setValue === "function" && typeof token === "string") {
+      GM_setValue(BROWSER_CONTROL_TOKEN_STORAGE_KEY, token.trim());
+    }
+  }
+
+  function clearBrowserControlToken() {
+    if (typeof GM_deleteValue === "function") {
+      GM_deleteValue(BROWSER_CONTROL_TOKEN_STORAGE_KEY);
+    }
+  }
+
+  function isReadOnlyAction(action) {
+    if (typeof action !== "string") { return false; }
+    return READ_ONLY_ACTIONS.indexOf(action.trim().toLowerCase()) !== -1;
+  }
+
+  function isEffectfulAction(action) {
+    if (typeof action !== "string") { return false; }
+    return EFFECTFUL_ACTIONS.indexOf(action.trim().toLowerCase()) !== -1;
+  }
+
+  function validateActionEnvelope(data) {
+    if (!data || typeof data !== "object") { return null; }
+    if (data.protocol !== DEVORCH_ACTION_V1) { return null; }
+    if (typeof data.request_id !== "string" || !data.request_id.trim()) { return null; }
+    if (typeof data.action !== "string" || !data.action.trim()) { return null; }
+    var action = data.action.trim().toLowerCase();
+    if (READ_ONLY_ACTIONS.indexOf(action) === -1 && EFFECTFUL_ACTIONS.indexOf(action) === -1) {
+      return null;
+    }
+    return {
+      protocol: DEVORCH_ACTION_V1,
+      request_id: data.request_id.trim(),
+      action: action,
+      project_id: (typeof data.project_id === "string" && data.project_id.trim()) ? data.project_id.trim() : "devorchestrator",
+      parameters: (data.parameters && typeof data.parameters === "object") ? data.parameters : {},
+      confirmed: Boolean(data.confirmed)
+    };
+  }
+
+  function parseActionEnvelope(rawText) {
+    if (!rawText || typeof rawText !== "string") {
+      return null;
+    }
+    var trimmed = rawText.trim();
+    if (trimmed.charAt(0) === "{" && trimmed.charAt(trimmed.length - 1) === "}") {
+      try {
+        var parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object" && parsed.protocol === DEVORCH_ACTION_V1) {
+          return validateActionEnvelope(parsed);
+        }
+      } catch (e) {}
+    }
+    var match = ACTION_ENVELOPE_RE.exec(rawText);
+    if (!match) {
+      match = FALLBACK_ACTION_RE.exec(rawText);
+    }
+    if (match && match[1]) {
+      try {
+        var parsed2 = JSON.parse(match[1].trim());
+        if (parsed2 && typeof parsed2 === "object") {
+          return validateActionEnvelope(parsed2);
+        }
+      } catch (e2) {}
+    }
+    return null;
+  }
+
+  function formatActionResult(requestId, status, dataOrError) {
+    var payload = {
+      protocol: DEVORCH_ACTION_RESULT_V1,
+      request_id: requestId,
+      status: status
+    };
+    if (status === "success") {
+      payload.data = dataOrError;
+    } else {
+      var errMsg = "Execution failed";
+      if (typeof dataOrError === "string") {
+        errMsg = dataOrError;
+      } else if (dataOrError && typeof dataOrError === "object") {
+        errMsg = dataOrError.error || dataOrError.message || "Execution failed";
+        if (dataOrError.reason) { payload.reason = dataOrError.reason; }
+        if (dataOrError.details) { payload.details = dataOrError.details; }
+      }
+      payload.error = errMsg;
+    }
+    return "[" + DEVORCH_ACTION_RESULT_V1 + " " + requestId + "]\n" + JSON.stringify(payload, null, 2) + "\n[/" + DEVORCH_ACTION_RESULT_V1 + "]";
+  }
+
+  function getProcessedActions() {
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        var raw = sessionStorage.getItem(BROWSER_CONTROL_PROCESSED_STORAGE_KEY);
+        if (raw) {
+          var arr = JSON.parse(raw);
+          if (Array.isArray(arr)) { return arr; }
+        }
+      }
+    } catch (e) {}
+    return [];
+  }
+
+  function isActionProcessed(requestId) {
+    if (!requestId) { return true; }
+    var list = getProcessedActions();
+    return list.indexOf(requestId) !== -1;
+  }
+
+  function markActionProcessed(requestId) {
+    if (!requestId) { return; }
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        var list = getProcessedActions();
+        if (list.indexOf(requestId) === -1) {
+          list.push(requestId);
+          if (list.length > 200) { list.shift(); }
+          sessionStorage.setItem(BROWSER_CONTROL_PROCESSED_STORAGE_KEY, JSON.stringify(list));
+        }
+      }
+    } catch (e) {}
+  }
+
+  function isActionResultInConversation(requestId) {
+    if (typeof document === "undefined" || !requestId) { return false; }
+    var marker = ACTION_RESULT_HEAD + requestId + "]";
+    var messages = document.querySelectorAll("[data-message-author-role]");
+    for (var i = 0; i < messages.length; i++) {
+      if ((messages[i].innerText || "").indexOf(marker) !== -1) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function classifyHeartbeatResult(result) {
@@ -604,7 +760,22 @@
     setAdapterStatus: setAdapterStatus,
     updateAdapterStatusDemoting: updateAdapterStatusDemoting,
     sendControlHeartbeat: sendControlHeartbeat,
-    redeemControlPairing: redeemControlPairing
+    redeemControlPairing: redeemControlPairing,
+    parseActionEnvelope: parseActionEnvelope,
+    validateActionEnvelope: validateActionEnvelope,
+    formatActionResult: formatActionResult,
+    isReadOnlyAction: isReadOnlyAction,
+    isEffectfulAction: isEffectfulAction,
+    storedBrowserControlToken: storedBrowserControlToken,
+    saveBrowserControlToken: saveBrowserControlToken,
+    clearBrowserControlToken: clearBrowserControlToken,
+    isActionProcessed: isActionProcessed,
+    markActionProcessed: markActionProcessed,
+    isActionResultInConversation: isActionResultInConversation,
+    dispatchBrowserControlAction: dispatchBrowserControlAction,
+    showEffectfulConfirmationModal: showEffectfulConfirmationModal,
+    submitActionResult: submitActionResult,
+    scanAndProcessBrowserActions: scanAndProcessBrowserActions
   };
 
   // Exposed for the automated adapter test (Node `require`); harmless in a
@@ -755,6 +926,17 @@
       });
     });
     GM_registerMenuCommand("Forget DevOrchestrator heartbeat capability", clearCapability);
+    GM_registerMenuCommand("Pair DevOrchestrator browser control", function () {
+      var raw = typeof root.prompt === "function" ? root.prompt("Paste browser control capability token (from dev-orchestrator browser-token mint):") : "";
+      if (raw && raw.trim()) {
+        saveBrowserControlToken(raw.trim());
+        if (typeof root.alert === "function") { root.alert("DevOrchestrator browser control token paired"); }
+      }
+    });
+    GM_registerMenuCommand("Forget DevOrchestrator browser control token", function () {
+      clearBrowserControlToken();
+      if (typeof root.alert === "function") { root.alert("DevOrchestrator browser control token forgotten"); }
+    });
     GM_registerMenuCommand("Test DevOrchestrator attention alert", function () {
       handleProgressNotification({
         notification_id: "manual-test-" + Date.now(),
@@ -1126,10 +1308,236 @@
     schedule(runAdapter, RETRY_MS);
   }
 
+  // ------------------------------------------------------------------
+  // P19.3 ChatGPT Plus Browser Control Bridge execution & scanning
+  // ------------------------------------------------------------------
+
+  function dispatchBrowserControlAction(actionPayload, confirmed) {
+    var token = storedBrowserControlToken();
+    if (!token) {
+      return Promise.resolve({
+        status: 401,
+        text: JSON.stringify({
+          status: "error",
+          reason: "Unauthorized",
+          error: "Browser control capability token not paired in Tampermonkey. Use 'Pair DevOrchestrator browser control' menu command."
+        })
+      });
+    }
+
+    var payload = Object.assign({}, actionPayload);
+    if (confirmed) {
+      payload.confirmed = true;
+    }
+
+    var url = BRIDGE_BASE + BROWSER_CONTROL_ACTION_PATH;
+    var body = JSON.stringify(payload);
+    return new Promise(function (resolve) {
+      var settled = false;
+      function finish(status, text) {
+        if (settled) { return; }
+        settled = true;
+        resolve({ status: status, text: text });
+      }
+      var headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + token,
+        "Origin": "https://chatgpt.com"
+      };
+      if (typeof GM_xmlhttpRequest === "function") {
+        GM_xmlhttpRequest({
+          method: "POST",
+          url: url,
+          data: body,
+          headers: headers,
+          timeout: 15000,
+          onload: function (response) { finish(response.status, response.responseText); },
+          onerror: function () { finish(0, ""); },
+          ontimeout: function () { finish(0, ""); }
+        });
+        return;
+      }
+      if (typeof fetch === "function") {
+        delete headers.Origin;
+        fetch(url, {
+          method: "POST",
+          headers: headers,
+          body: body
+        }).then(function (response) {
+          response.text().then(function (text) { finish(response.status, text); });
+        }).catch(function () { finish(0, ""); });
+        return;
+      }
+      finish(0, "");
+    });
+  }
+
+  function showEffectfulConfirmationModal(actionEnvelope, onApprove, onReject) {
+    if (typeof document === "undefined" || !document.body) {
+      if (typeof onReject === "function") { onReject("Document body not available"); }
+      return null;
+    }
+
+    var existing = document.getElementById("devorch-confirm-modal");
+    if (existing && existing.parentNode) {
+      existing.parentNode.removeChild(existing);
+    }
+
+    var overlay = document.createElement("div");
+    overlay.id = "devorch-confirm-modal";
+    overlay.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:2147483646;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,sans-serif;";
+
+    var modal = document.createElement("div");
+    modal.style.cssText = "background:#1e1e1e;color:#fff;border:1px solid #444;border-radius:12px;padding:24px;max-width:520px;width:90%;box-shadow:0 12px 36px rgba(0,0,0,0.6);";
+
+    var title = document.createElement("h3");
+    title.style.cssText = "margin:0 0 12px 0;font-size:18px;color:#f59e0b;display:flex;align-items:center;gap:8px;";
+    title.textContent = "⚠️ DevOrchestrator Effectful Action Confirmation";
+    modal.appendChild(title);
+
+    var desc = document.createElement("p");
+    desc.style.cssText = "margin:0 0 16px 0;font-size:14px;color:#d1d5db;line-height:1.5;";
+    desc.textContent = "ChatGPT has requested to execute an effectful operation on your local environment:";
+    modal.appendChild(desc);
+
+    var detailsBox = document.createElement("div");
+    detailsBox.style.cssText = "background:#111;border:1px solid #333;border-radius:8px;padding:12px;margin-bottom:20px;font-family:monospace;font-size:13px;color:#e5e7eb;word-break:break-all;";
+
+    var actRow = document.createElement("div");
+    actRow.innerHTML = "<strong>Action:</strong> <span style='color:#60a5fa;'>" + (actionEnvelope.action || "") + "</span>";
+    detailsBox.appendChild(actRow);
+
+    var projRow = document.createElement("div");
+    projRow.innerHTML = "<strong>Project:</strong> " + (actionEnvelope.project_id || "devorchestrator");
+    detailsBox.appendChild(projRow);
+
+    var reqRow = document.createElement("div");
+    reqRow.innerHTML = "<strong>Request ID:</strong> " + (actionEnvelope.request_id || "");
+    detailsBox.appendChild(reqRow);
+
+    var params = actionEnvelope.parameters || {};
+    if (params.command_ref) {
+      var cmdRow = document.createElement("div");
+      cmdRow.innerHTML = "<strong>Command:</strong> <span style='color:#34d399;'>" + params.command_ref + "</span>";
+      detailsBox.appendChild(cmdRow);
+    }
+    if (params.job_id) {
+      var jobRow = document.createElement("div");
+      jobRow.innerHTML = "<strong>Job ID:</strong> " + params.job_id;
+      detailsBox.appendChild(jobRow);
+    }
+    if (params.reason) {
+      var rRow = document.createElement("div");
+      rRow.innerHTML = "<strong>Reason:</strong> " + params.reason;
+      detailsBox.appendChild(rRow);
+    }
+    modal.appendChild(detailsBox);
+
+    var btnRow = document.createElement("div");
+    btnRow.style.cssText = "display:flex;justify-content:flex-end;gap:12px;";
+
+    var rejectBtn = document.createElement("button");
+    rejectBtn.textContent = "Reject";
+    rejectBtn.style.cssText = "padding:8px 16px;border-radius:6px;border:1px solid #555;background:#333;color:#fff;cursor:pointer;font-weight:500;font-size:14px;";
+    rejectBtn.onclick = function () {
+      if (overlay.parentNode) { overlay.parentNode.removeChild(overlay); }
+      if (typeof onReject === "function") { onReject("Action rejected by user in browser confirmation dialog"); }
+    };
+    btnRow.appendChild(rejectBtn);
+
+    var approveBtn = document.createElement("button");
+    approveBtn.textContent = "Approve & Execute";
+    approveBtn.style.cssText = "padding:8px 16px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer;font-weight:600;font-size:14px;";
+    approveBtn.onclick = function () {
+      if (overlay.parentNode) { overlay.parentNode.removeChild(overlay); }
+      if (typeof onApprove === "function") { onApprove(); }
+    };
+    btnRow.appendChild(approveBtn);
+
+    modal.appendChild(btnRow);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    return overlay;
+  }
+
+  function submitActionResult(resultText) {
+    if (typeof document === "undefined") { return false; }
+    var composer = document.querySelector("#prompt-textarea");
+    if (!composer) { return false; }
+    setComposerText(composer, resultText);
+    setTimeout(function () {
+      clickSendButton();
+    }, 150);
+    return true;
+  }
+
+  var actionScanActive = false;
+
+  function scanAndProcessBrowserActions() {
+    if (actionScanActive || typeof document === "undefined") { return; }
+    var assistants = document.querySelectorAll("[data-message-author-role='assistant']");
+    if (!assistants || assistants.length === 0) { return; }
+
+    for (var i = assistants.length - 1; i >= 0; i--) {
+      var text = assistants[i].innerText || "";
+      var envelope = parseActionEnvelope(text);
+      if (!envelope || !envelope.request_id) { continue; }
+
+      var reqId = envelope.request_id;
+      if (isActionProcessed(reqId) || isActionResultInConversation(reqId)) {
+        continue;
+      }
+
+      actionScanActive = true;
+      markActionProcessed(reqId);
+
+      var isEffectful = isEffectfulAction(envelope.action);
+      if (isEffectful) {
+        showEffectfulConfirmationModal(
+          envelope,
+          function onApprove() {
+            dispatchBrowserControlAction(envelope, true).then(function (result) {
+              handleActionResult(envelope, result);
+              actionScanActive = false;
+            });
+          },
+          function onReject(reason) {
+            var rejectedResult = formatActionResult(reqId, "rejected", reason);
+            submitActionResult(rejectedResult);
+            actionScanActive = false;
+          }
+        );
+      } else {
+        dispatchBrowserControlAction(envelope, false).then(function (result) {
+          handleActionResult(envelope, result);
+          actionScanActive = false;
+        });
+      }
+      break;
+    }
+  }
+
+  function handleActionResult(envelope, result) {
+    var reqId = envelope.request_id;
+    var status = (result.status >= 200 && result.status < 300) ? "success" : "error";
+    var body = null;
+    try {
+      body = JSON.parse(result.text);
+    } catch (e) {
+      body = { error: result.text || "Empty response from bridge" };
+    }
+    var dataOrError = (status === "success" && body && body.data !== undefined) ? body.data : body;
+    var formatted = formatActionResult(reqId, status, dataOrError);
+    submitActionResult(formatted);
+  }
+
   if (typeof document !== "undefined" && !root.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__) {
     setAdapterStatus("IDLE", "Adapter starting");
     registerControlPairingMenu();
     scheduleControlHeartbeat(250);
     schedule(runAdapter, 1000);
+    schedule(function () {
+      setInterval(scanAndProcessBrowserActions, 2000);
+    }, 1500);
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

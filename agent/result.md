@@ -1,5 +1,26 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P19.3 ChatGPT Plus Browser Control Bridge (implementation & acceptance complete 2026-09-30):
+- Delivered secure, browser-based control bridge enabling desktop Chrome ChatGPT Plus conversations to inspect and operate local DevOrchestrator over Tampermonkey (`browser/chatgpt-web-adapter.user.js`), port 8765 bridge, and port 8770 control plane with zero RDC calls, no OpenAI API billing, no Business workspace, no public exposure, without weakening or replacing P19.2 (remote MCP).
+- Strict channel isolation: DevOrchestrator control requests (`[DEVORCH_ACTION_V1]`) and responses (`[DEVORCH_ACTION_RESULT_V1]`) are strictly isolated from the Web Sol inference queue (`/v1/claim`, `/v1/response`) and never enter `BrowserBridgeStore` queues.
+- Structured protocol: enforces typed JSON action envelopes; arbitrary shell execution is prohibited.
+- Confirmation policy: read-only actions (`status`, `job_status`, `read_log`, `read_file`, `commands_catalog`) execute automatically with valid capability token; effectful actions (`start_task`, `cancel_job`) strictly require visible DOM modal confirmation (`showEffectfulConfirmationModal`) before execution.
+- Hardware safety: hardware commands in `commands_catalog` are non-selectable and fail closed.
+- Path traversal fail-closed: `read_file` prevents repo root escapes.
+- Implementation components:
+  - `src/dev_orchestrator/control/security.py`: browser control capability store, token creation, HMAC verification, scoping, revocation.
+  - `src/dev_orchestrator/cli.py`: `dev-orchestrator browser-token {mint,list,revoke}` CLI.
+  - `src/dev_orchestrator/control/browser_control.py`: protocol parser/formatter, `BrowserControlRequestStore` (locking, replay idempotency, conflict detection), `BrowserControlService` dispatching to shared operations layer (`operations.py`).
+  - `src/dev_orchestrator/bridge/server.py`: `OPTIONS /v1/control/action` (CORS preflight for `https://chatgpt.com`), `GET /v1/control/health`, `POST /v1/control/action` endpoints with capability token auth.
+  - `src/dev_orchestrator/daemon.py`: wired bridge server with runtime_root and config_path.
+  - `src/dev_orchestrator/web/server.py`: registered browser control web endpoints (`POST /api/v1/control/browser-control/action` and GET/POST `/api/v1/control/browser-control-capabilities`).
+  - `browser/chatgpt-web-adapter.user.js`: pairing/token management, action scanning, DOM confirmation modal, dispatch, auto-submission into `#prompt-textarea`.
+- Verification & Acceptance:
+  - Acceptance script: `python ops/p19_3_browser_control_acceptance.py` passed all 18 steps against live bridge (:8765) and daemon (:8770).
+  - Acceptance evidence: `docs/evidence/P19_3_BROWSER_CONTROL_ACCEPTANCE.json` and `docs/evidence/P19_3_BROWSER_CONTROL_OPERATIONS.ndjson` (result PASS, 6 native operations, 100% `local`, 0 RDC calls, confirmation gate enforced, channel isolation enforced).
+  - Test suites: 18/18 passed in `tests_py/test_p19_3_browser_control.py`; 15/15 passed in `tests_py/test_p19_2_remote_mcp.py`; 9/9 passed in `tests_py/test_p19_web_console.py`; 7/7 passed in `tests_py/test_p18_external_control.py`; 3/3 passed in `tests_py/test_bridge_http.py`; 14/14 passed in `tests_py/test_chatgpt_web_adapter.py`; `node --check browser/chatgpt-web-adapter.user.js` clean; `compileall` clean; `git diff --check` clean; `graphify update .` clean.
+- Design documentation: `docs/P19_3_BROWSER_CONTROL_DESIGN.md`.
+
 P19.2 Remote MCP Interface (remediation complete / ready for review 2026-09-30):
 - Remediated all three blocking Technical Review findings from `runtime/ai-reviewer.json` (`ai_review:wd-c7cf38273a315c31`):
   1. Origin validation & CORS: replaced naive `startswith()` prefix match in `src/dev_orchestrator/web/server.py` with canonical `ControlSecurity.valid_origin` (`self._same_origin()`) for POST, DELETE, and OPTIONS on `/mcp`. OPTIONS returns 403 on invalid origins; emits `Access-Control-Allow-Origin: {origin}` with `Vary: Origin` only for validated loopback origins; omits CORS header when request has no Origin.

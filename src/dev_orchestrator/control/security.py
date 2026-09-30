@@ -155,6 +155,7 @@ class ControlSecurity:
             "mobile_revocation_generation": 0,
             "transport_capabilities": {},
             "mcp_capabilities": {},
+            "browser_control_capabilities": {},
         }
 
     def _load_canonical_pairings(self, *, for_mutation: bool = False) -> dict[str, Any] | None:
@@ -181,6 +182,7 @@ class ControlSecurity:
             "mobile_revocation_generation": int(val.get("mobile_revocation_generation", 0)),
             "transport_capabilities": val.get("transport_capabilities") if isinstance(val.get("transport_capabilities"), dict) else {},
             "mcp_capabilities": val.get("mcp_capabilities") if isinstance(val.get("mcp_capabilities"), dict) else {},
+            "browser_control_capabilities": val.get("browser_control_capabilities") if isinstance(val.get("browser_control_capabilities"), dict) else {},
         }
 
     def _pairings(self) -> dict[str, Any]:
@@ -1084,6 +1086,149 @@ class ControlSecurity:
 
         return False, "invalid_or_revoked_token", None
 
+    def create_browser_control_capability(
+        self,
+        *,
+        project_id: str = "devorchestrator",
+        allowed_actions: Optional[list[str]] = None,
+        label: str = "",
+        ttl_seconds: int = 86400 * 30,
+    ) -> dict[str, Any]:
+        """Mint a new revocable bearer capability token for ChatGPT browser control bridge."""
+        cap_id = "bc-" + secrets.token_urlsafe(16)
+        raw_secret = f"bc_{secrets.token_urlsafe(32)}"
+        token_hash = _digest(raw_secret)
+        now = time.time()
+        now_iso = utc_now_iso()
+        expires_at_epoch = now + ttl_seconds
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+
+        row = {
+            "capability_id": cap_id,
+            "token_hash": token_hash,
+            "project_id": project_id.strip() if project_id else "*",
+            "allowed_actions": sorted(allowed_actions or ["*"]),
+            "label": label,
+            "created_at": now_iso,
+            "expires_at": expires_at,
+            "expires_at_epoch": expires_at_epoch,
+            "revoked": False,
+            "revoked_at": None,
+        }
+
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_canonical_pairings(for_mutation=True)
+            if not isinstance(data, dict):
+                raise ValueError("cannot access canonical capability state")
+            bc_caps = data.setdefault("browser_control_capabilities", {})
+            bc_caps[cap_id] = row
+            write_json(self.pairings_path, data, indent=2)
+
+        return {
+            "capability_id": cap_id,
+            "token": raw_secret,  # disclosed only once upon creation
+            "project_id": project_id.strip() if project_id else "*",
+            "allowed_actions": sorted(allowed_actions or ["*"]),
+            "label": label,
+            "created_at": now_iso,
+            "expires_at": expires_at,
+            "expires_in_seconds": ttl_seconds,
+        }
+
+    def list_browser_control_capabilities(self) -> list[dict[str, Any]]:
+        """List non-secret metadata for browser-control capability tokens."""
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if not isinstance(data, dict):
+                return []
+            bc_caps = data.get("browser_control_capabilities", {})
+            results = []
+            for row in bc_caps.values():
+                if isinstance(row, dict):
+                    results.append({
+                        "capability_id": row.get("capability_id"),
+                        "project_id": row.get("project_id", "*"),
+                        "allowed_actions": row.get("allowed_actions", ["*"]),
+                        "label": row.get("label", ""),
+                        "created_at": row.get("created_at"),
+                        "expires_at": row.get("expires_at"),
+                        "revoked": bool(row.get("revoked")),
+                        "revoked_at": row.get("revoked_at"),
+                    })
+            return sorted(results, key=lambda x: str(x.get("created_at") or ""))
+        except Exception:
+            return []
+
+    def revoke_browser_control_capability(self, capability_id: str) -> dict[str, Any]:
+        """Revoke a browser-control capability token by ID."""
+        clean_id = capability_id.strip()
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_canonical_pairings(for_mutation=True)
+            if not isinstance(data, dict):
+                raise ValueError("cannot access canonical capability state")
+            bc_caps = data.setdefault("browser_control_capabilities", {})
+            row = bc_caps.get(clean_id)
+            if not isinstance(row, dict):
+                return {"capability_id": clean_id, "revoked": False, "error": "not_found"}
+            row["revoked"] = True
+            row["revoked_at"] = utc_now_iso()
+            write_json(self.pairings_path, data, indent=2)
+            return {"capability_id": clean_id, "revoked": True}
+
+    def validate_browser_control_capability(
+        self,
+        token_or_header: Optional[str],
+        *,
+        project_id: Optional[str] = None,
+        action: Optional[str] = None,
+    ) -> tuple[bool, str, Optional[dict[str, Any]]]:
+        """Validate bearer token against master owner token or active browser control capability token."""
+        if not token_or_header:
+            return False, "missing_token", None
+
+        # Check master owner token first
+        if self.bearer_authorized(token_or_header):
+            return True, "valid", {"capability_id": "master", "label": "master", "project_id": "*", "allowed_actions": ["*"]}
+
+        tok = token_or_header[7:].strip() if token_or_header.startswith("Bearer ") else token_or_header.strip()
+        if not tok:
+            return False, "empty_token", None
+
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if data is None:
+                return False, "capability_store_missing", None
+        except Exception as exc:
+            return False, f"capability_store_unreadable: {exc}", None
+
+        bc_caps = data.get("browser_control_capabilities")
+        if not isinstance(bc_caps, dict):
+            return False, "invalid_or_revoked_token", None
+
+        t_digest = _digest(tok)
+        now = time.time()
+        for row in bc_caps.values():
+            if not isinstance(row, dict):
+                continue
+            if not hmac.compare_digest(str(row.get("token_hash") or ""), t_digest):
+                continue
+            if row.get("revoked"):
+                return False, "token_revoked", None
+            if float(row.get("expires_at_epoch", 0)) <= now:
+                return False, "token_expired", None
+
+            bound_proj = row.get("project_id", "*")
+            if bound_proj != "*" and project_id and bound_proj != project_id:
+                return False, f"project_mismatch: capability bound to {bound_proj}, requested {project_id}", None
+
+            allowed_actions = row.get("allowed_actions", ["*"])
+            if allowed_actions and "*" not in allowed_actions and action and action not in allowed_actions:
+                return False, f"action_not_allowed: {action}", None
+
+            return True, "valid", row
+
+        return False, "invalid_or_revoked_token", None
+
 
 def capability_state(pairing_id: str, runtime_root: Path | str | None = None) -> CapabilityVerdict:
     return ControlSecurity(runtime_root=runtime_root).capability_state(pairing_id)
@@ -1212,3 +1357,46 @@ def validate_mcp_token(
     runtime_root: Path | str | None = None,
 ) -> tuple[bool, str, Optional[dict[str, Any]]]:
     return ControlSecurity(runtime_root=runtime_root).validate_mcp_token(token_or_header)
+
+
+def create_browser_control_capability(
+    *,
+    project_id: str = "devorchestrator",
+    allowed_actions: Optional[list[str]] = None,
+    label: str = "",
+    ttl_seconds: int = 86400 * 30,
+    runtime_root: Path | str | None = None,
+) -> dict[str, Any]:
+    return ControlSecurity(runtime_root=runtime_root).create_browser_control_capability(
+        project_id=project_id,
+        allowed_actions=allowed_actions,
+        label=label,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def list_browser_control_capabilities(
+    runtime_root: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    return ControlSecurity(runtime_root=runtime_root).list_browser_control_capabilities()
+
+
+def revoke_browser_control_capability(
+    capability_id: str,
+    runtime_root: Path | str | None = None,
+) -> dict[str, Any]:
+    return ControlSecurity(runtime_root=runtime_root).revoke_browser_control_capability(capability_id)
+
+
+def validate_browser_control_capability(
+    token_or_header: Optional[str],
+    *,
+    project_id: Optional[str] = None,
+    action: Optional[str] = None,
+    runtime_root: Path | str | None = None,
+) -> tuple[bool, str, Optional[dict[str, Any]]]:
+    return ControlSecurity(runtime_root=runtime_root).validate_browser_control_capability(
+        token_or_header,
+        project_id=project_id,
+        action=action,
+    )

@@ -1608,6 +1608,38 @@ def cmd_mcp_token(args: argparse.Namespace) -> int:
         raise CliError("mcp-token subcommand required: mint, list, revoke")
 
 
+def cmd_browser_token(args: argparse.Namespace) -> int:
+    action = getattr(args, "browser_token_action", None)
+    runtime = resolve_runtime_root(args.runtime_root)
+    if action == "mint":
+        from dev_orchestrator.control.security import create_browser_control_capability
+        actions_str = getattr(args, "allowed_actions", "") or ""
+        allowed_actions = [a.strip() for a in actions_str.split(",") if a.strip()] if actions_str else None
+        cap = create_browser_control_capability(
+            project_id=getattr(args, "project_id", "devorchestrator") or "devorchestrator",
+            allowed_actions=allowed_actions,
+            label=getattr(args, "label", "") or "",
+            ttl_seconds=int(getattr(args, "ttl", 86400 * 30)),
+            runtime_root=runtime,
+        )
+        sys.stdout.write(json.dumps(cap, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    elif action == "list":
+        from dev_orchestrator.control.security import list_browser_control_capabilities
+        caps = list_browser_control_capabilities(runtime_root=runtime)
+        sys.stdout.write(json.dumps({"capabilities": caps, "count": len(caps)}, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    elif action == "revoke":
+        from dev_orchestrator.control.security import revoke_browser_control_capability
+        cap_id = getattr(args, "capability_id", None)
+        if not cap_id:
+            raise CliError("capability_id is required")
+        res = revoke_browser_control_capability(str(cap_id), runtime_root=runtime)
+        sys.stdout.write(json.dumps(res, indent=2, ensure_ascii=False) + "\n")
+        return 0 if res.get("revoked") else 1
+    else:
+        raise CliError("browser-token subcommand required: mint, list, revoke")
+
 
 def cmd_review_submit(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
@@ -2208,6 +2240,23 @@ def build_parser() -> argparse.ArgumentParser:
     revoke_p.add_argument("capability_id", help="capability ID to revoke")
     revoke_p.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
+    browser_token_parser = sub.add_parser("browser-token", help="manage revocable tokens for ChatGPT browser control access")
+    browser_token_sub = browser_token_parser.add_subparsers(dest="browser_token_action")
+
+    b_mint_p = browser_token_sub.add_parser("mint", help="mint a new revocable browser-control token")
+    b_mint_p.add_argument("--project-id", default="devorchestrator", help="target project ID (default: devorchestrator, or '*' for all)")
+    b_mint_p.add_argument("--allowed-actions", default="", help="comma-separated list of allowed actions (default: all)")
+    b_mint_p.add_argument("--label", default="", help="human-readable label")
+    b_mint_p.add_argument("--ttl", type=int, default=86400 * 30, help="TTL in seconds (default: 30 days)")
+    b_mint_p.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    b_list_p = browser_token_sub.add_parser("list", help="list active browser-control capability tokens")
+    b_list_p.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    b_revoke_p = browser_token_sub.add_parser("revoke", help="revoke a browser-control capability token")
+    b_revoke_p.add_argument("capability_id", help="capability ID to revoke")
+    b_revoke_p.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
 
     create_cap = sub.add_parser("create-web-bridge-capability", help="issue a scoped web bridge capability token")
     create_cap.add_argument("project_id", help="target project ID")
@@ -2561,6 +2610,7 @@ _COMMANDS = {
     "control-overview": cmd_control_overview,
     "mcp-adapter": cmd_mcp_adapter,
     "mcp-token": cmd_mcp_token,
+    "browser-token": cmd_browser_token,
     "create-web-bridge-capability": cmd_create_web_bridge_capability,
     "revoke-web-bridge-capability": cmd_revoke_web_bridge_capability,
     "mobile-pair": cmd_mobile_pair,
