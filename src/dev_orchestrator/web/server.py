@@ -83,7 +83,7 @@ _CONTROL_REVIEW_COVERAGE_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-
 _CONTROL_REVIEW_ARTIFACT_PATH_RE = re.compile(r"^/api/v1/control/reviews/([A-Za-z0-9_:-]+)/artifacts/([A-Za-z0-9_.-]+)$")
 
 _ALLOW_HEADER = "GET, HEAD"
-_CONTROL_ALLOW_HEADER = "GET, HEAD, POST, OPTIONS"
+_CONTROL_ALLOW_HEADER = "GET, HEAD, POST, OPTIONS, DELETE"
 _MAX_CONTROL_BODY = 64 * 1024
 _MAX_STAGE_WRITE_BODY = 16 * 1024 * 1024
 
@@ -97,6 +97,7 @@ _SELF_AUTHENTICATING_TRANSPORT_PATHS = {
 }
 
 _EXTERNAL_OPERATION_PATHS = {
+    "/mcp": "mcp",
     "/api/v1/control/external/status": "status",
     "/api/v1/control/logs": "logs",
     "/api/v1/control/transport/hosts": "transport_hosts",
@@ -589,6 +590,16 @@ class DevOrchestratorHTTPServer(ThreadingHTTPServer):
         self.websol_health_store = WebSolHealthStore(self.runtime_root)
         self.bridge_store: Any | None = None
         self.control_security = ControlSecurity(self.runtime_root) if self.control_enabled else None
+        if self.control_enabled:
+            from dev_orchestrator.control.mcp_http import MCPHttpEndpoint
+            self.mcp_endpoint: Optional[MCPHttpEndpoint] = MCPHttpEndpoint(
+                self.runtime_root,
+                config_path=self.config_path,
+                bridge_store=lambda: getattr(self, "bridge_store", None),
+                audit_fn=self.command_store.audit,
+            )
+        else:
+            self.mcp_endpoint = None
         self._heartbeat_lock = threading.Lock()
         super().__init__(server_address, _DashboardHandler)
         self.touch_heartbeat(None)
@@ -648,13 +659,60 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self._dispatch_method_not_allowed()
 
     do_PUT = _unsupported
-    do_DELETE = _unsupported
+
+    def do_DELETE(self) -> None:
+        if not self._begin_external_request():
+            return
+        if not self.server.control_enabled:
+            self._dispatch_method_not_allowed()
+            return
+        path = urlsplit(self.path).path
+        if path == "/mcp":
+            if not self._client_is_loopback():
+                self._error(403, "Forbidden", "loopback access required", False)
+                return
+            if getattr(self.server, "mcp_endpoint", None) is None:
+                self._error(503, "Service Unavailable", "MCP endpoint not enabled", False)
+                return
+            origin = self.headers.get("Origin")
+            if origin and not origin.startswith(("http://127.0.0.1", "http://localhost", "https://localhost")):
+                self._error(403, "Forbidden", "forbidden origin", False)
+                return
+            auth_header = self.headers.get("Authorization")
+            auth_ok, auth_err, _ = self.server.control_security.validate_mcp_token(auth_header)
+            if not auth_ok:
+                self._error(401, "Unauthorized", auth_err or "valid MCP authorization required", False)
+                return
+            session_id = self.headers.get("Mcp-Session-Id") or self.headers.get("mcp-session-id")
+            if not session_id:
+                self._error(400, "Bad Request", "Mcp-Session-Id header required", False)
+                return
+            deleted = self.server.mcp_endpoint.delete_session(str(session_id).strip())
+            payload = {"status": "ok", "deleted": deleted, "session_id": str(session_id).strip()}
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(payload), False)
+            self._touch_after_request()
+            return
+        self._dispatch_method_not_allowed()
+
     do_PATCH = _unsupported
+
     def do_OPTIONS(self) -> None:
         if not self.server.control_enabled or not self._client_is_loopback():
             self._dispatch_method_not_allowed()
             return
         path = urlsplit(self.path).path
+        if path == "/mcp":
+            self._send(
+                204, "No Content", "application/json; charset=utf-8", b"", False,
+                {
+                    "Allow": "POST, DELETE, OPTIONS",
+                    "Access-Control-Allow-Origin": self.headers.get("Origin") or "*",
+                    "Access-Control-Allow-Methods": "POST, DELETE, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type, Mcp-Session-Id, MCP-Protocol-Version, X-DevOrch-Request-ID, Accept",
+                },
+            )
+            self._touch_after_request()
+            return
         if (
             path not in {
                 "/api/v1/control/adapter-pairings/redeem",
@@ -823,6 +881,16 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._error(404, "Not Found", "route not found", head_only)
                 return
             self._send(200, "OK", content_type, body, head_only)
+            return
+
+        if path == "/mcp":
+            self._error(
+                405,
+                "Method Not Allowed",
+                "remote MCP endpoint requires POST or DELETE",
+                head_only,
+                {"Allow": "POST, DELETE"},
+            )
             return
 
         runtime = self.server.runtime_root
@@ -1268,47 +1336,37 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             )
             if not auth_ok:
                 self._error(401, "Unauthorized", auth_err or "valid control authorization required", head_only); return
-            import base64
-            from dev_orchestrator.transport.contracts import FileReadRequest
             try:
                 max_bytes = max(1, min(10 * 1024 * 1024, int(q_params.get("max_bytes", [10 * 1024 * 1024])[0])))
                 offset_bytes = max(0, int(q_params.get("offset_bytes", [0])[0]))
             except (TypeError, ValueError):
                 self._error(400, "Bad Request", "max_bytes and offset_bytes must be integers", head_only); return
             try:
-                transport = _get_transport_for_host(runtime, host_id, operation="read_file", effect_class="read_only")
-                file_res = transport.read_file(FileReadRequest(project_id=project_id, path=path_param, host_id=host_id, max_bytes=max_bytes, offset_bytes=offset_bytes))
-                b64_str = base64.b64encode(file_res.content_bytes).decode("ascii") if file_res.content_bytes else None
+                from dev_orchestrator.control.operations import ControlOperationError, read_file
+                res_dict = read_file(
+                    runtime,
+                    project_id=project_id,
+                    path=path_param,
+                    host_id=host_id,
+                    max_bytes=max_bytes,
+                    offset_bytes=offset_bytes,
+                    request_id=getattr(self, "_external_request_id", None),
+                    capability_id=cap_id,
+                )
                 payload = _control_envelope({
-                    "status": file_res.status,
-                    "path": file_res.path,
-                    "content_sha256": file_res.content_sha256,
-                    "size_bytes": file_res.size_bytes,
-                    "content_base64": b64_str,
-                    "host_identity": file_res.host_identity,
-                    "error": file_res.error,
-                    "selected_transport": _selected_transport_name(transport),
+                    "status": res_dict["status"],
+                    "path": res_dict["path"],
+                    "content_sha256": res_dict["content_sha256"],
+                    "size_bytes": res_dict["size_bytes"],
+                    "content_base64": res_dict["content_base64"],
+                    "host_identity": res_dict["host_identity"],
+                    "error": res_dict["error"],
+                    "selected_transport": res_dict["selected_transport"],
                 })
+            except ControlOperationError as exc:
+                self._error(exc.status_code, exc.reason, exc.message, head_only); return
             except Exception as exc:
                 self._error(400, "Bad Request", str(exc), head_only); return
-
-            try:
-                from dev_orchestrator.transport.observability import log_transport_operation
-                log_transport_operation(
-                    runtime,
-                    operation_id=f"read-{uuid4().hex[:12]}",
-                    request_id=getattr(self, "_external_request_id", None),
-                    operation="read_file",
-                    host_id=host_id,
-                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
-                    status=file_res.status,
-                    project_id=project_id,
-                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
-                    capability_id=cap_id,
-                    error=file_res.error,
-                )
-            except Exception:
-                pass
 
         elif path == "/api/monitor":
             payload = monitor_payload(runtime)
@@ -1482,6 +1540,63 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         security = self.server.control_security
         if security is None:
             self._dispatch_method_not_allowed(); return
+        if path == "/mcp":
+            if getattr(self.server, "mcp_endpoint", None) is None:
+                self._error(503, "Service Unavailable", "MCP endpoint not enabled", False)
+                return
+            origin = self.headers.get("Origin")
+            if origin and not origin.startswith(("http://127.0.0.1", "http://localhost", "https://localhost")):
+                self._error(403, "Forbidden", "forbidden origin", False)
+                return
+            auth_header = self.headers.get("Authorization")
+            auth_ok, auth_err, auth_ctx = security.validate_mcp_token(auth_header)
+            if not auth_ok:
+                self._error(401, "Unauthorized", auth_err or "valid MCP authorization required", False)
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                self._error(400, "Bad Request", "invalid Content-Length", False)
+                return
+            if length <= 0 or length > _MAX_CONTROL_BODY:
+                self._error(400, "Bad Request", f"request body must be between 1 and {_MAX_CONTROL_BODY} bytes", False)
+                return
+            raw_body = self.rfile.read(length)
+            if len(raw_body) != length:
+                self._error(400, "Bad Request", "unexpected EOF reading request body", False)
+                return
+
+            req_id = getattr(self, "_external_request_id", None)
+            status_code, resp_headers, resp_body = self.server.mcp_endpoint.handle_request(
+                raw_body,
+                headers=self.headers,
+                request_id=req_id,
+                auth_context=auth_ctx,
+            )
+            content_type = resp_headers.pop("Content-Type", "application/json; charset=utf-8")
+            _reason_map = {
+                200: "OK",
+                202: "Accepted",
+                204: "No Content",
+                400: "Bad Request",
+                401: "Unauthorized",
+                403: "Forbidden",
+                404: "Not Found",
+                405: "Method Not Allowed",
+                429: "Too Many Requests",
+                500: "Internal Server Error",
+                503: "Service Unavailable",
+            }
+            self._send(
+                status_code,
+                _reason_map.get(status_code, "HTTP Response"),
+                content_type,
+                resp_body,
+                False,
+                extra_headers=resp_headers,
+            )
+            return
         if path == "/api/v1/control/browser-sessions":
             if not self._same_origin() or not self._fetch_metadata_ok():
                 self._error(403, "Forbidden", "browser session requires same-origin request", False); return
@@ -1886,103 +2001,29 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if not auth_ok:
                 self._error(403, "Forbidden", auth_err or "forbidden", False); return
 
-            from dev_orchestrator.transport.hosts import load_transport_hosts_config
-            h_cfg = load_transport_hosts_config(runtime)
-            is_local = (host_id == "local")
-            p_digest = None
-            ep_digest = None
-            res_digest = None
-            effect_cls = "effectful"
-            if not is_local:
-                profile = h_cfg.hosts.get(host_id)
-                if profile is None:
-                    self._error(400, "Bad Request", f"unknown host_id: {host_id}", False); return
-                from dev_orchestrator.transport.ssh import SSHMachineTransport
-                from dev_orchestrator.transport.contracts import MachineOperation
-                ssh_t = SSHMachineTransport(profile)
-                op_probe = MachineOperation(
-                    project_id=project_id,
-                    command_ref=command_ref,
-                    idempotency_key=f"resolve-{idem_key}",
-                    parameters=value.get("parameters"),
-                    expected_working_directory=value.get("expected_working_directory"),
-                )
-                try:
-                    resolved_info = ssh_t.resolve(op_probe)
-                except Exception as exc:
-                    self._error(400, "Bad Request", f"remote resolution failed: {exc}", False); return
-                ep_digest = resolved_info.get("execution_policy_digest")
-                res_digest = resolved_info.get("resolution_digest")
-                p_digest = resolved_info.get("parameters_digest")
-                effect_cls = resolved_info.get("effect_class", "effectful")
-            else:
-                from dev_orchestrator.jobs.config import load_jobs_config, resolve_execution_policy
-                jobs_cfg = load_jobs_config(runtime / "execution-jobs.json")
-                if jobs_cfg and project_id and command_ref:
-                    ok_pol, _, resolved = resolve_execution_policy(
-                        jobs_cfg,
-                        project_id,
-                        command_ref,
-                        parameters=value.get("parameters"),
-                        expected_working_directory=value.get("expected_working_directory"),
-                    )
-                    if ok_pol and resolved:
-                        p_digest = resolved.parameters_digest
-                        ep_digest = resolved.execution_policy_digest
-                        res_digest = resolved.resolution_digest
-                        effect_cls = resolved.effect_class
-
+            from dev_orchestrator.control.operations import ControlOperationError, spawn_job
             try:
-                transport = _get_transport_for_host(
+                res_data = spawn_job(
                     runtime,
-                    host_id,
-                    operation="spawn",
-                    command_ref=command_ref,
-                    effect_class=effect_cls,
-                    policy_digest=ep_digest,
-                )
-                from dev_orchestrator.transport.contracts import MachineOperation
-                import dataclasses
-                op = MachineOperation(
                     project_id=project_id,
                     command_ref=command_ref,
                     idempotency_key=idem_key,
+                    host_id=host_id,
                     parameters=value.get("parameters"),
                     expected_working_directory=value.get("expected_working_directory"),
                     input_digest=value.get("input_digest"),
+                    request_id=getattr(self, "_external_request_id", None),
+                    capability_id=cap_id,
                 )
-                res = transport.spawn(op)
+            except ControlOperationError as exc:
+                self._error(exc.status_code, exc.reason, exc.message, False); return
             except Exception as exc:
                 self._error(400, "Bad Request", str(exc), False); return
 
-            try:
-                from dev_orchestrator.transport.observability import log_transport_operation
-                log_transport_operation(
-                    runtime,
-                    operation_id=getattr(res, "operation_id", idem_key),
-                    request_id=getattr(self, "_external_request_id", None),
-                    operation="spawn",
-                    host_id=host_id,
-                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
-                    status=res.status,
-                    project_id=project_id,
-                    command_ref=command_ref,
-                    parameters_names=sorted((value.get("parameters") or {}).keys()),
-                    parameters_digest=getattr(res, "parameters_digest", p_digest),
-                    execution_policy_digest=getattr(res, "execution_policy_digest", ep_digest),
-                    resolution_digest=getattr(res, "resolution_digest", res_digest),
-                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
-                    capability_id=cap_id,
-                    duration_seconds=getattr(res, "duration_seconds", None),
-                    exit_code=getattr(res, "exit_code", None),
-                    error=res.error,
-                )
-            except Exception:
-                pass
-
-            res_data = dataclasses.asdict(res)
-            res_data["selected_transport"] = _selected_transport_name(transport)
-            self._send(202 if res.status in ("ok", "queued", "running") else 400, "Accepted" if res.status in ("ok", "queued", "running") else "Bad Request", "application/json; charset=utf-8", _json_bytes(_control_envelope(res_data)), False)
+            res_status = res_data.get("status")
+            status_code = 202 if res_status in ("ok", "queued", "running") else 400
+            reason_str = "Accepted" if res_status in ("ok", "queued", "running") else "Bad Request"
+            self._send(status_code, reason_str, "application/json; charset=utf-8", _json_bytes(_control_envelope(res_data)), False)
             return
 
         if path == "/api/v1/control/transport/poll":
@@ -1999,39 +2040,22 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             )
             if not auth_ok:
                 self._error(403, "Forbidden", auth_err or "forbidden", False); return
-            if host_id == "local":
-                belongs, reason = _local_job_belongs_to_project(runtime, op_id, project_id)
-                if not belongs:
-                    self._error(404 if reason == "job not found" else 403, "Not Found" if reason == "job not found" else "Forbidden", reason, False); return
 
+            from dev_orchestrator.control.operations import ControlOperationError, poll_job
             try:
-                transport = _get_transport_for_host(runtime, host_id, operation="poll", effect_class="read_only")
-                import dataclasses
-                res = transport.poll(op_id, host_id=host_id)
+                res_data = poll_job(
+                    runtime,
+                    project_id=project_id,
+                    operation_id=op_id,
+                    host_id=host_id,
+                    request_id=getattr(self, "_external_request_id", None),
+                    capability_id=cap_id,
+                )
+            except ControlOperationError as exc:
+                self._error(exc.status_code, exc.reason, exc.message, False); return
             except Exception as exc:
                 self._error(400, "Bad Request", str(exc), False); return
 
-            try:
-                from dev_orchestrator.transport.observability import log_transport_operation
-                log_transport_operation(
-                    runtime,
-                    operation_id=str(op_id),
-                    request_id=getattr(self, "_external_request_id", None),
-                    operation="poll",
-                    host_id=host_id,
-                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
-                    status=res.status,
-                    project_id=project_id,
-                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
-                    capability_id=cap_id,
-                    exit_code=res.exit_code,
-                    error=res.error,
-                )
-            except Exception:
-                pass
-
-            res_data = dataclasses.asdict(res)
-            res_data["selected_transport"] = _selected_transport_name(transport)
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(res_data)), False)
             return
 
@@ -2050,38 +2074,23 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             )
             if not auth_ok:
                 self._error(403, "Forbidden", auth_err or "forbidden", False); return
-            if host_id == "local":
-                belongs, owner_reason = _local_job_belongs_to_project(runtime, op_id, project_id)
-                if not belongs:
-                    self._error(404 if owner_reason == "job not found" else 403, "Not Found" if owner_reason == "job not found" else "Forbidden", owner_reason, False); return
 
+            from dev_orchestrator.control.operations import ControlOperationError, cancel_job
             try:
-                transport = _get_transport_for_host(runtime, host_id, operation="cancel", effect_class="effectful")
-                import dataclasses
-                res = transport.cancel(op_id, host_id=host_id, reason=reason)
+                res_data = cancel_job(
+                    runtime,
+                    project_id=project_id,
+                    operation_id=op_id,
+                    host_id=host_id,
+                    reason=reason,
+                    request_id=getattr(self, "_external_request_id", None),
+                    capability_id=cap_id,
+                )
+            except ControlOperationError as exc:
+                self._error(exc.status_code, exc.reason, exc.message, False); return
             except Exception as exc:
                 self._error(400, "Bad Request", str(exc), False); return
 
-            try:
-                from dev_orchestrator.transport.observability import log_transport_operation
-                log_transport_operation(
-                    runtime,
-                    operation_id=str(op_id),
-                    request_id=getattr(self, "_external_request_id", None),
-                    operation="cancel",
-                    host_id=host_id,
-                    selected_transport=getattr(getattr(transport, "last_selection", None), "selected_transport", "local"),
-                    status=res.status,
-                    project_id=project_id,
-                    candidate_reasons=getattr(getattr(transport, "last_selection", None), "candidate_rejections", None),
-                    capability_id=cap_id,
-                    error=res.error,
-                )
-            except Exception:
-                pass
-
-            res_data = dataclasses.asdict(res)
-            res_data["selected_transport"] = _selected_transport_name(transport)
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(res_data)), False)
             return
 

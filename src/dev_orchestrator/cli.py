@@ -1576,6 +1576,36 @@ def cmd_transport_capability_revoke(args: argparse.Namespace) -> int:
     return 0 if res.get("revoked") else 1
 
 
+def cmd_mcp_token(args: argparse.Namespace) -> int:
+    action = getattr(args, "mcp_token_action", None)
+    runtime = resolve_runtime_root(args.runtime_root)
+    if action == "mint":
+        from dev_orchestrator.control.security import create_mcp_capability
+        cap = create_mcp_capability(
+            label=getattr(args, "label", "") or "",
+            ttl_seconds=int(getattr(args, "ttl", 86400 * 30)),
+            runtime_root=runtime,
+        )
+        sys.stdout.write(json.dumps(cap, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    elif action == "list":
+        from dev_orchestrator.control.security import list_mcp_capabilities
+        caps = list_mcp_capabilities(runtime_root=runtime)
+        sys.stdout.write(json.dumps({"capabilities": caps, "count": len(caps)}, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    elif action == "revoke":
+        from dev_orchestrator.control.security import revoke_mcp_capability
+        cap_id = getattr(args, "capability_id", None)
+        if not cap_id:
+            raise CliError("capability_id is required")
+        res = revoke_mcp_capability(str(cap_id), runtime_root=runtime)
+        sys.stdout.write(json.dumps(res, indent=2, ensure_ascii=False) + "\n")
+        return 0 if res.get("revoked") else 1
+    else:
+        raise CliError("mcp-token subcommand required: mint, list, revoke")
+
+
+
 def cmd_review_submit(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
     from dev_orchestrator.review.models import ReviewRequest
@@ -2159,6 +2189,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly expose privileged native exec/job/file MCP tools",
     )
 
+    mcp_token_parser = sub.add_parser("mcp-token", help="manage revocable tokens for remote MCP access")
+    mcp_token_sub = mcp_token_parser.add_subparsers(dest="mcp_token_action")
+
+    mint_p = mcp_token_sub.add_parser("mint", help="mint a new revocable MCP token")
+    mint_p.add_argument("--label", default="", help="human-readable label")
+    mint_p.add_argument("--ttl", type=int, default=86400 * 30, help="TTL in seconds (default: 30 days)")
+    mint_p.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    list_p = mcp_token_sub.add_parser("list", help="list active MCP capability tokens")
+    list_p.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    revoke_p = mcp_token_sub.add_parser("revoke", help="revoke an MCP capability token")
+    revoke_p.add_argument("capability_id", help="capability ID to revoke")
+    revoke_p.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+
     create_cap = sub.add_parser("create-web-bridge-capability", help="issue a scoped web bridge capability token")
     create_cap.add_argument("project_id", help="target project ID")
     create_cap.add_argument("binding_id", help="browser conversation binding ID")
@@ -2510,6 +2556,7 @@ _COMMANDS = {
     "project-control": cmd_project_control,
     "control-overview": cmd_control_overview,
     "mcp-adapter": cmd_mcp_adapter,
+    "mcp-token": cmd_mcp_token,
     "create-web-bridge-capability": cmd_create_web_bridge_capability,
     "revoke-web-bridge-capability": cmd_revoke_web_bridge_capability,
     "mobile-pair": cmd_mobile_pair,

@@ -82,7 +82,8 @@ rejected. Request IDs can be correlated with
 
 P19 does not write `runtime/transition-executor.json`, owner gates, invariant
 state, `agent/next.md`, or staged successor files. Normal reviewed lifecycle
-machinery remains solely responsible for advancing to P19.2.
+machinery remains solely responsible for advancing to P19.2 (see
+`docs/P19_2_REMOTE_MCP_DESIGN.md` for remote MCP interface details).
 
 Rollback is a source revert followed by a unified-daemon restart. P18 job,
 transport, write, audit, and lifecycle stores require no migration.

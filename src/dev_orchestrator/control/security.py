@@ -54,9 +54,14 @@ class ControlSecurity:
     SESSION_TTL_SECONDS = 15 * 60
     PAIRING_TTL_SECONDS = 5 * 60
 
-    def __init__(self, runtime_root: Path | str) -> None:
-        self.runtime_root = Path(runtime_root)
+    def __init__(self, runtime_root: Path | str | None = None) -> None:
+        if runtime_root is None:
+            from dev_orchestrator.config import resolve_runtime_root
+            self.runtime_root = resolve_runtime_root(None)
+        else:
+            self.runtime_root = Path(runtime_root)
         self.root = self.runtime_root / "control"
+        self.root.mkdir(parents=True, exist_ok=True)
         self.secret_path = self.root / "api-token"
         self.pairings_path = self.root / "adapter-capabilities.json"
         self.lock_path = self.root / "security.lock"
@@ -149,6 +154,7 @@ class ControlSecurity:
             "mobile_devices": {},
             "mobile_revocation_generation": 0,
             "transport_capabilities": {},
+            "mcp_capabilities": {},
         }
 
     def _load_canonical_pairings(self, *, for_mutation: bool = False) -> dict[str, Any] | None:
@@ -174,6 +180,7 @@ class ControlSecurity:
             "mobile_devices": val.get("mobile_devices") if isinstance(val.get("mobile_devices"), dict) else {},
             "mobile_revocation_generation": int(val.get("mobile_revocation_generation", 0)),
             "transport_capabilities": val.get("transport_capabilities") if isinstance(val.get("transport_capabilities"), dict) else {},
+            "mcp_capabilities": val.get("mcp_capabilities") if isinstance(val.get("mcp_capabilities"), dict) else {},
         }
 
     def _pairings(self) -> dict[str, Any]:
@@ -951,6 +958,132 @@ class ControlSecurity:
             write_json(nonce_file, data, indent=2)
             return True
 
+    def create_mcp_capability(
+        self,
+        *,
+        label: str = "",
+        ttl_seconds: int = 86400 * 30,
+        allowed_tools: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Mint a scoped, revocable MCP capability token. Returns token once."""
+        cap_id = "mcp-" + secrets.token_urlsafe(16)
+        raw_secret = f"mcp_{secrets.token_urlsafe(32)}"
+        token_hash = _digest(raw_secret)
+        now = time.time()
+        now_iso = utc_now_iso()
+        expires_at_epoch = now + ttl_seconds
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+
+        row = {
+            "capability_id": cap_id,
+            "token_hash": token_hash,
+            "label": label,
+            "allowed_tools": sorted(allowed_tools or ["*"]),
+            "created_at": now_iso,
+            "expires_at": expires_at,
+            "expires_at_epoch": expires_at_epoch,
+            "revoked": False,
+            "revoked_at": None,
+        }
+
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_canonical_pairings(for_mutation=True)
+            if not isinstance(data, dict):
+                raise ValueError("cannot access canonical capability state")
+            m_caps = data.setdefault("mcp_capabilities", {})
+            m_caps[cap_id] = row
+            write_json(self.pairings_path, data, indent=2)
+
+        return {
+            "capability_id": cap_id,
+            "token": raw_secret,  # disclosed only once upon creation
+            "label": label,
+            "allowed_tools": sorted(allowed_tools or ["*"]),
+            "created_at": now_iso,
+            "expires_at": expires_at,
+            "expires_in_seconds": ttl_seconds,
+        }
+
+    def list_mcp_capabilities(self) -> list[dict[str, Any]]:
+        """List non-secret metadata for MCP capability tokens."""
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if not isinstance(data, dict):
+                return []
+            m_caps = data.get("mcp_capabilities", {})
+            results = []
+            for row in m_caps.values():
+                if isinstance(row, dict):
+                    results.append({
+                        "capability_id": row.get("capability_id"),
+                        "label": row.get("label", ""),
+                        "allowed_tools": row.get("allowed_tools", ["*"]),
+                        "created_at": row.get("created_at"),
+                        "expires_at": row.get("expires_at"),
+                        "revoked": bool(row.get("revoked")),
+                        "revoked_at": row.get("revoked_at"),
+                    })
+            return sorted(results, key=lambda x: str(x.get("created_at") or ""))
+        except Exception:
+            return []
+
+    def revoke_mcp_capability(self, capability_id: str) -> dict[str, Any]:
+        """Revoke an MCP capability token by ID."""
+        clean_id = capability_id.strip()
+        with InterProcessFileLock(self.lock_path):
+            data = self._load_canonical_pairings(for_mutation=True)
+            if not isinstance(data, dict):
+                raise ValueError("cannot access canonical capability state")
+            m_caps = data.setdefault("mcp_capabilities", {})
+            row = m_caps.get(clean_id)
+            if not isinstance(row, dict):
+                return {"capability_id": clean_id, "revoked": False, "error": "not_found"}
+            row["revoked"] = True
+            row["revoked_at"] = utc_now_iso()
+            write_json(self.pairings_path, data, indent=2)
+            return {"capability_id": clean_id, "revoked": True}
+
+    def validate_mcp_token(
+        self, token_or_header: Optional[str]
+    ) -> tuple[bool, str, Optional[dict[str, Any]]]:
+        """Validate bearer token against master owner token or active MCP capability token."""
+        if not token_or_header:
+            return False, "missing_token", None
+
+        # Check master owner token first
+        if self.bearer_authorized(token_or_header):
+            return True, "valid", {"capability_id": "master", "label": "master", "allowed_tools": ["*"]}
+
+        tok = token_or_header[7:].strip() if token_or_header.startswith("Bearer ") else token_or_header.strip()
+        if not tok:
+            return False, "empty_token", None
+
+        try:
+            data = self._load_canonical_pairings(for_mutation=False)
+            if data is None:
+                return False, "capability_store_missing", None
+        except Exception as exc:
+            return False, f"capability_store_unreadable: {exc}", None
+
+        m_caps = data.get("mcp_capabilities")
+        if not isinstance(m_caps, dict):
+            return False, "invalid_or_revoked_token", None
+
+        t_digest = _digest(tok)
+        now = time.time()
+        for row in m_caps.values():
+            if not isinstance(row, dict):
+                continue
+            if not hmac.compare_digest(str(row.get("token_hash") or ""), t_digest):
+                continue
+            if row.get("revoked"):
+                return False, "token_revoked", None
+            if float(row.get("expires_at_epoch", 0)) <= now:
+                return False, "token_expired", None
+            return True, "valid", row
+
+        return False, "invalid_or_revoked_token", None
+
 
 def capability_state(pairing_id: str, runtime_root: Path | str | None = None) -> CapabilityVerdict:
     return ControlSecurity(runtime_root=runtime_root).capability_state(pairing_id)
@@ -1045,3 +1178,37 @@ def consume_request_nonce(
     return ControlSecurity(runtime_root=runtime_root).consume_request_nonce(
         capability_id, nonce, max_age_seconds=max_age_seconds
     )
+
+
+def create_mcp_capability(
+    *,
+    label: str = "",
+    ttl_seconds: int = 86400 * 30,
+    allowed_tools: Optional[list[str]] = None,
+    runtime_root: Path | str | None = None,
+) -> dict[str, Any]:
+    return ControlSecurity(runtime_root=runtime_root).create_mcp_capability(
+        label=label,
+        ttl_seconds=ttl_seconds,
+        allowed_tools=allowed_tools,
+    )
+
+
+def list_mcp_capabilities(
+    runtime_root: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    return ControlSecurity(runtime_root=runtime_root).list_mcp_capabilities()
+
+
+def revoke_mcp_capability(
+    capability_id: str,
+    runtime_root: Path | str | None = None,
+) -> dict[str, Any]:
+    return ControlSecurity(runtime_root=runtime_root).revoke_mcp_capability(capability_id)
+
+
+def validate_mcp_token(
+    token_or_header: Optional[str],
+    runtime_root: Path | str | None = None,
+) -> tuple[bool, str, Optional[dict[str, Any]]]:
+    return ControlSecurity(runtime_root=runtime_root).validate_mcp_token(token_or_header)

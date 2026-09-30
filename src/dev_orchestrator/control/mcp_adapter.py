@@ -19,6 +19,7 @@ from dev_orchestrator.control.adapter import (
     ControlAdapterRevisionMismatchError,
 )
 from dev_orchestrator.control.command_store import CONTROL_ACTIONS
+from dev_orchestrator.control.mcp_shared import checked_tool_args, format_tool_result_dict
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "devorchestrator-control"
@@ -543,14 +544,7 @@ class MCPAdapter:
         result = self.client.transport_operations(limit=limit)
         return self._format_tool_result(req_id, result)
 
-    @staticmethod
-    def _checked_args(args: dict[str, Any], allowed: set[str], required: tuple[str, ...]) -> None:
-        unknown = sorted(set(args) - allowed)
-        if unknown:
-            raise ValueError(f"Unknown arguments: {', '.join(unknown)}")
-        for name in required:
-            if name not in args or args[name] is None or (isinstance(args[name], str) and not args[name].strip()):
-                raise ValueError(f"missing required argument: {name}")
+    _checked_args = staticmethod(checked_tool_args)
 
     def _call_exec(self, req_id: Any, args: dict[str, Any]) -> str:
         allowed = {"project_id", "command_ref", "idempotency_key", "host_id", "parameters", "expected_working_directory", "timeout_seconds", "request_id"}
@@ -600,17 +594,10 @@ class MCPAdapter:
 
     @staticmethod
     def _format_tool_result(req_id: Any, result: Any, is_error: bool = False) -> str:
-        rendered = json.dumps(result, ensure_ascii=False, indent=2)
-        # Bound output to max 64KB per call
-        if len(rendered) > 65536:
-            rendered = rendered[:65500] + "\n...[OUTPUT_TRUNCATED]"
         return json.dumps({
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {
-                "content": [{"type": "text", "text": rendered}],
-                "isError": is_error,
-            },
+            "result": format_tool_result_dict(result, is_error=is_error),
         })
 
     def run(self) -> None:
