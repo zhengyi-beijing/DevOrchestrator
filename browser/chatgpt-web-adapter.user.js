@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.14
+// @version      0.1.15
 // @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge plus paired 8770 conversation-presence heartbeat.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
@@ -1403,33 +1403,31 @@
     var detailsBox = document.createElement("div");
     detailsBox.style.cssText = "background:#111;border:1px solid #333;border-radius:8px;padding:12px;margin-bottom:20px;font-family:monospace;font-size:13px;color:#e5e7eb;word-break:break-all;";
 
-    var actRow = document.createElement("div");
-    actRow.innerHTML = "<strong>Action:</strong> <span style='color:#60a5fa;'>" + (actionEnvelope.action || "") + "</span>";
-    detailsBox.appendChild(actRow);
+    function appendDetailRow(label, value, color) {
+      var row = document.createElement("div");
+      var heading = document.createElement("strong");
+      heading.textContent = label + ": ";
+      var content = document.createElement("span");
+      content.textContent = String(value === undefined || value === null ? "" : value);
+      if (color) { content.style.color = color; }
+      row.appendChild(heading);
+      row.appendChild(content);
+      detailsBox.appendChild(row);
+    }
 
-    var projRow = document.createElement("div");
-    projRow.innerHTML = "<strong>Project:</strong> " + (actionEnvelope.project_id || "devorchestrator");
-    detailsBox.appendChild(projRow);
-
-    var reqRow = document.createElement("div");
-    reqRow.innerHTML = "<strong>Request ID:</strong> " + (actionEnvelope.request_id || "");
-    detailsBox.appendChild(reqRow);
+    appendDetailRow("Action", actionEnvelope.action || "", "#60a5fa");
+    appendDetailRow("Project", actionEnvelope.project_id || "devorchestrator");
+    appendDetailRow("Request ID", actionEnvelope.request_id || "");
 
     var params = actionEnvelope.parameters || {};
     if (params.command_ref) {
-      var cmdRow = document.createElement("div");
-      cmdRow.innerHTML = "<strong>Command:</strong> <span style='color:#34d399;'>" + params.command_ref + "</span>";
-      detailsBox.appendChild(cmdRow);
+      appendDetailRow("Command", params.command_ref, "#34d399");
     }
     if (params.job_id) {
-      var jobRow = document.createElement("div");
-      jobRow.innerHTML = "<strong>Job ID:</strong> " + params.job_id;
-      detailsBox.appendChild(jobRow);
+      appendDetailRow("Job ID", params.job_id);
     }
     if (params.reason) {
-      var rRow = document.createElement("div");
-      rRow.innerHTML = "<strong>Reason:</strong> " + params.reason;
-      detailsBox.appendChild(rRow);
+      appendDetailRow("Reason", params.reason);
     }
     modal.appendChild(detailsBox);
 
@@ -1460,15 +1458,36 @@
     return overlay;
   }
 
-  function submitActionResult(resultText) {
-    if (typeof document === "undefined") { return false; }
-    var composer = document.querySelector("#prompt-textarea");
-    if (!composer) { return false; }
-    setComposerText(composer, resultText);
-    setTimeout(function () {
-      clickSendButton();
-    }, 150);
-    return true;
+  function submitActionResult(resultText, requestId) {
+    return new Promise(function (resolve) {
+      if (typeof document === "undefined") { resolve(false); return; }
+      var deadline = Date.now() + SUBMISSION_CONFIRM_MS;
+      var prepared = false;
+      var clicked = false;
+
+      function attempt() {
+        if (clicked && isActionResultInConversation(requestId)) {
+          resolve(true);
+          return;
+        }
+        if (Date.now() >= deadline) {
+          resolve(false);
+          return;
+        }
+        if (!prepared) {
+          var composer = document.querySelector("#prompt-textarea");
+          if (composer) {
+            setComposerText(composer, resultText);
+            prepared = true;
+          }
+        } else if (!clicked) {
+          clicked = clickSendButton();
+        }
+        setTimeout(attempt, 100);
+      }
+
+      attempt();
+    });
   }
 
   var actionScanActive = false;
@@ -1489,7 +1508,6 @@
       }
 
       actionScanActive = true;
-      markActionProcessed(reqId);
 
       var isEffectful = isEffectfulAction(envelope.action);
       if (isEffectful) {
@@ -1497,20 +1515,24 @@
           envelope,
           function onApprove() {
             dispatchBrowserControlAction(envelope, true).then(function (result) {
-              handleActionResult(envelope, result);
-              actionScanActive = false;
+              handleActionResult(envelope, result).then(function () {
+                actionScanActive = false;
+              });
             });
           },
           function onReject(reason) {
             var rejectedResult = formatActionResult(reqId, "rejected", reason);
-            submitActionResult(rejectedResult);
-            actionScanActive = false;
+            submitActionResult(rejectedResult, reqId).then(function (submitted) {
+              if (submitted) { markActionProcessed(reqId); }
+              actionScanActive = false;
+            });
           }
         );
       } else {
         dispatchBrowserControlAction(envelope, false).then(function (result) {
-          handleActionResult(envelope, result);
-          actionScanActive = false;
+          handleActionResult(envelope, result).then(function () {
+            actionScanActive = false;
+          });
         });
       }
       break;
@@ -1528,7 +1550,10 @@
     }
     var dataOrError = (status === "success" && body && body.data !== undefined) ? body.data : body;
     var formatted = formatActionResult(reqId, status, dataOrError);
-    submitActionResult(formatted);
+    return submitActionResult(formatted, reqId).then(function (submitted) {
+      if (submitted) { markActionProcessed(reqId); }
+      return submitted;
+    });
   }
 
   if (typeof document !== "undefined" && !root.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__) {

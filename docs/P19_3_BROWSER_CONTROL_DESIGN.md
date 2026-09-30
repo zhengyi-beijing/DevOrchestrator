@@ -136,10 +136,19 @@ Submitted into the prompt textarea by the userscript after dispatch:
    python -m dev_orchestrator browser-token revoke <capability_id>
    ```
    Stored hashed in `runtime/control/browser-control-capabilities.json`. Tokens are compared via constant-time HMAC and never leaked in logs.
-2. **CORS Restrictions**: Port 8765 responds to preflight `OPTIONS` requests allowing only `Origin: https://chatgpt.com` and loopback.
+2. **Loopback & CORS Restrictions**: Every browser-control route on port 8765
+   requires a loopback peer even if the shared bridge listener is configured
+   with a wildcard bind address. Preflight and action requests use parsed,
+   exact origin matching for `https://chatgpt.com` and HTTP loopback origins;
+   prefix/suffix-spoofed hosts are rejected.
 3. **Path Traversal Protection**: `read_file` validates canonical containment within configured project roots; relative path escapes (e.g. `../../windows/win.ini`) fail closed with HTTP 400.
 4. **Hardware Fence**: In `commands_catalog`, hardware-effect commands have `is_hardware: true` and `selectable: false`. Attempting to start hardware commands via the bridge fails closed.
-5. **Idempotency Protection**: `BrowserControlRequestStore` tracks all requests by `request_id` under `runtime/control/browser_control_requests/`. Identical resends return cached results without re-executing; mismatched payloads on the same `request_id` fail with HTTP 409 Conflict.
+5. **Idempotency Protection**: `BrowserControlRequestStore` tracks all requests by
+   `request_id` under `runtime/control/browser_control_requests/`. A per-request
+   inter-process lock and durable `in_progress` claim serialize concurrent
+   requests. Identical completed resends return cached results without
+   re-executing; mismatched, corrupt, failed, or crash-ambiguous records fail
+   closed with HTTP 409 Conflict.
 6. **Zero-RDC Constraint**: All dispatched operations strictly assert native transport (`local` or `ssh`). RDC transport count must be 0.
 
 ---
@@ -154,22 +163,23 @@ python ops/p19_3_browser_control_acceptance.py
 Verified steps:
 1. Bridge control health check (`GET /v1/control/health`).
 2. CORS preflight check from `Origin: https://chatgpt.com`.
-3. Unauthorized request rejection (missing and invalid token).
-4. Capability token minting via `create_browser_control_capability`.
-5. Authoritative `status` inspection.
-6. `commands_catalog` discovery & hardware non-selectable assertion.
-7. `read_file` text inspection on `pyproject.toml`.
-8. Path traversal attempt fail-closed verification.
-9. Effectful `start_task` confirmation gate (HTTP 400 requirement).
-10. Confirmed `start_task` execution returning durable `job_id`.
-11. Idempotency exact replay returning identical job without re-spawn.
-12. Idempotency conflict rejection on altered payload (HTTP 409).
-13. `job_status` polling until terminal completion.
-14. Cancellable job lifecycle: spawn -> confirmation gate -> cancel gate -> cancel confirmed.
-15. Redacted `read_log` querying.
-16. Web Sol inference queue isolation (zero control actions in Web Sol queues).
-17. Capability revocation verification (HTTP 401).
-18. Transport audit: 0 RDC invocations, 100% native local transport.
+3. Suffix-spoofed ChatGPT Origin rejection without reflected CORS headers.
+4. Unauthorized request rejection (missing and invalid token).
+5. Capability token minting via `create_browser_control_capability`.
+6. Authoritative `status` inspection.
+7. `commands_catalog` discovery & hardware non-selectable assertion.
+8. `read_file` text inspection on `pyproject.toml`.
+9. Path traversal attempt fail-closed verification.
+10. Effectful `start_task` confirmation gate (HTTP 400 requirement).
+11. Confirmed `start_task` execution returning durable `job_id`.
+12. Idempotency exact replay returning identical job without re-spawn.
+13. Idempotency conflict rejection on altered payload (HTTP 409).
+14. `job_status` polling until terminal completion.
+15. Cancellable job lifecycle: spawn -> confirmation gate -> cancel gate -> cancel confirmed.
+16. Redacted `read_log` querying.
+17. Web Sol inference queue isolation (zero control actions in Web Sol queues).
+18. Capability revocation verification (HTTP 401).
+19. Transport audit: 0 RDC invocations, 100% native local transport.
 
 Evidence artifacts:
 - `docs/evidence/P19_3_BROWSER_CONTROL_ACCEPTANCE.json`

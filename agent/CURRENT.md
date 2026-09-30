@@ -1,7 +1,21 @@
 # DevOrchestrator Self-Hosted Development State
 
 P19.3 ChatGPT Plus Browser Control Bridge (2026-09-30):
-- Status: **COMPLETE** (Zero-RDC Acceptance Verified).
+- Status: **REMEDIATION_COMPLETE** (server-side live acceptance passed after
+  remediation; browser userscript update and interactive verification pending).
+- Review remediation:
+  - Browser-control health, preflight, and action routes now require an actual
+    loopback peer even when the shared bridge listener has a wildcard bind.
+  - CORS validation parses and exactly matches ChatGPT/loopback origins; suffix
+    spoofing such as `https://chatgpt.com.attacker.example` fails closed.
+  - Confirmation details use `textContent`, preventing model-controlled HTML or
+    CSS injection into the human approval boundary.
+  - Idempotency now uses hashed record names, per-request inter-process locks,
+    and durable `in_progress`/`completed`/`failed` records. Concurrent replay
+    dispatches once; corrupt, failed, or crash-ambiguous state fails closed.
+  - Action results are marked processed only after their exact result marker is
+    observed as a submitted conversation turn; unavailable composers/send
+    controls retry instead of silently losing the result.
 - Delivered secure, browser-based control bridge enabling desktop Chrome ChatGPT Plus conversations to inspect and operate local DevOrchestrator over Tampermonkey (`browser/chatgpt-web-adapter.user.js`), port 8765 bridge, and port 8770 control plane with zero RDC calls, no OpenAI API billing, no Business workspace, no public exposure, without weakening or replacing P19.2 (remote MCP).
 - Architecture & Boundaries:
   - Transport/adapter only: userscript and bridge port 8765 maintain strict isolation from lifecycle authority and state machines.
@@ -19,9 +33,18 @@ P19.3 ChatGPT Plus Browser Control Bridge (2026-09-30):
   - `src/dev_orchestrator/web/server.py`: registered browser control web endpoints (`POST /api/v1/control/browser-control/action` and GET/POST `/api/v1/control/browser-control-capabilities`).
   - `browser/chatgpt-web-adapter.user.js`: pairing/token management, action scanning, DOM confirmation modal, dispatch, auto-submission into `#prompt-textarea`.
 - Verification & Acceptance:
-  - Acceptance script: `python ops/p19_3_browser_control_acceptance.py` passed all 18 steps against live bridge (:8765) and daemon (:8770).
+  - Remediation acceptance passed all 19 live steps on 2026-09-30 against the
+    restarted loopback bridge (:8765) and daemon (:8770), including the new
+    suffix-spoofed-Origin rejection step. The evidence artifacts now record
+    this run (`20260930T041210Z`): 6 native operations, 0 RDC calls, enforced
+    confirmation gate, Web Sol isolation, and capability revocation.
+  - The Chrome Tampermonkey store predates the userscript 0.1.15 update. A
+    browser interaction tool is needed to install and verify the updated
+    script in the existing Chrome profile.
   - Acceptance evidence: `docs/evidence/P19_3_BROWSER_CONTROL_ACCEPTANCE.json` and `docs/evidence/P19_3_BROWSER_CONTROL_OPERATIONS.ndjson` (result PASS, 6 native operations, 100% `local`, 0 RDC calls, confirmation gate enforced, channel isolation enforced).
-  - Test suites: 18/18 passed in `tests_py/test_p19_3_browser_control.py`; 15/15 passed in `tests_py/test_p19_2_remote_mcp.py`; 9/9 passed in `tests_py/test_p19_web_console.py`; 7/7 passed in `tests_py/test_p18_external_control.py`; 3/3 passed in `tests_py/test_bridge_http.py`; 14/14 passed in `tests_py/test_chatgpt_web_adapter.py`; `node --check browser/chatgpt-web-adapter.user.js` clean; `compileall` clean; `git diff --check` clean; `graphify update .` clean.
+  - Focused P19.3 suite: 22/22 passed. Full regression: 1665 passed and
+    109 subtests passed. Adjacent P18/P19.2/Web Console/Bridge/Daemon/Adapter
+    suites passed; JavaScript syntax and Python compilation passed.
 - Design documentation: `docs/P19_3_BROWSER_CONTROL_DESIGN.md`.
 
 P19.2 Remote MCP Interface remediation & acceptance (2026-09-30):

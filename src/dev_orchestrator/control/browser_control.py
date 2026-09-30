@@ -265,33 +265,87 @@ class BrowserControlRequestStore:
         self.runtime_root = Path(runtime_root)
         self.root = self.runtime_root / "control"
         self.store_dir = self.root / "browser_control_requests"
+        self.request_locks_dir = self.root / "browser_control_request_locks"
         self.lock_path = self.root / "browser_control.lock"
         self.store_dir.mkdir(parents=True, exist_ok=True)
+        self.request_locks_dir.mkdir(parents=True, exist_ok=True)
 
     def _file_path(self, request_id: str) -> Path:
+        digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+        return self.store_dir / f"{digest}.json"
+
+    def _legacy_file_path(self, request_id: str) -> Path:
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", request_id)
         return self.store_dir / f"{safe_name}.json"
 
+    def _existing_file_path(self, request_id: str) -> Optional[Path]:
+        canonical = self._file_path(request_id)
+        if canonical.is_file():
+            return canonical
+        legacy = self._legacy_file_path(request_id)
+        return legacy if legacy.is_file() else None
+
+    def request_lock(self, request_id: str) -> InterProcessFileLock:
+        """Serialize one request ID without blocking unrelated actions."""
+        digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+        return InterProcessFileLock(self.request_locks_dir / f"{digest}.lock")
+
     def get_or_claim(
-        self, request_id: str, request_hash: str
+        self,
+        request_id: str,
+        request_hash: str,
+        action: str,
+        project_id: str,
+        capability_id: str = "master",
     ) -> tuple[Optional[dict[str, Any]], bool]:
-        """Check for existing request.
+        """Return a completed replay or durably claim a new request.
 
         Returns (cached_response, is_replay).
-        Raises BrowserControlConflictError if request_id matches but hash differs.
+        Raises BrowserControlConflictError for conflicting, incomplete, failed,
+        corrupt, or ambiguously in-progress records.
         """
-        path = self._file_path(request_id)
         with InterProcessFileLock(self.lock_path):
-            if path.is_file():
+            path = self._existing_file_path(request_id)
+            if path is not None:
                 existing = read_json(path, None)
-                if isinstance(existing, dict):
-                    stored_hash = existing.get("request_hash")
-                    if stored_hash == request_hash:
-                        return existing.get("response"), True
+                if not isinstance(existing, dict):
+                    raise BrowserControlConflictError(
+                        f"request_id {request_id!r} has a corrupt idempotency record; refusing replay"
+                    )
+                if existing.get("request_id") != request_id or existing.get("request_hash") != request_hash:
                     raise BrowserControlConflictError(
                         f"request_id {request_id!r} was reused with conflicting parameters or action"
                     )
-        return None, False
+                state = existing.get("state")
+                response = existing.get("response")
+                if state in (None, "completed") and isinstance(response, dict):
+                    return response, True
+                if state == "in_progress":
+                    raise BrowserControlConflictError(
+                        f"request_id {request_id!r} is already in progress or has an unknown outcome"
+                    )
+                if state == "failed":
+                    raise BrowserControlConflictError(
+                        f"request_id {request_id!r} previously failed and cannot be replayed safely"
+                    )
+                raise BrowserControlConflictError(
+                    f"request_id {request_id!r} has an incomplete idempotency record; refusing replay"
+                )
+
+            path = self._file_path(request_id)
+            write_json(path, {
+                "schema_version": 2,
+                "state": "in_progress",
+                "request_id": request_id,
+                "request_hash": request_hash,
+                "action": action,
+                "project_id": project_id,
+                "capability_id": capability_id,
+                "claimed_at": utc_now_iso(),
+                "recorded_at": utc_now_iso(),
+                "response": None,
+            }, indent=2)
+            return None, False
 
     def save_response(
         self,
@@ -305,7 +359,8 @@ class BrowserControlRequestStore:
         """Persist successful or terminal response for idempotency."""
         path = self._file_path(request_id)
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "state": "completed",
             "request_id": request_id,
             "request_hash": request_hash,
             "action": action,
@@ -316,6 +371,31 @@ class BrowserControlRequestStore:
         }
         with InterProcessFileLock(self.lock_path):
             write_json(path, record, indent=2)
+
+    def save_failure(
+        self,
+        request_id: str,
+        request_hash: str,
+        action: str,
+        project_id: str,
+        error: dict[str, Any],
+        capability_id: str = "master",
+    ) -> None:
+        """Persist an ambiguous/failed terminal outcome so replay fails closed."""
+        record = {
+            "schema_version": 2,
+            "state": "failed",
+            "request_id": request_id,
+            "request_hash": request_hash,
+            "action": action,
+            "project_id": project_id,
+            "capability_id": capability_id,
+            "recorded_at": utc_now_iso(),
+            "response": None,
+            "error": error,
+        }
+        with InterProcessFileLock(self.lock_path):
+            write_json(self._file_path(request_id), record, indent=2)
 
 
 class BrowserControlService:
@@ -377,8 +457,8 @@ class BrowserControlService:
         """Execute a validated browser-control action request.
 
         1. Validates envelope and schema.
-        2. Checks idempotency cache.
-        3. Enforces confirmation policy for effectful actions.
+        2. Enforces confirmation policy for effectful actions.
+        3. Durably claims the request or returns its completed replay.
         4. Dispatches to shared operations layer.
         5. Saves result in request store and writes audit log.
         """
@@ -390,12 +470,8 @@ class BrowserControlService:
         confirmed = validated["confirmed"]
         req_hash = compute_action_request_hash(validated)
 
-        # 1. Check idempotency
-        cached_resp, is_replay = self.store.get_or_claim(request_id, req_hash)
-        if is_replay and cached_resp is not None:
-            return cached_resp
-
-        # 2. Confirmation gate for effectful actions
+        # 1. Confirmation must precede a durable claim so a browser can retry
+        # the same request_id after the user approves it.
         if action in EFFECTFUL_ACTIONS and not confirmed:
             details = {
                 "command_ref": parameters.get("command_ref"),
@@ -404,56 +480,75 @@ class BrowserControlService:
             }
             raise BrowserControlConfirmationRequiredError(action, project_id, request_id, details)
 
-        # 3. Action dispatch
-        try:
-            result_data = self._dispatch(action, project_id, request_id, parameters, host_id, capability_id)
-            response_payload = {
-                "protocol": RESULT_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "action": action,
-                "project_id": project_id,
-                "status": "success",
-                "data": result_data,
-            }
-            self._log_audit(
-                action=action,
-                request_id=request_id,
-                project_id=project_id,
-                capability_id=capability_id,
-                status="success",
+        # 2. Serialize this request ID across threads/processes. The durable
+        # in-progress record makes a crash after dispatch fail closed instead
+        # of silently repeating an effectful operation.
+        with self.store.request_lock(request_id):
+            cached_resp, is_replay = self.store.get_or_claim(
+                request_id,
+                req_hash,
+                action,
+                project_id,
+                capability_id,
             )
-            self.store.save_response(request_id, req_hash, action, project_id, response_payload, capability_id)
-            return response_payload
-        except ControlOperationError as exc:
-            self._log_audit(
-                action=action,
-                request_id=request_id,
-                project_id=project_id,
-                capability_id=capability_id,
-                status="error",
-                details={"status_code": exc.status_code, "reason": exc.reason, "error": exc.message},
-            )
-            raise BrowserControlError(exc.status_code, exc.reason, exc.message) from exc
-        except BrowserControlError as exc:
-            self._log_audit(
-                action=action,
-                request_id=request_id,
-                project_id=project_id,
-                capability_id=capability_id,
-                status="error",
-                details={"status_code": exc.status_code, "reason": exc.reason, "error": exc.message},
-            )
-            raise
-        except Exception as exc:
-            self._log_audit(
-                action=action,
-                request_id=request_id,
-                project_id=project_id,
-                capability_id=capability_id,
-                status="error",
-                details={"status_code": 500, "reason": "Internal Error", "error": str(exc)},
-            )
-            raise BrowserControlError(500, "Internal Server Error", str(exc)) from exc
+            if is_replay and cached_resp is not None:
+                return cached_resp
+
+            try:
+                result_data = self._dispatch(action, project_id, request_id, parameters, host_id, capability_id)
+                response_payload = {
+                    "protocol": RESULT_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "action": action,
+                    "project_id": project_id,
+                    "status": "success",
+                    "data": result_data,
+                }
+                self._log_audit(
+                    action=action,
+                    request_id=request_id,
+                    project_id=project_id,
+                    capability_id=capability_id,
+                    status="success",
+                )
+                self.store.save_response(request_id, req_hash, action, project_id, response_payload, capability_id)
+                return response_payload
+            except ControlOperationError as exc:
+                failure = {"status_code": exc.status_code, "reason": exc.reason, "error": exc.message}
+                self.store.save_failure(request_id, req_hash, action, project_id, failure, capability_id)
+                self._log_audit(
+                    action=action,
+                    request_id=request_id,
+                    project_id=project_id,
+                    capability_id=capability_id,
+                    status="error",
+                    details=failure,
+                )
+                raise BrowserControlError(exc.status_code, exc.reason, exc.message) from exc
+            except BrowserControlError as exc:
+                failure = {"status_code": exc.status_code, "reason": exc.reason, "error": exc.message}
+                self.store.save_failure(request_id, req_hash, action, project_id, failure, capability_id)
+                self._log_audit(
+                    action=action,
+                    request_id=request_id,
+                    project_id=project_id,
+                    capability_id=capability_id,
+                    status="error",
+                    details=failure,
+                )
+                raise
+            except Exception as exc:
+                failure = {"status_code": 500, "reason": "Internal Error", "error": str(exc)}
+                self.store.save_failure(request_id, req_hash, action, project_id, failure, capability_id)
+                self._log_audit(
+                    action=action,
+                    request_id=request_id,
+                    project_id=project_id,
+                    capability_id=capability_id,
+                    status="error",
+                    details=failure,
+                )
+                raise BrowserControlError(500, "Internal Server Error", str(exc)) from exc
 
     def _dispatch(
         self,

@@ -6,12 +6,19 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any
 
-from dev_orchestrator.bridge.server import make_bridge_server
+from dev_orchestrator.bridge.server import (
+    _is_allowed_control_origin,
+    _is_loopback_address,
+    make_bridge_server,
+)
 from dev_orchestrator.bridge.store import BrowserBridgeStore
 from dev_orchestrator.control.browser_control import (
     DEVORCH_ACTION_RESULT_V1,
@@ -159,6 +166,21 @@ class UserscriptAdapterTests(unittest.TestCase):
         self.assertEqual(data["parsed_id"], "node-1")
         self.assertEqual(data["parsed_action"], "status")
         self.assertTrue(data["has_head"])
+
+    def test_confirmation_modal_uses_text_nodes_and_delivery_is_confirmed(self):
+        source = USERSCRIPT_PATH.read_text(encoding="utf-8")
+        modal = source[
+            source.index("function showEffectfulConfirmationModal"):
+            source.index("function submitActionResult")
+        ]
+        self.assertNotIn(".innerHTML", modal)
+        self.assertIn("content.textContent", modal)
+        submit = source[
+            source.index("function submitActionResult"):
+            source.index("var actionScanActive")
+        ]
+        self.assertIn("isActionResultInConversation(requestId)", submit)
+        self.assertIn("resolve(false)", submit)
 
 
 class BrowserControlSecurityTests(unittest.TestCase):
@@ -396,6 +418,64 @@ class BrowserControlServiceTests(unittest.TestCase):
         with self.assertRaises(BrowserControlConflictError):
             self.service.execute_action(conflicting_req, host_id="test", capability_id="test-cap")
 
+    def test_concurrent_replay_dispatches_only_once(self):
+        req = {
+            "protocol": DEVORCH_ACTION_V1,
+            "request_id": "req-concurrent-1",
+            "action": "start_task",
+            "project_id": "devorchestrator",
+            "parameters": {"command_ref": "echo_test"},
+            "confirmed": True,
+        }
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def fake_dispatch(*_args):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            time.sleep(0.15)
+            return {"job_id": "job-single", "selected_transport": "local"}
+
+        self.service._dispatch = fake_dispatch
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(
+                lambda _: self.service.execute_action(req, host_id="test", capability_id="test-cap"),
+                range(2),
+            ))
+
+        self.assertEqual(calls, 1)
+        self.assertEqual([row["data"]["job_id"] for row in results], ["job-single", "job-single"])
+
+    def test_failed_or_corrupt_claim_fails_closed_on_replay(self):
+        req = {
+            "protocol": DEVORCH_ACTION_V1,
+            "request_id": "req-failed-1",
+            "action": "start_task",
+            "project_id": "devorchestrator",
+            "parameters": {"command_ref": "echo_test"},
+            "confirmed": True,
+        }
+        calls = 0
+
+        def failing_dispatch(*_args):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("ambiguous transport failure")
+
+        self.service._dispatch = failing_dispatch
+        with self.assertRaises(BrowserControlError):
+            self.service.execute_action(req, host_id="test", capability_id="test-cap")
+        with self.assertRaises(BrowserControlConflictError):
+            self.service.execute_action(req, host_id="test", capability_id="test-cap")
+        self.assertEqual(calls, 1)
+
+        corrupt_id = "req-corrupt-1"
+        self.service.store._file_path(corrupt_id).write_text("{not-json", encoding="utf-8")
+        corrupt = dict(req, request_id=corrupt_id)
+        with self.assertRaises(BrowserControlConflictError):
+            self.service.execute_action(corrupt, host_id="test", capability_id="test-cap")
+
     def test_web_sol_channel_isolation(self):
         # Executing browser control action must NOT enqueue anything in BrowserBridgeStore
         req = {
@@ -479,6 +559,28 @@ class BridgeHTTPServerIntegrationTests(unittest.TestCase):
             headers={"Origin": "https://attacker.site"},
         )
         self.assertEqual(status, 403)
+
+        # Prefix/suffix spoofing must not be treated as the ChatGPT origin.
+        status, headers, _ = self._request(
+            "OPTIONS",
+            "/v1/control/action",
+            headers={"Origin": "https://chatgpt.com.attacker.example"},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("access-control-allow-origin", headers)
+
+    def test_control_origin_and_peer_helpers_are_exact(self):
+        self.assertTrue(_is_allowed_control_origin("https://chatgpt.com"))
+        self.assertTrue(_is_allowed_control_origin("https://chatgpt.com:443"))
+        self.assertTrue(_is_allowed_control_origin("http://127.0.0.1:8765"))
+        self.assertTrue(_is_allowed_control_origin("http://[::1]:8765"))
+        self.assertFalse(_is_allowed_control_origin("https://chatgpt.com.attacker.example"))
+        self.assertFalse(_is_allowed_control_origin("http://localhost.attacker.example"))
+        self.assertFalse(_is_allowed_control_origin("https://chatgpt.com/path"))
+        self.assertTrue(_is_loopback_address("127.0.0.1"))
+        self.assertTrue(_is_loopback_address("::1"))
+        self.assertTrue(_is_loopback_address("::ffff:127.0.0.1"))
+        self.assertFalse(_is_loopback_address("192.0.2.10"))
 
     def test_health_check(self):
         status, headers, body = self._request("GET", "/v1/control/health")

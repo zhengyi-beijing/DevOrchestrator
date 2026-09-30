@@ -50,7 +50,14 @@ The daemon exposes a read-only paginated logs route backed by durable evidence f
 ## 5. WebBridgeAdapter and Extended Control Security
 
 `WebBridgeAdapter` provides a secondary transport for ChatGPT web sessions via the daemon's port 8770 surface:
-- **Port Isolation**: Port 8765 (`BrowserBridgeServer`) remains strictly transport-only for notifications/toasts. Port 8765 exposes NO lifecycle or control endpoints. All control ingress resides on port 8770.
+- **Port Isolation**: Port 8765 (`BrowserBridgeServer`) remains the adapter-facing
+  transport listener. P19.3 adds only the closed browser-control endpoints
+  `GET /v1/control/health`, `OPTIONS /v1/control/action`, and
+  `POST /v1/control/action`; those routes require a loopback peer, exact allowed
+  browser origin when `Origin` is present, a separately scoped browser-control
+  capability, and the P19.3 confirmation/idempotency gates. They may inspect
+  state or operate allowlisted execution jobs, but expose no lifecycle command
+  or lifecycle-authority surface. General control ingress remains on port 8770.
 - **WebBridge Control Capability**:
   - Distinct from the heartbeat-only capability (`session_heartbeat`).
   - Owner-created, hash-only (`web_bridge_control`), revocable, and bound to an exact `project_id` and live `conversation_binding`.

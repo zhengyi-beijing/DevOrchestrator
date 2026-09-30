@@ -31,6 +31,7 @@ No generic prompt endpoint or arbitrary shell/Worker execution is exposed.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,13 +51,42 @@ from dev_orchestrator.control.security import validate_browser_control_capabilit
 
 _ALLOW = "GET, POST, OPTIONS"
 
-ALLOWED_CONTROL_ORIGIN_PREFIXES = (
-    "https://chatgpt.com",
-    "http://localhost:",
-    "http://127.0.0.1:",
-    "http://localhost",
-    "http://127.0.0.1",
-)
+def _is_loopback_address(value: str) -> bool:
+    """Return whether a peer address is unambiguously loopback."""
+    try:
+        address = ipaddress.ip_address(str(value).split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped.is_loopback
+    return address.is_loopback
+
+
+def _is_allowed_control_origin(origin: Optional[str]) -> bool:
+    """Validate browser-control origins without suffix/prefix spoofing."""
+    if not origin:
+        return True
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        not parsed.scheme
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    if parsed.scheme == "https" and host == "chatgpt.com":
+        return port in (None, 443)
+    if parsed.scheme == "http" and host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    return False
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -112,6 +142,9 @@ class _BridgeHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         path = self._path()
         if path == "/v1/control/action":
+            if not self._client_is_loopback():
+                self._error(403, "Forbidden", "browser control requires a loopback peer")
+                return
             allowed, origin = self._is_origin_allowed()
             if not allowed:
                 self._error(403, "Forbidden", f"Origin '{origin}' not allowed")
@@ -132,14 +165,12 @@ class _BridgeHandler(BaseHTTPRequestHandler):
     do_CONNECT = _unsupported
 
     # -- CORS helpers -----------------------------------------------------
+    def _client_is_loopback(self) -> bool:
+        return bool(self.client_address) and _is_loopback_address(str(self.client_address[0]))
+
     def _is_origin_allowed(self) -> tuple[bool, Optional[str]]:
         origin = self.headers.get("Origin")
-        if not origin:
-            return True, None
-        for prefix in ALLOWED_CONTROL_ORIGIN_PREFIXES:
-            if origin == prefix or origin.startswith(prefix):
-                return True, origin
-        return False, origin
+        return _is_allowed_control_origin(origin), origin
 
     def _cors_headers(self, origin: Optional[str]) -> dict[str, str]:
         if not origin:
@@ -195,6 +226,9 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/v1/control/health":
+            if not self._client_is_loopback():
+                self._error(403, "Forbidden", "browser control requires a loopback peer")
+                return
             allowed, origin = self._is_origin_allowed()
             if not allowed:
                 self._error(403, "Forbidden", f"Origin '{origin}' not allowed")
@@ -342,6 +376,9 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_control_action(self) -> None:
+        if not self._client_is_loopback():
+            self._error(403, "Forbidden", "browser control requires a loopback peer")
+            return
         allowed, origin = self._is_origin_allowed()
         if not allowed:
             self._error(403, "Forbidden", f"Origin '{origin}' not allowed")

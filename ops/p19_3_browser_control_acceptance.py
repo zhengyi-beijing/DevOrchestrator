@@ -133,6 +133,29 @@ def main() -> int:
         extra={"allow_origin": allow_origin, "allow_methods": allow_methods},
     )
 
+    spoofed_origin = "https://chatgpt.com.attacker.example"
+    spoof_status, spoof_headers, spoof_data = http_request(
+        action_url,
+        method="OPTIONS",
+        headers={
+            "Origin": spoofed_origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Authorization, Content-Type",
+        },
+    )
+    if spoof_status != 403 or spoof_headers.get("Access-Control-Allow-Origin"):
+        raise RuntimeError(
+            "Suffix-spoofed ChatGPT origin was not rejected: "
+            f"status={spoof_status}, headers={spoof_headers}, body={spoof_data}"
+        )
+    record(
+        "cors_suffix_spoof_rejected",
+        spoof_status,
+        spoof_data,
+        f"req-{run_tag}-cors-spoof",
+        extra={"origin": spoofed_origin},
+    )
+
     # Step 3: Unauthenticated & invalid token rejection
     no_auth_status, _, no_auth_data = http_request(
         action_url,

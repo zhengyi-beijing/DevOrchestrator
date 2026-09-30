@@ -1,6 +1,17 @@
 # DevOrchestrator Self-Hosting Result Log
 
 P19.3 ChatGPT Plus Browser Control Bridge (implementation & acceptance complete 2026-09-30):
+- Review remediation completed after the initial acceptance: enforced loopback
+  peers on the 8765 control routes, replaced prefix CORS matching with exact
+  parsed origins, removed model-controlled `innerHTML` from the confirmation
+  modal, added durable per-request claims and locks for fail-closed idempotency,
+  and delayed processed markers until result-turn delivery is confirmed.
+- Regression evidence: 22/22 focused P19.3 tests passed; the full `tests_py`
+  suite passed with 1665 tests and 109 subtests. Post-remediation live
+  acceptance passed all 19 steps on 2026-09-30 (`20260930T041210Z`), including
+  suffix-spoofed Origin rejection, 6 native operations, and 0 RDC calls.
+  The existing Chrome Tampermonkey profile still requires the userscript
+  0.1.15 update and an interactive browser check.
 - Delivered secure, browser-based control bridge enabling desktop Chrome ChatGPT Plus conversations to inspect and operate local DevOrchestrator over Tampermonkey (`browser/chatgpt-web-adapter.user.js`), port 8765 bridge, and port 8770 control plane with zero RDC calls, no OpenAI API billing, no Business workspace, no public exposure, without weakening or replacing P19.2 (remote MCP).
 - Strict channel isolation: DevOrchestrator control requests (`[DEVORCH_ACTION_V1]`) and responses (`[DEVORCH_ACTION_RESULT_V1]`) are strictly isolated from the Web Sol inference queue (`/v1/claim`, `/v1/response`) and never enter `BrowserBridgeStore` queues.
 - Structured protocol: enforces typed JSON action envelopes; arbitrary shell execution is prohibited.

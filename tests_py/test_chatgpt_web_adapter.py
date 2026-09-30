@@ -146,7 +146,7 @@ class ChatGptWebAdapterTests(unittest.TestCase):
 
     def test_userscript_raises_transport_alert_from_server_attention_metadata(self):
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertTrue('// @version      0.1.13' in source or '// @version      0.1.14' in source)
+        self.assertIn('// @version      0.1.15', source)
         self.assertIn('// @grant        GM_notification', source)
         self.assertIn('notification.attention !== "urgent"', source)
         self.assertIn('GM_notification({', source)
