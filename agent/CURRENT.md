@@ -1,17 +1,21 @@
 # DevOrchestrator Self-Hosted Development State
 
-P19.2 Remote MCP Interface implementation & acceptance (2026-09-30):
-- Status: **IMPLEMENTATION_COMPLETE** (Ready for Technical Review). Executed bounded task P19.2 from `agent/next.md` without modifying lifecycle authority or fabricating successors.
-- Implementation commit: `0d0b688` (`feat(P19.2): implement remote MCP interface over streamable HTTP and record zero-RDC evidence`).
-- Added authenticated remote Model Context Protocol endpoint at `POST /mcp` (and `DELETE /mcp` for session termination) inside unified daemon (`src/dev_orchestrator/web/server.py`), exposing exactly six bounded tools (`devo_status`, `devo_start_task`, `devo_job_status`, `devo_cancel_job`, `devo_read_log`, `devo_read_file`) via JSON-RPC 2.0 and Streamable HTTP.
-- Extracted shared service operations core `src/dev_orchestrator/control/operations.py` (`spawn_job`, `poll_job`, `cancel_job`, `read_file`), unifying REST routes and MCP adapter over the exact same control/service layer while retaining all P18 transport fences, capability verification, and fail-closed RDC rejections.
-- Implemented `src/dev_orchestrator/control/mcp_http.py` handling JSON-RPC protocol negotiation (2025-06-18, 2025-03-26, 2024-11-05), Accept content negotiation (application/json and text/event-stream), in-memory session tracking with Mcp-Session-Id and TTL, and 64KB bounded tool results.
-- Added revocable scoped MCP capability tokens in `src/dev_orchestrator/control/security.py` and CLI commands `dev-orchestrator mcp-token {mint,list,revoke}` in `src/dev_orchestrator/cli.py`.
-- Enforced strict Origin validation, mandatory bearer authentication, loopback-first binding, and zero-RDC safety.
+P19.2 Remote MCP Interface remediation & acceptance (2026-09-30):
+- Status: **REMEDIATION_COMPLETE** (Ready for Technical Review verification). Remediated bounded task P19.2 without modifying lifecycle authority or fabricating successors.
+- Implementation commits: `0d0b688` (`feat(P19.2): implement remote MCP interface over streamable HTTP and record zero-RDC evidence`), `9e0b3e7`, and `15be804` (`fix(p19.2): remediate technical review findings for tools allowlist, CORS origin, and logs filtering`).
+- Closed all three blocking Technical Review findings from `runtime/ai-reviewer.json` (`ai_review:wd-c7cf38273a315c31`):
+  1. Finding 1 (Origin gate & CORS preflight reflection): replaced naive `startswith()` checks with canonical `ControlSecurity.valid_origin` (`self._same_origin()`) in `src/dev_orchestrator/web/server.py` for POST, DELETE, and OPTIONS on `/mcp`. OPTIONS returns 403 on invalid origins; emits `Access-Control-Allow-Origin: {origin}` with `Vary: Origin` only for validated loopback origins; omits CORS header when request has no Origin.
+  2. Finding 2 (`devo_read_log` job_id filtering): fixed `devo_read_log` in `src/dev_orchestrator/control/mcp_http.py` to pass `job_id` directly without setting both `run_id` and `command_id` conjunctively; updated `read_control_logs` in `src/dev_orchestrator/control/logs.py` to support `job_id` matching `run_id`, `command_id`, `job_id`, or `operation_id` non-conjunctively; enforced fail-closed `limit` range (`1 <= limit <= 100`).
+  3. Finding 3 (`devo_read_file` truncation and schema bounds): restored `_MAX_TOOL_RESULT_BYTES = 65536` in `src/dev_orchestrator/control/mcp_shared.py` with structured JSON truncation payload preserving valid JSON and `...[OUTPUT_TRUNCATED]`; configured `mcp_http.py` to pass `_HTTP_MAX_TOOL_RESULT_BYTES = 16 * 1024 * 1024` for remote tool results; added fail-closed schema bounds checking on `max_bytes` (`1 <= max_bytes <= 10485760`) and `offset_bytes >= 0` in both `mcp_http.py` and `operations.py:read_file`; placed metadata fields before `content` to avoid truncation of key metadata.
+  4. Non-blocking observation: added `--allowed-tools` flag to `dev-orchestrator mcp-token mint` in `src/dev_orchestrator/cli.py`.
+- Regression tests in `tests_py/test_p19_2_remote_mcp.py`:
+  - `test_mcp_rejects_suffix_spoofed_and_off_port_origins`
+  - `test_devo_read_log_job_id_filter_matches_run_and_command_records`
+  - `test_devo_read_file_oversized_result_is_structurally_bounded`
+- Verification: 15/15 passed in `test_p19_2_remote_mcp.py`; 16/16 passed in `test_p13_mcp_adapter.py`; 84/84 passed in related suites (`test_p19_web_console.py`, `test_p18_selector_and_security.py`, `test_p18_transports.py`, `test_p14_durable_jobs.py`, `test_control_commands.py`, `test_p13_control_logs.py`); 88/88 passed across all P13/P18/P19 suites; `compileall -q src tests_py ops` clean; `git diff --check` clean; `graphify update .` clean.
 - Acceptance evidence: `docs/evidence/P19_2_REMOTE_MCP_ACCEPTANCE.json` and `docs/evidence/P19_2_REMOTE_MCP_OPERATIONS.ndjson` (12 operations, zero RDC calls, all native operations selected `local`).
-- Design and SDK exception documentation: `docs/P19_2_REMOTE_MCP_DESIGN.md`.
-- Verification: 12/12 focused tests passed (`test_p19_2_remote_mcp.py`); 26/26 P19 web console tests passed; 70/70 P18 transport tests passed; 49/49 durable job & transport tests passed; 167/167 lifecycle and control plane tests passed; `compileall`, `node --check web/app.js`, `git diff --check`, and `graphify update .` all passed.
 - Diff hygiene: untouched `agent/next.md`, `agent/HANDOFF.md`, `agent/staged/*`, and `runtime/transition-executor.json`.
+
 
 P19 Remote HTTP/HTTPS Gateway + Web UI implementation & acceptance (2026-09-29):
 - Status: **COMPLETE**. Executed bounded task P19.1 from `agent/next.md` without modifying lifecycle authority or fabricating successors.
