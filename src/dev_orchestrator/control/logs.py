@@ -126,12 +126,14 @@ def _read_jsonl_records(
                         pid = _extract_project_id(data)
                         cmd_id = _extract_field(data, ("command_id", "cmd_id", "id"))
                         run_id = _extract_field(data, ("run_id", "run"))
+                        job_id_val = _extract_field(data, ("job_id", "operation_id"))
                         records.append({
                             "source": source_name,
                             "timestamp": ts,
                             "project_id": pid,
                             "command_id": cmd_id,
                             "run_id": run_id,
+                            "job_id": job_id_val,
                             "entry_id": f"{source_name}:{idx}",
                             "data": redact_secrets(data),
                         })
@@ -157,6 +159,7 @@ def read_control_logs(
     source: str | None = None,
     limit: int = 50,
     cursor: str | None = None,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
     """Read, filter, redact and paginate control logs across runtime data stores."""
     runtime = Path(runtime_root)
@@ -232,6 +235,19 @@ def read_control_logs(
         filtered = [r for r in filtered if r.get("command_id") == command_id]
     if run_id:
         filtered = [r for r in filtered if r.get("run_id") == run_id]
+    if job_id:
+        filtered = [
+            r for r in filtered
+            if r.get("job_id") == job_id
+            or r.get("run_id") == job_id
+            or r.get("command_id") == job_id
+            or (isinstance(r.get("data"), dict) and (
+                r["data"].get("job_id") == job_id
+                or r["data"].get("operation_id") == job_id
+                or r["data"].get("command_id") == job_id
+                or r["data"].get("run_id") == job_id
+            ))
+        ]
 
     # Sort descending by timestamp, then entry_id
     filtered.sort(key=lambda r: (str(r.get("timestamp") or ""), str(r.get("entry_id") or "")), reverse=True)
@@ -303,6 +319,10 @@ def build_control_logs(
     if run_id is not None:
         run_id = run_id.strip() or None
 
+    job_id = params.get("job_id", [None])[0]
+    if job_id is not None:
+        job_id = job_id.strip() or None
+
     source = params.get("source", [None])[0]
     if source is not None:
         source = source.strip() or None
@@ -323,4 +343,5 @@ def build_control_logs(
         source=source,
         limit=limit,
         cursor=cursor,
+        job_id=job_id,
     )

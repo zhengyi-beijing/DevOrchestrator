@@ -674,6 +674,340 @@ class P19_2RemoteMCPTests(unittest.TestCase):
         self.assertIsNotNone(found2)
         self.assertTrue(found2["revoked"])
 
+        # Test CLI mint with --allowed-tools
+        from dev_orchestrator.cli import main
+        import io
+        from unittest.mock import patch
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            code = main(["mcp-token", "mint", "--label", "scoped-token", "--allowed-tools", "devo_status,devo_read_file", "--runtime-root", str(self.runtime)])
+        self.assertEqual(code, 0)
+        cli_cap = json.loads(buf.getvalue())
+        self.assertEqual(cli_cap["label"], "scoped-token")
+        self.assertEqual(sorted(cli_cap["allowed_tools"]), ["devo_read_file", "devo_status"])
+
+    def test_mcp_rejects_suffix_spoofed_and_off_port_origins(self) -> None:
+        session_id, _ = self._init_session()
+
+        # 1. POST /mcp with forbidden origins:
+        forbidden_origins = [
+            "http://localhost.evil.example",
+            "http://127.0.0.1.attacker.test",
+            "https://localhost.attacker.test",
+            "http://127.0.0.1:9999",
+            "https://evil.example",
+        ]
+        for bad_origin in forbidden_origins:
+            status, headers, resp = self._rpc_request(
+                {"jsonrpc": "2.0", "id": 100, "method": "tools/list", "params": {}},
+                session_id=session_id,
+                origin=bad_origin,
+            )
+            self.assertEqual(status, 403, f"Expected 403 for bad origin {bad_origin}, got {status}")
+            self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+        # 2. OPTIONS /mcp with forbidden origin
+        opt_status, opt_headers, _ = self._rpc_request(
+            None,
+            method="OPTIONS",
+            token="",
+            origin="https://evil.example",
+        )
+        self.assertEqual(opt_status, 403)
+        self.assertNotIn("Access-Control-Allow-Origin", opt_headers)
+
+        # 3. OPTIONS /mcp with valid origin
+        valid_origin = f"http://127.0.0.1:{self.port}"
+        opt_status2, opt_headers2, _ = self._rpc_request(
+            None,
+            method="OPTIONS",
+            token="",
+            origin=valid_origin,
+        )
+        self.assertEqual(opt_status2, 204)
+        self.assertEqual(opt_headers2.get("Access-Control-Allow-Origin"), valid_origin)
+        self.assertIn("POST, DELETE, OPTIONS", opt_headers2.get("Access-Control-Allow-Methods", ""))
+        self.assertIn("Vary", opt_headers2)
+
+        # 4. OPTIONS /mcp without Origin header
+        opt_status3, opt_headers3, _ = self._rpc_request(
+            None,
+            method="OPTIONS",
+            token="",
+            origin=None,
+        )
+        self.assertEqual(opt_status3, 204)
+        self.assertNotIn("Access-Control-Allow-Origin", opt_headers3)
+
+        # 5. POST /mcp with valid origin reflects origin
+        status_ok, headers_ok, _ = self._rpc_request(
+            {"jsonrpc": "2.0", "id": 101, "method": "tools/list", "params": {}},
+            session_id=session_id,
+            origin=valid_origin,
+        )
+        self.assertEqual(status_ok, 200)
+        self.assertEqual(headers_ok.get("Access-Control-Allow-Origin"), valid_origin)
+        self.assertIn("Origin", headers_ok.get("Vary", ""))
+
+        # 6. DELETE /mcp with forbidden origin fails 403
+        del_status_bad, _, _ = self._rpc_request(
+            None,
+            method="DELETE",
+            session_id=session_id,
+            origin="http://localhost.evil.example",
+        )
+        self.assertEqual(del_status_bad, 403)
+
+        # 7. DELETE /mcp with valid origin succeeds 200 with CORS reflection
+        del_status_ok, del_headers_ok, _ = self._rpc_request(
+            None,
+            method="DELETE",
+            session_id=session_id,
+            origin=valid_origin,
+        )
+        self.assertEqual(del_status_ok, 200)
+        self.assertEqual(del_headers_ok.get("Access-Control-Allow-Origin"), valid_origin)
+
+    def test_devo_read_log_job_id_filter_matches_run_and_command_records(self) -> None:
+        session_id, _ = self._init_session()
+
+        # Seed runs.jsonl with a record that has run_id and NO command_id
+        runs_file = self.runtime / "history" / "runs.jsonl"
+        with runs_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "timestamp": "2026-09-30T10:00:00Z",
+                "project_id": "p19_test",
+                "run_id": "job-target-alpha",
+                "role_run_id": "job-target-alpha",
+                "status": "completed",
+            }) + "\n")
+            f.write(json.dumps({
+                "timestamp": "2026-09-30T10:01:00Z",
+                "project_id": "p19_test",
+                "run_id": "job-other-beta",
+                "status": "completed",
+            }) + "\n")
+
+        # Seed events.jsonl with a record that has command_id and NO run_id
+        events_file = self.runtime / "history" / "events.jsonl"
+        with events_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "timestamp": "2026-09-30T10:02:00Z",
+                "project_id": "p19_test",
+                "command_id": "job-target-alpha",
+                "event": "command_finished",
+            }) + "\n")
+            f.write(json.dumps({
+                "timestamp": "2026-09-30T10:03:00Z",
+                "project_id": "p19_test",
+                "command_id": "job-other-beta",
+                "event": "command_finished",
+            }) + "\n")
+
+        # 1. Query runs by job_id="job-target-alpha": matches run_id record
+        s_runs, _, r_runs = self._rpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 110,
+                "method": "tools/call",
+                "params": {
+                    "name": "devo_read_log",
+                    "arguments": {"source": "runs", "job_id": "job-target-alpha"},
+                },
+            },
+            session_id=session_id,
+        )
+        self.assertEqual(s_runs, 200)
+        runs_data = json.loads(r_runs["result"]["content"][0]["text"])
+        self.assertFalse(r_runs["result"].get("isError", False))
+        self.assertEqual(len(runs_data["items"]), 1)
+        self.assertEqual(runs_data["items"][0]["run_id"], "job-target-alpha")
+
+        # 2. Query events by job_id="job-target-alpha": matches command_id record
+        s_events, _, r_events = self._rpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 111,
+                "method": "tools/call",
+                "params": {
+                    "name": "devo_read_log",
+                    "arguments": {"source": "events", "job_id": "job-target-alpha"},
+                },
+            },
+            session_id=session_id,
+        )
+        self.assertEqual(s_events, 200)
+        events_data = json.loads(r_events["result"]["content"][0]["text"])
+        self.assertFalse(r_events["result"].get("isError", False))
+        self.assertEqual(len(events_data["items"]), 1)
+        self.assertEqual(events_data["items"][0]["command_id"], "job-target-alpha")
+
+        # 3. Query with non-matching job_id returns 0 items
+        s_none, _, r_none = self._rpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 112,
+                "method": "tools/call",
+                "params": {
+                    "name": "devo_read_log",
+                    "arguments": {"source": "runs", "job_id": "job-nonexistent"},
+                },
+            },
+            session_id=session_id,
+        )
+        self.assertEqual(s_none, 200)
+        none_data = json.loads(r_none["result"]["content"][0]["text"])
+        self.assertEqual(len(none_data["items"]), 0)
+
+        # 4. Limit out of range fails closed
+        s_lim0, _, r_lim0 = self._rpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 113,
+                "method": "tools/call",
+                "params": {
+                    "name": "devo_read_log",
+                    "arguments": {"source": "events", "limit": 0},
+                },
+            },
+            session_id=session_id,
+        )
+        self.assertEqual(s_lim0, 200)
+        self.assertTrue(r_lim0["result"].get("isError"))
+
+        s_lim101, _, r_lim101 = self._rpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 114,
+                "method": "tools/call",
+                "params": {
+                    "name": "devo_read_log",
+                    "arguments": {"source": "events", "limit": 101},
+                },
+            },
+            session_id=session_id,
+        )
+        self.assertEqual(s_lim101, 200)
+        self.assertTrue(r_lim101["result"].get("isError"))
+
+    def test_devo_read_file_oversized_result_is_structurally_bounded(self) -> None:
+        session_id, _ = self._init_session()
+
+        # Create 200KB text file in repo root
+        large_bytes = b"A" * (200 * 1024)
+        large_file = self.repo / "large_200k.txt"
+        large_file.write_bytes(large_bytes)
+        expected_sha = "sha256:" + hashlib.sha256(large_bytes).hexdigest()
+
+        # 1. Read 200KB file with default max_bytes (1MB)
+        status, _, resp = self._rpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 120,
+                "method": "tools/call",
+                "params": {
+                    "name": "devo_read_file",
+                    "arguments": {"project_id": "p19_test", "path": "large_200k.txt"},
+                },
+            },
+            session_id=session_id,
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(resp["result"].get("isError", False))
+        raw_text = resp["result"]["content"][0]["text"]
+        # Must parse as clean JSON without truncation
+        parsed = json.loads(raw_text)
+        self.assertTrue(parsed["is_text"])
+        self.assertEqual(parsed["size_bytes"], 200 * 1024)
+        self.assertEqual(parsed["content_sha256"], expected_sha)
+        self.assertEqual(len(parsed["content"]), 200 * 1024)
+        self.assertEqual(parsed["selected_transport"], "local")
+
+        # 2. Read with explicit max_bytes=50000 (bounded read)
+        status2, _, resp2 = self._rpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 121,
+                "method": "tools/call",
+                "params": {
+                    "name": "devo_read_file",
+                    "arguments": {
+                        "project_id": "p19_test",
+                        "path": "large_200k.txt",
+                        "max_bytes": 50000,
+                    },
+                },
+            },
+            session_id=session_id,
+        )
+        self.assertEqual(status2, 200)
+        self.assertFalse(resp2["result"].get("isError", False))
+        parsed2 = json.loads(resp2["result"]["content"][0]["text"])
+        self.assertEqual(parsed2["size_bytes"], 50000)
+        self.assertEqual(len(parsed2["content"]), 50000)
+
+        # 3. Oversized read beyond 10MB schema limit fails closed
+        status3, _, resp3 = self._rpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 122,
+                "method": "tools/call",
+                "params": {
+                    "name": "devo_read_file",
+                    "arguments": {
+                        "project_id": "p19_test",
+                        "path": "large_200k.txt",
+                        "max_bytes": 20 * 1024 * 1024,
+                    },
+                },
+            },
+            session_id=session_id,
+        )
+        self.assertEqual(status3, 200)
+        self.assertTrue(resp3["result"].get("isError"))
+        err_msg = resp3["result"]["content"][0]["text"]
+        self.assertIn("out of range", err_msg)
+
+        # 4. max_bytes < 1 fails closed
+        status4, _, resp4 = self._rpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 123,
+                "method": "tools/call",
+                "params": {
+                    "name": "devo_read_file",
+                    "arguments": {
+                        "project_id": "p19_test",
+                        "path": "large_200k.txt",
+                        "max_bytes": 0,
+                    },
+                },
+            },
+            session_id=session_id,
+        )
+        self.assertEqual(status4, 200)
+        self.assertTrue(resp4["result"].get("isError"))
+
+        # 5. offset_bytes < 0 fails closed
+        status5, _, resp5 = self._rpc_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 124,
+                "method": "tools/call",
+                "params": {
+                    "name": "devo_read_file",
+                    "arguments": {
+                        "project_id": "p19_test",
+                        "path": "large_200k.txt",
+                        "offset_bytes": -5,
+                    },
+                },
+            },
+            session_id=session_id,
+        )
+        self.assertEqual(status5, 200)
+        self.assertTrue(resp5["result"].get("isError"))
+
 
 if __name__ == "__main__":
     unittest.main()

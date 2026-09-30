@@ -2,11 +2,11 @@
   "schema_version": 1,
   "acceptance": "P19.2 Remote MCP Interface zero-RDC",
   "host": "ZXZ-PC",
-  "started_run_tag": "20260930T013228Z",
-  "completed_at": "2026-09-30T01:32:34.325190+00:00",
+  "started_run_tag": "20260930T021349Z",
+  "completed_at": "2026-09-30T02:13:55.494418+00:00",
   "base_url": "http://127.0.0.1:8770",
   "project_id": "devorchestrator",
-  "capability_id": "mcp-SltKjjaqk9Oeka-2fY4syw",
+  "capability_id": "mcp-uKNCisY9wZiTh26rDJpyKw",
   "protocol_version": "2025-06-18",
   "tools_discovered": 6,
   "result": "PASS",
@@ -16,30 +16,30 @@
   ],
   "rdc_call_count": 0,
   "observed_rdc_selections": 0,
-  "complete_job_id": "job-9b593fe04ad8c7a3",
-  "cancel_job_id": "job-97d864a242d12bf2",
+  "complete_job_id": "job-83a36790c7a31a37",
+  "cancel_job_id": "job-ceb3f0ebca508bf4",
   "operations": [
     {
-      "timestamp": "2026-09-30T01:32:28.345042+00:00",
+      "timestamp": "2026-09-30T02:13:49.865225+00:00",
       "operation": "initialize",
-      "request_id": "p19-2-mcp-20260930T013228Z-init",
+      "request_id": "p19-2-mcp-20260930T021349Z-init",
       "selected_transport": null,
       "job_id": null,
-      "session_id": "mcp-sess-3a79e321bd3a4213a8517876eadc7ee1",
+      "session_id": "mcp-sess-668512099e3d47a7b020c240ce1db5b1",
       "protocol_version": "2025-06-18"
     },
     {
-      "timestamp": "2026-09-30T01:32:28.379331+00:00",
+      "timestamp": "2026-09-30T02:13:49.900890+00:00",
       "operation": "notifications/initialized",
-      "request_id": "p19-2-mcp-20260930T013228Z-notif",
+      "request_id": "p19-2-mcp-20260930T021349Z-notif",
       "selected_transport": null,
       "job_id": null,
       "status_code": 202
     },
     {
-      "timestamp": "2026-09-30T01:32:28.438678+00:00",
+      "timestamp": "2026-09-30T02:13:49.912794+00:00",
       "operation": "tools/list",
-      "request_id": "p19-2-mcp-20260930T013228Z-tools-list",
+      "request_id": "p19-2-mcp-20260930T021349Z-tools-list",
       "selected_transport": null,
       "job_id": null,
       "tool_count": 6,
@@ -53,69 +53,69 @@
       ]
     },
     {
-      "timestamp": "2026-09-30T01:32:32.626551+00:00",
+      "timestamp": "2026-09-30T02:13:53.789863+00:00",
       "operation": "devo_status",
-      "request_id": "p19-2-mcp-20260930T013228Z-status",
+      "request_id": "p19-2-mcp-20260930T021349Z-status",
       "selected_transport": null,
       "job_id": null,
-      "project_state": "READY_TO_RUN"
+      "project_state": "WORKER_RUNNING"
     },
     {
-      "timestamp": "2026-09-30T01:32:32.710875+00:00",
+      "timestamp": "2026-09-30T02:13:53.844130+00:00",
       "operation": "devo_start_task",
-      "request_id": "p19-2-mcp-20260930T013228Z-start-task",
+      "request_id": "p19-2-mcp-20260930T021349Z-start-task",
       "selected_transport": "local",
-      "job_id": "job-9b593fe04ad8c7a3"
+      "job_id": "job-83a36790c7a31a37"
     },
     {
-      "timestamp": "2026-09-30T01:32:33.901651+00:00",
+      "timestamp": "2026-09-30T02:13:55.088611+00:00",
       "operation": "devo_job_status",
-      "request_id": "p19-2-mcp-20260930T013228Z-job-status",
+      "request_id": "p19-2-mcp-20260930T021349Z-job-status",
       "selected_transport": "local",
-      "job_id": "job-9b593fe04ad8c7a3"
+      "job_id": "job-83a36790c7a31a37"
     },
     {
-      "timestamp": "2026-09-30T01:32:33.961276+00:00",
+      "timestamp": "2026-09-30T02:13:55.145934+00:00",
       "operation": "devo_start_task_for_cancel",
-      "request_id": "p19-2-mcp-20260930T013228Z-spawn-cancel",
+      "request_id": "p19-2-mcp-20260930T021349Z-spawn-cancel",
       "selected_transport": "local",
-      "job_id": "job-97d864a242d12bf2"
+      "job_id": "job-ceb3f0ebca508bf4"
     },
     {
-      "timestamp": "2026-09-30T01:32:34.252490+00:00",
+      "timestamp": "2026-09-30T02:13:55.416269+00:00",
       "operation": "devo_cancel_job",
-      "request_id": "p19-2-mcp-20260930T013228Z-cancel-job",
+      "request_id": "p19-2-mcp-20260930T021349Z-cancel-job",
       "selected_transport": "local",
-      "job_id": "job-97d864a242d12bf2"
+      "job_id": "job-ceb3f0ebca508bf4"
     },
     {
-      "timestamp": "2026-09-30T01:32:34.273967+00:00",
+      "timestamp": "2026-09-30T02:13:55.438185+00:00",
       "operation": "devo_read_log",
-      "request_id": "p19-2-mcp-20260930T013228Z-read-log",
+      "request_id": "p19-2-mcp-20260930T021349Z-read-log",
       "selected_transport": null,
       "job_id": null,
       "items_count": 10
     },
     {
-      "timestamp": "2026-09-30T01:32:34.298381+00:00",
+      "timestamp": "2026-09-30T02:13:55.465932+00:00",
       "operation": "devo_read_file",
-      "request_id": "p19-2-mcp-20260930T013228Z-read-file",
+      "request_id": "p19-2-mcp-20260930T021349Z-read-file",
       "selected_transport": "local",
       "job_id": null,
       "size_bytes": 639
     },
     {
-      "timestamp": "2026-09-30T01:32:34.309804+00:00",
+      "timestamp": "2026-09-30T02:13:55.478283+00:00",
       "operation": "sse_negotiation",
-      "request_id": "p19-2-mcp-20260930T013228Z-sse-negotiate",
+      "request_id": "p19-2-mcp-20260930T021349Z-sse-negotiate",
       "selected_transport": null,
       "job_id": null,
       "content_type": "text/event-stream; charset=utf-8"
     },
     {
-      "timestamp": "2026-09-30T01:32:34.320590+00:00",
+      "timestamp": "2026-09-30T02:13:55.489852+00:00",
       "operation": "session_delete",
-      "request_id": "p19-2-mcp-20260930T013228Z-terminate",
+      "request_id": "p19-2-mcp-20260930T021349Z-terminate",
       "selected_transport": null,
       "job_id": null,
       "deleted": true

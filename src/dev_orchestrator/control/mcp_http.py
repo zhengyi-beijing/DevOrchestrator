@@ -31,6 +31,7 @@ SERVER_NAME = "devorchestrator-remote-mcp"
 SERVER_VERSION = "1.0.0"
 
 _ALLOWED_LOG_SOURCES = frozenset({"events", "runs", "control_audit", "accounting"})
+_HTTP_MAX_TOOL_RESULT_BYTES = 16 * 1024 * 1024  # 16 MB accommodating 10 MB file reads + JSON formatting overhead
 
 MCP_TOOLS: list[dict[str, Any]] = [
     {
@@ -473,7 +474,7 @@ class MCPHttpEndpoint:
             return 200, {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
-                "result": format_tool_result_dict(res_dict, is_error=is_error),
+                "result": format_tool_result_dict(res_dict, is_error=is_error, max_bytes=_HTTP_MAX_TOOL_RESULT_BYTES),
             }
 
         return 200, {
@@ -562,42 +563,83 @@ class MCPHttpEndpoint:
                         "status": "failed",
                         "error": f"source {source!r} not in allowed sources: {sorted(_ALLOWED_LOG_SOURCES)}",
                     }, True, None
-                limit = max(1, min(100, int(args.get("limit", 50))))
+                limit_arg = args.get("limit")
+                if limit_arg is not None:
+                    try:
+                        limit = int(limit_arg)
+                    except (ValueError, TypeError):
+                        return {"status": "failed", "error": f"invalid limit: {limit_arg!r}"}, True, None
+                    if limit < 1 or limit > 100:
+                        return {
+                            "status": "failed",
+                            "error": f"limit {limit} out of range (1..100)",
+                        }, True, None
+                else:
+                    limit = 50
+                target_job_id = args.get("job_id")
                 logs_res = read_control_logs(
                     self.runtime_root,
                     project_id=args.get("project_id"),
-                    run_id=args.get("job_id"),
-                    command_id=args.get("job_id"),
+                    job_id=target_job_id,
                     source=source,
                     limit=limit,
                     cursor=args.get("cursor"),
                 )
-                return logs_res, False, args.get("job_id")
+                return logs_res, False, target_job_id
 
             if name == "devo_read_file":
                 checked_tool_args(args, {"project_id", "path", "max_bytes", "offset_bytes"}, ("project_id", "path"))
-                max_bytes = max(1, min(10 * 1024 * 1024, int(args.get("max_bytes", 1024 * 1024))))
-                offset_bytes = max(0, int(args.get("offset_bytes", 0)))
-                res = read_file(
-                    self.runtime_root,
-                    project_id=args["project_id"],
-                    path=args["path"],
-                    max_bytes=max_bytes,
-                    offset_bytes=offset_bytes,
-                    request_id=request_id,
-                )
+                max_bytes_arg = args.get("max_bytes")
+                if max_bytes_arg is not None:
+                    try:
+                        max_bytes = int(max_bytes_arg)
+                    except (ValueError, TypeError):
+                        return {"status": "failed", "error": f"invalid max_bytes: {max_bytes_arg!r}"}, True, None
+                    if max_bytes < 1 or max_bytes > 10 * 1024 * 1024:
+                        return {
+                            "status": "failed",
+                            "error": f"max_bytes {max_bytes} out of range (1..10485760)",
+                        }, True, None
+                else:
+                    max_bytes = 1024 * 1024
+
+                offset_bytes_arg = args.get("offset_bytes")
+                if offset_bytes_arg is not None:
+                    try:
+                        offset_bytes = int(offset_bytes_arg)
+                    except (ValueError, TypeError):
+                        return {"status": "failed", "error": f"invalid offset_bytes: {offset_bytes_arg!r}"}, True, None
+                    if offset_bytes < 0:
+                        return {
+                            "status": "failed",
+                            "error": f"offset_bytes {offset_bytes} must be >= 0",
+                        }, True, None
+                else:
+                    offset_bytes = 0
+
+                try:
+                    res = read_file(
+                        self.runtime_root,
+                        project_id=args["project_id"],
+                        path=args["path"],
+                        max_bytes=max_bytes,
+                        offset_bytes=offset_bytes,
+                        request_id=request_id,
+                    )
+                except Exception as exc:
+                    return {"status": "failed", "error": str(exc)}, True, None
                 if res.get("status") != "ok":
                     return res, True, None
-                # Explicit text/binary output reporting
+                # Explicit text/binary output reporting with metadata preceding content
                 if res.get("content_text") is not None:
                     out = {
                         "status": res["status"],
                         "path": res["path"],
                         "is_text": True,
-                        "content": res["content_text"],
                         "size_bytes": res["size_bytes"],
                         "content_sha256": res["content_sha256"],
                         "selected_transport": res["selected_transport"],
+                        "content": res["content_text"],
                     }
                 else:
                     out = {
@@ -605,10 +647,10 @@ class MCPHttpEndpoint:
                         "path": res["path"],
                         "is_text": False,
                         "encoding": "base64",
-                        "content_base64": res.get("content_base64"),
                         "size_bytes": res["size_bytes"],
                         "content_sha256": res["content_sha256"],
                         "selected_transport": res["selected_transport"],
+                        "content_base64": res.get("content_base64"),
                     }
                 return out, False, None
 

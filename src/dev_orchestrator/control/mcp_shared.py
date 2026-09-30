@@ -16,15 +16,24 @@ def checked_tool_args(args: dict[str, Any], allowed: set[str], required: tuple[s
             raise ValueError(f"missing required argument: {name}")
 
 
-def format_tool_content(result: Any, max_bytes: int = 65536) -> str:
+_MAX_TOOL_RESULT_BYTES = 65536
+
+
+def format_tool_content(result: Any, max_bytes: int = _MAX_TOOL_RESULT_BYTES) -> str:
     """Serialize tool result to JSON with max byte ceiling and truncation marker."""
     rendered = json.dumps(result, ensure_ascii=False, indent=2)
-    if len(rendered) > max_bytes:
-        rendered = rendered[: max_bytes - 36] + "\n...[OUTPUT_TRUNCATED]"
+    encoded = rendered.encode("utf-8")
+    if len(encoded) > max_bytes:
+        truncation_payload = {
+            "error": "output_truncated",
+            "message": f"Tool output exceeded limit of {max_bytes} bytes...[OUTPUT_TRUNCATED]",
+            "max_bytes": max_bytes,
+        }
+        return json.dumps(truncation_payload, ensure_ascii=False, indent=2)
     return rendered
 
 
-def format_tool_result_dict(result: Any, is_error: bool = False, max_bytes: int = 65536) -> dict[str, Any]:
+def format_tool_result_dict(result: Any, is_error: bool = False, max_bytes: int = _MAX_TOOL_RESULT_BYTES) -> dict[str, Any]:
     """Return standard MCP tool execution content block."""
     return {
         "content": [{"type": "text", "text": format_tool_content(result, max_bytes=max_bytes)}],

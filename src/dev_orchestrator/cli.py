@@ -1581,9 +1581,12 @@ def cmd_mcp_token(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
     if action == "mint":
         from dev_orchestrator.control.security import create_mcp_capability
+        tools_str = getattr(args, "allowed_tools", "") or ""
+        allowed_tools = [t.strip() for t in tools_str.split(",") if t.strip()] if tools_str else None
         cap = create_mcp_capability(
             label=getattr(args, "label", "") or "",
             ttl_seconds=int(getattr(args, "ttl", 86400 * 30)),
+            allowed_tools=allowed_tools,
             runtime_root=runtime,
         )
         sys.stdout.write(json.dumps(cap, indent=2, ensure_ascii=False) + "\n")
@@ -2195,6 +2198,7 @@ def build_parser() -> argparse.ArgumentParser:
     mint_p = mcp_token_sub.add_parser("mint", help="mint a new revocable MCP token")
     mint_p.add_argument("--label", default="", help="human-readable label")
     mint_p.add_argument("--ttl", type=int, default=86400 * 30, help="TTL in seconds (default: 30 days)")
+    mint_p.add_argument("--allowed-tools", default="", help="comma-separated list of allowed tools (default: all)")
     mint_p.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
     list_p = mcp_token_sub.add_parser("list", help="list active MCP capability tokens")

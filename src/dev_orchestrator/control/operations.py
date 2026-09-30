@@ -326,8 +326,29 @@ def read_file(
     if not path or not str(path).strip():
         raise ControlOperationError(400, "Bad Request", "path is required")
 
-    clamped_max = max(1, min(10 * 1024 * 1024, int(max_bytes)))
-    clamped_offset = max(0, int(offset_bytes))
+    if max_bytes is not None:
+        try:
+            int_max = int(max_bytes)
+        except (ValueError, TypeError) as exc:
+            raise ControlOperationError(400, "Bad Request", f"invalid max_bytes: {max_bytes!r}") from exc
+        if int_max < 1:
+            raise ControlOperationError(400, "Bad Request", "max_bytes must be >= 1")
+        if int_max > 10 * 1024 * 1024:
+            raise ControlOperationError(400, "Bad Request", "max_bytes exceeds maximum allowed limit of 10485760")
+        target_max = int_max
+    else:
+        target_max = 10 * 1024 * 1024
+
+    if offset_bytes is not None:
+        try:
+            int_offset = int(offset_bytes)
+        except (ValueError, TypeError) as exc:
+            raise ControlOperationError(400, "Bad Request", f"invalid offset_bytes: {offset_bytes!r}") from exc
+        if int_offset < 0:
+            raise ControlOperationError(400, "Bad Request", "offset_bytes must be >= 0")
+        target_offset = int_offset
+    else:
+        target_offset = 0
 
     try:
         transport = get_transport_for_host(runtime, host_id, operation="read_file", effect_class="read_only")
@@ -337,8 +358,8 @@ def read_file(
                 project_id=project_id,
                 path=path,
                 host_id=host_id,
-                max_bytes=clamped_max,
-                offset_bytes=clamped_offset,
+                max_bytes=target_max,
+                offset_bytes=target_offset,
             )
         )
     except TransportRejectedError as exc:

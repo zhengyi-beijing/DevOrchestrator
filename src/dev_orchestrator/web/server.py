@@ -675,7 +675,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._error(503, "Service Unavailable", "MCP endpoint not enabled", False)
                 return
             origin = self.headers.get("Origin")
-            if origin and not origin.startswith(("http://127.0.0.1", "http://localhost", "https://localhost")):
+            if origin and not self._same_origin():
                 self._error(403, "Forbidden", "forbidden origin", False)
                 return
             auth_header = self.headers.get("Authorization")
@@ -689,7 +689,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 return
             deleted = self.server.mcp_endpoint.delete_session(str(session_id).strip())
             payload = {"status": "ok", "deleted": deleted, "session_id": str(session_id).strip()}
-            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(payload), False)
+            extra = {}
+            if origin:
+                extra["Access-Control-Allow-Origin"] = origin
+                extra["Vary"] = "Origin"
+            self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(payload), False, extra)
             self._touch_after_request()
             return
         self._dispatch_method_not_allowed()
@@ -702,14 +706,21 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         if path == "/mcp":
+            origin = self.headers.get("Origin")
+            if origin and not self._same_origin():
+                self._error(403, "Forbidden", "forbidden origin", False)
+                return
+            cors_headers = {
+                "Allow": "POST, DELETE, OPTIONS",
+                "Access-Control-Allow-Methods": "POST, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, Mcp-Session-Id, MCP-Protocol-Version, X-DevOrch-Request-ID, Accept",
+            }
+            if origin:
+                cors_headers["Access-Control-Allow-Origin"] = origin
+                cors_headers["Vary"] = "Origin"
             self._send(
                 204, "No Content", "application/json; charset=utf-8", b"", False,
-                {
-                    "Allow": "POST, DELETE, OPTIONS",
-                    "Access-Control-Allow-Origin": self.headers.get("Origin") or "*",
-                    "Access-Control-Allow-Methods": "POST, DELETE, OPTIONS",
-                    "Access-Control-Allow-Headers": "Authorization, Content-Type, Mcp-Session-Id, MCP-Protocol-Version, X-DevOrch-Request-ID, Accept",
-                },
+                cors_headers,
             )
             self._touch_after_request()
             return
@@ -1545,7 +1556,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 self._error(503, "Service Unavailable", "MCP endpoint not enabled", False)
                 return
             origin = self.headers.get("Origin")
-            if origin and not origin.startswith(("http://127.0.0.1", "http://localhost", "https://localhost")):
+            if origin and not self._same_origin():
                 self._error(403, "Forbidden", "forbidden origin", False)
                 return
             auth_header = self.headers.get("Authorization")
@@ -1588,6 +1599,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 500: "Internal Server Error",
                 503: "Service Unavailable",
             }
+            if origin:
+                resp_headers["Access-Control-Allow-Origin"] = origin
+                resp_headers["Vary"] = "Origin"
             self._send(
                 status_code,
                 _reason_map.get(status_code, "HTTP Response"),
