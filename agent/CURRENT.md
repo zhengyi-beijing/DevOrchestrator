@@ -1,3 +1,15 @@
+# P20 active development baseline (2026-10-04)
+
+Owner authorized P20.1 through P20.5 after P19.2, no successor afterwards.
+Direction frozen in agent/staged/P20.md; full owner contract in
+docs/P20_OWNER_REQUIREMENTS.md. Independent phase Plan Review and Technical
+Review remain mandatory. Initial authority P19.2 COMPLETE generation 10;
+daemon was stopped, owner review freeze paused, no active execution/roles.
+Initial evidence: docs/evidence/P20_INITIAL_STATE.json. Soak NOT STARTED.
+AIBroker restored on loopback 18875 (8875 is OS-excluded); machine config
+backed up before changing service_url, existing authentication retained.
+No P20 phase is complete. Main only, local commits, no push.
+
 # DevOrchestrator Self-Hosted Development State
 
 P19.2 authoritative lifecycle closeout (2026-10-03):

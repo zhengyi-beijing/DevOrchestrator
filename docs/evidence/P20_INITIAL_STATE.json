@@ -1,0 +1,220 @@
+{
+  "observed_at": "2026-10-03T20:11:43.951320+00:00",
+  "head": "30c0a8bcdbac0e3424558af179dc9a89c9e859d4",
+  "branch": "main",
+  "ahead": 4,
+  "tracked_dirty": false,
+  "daemon_process_alive": false,
+  "recorded_pid": 42844,
+  "listening_ports": [],
+  "authoritative_lifecycle": {
+    "schema_version": 1,
+    "project_id": "devorchestrator",
+    "generation": 10,
+    "current_task_id": "P19.2",
+    "lifecycle_state": "COMPLETE",
+    "source_task_id": "P19",
+    "active_transition_id": "handoff:9be5980b189b6bb0c4b8",
+    "active_owner": null,
+    "owner_gate": null,
+    "updated_at": "2026-10-03T20:01:00.371385+00:00",
+    "repository_projection": {
+      "task_id": "P19.2",
+      "state": "READY_TO_RUN",
+      "matches_authority": true
+    },
+    "recovery_epoch_id": "991cd4fb2b81b2cd",
+    "invariants": [
+      {
+        "code": "CURRENT_TASK_MATCHES_ACTIVE_EXECUTION",
+        "holds": true,
+        "recoverable": true,
+        "reason": "active Worker task must equal authoritative current task",
+        "evidence": {
+          "authority_task_id": "P19.2",
+          "active_workers": []
+        }
+      },
+      {
+        "code": "TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION",
+        "holds": true,
+        "recoverable": true,
+        "reason": "terminal authority cannot retain a running Worker",
+        "evidence": {
+          "authority_state": "COMPLETE",
+          "active_workers": []
+        }
+      },
+      {
+        "code": "PENDING_DESIGN_NOT_EXECUTING",
+        "holds": true,
+        "recoverable": true,
+        "reason": "pending-design authority cannot execute a Worker",
+        "evidence": {
+          "authority_state": "COMPLETE",
+          "active_workers": []
+        }
+      },
+      {
+        "code": "SUCCESSOR_HANDOFF_LINEAGE_VALID",
+        "holds": true,
+        "recoverable": false,
+        "reason": "handoff lineage requires distinct source and target identities",
+        "evidence": {
+          "invalid_handoffs": []
+        }
+      },
+      {
+        "code": "NEXT_TASK_WITHOUT_HANDOFF",
+        "holds": true,
+        "recoverable": true,
+        "reason": "accepted NEXT_TASK must have a durable handoff",
+        "evidence": {
+          "next_decisions": [],
+          "handoffs": 17,
+          "transitions": 17,
+          "evidence_unavailable": false
+        }
+      },
+      {
+        "code": "SINGLE_ACTIVE_LIFECYCLE_OWNER",
+        "holds": true,
+        "recoverable": false,
+        "reason": "only one lifecycle role may own a project",
+        "evidence": {
+          "owners": [],
+          "owner_tasks": []
+        }
+      }
+    ],
+    "historical_lineage_reconciled": {
+      "from_task_id": "P16.8",
+      "to_task_id": "P19.2",
+      "trigger": "owner-approved P19.2 lifecycle closeout reconciliation",
+      "head": "c5ba8a7161421e6d4f8b51f7aba607a1d6a84b6b",
+      "edges": [
+        {
+          "source_task_id": "P16.8",
+          "target_task_id": "P16.9",
+          "activation_commit": "3fdbc862f9edc928dbfaadebe7b86870d935b50c",
+          "transition_id": "handoff:b32b1bb2b04fb35b6c04",
+          "source_request_id": "recover-handoff:devorchestrator:P16.8:P16.9:2262f876ad53"
+        },
+        {
+          "source_task_id": "P16.9",
+          "target_task_id": "P16.10",
+          "activation_commit": "fae685c8abe10ac82df10dfd24538a6bb1b9f754",
+          "transition_id": "handoff:236504f01abfa21734a9",
+          "source_request_id": "historical-handoff:devorchestrator:P16.9:P16.10:fae685c8abe1"
+        },
+        {
+          "source_task_id": "P16.10",
+          "target_task_id": "P16.11",
+          "activation_commit": "2eb572146ed1afd15a6cd00743d26a16aa6afa6b",
+          "transition_id": "handoff:d5e1785145e63a53fe91",
+          "source_request_id": "historical-handoff:devorchestrator:P16.10:P16.11:2eb572146ed1"
+        },
+        {
+          "source_task_id": "P16.11",
+          "target_task_id": "P16.12",
+          "activation_commit": "c157dc9376a528e148488671b48a08d9e8d45127",
+          "transition_id": "handoff:5cf04796b10634dff19a",
+          "source_request_id": "historical-handoff:devorchestrator:P16.11:P16.12:c157dc9376a5"
+        },
+        {
+          "source_task_id": "P16.12",
+          "target_task_id": "P16.13",
+          "activation_commit": "2b326fdc6dcc3e6ca53ceda47e3fbeaac959f923",
+          "transition_id": "handoff:e549aca0a2ef38b8de38",
+          "source_request_id": "historical-handoff:devorchestrator:P16.12:P16.13:2b326fdc6dcc"
+        },
+        {
+          "source_task_id": "P16.13",
+          "target_task_id": "P16.14",
+          "activation_commit": "140879e9068df7859d2b17f298e4d67e89ba7b93",
+          "transition_id": "handoff:1bb6daae8e568bf940b7",
+          "source_request_id": "historical-handoff:devorchestrator:P16.13:P16.14:140879e9068d"
+        },
+        {
+          "source_task_id": "P16.14",
+          "target_task_id": "P17",
+          "activation_commit": "e3eeb29184eb6daadaa5913d1296c66a55f487dd",
+          "transition_id": "handoff:2f439466fd1d47fb47d5",
+          "source_request_id": "historical-handoff:devorchestrator:P16.14:P17:e3eeb29184eb"
+        },
+        {
+          "source_task_id": "P17",
+          "target_task_id": "P18",
+          "activation_commit": "dc085d85a0b99e07cdd91b83f84f2bfac485a078",
+          "transition_id": "handoff:65f99bf0c6c146e528b7",
+          "source_request_id": "historical-handoff:devorchestrator:P17:P18:dc085d85a0b9"
+        },
+        {
+          "source_task_id": "P18",
+          "target_task_id": "P19",
+          "activation_commit": "fcb4c3de3155670240819a725fee1ffed03b2aa0",
+          "transition_id": "handoff:94e4be2321589012c53b",
+          "source_request_id": "historical-handoff:devorchestrator:P18:P19:fcb4c3de3155"
+        },
+        {
+          "source_task_id": "P19",
+          "target_task_id": "P19.2",
+          "activation_commit": "7183a730b92362642995e2379ec0830113a87e92",
+          "transition_id": "handoff:9be5980b189b6bb0c4b8",
+          "source_request_id": "historical-handoff:devorchestrator:P19:P19.2:7183a730b923"
+        }
+      ],
+      "historical_obligations_backfilled": [
+        {
+          "source_task_id": "P12.6",
+          "target_task_id": "P12.7",
+          "activation_commit": "8059d04520e57f778e2de6cbc0d6920176fab078",
+          "source_request_id": "recover-handoff:devorchestrator:P12.6:P12.7:3c910a56ae0d"
+        },
+        {
+          "source_task_id": "P12.7",
+          "target_task_id": "P13",
+          "activation_commit": "f62b080e886e5e9951c460332312ab54e58d3309",
+          "source_request_id": "recover-handoff:devorchestrator:P12.7:P13:40034708a609"
+        },
+        {
+          "source_task_id": "P13",
+          "target_task_id": "P13.5",
+          "activation_commit": "076c25011a57dd0459150b84c613a439a2208d87",
+          "source_request_id": "recover-handoff:devorchestrator:P13:P13.5:8a3096e92bf6"
+        },
+        {
+          "source_task_id": "P13.5",
+          "target_task_id": "P14",
+          "activation_commit": "da1b501978f01924c389906357b21e4def8f70c3",
+          "source_request_id": "recover-handoff:devorchestrator:P13.5:P14:8e8b41a1eed5"
+        },
+        {
+          "source_task_id": "P14",
+          "target_task_id": "P14.5",
+          "activation_commit": "8565d83ce2bd8fc1d0e01cbae80c14bd3f1f8c21",
+          "source_request_id": "recover-handoff:devorchestrator:P14:P14.5:bfd175f36aa2"
+        },
+        {
+          "source_task_id": "P15",
+          "target_task_id": "P16",
+          "activation_commit": "30aa6f6f17d82c92a40cc918b2ea8e128784b84e",
+          "source_request_id": "recover-handoff:devorchestrator:P15:P16:488573bd5b1d"
+        },
+        {
+          "source_task_id": "P16.7",
+          "target_task_id": "P16.8",
+          "activation_commit": "915b4a6217034cd9519458ac53025a210eb16299",
+          "source_request_id": "recover-handoff:devorchestrator:P16.7:P16.8:e543e50214e7"
+        }
+      ],
+      "recorded_at": "2026-10-03T08:46:42.478428+00:00"
+    }
+  },
+  "owner_paused": true,
+  "active_roles": [],
+  "backup_path": "C:\\work\\github\\DevOrchestrator-dev\\runtime\\backup-p20-initial-20261003-201143",
+  "soak_started": false,
+  "review_status": "not_started",
+  "owner_successor_authorization": "docs/P20_OWNER_REQUIREMENTS.md"
+}

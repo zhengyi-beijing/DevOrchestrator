@@ -359,3 +359,14 @@ scope and scenarios are staged in `agent/staged/P19.2.md`.
 
 Sequence: P18 -> P19/P19.1 -> P19.2. P19.2 does not block P19.1 completion unless
 P19.1 would otherwise compromise the required shared-service architecture.
+
+
+## P20 — Unattended Execution Reliability & Self-Recovery
+
+Owner authorized 2026-10-04. Unique sequence: P19.2 -> P20.1 telemetry/taxonomy
+-> P20.2 harvesting/regressions -> P20.3 durable bounded recovery/escalation
+-> P20.4 isolated real-AI six-hour five-task fault soak -> P20.5 hard acceptance
+and authoritative closeout -> TBD. Direction: agent/staged/P20.md;
+requirements: docs/P20_OWNER_REQUIREMENTS.md. TDD and independent reviews
+required per phase. No unit-test substitute for real continuous qualification.
+No successor has been invented. Roadmap re-baseline requires owner decision.

@@ -1,3 +1,25 @@
+# P20 restoration and design checkpoint (2026-10-04)
+
+P20.1-P20.5 direction: agent/staged/P20.md. Owner contract:
+docs/P20_OWNER_REQUIREMENTS.md. Unique sequence staged from P19.2;
+P20.5 successor null. Each phase awaits its reviewed executable plan.
+No implementation or live soak acceptance has been claimed.
+
+Initial clean main HEAD 30c0a8b, ahead 4; P19.2 authority COMPLETE generation
+10, no active owner/execution/gate. Daemon PID 42844 was dead;
+8770/8765/8875 absent; owner review freeze paused. Backup and initial
+authority evidence: docs/evidence/P20_INITIAL_STATE.json. Preserve history.
+
+Resume checks: python -m dev_orchestrator status-daemon --runtime-root runtime;
+python -m dev_orchestrator project-status devorchestrator --runtime-root runtime
+--config config/projects.json. Read authority and active roles before editing.
+Normal successor API, reviewed Planner pipeline, then TDD P20.1.
+No push, reset, clean, rebase, runtime ledger editing or P21. Soak NOT STARTED.
+AIBroker restored on loopback 18875 (8875 is OS-excluded); machine config
+backed up before changing service_url, existing authentication retained.
+
+Historical P19.3 handoff follows:
+
 # P19.3 Handoff — Read-only Browser Control Bridge
 
 Last updated: 2026-10-03.

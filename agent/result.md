@@ -2313,3 +2313,17 @@ Closed both concrete BLOCKING review findings from `ai_review:rereview:37165140-
   Graphify update passed.
 - P16.13 has no roadmap successor and is COMPLETE. The two external project
   owner gates remain correctly fail closed pending their owners' disposition.
+
+
+## P20 restoration and design baseline (2026-10-04)
+
+- Owner authorized P19.2 -> P20.1 -> P20.2 -> P20.3 -> P20.4 -> P20.5 -> TBD.
+- Canonical workflow and actual Git/runtime/project/watchdog/role/owner state inspected; backup and initial authority evidence in docs/evidence/P20_INITIAL_STATE.json.
+- Daemon stopped, contrary to historical running reference. No ledger overwritten or terminal task rerun.
+- Existing P14.6/P16.10/P16.11 implementations and reviews inspected; direct reuse and concrete gaps frozen in agent/staged/P20.md.
+- Full owner contract and five staged specs preserved, each PENDING DESIGN until its independent Plan Review.
+- Roadmap RED: new P20 test failed because P19.2 had no successor.
+- P20 implementation and six-hour live soak not yet accepted.
+
+- Design verification: 115 tests + 12 subtests passed; CPF/invariant workflow and declaration: 47 tests passed; compileall and diff check passed; Graphify updated (8577 nodes).
+- Broker restore: Windows excludes 8850-8949, original 8875 bind fails with WinError 10013. Backed up machine execution config and moved service_url only to authenticated loopback 18875, retaining token/config/database.

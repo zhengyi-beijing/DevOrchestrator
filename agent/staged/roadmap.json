@@ -133,6 +133,31 @@
     },
     {
       "task_id": "P19.2",
+      "successor": "P20.1",
+      "successor_spec_path": "agent/staged/P20.1.md"
+    },
+    {
+      "task_id": "P20.1",
+      "successor": "P20.2",
+      "successor_spec_path": "agent/staged/P20.2.md"
+    },
+    {
+      "task_id": "P20.2",
+      "successor": "P20.3",
+      "successor_spec_path": "agent/staged/P20.3.md"
+    },
+    {
+      "task_id": "P20.3",
+      "successor": "P20.4",
+      "successor_spec_path": "agent/staged/P20.4.md"
+    },
+    {
+      "task_id": "P20.4",
+      "successor": "P20.5",
+      "successor_spec_path": "agent/staged/P20.5.md"
+    },
+    {
+      "task_id": "P20.5",
       "successor": null,
       "successor_spec_path": null
     }
