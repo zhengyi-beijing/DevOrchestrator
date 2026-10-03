@@ -1,5 +1,18 @@
 # DevOrchestrator Self-Hosted Development State
 
+P19.2 authoritative lifecycle closeout (2026-10-03):
+- Status: **COMPLETE / TECHNICAL_REVIEW_ACCEPT / RESTART_ACCEPTANCE_PASS**.
+- Reviewed implementation HEAD: `4c40ce1dd9697c5d24acef87080620c77f390180`.
+- Existing TransitionExecutor settlement API closed P19.2 at generation 10;
+  no hand-written ledger mutation or fabricated successor was used.
+- Terminal restarts retained historical handoffs/transitions at 17/17, no
+  active owner/execution, all six invariants true, watchdog ok, and continue
+  disabled. Owner freeze remains in place.
+- Final full regression: 1702 passed, 130 subtests passed, 0 failed.
+- Evidence and the non-blocking compatibility display note:
+  `docs/evidence/P19_2_LIFECYCLE_CLOSEOUT.md`.
+- No successor has been invented. Roadmap re-baseline requires owner decision.
+
 P19.3 read-only Browser Control Bridge live closeout (2026-10-03, authoritative update):
 - Status: **COMPLETE / LIVE_BROWSER_E2E_PASS**.
 - Audit found that the prior 8765 implementation was not an adapter over the
@@ -120,7 +133,7 @@ P18 External Control Entrypoint closeout (2026-09-29):
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current closeout: **P19.3 ChatGPT Plus Browser Control Bridge** (Status: **COMPLETE / LIVE_BROWSER_E2E_PASS**, read-only scope). Runtime lifecycle still reports `current_task=P19.2`; this documentation closeout does not mutate lifecycle authority.
+Current authoritative closeout: **P19.2 Remote MCP Interface** (Status: **COMPLETE / TECHNICAL_REVIEW_ACCEPT / RESTART_ACCEPTANCE_PASS**). P19.3's read-only live acceptance remains complete. No successor has been invented. Roadmap re-baseline requires owner decision.
 
 P18 Owner-Authorized Technical Review Remediation Evidence (2026-09-28):
 - Addressed exactly the four remaining blockers from Claude Opus review `ai_review:ai_review:ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute` at `d3ecdb9` without reopening planning:
