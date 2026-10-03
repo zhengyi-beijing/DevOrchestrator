@@ -1,3 +1,16 @@
+# P20 bootstrap recovery checkpoint (2026-10-04)
+
+P20.1 remains PENDING_DESIGN, generation 11; no phase accepted, soak NOT STARTED.
+Stale-readiness successor bootstrap repair accepted and normal handoff consumed
+once. Terminal read-only Codex review timeout fix: independent round-2 ACCEPT,
+98 canonical regression tests; full prior baseline 1712 tests +130 subtests.
+Evidence: docs/P20_BOOTSTRAP_REVIEW_TIMEOUT_FIX.md and docs/evidence/
+P20_READONLY_TIMEOUT_TECHNICAL_REVIEW_R2.json. Broker loopback 18875; repeated
+Codex timeout resource is temporarily quarantined via normal resource API.
+Machine configuration/restore evidence stays untracked and secret-safe.
+Resume existing candidate review normally; do not rerun Planner/handoff.
+No P21, no push, no invented successor after P20.5.
+
 # P20 active development baseline (2026-10-04)
 
 Owner authorized P20.1 through P20.5 after P19.2, no successor afterwards.

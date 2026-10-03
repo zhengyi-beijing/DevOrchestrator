@@ -1,0 +1,44 @@
+{
+  "request_id": "p20-readonly-codex-timeout-technical-review-20261004-r1",
+  "status": "succeeded",
+  "resource_context": {
+    "resource_id": "claude/default/opus",
+    "provider": "anthropic",
+    "account": "default",
+    "model": "claude-opus-5"
+  },
+  "verdict": "CHANGES_REQUIRED",
+  "findings": [
+    {
+      "classification": "BLOCKING",
+      "file": "runtime/p20-drafts/test_p20_readonly_review_timeout.py",
+      "reason": "test_unknown_terminal_never_fails_over cannot exercise its stated guard. \"unknown\" is not a valid AIRoleResult.status (src/dev_orchestrator/ai/contracts.py:12 allows only succeeded|failed|cancelled|no_candidate), so replace(result,status=\"unknown\") at lines 18-19 raises ValueError inside execute(). The ValueError escapes the port and is swallowed by the generic handler at src/dev_orchestrator/core/ai_planner.py:1749 (the stub port has no .status, so reconciliation also fails with AttributeError and classification stays None), after which review_result is None and can_failover is False. Both assertions (state failed, review_calls==1) therefore pass through the port-exception path and never reach the patched result branch, so the declared seven-test acceptance set contains no real coverage of a non-\"failed\" terminal status - which is exactly the guard the patch omits (see next finding). Use a valid non-failed status (cancelled or no_candidate) with error \"Codex turn timed out\" and assert both no failover and the recorded failure_classification."
+    },
+    {
+      "classification": "NON_BLOCKING",
+      "file": "src/dev_orchestrator/core/ai_planner.py",
+      "reason": "The mapping is applied before the status gate, so any non-succeeded, non-failed terminal result (cancelled, no_candidate) carrying the same error text is persisted as failure_classification \"provider_temporarily_unavailable\" in reviewer_attempts (_record_reviewer_attempt, line 2561) and surfaced as reviewer_last_failure_classification (core/diagnostics.py:321), even though can_failover correctly refuses to fail over. No behavioral failover change, but an indeterminate or cancelled dispatch is labelled as provider resource evidence. Gate the new condition on review_result.status == \"failed\" to match the existing can_failover precondition."
+    },
+    {
+      "classification": "NON_BLOCKING",
+      "file": "src/dev_orchestrator/core/ai_planner.py",
+      "reason": "The synthesized classification is written into the durable reviewer attempt record with no provenance marker distinguishing coordinator-mapped classification from Broker/Worker-reported evidence, so P20 reliability aggregation over failure_classification will count provider_temporarily_unavailable events the Worker never classified (confirmed conservative at ai/aibroker_subprocess.py:136-161). Precedent for coordinator-authored values exists (lines 1720, 1735), so this is hygiene only; recommend an attempt-record marker such as classification_source=\"coordinator_exact_error_map\"."
+    },
+    {
+      "classification": "NON_BLOCKING",
+      "file": "src/dev_orchestrator/core/ai_planner.py",
+      "reason": "Wall-clock exposure of the REVIEWING_PLAN phase grows from one to up to three reviewer dispatches (config/projects.json: review_timeout_seconds 900, max_reviewer_resource_failovers default 2, i.e. up to ~2700s) while watchdog no_progress_threshold_minutes stays 15 with auto_recovery true and planner-ledger progress pinned to the record's started_at rather than per-attempt timestamps (core/watchdog.py:657-671). The retry budget itself is unchanged and finite, and lifecycle/epoch guards remain (watchdog.py:2518-2522, 2614-2619), but the window in which a stall diagnosis can race an in-flight reviewer failover widens. Also note review_independence is \"provider\", so if the timeout is systemic rather than resource-specific the extra attempts add cost without raising success probability. Record as an acceptance note, or set a REVIEWING_PLAN lifecycle_override before soak."
+    },
+    {
+      "classification": "NON_BLOCKING",
+      "file": "runtime/p20-readonly-review-timeout-red.log",
+      "reason": "The red evidence does not correspond to the final test file: the log is a three-test run (\"FF.\", 2 failed 1 passed) with failure line numbers 28 and 39, whereas the same assertions now sit at lines 41 and 52 of the seven-test file, and the stated green run also covers only the initial three tests. The four negative tests (unknown status, missing resource, semantic timeout, Worker port conservatism) therefore have no recorded execution evidence - which is how the vacuous test above went undetected. Re-run and attach red/green logs for the final seven-test file in the isolated draft process."
+    },
+    {
+      "classification": "NON_BLOCKING",
+      "file": "runtime/p20-drafts/patch-manifest.json",
+      "reason": "The manifest declares after_sha256 d1692db8... which I reproduced exactly as canonical plus the hunk with LF endings, but the artifact actually executed by the draft test (runtime/p20-drafts/ai_planner.py, loaded via conftest.py sys.modules injection) is the CRLF variant hashing 8f12ac58... and is named nowhere in the manifest. Content is identical modulo line endings (verified with diff --strip-trailing-cr), so this is a provenance gap rather than a divergence; record the tested vehicle's hash so the equivalence does not have to be re-derived by each reviewer."
+    }
+  ],
+  "scope": "bootstrap only; not P20.1/soak acceptance"
+}

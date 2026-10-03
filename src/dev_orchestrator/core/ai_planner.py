@@ -1655,6 +1655,14 @@ class AIPlannerCoordinator:
                 if review_result.status != "succeeded":
                     review_failure = review_result.error or f"plan_reviewer_{review_result.status}"
                     classification = getattr(review_result, "failure_classification", None)
+                    # This exact terminal error is emitted by Broker's read-only Codex harness.
+                    # Keep Worker/transport ambiguity handling and semantic rejections unchanged.
+                    if (
+                        review_result.status == "failed"
+                        and classification is None
+                        and str(review_result.error or "").strip().casefold() == "codex turn timed out"
+                    ):
+                        classification = "provider_temporarily_unavailable"
                     resource = review_result.resource_context
                     can_failover = (
                         review_result.status == "failed"

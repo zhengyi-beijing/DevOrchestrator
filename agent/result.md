@@ -2327,3 +2327,10 @@ Closed both concrete BLOCKING review findings from `ai_review:rereview:37165140-
 
 - Design verification: 115 tests + 12 subtests passed; CPF/invariant workflow and declaration: 47 tests passed; compileall and diff check passed; Graphify updated (8577 nodes).
 - Broker restore: Windows excludes 8850-8949, original 8875 bind fails with WinError 10013. Backed up machine execution config and moved service_url only to authenticated loopback 18875, retaining token/config/database.
+
+
+P20 bootstrap terminal read-only review timeout recovery accepted independently
+after one concrete remediation round. Two non-vacuous cancelled/no_candidate
+RED assertions then 98 canonical GREEN. Full pre-patch baseline 1712 tests and
+130 subtests GREEN. P20.1 implementation and 6-hour soak remain NOT ACCEPTED /
+NOT STARTED. See docs/P20_BOOTSTRAP_REVIEW_TIMEOUT_FIX.md.

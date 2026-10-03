@@ -1,0 +1,57 @@
+{
+  "request_id": "p20-readonly-codex-timeout-technical-review-20261004-r2",
+  "status": "succeeded",
+  "resource_context": {
+    "resource_id": "claude/default/opus",
+    "provider": "anthropic",
+    "account": "default",
+    "model": "claude-opus-5"
+  },
+  "verdict": "ACCEPT",
+  "findings": [
+    {
+      "classification": "NON_BLOCKING",
+      "file": "src/dev_orchestrator/core/ai_planner.py",
+      "reason": "The symmetric planner normal-result path (line 1373) has no equivalent exact-error mapping, so a planner dispatch returning failed / \"Codex turn timed out\" with classification None still raises RuntimeError into the generic handler at line 1425, where it is counted as a semantic failure and retried up to max_attempts on a resource that is not excluded. Correctly out of scope for a reviewer-path bootstrap and fail-closed, but record it as a P20 phase input so the same provider failure mode does not silently consume the planner semantic budget."
+    },
+    {
+      "classification": "NON_BLOCKING",
+      "file": "runtime/p20-drafts/test_p20_readonly_review_timeout.py",
+      "reason": "The untracked draft copy still contains the superseded vacuous UnknownTimeoutPort test (status=\"unknown\"), while the manifest records only tracked_test_sha256 (which matches tests_py/...). The authoritative test is unambiguous, but the stale draft remains the file named in the retained red/prototype logs and could be mistaken for the reviewed vehicle during archival. Re-sync or remove it when the evidence is archived."
+    },
+    {
+      "classification": "NON_BLOCKING",
+      "file": "runtime/p20-readonly-timeout-real-regression-r2.log",
+      "reason": "The final green log contains only \"98 passed in 32.27s\" with no pytest header, invocation or node ids, so its selection is not self-describing; coverage of the eight final tests is only inferable from the remediation RED (which does show tests_py paths and the final test names) and the 97 -> 98 delta. Capture the exact command and selected files in future acceptance logs."
+    },
+    {
+      "classification": "NON_BLOCKING",
+      "file": "tests_py/test_p20_readonly_review_timeout.py",
+      "reason": "Line 5 inserts str(Path.cwd()/\"tests_py\") into sys.path, which is CWD-dependent and non-canonical: the other cross-importing tests (test_accounting_dashboard.py, test_web.py) import sibling helpers directly and rely on pytest rootdir insertion plus tests_py/conftest.py. The import works without it, so this is harmless, as are the compressed multi-statement lines that deviate from surrounding tests_py style."
+    }
+  ],
+  "source_manifest": {
+    "source": "src/dev_orchestrator/core/ai_planner.py",
+    "before_sha256": "d84b4dd5cc5a2c3b6e9fbb08847d3cfaa7ec2a85d9921605f37d077f71276a30",
+    "after_sha256": "a4faac45e99f91cd668cb2f3a24770449cf1efcb34fd51f6974b1ea8bab6a6e3",
+    "tested_prototype_sha256": "a4faac45e99f91cd668cb2f3a24770449cf1efcb34fd51f6974b1ea8bab6a6e3",
+    "tracked_test_sha256": "98fc8469782bb383b2fda7960310d753c0c1b4a55397741db9e36cdce99ce5eb",
+    "source_changed_only_after_planner_failed_and_authority_quiescent": true,
+    "review_round": 2,
+    "scope": "exact terminal failed read-only Codex Plan Review error; existing budget/context/independence retained"
+  },
+  "canonical_regression": {
+    "command": "python -m pytest tests_py/test_p20_readonly_review_timeout.py tests_py/test_ai_planner.py tests_py/test_aibroker_execution_port.py tests_py/test_control_commands.py tests_py/test_daemon_transition_integration.py -q",
+    "result": "98 passed in 32.27s",
+    "log": "runtime/p20-readonly-timeout-real-regression-r2.log"
+  },
+  "red": {
+    "command": "python -m pytest tests_py/test_p20_readonly_review_timeout.py -q",
+    "result": "2 failed, 6 passed (valid cancelled/no_candidate classification assertions)",
+    "log": "runtime/p20-readonly-review-timeout-remediation-red.log"
+  },
+  "pre_patch_full_regression": "1712 passed, 130 subtests passed in 716.78s",
+  "compileall": "pass",
+  "diff_check": "pass",
+  "scope": "bootstrap only; not P20.1 or soak acceptance"
+}
