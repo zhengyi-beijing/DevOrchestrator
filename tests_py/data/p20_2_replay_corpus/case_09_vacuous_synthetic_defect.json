@@ -1,0 +1,20 @@
+{
+  "case_id": "case_09_vacuous_synthetic_defect",
+  "replay_op": "fingerprint_stability",
+  "source_failure_signature": "vacuous_signature",
+  "expected_invariant": "ANY",
+  "expected_defect_outcome": "same_outcome",
+  "defect_anchor": {
+    "failure_class": "planner_timeout",
+    "outcome": "same_outcome"
+  },
+  "corrected_anchor": {
+    "failure_class": "planner_timeout",
+    "outcome": "same_outcome"
+  },
+  "regression_class": "planner_timeout",
+  "cpf_scenarios": [
+    "CPF-09"
+  ],
+  "notes": "Non-discriminating oracle where defect and corrected yield same outcome."
+}

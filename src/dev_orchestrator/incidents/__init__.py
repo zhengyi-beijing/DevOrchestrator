@@ -19,6 +19,26 @@ from dev_orchestrator.incidents.obligations import resolve_progress_obligation
 from dev_orchestrator.incidents.owner_gate import resolve_owner_gate_authority
 from dev_orchestrator.incidents.policy import resolve_incident_policy
 from dev_orchestrator.incidents.promotion import promote_candidate, resolve_promotion_state
+from dev_orchestrator.incidents.regression_candidate import (
+    REGRESSION_CANDIDATE_SCHEMA_VERSION,
+    REPLAYABILITY_VALUES,
+    VERIFICATION_STATUSES,
+    RegressionCandidate,
+    create_regression_candidate,
+    normalize_regression_candidate,
+    promote_verified_regression,
+    resolve_regression_candidate,
+    validate_regression_candidate,
+    verify_regression_candidate,
+)
+from dev_orchestrator.incidents.replay_runner import (
+    REPLAY_OPS,
+    ReplayCaseSpec,
+    ReplayFixtureInvalidError,
+    ReplayOpNotAllowedError,
+    load_replay_case,
+    run_replay_case,
+)
 from dev_orchestrator.incidents.regression_owner import resolve_regression_owner
 from dev_orchestrator.incidents.reliability_runs import (
     close_reliability_run,
@@ -43,6 +63,7 @@ from dev_orchestrator.incidents.store import (
     load_incident_store,
     reconcile_journal,
 )
+from dev_orchestrator.incidents.taxonomy import map_to_failure_class
 
 __all__ = [
     "harvest_tick",
@@ -86,4 +107,21 @@ __all__ = [
     "ReliabilityTelemetry",
     "MetricResult",
     "Coverage",
+    "REGRESSION_CANDIDATE_SCHEMA_VERSION",
+    "VERIFICATION_STATUSES",
+    "REPLAYABILITY_VALUES",
+    "RegressionCandidate",
+    "validate_regression_candidate",
+    "normalize_regression_candidate",
+    "create_regression_candidate",
+    "resolve_regression_candidate",
+    "verify_regression_candidate",
+    "promote_verified_regression",
+    "REPLAY_OPS",
+    "ReplayCaseSpec",
+    "load_replay_case",
+    "run_replay_case",
+    "ReplayOpNotAllowedError",
+    "ReplayFixtureInvalidError",
+    "map_to_failure_class",
 ]

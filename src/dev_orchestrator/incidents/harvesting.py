@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from typing import Any, Callable, Sequence
 
 from dev_orchestrator.control.command_store import ControlCommandStore
@@ -415,8 +416,467 @@ def _detect_orchestrator_alive_task_stalled(
     return anomalies
 
 
+def _detect_planner_failure(
+    runtime_root: Path,
+    config: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    executor: Any,
+    watchdog: Any,
+    planner: Any,
+    reviewer: Any,
+    now: Any,
+) -> list[tuple[str, str | None, str, dict[str, Any], dict[str, Any], str]]:
+    anomalies = []
+    planner_file = runtime_root / "ai-planner.json"
+    if not planner_file.is_file():
+        return anomalies
+    data = read_json(planner_file, {})
+    plans = data.get("plans") if isinstance(data, dict) else {}
+    if not isinstance(plans, dict):
+        return anomalies
+
+    for plan_id, pdata in plans.items():
+        if not isinstance(pdata, dict):
+            continue
+        pid = pdata.get("project_id")
+        if not pid:
+            continue
+        tid = pdata.get("task_id")
+        state = pdata.get("state")
+        last_fail = str(pdata.get("planner_last_failure") or "")
+        attempts = pdata.get("planner_attempts") or []
+
+        has_failed_attempt = False
+        if isinstance(attempts, list):
+            for att in attempts:
+                if not isinstance(att, dict):
+                    continue
+                if att.get("status") == "failed":
+                    has_failed_attempt = True
+                    att_idx = att.get("attempt", 1)
+                    reason = str(att.get("reason") or last_fail or "").lower()
+                    if "timeout" in reason or "timed out" in reason or "deadline" in reason:
+                        fclass = "planner_timeout"
+                    elif "malformed" in reason or "extraction" in reason or "json" in reason or "marker" in reason:
+                        fclass = "malformed_ai_output"
+                    else:
+                        fclass = "planner_timeout" if "time" in reason else "malformed_ai_output"
+                    semantic = {
+                        "failure_class": fclass,
+                        "role": "planner",
+                        "stage": "planning",
+                        "lifecycle_class": "planning",
+                    }
+                    occ_key = f"plan_fail:{pid}:{plan_id}:{att_idx}"
+                    anomalies.append((str(pid), tid, "PLANNER_FAILURE", semantic, att, occ_key))
+
+        if not has_failed_attempt and (state in ("failed", "blocked") or last_fail):
+            reason = last_fail.lower()
+            if "timeout" in reason or "timed out" in reason or "deadline" in reason:
+                fclass = "planner_timeout"
+            elif "malformed" in reason or "extraction" in reason or "json" in reason or "marker" in reason:
+                fclass = "malformed_ai_output"
+            else:
+                fclass = "malformed_ai_output"
+            semantic = {
+                "failure_class": fclass,
+                "role": "planner",
+                "stage": "planning",
+                "lifecycle_class": "planning",
+            }
+            occ_key = f"plan_fail:{pid}:{plan_id}:1"
+            anomalies.append((str(pid), tid, "PLANNER_FAILURE", semantic, pdata, occ_key))
+
+    return anomalies
+
+
+def _detect_worker_loss(
+    runtime_root: Path,
+    config: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    executor: Any,
+    watchdog: Any,
+    planner: Any,
+    reviewer: Any,
+    now: Any,
+) -> list[tuple[str, str | None, str, dict[str, Any], dict[str, Any], str]]:
+    anomalies = []
+    lineage_file = runtime_root / "execution-lineage.json"
+    if not lineage_file.is_file():
+        return anomalies
+    data = read_json(lineage_file, {})
+    records = data.get("records") if isinstance(data, dict) else {}
+    if not isinstance(records, dict):
+        return anomalies
+
+    for lkey, rec in records.items():
+        if not isinstance(rec, dict):
+            continue
+        pid = rec.get("project_id")
+        if not pid:
+            continue
+        tid = rec.get("task_id")
+        inv_key = rec.get("invariant_key")
+        term_outcome = rec.get("terminal_outcome")
+        if rec.get("loss_detected") or term_outcome in ("explicitly_reconciled", "stale_predecessor_fenced") or rec.get("state") == "lost":
+            if term_outcome == "missing_execution_record":
+                fclass = "missing_execution_record"
+            else:
+                fclass = "worker_process_lost"
+            semantic = {
+                "failure_class": fclass,
+                "role": "worker",
+                "diagnosis_code": "worker_vanished_without_terminal_state",
+                "lifecycle_class": "executing",
+                "contract_class": "durability",
+                "invariant_identifier": str(inv_key or "execution_terminal_invariant"),
+            }
+            occ_key = f"worker_loss:{pid}:{lkey}"
+            anomalies.append((str(pid), tid, "ACTIONABLE_EXECUTION_LOSS", semantic, rec, occ_key))
+
+    return anomalies
+
+
+def _detect_reviewer_failure(
+    runtime_root: Path,
+    config: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    executor: Any,
+    watchdog: Any,
+    planner: Any,
+    reviewer: Any,
+    now: Any,
+) -> list[tuple[str, str | None, str, dict[str, Any], dict[str, Any], str]]:
+    anomalies = []
+    rev_file = runtime_root / "ai-reviewer.json"
+    if not rev_file.is_file():
+        return anomalies
+    data = read_json(rev_file, {})
+    reviews = data.get("reviews") if isinstance(data, dict) else {}
+    if not isinstance(reviews, dict):
+        return anomalies
+
+    for rid, rdata in reviews.items():
+        if not isinstance(rdata, dict):
+            continue
+        pid = rdata.get("project_id")
+        if not pid:
+            continue
+        tid = rdata.get("task_id")
+        state = rdata.get("state")
+        decision = str(rdata.get("decision") or "").lower()
+        dec_id = rdata.get("decision_id") or "1"
+        reason = str(rdata.get("reason") or "").lower()
+
+        if state == "failed" or decision in ("reject", "remediate") or "reject" in reason:
+            if "timeout" in reason or "timed out" in reason or "deadline" in reason:
+                fclass = "reviewer_timeout"
+            elif decision in ("reject", "remediate") or "reject" in reason:
+                fclass = "reviewer_rejected"
+            else:
+                fclass = "reviewer_rejected"
+            semantic = {
+                "failure_class": fclass,
+                "role": "reviewer",
+                "stage": "reviewing",
+                "lifecycle_class": "reviewing",
+                "contract_class": "technical_review",
+            }
+            occ_key = f"rev_fail:{pid}:{rid}:{dec_id}"
+            anomalies.append((str(pid), tid, "REVIEWER_FAILURE", semantic, rdata, occ_key))
+
+    return anomalies
+
+
+def _detect_transition_executor_failure(
+    runtime_root: Path,
+    config: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    executor: Any,
+    watchdog: Any,
+    planner: Any,
+    reviewer: Any,
+    now: Any,
+) -> list[tuple[str, str | None, str, dict[str, Any], dict[str, Any], str]]:
+    anomalies = []
+    te_file = runtime_root / "transition-executor.json"
+    if not te_file.is_file():
+        return anomalies
+    data = read_json(te_file, {})
+    executions = data.get("executions") if isinstance(data, dict) else {}
+    if not isinstance(executions, dict):
+        return anomalies
+
+    for eid, edata in executions.items():
+        if not isinstance(edata, dict):
+            continue
+        pid = edata.get("project_id")
+        if not pid:
+            continue
+        tid = edata.get("task_id")
+        state = edata.get("state")
+        reason = str(edata.get("reason") or "").lower()
+
+        if state in ("blocked", "failed"):
+            if "handoff" in reason and ("missing" in reason or "lost" in reason):
+                fclass = "lost_handoff"
+            elif "duplicate" in reason:
+                fclass = "duplicate_request"
+            elif "projection" in reason or "mismatch" in reason or "repository changed" in reason:
+                fclass = "lifecycle_projection_mismatch"
+            elif "contradict" in reason or "ambiguous" in reason or "unspecified" in reason:
+                fclass = "unknown_requires_owner"
+            else:
+                fclass = "unknown_requires_owner"
+            semantic = {
+                "failure_class": fclass,
+                "lifecycle_class": "handoff",
+                "contract_class": "transition_executor",
+            }
+            idem_key = edata.get("handoff_idempotency_key") or eid
+            occ_key = f"trans_fail:{pid}:{idem_key}"
+            anomalies.append((str(pid), tid, "TRANSITION_EXECUTOR_FAILURE", semantic, edata, occ_key))
+
+    return anomalies
+
+
+def _detect_daemon_restart_failure(
+    runtime_root: Path,
+    config: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    executor: Any,
+    watchdog: Any,
+    planner: Any,
+    reviewer: Any,
+    now: Any,
+) -> list[tuple[str, str | None, str, dict[str, Any], dict[str, Any], str]]:
+    anomalies = []
+    boots_file = runtime_root / "daemon-boots.jsonl"
+    if not boots_file.is_file():
+        return anomalies
+
+    boots: list[dict[str, Any]] = []
+    try:
+        with boots_file.open("r", encoding="utf-8-sig", errors="replace") as f:
+            for line in f:
+                if line.strip():
+                    boots.append(json.loads(line.strip()))
+    except Exception:
+        return anomalies
+
+    if not boots:
+        return anomalies
+    latest_boot = boots[-1]
+    boot_id = str(latest_boot.get("boot_id") or f"boot-{len(boots)}")
+
+    te_file = runtime_root / "transition-executor.json"
+    if not te_file.is_file():
+        return anomalies
+    data = read_json(te_file, {})
+    executions = data.get("executions") if isinstance(data, dict) else {}
+    if not isinstance(executions, dict):
+        return anomalies
+
+    for eid, edata in executions.items():
+        if not isinstance(edata, dict):
+            continue
+        pid = edata.get("project_id")
+        if not pid:
+            continue
+        tid = edata.get("task_id")
+        state = edata.get("state")
+
+        if state in ("running", "handoff"):
+            if state == "handoff":
+                fclass = "daemon_restart_during_handoff"
+            else:
+                fclass = "daemon_restart_during_execution"
+            semantic = {
+                "failure_class": fclass,
+                "lifecycle_class": "executing" if state == "running" else "handoff",
+                "contract_class": "daemon_lifecycle",
+                "restart_kind": "handoff" if state == "handoff" else "execution",
+            }
+            occ_key = f"boot_restart:{pid}:{boot_id}:{eid}"
+            anomalies.append((str(pid), tid, "DAEMON_RESTART_FAILURE", semantic, edata, occ_key))
+
+    return anomalies
+
+
+def _detect_aibroker_routing_failure(
+    runtime_root: Path,
+    config: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    executor: Any,
+    watchdog: Any,
+    planner: Any,
+    reviewer: Any,
+    now: Any,
+) -> list[tuple[str, str | None, str, dict[str, Any], dict[str, Any], str]]:
+    anomalies = []
+    events_file = runtime_root / "execution-accounting" / "events.jsonl"
+    if not events_file.is_file():
+        return anomalies
+
+    try:
+        with events_file.open("r", encoding="utf-8-sig", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line.strip())
+                if not isinstance(row, dict):
+                    continue
+                ev_type = row.get("event_type")
+                if ev_type == "provider_result_observed":
+                    metadata = row.get("metadata") or {}
+                    if not isinstance(metadata, dict):
+                        continue
+                    status = metadata.get("status")
+                    if status in ("failed", "no_candidate"):
+                        pid = row.get("project_id")
+                        if not pid:
+                            continue
+                        tid = row.get("task_id")
+                        req_id = row.get("request_id") or "req"
+                        cls_hint = str(metadata.get("classification") or "").lower()
+                        err_msg = str(metadata.get("error") or "").lower()
+
+                        if cls_hint in {"quota_exhausted", "rate_limited"} or "quota" in err_msg or "rate limit" in err_msg:
+                            fclass = "provider_quota_exhausted"
+                        elif cls_hint in {"provider_temporarily_unavailable", "resource_unavailable"} or "provider" in err_msg or "candidate" in err_msg:
+                            fclass = "provider_unavailable"
+                        elif "broker" in err_msg or "connection refused" in err_msg:
+                            fclass = "aibroker_unavailable"
+                        else:
+                            fclass = "provider_unavailable"
+                        semantic = {
+                            "failure_class": fclass,
+                            "role": row.get("role", "worker"),
+                            "contract_class": "broker_routing",
+                        }
+                        occ_key = f"broker_routing:{pid}:{req_id}"
+                        anomalies.append((str(pid), tid, "AIBROKER_ROUTING_FAILURE", semantic, row, occ_key))
+
+                elif ev_type == "attempt_outcome":
+                    outcome = str(row.get("outcome") or "").lower()
+                    phase = str(row.get("phase") or "").lower()
+                    if outcome in ("failed", "no_candidate") and phase in ("retry", "failover"):
+                        pid = row.get("project_id")
+                        if not pid:
+                            continue
+                        tid = row.get("task_id")
+                        att_id = row.get("attempt_id") or "att"
+                        semantic = {
+                            "failure_class": "provider_unavailable",
+                            "role": row.get("role", "worker"),
+                            "contract_class": "broker_routing",
+                        }
+                        occ_key = f"broker_routing:{pid}:{att_id}"
+                        anomalies.append((str(pid), tid, "AIBROKER_ROUTING_FAILURE", semantic, row, occ_key))
+    except Exception:
+        return anomalies
+
+    return anomalies
+
+
+def _detect_execution_transport_failure(
+    runtime_root: Path,
+    config: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    executor: Any,
+    watchdog: Any,
+    planner: Any,
+    reviewer: Any,
+    now: Any,
+) -> list[tuple[str, str | None, str, dict[str, Any], dict[str, Any], str]]:
+    anomalies = []
+    logs_file = runtime_root / "logs" / "transport-operations.ndjson"
+    if not logs_file.is_file():
+        return anomalies
+
+    try:
+        with logs_file.open("r", encoding="utf-8-sig", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line.strip())
+                if not isinstance(row, dict):
+                    continue
+                status = str(row.get("status") or "").lower()
+                err = row.get("error")
+                if status in ("failed", "rejected") or err:
+                    pid = row.get("project_id")
+                    if not pid:
+                        continue
+                    op_id = row.get("operation_id") or row.get("request_id") or f"op-{hash(json.dumps(row))}"
+                    semantic = {
+                        "failure_class": "transport_unavailable",
+                        "contract_class": "execution_transport",
+                    }
+                    occ_key = f"transport_op:{pid}:{op_id}"
+                    anomalies.append((str(pid), None, "EXECUTION_TRANSPORT_FAILURE", semantic, row, occ_key))
+    except Exception:
+        return anomalies
+
+    return anomalies
+
+
+def _detect_durable_job_failure(
+    runtime_root: Path,
+    config: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    executor: Any,
+    watchdog: Any,
+    planner: Any,
+    reviewer: Any,
+    now: Any,
+) -> list[tuple[str, str | None, str, dict[str, Any], dict[str, Any], str]]:
+    anomalies = []
+    jobs_file = runtime_root / "jobs" / "index.json"
+    if not jobs_file.is_file():
+        return anomalies
+    data = read_json(jobs_file, {})
+    jobs = data.get("jobs") if isinstance(data, dict) else {}
+    if not isinstance(jobs, dict):
+        return anomalies
+
+    for jid, jdata in jobs.items():
+        if not isinstance(jdata, dict):
+            continue
+        pid = jdata.get("project_id")
+        if not pid:
+            continue
+        state = jdata.get("state")
+        if state == "failed":
+            fkind = str(jdata.get("failure_kind") or "").lower()
+            if "transport" in fkind or "channel" in fkind or "connection" in fkind:
+                fclass = "transport_unavailable"
+            elif "duplicate" in fkind:
+                fclass = "duplicate_request"
+            elif "worker" in fkind or "loss" in fkind:
+                fclass = "worker_process_lost"
+            else:
+                fclass = "transport_unavailable"
+            semantic = {
+                "failure_class": fclass,
+                "contract_class": "durable_job",
+            }
+            occ_key = f"job_fail:{pid}:{jid}:{state}"
+            anomalies.append((str(pid), None, "DURABLE_JOB_FAILURE", semantic, jdata, occ_key))
+
+    return anomalies
+
+
 DETECTORS: dict[str, Callable[..., list[tuple[str, str | None, str, dict[str, Any], dict[str, Any], str]]]] = {
+    "planner_failure": _detect_planner_failure,
+    "worker_loss": _detect_worker_loss,
+    "reviewer_failure": _detect_reviewer_failure,
     "watchdog_recovery": _detect_watchdog_recovery,
+    "transition_executor_failure": _detect_transition_executor_failure,
+    "daemon_restart_failure": _detect_daemon_restart_failure,
+    "aibroker_routing_failure": _detect_aibroker_routing_failure,
+    "execution_transport_failure": _detect_execution_transport_failure,
+    "durable_job_failure": _detect_durable_job_failure,
     "actionable_execution_loss": _detect_execution_loss,
     "execution_loss": _detect_execution_loss,
     "unconsumed_plan_or_review": _detect_unconsumed_plan_or_review,

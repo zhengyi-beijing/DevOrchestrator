@@ -90,6 +90,7 @@ def _empty_index(degraded: bool = False, degraded_reason: str | None = None) -> 
         "degraded_reason": degraded_reason,
         "families": {},
         "candidates": {},
+        "regression_candidates": {},
     }
 
 
@@ -172,6 +173,8 @@ class IncidentStore:
             data["families"] = {}
         if not isinstance(data.get("candidates"), dict):
             data["candidates"] = {}
+        if not isinstance(data.get("regression_candidates"), dict):
+            data["regression_candidates"] = {}
         if "revision" not in data or not isinstance(data["revision"], int):
             data["revision"] = 0
         if "schema_version" not in data:

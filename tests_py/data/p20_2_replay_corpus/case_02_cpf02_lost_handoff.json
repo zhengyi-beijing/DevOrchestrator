@@ -1,0 +1,24 @@
+{
+  "case_id": "case_02_cpf02_lost_handoff",
+  "replay_op": "incident_capture_dedup",
+  "source_failure_signature": "lost_handoff_sig",
+  "expected_invariant": "SINGLE_ACTIVE_LIFECYCLE_OWNER",
+  "expected_defect_outcome": "dedup_failed",
+  "defect_anchor": {
+    "classification": "lost_handoff",
+    "occurrence_key": "cpf02_key",
+    "repeats": 1,
+    "outcome": "dedup_failed"
+  },
+  "corrected_anchor": {
+    "classification": "lost_handoff",
+    "occurrence_key": "cpf02_key",
+    "repeats": 2,
+    "outcome": "dedup_confirmed"
+  },
+  "regression_class": "lost_handoff",
+  "cpf_scenarios": [
+    "CPF-02"
+  ],
+  "notes": "CPF-02 lost handoff dedup"
+}

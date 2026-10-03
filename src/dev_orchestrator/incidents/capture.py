@@ -12,6 +12,7 @@ from dev_orchestrator.incidents.fingerprint import failure_signature
 from dev_orchestrator.incidents.policy import resolve_incident_policy
 from dev_orchestrator.incidents.sanitize import build_evidence_reference, sanitize_incident_payload
 from dev_orchestrator.incidents.store import IncidentCapacityExceededError, load_incident_store
+from dev_orchestrator.incidents.taxonomy import map_to_failure_class
 from dev_orchestrator.storage.json_store import utc_now_iso
 
 
@@ -114,6 +115,7 @@ def capture_incident(
         packet_id = f"pkt-{uuid4().hex[:12]}"
         family_id = f"fam-{fp[:12]}"
         now_ts = utc_now_iso()
+        tax_class = map_to_failure_class(classification, clean_semantic, clean_evidence)
 
         packet_data = {
             "packet_id": packet_id,
@@ -125,6 +127,8 @@ def capture_incident(
             "failure_signature": fp,
             "failure_family": family_id,
             "failure_class": clean_semantic.get("failure_class", classification),
+            "taxonomy_class": tax_class,
+            "taxonomy_source": classification,
             "semantic": copy.deepcopy(clean_semantic),
             "evidence": copy.deepcopy(clean_evidence or {}),
             "occurrence_key": occurrence_key,
@@ -144,6 +148,8 @@ def capture_incident(
             "failure_signature": fp,
             "classification": classification,
             "failure_class": clean_semantic.get("failure_class", classification),
+            "taxonomy_class": tax_class,
+            "taxonomy_source": classification,
             "project_id": project_id,
             "task_id": task_id,
             "first_seen_at": now_ts,

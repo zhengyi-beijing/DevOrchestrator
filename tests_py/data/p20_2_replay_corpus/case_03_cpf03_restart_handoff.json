@@ -1,0 +1,20 @@
+{
+  "case_id": "case_03_cpf03_restart_handoff",
+  "replay_op": "fingerprint_stability",
+  "source_failure_signature": "daemon_restart_sig",
+  "expected_invariant": "SUCCESSOR_HANDOFF_LINEAGE_VALID",
+  "expected_defect_outcome": "restart_untracked",
+  "defect_anchor": {
+    "failure_class": "daemon_restart_during_handoff",
+    "outcome": "restart_untracked"
+  },
+  "corrected_anchor": {
+    "failure_class": "daemon_restart_during_handoff",
+    "outcome": "SUCCESSOR_HANDOFF_LINEAGE_VALID"
+  },
+  "regression_class": "daemon_restart_during_handoff",
+  "cpf_scenarios": [
+    "CPF-03"
+  ],
+  "notes": "CPF-03 daemon restart mid-transition"
+}

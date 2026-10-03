@@ -1,0 +1,18 @@
+{
+  "case_id": "case_07_cpf07_intent_reconcile",
+  "replay_op": "store_journal_reconcile",
+  "source_failure_signature": "journal_reconcile_sig",
+  "expected_invariant": "SINGLE_ACTIVE_LIFECYCLE_OWNER",
+  "expected_defect_outcome": "intent_unreconciled",
+  "defect_anchor": {
+    "outcome": "intent_unreconciled"
+  },
+  "corrected_anchor": {
+    "outcome": "journal_reconciled"
+  },
+  "regression_class": "store_corruption",
+  "cpf_scenarios": [
+    "CPF-07"
+  ],
+  "notes": "CPF-07 crash after intent before publication"
+}

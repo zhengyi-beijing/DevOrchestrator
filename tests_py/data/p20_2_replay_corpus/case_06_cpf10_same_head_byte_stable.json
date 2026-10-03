@@ -1,0 +1,25 @@
+{
+  "case_id": "case_06_cpf10_same_head_byte_stable",
+  "replay_op": "fingerprint_stability",
+  "source_failure_signature": "689a96fe6ea97a6a428e20efbf82ccc0",
+  "expected_invariant": "SIGNATURE_MATCHES",
+  "expected_defect_outcome": "signature_matches",
+  "defect_anchor": {
+    "failure_class": "planner_timeout",
+    "stage": "planning",
+    "role": "planner",
+    "outcome": "signature_matches"
+  },
+  "corrected_anchor": {
+    "failure_class": "planner_timeout",
+    "stage": "planning",
+    "role": "planner",
+    "outcome": "SIGNATURE_MATCHES"
+  },
+  "regression_class": "planner_timeout",
+  "cpf_scenarios": [
+    "CPF-10",
+    "CPF-06"
+  ],
+  "notes": "Validates signature byte stability and discrimination between defect and corrected anchors."
+}

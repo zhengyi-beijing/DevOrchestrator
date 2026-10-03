@@ -1,0 +1,23 @@
+{
+  "case_id": "case_01",
+  "replay_op": "fingerprint_stability",
+  "source_failure_signature": "689a96fe6ea97a6a428e20efbf82ccc0",
+  "expected_invariant": "PROGRESS_ADVANCES",
+  "expected_defect_outcome": "progress_stalled",
+  "defect_anchor": {
+    "failure_class": "planner_timeout",
+    "stage": "planning",
+    "outcome": "progress_stalled"
+  },
+  "corrected_anchor": {
+    "failure_class": "planner_timeout",
+    "stage": "planning",
+    "outcome": "PROGRESS_ADVANCES"
+  },
+  "regression_class": "planner_timeout",
+  "cpf_scenarios": [
+    "CPF-01",
+    "CPF-10"
+  ],
+  "notes": "Anchors planner progress stalling vs progress advancement."
+}

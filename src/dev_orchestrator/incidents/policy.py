@@ -18,6 +18,11 @@ DEFAULT_INCIDENT_POLICY: dict[str, Any] = {
     "quarantine_corrupt": True,
     "regression_owner": None,
     "escalation_window_seconds": 600,
+    "typed_replay_candidates": True,
+    "max_regression_candidates": 1000,
+    "max_replay_corpus_cases": 500,
+    "max_replay_fixture_bytes": 65536,
+    "max_replay_repeats": 2,
 }
 
 
@@ -34,6 +39,11 @@ KNOWN_INCIDENT_KEYS = frozenset({
     "progress_obligation_window_seconds",
     "quarantine_corrupt",
     "escalation_window_seconds",
+    "typed_replay_candidates",
+    "max_regression_candidates",
+    "max_replay_corpus_cases",
+    "max_replay_fixture_bytes",
+    "max_replay_repeats",
 })
 
 FOREIGN_TOP_LEVEL_SECTIONS = frozenset({
@@ -88,6 +98,16 @@ def resolve_incident_policy(config: dict[str, Any] | None = None) -> dict[str, A
             policy["quarantine_corrupt"] = bool(raw["quarantine_corrupt"])
         if "escalation_window_seconds" in raw and isinstance(raw["escalation_window_seconds"], (int, float)):
             policy["escalation_window_seconds"] = max(1.0, float(raw["escalation_window_seconds"]))
+        if "typed_replay_candidates" in raw:
+            policy["typed_replay_candidates"] = bool(raw["typed_replay_candidates"])
+        if "max_regression_candidates" in raw and isinstance(raw["max_regression_candidates"], int):
+            policy["max_regression_candidates"] = max(1, min(100000, raw["max_regression_candidates"]))
+        if "max_replay_corpus_cases" in raw and isinstance(raw["max_replay_corpus_cases"], int):
+            policy["max_replay_corpus_cases"] = max(1, min(50000, raw["max_replay_corpus_cases"]))
+        if "max_replay_fixture_bytes" in raw and isinstance(raw["max_replay_fixture_bytes"], int):
+            policy["max_replay_fixture_bytes"] = max(1024, min(1048576, raw["max_replay_fixture_bytes"]))
+        if "max_replay_repeats" in raw and isinstance(raw["max_replay_repeats"], int):
+            policy["max_replay_repeats"] = max(2, min(10, raw["max_replay_repeats"]))
 
     if "regression_owner" in config:
         policy["regression_owner"] = config["regression_owner"]
