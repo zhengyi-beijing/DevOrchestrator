@@ -74,6 +74,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "project_id": {"type": "string", "description": "Project identifier the job belongs to."},
                 "job_id": {"type": "string", "description": "Durable job or operation identifier."},
+                "host_id": {"type": "string", "description": "Host used to start the job (default local)."},
             },
             "required": ["project_id", "job_id"],
             "additionalProperties": False,
@@ -87,6 +88,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "project_id": {"type": "string", "description": "Project identifier the job belongs to."},
                 "job_id": {"type": "string", "description": "Durable job or operation identifier to cancel."},
+                "host_id": {"type": "string", "description": "Host used to start the job (default local)."},
                 "reason": {"type": "string", "description": "Optional cancellation reason message."},
             },
             "required": ["project_id", "job_id"],
@@ -279,6 +281,12 @@ class MCPHttpEndpoint:
         req_id_str = request_id or f"mcp-req-{uuid4().hex}"
         accept = headers.get("Accept", "") or headers.get("accept", "")
         wants_sse = ("text/event-stream" in accept) and ("application/json" not in accept)
+        protocol = headers.get("MCP-Protocol-Version") or headers.get("mcp-protocol-version")
+        if protocol and protocol not in SUPPORTED_PROTOCOL_VERSIONS:
+            return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "Unsupported MCP-Protocol-Version"},
+            }).encode("utf-8")
 
         # 1. Parse JSON body
         try:
@@ -301,16 +309,15 @@ class MCPHttpEndpoint:
 
         rpc_id = req.get("id")
         method = req.get("method")
-        params = req.get("params") or {}
-
-        # 2. Check notifications (rpc_id is None)
-        if rpc_id is None:
-            # Client notification (e.g. notifications/initialized) -> 202 Accepted, empty body
-            sess_hdr = headers.get("Mcp-Session-Id") or headers.get("mcp-session-id")
-            resp_headers: dict[str, str] = {"X-DevOrch-Request-ID": req_id_str}
-            if sess_hdr:
-                resp_headers["Mcp-Session-Id"] = sess_hdr
-            return 202, resp_headers, b""
+        params = req.get("params", {})
+        notification = "id" not in req
+        if req.get("jsonrpc") != "2.0" or (
+            not notification and type(rpc_id) not in (str, int)
+        ):
+            return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "Invalid JSON-RPC version or request ID"},
+            }).encode("utf-8")
 
         if not isinstance(method, str):
             err_resp = {
@@ -330,6 +337,11 @@ class MCPHttpEndpoint:
 
         # 3. Handle 'initialize' (does not require session ID yet)
         if method == "initialize":
+            if notification:
+                return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32600, "message": "initialize requires a request ID"},
+                }).encode("utf-8")
             client_version = params.get("protocolVersion")
             proto_version = self._negotiate_protocol(str(client_version) if client_version else None)
             new_session_id = self.session_manager.create_session(proto_version)
@@ -383,6 +395,8 @@ class MCPHttpEndpoint:
             return 429, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(err_resp).encode("utf-8")
 
         try:
+            if notification:
+                return 202, {"X-DevOrch-Request-ID": req_id_str, "Mcp-Session-Id": session_id}, b""
             proto_version = session.protocol_version if session else LATEST_PROTOCOL_VERSION
             status_code, rpc_reply = self._dispatch_method(
                 rpc_id,
@@ -421,7 +435,7 @@ class MCPHttpEndpoint:
 
         if method == "tools/call":
             tool_name = params.get("name")
-            arguments = params.get("arguments") or {}
+            arguments = params.get("arguments", {})
             if not isinstance(arguments, dict):
                 return 200, {
                     "jsonrpc": "2.0",
@@ -432,7 +446,7 @@ class MCPHttpEndpoint:
                 }
 
             known_tools = {t["name"]: t for t in MCP_TOOLS}
-            if tool_name not in known_tools:
+            if not isinstance(tool_name, str) or tool_name not in known_tools:
                 return 200, {
                     "jsonrpc": "2.0",
                     "id": rpc_id,
@@ -440,8 +454,12 @@ class MCPHttpEndpoint:
                 }
 
             # Check capability tool scope if token is scoped
-            allowed_tools = (auth_context or {}).get("allowed_tools", ["*"])
-            if allowed_tools and "*" not in allowed_tools and tool_name not in allowed_tools:
+            allowed_tools = (auth_context or {}).get("allowed_tools")
+            if (
+                not isinstance(allowed_tools, list)
+                or any(not isinstance(t, str) or not t.strip() for t in allowed_tools)
+                or ("*" not in allowed_tools and tool_name not in allowed_tools)
+            ):
                 return 200, {
                     "jsonrpc": "2.0",
                     "id": rpc_id,
@@ -451,6 +469,30 @@ class MCPHttpEndpoint:
                 }
 
             # Invoke tool
+            schema = known_tools[tool_name]["inputSchema"]
+            try:
+                checked_tool_args(arguments, set(schema["properties"]), tuple(schema["required"]))
+                for key, value in arguments.items():
+                    field = schema["properties"][key]
+                    kind = field["type"]
+                    if (
+                        (kind == "string" and (not isinstance(value, str) or len(value) > 4096))
+                        or (kind == "integer" and type(value) is not int)
+                        or (kind == "object" and not isinstance(value, dict))
+                    ):
+                        raise ValueError(f"invalid type or size for {key}")
+                    if "enum" in field and value not in field["enum"]:
+                        if key == "source":
+                            raise ValueError(f"source {value!r} not in allowed sources: {field['enum']}")
+                        raise ValueError(f"invalid value for {key}")
+                    if kind == "integer" and (
+                        ("minimum" in field and value < field["minimum"])
+                        or ("maximum" in field and value > field["maximum"])
+                    ):
+                        raise ValueError(f"out of range: {key}")
+            except ValueError as exc:
+                return 200, {"jsonrpc": "2.0", "id": rpc_id,
+                             "result": format_tool_result_dict({"error": str(exc)}, is_error=True)}
             res_dict, is_error, job_id = self._call_tool(
                 tool_name, arguments, request_id=request_id
             )
@@ -528,15 +570,17 @@ class MCPHttpEndpoint:
                     request_id=request_id,
                 )
                 job_id = res.get("job_id") or res.get("operation_id")
+                res["host_id"] = args.get("host_id", "local")
                 is_err = res.get("status") not in ("ok", "queued", "running")
                 return res, is_err, job_id
 
             if name == "devo_job_status":
-                checked_tool_args(args, {"project_id", "job_id"}, ("project_id", "job_id"))
+                checked_tool_args(args, {"project_id", "job_id", "host_id"}, ("project_id", "job_id"))
                 res = poll_job(
                     self.runtime_root,
                     project_id=args["project_id"],
                     job_id=args["job_id"],
+                    host_id=args.get("host_id", "local"),
                     request_id=request_id,
                 )
                 job_id = res.get("job_id") or res.get("operation_id") or args["job_id"]
@@ -544,11 +588,12 @@ class MCPHttpEndpoint:
                 return res, is_err, job_id
 
             if name == "devo_cancel_job":
-                checked_tool_args(args, {"project_id", "job_id", "reason"}, ("project_id", "job_id"))
+                checked_tool_args(args, {"project_id", "job_id", "host_id", "reason"}, ("project_id", "job_id"))
                 res = cancel_job(
                     self.runtime_root,
                     project_id=args["project_id"],
                     job_id=args["job_id"],
+                    host_id=args.get("host_id", "local"),
                     reason=args.get("reason", "cancelled"),
                     request_id=request_id,
                 )

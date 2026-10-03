@@ -1178,6 +1178,9 @@ class ControlSecurity:
         allowed_tools: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Mint a scoped, revocable MCP capability token. Returns token once."""
+        tools = ["*"] if allowed_tools is None else allowed_tools
+        if not isinstance(tools, list) or any(not isinstance(t, str) or not t.strip() for t in tools):
+            raise ValueError("allowed_tools must be a list of nonblank tool names")
         cap_id = "mcp-" + secrets.token_urlsafe(16)
         raw_secret = f"mcp_{secrets.token_urlsafe(32)}"
         token_hash = _digest(raw_secret)
@@ -1190,7 +1193,7 @@ class ControlSecurity:
             "capability_id": cap_id,
             "token_hash": token_hash,
             "label": label,
-            "allowed_tools": sorted(allowed_tools or ["*"]),
+            "allowed_tools": sorted(tools),
             "created_at": now_iso,
             "expires_at": expires_at,
             "expires_at_epoch": expires_at_epoch,
@@ -1210,7 +1213,7 @@ class ControlSecurity:
             "capability_id": cap_id,
             "token": raw_secret,  # disclosed only once upon creation
             "label": label,
-            "allowed_tools": sorted(allowed_tools or ["*"]),
+            "allowed_tools": sorted(tools),
             "created_at": now_iso,
             "expires_at": expires_at,
             "expires_in_seconds": ttl_seconds,
@@ -1292,6 +1295,9 @@ class ControlSecurity:
                 return False, "token_revoked", None
             if float(row.get("expires_at_epoch", 0)) <= now:
                 return False, "token_expired", None
+            tools = row.get("allowed_tools")
+            if not isinstance(tools, list) or any(not isinstance(t, str) or not t.strip() for t in tools):
+                return False, "invalid_tool_scope", None
             return True, "valid", row
 
         return False, "invalid_or_revoked_token", None

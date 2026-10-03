@@ -13,6 +13,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from dev_orchestrator.control.mcp_http import MCP_TOOLS
 from dev_orchestrator.control.security import (
@@ -23,6 +25,7 @@ from dev_orchestrator.control.security import (
 )
 from dev_orchestrator.storage.json_store import write_json
 from dev_orchestrator.web.server import make_server
+from dev_orchestrator.transport.contracts import MachineOperationResult
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -242,6 +245,163 @@ class P19_2RemoteMCPTests(unittest.TestCase):
         # Unsupported version falls back safely to latest
         _, proto_fallback = self._init_session(proto_ver="1999-01-01")
         self.assertEqual(proto_fallback, "2025-06-18")
+
+    def test_empty_and_malformed_scopes_never_grant_tools(self) -> None:
+        cap = create_mcp_capability(
+            label="deny-all", allowed_tools=[], runtime_root=self.runtime,
+        )
+        session_id, _ = self._init_session(token=cap["token"])
+        payload = {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                   "params": {"name": "devo_read_file", "arguments": {
+                       "project_id": "p19_test", "path": "hello.txt"}}}
+        _, _, response = self._rpc_request(payload, token=cap["token"], session_id=session_id)
+        self.assertTrue(response["result"]["isError"])
+        self.assertNotIn("Hello World", json.dumps(response))
+
+        cap_path = self.server.control_security.pairings_path
+        data = json.loads(cap_path.read_text(encoding="utf-8"))
+        row = data["mcp_capabilities"][cap["capability_id"]]
+        for scope in (None, "*", ["devo_read_file", 1]):
+            with self.subTest(scope=scope):
+                row["allowed_tools"] = scope
+                write_json(cap_path, data)
+                code, _, _ = self._rpc_request(payload, token=cap["token"], session_id=session_id)
+                self.assertEqual(code, 401)
+
+    def test_scoped_file_read_cannot_recover_owner_credentials(self) -> None:
+        # The live deployment nests runtime in the registered repository root.
+        jobs_path = self.runtime / "execution-jobs.json"
+        cfg = json.loads(jobs_path.read_text(encoding="utf-8"))
+        cfg["projects"]["p19_test"]["repo_path"] = str(self.base)
+        write_json(jobs_path, cfg)
+        cap = create_mcp_capability(
+            allowed_tools=["devo_read_file"], runtime_root=self.runtime,
+        )
+        session_id, _ = self._init_session(token=cap["token"])
+        backup = self.runtime / "backup-test" / "control"
+        backup.mkdir(parents=True)
+        (backup / "api-token").write_text("backup-credential-sentinel", encoding="utf-8")
+        (self.runtime / "control" / "api-token.tmp-test").write_text("temporary-credential-sentinel", encoding="utf-8")
+        paths = ["runtime/control/api-token", str(self.runtime / "control" / "api-token"),
+                 "repo/../runtime/control/api-token", "runtime/control/api-token.tmp-test",
+                 "runtime/backup-test/control/api-token"]
+        os.link(self.runtime / "control" / "api-token", self.base / "credential-hardlink")
+        paths.append("credential-hardlink")
+        try:
+            (self.base / "credential-alias").symlink_to(self.runtime / "control" / "api-token")
+        except OSError:
+            pass  # Windows may lack permission to create symbolic links.
+        else:
+            paths.append("credential-alias")
+        # A separate jobs store must not change which control credentials are protected.
+        cfg["runtime_root"] = str(self.base / "alternate-jobs")
+        write_json(jobs_path, cfg)
+        for path in paths:
+            with self.subTest(path=path):
+                _, _, response = self._rpc_request(
+                    {"jsonrpc": "2.0", "id": 13, "method": "tools/call",
+                     "params": {"name": "devo_read_file", "arguments": {
+                         "project_id": "p19_test", "path": path}}},
+                    token=cap["token"], session_id=session_id,
+                )
+                self.assertTrue(response["result"]["isError"])
+                self.assertNotIn(self.master_token, json.dumps(response))
+        _, _, response = self._rpc_request(
+            {"jsonrpc": "2.0", "id": 14, "method": "tools/call",
+             "params": {"name": "devo_read_file", "arguments": {
+                 "project_id": "p19_test", "path": "repo/hello.txt"}}},
+            token=cap["token"], session_id=session_id,
+        )
+        self.assertFalse(response["result"]["isError"])
+        self.assertIn("Hello World", json.loads(response["result"]["content"][0]["text"])["content"])
+
+    def test_unsupported_protocol_header_is_rejected_before_dispatch(self) -> None:
+        session_id, _ = self._init_session()
+        request = urllib.request.Request(self.mcp_url, data=json.dumps({
+            "jsonrpc": "2.0", "id": 15, "method": "tools/list", "params": {},
+        }).encode(), headers={"Authorization": f"Bearer {self.master_token}",
+                              "Mcp-Session-Id": session_id,
+                              "MCP-Protocol-Version": "1999-01-01"})
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request)
+        self.assertEqual(raised.exception.code, 400)
+
+    def test_closed_tool_schema_rejects_wrong_types_before_operations(self) -> None:
+        session_id, _ = self._init_session()
+        for name, arguments in (
+            ("devo_read_file", {"project_id": "p19_test", "path": "hello.txt", "max_bytes": True}),
+            ("devo_read_file", {"project_id": "p19_test", "path": "hello.txt", "offset_bytes": "0"}),
+            ("devo_read_log", {"source": "events", "limit": 1.5}),
+            ("devo_status", {"project_id": ["p19_test"]}),
+        ):
+            with self.subTest(name=name, arguments=arguments):
+                code, _, response = self._rpc_request(
+                    {"jsonrpc": "2.0", "id": 16, "method": "tools/call",
+                     "params": {"name": name, "arguments": arguments}}, session_id=session_id,
+                )
+                self.assertEqual(code, 200)
+                self.assertTrue(response["result"]["isError"])
+
+    def test_invalid_rpc_envelopes_and_notifications_fail_closed(self) -> None:
+        session_id, _ = self._init_session()
+        for payload in (
+            {"id": 17, "method": "tools/list"},
+            {"jsonrpc": "1.0", "id": 17, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": {}, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": True, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 17, "method": "tools/list", "params": []},
+        ):
+            with self.subTest(payload=payload):
+                code, _, response = self._rpc_request(payload, session_id=session_id)
+                self.assertEqual(code, 400)
+                self.assertIn("error", response)
+        code, _, _ = self._rpc_request(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id="expired-session",
+        )
+        self.assertEqual(code, 404)
+        for arguments in ([], None, False):
+            with self.subTest(arguments=arguments):
+                code, _, response = self._rpc_request(
+                    {"jsonrpc": "2.0", "id": 18, "method": "tools/call",
+                     "params": {"name": "devo_status", "arguments": arguments}}, session_id=session_id,
+                )
+                self.assertEqual(code, 200)
+                self.assertTrue(response["result"]["isError"])
+
+    def test_remote_job_poll_and_cancel_preserve_host_identity(self) -> None:
+        session_id, _ = self._init_session()
+        calls = []
+
+        class RemoteTransport:
+            last_selection = SimpleNamespace(selected_transport="ssh")
+
+            def poll(inner_self, operation_id, host_id=None):
+                calls.append(("poll", operation_id, host_id))
+                return MachineOperationResult(operation_id=operation_id, command_ref="short_job",
+                                              status="completed", job_id=operation_id, exit_code=0)
+
+            def cancel(inner_self, operation_id, host_id=None, reason="cancelled"):
+                calls.append(("cancel", operation_id, host_id))
+                return MachineOperationResult(operation_id=operation_id, command_ref="short_job",
+                                              status="cancelled", job_id=operation_id)
+
+        # No corresponding local job exists: selecting local would fail ownership.
+        with patch("dev_orchestrator.control.operations.get_transport_for_host", return_value=RemoteTransport()):
+            for name in ("devo_job_status", "devo_cancel_job", "devo_cancel_job"):
+                code, _, response = self._rpc_request(
+                    {"jsonrpc": "2.0", "id": 19, "method": "tools/call",
+                     "params": {"name": name, "arguments": {
+                         "project_id": "p19_test", "job_id": "job-remote", "host_id": "ssh-peer"}}},
+                    session_id=session_id,
+                )
+                self.assertEqual(code, 200)
+                self.assertFalse(response["result"]["isError"])
+                data = json.loads(response["result"]["content"][0]["text"])
+                self.assertEqual(data["job_id"], "job-remote")
+                self.assertEqual(data["selected_transport"], "ssh")
+        self.assertEqual(calls, [("poll", "job-remote", "ssh-peer"),
+                                 ("cancel", "job-remote", "ssh-peer"),
+                                 ("cancel", "job-remote", "ssh-peer")])
 
     def test_session_lifecycle_and_termination(self) -> None:
         session_id, _ = self._init_session()

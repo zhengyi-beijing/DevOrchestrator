@@ -400,7 +400,11 @@ class P12HTTPTests(unittest.TestCase):
             "url": "https://chatgpt.com/c/conv", "tab_instance_id": "tab-1",
         })
         cap_headers = {"Origin": "https://chatgpt.com", "Content-Type": "application/json", "Authorization": "Bearer " + capability}
-        self.assertEqual(self.request("POST", "/api/v1/control/session-heartbeats", body=heartbeat, headers=cap_headers)[0], 200)
+        status, _, unbound_body = self.request("POST", "/api/v1/control/session-heartbeats", body=heartbeat, headers=cap_headers)
+        self.assertEqual(status, 200)
+        self.assertIsNone(json.loads(unbound_body)["data"]["project_id"])
+        self.assertIsNone(json.loads(unbound_body)["data"]["websol_health"])
+        self.server.conversation_store.bind("p1", "chatgpt", "conv")
 
         now = datetime.now(timezone.utc)
         health = WebSolHealth(

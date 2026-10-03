@@ -53,6 +53,7 @@ class LocalMachineTransport:
         jobs_config: Optional[JobsConfig] = None,
     ) -> None:
         self.host_id = host_id
+        self.control_runtime_root = Path(jobs_config_path).absolute().parent.resolve() if jobs_config_path else None
         if jobs_config is not None:
             self.jobs_cfg = jobs_config
         else:
@@ -339,6 +340,24 @@ class LocalMachineTransport:
                     break
         if resolved_target is None:
             raise TransportRejectedError(f"path {request.path!r} escapes project containment")
+        resolved_target = resolved_target.resolve()
+        # Repository roots may contain the daemon runtime. File capabilities
+        # must never disclose owner credentials, capability stores or backups.
+        protected = False
+        for root in (self.control_runtime_root, self.jobs_cfg.runtime_root):
+            if root is None:
+                continue
+            runtime = root.resolve()
+            protected = protected or is_path_contained(runtime / "control", resolved_target)
+            for filename in ("api-token", "adapter-capabilities.json"):
+                credential = runtime / "control" / filename
+                if credential.is_file() and resolved_target.is_file() and resolved_target.samefile(credential):
+                    protected = True
+            if is_path_contained(runtime, resolved_target):
+                relative = resolved_target.relative_to(runtime)
+                protected = protected or bool(relative.parts and relative.parts[0].casefold().startswith("backup-"))
+        if protected:
+            raise TransportRejectedError("control credentials and runtime backups are not readable through file tools")
         if not resolved_target.is_file():
             return FileResult(
                 status="failed",

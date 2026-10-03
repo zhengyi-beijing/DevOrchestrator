@@ -683,6 +683,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if not auth_ok:
                 self._error(401, "Unauthorized", auth_err or "valid MCP authorization required", False)
                 return
+            from dev_orchestrator.control.mcp_http import SUPPORTED_PROTOCOL_VERSIONS
+            protocol = self.headers.get("MCP-Protocol-Version")
+            if protocol and protocol not in SUPPORTED_PROTOCOL_VERSIONS:
+                self._error(400, "Bad Request", "Unsupported MCP-Protocol-Version", False)
+                return
             session_id = self.headers.get("Mcp-Session-Id") or self.headers.get("mcp-session-id")
             if not session_id:
                 self._error(400, "Bad Request", "Mcp-Session-Id header required", False)

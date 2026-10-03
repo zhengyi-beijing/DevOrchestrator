@@ -35,6 +35,15 @@ shell, arbitrary command execution, file deletion, and unrestricted file writes:
 5. `devo_read_log`: Queries bounded, redacted logs across allowlisted sources (`events`, `runs`, `control_audit`, `accounting`) with limit clamping (1..100).
 6. `devo_read_file`: Reads bounded content from configured project roots, with explicit `is_text` boolean reporting (`content` for UTF-8 text, `content_base64` for binary data).
 
+The executable plan defines `devo_start_task` as a registered native job (for
+example compilation), not as a Planner/Worker lifecycle launch. Native jobs keep
+their existing P18 policy and durable identity; remote lifecycle controls,
+owner-gate approval, and successor selection are excluded from this surface.
+`devo_start_task` returns `host_id` with its stable job identifier. For SSH jobs,
+pass that same `host_id` to `devo_job_status` and `devo_cancel_job`, including
+after reconnecting or daemon restart. These two tools default to `local` for
+existing local clients and delegate host selection to the same shared service.
+
 ## Protocol Specification & Streamable HTTP
 
 The endpoint conforms to the standard MCP Streamable HTTP transport:
@@ -49,6 +58,11 @@ The endpoint conforms to the standard MCP Streamable HTTP transport:
 - **Content Negotiation**: Supports both `Accept: application/json` and `Accept: text/event-stream` (SSE format: `event: message\ndata: {json}\n\n`).
 - **Bounded Resources**: In-flight concurrency limits, 64KB request size limit, and bounded session cache.
 
+Unsupported `MCP-Protocol-Version` headers fail with HTTP 400 before dispatch.
+Tool arguments are checked against the published closed schemas, including
+exact integer/string/object types and numeric bounds. Booleans, fractional
+limits, and numeric strings are not silently converted into valid limits.
+
 ## Security Boundary & Capability Tokens
 
 1. **Loopback Binding**: The daemon listens only on loopback (`127.0.0.1`). External access requires an authenticated SSH local port forward (e.g. `ssh -L 8770:127.0.0.1:8770 host`) or scoped reverse proxy.
@@ -61,6 +75,28 @@ The endpoint conforms to the standard MCP Streamable HTTP transport:
    ```
 4. **Token Secrecy**: Tokens are compared using constant-time HMAC digest matching and are never written to audit logs, traces, or MCP JSON-RPC responses.
 5. **Zero-RDC Constraint**: All job and transport operations are strictly verified to use native `local` or `ssh` transport. RDC fallback is prohibited.
+
+Explicit `allowed_tools=[]` grants no tool access. Missing or malformed persisted
+tool scopes fail authentication, and adapter dispatch defaults to denial. Only
+an explicit wildcard grants all six tools; omitting the scope at token creation
+retains the existing owner-selected wildcard default.
+
+File reads exclude canonical `runtime/control` and `runtime/backup-*` trees
+even if they sit inside a registered repository. Both the control runtime
+containing `execution-jobs.json` and any configured job runtime are protected.
+Paths are resolved before this check, so absolute, traversal and symlink aliases
+cannot expose API tokens, capability stores, temporary credential files or
+runtime backups. File-identity checks also exclude hardlinks to the canonical
+API token and capability store. Ordinary project text/binary reads remain available, including
+repositories nested inside a job runtime. Read logs through `devo_read_log` for
+bounded, redacted diagnostics. Operators must keep copies or hardlinks of
+credentials outside project file roots; path containment cannot identify
+arbitrary copies made by an owner.
+
+The P19.3 Browser Control Bridge is a separately scoped, read-only browser
+adapter over 8770. Its ChatGPT Plus flow does not change P19.2 acceptance or add
+remote MCP lifecycle authority. Direct remote MCP client availability is a
+client-product requirement, separate from this endpoint's implementation.
 
 ## Zero-Dependency Rationale
 
