@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ from dev_orchestrator.incidents.store import (
     load_incident_store,
 )
 from dev_orchestrator.incidents.capture import capture_incident
+from dev_orchestrator.incidents.policy import resolve_incident_policy
 from dev_orchestrator.incidents.reliability_runs import (
     close_reliability_run,
     get_reliability_run,
@@ -301,7 +303,7 @@ class TestP201StoreHardeningAndConcurrency(unittest.TestCase):
         self.assertEqual(len(fams), 1)
         fam = next(iter(fams.values()))
         self.assertEqual(fam["recurrence_count"], 1)
-        self.assertEqual(fam["occurrences"], [occ_key])
+        self.assertEqual([o["occurrence_key"] if isinstance(o, dict) else o for o in fam["occurrences"]], [occ_key])
 
     def test_repeated_daemon_ticks_add_no_duplicate_occurrences(self) -> None:
         """CPF-06: Repeated daemon ticks over the same durable event identity do not increment."""
@@ -652,23 +654,440 @@ class TestP201CPFObservationMatrix(unittest.TestCase):
         expected_cpfs = {f"CPF-{i:02d}" for i in range(1, 11)}
         self.assertTrue(expected_cpfs.issubset(registered))
 
-    def test_cpf_matrix_observation_definitions(self) -> None:
-        """Validate that all 10 CPF scenarios have defined metrics and expectations."""
-        matrix = {
-            "CPF-01": {"metric": "duplicate_execution_count", "expected": 0},
-            "CPF-02": {"metric": "duplicate_handoff_count", "expected": 0},
-            "CPF-03": {"metric": "daemon_restart_count", "expected": 1},
-            "CPF-04": {"metric": "lifecycle_invariant_escape_count", "expected": 0},
-            "CPF-05": {"metric": "automatic_recovery_success_count", "expected": 0},
-            "CPF-06": {"metric": "duplicate_successor_activation_count", "expected": 0},
-            "CPF-07": {"metric": "duplicate_execution_count", "expected": 0},
-            "CPF-08": {"metric": "owner_gate_count", "expected": 1},
-            "CPF-09": {"metric": "manual_continue_count", "expected": 0},
-            "CPF-10": {"metric": "failure_incident_count", "expected": 1},
+    def test_cpf_matrix_expected_values_assert_against_computed_telemetry(self) -> None:
+        """Finding 8: table-driven assertions verify CPF-01 through CPF-10 against computed telemetry."""
+        # CPF-01: stale predecessor worker under fenced target -> duplicate_execution_count == 0
+        r_cpf01 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf01.mkdir(parents=True, exist_ok=True)
+        run01 = open_reliability_run(r_cpf01, project_id="devorchestrator")
+        t_data01 = {
+            "executions": {
+                "exec-1": {
+                    "project_id": "devorchestrator",
+                    "task_id": "P20.1",
+                    "source_request_id": "req-1",
+                    "state": "running",
+                    "started_at": run01["opened_at"],
+                }
+            }
         }
-        for cpf_id, spec in matrix.items():
-            self.assertIn("metric", spec)
-            self.assertIn("expected", spec)
+        (r_cpf01 / "transition-executor.json").write_text(json.dumps(t_data01), encoding="utf-8")
+        tel01 = compute_reliability_telemetry(r_cpf01, run01["run_id"])
+        self.assertEqual(tel01.metrics["duplicate_execution_count"].value, 0)
+        shutil.rmtree(r_cpf01.parent, ignore_errors=True)
+
+        # CPF-02: rebuilt single handoff -> duplicate_handoff_count == 0
+        r_cpf02 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf02.mkdir(parents=True, exist_ok=True)
+        run02 = open_reliability_run(r_cpf02, project_id="devorchestrator")
+        t_data02 = {
+            "executions": {
+                "trans-1": {
+                    "state": "handoff",
+                    "handoff_idempotency_key": "idem-cpf02",
+                    "recorded_at": run02["opened_at"],
+                }
+            }
+        }
+        (r_cpf02 / "transition-executor.json").write_text(json.dumps(t_data02), encoding="utf-8")
+        tel02 = compute_reliability_telemetry(r_cpf02, run02["run_id"])
+        self.assertEqual(tel02.metrics["duplicate_handoff_count"].value, 0)
+        shutil.rmtree(r_cpf02.parent, ignore_errors=True)
+
+        # CPF-03: daemon restart -> daemon_restart_count == 1
+        r_cpf03 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf03.mkdir(parents=True, exist_ok=True)
+        record_daemon_boot(r_cpf03, pid=101, listen_address="127.0.0.1", port=8770, started_at="2026-10-01T00:00:00Z", boot_id="boot-0")
+        run03 = open_reliability_run(r_cpf03, project_id="devorchestrator", boot_id="boot-0")
+        record_daemon_boot(r_cpf03, pid=102, listen_address="127.0.0.1", port=8770, started_at="2026-10-05T00:00:00Z", boot_id="boot-1")
+        tel03 = compute_reliability_telemetry(r_cpf03, run03["run_id"])
+        self.assertEqual(tel03.metrics["daemon_restart_count"].value, 1)
+        shutil.rmtree(r_cpf03.parent, ignore_errors=True)
+
+        # CPF-04: ambiguous successor fail-closed -> lifecycle_invariant_escape_count == 0
+        r_cpf04 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf04.mkdir(parents=True, exist_ok=True)
+        run04 = open_reliability_run(r_cpf04, project_id="devorchestrator")
+        t_data04 = {
+            "lifecycle": {
+                "devorchestrator": {
+                    "invariants": [
+                        {"code": "SUCCESSOR_HANDOFF_LINEAGE_VALID", "holds": False, "escaped_to_authority": False}
+                    ]
+                }
+            }
+        }
+        (r_cpf04 / "transition-executor.json").write_text(json.dumps(t_data04), encoding="utf-8")
+        tel04 = compute_reliability_telemetry(r_cpf04, run04["run_id"])
+        self.assertEqual(tel04.metrics["lifecycle_invariant_escape_count"].value, 0)
+        shutil.rmtree(r_cpf04.parent, ignore_errors=True)
+
+        # CPF-05: dirty worktree deferral -> automatic_recovery_success_count == 0
+        r_cpf05 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf05.mkdir(parents=True, exist_ok=True)
+        run05 = open_reliability_run(r_cpf05, project_id="devorchestrator")
+        (r_cpf05 / "execution-accounting").mkdir(parents=True, exist_ok=True)
+        with (r_cpf05 / "execution-accounting" / "events.jsonl").open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "recorded_at": run05["opened_at"],
+                "schema_version": 1,
+                "event_type": "attempt_outcome",
+                "project_id": "devorchestrator",
+                "attempt_id": "att-defer-1",
+                "role": "worker",
+                "phase": "retry",
+                "recovery_attempt": 1,
+                "outcome": "deferred",
+            }) + "\n")
+        tel05 = compute_reliability_telemetry(r_cpf05, run05["run_id"])
+        self.assertEqual(tel05.metrics["automatic_recovery_success_count"].value, 0)
+        shutil.rmtree(r_cpf05.parent, ignore_errors=True)
+
+        # CPF-06: repeated ticks -> duplicate_successor_activation_count == 0
+        r_cpf06 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf06.mkdir(parents=True, exist_ok=True)
+        run06 = open_reliability_run(r_cpf06, project_id="devorchestrator")
+        t_data06 = {
+            "transitions": [
+                {
+                    "source_task_id": "P20.1",
+                    "target_task_id": "P20.2",
+                    "generation": 11,
+                    "created_at": run06["opened_at"],
+                }
+            ]
+        }
+        (r_cpf06 / "transition-executor.json").write_text(json.dumps(t_data06), encoding="utf-8")
+        tel06 = compute_reliability_telemetry(r_cpf06, run06["run_id"])
+        self.assertEqual(tel06.metrics["duplicate_successor_activation_count"].value, 0)
+        shutil.rmtree(r_cpf06.parent, ignore_errors=True)
+
+        # CPF-07: crash after intent recovers single owner -> duplicate_execution_count == 0
+        r_cpf07 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf07.mkdir(parents=True, exist_ok=True)
+        run07 = open_reliability_run(r_cpf07, project_id="devorchestrator")
+        t_data07 = {
+            "executions": {
+                "exec-cpf07": {
+                    "project_id": "devorchestrator",
+                    "task_id": "P20.1",
+                    "source_request_id": "req-cpf07",
+                    "state": "running",
+                    "started_at": run07["opened_at"],
+                }
+            }
+        }
+        (r_cpf07 / "transition-executor.json").write_text(json.dumps(t_data07), encoding="utf-8")
+        tel07 = compute_reliability_telemetry(r_cpf07, run07["run_id"])
+        self.assertEqual(tel07.metrics["duplicate_execution_count"].value, 0)
+        shutil.rmtree(r_cpf07.parent, ignore_errors=True)
+
+        # CPF-08: missing declaration owner gate -> owner_gate_count == 1
+        r_cpf08 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf08.mkdir(parents=True, exist_ok=True)
+        run08 = open_reliability_run(r_cpf08, project_id="devorchestrator")
+        (r_cpf08 / "execution-accounting").mkdir(parents=True, exist_ok=True)
+        with (r_cpf08 / "execution-accounting" / "events.jsonl").open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "recorded_at": run08["opened_at"],
+                "schema_version": 1,
+                "event_type": "owner_gate_opened",
+                "project_id": "devorchestrator",
+                "gate_id": "gate-cpf08",
+            }) + "\n")
+        tel08 = compute_reliability_telemetry(r_cpf08, run08["run_id"])
+        self.assertEqual(tel08.metrics["owner_gate_count"].value, 1)
+        shutil.rmtree(r_cpf08.parent, ignore_errors=True)
+
+        # CPF-09: repaired HEAD replay -> manual_continue_count == 0
+        r_cpf09 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf09.mkdir(parents=True, exist_ok=True)
+        run09 = open_reliability_run(r_cpf09, project_id="devorchestrator")
+        (r_cpf09 / "control").mkdir(parents=True, exist_ok=True)
+        with (r_cpf09 / "control" / "audit.jsonl").open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "timestamp": run09["opened_at"],
+                "project_id": "devorchestrator",
+                "action": "continue",
+                "command_id": "cmd-auto-cpf09",
+                "source": "automatic_replay_gate_resolved",
+            }) + "\n")
+        tel09 = compute_reliability_telemetry(r_cpf09, run09["run_id"])
+        self.assertEqual(tel09.metrics["manual_continue_count"].value, 0)
+        shutil.rmtree(r_cpf09.parent, ignore_errors=True)
+
+        # CPF-10: same-HEAD retries -> failure_incident_count == 1
+        r_cpf10 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf10.mkdir(parents=True, exist_ok=True)
+        run10 = open_reliability_run(r_cpf10, project_id="devorchestrator")
+        semantic10 = {
+            "failure_class": "retry_without_progress",
+            "stage": "ai_execution",
+            "role": "worker",
+            "lifecycle_class": "EXECUTING",
+        }
+        capture_incident(
+            r_cpf10,
+            project_id="devorchestrator",
+            task_id="P20.1",
+            classification="retry_without_progress",
+            semantic=semantic10,
+            evidence=None,
+            occurrence_key="occ-cpf10-1",
+        )
+        # same occurrence key retry
+        capture_incident(
+            r_cpf10,
+            project_id="devorchestrator",
+            task_id="P20.1",
+            classification="retry_without_progress",
+            semantic=semantic10,
+            evidence=None,
+            occurrence_key="occ-cpf10-1",
+        )
+        tel10 = compute_reliability_telemetry(r_cpf10, run10["run_id"])
+        self.assertEqual(tel10.metrics["failure_incident_count"].value, 1)
+        shutil.rmtree(r_cpf10.parent, ignore_errors=True)
+
+
+class TestP201TechnicalReviewRemediation(unittest.TestCase):
+    """Regression tests for all 9 Technical Review findings."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.mkdtemp()
+        self.runtime_root = Path(self.temp_dir) / "runtime"
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_cpf03_restart_during_run_counts_once_when_initial_boot_precedes_run(self) -> None:
+        """Finding 1: daemon_restart_count counts boots after initial boot when initial boot precedes run."""
+        record_daemon_boot(
+            self.runtime_root,
+            pid=1000,
+            listen_address="127.0.0.1",
+            port=8770,
+            started_at="2026-10-01T00:00:00Z",
+            boot_id="boot-initial",
+        )
+        run = open_reliability_run(
+            self.runtime_root,
+            project_id="devorchestrator",
+            boot_id="boot-initial",
+        )
+        # Daemon restarts during run
+        record_daemon_boot(
+            self.runtime_root,
+            pid=2000,
+            listen_address="127.0.0.1",
+            port=8770,
+            started_at="2026-10-05T00:00:00Z",
+            boot_id="boot-restart-1",
+        )
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        m = telemetry.metrics["daemon_restart_count"]
+        self.assertEqual(m.coverage, "full")
+        self.assertEqual(m.value, 1)
+
+    def test_failure_incident_count_excludes_occurrences_outside_run_window(self) -> None:
+        """Finding 2: failure_incident_count and repeated_family_count window occurrences by recorded_at."""
+        semantic = {
+            "failure_class": "planner_timeout",
+            "stage": "planning",
+            "role": "planner",
+            "lifecycle_class": "PLANNING",
+        }
+        # 3 captures before the run
+        capture_incident(
+            self.runtime_root,
+            project_id="devorchestrator",
+            task_id="P20.1",
+            classification="planner_timeout",
+            semantic=semantic,
+            evidence=None,
+            occurrence_key="occ-pre-1",
+        )
+        capture_incident(
+            self.runtime_root,
+            project_id="devorchestrator",
+            task_id="P20.1",
+            classification="planner_timeout",
+            semantic=semantic,
+            evidence=None,
+            occurrence_key="occ-pre-2",
+        )
+        capture_incident(
+            self.runtime_root,
+            project_id="devorchestrator",
+            task_id="P20.1",
+            classification="planner_timeout",
+            semantic=semantic,
+            evidence=None,
+            occurrence_key="occ-pre-3",
+        )
+        time.sleep(0.01)
+        run = open_reliability_run(self.runtime_root, project_id="devorchestrator")
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        self.assertEqual(telemetry.metrics["failure_incident_count"].value, 0)
+        self.assertEqual(telemetry.metrics["repeated_failure_family_count"].value, 0)
+
+    def test_review_acceptance_count_dedups_replayed_attempt_id(self) -> None:
+        """Finding 3: review_acceptance_count dedups on attempt_id."""
+        run = open_reliability_run(self.runtime_root, project_id="devorchestrator")
+        acct_dir = self.runtime_root / "execution-accounting"
+        acct_dir.mkdir(parents=True, exist_ok=True)
+        # Replayed 3 times with same attempt_id
+        row = {
+            "recorded_at": run["opened_at"],
+            "schema_version": 1,
+            "event_type": "attempt_outcome",
+            "project_id": "devorchestrator",
+            "attempt_id": "att-review-replay-1",
+            "role": "reviewer",
+            "outcome": "accepted",
+        }
+        with (acct_dir / "events.jsonl").open("w", encoding="utf-8") as f:
+            for _ in range(3):
+                f.write(json.dumps(row) + "\n")
+
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        m = telemetry.metrics["review_acceptance_count"]
+        self.assertEqual(m.value, 1)
+
+    def test_invariant_escape_count_is_unknown_without_escape_evidence_and_one_on_real_escape(self) -> None:
+        """Finding 4: escape count reports unknown without escape evidence, and 1 on real escape."""
+        run = open_reliability_run(self.runtime_root, project_id="devorchestrator")
+        trans_file = self.runtime_root / "transition-executor.json"
+
+        # Case A: no escaped_to_authority evidence field produced
+        trans_data_a = {
+            "lifecycle": {
+                "devorchestrator": {
+                    "invariants": [
+                        {"code": "INV-1", "holds": False}
+                    ]
+                }
+            }
+        }
+        trans_file.write_text(json.dumps(trans_data_a), encoding="utf-8")
+        telemetry_a = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        m_a = telemetry_a.metrics["lifecycle_invariant_escape_count"]
+        self.assertEqual(m_a.coverage, "unknown")
+        self.assertIsNone(m_a.value)
+        self.assertEqual(m_a.coverage_reason, "no escape evidence field produced")
+
+        # Case B: real escape with escaped_to_authority=True
+        trans_data_b = {
+            "lifecycle": {
+                "devorchestrator": {
+                    "invariants": [
+                        {
+                            "code": "INV-1",
+                            "holds": False,
+                            "escaped_to_authority": True,
+                            "transition_id": "trans-esc-1",
+                        }
+                    ]
+                }
+            }
+        }
+        trans_file.write_text(json.dumps(trans_data_b), encoding="utf-8")
+        telemetry_b = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        m_b = telemetry_b.metrics["lifecycle_invariant_escape_count"]
+        self.assertEqual(m_b.coverage, "full")
+        self.assertEqual(m_b.value, 1)
+
+    def test_automatic_recovery_counts_are_derived_from_accounting_events_not_hardcoded(self) -> None:
+        """Finding 5: automatic recovery counts are derived from accounting events."""
+        run = open_reliability_run(self.runtime_root, project_id="devorchestrator")
+        acct_dir = self.runtime_root / "execution-accounting"
+        acct_dir.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {
+                "recorded_at": run["opened_at"],
+                "schema_version": 1,
+                "event_type": "attempt_outcome",
+                "project_id": "devorchestrator",
+                "attempt_id": "att-auto-1",
+                "role": "worker",
+                "phase": "retry",
+                "recovery_attempt": 1,
+                "outcome": "accepted",
+            },
+            {
+                "recorded_at": run["opened_at"],
+                "schema_version": 1,
+                "event_type": "attempt_outcome",
+                "project_id": "devorchestrator",
+                "attempt_id": "att-auto-2",
+                "role": "worker",
+                "phase": "retry",
+                "recovery_attempt": 2,
+                "outcome": "deferred",
+            },
+        ]
+        with (acct_dir / "events.jsonl").open("w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        self.assertEqual(telemetry.metrics["automatic_recovery_count"].value, 2)
+        self.assertEqual(telemetry.metrics["automatic_recovery_success_count"].value, 1)
+
+    def test_recovery_latency_samples_are_read_from_persisted_incident_records(self) -> None:
+        """Finding 6: recovery_latency samples are sourced from persisted failure incidents."""
+        run = open_reliability_run(self.runtime_root, project_id="devorchestrator")
+        semantic = {
+            "failure_class": "planner_timeout",
+            "stage": "planning",
+            "role": "planner",
+            "lifecycle_class": "PLANNING",
+            "recovery_latency": 45.2,
+            "recovery_attempt": 1,
+        }
+        capture_incident(
+            self.runtime_root,
+            project_id="devorchestrator",
+            task_id="P20.1",
+            classification="planner_timeout",
+            semantic=semantic,
+            evidence=None,
+            occurrence_key="occ-rec-lat-1",
+        )
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        self.assertEqual(telemetry.metrics["recovery_latency_seconds"].value, [45.2])
+        self.assertEqual(telemetry.metrics["recovery_latency_sample_count"].value, 1)
+        self.assertEqual(telemetry.metrics["recovery_latency_sample_count"].coverage, "full")
+
+        # When no incident carries measured latency, sample count is unknown coverage
+        run2 = open_reliability_run(self.runtime_root, project_id="devorchestrator-empty")
+        telemetry2 = compute_reliability_telemetry(self.runtime_root, run2["run_id"])
+        self.assertEqual(telemetry2.metrics["recovery_latency_sample_count"].coverage, "unknown")
+        self.assertIsNone(telemetry2.metrics["recovery_latency_sample_count"].value)
+
+    def test_journal_intent_capacity_exhaustion_raises_typed_backpressure(self) -> None:
+        """Finding 7: max_journal_intents raises IncidentCapacityExceededError on execute_txn."""
+        store = load_incident_store(self.runtime_root, max_journal_intents=0)
+        with self.assertRaises(IncidentCapacityExceededError):
+            store.execute_txn("dummy_op", lambda idx: (idx, {}))
+
+        # Also verify with max_journal_intents=1 and remaining intent
+        store1 = load_incident_store(self.runtime_root, max_journal_intents=1)
+        (store1.journal_dir / "txn-intent-1.json").write_text("{}", encoding="utf-8")
+        with unittest.mock.patch.object(store1, "reconcile_journal", return_value=[]):
+            with self.assertRaises(IncidentCapacityExceededError):
+                store1.execute_txn("dummy_op", lambda idx: (idx, {}))
+
+    def test_full_daemon_config_without_incidents_section_resolves_to_defaults(self) -> None:
+        """Finding 9: full daemon config without incidents section resolves to defaults."""
+        full_daemon_config = {
+            "projects": [{"id": "p1"}],
+            "execution_accounting": {"enabled": False},
+            "enabled": False,
+        }
+        policy = resolve_incident_policy(full_daemon_config)
+        self.assertTrue(policy["enabled"])
 
 
 if __name__ == "__main__":

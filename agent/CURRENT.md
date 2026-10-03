@@ -1,12 +1,22 @@
-# P20.1 Implementation and Verification State (2026-10-04)
+# P20.1 Technical Review Remediation State (2026-10-04)
 
-P20.1 Reliability Telemetry & Failure Taxonomy implementation and verification complete:
-- Status: **IMPLEMENTATION_COMPLETE / TECHNICAL_REVIEW_PENDING**.
+P20.1 Reliability Telemetry & Failure Taxonomy technical review remediation complete:
+- Status: **REMEDIATION_COMPLETE / TECHNICAL_REVIEW_PENDING**.
 - Control-Plane Impact:
   - Invariants: CURRENT_TASK_MATCHES_ACTIVE_EXECUTION, TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION, PENDING_DESIGN_NOT_EXECUTING, SUCCESSOR_HANDOFF_LINEAGE_VALID, NEXT_TASK_WITHOUT_HANDOFF, SINGLE_ACTIVE_LIFECYCLE_OWNER.
   - Transition boundaries: authority_reconciliation, watchdog_recovery, owner_gate_transition, successor_handoff, worker_launch.
   - Fault scenarios: CPF-01, CPF-02, CPF-03, CPF-04, CPF-05, CPF-06, CPF-07, CPF-08, CPF-09, CPF-10.
   - Convergence evidence: Telemetry observes sole authority without actuation; replay preserves counters and owner/task identities; corrupt evidence gates without relaunch; registered CPF tests remain green (196 passed).
+- Technical Review Findings Remediated:
+  1. `daemon_restart_count`: uses `boot_id_at_open` as baseline or first boot within run window, incrementing for subsequent boots (`test_cpf03_restart_during_run_counts_once_when_initial_boot_precedes_run` passes).
+  2. `failure_incident_count` / `repeated_failure_family_count`: occurrences windowed by per-occurrence `recorded_at` or `evidence_references`, excluding occurrences outside run window; reports `coverage=partial` when compaction removed timestamps (`test_failure_incident_count_excludes_occurrences_outside_run_window` passes).
+  3. `review_acceptance_count`: deduplicated by `attempt_id` using `seen_review_attempt_ids`, correctly counting replayed/re-read attempts once (`test_review_acceptance_count_dedups_replayed_attempt_id` passes).
+  4. `lifecycle_invariant_escape_count`: reports `coverage=unknown` with `"no escape evidence field produced"` when no invariant has `escaped_to_authority`, and deduped on `(invariant_code, transition_id)` (`test_invariant_escape_count_is_unknown_without_escape_evidence_and_one_on_real_escape` passes).
+  5. `automatic_recovery_*`: parsed from accounting `attempt_outcome` recovery rows (excluding deferral/wait), reading directly from `events.jsonl` in a single pass (`test_automatic_recovery_counts_are_derived_from_accounting_events_not_hardcoded` passes).
+  6. `recovery_latency_*`: sourced latency samples from packets and families keyed by `(incident_id, recovery_attempt)`, reporting `coverage=unknown` when no latency samples in window (`test_recovery_latency_samples_are_read_from_persisted_incident_records` passes).
+  7. `max_journal_intents`: enforced capacity limit under lock in `IncidentStore.execute_txn` when un-reconciled journal intents exceed policy (`test_journal_intent_capacity_exhaustion_raises_typed_backpressure` passes).
+  8. `test_cpf_matrix_observation_definitions`: asserts against actual output of `compute_reliability_telemetry()` over real run fixture rather than dict literal (`test_cpf_matrix_expected_values_assert_against_computed_telemetry` passes).
+  9. `resolve_incident_policy`: recognizes flat dict only when incident policy keys are present and no foreign top-level sections exist; default daemon configuration resolves correctly to defaults (`test_full_daemon_config_without_incidents_section_resolves_to_defaults` passes).
 - Architecture & Boundaries:
   - Sole lifecycle authority preserved: TransitionExecutor and OwnerControlStore remain sole authorities; telemetry and IncidentStore perform observation-only projection without state machine mutation.
   - Incident contract (`contract.py`): schema version 1, 19 owner failure classes, 33-field `FailureIncident` record with strict normalization and validation.
@@ -17,15 +27,15 @@ P20.1 Reliability Telemetry & Failure Taxonomy implementation and verification c
   - Read-only telemetry projection (`reliability_telemetry.py`, `reliability_runs.py`): 16 metrics (15 owner metrics + recovery latency sample count) mapped to single primary ledgers with cross-ledger dedup via durable keys and `{full, partial, unknown}` coverage.
   - Contract documentation: `docs/P20_1_RELIABILITY_TELEMETRY_CONTRACT.md`.
 - Verification & Evidence:
-  - Section-16 preflight: verified daemon PID 45216 running, owner paused, backed up 7 ledgers to `runtime/backup-p20-1-20261003-222317/`, restored resume posture.
-  - RED test evidence: `docs/evidence/P20_1_RED.txt`.
-  - Focused test suite: `tests_py/test_p20_1_reliability.py` (27 passed in 0.59s).
-  - Regression Group 1 (Incidents & Accounting, 10 suites): 106 passed in 17.69s.
-  - Regression Group 2 (Lifecycle & Control Plane, 10 suites): 196 passed in 96.41s.
-  - Regression Group 3 (Watchdog, Control, Daemon, Durable Jobs, 8 suites): 123 passed in 28.01s.
+  - RED test evidence: `docs/evidence/P20_1_RED.txt` (captured genuine failure outputs across all 9 review findings).
+  - Focused test suite: `tests_py/test_p20_1_reliability.py` (35 passed in 1.19s).
+  - Regression Group 1 (Incidents & Accounting, 9 suites): 79 passed in 16.51s.
+  - Regression Group 2 (Lifecycle & Control Plane CPF, 10 suites): 196 passed in 96.97s.
+  - Regression Group 3 (Watchdog, Control, Daemon, Durable Jobs, 8 suites): 123 passed in 28.61s.
+  - Total across regression suites: 433 passed, 0 failed.
   - Python compileall: clean.
   - `git diff --check`: clean.
-  - `graphify update .`: completed (8757 nodes, 23889 edges, 386 communities).
+  - `graphify update .`: completed (8778 nodes, 23938 edges, 344 communities).
 - Staged successor `agent/staged/P20.2.md` remains strictly `PENDING DESIGN`. No P21, no push, no unapproved successor activation.
 
 # P20 bootstrap recovery checkpoint (2026-10-04)

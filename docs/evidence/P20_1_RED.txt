@@ -2,20 +2,318 @@
 platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.6.0
 rootdir: C:\work\github\DevOrchestrator-dev
 configfile: pyproject.toml
-collected 0 items / 1 error
+collected 35 items / 26 deselected / 9 selected
 
-=================================== ERRORS ====================================
-_____________ ERROR collecting tests_py/test_p20_1_reliability.py _____________
-ImportError while importing test module 'C:\work\github\DevOrchestrator-dev\tests_py\test_p20_1_reliability.py'.
-Hint: make sure your test modules/packages have valid Python names.
-Traceback:
-C:\Users\yizhe\AppData\Local\Programs\Python\Python312\Lib\importlib\__init__.py:90: in import_module
-    return _bootstrap._gcd_import(name[level:], package, level)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-tests_py\test_p20_1_reliability.py:29: in <module>
-    from dev_orchestrator.incidents.contract import (
-E   ModuleNotFoundError: No module named 'dev_orchestrator.incidents.contract'
+tests_py\test_p20_1_reliability.py FFFFFFFFF                             [100%]
+
+================================== FAILURES ===================================
+_ TestP201CPFObservationMatrix.test_cpf_matrix_expected_values_assert_against_computed_telemetry _
+
+self = <test_p20_1_reliability.TestP201CPFObservationMatrix testMethod=test_cpf_matrix_expected_values_assert_against_computed_telemetry>
+
+    def test_cpf_matrix_expected_values_assert_against_computed_telemetry(self) -> None:
+        """Finding 8: table-driven assertions verify CPF-01 through CPF-10 against computed telemetry."""
+        # CPF-01: stale predecessor worker under fenced target -> duplicate_execution_count == 0
+        r_cpf01 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf01.mkdir(parents=True, exist_ok=True)
+        run01 = open_reliability_run(r_cpf01, project_id="devorchestrator")
+        t_data01 = {
+            "executions": {
+                "exec-1": {
+                    "project_id": "devorchestrator",
+                    "task_id": "P20.1",
+                    "source_request_id": "req-1",
+                    "state": "running",
+                    "started_at": run01["opened_at"],
+                }
+            }
+        }
+        (r_cpf01 / "transition-executor.json").write_text(json.dumps(t_data01), encoding="utf-8")
+        tel01 = compute_reliability_telemetry(r_cpf01, run01["run_id"])
+        self.assertEqual(tel01.metrics["duplicate_execution_count"].value, 0)
+        shutil.rmtree(r_cpf01.parent, ignore_errors=True)
+
+        # CPF-02: rebuilt single handoff -> duplicate_handoff_count == 0
+        r_cpf02 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf02.mkdir(parents=True, exist_ok=True)
+        run02 = open_reliability_run(r_cpf02, project_id="devorchestrator")
+        t_data02 = {
+            "executions": {
+                "trans-1": {
+                    "state": "handoff",
+                    "handoff_idempotency_key": "idem-cpf02",
+                    "recorded_at": run02["opened_at"],
+                }
+            }
+        }
+        (r_cpf02 / "transition-executor.json").write_text(json.dumps(t_data02), encoding="utf-8")
+        tel02 = compute_reliability_telemetry(r_cpf02, run02["run_id"])
+        self.assertEqual(tel02.metrics["duplicate_handoff_count"].value, 0)
+        shutil.rmtree(r_cpf02.parent, ignore_errors=True)
+
+        # CPF-03: daemon restart -> daemon_restart_count == 1
+        r_cpf03 = Path(tempfile.mkdtemp()) / "runtime"
+        r_cpf03.mkdir(parents=True, exist_ok=True)
+        record_daemon_boot(r_cpf03, pid=101, listen_address="127.0.0.1", port=8770, started_at="2026-10-01T00:00:00Z", boot_id="boot-0")
+        run03 = open_reliability_run(r_cpf03, project_id="devorchestrator", boot_id="boot-0")
+        record_daemon_boot(r_cpf03, pid=102, listen_address="127.0.0.1", port=8770, started_at="2026-10-05T00:00:00Z", boot_id="boot-1")
+        tel03 = compute_reliability_telemetry(r_cpf03, run03["run_id"])
+>       self.assertEqual(tel03.metrics["daemon_restart_count"].value, 1)
+E       AssertionError: 0 != 1
+
+tests_py\test_p20_1_reliability.py:703: AssertionError
+_ TestP201TechnicalReviewRemediation.test_automatic_recovery_counts_are_derived_from_accounting_events_not_hardcoded _
+
+self = <test_p20_1_reliability.TestP201TechnicalReviewRemediation testMethod=test_automatic_recovery_counts_are_derived_from_accounting_events_not_hardcoded>
+
+    def test_automatic_recovery_counts_are_derived_from_accounting_events_not_hardcoded(self) -> None:
+        """Finding 5: automatic recovery counts are derived from accounting events."""
+        run = open_reliability_run(self.runtime_root, project_id="devorchestrator")
+        acct_dir = self.runtime_root / "execution-accounting"
+        acct_dir.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {
+                "recorded_at": run["opened_at"],
+                "schema_version": 1,
+                "event_type": "attempt_outcome",
+                "project_id": "devorchestrator",
+                "attempt_id": "att-auto-1",
+                "role": "worker",
+                "phase": "retry",
+                "recovery_attempt": 1,
+                "outcome": "accepted",
+            },
+            {
+                "recorded_at": run["opened_at"],
+                "schema_version": 1,
+                "event_type": "attempt_outcome",
+                "project_id": "devorchestrator",
+                "attempt_id": "att-auto-2",
+                "role": "worker",
+                "phase": "retry",
+                "recovery_attempt": 2,
+                "outcome": "deferred",
+            },
+        ]
+        with (acct_dir / "events.jsonl").open("w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+>       self.assertEqual(telemetry.metrics["automatic_recovery_count"].value, 2)
+E       AssertionError: 0 != 2
+
+tests_py\test_p20_1_reliability.py:1034: AssertionError
+_ TestP201TechnicalReviewRemediation.test_cpf03_restart_during_run_counts_once_when_initial_boot_precedes_run _
+
+self = <test_p20_1_reliability.TestP201TechnicalReviewRemediation testMethod=test_cpf03_restart_during_run_counts_once_when_initial_boot_precedes_run>
+
+    def test_cpf03_restart_during_run_counts_once_when_initial_boot_precedes_run(self) -> None:
+        """Finding 1: daemon_restart_count counts boots after initial boot when initial boot precedes run."""
+        record_daemon_boot(
+            self.runtime_root,
+            pid=1000,
+            listen_address="127.0.0.1",
+            port=8770,
+            started_at="2026-10-01T00:00:00Z",
+            boot_id="boot-initial",
+        )
+        run = open_reliability_run(
+            self.runtime_root,
+            project_id="devorchestrator",
+            boot_id="boot-initial",
+        )
+        # Daemon restarts during run
+        record_daemon_boot(
+            self.runtime_root,
+            pid=2000,
+            listen_address="127.0.0.1",
+            port=8770,
+            started_at="2026-10-05T00:00:00Z",
+            boot_id="boot-restart-1",
+        )
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        m = telemetry.metrics["daemon_restart_count"]
+        self.assertEqual(m.coverage, "full")
+>       self.assertEqual(m.value, 1)
+E       AssertionError: 0 != 1
+
+tests_py\test_p20_1_reliability.py:890: AssertionError
+_ TestP201TechnicalReviewRemediation.test_failure_incident_count_excludes_occurrences_outside_run_window _
+
+self = <test_p20_1_reliability.TestP201TechnicalReviewRemediation testMethod=test_failure_incident_count_excludes_occurrences_outside_run_window>
+
+    def test_failure_incident_count_excludes_occurrences_outside_run_window(self) -> None:
+        """Finding 2: failure_incident_count and repeated_family_count window occurrences by recorded_at."""
+        semantic = {
+            "failure_class": "planner_timeout",
+            "stage": "planning",
+            "role": "planner",
+            "lifecycle_class": "PLANNING",
+        }
+        # 3 captures before the run
+        capture_incident(
+            self.runtime_root,
+            project_id="devorchestrator",
+            task_id="P20.1",
+            classification="planner_timeout",
+            semantic=semantic,
+            evidence=None,
+            occurrence_key="occ-pre-1",
+        )
+        capture_incident(
+            self.runtime_root,
+            project_id="devorchestrator",
+            task_id="P20.1",
+            classification="planner_timeout",
+            semantic=semantic,
+            evidence=None,
+            occurrence_key="occ-pre-2",
+        )
+        capture_incident(
+            self.runtime_root,
+            project_id="devorchestrator",
+            task_id="P20.1",
+            classification="planner_timeout",
+            semantic=semantic,
+            evidence=None,
+            occurrence_key="occ-pre-3",
+        )
+        time.sleep(0.01)
+        run = open_reliability_run(self.runtime_root, project_id="devorchestrator")
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+>       self.assertEqual(telemetry.metrics["failure_incident_count"].value, 0)
+E       AssertionError: 3 != 0
+
+tests_py\test_p20_1_reliability.py:931: AssertionError
+_ TestP201TechnicalReviewRemediation.test_full_daemon_config_without_incidents_section_resolves_to_defaults _
+
+self = <test_p20_1_reliability.TestP201TechnicalReviewRemediation testMethod=test_full_daemon_config_without_incidents_section_resolves_to_defaults>
+
+    def test_full_daemon_config_without_incidents_section_resolves_to_defaults(self) -> None:
+        """Finding 9: full daemon config without incidents section resolves to defaults."""
+        full_daemon_config = {
+            "projects": [{"id": "p1"}],
+            "execution_accounting": {"enabled": False},
+            "enabled": False,
+        }
+        policy = resolve_incident_policy(full_daemon_config)
+>       self.assertTrue(policy["enabled"])
+E       AssertionError: False is not true
+
+tests_py\test_p20_1_reliability.py:1086: AssertionError
+_ TestP201TechnicalReviewRemediation.test_invariant_escape_count_is_unknown_without_escape_evidence_and_one_on_real_escape _
+
+self = <test_p20_1_reliability.TestP201TechnicalReviewRemediation testMethod=test_invariant_escape_count_is_unknown_without_escape_evidence_and_one_on_real_escape>
+
+    def test_invariant_escape_count_is_unknown_without_escape_evidence_and_one_on_real_escape(self) -> None:
+        """Finding 4: escape count reports unknown without escape evidence, and 1 on real escape."""
+        run = open_reliability_run(self.runtime_root, project_id="devorchestrator")
+        trans_file = self.runtime_root / "transition-executor.json"
+
+        # Case A: no escaped_to_authority evidence field produced
+        trans_data_a = {
+            "lifecycle": {
+                "devorchestrator": {
+                    "invariants": [
+                        {"code": "INV-1", "holds": False}
+                    ]
+                }
+            }
+        }
+        trans_file.write_text(json.dumps(trans_data_a), encoding="utf-8")
+        telemetry_a = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        m_a = telemetry_a.metrics["lifecycle_invariant_escape_count"]
+>       self.assertEqual(m_a.coverage, "unknown")
+E       AssertionError: 'full' != 'unknown'
+E       - full
+E       + unknown
+
+tests_py\test_p20_1_reliability.py:975: AssertionError
+_ TestP201TechnicalReviewRemediation.test_journal_intent_capacity_exhaustion_raises_typed_backpressure _
+
+self = <test_p20_1_reliability.TestP201TechnicalReviewRemediation testMethod=test_journal_intent_capacity_exhaustion_raises_typed_backpressure>
+
+    def test_journal_intent_capacity_exhaustion_raises_typed_backpressure(self) -> None:
+        """Finding 7: max_journal_intents raises IncidentCapacityExceededError on execute_txn."""
+>       store = load_incident_store(self.runtime_root, max_journal_intents=2)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: load_incident_store() got an unexpected keyword argument 'max_journal_intents'
+
+tests_py\test_p20_1_reliability.py:1070: TypeError
+_ TestP201TechnicalReviewRemediation.test_recovery_latency_samples_are_read_from_persisted_incident_records _
+
+self = <test_p20_1_reliability.TestP201TechnicalReviewRemediation testMethod=test_recovery_latency_samples_are_read_from_persisted_incident_records>
+
+    def test_recovery_latency_samples_are_read_from_persisted_incident_records(self) -> None:
+        """Finding 6: recovery_latency samples are sourced from persisted failure incidents."""
+        run = open_reliability_run(self.runtime_root, project_id="devorchestrator")
+        semantic = {
+            "failure_class": "planner_timeout",
+            "stage": "planning",
+            "role": "planner",
+            "lifecycle_class": "PLANNING",
+            "recovery_latency": 45.2,
+            "recovery_attempt": 1,
+        }
+        capture_incident(
+            self.runtime_root,
+            project_id="devorchestrator",
+            task_id="P20.1",
+            classification="planner_timeout",
+            semantic=semantic,
+            evidence=None,
+            occurrence_key="occ-rec-lat-1",
+        )
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+>       self.assertEqual(telemetry.metrics["recovery_latency_seconds"].value, [45.2])
+E       AssertionError: Lists differ: [] != [45.2]
+E
+E       Second list contains 1 additional elements.
+E       First extra element 0:
+E       45.2
+E
+E       - []
+E       + [45.2]
+
+tests_py\test_p20_1_reliability.py:1058: AssertionError
+_ TestP201TechnicalReviewRemediation.test_review_acceptance_count_dedups_replayed_attempt_id _
+
+self = <test_p20_1_reliability.TestP201TechnicalReviewRemediation testMethod=test_review_acceptance_count_dedups_replayed_attempt_id>
+
+    def test_review_acceptance_count_dedups_replayed_attempt_id(self) -> None:
+        """Finding 3: review_acceptance_count dedups on attempt_id."""
+        run = open_reliability_run(self.runtime_root, project_id="devorchestrator")
+        acct_dir = self.runtime_root / "execution-accounting"
+        acct_dir.mkdir(parents=True, exist_ok=True)
+        # Replayed 3 times with same attempt_id
+        row = {
+            "recorded_at": run["opened_at"],
+            "schema_version": 1,
+            "event_type": "attempt_outcome",
+            "project_id": "devorchestrator",
+            "attempt_id": "att-review-replay-1",
+            "role": "reviewer",
+            "outcome": "accepted",
+        }
+        with (acct_dir / "events.jsonl").open("w", encoding="utf-8") as f:
+            for _ in range(3):
+                f.write(json.dumps(row) + "\n")
+
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        m = telemetry.metrics["review_acceptance_count"]
+>       self.assertEqual(m.value, 1)
+E       AssertionError: 3 != 1
+
+tests_py\test_p20_1_reliability.py:955: AssertionError
 =========================== short test summary info ===========================
-ERROR tests_py/test_p20_1_reliability.py
-!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
-============================== 1 error in 0.28s ===============================
+FAILED tests_py/test_p20_1_reliability.py::TestP201CPFObservationMatrix::test_cpf_matrix_expected_values_assert_against_computed_telemetry
+FAILED tests_py/test_p20_1_reliability.py::TestP201TechnicalReviewRemediation::test_automatic_recovery_counts_are_derived_from_accounting_events_not_hardcoded
+FAILED tests_py/test_p20_1_reliability.py::TestP201TechnicalReviewRemediation::test_cpf03_restart_during_run_counts_once_when_initial_boot_precedes_run
+FAILED tests_py/test_p20_1_reliability.py::TestP201TechnicalReviewRemediation::test_failure_incident_count_excludes_occurrences_outside_run_window
+FAILED tests_py/test_p20_1_reliability.py::TestP201TechnicalReviewRemediation::test_full_daemon_config_without_incidents_section_resolves_to_defaults
+FAILED tests_py/test_p20_1_reliability.py::TestP201TechnicalReviewRemediation::test_invariant_escape_count_is_unknown_without_escape_evidence_and_one_on_real_escape
+FAILED tests_py/test_p20_1_reliability.py::TestP201TechnicalReviewRemediation::test_journal_intent_capacity_exhaustion_raises_typed_backpressure
+FAILED tests_py/test_p20_1_reliability.py::TestP201TechnicalReviewRemediation::test_recovery_latency_samples_are_read_from_persisted_incident_records
+FAILED tests_py/test_p20_1_reliability.py::TestP201TechnicalReviewRemediation::test_review_acceptance_count_dedups_replayed_attempt_id
+====================== 9 failed, 26 deselected in 0.48s =======================

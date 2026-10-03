@@ -145,13 +145,25 @@ def compute_reliability_telemetry(
         coverage_reason=continue_reason,
     )
 
-    # 2. owner_gate_count
-    # Primary ledger: runtime/execution-accounting/events.jsonl (event_type=owner_gate_opened)
+    # 2. owner_gate_count & shared events.jsonl pass
+    # Primary ledger: runtime/execution-accounting/events.jsonl
     events_file = runtime / "execution-accounting" / "events.jsonl"
     owner_gate_count = 0
     gate_coverage = Coverage.FULL
     gate_reason = None
     seen_gate_ids: set[str] = set()
+
+    review_acceptance_count = 0
+    rev_coverage = Coverage.FULL
+    rev_reason = None
+    seen_review_attempt_ids: set[str] = set()
+
+    auto_rec_count = 0
+    auto_rec_success_count = 0
+    seen_recovery_attempt_ids: set[str] = set()
+    seen_recovery_success_ids: set[str] = set()
+    rec_coverage = Coverage.PARTIAL
+    rec_reason = "coverage partial until P20.3 recovery policy is implemented"
 
     if events_file.is_file():
         try:
@@ -163,10 +175,12 @@ def compute_reliability_telemetry(
                     row = json.loads(line_str)
                     if str(row.get("project_id")) != project_id:
                         continue
-                    ts = row.get("recorded_at") or row.get("timestamp")
+                    ts = row.get("recorded_at") or row.get("timestamp") or row.get("occurred_at")
                     if not _is_event_in_run(ts, opened_at, closed_at):
                         continue
-                    if row.get("event_type") == "owner_gate_opened":
+
+                    ev_type = row.get("event_type")
+                    if ev_type == "owner_gate_opened":
                         gid = row.get("gate_id") or (row.get("payload") or {}).get("gate_id")
                         if not gid:
                             gate_coverage = Coverage.UNKNOWN
@@ -174,12 +188,59 @@ def compute_reliability_telemetry(
                         elif gid not in seen_gate_ids:
                             seen_gate_ids.add(gid)
                             owner_gate_count += 1
+                    elif ev_type == "attempt_outcome":
+                        att_id = row.get("attempt_id")
+                        role = row.get("role")
+                        outcome = str(row.get("outcome", "")).lower()
+
+                        if role in {"plan_reviewer", "reviewer"} and outcome == "accepted":
+                            if not att_id:
+                                rev_coverage = Coverage.PARTIAL
+                                rev_reason = "attempt_outcome event missing attempt_id"
+                            elif att_id not in seen_review_attempt_ids:
+                                seen_review_attempt_ids.add(att_id)
+                                review_acceptance_count += 1
+
+                        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+                        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                        is_recovery = (
+                            row.get("recovery_attempt") is not None
+                            or payload.get("recovery_attempt") is not None
+                            or meta.get("recovery_attempt") is not None
+                            or row.get("phase") in {"retry", "managed_validation"}
+                            or bool(row.get("is_recovery") or payload.get("is_recovery") or meta.get("is_recovery"))
+                            or bool(row.get("recovery_strategy") or payload.get("recovery_strategy") or meta.get("recovery_strategy"))
+                        )
+                        if is_recovery:
+                            rec_id = att_id or (row.get("invocation_id") or row.get("event_id"))
+                            if rec_id:
+                                if rec_id not in seen_recovery_attempt_ids:
+                                    seen_recovery_attempt_ids.add(rec_id)
+                                    auto_rec_count += 1
+
+                                is_wait_deferral = (
+                                    outcome in {"wait", "deferral", "deferred", "owner_wait"}
+                                    or row.get("phase") == "owner_wait"
+                                    or bool(payload.get("deferred") or meta.get("deferred") or payload.get("wait") or meta.get("wait"))
+                                )
+                                if outcome == "accepted" and not is_wait_deferral:
+                                    if rec_id not in seen_recovery_success_ids:
+                                        seen_recovery_success_ids.add(rec_id)
+                                        auto_rec_success_count += 1
+                            else:
+                                rec_reason = "attempt_outcome recovery row missing attempt_id"
         except Exception as exc:
             gate_coverage = Coverage.UNKNOWN
             gate_reason = f"error reading events.jsonl: {exc}"
+            rev_coverage = Coverage.UNKNOWN
+            rev_reason = f"error reading events.jsonl: {exc}"
+            rec_coverage = Coverage.UNKNOWN
+            rec_reason = f"error reading events.jsonl: {exc}"
     else:
         gate_coverage = Coverage.UNKNOWN
         gate_reason = "execution-accounting/events.jsonl ledger not found"
+        rev_coverage = Coverage.UNKNOWN
+        rev_reason = "events.jsonl not found"
 
     metrics["owner_gate_count"] = MetricResult(
         name="owner_gate_count",
@@ -328,7 +389,6 @@ def compute_reliability_telemetry(
     incident_index_file = runtime / "incident-packets" / "index.json"
     failure_incident_count = 0
     repeated_family_count = 0
-    recovery_latencies: list[float] = []
     inc_coverage = Coverage.FULL
     inc_reason = None
 
@@ -336,21 +396,50 @@ def compute_reliability_telemetry(
         try:
             inc_data = read_json(incident_index_file, {})
             fams = inc_data.get("families") or {}
+            missing_timestamps = False
             for fp, fam in fams.items():
                 if not isinstance(fam, dict):
                     continue
                 if str(fam.get("project_id")) != project_id:
                     continue
+
                 occs = fam.get("occurrences") or []
-                in_window_occs = 0
+                ev_refs = fam.get("evidence_references") or []
+                ref_timestamps: dict[str, str] = {}
+                for ref in ev_refs:
+                    if isinstance(ref, dict):
+                        k = ref.get("occurrence_key")
+                        ts = ref.get("recorded_at")
+                        if k and ts:
+                            ref_timestamps[k] = ts
+
+                in_window_occ_keys: set[str] = set()
                 for occ in occs:
-                    failure_incident_count += 1
-                    in_window_occs += 1
-                if in_window_occs > 1:
+                    if isinstance(occ, dict):
+                        occ_k = occ.get("occurrence_key")
+                        occ_ts = occ.get("recorded_at") or (ref_timestamps.get(occ_k) if occ_k else None)
+                    elif isinstance(occ, str):
+                        occ_k = occ
+                        occ_ts = ref_timestamps.get(occ_k)
+                    else:
+                        continue
+
+                    if not occ_k:
+                        continue
+
+                    if occ_ts:
+                        if _is_event_in_run(occ_ts, opened_at, closed_at):
+                            in_window_occ_keys.add(occ_k)
+                    else:
+                        missing_timestamps = True
+
+                failure_incident_count += len(in_window_occ_keys)
+                if len(in_window_occ_keys) > 1:
                     repeated_family_count += 1
-                lat = fam.get("recovery_latency")
-                if isinstance(lat, (int, float)):
-                    recovery_latencies.append(float(lat))
+
+            if missing_timestamps:
+                inc_coverage = Coverage.PARTIAL
+                inc_reason = "per-occurrence timestamps unavailable for some compacted occurrences"
         except Exception as exc:
             inc_coverage = Coverage.UNKNOWN
             inc_reason = f"error reading incident store index: {exc}"
@@ -381,37 +470,83 @@ def compute_reliability_telemetry(
         coverage_reason=inc_reason,
     )
 
-    # 9. recovery_latency_seconds
+    # Recovery latency samples
+    recovery_latencies: list[float] = []
+    seen_latency_keys: set[tuple[str, int]] = set()
+
+    packets_dir = runtime / "incident-packets" / "packets"
+    if packets_dir.is_dir():
+        for pkt_file in packets_dir.glob("*.json"):
+            pkt = read_json(pkt_file, None)
+            if isinstance(pkt, dict) and str(pkt.get("project_id")) == project_id:
+                pkt_ts = pkt.get("captured_at") or pkt.get("first_seen_at")
+                if _is_event_in_run(pkt_ts, opened_at, closed_at):
+                    lat = pkt.get("recovery_latency")
+                    if isinstance(lat, (int, float)):
+                        inc_id = str(pkt.get("packet_id") or pkt.get("incident_id") or pkt_file.stem)
+                        rec_att = int(pkt.get("recovery_attempt") or 1)
+                        lat_key = (inc_id, rec_att)
+                        if lat_key not in seen_latency_keys:
+                            seen_latency_keys.add(lat_key)
+                            recovery_latencies.append(float(lat))
+
+    if incident_index_file.is_file():
+        try:
+            inc_data = read_json(incident_index_file, {})
+            fams = inc_data.get("families") or {}
+            for fam in fams.values():
+                if isinstance(fam, dict) and str(fam.get("project_id")) == project_id:
+                    lat = fam.get("recovery_latency")
+                    if isinstance(lat, (int, float)):
+                        fam_ts = fam.get("last_seen_at") or fam.get("first_seen_at")
+                        if _is_event_in_run(fam_ts, opened_at, closed_at):
+                            fam_id = str(fam.get("packet_id") or fam.get("family_id") or "fam")
+                            rec_att = int(fam.get("recovery_attempt") or 1)
+                            lat_key = (fam_id, rec_att)
+                            if lat_key not in seen_latency_keys:
+                                seen_latency_keys.add(lat_key)
+                                recovery_latencies.append(float(lat))
+        except Exception:
+            pass
+
+    # 9. recovery_latency_seconds & 10. recovery_latency_sample_count
+    if not recovery_latencies:
+        sample_count_cov = Coverage.UNKNOWN
+        sample_count_reason = "no incident in window carries measured recovery latency"
+        sample_count_val = None
+        lat_cov = Coverage.UNKNOWN
+        lat_reason = "no incident in window carries measured recovery latency"
+    else:
+        sample_count_cov = Coverage.FULL
+        sample_count_reason = None
+        sample_count_val = len(recovery_latencies)
+        lat_cov = Coverage.PARTIAL
+        lat_reason = "recovery latency samples gathered from available incident packets"
+
     metrics["recovery_latency_seconds"] = MetricResult(
         name="recovery_latency_seconds",
         value=recovery_latencies,
         source="runtime/incident-packets/index.json",
         identity_key="(incident_id, recovery_attempt)",
         dedup_rule="sample series from incident recovery_latency",
-        coverage=Coverage.PARTIAL.value,
-        coverage_reason="recovery latency samples gathered from available incident packets",
+        coverage=lat_cov.value,
+        coverage_reason=lat_reason,
     )
 
-    # 10. recovery_latency_sample_count
     metrics["recovery_latency_sample_count"] = MetricResult(
         name="recovery_latency_sample_count",
-        value=len(recovery_latencies),
+        value=sample_count_val,
         source="runtime/incident-packets/index.json",
         identity_key="(incident_id, recovery_attempt)",
         dedup_rule="count of recovery latency samples",
-        coverage=Coverage.FULL.value,
-        coverage_reason=None,
+        coverage=sample_count_cov.value,
+        coverage_reason=sample_count_reason,
     )
 
     # 11 & 12. automatic_recovery_count and automatic_recovery_success_count
-    auto_rec_count = 0
-    auto_rec_success_count = 0
-    rec_coverage = Coverage.PARTIAL
-    rec_reason = "coverage partial until P20.3 recovery policy is implemented"
-
     metrics["automatic_recovery_count"] = MetricResult(
         name="automatic_recovery_count",
-        value=auto_rec_count,
+        value=auto_rec_count if rec_coverage != Coverage.UNKNOWN else None,
         source="runtime/execution-accounting/events.jsonl",
         identity_key="attempt_id",
         dedup_rule="accounting attempt_outcome events with recovery attempt",
@@ -421,7 +556,7 @@ def compute_reliability_telemetry(
 
     metrics["automatic_recovery_success_count"] = MetricResult(
         name="automatic_recovery_success_count",
-        value=auto_rec_success_count,
+        value=auto_rec_success_count if rec_coverage != Coverage.UNKNOWN else None,
         source="runtime/execution-accounting/events.jsonl",
         identity_key="attempt_id",
         dedup_rule="recovery attempts reaching accepted outcome; waits excluded",
@@ -449,32 +584,6 @@ def compute_reliability_telemetry(
     )
 
     # 14. review_acceptance_count
-    review_acceptance_count = 0
-    rev_coverage = Coverage.FULL
-    rev_reason = None
-    if events_file.is_file():
-        try:
-            with events_file.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line_str = line.strip()
-                    if not line_str:
-                        continue
-                    row = json.loads(line_str)
-                    if str(row.get("project_id")) != project_id:
-                        continue
-                    ts = row.get("recorded_at") or row.get("timestamp")
-                    if not _is_event_in_run(ts, opened_at, closed_at):
-                        continue
-                    if row.get("event_type") == "attempt_outcome":
-                        if row.get("role") in {"plan_reviewer", "reviewer"} and row.get("outcome") == "accepted":
-                            review_acceptance_count += 1
-        except Exception as exc:
-            rev_coverage = Coverage.UNKNOWN
-            rev_reason = f"error reading events.jsonl: {exc}"
-    else:
-        rev_coverage = Coverage.UNKNOWN
-        rev_reason = "events.jsonl not found"
-
     metrics["review_acceptance_count"] = MetricResult(
         name="review_acceptance_count",
         value=review_acceptance_count if rev_coverage != Coverage.UNKNOWN else None,
@@ -498,7 +607,20 @@ def compute_reliability_telemetry(
             b for b in boots
             if _is_event_in_run(b.get("started_at"), opened_at, closed_at)
         ]
-        daemon_restart_count = max(0, len(boots_in_window) - 1)
+        boot_id_at_open = run.get("boot_id_at_open")
+        if boot_id_at_open:
+            daemon_restart_count = sum(1 for b in boots_in_window if b.get("boot_id") != boot_id_at_open)
+        else:
+            boots_prior = [
+                b for b in boots
+                if not _is_event_in_run(b.get("started_at"), opened_at, closed_at)
+                and b.get("started_at") and b.get("started_at") < opened_at
+            ]
+            if not boots_prior and boots_in_window:
+                daemon_restart_count = max(0, len(boots_in_window) - 1)
+            else:
+                boot_coverage = Coverage.UNKNOWN
+                boot_reason = "boot_id_at_open is null and initial boot cannot be identified"
 
     metrics["daemon_restart_count"] = MetricResult(
         name="daemon_restart_count",
@@ -516,14 +638,30 @@ def compute_reliability_telemetry(
     escape_count = 0
     escape_coverage = Coverage.FULL
     escape_reason = None
-    for item in trans_data.get("lifecycle", {}).get(project_id, {}).get("invariants", []):
-        if isinstance(item, dict) and item.get("holds") is False:
-            if item.get("escaped_to_authority"):
-                escape_count += 1
+    seen_escape_keys: set[tuple[str, str]] = set()
+    has_escape_evidence_field = False
+
+    inv_items = trans_data.get("lifecycle", {}).get(project_id, {}).get("invariants", [])
+    if isinstance(inv_items, list):
+        for item in inv_items:
+            if isinstance(item, dict):
+                if "escaped_to_authority" in item:
+                    has_escape_evidence_field = True
+                    if item.get("holds") is False and item.get("escaped_to_authority"):
+                        inv_code = str(item.get("invariant_code") or item.get("code") or item.get("invariant") or "unknown")
+                        trans_id = str(item.get("transition_id") or item.get("execution_id") or "none")
+                        key = (inv_code, trans_id)
+                        if key not in seen_escape_keys:
+                            seen_escape_keys.add(key)
+                            escape_count += 1
+
+    if not has_escape_evidence_field:
+        escape_coverage = Coverage.UNKNOWN
+        escape_reason = "no escape evidence field produced"
 
     metrics["lifecycle_invariant_escape_count"] = MetricResult(
         name="lifecycle_invariant_escape_count",
-        value=escape_count,
+        value=escape_count if escape_coverage != Coverage.UNKNOWN else None,
         source="runtime/transition-executor.json",
         identity_key="(invariant_code, transition_id)",
         dedup_rule="durable evidence that invalid state affected actuation or authority",

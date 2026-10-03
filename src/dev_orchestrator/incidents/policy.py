@@ -21,13 +21,48 @@ DEFAULT_INCIDENT_POLICY: dict[str, Any] = {
 }
 
 
+KNOWN_INCIDENT_KEYS = frozenset({
+    "enabled",
+    "auto_synthesis",
+    "max_evidence_references",
+    "retention_max_references",
+    "max_families",
+    "max_occurrences_per_family",
+    "max_total_occurrences",
+    "max_journal_intents",
+    "stale_task_activity_threshold_seconds",
+    "progress_obligation_window_seconds",
+    "quarantine_corrupt",
+    "escalation_window_seconds",
+})
+
+FOREIGN_TOP_LEVEL_SECTIONS = frozenset({
+    "projects",
+    "execution_accounting",
+    "daemon",
+    "watchdog",
+    "bridge",
+    "web",
+    "storage",
+    "core",
+    "control",
+    "transport",
+})
+
+
 def resolve_incident_policy(config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return normalized incident policy, merging defaults with provided configuration."""
     policy = copy.deepcopy(DEFAULT_INCIDENT_POLICY)
     if not isinstance(config, dict):
         return policy
 
-    raw = config.get("incidents") if isinstance(config.get("incidents"), dict) else config
+    if isinstance(config.get("incidents"), dict):
+        raw = config["incidents"]
+    elif not any(k in config for k in FOREIGN_TOP_LEVEL_SECTIONS) and any(k in config for k in KNOWN_INCIDENT_KEYS):
+        raw = config
+    else:
+        raw = None
+
     if isinstance(raw, dict):
         if "enabled" in raw:
             policy["enabled"] = bool(raw["enabled"])

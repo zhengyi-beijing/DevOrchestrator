@@ -40,12 +40,23 @@ def capture_incident(
     clean_semantic = sanitize_incident_payload(semantic)
     clean_evidence = sanitize_incident_payload(evidence) if evidence else None
 
-    store = load_incident_store(runtime)
-
     max_refs = int(policy.get("max_evidence_references", 10))
     max_families = int(policy.get("max_families", 1000))
     max_occ_per_fam = int(policy.get("max_occurrences_per_family", 5000))
     max_total_occ = int(policy.get("max_total_occurrences", 50000))
+    max_journal_intents = int(policy.get("max_journal_intents", 100))
+
+    store = load_incident_store(runtime, max_journal_intents=max_journal_intents)
+
+    raw_latency = clean_semantic.get("recovery_latency") if clean_semantic else None
+    if raw_latency is None and clean_evidence:
+        raw_latency = clean_evidence.get("recovery_latency")
+    parsed_latency = float(raw_latency) if isinstance(raw_latency, (int, float)) else None
+
+    raw_attempt = clean_semantic.get("recovery_attempt") if clean_semantic else None
+    if raw_attempt is None and clean_evidence:
+        raw_attempt = clean_evidence.get("recovery_attempt")
+    parsed_attempt = int(raw_attempt) if isinstance(raw_attempt, int) else None
 
     cand_id_to_generate: str | None = None
     packet_id_for_cand: str | None = None
@@ -58,7 +69,8 @@ def capture_incident(
         if fp in fams:
             fam = fams[fp]
             occs = fam.setdefault("occurrences", [])
-            if occurrence_key in occs:
+            seen_keys = {o if isinstance(o, str) else o.get("occurrence_key") for o in occs}
+            if occurrence_key in seen_keys:
                 # Idempotent: already recorded this occurrence key
                 return idx, {}
 
@@ -71,12 +83,17 @@ def capture_incident(
                     f"max_total_occurrences exceeded ({total_occurrences} >= {max_total_occ})"
                 )
 
+            now_ts = utc_now_iso()
             fam["recurrence_count"] = int(fam.get("recurrence_count", len(occs))) + 1
-            fam["last_seen_at"] = utc_now_iso()
-            occs.append(occurrence_key)
+            fam["last_seen_at"] = now_ts
+            occs.append({"occurrence_key": occurrence_key, "recorded_at": now_ts})
+            if parsed_latency is not None:
+                fam["recovery_latency"] = parsed_latency
+                if parsed_attempt is not None:
+                    fam["recovery_attempt"] = parsed_attempt
 
             ev_refs = fam.setdefault("evidence_references", [])
-            ev_ref_entry = build_evidence_reference(occurrence_key, clean_evidence, recorded_at=fam["last_seen_at"])
+            ev_ref_entry = build_evidence_reference(occurrence_key, clean_evidence, recorded_at=now_ts)
             ev_refs.append(ev_ref_entry)
             if len(ev_refs) > max_refs:
                 dropped = len(ev_refs) - max_refs
@@ -116,6 +133,10 @@ def capture_incident(
             "last_seen_at": now_ts,
             "occurrence_count": 1,
         }
+        if parsed_latency is not None:
+            packet_data["recovery_latency"] = parsed_latency
+            if parsed_attempt is not None:
+                packet_data["recovery_attempt"] = parsed_attempt
 
         new_family = {
             "family_id": family_id,
@@ -128,13 +149,17 @@ def capture_incident(
             "first_seen_at": now_ts,
             "last_seen_at": now_ts,
             "recurrence_count": 1,
-            "occurrences": [occurrence_key],
+            "occurrences": [{"occurrence_key": occurrence_key, "recorded_at": now_ts}],
             "packet_id": packet_id,
             "packet_ids": [packet_id],
             "evidence_references": [build_evidence_reference(occurrence_key, clean_evidence, recorded_at=now_ts)],
             "dropped_evidence_count": 0,
             "candidate_id": None,
         }
+        if parsed_latency is not None:
+            new_family["recovery_latency"] = parsed_latency
+            if parsed_attempt is not None:
+                new_family["recovery_attempt"] = parsed_attempt
 
         packet_rel = f"packets/{packet_id}.json"
         side_files = {packet_rel: json.dumps(packet_data, indent=2)}

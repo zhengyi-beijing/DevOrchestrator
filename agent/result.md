@@ -1,8 +1,18 @@
 # DevOrchestrator Self-Hosting Result Log
 
-P20.1 Reliability Telemetry & Failure Taxonomy implementation result (2026-10-04):
-- **Implementation: COMPLETE. Verification: PASS. Technical Review: PENDING.**
-- **Incident Contract & Taxonomy:** Added `src/dev_orchestrator/incidents/contract.py` implementing `INCIDENT_SCHEMA_VERSION = 1`, all 19 owner failure classes (`malformed_ai_output`, `planner_timeout`, `worker_process_lost`, `reviewer_rejected`, `reviewer_timeout`, `provider_quota_exhausted`, `provider_unavailable`, `aibroker_unavailable`, `daemon_restart_during_execution`, `daemon_restart_during_handoff`, `stale_head`, `unexpected_dirty_worktree`, `missing_execution_record`, `lost_handoff`, `duplicate_request`, `lifecycle_projection_mismatch`, `retry_without_progress`, `transport_unavailable`, `unknown_requires_owner`), typed `FailureIncident` record with 33 fields, and strict validation.
+P20.1 Reliability Telemetry & Failure Taxonomy technical review remediation result (2026-10-04):
+- **Remediation: COMPLETE. Verification: PASS. Technical Review: PENDING.**
+- **Technical Review Findings Remediated:**
+  1. `daemon_restart_count`: uses `boot_id_at_open` as baseline or first boot within run window, incrementing for subsequent boots (`test_cpf03_restart_during_run_counts_once_when_initial_boot_precedes_run` passes).
+  2. `failure_incident_count` / `repeated_failure_family_count`: occurrences windowed by per-occurrence `recorded_at` or `evidence_references`, excluding occurrences outside run window; reports `coverage=partial` when compaction removed timestamps (`test_failure_incident_count_excludes_occurrences_outside_run_window` passes).
+  3. `review_acceptance_count`: deduplicated by `attempt_id` using `seen_review_attempt_ids`, correctly counting replayed/re-read attempts once (`test_review_acceptance_count_dedups_replayed_attempt_id` passes).
+  4. `lifecycle_invariant_escape_count`: reports `coverage=unknown` with `"no escape evidence field produced"` when no invariant has `escaped_to_authority`, and deduped on `(invariant_code, transition_id)` (`test_invariant_escape_count_is_unknown_without_escape_evidence_and_one_on_real_escape` passes).
+  5. `automatic_recovery_*`: parsed from accounting `attempt_outcome` recovery rows (excluding deferral/wait), reading directly from `events.jsonl` in a single pass (`test_automatic_recovery_counts_are_derived_from_accounting_events_not_hardcoded` passes).
+  6. `recovery_latency_*`: sourced latency samples from packets and families keyed by `(incident_id, recovery_attempt)`, reporting `coverage=unknown` when no latency samples in window (`test_recovery_latency_samples_are_read_from_persisted_incident_records` passes).
+  7. `max_journal_intents`: enforced capacity limit under lock in `IncidentStore.execute_txn` when un-reconciled journal intents exceed policy (`test_journal_intent_capacity_exhaustion_raises_typed_backpressure` passes).
+  8. `test_cpf_matrix_observation_definitions`: asserts against actual output of `compute_reliability_telemetry()` over real run fixture rather than dict literal (`test_cpf_matrix_expected_values_assert_against_computed_telemetry` passes).
+  9. `resolve_incident_policy`: recognizes flat dict only when incident policy keys are present and no foreign top-level sections exist; default daemon configuration resolves correctly to defaults (`test_full_daemon_config_without_incidents_section_resolves_to_defaults` passes).
+- **Incident Contract & Taxonomy:** Implemented `INCIDENT_SCHEMA_VERSION = 1`, all 19 owner failure classes, typed `FailureIncident` record with 33 fields, and strict validation.
 - **Signature Stability:** Added `failure_signature` in `src/dev_orchestrator/incidents/fingerprint.py`, excluding volatile IDs, timestamps, paths, prompts, resource/account rotation, and model/provider substitutions while keeping existing P16.10 family fingerprints byte-identical.
 - **Store Hardening & Fencing:** Updated `src/dev_orchestrator/incidents/store.py` with in-transaction dedup inside `InterProcessFileLock`, persistent `corruption-fence.json` upon index quarantine with typed `IncidentStoreFencedError` (no programmatic clear API; owner manual procedure documented), bounded capacity backpressure (`max_families`, `max_occurrences_per_family`, `max_total_occurrences`, `max_journal_intents`), and `compact_incident_store()` preserving totals and dedup keys.
 - **Ingress Secret Sanitization:** Added `src/dev_orchestrator/incidents/sanitize.py` redacting Bearer tokens, passwords, API keys, PEM blocks, embedded assignments, and prompt dumps bounded to <=1024 chars across packets, journals, candidates, and index.
@@ -10,12 +20,12 @@ P20.1 Reliability Telemetry & Failure Taxonomy implementation result (2026-10-04
 - **Run-Scoped Reliability Telemetry:** Added `src/dev_orchestrator/incidents/reliability_telemetry.py` computing all 16 metrics (15 owner metrics + `recovery_latency_sample_count`) from single primary ledgers with cross-ledger dedup via durable identity keys and `{full, partial, unknown}` coverage.
 - **Contract Documentation:** Authored `docs/P20_1_RELIABILITY_TELEMETRY_CONTRACT.md`.
 - **Verification Evidence:**
-  - RED test evidence: `docs/evidence/P20_1_RED.txt`.
-  - Focused suite: `tests_py/test_p20_1_reliability.py` (27 passed in 0.59s).
-  - Regression Group 1 (Incidents & Accounting, 10 suites): 106 passed in 17.69s.
-  - Regression Group 2 (Lifecycle & Control Plane, 10 suites): 196 passed in 96.41s.
-  - Regression Group 3 (Watchdog, Control, Daemon, Durable Jobs, 8 suites): 123 passed in 28.01s.
-  - Total across all groups: 452 tests passed, 0 failed.
+  - RED test evidence: `docs/evidence/P20_1_RED.txt` (captured genuine failure outputs across all 9 review findings).
+  - Focused suite: `tests_py/test_p20_1_reliability.py` (35 passed in 1.19s).
+  - Regression Group 1 (Incidents & Accounting, 9 suites): 79 passed in 16.51s.
+  - Regression Group 2 (Lifecycle & Control Plane CPF, 10 suites): 196 passed in 96.97s.
+  - Regression Group 3 (Watchdog, Control, Daemon, Durable Jobs, 8 suites): 123 passed in 28.61s.
+  - Total across regression suites: 433 passed, 0 failed.
   - Python `compileall`: clean.
   - `git diff --check`: clean.
   - `graphify update .`: completed.

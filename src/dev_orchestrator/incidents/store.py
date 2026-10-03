@@ -102,8 +102,9 @@ def index_revision(runtime_root: Path | str) -> int:
 class IncidentStore:
     """Thread- and process-safe transactional store for incident families and candidates."""
 
-    def __init__(self, runtime_root: Path | str) -> None:
+    def __init__(self, runtime_root: Path | str, *, max_journal_intents: int = 100) -> None:
         self.runtime_root = Path(runtime_root)
+        self.max_journal_intents = int(max_journal_intents)
         self.base_dir = _store_dir(self.runtime_root)
         self.lock_path = _lock_path(self.runtime_root)
         self.index_path = _index_path(self.runtime_root)
@@ -190,6 +191,8 @@ class IncidentStore:
         self,
         operation: str,
         mutator: Callable[[dict[str, Any]], tuple[dict[str, Any], dict[str, str]]],
+        *,
+        max_journal_intents: int | None = None,
     ) -> tuple[dict[str, Any], str]:
         """Execute a journaled atomic mutation.
 
@@ -199,6 +202,12 @@ class IncidentStore:
         """
         with InterProcessFileLock(self.lock_path):
             self.reconcile_journal()
+            limit = max_journal_intents if max_journal_intents is not None else self.max_journal_intents
+            remaining_intents = list(self.journal_dir.glob("*.json"))
+            if len(remaining_intents) >= limit:
+                raise IncidentCapacityExceededError(
+                    f"max_journal_intents exceeded ({len(remaining_intents)} >= {limit})"
+                )
             current_index = self._load_index_failclosed()
             if self.is_fenced:
                 raise IncidentStoreFencedError(
@@ -398,9 +407,19 @@ class IncidentStore:
         return _search(live_index)
 
 
-def load_incident_store(runtime_root: Path | str) -> IncidentStore:
+def load_incident_store(
+    runtime_root: Path | str,
+    *,
+    max_journal_intents: int | None = None,
+    config: dict[str, Any] | None = None,
+) -> IncidentStore:
     """Return an IncidentStore instance for the given runtime root."""
-    return IncidentStore(runtime_root)
+    if max_journal_intents is None and config is not None:
+        from dev_orchestrator.incidents.policy import resolve_incident_policy
+        pol = resolve_incident_policy(config)
+        max_journal_intents = int(pol.get("max_journal_intents", 100))
+    limit = max_journal_intents if max_journal_intents is not None else 100
+    return IncidentStore(runtime_root, max_journal_intents=limit)
 
 
 @dataclass
@@ -421,11 +440,19 @@ def begin_txn(
     side_files: Optional[dict[str, Any]] = None,
     target_index_updater: Optional[Callable[[dict[str, Any]], None]] = None,
     mutator: Optional[Callable[[dict[str, Any]], tuple[dict[str, Any], dict[str, Any]]]] = None,
+    *,
+    max_journal_intents: int | None = None,
 ) -> TransactionIntent:
     """Prepare a transaction intent and write side files without committing index.json."""
     store = store_or_runtime if isinstance(store_or_runtime, IncidentStore) else load_incident_store(store_or_runtime)
     if store.is_fenced:
         raise IncidentStoreFencedError("Refusing to begin txn on fenced store index")
+    limit = max_journal_intents if max_journal_intents is not None else store.max_journal_intents
+    remaining_intents = list(store.journal_dir.glob("*.json"))
+    if len(remaining_intents) >= limit:
+        raise IncidentCapacityExceededError(
+            f"max_journal_intents exceeded ({len(remaining_intents)} >= {limit})"
+        )
     prior_rev = int(store.index.get("revision", 0))
     target_rev = prior_rev + 1
     txn_id = f"txn-{uuid4().hex[:12]}"
