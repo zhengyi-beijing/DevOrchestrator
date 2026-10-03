@@ -1,3 +1,33 @@
+# P20.1 Implementation and Verification State (2026-10-04)
+
+P20.1 Reliability Telemetry & Failure Taxonomy implementation and verification complete:
+- Status: **IMPLEMENTATION_COMPLETE / TECHNICAL_REVIEW_PENDING**.
+- Control-Plane Impact:
+  - Invariants: CURRENT_TASK_MATCHES_ACTIVE_EXECUTION, TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION, PENDING_DESIGN_NOT_EXECUTING, SUCCESSOR_HANDOFF_LINEAGE_VALID, NEXT_TASK_WITHOUT_HANDOFF, SINGLE_ACTIVE_LIFECYCLE_OWNER.
+  - Transition boundaries: authority_reconciliation, watchdog_recovery, owner_gate_transition, successor_handoff, worker_launch.
+  - Fault scenarios: CPF-01, CPF-02, CPF-03, CPF-04, CPF-05, CPF-06, CPF-07, CPF-08, CPF-09, CPF-10.
+  - Convergence evidence: Telemetry observes sole authority without actuation; replay preserves counters and owner/task identities; corrupt evidence gates without relaunch; registered CPF tests remain green (196 passed).
+- Architecture & Boundaries:
+  - Sole lifecycle authority preserved: TransitionExecutor and OwnerControlStore remain sole authorities; telemetry and IncidentStore perform observation-only projection without state machine mutation.
+  - Incident contract (`contract.py`): schema version 1, 19 owner failure classes, 33-field `FailureIncident` record with strict normalization and validation.
+  - Signature stability (`fingerprint.py`): `failure_signature` excludes volatile IDs, timestamps, absolute paths, prompts, resource/account rotation, and model/provider substitutions while keeping legacy `incident_fingerprint` byte-identical.
+  - Store hardening & fencing (`store.py`, `policy.py`): in-transaction dedup inside InterProcessFileLock, persistent `corruption-fence.json` upon quarantine (no programmatic clear API), bounded capacity backpressure (`max_families`, `max_occurrences_per_family`, `max_total_occurrences`, `max_journal_intents`), and compaction preserving totals and dedup keys.
+  - Ingress sanitization (`sanitize.py`, `capture.py`): redaction of Bearer tokens, credentials, API keys, PEM blocks, embedded assignments, prompt dumps bounded to <=1024 characters.
+  - Append-only boot ledger (`daemon.py`, `reliability_runs.py`): records `runtime/daemon-boots.jsonl` at daemon startup to establish durable restart identity.
+  - Read-only telemetry projection (`reliability_telemetry.py`, `reliability_runs.py`): 16 metrics (15 owner metrics + recovery latency sample count) mapped to single primary ledgers with cross-ledger dedup via durable keys and `{full, partial, unknown}` coverage.
+  - Contract documentation: `docs/P20_1_RELIABILITY_TELEMETRY_CONTRACT.md`.
+- Verification & Evidence:
+  - Section-16 preflight: verified daemon PID 45216 running, owner paused, backed up 7 ledgers to `runtime/backup-p20-1-20261003-222317/`, restored resume posture.
+  - RED test evidence: `docs/evidence/P20_1_RED.txt`.
+  - Focused test suite: `tests_py/test_p20_1_reliability.py` (27 passed in 0.59s).
+  - Regression Group 1 (Incidents & Accounting, 10 suites): 106 passed in 17.69s.
+  - Regression Group 2 (Lifecycle & Control Plane, 10 suites): 196 passed in 96.41s.
+  - Regression Group 3 (Watchdog, Control, Daemon, Durable Jobs, 8 suites): 123 passed in 28.01s.
+  - Python compileall: clean.
+  - `git diff --check`: clean.
+  - `graphify update .`: completed (8757 nodes, 23889 edges, 386 communities).
+- Staged successor `agent/staged/P20.2.md` remains strictly `PENDING DESIGN`. No P21, no push, no unapproved successor activation.
+
 # P20 bootstrap recovery checkpoint (2026-10-04)
 
 P20.1 remains PENDING_DESIGN, generation 11; no phase accepted, soak NOT STARTED.

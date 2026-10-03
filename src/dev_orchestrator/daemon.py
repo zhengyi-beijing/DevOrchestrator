@@ -52,7 +52,7 @@ from dev_orchestrator.core.websol_health import (
 )
 from dev_orchestrator.core.websol_failover import FailoverEngine, WebSolFailoverStore
 from dev_orchestrator.core.websol_probe import DEFAULT_PROBE_TIMEOUT_SECONDS, run_websol_probe
-from dev_orchestrator.incidents import capture_incident
+from dev_orchestrator.incidents import capture_incident, record_daemon_boot
 from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.control.security import ControlSecurity
 from dev_orchestrator.control.store import ConversationControlStore
@@ -786,6 +786,16 @@ def run_daemon(
          "listen_address": listen, "port": port,
          "bridge_listen_address": bridge_listen, "bridge_port": bridge_bound_port},
     )
+    try:
+        record_daemon_boot(
+            runtime,
+            pid=pid,
+            listen_address=listen,
+            port=port,
+            started_at=started_at,
+        )
+    except Exception:
+        pass
     try:
         while True:
             last_error: Optional[str] = None

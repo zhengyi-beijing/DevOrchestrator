@@ -18,6 +18,10 @@ ALLOWED_FINGERPRINT_FIELDS = frozenset({
     "git_anchor_relation",
     "continuation_relation",
     "invariant_identifier",
+    "stage",
+    "role",
+    "error_type",
+    "target_phase",
 })
 
 FORBIDDEN_VOLATILE_KEYS = frozenset({
@@ -43,6 +47,33 @@ FORBIDDEN_VOLATILE_KEYS = frozenset({
     "traceback",
     "stdout",
     "stderr",
+})
+
+EXCLUDED_SIGNATURE_FIELDS = frozenset({
+    "model",
+    "provider",
+    "resource",
+    "account",
+    "prompt",
+    "environment",
+    "env",
+    "incident_id",
+    "execution_id",
+    "task_id",
+    "plan_id",
+    "review_id",
+    "project_id",
+    "timestamp",
+    "timestamps",
+    "first_seen_at",
+    "last_seen_at",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "completed_at",
+    "path",
+    "repo_path",
+    "runtime_root",
 })
 
 _ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]|^\/")
@@ -95,4 +126,32 @@ def incident_fingerprint(semantic: dict[str, Any]) -> str:
         _validate_non_volatile(v, key_name=str(k))
 
     canonical_json = json.dumps(semantic, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()[:32]
+
+
+def failure_signature(semantic: dict[str, Any]) -> str:
+    """Compute stable normalized failure signature across processes, restarts, and retries.
+
+    Filters input to keep only allowlisted semantic facts, strictly excluding volatile IDs,
+    timestamps, paths, prompts, resource, account, provider, and model changes.
+    """
+    if not isinstance(semantic, dict):
+        raise ValueError("Semantic payload must be a dictionary")
+
+    filtered: dict[str, Any] = {}
+    for k, v in semantic.items():
+        key_str = str(k)
+        if key_str in EXCLUDED_SIGNATURE_FIELDS or key_str.lower() in FORBIDDEN_VOLATILE_KEYS:
+            continue
+        if key_str in ALLOWED_FINGERPRINT_FIELDS:
+            _validate_non_volatile(v, key_name=key_str)
+            filtered[key_str] = v
+
+    if not filtered:
+        # Fall back to using the class name if only excluded fields were present
+        fc = semantic.get("failure_class") or semantic.get("classification")
+        if fc:
+            filtered["failure_class"] = str(fc)
+
+    canonical_json = json.dumps(filtered, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()[:32]

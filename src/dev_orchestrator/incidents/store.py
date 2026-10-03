@@ -16,6 +16,15 @@ from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_is
 
 STORE_SCHEMA_VERSION = 1
 INCIDENTS_SUBDIR = "incident-packets"
+FENCE_FILE = "corruption-fence.json"
+
+
+class IncidentStoreFencedError(RuntimeError):
+    """Store mutation refused because persistent corruption fence is active."""
+
+
+class IncidentCapacityExceededError(RuntimeError):
+    """Store mutation refused because capacity limit is exceeded."""
 
 
 def _store_dir(runtime_root: Path | str) -> Path:
@@ -28,6 +37,10 @@ def _lock_path(runtime_root: Path | str) -> Path:
 
 def _index_path(runtime_root: Path | str) -> Path:
     return _store_dir(runtime_root) / "index.json"
+
+
+def _fence_path(runtime_root: Path | str) -> Path:
+    return _store_dir(runtime_root) / FENCE_FILE
 
 
 def _sha256_of_bytes(data: bytes) -> str:
@@ -51,9 +64,19 @@ def _quarantine_index(index_file: Path, raw_text: str, reason: str) -> None:
     else:
         q_name = f"index.corrupt.{stamp}-{content_hash}"
     q_path = index_file.parent / q_name
+    fence_path = index_file.parent / FENCE_FILE
     try:
         q_path.write_text(raw_text, encoding="utf-8")
         index_file.unlink(missing_ok=True)
+        # Write persistent corruption fence record
+        fence_record = {
+            "schema_version": STORE_SCHEMA_VERSION,
+            "fenced_at": utc_now_iso(),
+            "reason": reason,
+            "quarantined_file": q_name,
+            "details": f"Index quarantine triggered by {reason}",
+        }
+        write_json(fence_path, fence_record, indent=2)
     except (OSError, IOError):
         pass
 
@@ -84,6 +107,7 @@ class IncidentStore:
         self.base_dir = _store_dir(self.runtime_root)
         self.lock_path = _lock_path(self.runtime_root)
         self.index_path = _index_path(self.runtime_root)
+        self.fence_path = _fence_path(self.runtime_root)
         self.packets_dir = self.base_dir / "packets"
         self.candidates_dir = self.base_dir / "candidates"
         self.journal_dir = self.base_dir / "journal"
@@ -104,11 +128,20 @@ class IncidentStore:
     def last_txn_id(self) -> str | None:
         return self.index.get("last_txn_id")
 
+    @property
+    def is_fenced(self) -> bool:
+        return self.fence_path.is_file()
+
     def _ensure_dirs(self) -> None:
         for directory in (self.base_dir, self.packets_dir, self.candidates_dir, self.journal_dir, self.orphans_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
     def _load_index_failclosed(self) -> dict[str, Any]:
+        if self.fence_path.is_file():
+            fence_info = read_json(self.fence_path, {})
+            fence_reason = fence_info.get("reason", "unknown corruption") if isinstance(fence_info, dict) else "corrupt"
+            return _empty_index(degraded=True, degraded_reason=f"persistent corruption fence active: {fence_reason}")
+
         if not self.index_path.is_file():
             return _empty_index()
 
@@ -167,6 +200,10 @@ class IncidentStore:
         with InterProcessFileLock(self.lock_path):
             self.reconcile_journal()
             current_index = self._load_index_failclosed()
+            if self.is_fenced:
+                raise IncidentStoreFencedError(
+                    f"Refusing to execute mutation on fenced store index: {current_index.get('degraded_reason')}"
+                )
             if current_index.get("degraded"):
                 raise RuntimeError(
                     f"Refusing to execute mutation on degraded store index: {current_index.get('degraded_reason')}"
@@ -387,6 +424,8 @@ def begin_txn(
 ) -> TransactionIntent:
     """Prepare a transaction intent and write side files without committing index.json."""
     store = store_or_runtime if isinstance(store_or_runtime, IncidentStore) else load_incident_store(store_or_runtime)
+    if store.is_fenced:
+        raise IncidentStoreFencedError("Refusing to begin txn on fenced store index")
     prior_rev = int(store.index.get("revision", 0))
     target_rev = prior_rev + 1
     txn_id = f"txn-{uuid4().hex[:12]}"
@@ -451,6 +490,8 @@ def commit_txn(
 ) -> bool:
     """Atomically commit index.json and remove the intent."""
     store = store_or_runtime if isinstance(store_or_runtime, IncidentStore) else load_incident_store(store_or_runtime)
+    if store.is_fenced:
+        raise IncidentStoreFencedError("Refusing to commit txn on fenced store index")
     tmp_index = store.base_dir / f"index.json.tmp-{intent.txn_id}"
     write_json(tmp_index, intent.target_index, indent=2)
     os.replace(tmp_index, store.index_path)
@@ -464,3 +505,23 @@ def reconcile_journal(store_or_runtime: IncidentStore | Path | str) -> list[dict
     store = store_or_runtime if isinstance(store_or_runtime, IncidentStore) else load_incident_store(store_or_runtime)
     with InterProcessFileLock(store.lock_path):
         return store.reconcile_journal()
+
+
+def compact_incident_store(runtime_root: Path | str, max_refs: int = 10) -> dict[str, Any]:
+    """Compact incident family evidence references, preserving totals, identities, and dedup keys."""
+    store = load_incident_store(runtime_root)
+
+    def _compact_mutator(idx: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+        fams = idx.get("families") or {}
+        for fam in fams.values():
+            if not isinstance(fam, dict):
+                continue
+            ev_refs = fam.get("evidence_references") or []
+            if len(ev_refs) > max_refs:
+                dropped = len(ev_refs) - max_refs
+                fam["evidence_references"] = ev_refs[-max_refs:]
+                fam["dropped_evidence_count"] = int(fam.get("dropped_evidence_count", 0)) + dropped
+        return idx, {}
+
+    updated, _ = store.execute_txn("compact_incident_store", _compact_mutator)
+    return updated

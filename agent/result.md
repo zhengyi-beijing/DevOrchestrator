@@ -1,5 +1,31 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P20.1 Reliability Telemetry & Failure Taxonomy implementation result (2026-10-04):
+- **Implementation: COMPLETE. Verification: PASS. Technical Review: PENDING.**
+- **Incident Contract & Taxonomy:** Added `src/dev_orchestrator/incidents/contract.py` implementing `INCIDENT_SCHEMA_VERSION = 1`, all 19 owner failure classes (`malformed_ai_output`, `planner_timeout`, `worker_process_lost`, `reviewer_rejected`, `reviewer_timeout`, `provider_quota_exhausted`, `provider_unavailable`, `aibroker_unavailable`, `daemon_restart_during_execution`, `daemon_restart_during_handoff`, `stale_head`, `unexpected_dirty_worktree`, `missing_execution_record`, `lost_handoff`, `duplicate_request`, `lifecycle_projection_mismatch`, `retry_without_progress`, `transport_unavailable`, `unknown_requires_owner`), typed `FailureIncident` record with 33 fields, and strict validation.
+- **Signature Stability:** Added `failure_signature` in `src/dev_orchestrator/incidents/fingerprint.py`, excluding volatile IDs, timestamps, paths, prompts, resource/account rotation, and model/provider substitutions while keeping existing P16.10 family fingerprints byte-identical.
+- **Store Hardening & Fencing:** Updated `src/dev_orchestrator/incidents/store.py` with in-transaction dedup inside `InterProcessFileLock`, persistent `corruption-fence.json` upon index quarantine with typed `IncidentStoreFencedError` (no programmatic clear API; owner manual procedure documented), bounded capacity backpressure (`max_families`, `max_occurrences_per_family`, `max_total_occurrences`, `max_journal_intents`), and `compact_incident_store()` preserving totals and dedup keys.
+- **Ingress Secret Sanitization:** Added `src/dev_orchestrator/incidents/sanitize.py` redacting Bearer tokens, passwords, API keys, PEM blocks, embedded assignments, and prompt dumps bounded to <=1024 chars across packets, journals, candidates, and index.
+- **Append-Only Daemon Boot Ledger:** Updated `src/dev_orchestrator/daemon.py` and `src/dev_orchestrator/incidents/reliability_runs.py` recording startup boot records in `runtime/daemon-boots.jsonl`.
+- **Run-Scoped Reliability Telemetry:** Added `src/dev_orchestrator/incidents/reliability_telemetry.py` computing all 16 metrics (15 owner metrics + `recovery_latency_sample_count`) from single primary ledgers with cross-ledger dedup via durable identity keys and `{full, partial, unknown}` coverage.
+- **Contract Documentation:** Authored `docs/P20_1_RELIABILITY_TELEMETRY_CONTRACT.md`.
+- **Verification Evidence:**
+  - RED test evidence: `docs/evidence/P20_1_RED.txt`.
+  - Focused suite: `tests_py/test_p20_1_reliability.py` (27 passed in 0.59s).
+  - Regression Group 1 (Incidents & Accounting, 10 suites): 106 passed in 17.69s.
+  - Regression Group 2 (Lifecycle & Control Plane, 10 suites): 196 passed in 96.41s.
+  - Regression Group 3 (Watchdog, Control, Daemon, Durable Jobs, 8 suites): 123 passed in 28.01s.
+  - Total across all groups: 452 tests passed, 0 failed.
+  - Python `compileall`: clean.
+  - `git diff --check`: clean.
+  - `graphify update .`: completed.
+- **Control-Plane Impact:**
+  - Invariants: CURRENT_TASK_MATCHES_ACTIVE_EXECUTION, TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION, PENDING_DESIGN_NOT_EXECUTING, SUCCESSOR_HANDOFF_LINEAGE_VALID, NEXT_TASK_WITHOUT_HANDOFF, SINGLE_ACTIVE_LIFECYCLE_OWNER.
+  - Transition boundaries: authority_reconciliation, watchdog_recovery, owner_gate_transition, successor_handoff, worker_launch.
+  - Fault scenarios: CPF-01, CPF-02, CPF-03, CPF-04, CPF-05, CPF-06, CPF-07, CPF-08, CPF-09, CPF-10.
+  - Convergence evidence: Telemetry observes sole authority without actuation; replay preserves counters and owner/task identities; corrupt evidence gates without relaunch; registered CPF tests remain green.
+- **Lifecycle Posture:** Staged successor `agent/staged/P20.2.md` remains `PENDING DESIGN`. No P21, no push, no unapproved successor handoff.
+
 P19.2 Technical Review and authoritative closeout (2026-10-03):
 - **Restart acceptance: PASS. Technical Review: ACCEPT. Authority: COMPLETE.**
 - Bounded regression-first repairs closed MCP scope escalation, owner-credential

@@ -9,6 +9,10 @@ DEFAULT_INCIDENT_POLICY: dict[str, Any] = {
     "auto_synthesis": True,
     "max_evidence_references": 10,
     "retention_max_references": 20,
+    "max_families": 1000,
+    "max_occurrences_per_family": 5000,
+    "max_total_occurrences": 50000,
+    "max_journal_intents": 100,
     "stale_task_activity_threshold_seconds": 300,
     "progress_obligation_window_seconds": 300,
     "quarantine_corrupt": True,
@@ -23,7 +27,7 @@ def resolve_incident_policy(config: dict[str, Any] | None = None) -> dict[str, A
     if not isinstance(config, dict):
         return policy
 
-    raw = config.get("incidents")
+    raw = config.get("incidents") if isinstance(config.get("incidents"), dict) else config
     if isinstance(raw, dict):
         if "enabled" in raw:
             policy["enabled"] = bool(raw["enabled"])
@@ -33,6 +37,14 @@ def resolve_incident_policy(config: dict[str, Any] | None = None) -> dict[str, A
             policy["max_evidence_references"] = max(1, min(100, raw["max_evidence_references"]))
         if "retention_max_references" in raw and isinstance(raw["retention_max_references"], int):
             policy["retention_max_references"] = max(1, min(500, raw["retention_max_references"]))
+        if "max_families" in raw and isinstance(raw["max_families"], int):
+            policy["max_families"] = max(1, min(100000, raw["max_families"]))
+        if "max_occurrences_per_family" in raw and isinstance(raw["max_occurrences_per_family"], int):
+            policy["max_occurrences_per_family"] = max(1, min(500000, raw["max_occurrences_per_family"]))
+        if "max_total_occurrences" in raw and isinstance(raw["max_total_occurrences"], int):
+            policy["max_total_occurrences"] = max(1, min(1000000, raw["max_total_occurrences"]))
+        if "max_journal_intents" in raw and isinstance(raw["max_journal_intents"], int):
+            policy["max_journal_intents"] = max(1, min(10000, raw["max_journal_intents"]))
         if "stale_task_activity_threshold_seconds" in raw and isinstance(raw["stale_task_activity_threshold_seconds"], (int, float)):
             policy["stale_task_activity_threshold_seconds"] = max(1.0, float(raw["stale_task_activity_threshold_seconds"]))
         if "progress_obligation_window_seconds" in raw and isinstance(raw["progress_obligation_window_seconds"], (int, float)):
