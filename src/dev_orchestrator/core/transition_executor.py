@@ -2770,6 +2770,548 @@ class TransitionExecutor:
         except Exception:
             pass
 
+    def reconcile_historical_repository_lineage(
+        self,
+        project: dict[str, Any],
+        snapshot: dict[str, Any],
+        *,
+        expected_from_task_id: str,
+        expected_to_task_id: str,
+        trigger: str,
+    ) -> dict[str, Any]:
+        """Reconcile a lost multi-hop lifecycle ledger from durable Git history.
+
+        This is an explicit recovery path, not an automatic daemon migration.
+        It is permitted only for a clean, quiescent repository when the current
+        runtime authority is a strict ancestor of the repository-projected task
+        along the staged roadmap and every edge is proven by a committed
+        repository task projection in agent/next.md within the ancestry of HEAD.
+        This legacy-compatible source is required because execution-state.json
+        did not exist for every older lifecycle hop. No Planner/Worker is
+        launched and repository files are not rewritten.
+
+        Recovered authority edges and older accepted NEXT_TASK obligations are
+        represented as consumed historical handoffs. Pre-authority obligations
+        repair evidence only; they never rewind or increment current authority.
+        This prevents lost legacy ledger rows from re-opening
+        NEXT_TASK_WITHOUT_HANDOFF on the next tick.
+        """
+        project_id = str(project.get("project_id") or "").strip()
+        raw_repo_path = str(project.get("repo_path") or project.get("root") or "").strip()
+        expected_from = str(expected_from_task_id or "").strip()
+        expected_to = str(expected_to_task_id or "").strip()
+        if not project_id or not raw_repo_path or not expected_from or not expected_to:
+            return {
+                "status": "blocked",
+                "reason": "project, repository, and expected task identities are required",
+            }
+        repo_path = Path(raw_repo_path).resolve()
+
+        truth = read_repository_truth(repo_path)
+        if not truth.valid or truth.dirty:
+            return {"status": "blocked", "reason": "historical lineage reconciliation requires a clean repository"}
+
+        repository_task = advertised_task_id(snapshot)
+        if repository_task != expected_to:
+            return {
+                "status": "blocked",
+                "reason": (
+                    "repository task does not match expected reconciliation target: "
+                    f"{repository_task!r} != {expected_to!r}"
+                ),
+            }
+
+        roadmap_path = repo_path / "agent" / "staged" / "roadmap.json"
+        roadmap = read_json(roadmap_path, None)
+        tasks = roadmap.get("tasks") if isinstance(roadmap, dict) else None
+        if not isinstance(tasks, list):
+            return {"status": "blocked", "reason": "staged roadmap is unavailable or invalid"}
+        successor_by_task: dict[str, tuple[str | None, str | None]] = {}
+        for item in tasks:
+            if not isinstance(item, dict):
+                continue
+            task_id = str(item.get("task_id") or "").strip()
+            if not task_id:
+                continue
+            successor = item.get("successor")
+            successor_id = str(successor).strip() if successor is not None else None
+            spec = item.get("successor_spec_path")
+            spec_path = str(spec).strip() if spec is not None else None
+            successor_by_task[task_id] = (successor_id or None, spec_path or None)
+
+        chain = [expected_from]
+        seen: set[str] = set()
+        while chain[-1] != expected_to:
+            current = chain[-1]
+            if current in seen or len(chain) > 64:
+                return {"status": "blocked", "reason": "roadmap successor chain is cyclic or unbounded"}
+            seen.add(current)
+            successor, spec_path = successor_by_task.get(current, (None, None))
+            if not successor:
+                return {
+                    "status": "blocked",
+                    "reason": f"roadmap has no successor from {current!r} toward {expected_to!r}",
+                }
+            if not spec_path or not (repo_path / spec_path).is_file():
+                return {
+                    "status": "blocked",
+                    "reason": f"staged successor spec is missing for {current!r} -> {successor!r}",
+                }
+            chain.append(successor)
+        if len(chain) < 2:
+            return {"status": "noop", "reason": "authority already matches repository task"}
+
+        def _git(args: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", "-C", str(repo_path), *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                **hidden_subprocess_kwargs(),
+            )
+
+        history = _git(["rev-list", "--reverse", "HEAD", "--", "agent/next.md"])
+        if history.returncode != 0:
+            return {"status": "blocked", "reason": "cannot inspect agent/next.md Git history"}
+        transition_commits: dict[tuple[str, str], list[tuple[int, str]]] = {}
+        previous_task: str | None = None
+        for index, commit in enumerate(
+            line.strip() for line in history.stdout.splitlines() if line.strip()
+        ):
+            shown = _git(["show", f"{commit}:agent/next.md"])
+            if shown.returncode != 0:
+                continue
+            task_id = None
+            for line in shown.stdout.splitlines()[:40]:
+                if line.lstrip().startswith("#"):
+                    task_id = extract_task_id(line)
+                    if task_id:
+                        break
+            if not task_id:
+                continue
+            task_id = str(task_id)
+            if previous_task and task_id != previous_task:
+                transition_commits.setdefault(
+                    (previous_task, task_id), []
+                ).append((index, commit))
+            previous_task = task_id
+
+        def _edge_evidence(
+            source_task: str, target_task: str,
+        ) -> tuple[dict[str, Any] | None, str | None]:
+            matches = transition_commits.get((source_task, target_task), [])
+            if len(matches) != 1:
+                return None, (
+                    "historical Git lineage is missing or ambiguous for "
+                    f"{source_task!r} -> {target_task!r}"
+                )
+            index, commit = matches[0]
+            stamp = _git(["show", "-s", "--format=%cI", commit])
+            if stamp.returncode != 0 or not stamp.stdout.strip():
+                return None, f"cannot read commit timestamp for {commit[:12]}"
+            spec_path = successor_by_task[source_task][1]
+            if not spec_path or not (repo_path / spec_path).is_file():
+                return None, f"staged successor spec is missing for {source_task!r}"
+            spec_bytes = (repo_path / spec_path).read_bytes()
+            return {
+                "history_index": index,
+                "source_task_id": source_task,
+                "target_task_id": target_task,
+                "activation_commit": commit,
+                "activation_committed_at": stamp.stdout.strip(),
+                "successor_spec_path": spec_path,
+                "successor_spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
+            }, None
+
+        edge_evidence: list[dict[str, Any]] = []
+        previous_index = -1
+        for source_task, target_task in zip(chain, chain[1:]):
+            evidence, error = _edge_evidence(source_task, target_task)
+            if error or evidence is None:
+                return {"status": "blocked", "reason": error or "missing historical edge evidence"}
+            index = int(evidence["history_index"])
+            if index <= previous_index:
+                return {
+                    "status": "blocked",
+                    "reason": "historical Git task transitions are out of order",
+                }
+            previous_index = index
+            edge_evidence.append(evidence)
+
+        decisions_state = read_json(self.runtime_root / "review-decisions.json", {})
+        if not isinstance(decisions_state, dict):
+            decisions_state = {}
+
+        # The decisions ledger can outlive older runtime handoff rows.  Backfill
+        # only accepted NEXT_TASK obligations whose source task has a unique
+        # roadmap path to the current repository task and whose direct successor
+        # activation is independently proven by Git history.  These baseline
+        # rows satisfy evidence obligations but never alter current authority.
+        lineage_sources: set[str] = set()
+        for candidate in successor_by_task:
+            cursor = candidate
+            visited: set[str] = set()
+            while cursor and cursor not in visited:
+                if cursor == expected_to:
+                    lineage_sources.add(candidate)
+                    break
+                visited.add(cursor)
+                cursor = successor_by_task.get(cursor, (None, None))[0]
+
+        decision_sources: set[str] = set()
+        decisions = decisions_state.get("decisions")
+        if isinstance(decisions, dict):
+            for row in decisions.values():
+                if not isinstance(row, dict) or row.get("project_id") != project_id:
+                    continue
+                if not (
+                    row.get("disposition") == "apply"
+                    and row.get("decision") == "next"
+                    and row.get("next_action") == "next_task"
+                ):
+                    continue
+                source_task = str(row.get("task_id") or "").strip()
+                if source_task and source_task in lineage_sources and source_task != expected_to:
+                    decision_sources.add(source_task)
+
+        authority_sources = set(chain[:-1])
+        baseline_evidence: list[dict[str, Any]] = []
+        for source_task in sorted(decision_sources - authority_sources):
+            target_task = successor_by_task.get(source_task, (None, None))[0]
+            if not target_task:
+                return {
+                    "status": "blocked",
+                    "reason": f"accepted historical NEXT_TASK has no roadmap successor: {source_task!r}",
+                }
+            evidence, error = _edge_evidence(source_task, target_task)
+            if error or evidence is None:
+                return {
+                    "status": "blocked",
+                    "reason": error or f"missing historical obligation evidence for {source_task!r}",
+                }
+            baseline_evidence.append(evidence)
+        baseline_evidence.sort(key=lambda row: int(row["history_index"]))
+
+        with self._lock:
+            ledger = self._load_ledger()
+            lifecycle = ledger.setdefault("lifecycle", {})
+            executions = ledger.setdefault("executions", {})
+            transitions = ledger.setdefault("transitions", {})
+            authority = lifecycle.get(project_id)
+            if not isinstance(authority, dict):
+                return {"status": "blocked", "reason": "authoritative lifecycle row is missing"}
+
+            current_task = str(authority.get("current_task_id") or "").strip()
+            if current_task == expected_to and not authority.get("owner_gate"):
+                return {
+                    "status": "noop",
+                    "reason": "authority already matches reconciled repository task",
+                    "edges_reconciled": 0,
+                }
+            if current_task != expected_from:
+                return {
+                    "status": "blocked",
+                    "reason": (
+                        "authoritative task changed before reconciliation: "
+                        f"{current_task!r} != {expected_from!r}"
+                    ),
+                }
+            if authority.get("active_owner"):
+                return {"status": "blocked", "reason": "active lifecycle owner prevents historical reconciliation"}
+            active_rows = [
+                key for key, row in executions.items()
+                if isinstance(row, dict)
+                and row.get("project_id") == project_id
+                and row.get("state") in _ACTIVE_STATES
+            ]
+            if active_rows:
+                return {
+                    "status": "blocked",
+                    "reason": "active execution prevents historical reconciliation",
+                    "active_execution_ids": active_rows,
+                }
+            gate = authority.get("owner_gate")
+            if isinstance(gate, dict) and gate.get("code") not in {
+                "NEXT_TASK_WITHOUT_HANDOFF",
+                "CURRENT_TASK_MATCHES_ACTIVE_EXECUTION",
+            }:
+                return {
+                    "status": "blocked",
+                    "reason": f"owner gate {gate.get('code')!r} is not eligible for historical reconciliation",
+                }
+
+            reconciliation_at = utc_now_iso()
+            baseline_applied: list[dict[str, Any]] = []
+            for edge in baseline_evidence:
+                source_task = str(edge["source_task_id"])
+                target_task = str(edge["target_task_id"])
+                activation_commit = str(edge["activation_commit"])
+                committed_at = str(edge["activation_committed_at"])
+
+                matching_handoffs = [
+                    (key, row) for key, row in executions.items()
+                    if isinstance(row, dict)
+                    and row.get("project_id") == project_id
+                    and row.get("state") == "handoff"
+                    and (row.get("source_task_id") or row.get("task_id")) == source_task
+                    and (row.get("target_task_id") or row.get("next_task_id")) == target_task
+                ]
+                if len(matching_handoffs) > 1:
+                    return {
+                        "status": "blocked",
+                        "reason": (
+                            "multiple historical handoffs exist for "
+                            f"{source_task} -> {target_task}"
+                        ),
+                    }
+                if matching_handoffs:
+                    source_request_id, handoff = matching_handoffs[0]
+                else:
+                    source_request_id = (
+                        f"historical-obligation:{project_id}:{source_task}:{target_task}:"
+                        f"{activation_commit[:12]}"
+                    )
+                    handoff = {
+                        "project_id": project_id,
+                        "source_request_id": source_request_id,
+                        "source_kind": "historical_repository_lineage",
+                        "task_id": source_task,
+                        "source_task_id": source_task,
+                        "target_task_id": target_task,
+                        "next_task_id": target_task,
+                        "state": "handoff",
+                        "outcome": "historical_activation_reconciled",
+                        "reason": (
+                            f"{trigger}: reconstructed pre-authority NEXT_TASK "
+                            "satisfaction evidence"
+                        ),
+                        "recorded_at": committed_at,
+                    }
+                    executions[source_request_id] = handoff
+
+                handoff.update({
+                    "handoff_consumed": True,
+                    # The activation happened at committed_at; the durable
+                    # handoff evidence is reconstructed now.  The invariant
+                    # compares consumption time so later historical rereviews
+                    # are satisfied without falsifying activation chronology.
+                    "handoff_consumed_at": reconciliation_at,
+                    "historical_activation_commit": activation_commit,
+                    "historical_activation_committed_at": committed_at,
+                    "historical_reconciliation": True,
+                    "historical_authority_baseline": True,
+                    "successor_evidence": "git_history+roadmap",
+                    "staged_successor": target_task,
+                    "staged_spec_path": edge["successor_spec_path"],
+                    "staged_spec_sha256": edge["successor_spec_sha256"],
+                })
+
+                matching_transitions = [
+                    row for row in transitions.values()
+                    if isinstance(row, dict)
+                    and row.get("project_id") == project_id
+                    and row.get("source_task_id") == source_task
+                    and row.get("target_task_id") == target_task
+                ]
+                if len(matching_transitions) > 1:
+                    return {
+                        "status": "blocked",
+                        "reason": (
+                            "multiple historical transitions exist for "
+                            f"{source_task} -> {target_task}"
+                        ),
+                    }
+                if matching_transitions:
+                    transition = matching_transitions[0]
+                    transition["state"] = "completed"
+                    transition["source_request_id"] = source_request_id
+                    transition["handoff_record"] = copy.deepcopy(handoff)
+                    transition["historical_reconciliation"] = True
+                    transition["historical_authority_baseline"] = True
+                    transition["updated_at"] = reconciliation_at
+
+                baseline_applied.append({
+                    "source_task_id": source_task,
+                    "target_task_id": target_task,
+                    "activation_commit": activation_commit,
+                    "source_request_id": source_request_id,
+                })
+
+            generation = int(authority.get("generation") or 0)
+            applied: list[dict[str, Any]] = []
+            for edge in edge_evidence:
+                source_task = str(edge["source_task_id"])
+                target_task = str(edge["target_task_id"])
+                activation_commit = str(edge["activation_commit"])
+                committed_at = str(edge["activation_committed_at"])
+                generation += 1
+
+                matching_transitions = [
+                    row for row in transitions.values()
+                    if isinstance(row, dict)
+                    and row.get("project_id") == project_id
+                    and row.get("source_task_id") == source_task
+                    and row.get("target_task_id") == target_task
+                ]
+                if len(matching_transitions) > 1:
+                    return {
+                        "status": "blocked",
+                        "reason": f"multiple lifecycle transitions exist for {source_task} -> {target_task}",
+                    }
+                if matching_transitions:
+                    transition = matching_transitions[0]
+                    transition_id = str(transition.get("transition_id") or "")
+                    existing_generation = int(transition.get("generation") or generation)
+                    if existing_generation != generation:
+                        return {
+                            "status": "blocked",
+                            "reason": (
+                                f"transition generation mismatch for {source_task} -> {target_task}: "
+                                f"{existing_generation} != {generation}"
+                            ),
+                        }
+                else:
+                    transition_id = transition_id_for(
+                        project_id, source_task, target_task, generation,
+                    )
+                    transition = {
+                        "transition_id": transition_id,
+                        "idempotency_key": transition_id,
+                        "project_id": project_id,
+                        "source_task_id": source_task,
+                        "target_task_id": target_task,
+                        "generation": generation,
+                        "recorded_at": committed_at,
+                    }
+                    transitions[transition_id] = transition
+
+                matching_handoffs = [
+                    (key, row) for key, row in executions.items()
+                    if isinstance(row, dict)
+                    and row.get("project_id") == project_id
+                    and row.get("state") == "handoff"
+                    and (row.get("source_task_id") or row.get("task_id")) == source_task
+                    and (row.get("target_task_id") or row.get("next_task_id")) == target_task
+                ]
+                if len(matching_handoffs) > 1:
+                    return {
+                        "status": "blocked",
+                        "reason": f"multiple handoffs exist for {source_task} -> {target_task}",
+                    }
+                if matching_handoffs:
+                    source_request_id, handoff = matching_handoffs[0]
+                else:
+                    source_request_id = (
+                        f"historical-handoff:{project_id}:{source_task}:{target_task}:"
+                        f"{activation_commit[:12]}"
+                    )
+                    handoff = {
+                        "project_id": project_id,
+                        "source_request_id": source_request_id,
+                        "source_kind": "historical_repository_lineage",
+                        "task_id": source_task,
+                        "source_task_id": source_task,
+                        "target_task_id": target_task,
+                        "next_task_id": target_task,
+                        "state": "handoff",
+                        "outcome": "historical_activation_reconciled",
+                        "reason": f"{trigger}: recovered durable repository task activation",
+                        "recorded_at": committed_at,
+                    }
+                    executions[source_request_id] = handoff
+
+                handoff.update({
+                    "handoff_consumed": True,
+                    "handoff_consumed_at": reconciliation_at,
+                    "lifecycle_transition_id": transition_id,
+                    "transition_generation": generation,
+                    "historical_activation_commit": activation_commit,
+                    "historical_activation_committed_at": committed_at,
+                    "historical_reconciliation": True,
+                    "successor_evidence": "git_history+roadmap",
+                    "staged_successor": target_task,
+                    "staged_spec_path": edge["successor_spec_path"],
+                    "staged_spec_sha256": edge["successor_spec_sha256"],
+                })
+                transition.update({
+                    "state": "completed",
+                    "source_request_id": source_request_id,
+                    "handoff_record": copy.deepcopy(handoff),
+                    "published_at": committed_at,
+                    "completed_at": committed_at,
+                    "updated_at": utc_now_iso(),
+                    "historical_reconciliation": True,
+                    "evidence": {
+                        "source": "historical_repository_lineage",
+                        "activation_commit": activation_commit,
+                        "activation_committed_at": committed_at,
+                        "successor_spec_path": edge["successor_spec_path"],
+                        "successor_spec_sha256": edge["successor_spec_sha256"],
+                        "trigger": trigger,
+                    },
+                })
+                applied.append({
+                    "source_task_id": source_task,
+                    "target_task_id": target_task,
+                    "activation_commit": activation_commit,
+                    "transition_id": transition_id,
+                    "source_request_id": source_request_id,
+                })
+
+            authority.update({
+                "generation": generation,
+                "source_task_id": chain[-2],
+                "current_task_id": expected_to,
+                "active_transition_id": applied[-1]["transition_id"],
+                "active_owner": None,
+                "owner_gate": None,
+                "lifecycle_state": lifecycle_state_from_snapshot(snapshot),
+                "repository_projection": {
+                    "task_id": expected_to,
+                    "state": lifecycle_state_from_snapshot(snapshot),
+                    "matches_authority": True,
+                },
+                "historical_lineage_reconciled": {
+                    "from_task_id": expected_from,
+                    "to_task_id": expected_to,
+                    "trigger": trigger,
+                    "head": truth.head,
+                    "edges": copy.deepcopy(applied),
+                    "historical_obligations_backfilled": copy.deepcopy(baseline_applied),
+                    "recorded_at": reconciliation_at,
+                },
+                "updated_at": utc_now_iso(),
+            })
+            authority["recovery_epoch_id"] = epoch_for(authority)
+            findings = evaluate_lifecycle_invariants(
+                snapshot=snapshot,
+                executor_state=ledger,
+                decisions_state=decisions_state,
+            )
+            failed = [item for item in findings if not item.holds]
+            if failed:
+                return {
+                    "status": "blocked",
+                    "reason": "historical reconciliation does not satisfy lifecycle invariants",
+                    "failed_invariants": [item.code for item in failed],
+                }
+            authority["invariants"] = invariant_payload(findings)
+            self._save_ledger(ledger)
+            return {
+                "status": "applied",
+                "project_id": project_id,
+                "from_task_id": expected_from,
+                "to_task_id": expected_to,
+                "edges_reconciled": len(applied),
+                "historical_obligations_backfilled": len(baseline_applied),
+                "head": truth.head,
+                "edges": applied,
+                "baseline_obligations": baseline_applied,
+            }
+
     def reconcile_successor_handoff(
         self,
         project: dict[str, Any],

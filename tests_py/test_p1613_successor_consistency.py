@@ -531,6 +531,355 @@ class SuccessorConsistencyFaultMatrixTests(unittest.TestCase):
             self.assertEqual(reconciled["transitions"]["bad-bootstrap"]["state"], "owner_gate")
 
 
+class HistoricalRepositoryLineageReconciliationTests(unittest.TestCase):
+    def _historical_repo(self, root: Path) -> tuple[Path, dict[str, str]]:
+        repo = root / "repo"
+        (repo / "agent" / "staged").mkdir(parents=True)
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        _git(repo, "config", "user.email", "test@example.com")
+        _git(repo, "config", "user.name", "Test")
+        chain = ["P1", "P2", "P3", "P4"]
+        tasks = []
+        for idx, task in enumerate(chain):
+            successor = chain[idx + 1] if idx + 1 < len(chain) else None
+            tasks.append({
+                "task_id": task,
+                "successor": successor,
+                "successor_spec_path": (
+                    f"agent/staged/{successor}.md" if successor else None
+                ),
+            })
+            if task != "P1":
+                (repo / "agent" / "staged" / f"{task}.md").write_text(
+                    f"# {task} task\n\nStatus: **PENDING DESIGN**\n",
+                    encoding="utf-8",
+                )
+        (repo / "agent" / "staged" / "roadmap.json").write_text(
+            json.dumps({"schema_version": 1, "tasks": tasks}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (repo / "agent" / "next.md").write_text(
+            "# P1 task\n\nStatus: **COMPLETE**\n", encoding="utf-8",
+        )
+        (repo / "agent" / "execution-state.json").write_text(
+            json.dumps({
+                "schema_version": 1, "execution_state": "ready_to_run",
+                "task_id": "P1",
+            }, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        _commit(repo, "fixture P1")
+        commits: dict[str, str] = {}
+        for source, target in zip(chain, chain[1:]):
+            (repo / "agent" / "next.md").write_text(
+                f"# {target} task\n\nStatus: **PENDING DESIGN**\n",
+                encoding="utf-8",
+            )
+            (repo / "agent" / "execution-state.json").write_text(
+                json.dumps({
+                    "schema_version": 1, "execution_state": "ready_to_run",
+                    "task_id": target,
+                }, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            commits[target] = _commit(repo, f"activate {source} -> {target}")
+        return repo, commits
+
+    @staticmethod
+    def _accepted_next(task_id: str, stamp: str) -> dict:
+        request_id = f"review-next-{task_id}"
+        return {
+            "request_id": request_id,
+            "project_id": "p1",
+            "task_id": task_id,
+            "disposition": "apply",
+            "decision": "next",
+            "next_action": "next_task",
+            "created_at": stamp,
+        }
+
+    def test_historical_git_lineage_reconciles_multi_hop_authority_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, commits = self._historical_repo(root)
+            runtime = root / "runtime"
+            executor = TransitionExecutor(runtime)
+            ledger = executor.state()
+            ledger["lifecycle"]["p1"] = {
+                "schema_version": 1,
+                "project_id": "p1",
+                "generation": 0,
+                "current_task_id": "P1",
+                "source_task_id": "P1",
+                "lifecycle_state": "OWNER_GATE",
+                "active_transition_id": None,
+                "active_owner": None,
+                "owner_gate": {
+                    "code": "NEXT_TASK_WITHOUT_HANDOFF",
+                    "reason": "historical runtime lineage missing",
+                },
+            }
+            executor._save_ledger(ledger)
+            decisions = {
+                "decisions": {
+                    f"review-next-{task}": self._accepted_next(
+                        task, "2020-01-01T00:00:00+00:00"
+                    )
+                    for task in ("P1", "P2", "P3")
+                }
+            }
+            (runtime / "review-decisions.json").write_text(
+                json.dumps(decisions), encoding="utf-8",
+            )
+            snapshot = _summary(repo, "P4")["projects"][0]
+            project = {"project_id": "p1", "repo_path": str(repo)}
+
+            outcome = executor.reconcile_historical_repository_lineage(
+                project,
+                snapshot,
+                expected_from_task_id="P1",
+                expected_to_task_id="P4",
+                trigger="owner-approved test reconciliation",
+            )
+            self.assertEqual(outcome["status"], "applied", outcome)
+            self.assertEqual(outcome["edges_reconciled"], 3)
+
+            state = executor.state()
+            authority = state["lifecycle"]["p1"]
+            self.assertEqual(authority["current_task_id"], "P4")
+            self.assertIsNone(authority["owner_gate"])
+            self.assertIsNone(authority["active_owner"])
+            self.assertEqual(
+                authority["historical_lineage_reconciled"]["from_task_id"], "P1",
+            )
+            self.assertEqual(
+                authority["historical_lineage_reconciled"]["to_task_id"], "P4",
+            )
+            handoffs = [
+                row for row in state["executions"].values()
+                if isinstance(row, dict)
+                and row.get("source_kind") == "historical_repository_lineage"
+            ]
+            self.assertEqual(len(handoffs), 3)
+            self.assertTrue(all(row.get("handoff_consumed") is True for row in handoffs))
+            self.assertEqual(
+                [row["historical_activation_commit"] for row in handoffs],
+                [commits["P2"], commits["P3"], commits["P4"]],
+            )
+            findings = {
+                row.code: row for row in evaluate_lifecycle_invariants(
+                    snapshot=snapshot,
+                    executor_state=state,
+                    decisions_state=decisions,
+                )
+            }
+            self.assertTrue(findings["NEXT_TASK_WITHOUT_HANDOFF"].holds)
+            self.assertTrue(all(row.holds for row in findings.values()))
+
+            restarted = TransitionExecutor(runtime)
+            replay = restarted.reconcile_historical_repository_lineage(
+                project,
+                snapshot,
+                expected_from_task_id="P1",
+                expected_to_task_id="P4",
+                trigger="replay",
+            )
+            self.assertEqual(replay["status"], "noop")
+            replay_state = restarted.state()
+            replay_handoffs = [
+                row for row in replay_state["executions"].values()
+                if isinstance(row, dict)
+                and row.get("source_kind") == "historical_repository_lineage"
+            ]
+            self.assertEqual(len(replay_handoffs), 3)
+
+    def test_historical_git_lineage_backfills_pre_authority_next_obligation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, commits = self._historical_repo(root)
+            runtime = root / "runtime"
+            executor = TransitionExecutor(runtime)
+            ledger = executor.state()
+            ledger["lifecycle"]["p1"] = {
+                "schema_version": 1,
+                "project_id": "p1",
+                "generation": 0,
+                "current_task_id": "P2",
+                "source_task_id": "P1",
+                "lifecycle_state": "OWNER_GATE",
+                "active_transition_id": None,
+                "active_owner": None,
+                "owner_gate": {
+                    "code": "NEXT_TASK_WITHOUT_HANDOFF",
+                    "reason": "legacy decision evidence was lost",
+                },
+            }
+            executor._save_ledger(ledger)
+            decisions = {
+                "decisions": {
+                    f"review-next-{task}": self._accepted_next(
+                        task, "2020-01-01T00:00:00+00:00"
+                    )
+                    for task in ("P1", "P2", "P3")
+                }
+            }
+            (runtime / "review-decisions.json").write_text(
+                json.dumps(decisions), encoding="utf-8",
+            )
+
+            outcome = executor.reconcile_historical_repository_lineage(
+                {"project_id": "p1", "repo_path": str(repo)},
+                _summary(repo, "P4")["projects"][0],
+                expected_from_task_id="P2",
+                expected_to_task_id="P4",
+                trigger="backfill pre-authority obligation",
+            )
+            self.assertEqual(outcome["status"], "applied", outcome)
+            self.assertEqual(outcome["edges_reconciled"], 2)
+            self.assertEqual(outcome["historical_obligations_backfilled"], 1)
+
+            state = executor.state()
+            authority = state["lifecycle"]["p1"]
+            self.assertEqual(authority["current_task_id"], "P4")
+            self.assertEqual(authority["generation"], 2)
+            baseline = [
+                row for row in state["executions"].values()
+                if isinstance(row, dict)
+                and row.get("historical_authority_baseline") is True
+            ]
+            self.assertEqual(len(baseline), 1)
+            self.assertEqual(
+                (baseline[0]["source_task_id"], baseline[0]["target_task_id"]),
+                ("P1", "P2"),
+            )
+            self.assertEqual(
+                baseline[0]["historical_activation_commit"], commits["P2"],
+            )
+            self.assertNotEqual(
+                baseline[0]["handoff_consumed_at"],
+                baseline[0]["historical_activation_committed_at"],
+            )
+            findings = {
+                row.code: row for row in evaluate_lifecycle_invariants(
+                    snapshot=_summary(repo, "P4")["projects"][0],
+                    executor_state=state,
+                    decisions_state=decisions,
+                )
+            }
+            self.assertTrue(findings["NEXT_TASK_WITHOUT_HANDOFF"].holds)
+            self.assertTrue(all(row.holds for row in findings.values()))
+
+    def test_historical_git_lineage_reuses_existing_ready_first_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, commits = self._historical_repo(root)
+            runtime = root / "runtime"
+            executor = TransitionExecutor(runtime)
+            ledger = executor.state()
+            transition_id = "existing-p1-p2"
+            source_id = "recover-handoff:p1:P1:P2"
+            ledger["lifecycle"]["p1"] = {
+                "schema_version": 1,
+                "project_id": "p1",
+                "generation": 0,
+                "current_task_id": "P1",
+                "source_task_id": "P1",
+                "lifecycle_state": "OWNER_GATE",
+                "active_transition_id": transition_id,
+                "active_owner": None,
+                "owner_gate": {
+                    "code": "CURRENT_TASK_MATCHES_ACTIVE_EXECUTION",
+                    "reason": "repository task changed without an authoritative transition",
+                },
+            }
+            ledger["executions"][source_id] = {
+                "project_id": "p1",
+                "source_request_id": source_id,
+                "source_kind": "decision",
+                "task_id": "P1",
+                "source_task_id": "P1",
+                "target_task_id": "P2",
+                "next_task_id": "P2",
+                "state": "handoff",
+                "outcome": "planning_required",
+                "recorded_at": "2020-01-01T00:00:00+00:00",
+                "lifecycle_transition_id": transition_id,
+                "transition_generation": 1,
+            }
+            ledger["transitions"][transition_id] = {
+                "transition_id": transition_id,
+                "idempotency_key": transition_id,
+                "project_id": "p1",
+                "source_request_id": source_id,
+                "source_task_id": "P1",
+                "target_task_id": "P2",
+                "generation": 1,
+                "state": "ready",
+                "recorded_at": "2020-01-01T00:00:00+00:00",
+            }
+            executor._save_ledger(ledger)
+
+            outcome = executor.reconcile_historical_repository_lineage(
+                {"project_id": "p1", "repo_path": str(repo)},
+                _summary(repo, "P4")["projects"][0],
+                expected_from_task_id="P1",
+                expected_to_task_id="P4",
+                trigger="reuse existing handoff",
+            )
+            self.assertEqual(outcome["status"], "applied", outcome)
+            state = executor.state()
+            self.assertEqual(
+                len([
+                    row for row in state["executions"].values()
+                    if isinstance(row, dict)
+                    and (row.get("source_task_id") or row.get("task_id")) == "P1"
+                    and (row.get("target_task_id") or row.get("next_task_id")) == "P2"
+                    and row.get("state") == "handoff"
+                ]),
+                1,
+            )
+            first = state["executions"][source_id]
+            self.assertTrue(first["handoff_consumed"])
+            self.assertTrue(first["historical_reconciliation"])
+            self.assertEqual(first["historical_activation_commit"], commits["P2"])
+            self.assertEqual(state["transitions"][transition_id]["state"], "completed")
+
+    def test_historical_git_lineage_refuses_active_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, _ = self._historical_repo(root)
+            runtime = root / "runtime"
+            executor = TransitionExecutor(runtime)
+            ledger = executor.state()
+            ledger["lifecycle"]["p1"] = {
+                "schema_version": 1,
+                "project_id": "p1",
+                "generation": 0,
+                "current_task_id": "P1",
+                "source_task_id": "P1",
+                "lifecycle_state": "EXECUTING",
+                "active_transition_id": None,
+                "active_owner": {"role": "worker", "id": "run-1", "task_id": "P1"},
+                "owner_gate": None,
+            }
+            ledger["executions"]["run-1"] = {
+                "project_id": "p1",
+                "source_request_id": "run-1",
+                "task_id": "P1",
+                "state": "running",
+            }
+            executor._save_ledger(ledger)
+            outcome = executor.reconcile_historical_repository_lineage(
+                {"project_id": "p1", "repo_path": str(repo)},
+                _summary(repo, "P4")["projects"][0],
+                expected_from_task_id="P1",
+                expected_to_task_id="P4",
+                trigger="must fail closed",
+            )
+            self.assertEqual(outcome["status"], "blocked")
+            self.assertIn("active", outcome["reason"].lower())
+
+
 class _StalePredecessorExecutor:
     """Authority owns the successor while a stale predecessor run still projects.
 
