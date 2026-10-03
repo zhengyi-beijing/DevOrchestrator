@@ -62,6 +62,12 @@ class WebBridgeRequestStoreUnitTests(unittest.TestCase):
         self.assertEqual(h1, h2)
         self.assertTrue(h1.startswith("sha256:"))
 
+        # Freshness metadata is validated separately and must not change
+        # semantic idempotency identity.
+        retry = dict(canonical)
+        retry["issued_at"] = datetime.now(timezone.utc).isoformat()
+        self.assertEqual(h1, web_bridge_request_hash(retry))
+
         # Unknown field rejected
         with self.assertRaisesRegex(ValueError, "unknown WebBridge request fields"):
             invalid = dict(req)
@@ -110,8 +116,16 @@ class WebBridgeRequestStoreUnitTests(unittest.TestCase):
             self.assertEqual(res1, res2)
             self.assertEqual(client.status.call_count, 1)
 
-            # Replay conflict: same request_id with altered operation
-            conflict_req = dict(req)
+            # A retry may carry a new, still-fresh transport timestamp.
+            # It must replay the cached response rather than conflict/re-execute.
+            refreshed_req = dict(req)
+            refreshed_req["issued_at"] = datetime.now(timezone.utc).isoformat()
+            res3 = store.handle_request(refreshed_req, client)
+            self.assertEqual(res1, res3)
+            self.assertEqual(client.status.call_count, 1)
+
+            # Replay conflict: same request_id with altered semantic operation.
+            conflict_req = dict(refreshed_req)
             conflict_req["operation"] = "logs"
             with self.assertRaises(WebBridgeConflictError):
                 store.handle_request(conflict_req, client)

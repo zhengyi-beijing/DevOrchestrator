@@ -54,6 +54,12 @@ EFFECTFUL_ACTIONS = frozenset({
 
 ALL_ACTIONS = READ_ONLY_ACTIONS | EFFECTFUL_ACTIONS
 
+# P19.3 read-only browser slice.  Legacy BrowserControlService actions remain
+# available to owner-authenticated 8770 callers, but the 8765 ChatGPT adapter
+# surface accepts only this closed action and translates it to the existing
+# WebBridge contract.
+BROWSER_BRIDGE_READ_ONLY_ACTIONS = frozenset({"get_project_status"})
+
 _ACTION_ENVELOPE_RE = re.compile(
     r"(?:\[DEVORCH_ACTION_V1\]?|```(?:devorch_action|json:devorch_action|action))\s*(\{[\s\S]*?\})\s*(?:\[/DEVORCH_ACTION_V1\]|\]|```)",
     re.IGNORECASE,
@@ -191,6 +197,51 @@ def validate_action_envelope(data: dict[str, Any]) -> dict[str, Any]:
         "parameters": parameters,
         "confirmed": confirmed,
         "binding_id": binding_id,
+    }
+
+
+def to_web_bridge_request(data: dict[str, Any]) -> dict[str, Any]:
+    """Translate the closed P19.3 browser envelope to the existing WebBridge schema."""
+    if not isinstance(data, dict):
+        raise BrowserControlError(400, "Bad Request", "Action envelope must be a JSON object")
+    allowed = {"protocol", "request_id", "action", "project_id", "parameters", "binding", "issued_at"}
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise BrowserControlError(400, "Bad Request", f"unknown action fields: {', '.join(unknown)}")
+    if data.get("protocol") != PROTOCOL_VERSION:
+        raise BrowserControlError(400, "Bad Request", f"unsupported protocol: expected {PROTOCOL_VERSION!r}")
+    request_id = data.get("request_id")
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise BrowserControlError(400, "Bad Request", "request_id must be a non-empty string")
+    action = data.get("action")
+    if action not in BROWSER_BRIDGE_READ_ONLY_ACTIONS:
+        raise BrowserControlError(400, "Bad Request", f"unsupported browser action: {action!r}")
+    project_id = data.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise BrowserControlError(400, "Bad Request", "project_id must be a non-empty string")
+    parameters = data.get("parameters", {})
+    if not isinstance(parameters, dict) or parameters:
+        raise BrowserControlError(400, "Bad Request", "get_project_status parameters must be an empty object")
+    binding = data.get("binding")
+    if not isinstance(binding, dict) or set(binding) - {"adapter", "binding_id"}:
+        raise BrowserControlError(400, "Bad Request", "binding must contain only adapter and binding_id")
+    if binding.get("adapter") != "chatgpt_web":
+        raise BrowserControlError(400, "Bad Request", "binding.adapter must be 'chatgpt_web'")
+    binding_id = binding.get("binding_id")
+    if not isinstance(binding_id, str) or not binding_id.strip():
+        raise BrowserControlError(400, "Bad Request", "binding.binding_id must be a non-empty string")
+    issued_at = data.get("issued_at")
+    if not isinstance(issued_at, str) or parse_utc(issued_at) is None:
+        raise BrowserControlError(400, "Bad Request", "issued_at must be a valid UTC timestamp")
+    return {
+        "schema_version": 1,
+        "adapter_request_id": request_id.strip(),
+        "operation": "project_status",
+        "issued_at": issued_at,
+        "binding": {"adapter": "chatgpt_web", "binding_id": binding_id.strip()},
+        "project_id": project_id.strip(),
+        "expected_revision": None,
+        "payload": {},
     }
 
 

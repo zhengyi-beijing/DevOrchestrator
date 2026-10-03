@@ -21,7 +21,7 @@ from dev_orchestrator.control.logs import redact_secrets
 from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
 
 WEB_BRIDGE_SCHEMA_VERSION = 1
-WEB_BRIDGE_OPERATIONS = frozenset({"status", "logs", "submit_control", "command_status"})
+WEB_BRIDGE_OPERATIONS = frozenset({"status", "project_status", "logs", "submit_control", "command_status"})
 DEFAULT_FRESHNESS_WINDOW_SECONDS = 300.0  # 5 minutes
 
 
@@ -109,8 +109,16 @@ def canonical_web_bridge_request(req: dict[str, Any]) -> dict[str, Any]:
 
 
 def web_bridge_request_hash(canonical_req: dict[str, Any]) -> str:
-    """Deterministic hash of canonical WebBridge request."""
-    raw = json.dumps(canonical_req, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Hash semantic WebBridge request fields for durable idempotency.
+
+    issued_at is transport freshness metadata, not request semantics. It is
+    validated on every attempt before replay lookup, but excluding it here lets
+    a fresh retry of the same adapter_request_id return the cached response
+    instead of conflicting solely because the retry timestamp changed.
+    """
+    semantic = dict(canonical_req)
+    semantic.pop("issued_at", None)
+    raw = json.dumps(semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -195,6 +203,8 @@ class WebBridgeRequestStore:
 
             if op == "status":
                 result = client.status(proj_id)
+            elif op == "project_status":
+                result = client.project_status(proj_id)
             elif op == "logs":
                 result = client.logs(
                     project_id=proj_id,

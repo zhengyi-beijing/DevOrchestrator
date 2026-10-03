@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DevOrchestrator ChatGPT Web binding adapter
 // @namespace    devorchestrator
-// @version      0.1.15
-// @description  Dumb ChatGPT Web adapter for the DevOrchestrator browser bridge plus paired 8770 conversation-presence heartbeat.
+// @version      0.1.26
+// @description  Dumb ChatGPT Web adapter for bound read-only DevOrchestrator status plus paired 8770 conversation-presence heartbeat.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
 // @grant        GM_xmlhttpRequest
@@ -42,17 +42,35 @@
   var TAB_INSTANCE_STORAGE_KEY = "devorch:control:tab-instance";
   var LAST_URGENT_NOTIFICATION_KEY = "devorch:progress:last-urgent";
   var BROWSER_CONTROL_ACTION_PATH = "/v1/control/action";
+  var BROWSER_CONTROL_BOOTSTRAP_PATH = "/api/v1/control/web-bridge/bootstrap/redeem";
   var BROWSER_CONTROL_TOKEN_STORAGE_KEY = "devorch:control:browser-control-capability";
   var BROWSER_CONTROL_PROCESSED_STORAGE_KEY = "devorch:control:processed-actions";
+  var BROWSER_CONTROL_PENDING_RESULT_STORAGE_KEY = "devorch:control:pending-results";
+  var BROWSER_CONTROL_ISSUED_AT_STORAGE_KEY = "devorch:control:issued-at";
+  var BROWSER_CONTROL_PENDING_MAX_ITEMS = 20;
+  var BROWSER_CONTROL_PENDING_MAX_CHARS = 128 * 1024;
   var DEVORCH_ACTION_V1 = "DEVORCH_ACTION_V1";
   var DEVORCH_ACTION_RESULT_V1 = "DEVORCH_ACTION_RESULT_V1";
-  var READ_ONLY_ACTIONS = ["status", "job_status", "read_log", "read_file", "commands_catalog"];
-  var EFFECTFUL_ACTIONS = ["start_task", "cancel_job"];
+  var READ_ONLY_ACTIONS = ["get_project_status"];
+  var EFFECTFUL_ACTIONS = [];
+  var ROLELESS_ACTION_TAIL_MAX_CHARS = 32 * 1024;
   var ACTION_ENVELOPE_RE = /(?:\[DEVORCH_ACTION_V1\]?|```(?:devorch_action|json:devorch_action|action))\s*(\{[\s\S]*?\})\s*(?:\[\/DEVORCH_ACTION_V1\]|\]|```)/i;
   var FALLBACK_ACTION_RE = /DEVORCH_ACTION_V1\s*(\{[\s\S]*?\})/i;
   var ACTION_RESULT_HEAD = "[DEVORCH_ACTION_RESULT_V1 ";
   var CONTROL_HEARTBEAT_MS = 15000;
   var controlHeartbeatTimer = null;
+  var browserControlBootstrapPromise = null;
+  var lastActionScanTelemetry = null;
+  var rolelessFallbackCandidateCount = 0;
+  var rolelessFallbackDispatchCount = 0;
+  var lastRolelessFallbackRequestId = null;
+  var resultSubmitAttemptCount = 0;
+  var resultComposerFoundCount = 0;
+  var resultComposerPreparedCount = 0;
+  var resultSendClickCount = 0;
+  var resultConfirmSuccessCount = 0;
+  var lastResultSubmitRequestId = null;
+  var lastResultSubmitStage = "idle";
   var POLL_MS = 1500;
   var RENEW_INTERVAL_MS = 20000;
   var WAIT_DEADLINE_MS = 15 * 60 * 1000;
@@ -358,9 +376,24 @@
 
   function validateActionEnvelope(data) {
     if (!data || typeof data !== "object") { return null; }
+    var allowedFields = ["protocol", "request_id", "action", "project_id", "parameters", "binding", "issued_at"];
+    var dataKeys = Object.keys(data);
+    for (var i = 0; i < dataKeys.length; i++) {
+      if (allowedFields.indexOf(dataKeys[i]) === -1) { return null; }
+    }
     if (data.protocol !== DEVORCH_ACTION_V1) { return null; }
     if (typeof data.request_id !== "string" || !data.request_id.trim()) { return null; }
     if (typeof data.action !== "string" || !data.action.trim()) { return null; }
+    if (typeof data.project_id !== "string" || !data.project_id.trim()) { return null; }
+    if (!data.parameters || typeof data.parameters !== "object" || Array.isArray(data.parameters) || Object.keys(data.parameters).length !== 0) {
+      return null;
+    }
+    if (data.binding !== undefined && data.binding !== null) {
+      if (typeof data.binding !== "object" || Array.isArray(data.binding)) { return null; }
+      var bindingKeys = Object.keys(data.binding);
+      if (bindingKeys.some(function (key) { return ["adapter", "binding_id"].indexOf(key) === -1; })) { return null; }
+      if (data.binding.adapter !== ADAPTER_ID || typeof data.binding.binding_id !== "string" || !data.binding.binding_id.trim()) { return null; }
+    }
     var action = data.action.trim().toLowerCase();
     if (READ_ONLY_ACTIONS.indexOf(action) === -1 && EFFECTFUL_ACTIONS.indexOf(action) === -1) {
       return null;
@@ -369,9 +402,11 @@
       protocol: DEVORCH_ACTION_V1,
       request_id: data.request_id.trim(),
       action: action,
-      project_id: (typeof data.project_id === "string" && data.project_id.trim()) ? data.project_id.trim() : "devorchestrator",
-      parameters: (data.parameters && typeof data.parameters === "object") ? data.parameters : {},
-      confirmed: Boolean(data.confirmed)
+      project_id: data.project_id.trim(),
+      parameters: {},
+      binding: (data.binding && typeof data.binding === "object") ? data.binding : null,
+      issued_at: (typeof data.issued_at === "string") ? data.issued_at : "",
+      confirmed: false
     };
   }
 
@@ -403,6 +438,62 @@
     return null;
   }
 
+  function updateRolelessFallbackTelemetry() {
+    if (!lastActionScanTelemetry) { return; }
+    lastActionScanTelemetry.roleless_fallback_candidate_count = rolelessFallbackCandidateCount;
+    lastActionScanTelemetry.roleless_fallback_dispatch_count = rolelessFallbackDispatchCount;
+    lastActionScanTelemetry.last_roleless_fallback_request_id = lastRolelessFallbackRequestId;
+  }
+
+  function updateResultSubmitTelemetry() {
+    if (!lastActionScanTelemetry) { return; }
+    lastActionScanTelemetry.result_submit_attempt_count = resultSubmitAttemptCount;
+    lastActionScanTelemetry.result_composer_found_count = resultComposerFoundCount;
+    lastActionScanTelemetry.result_composer_prepared_count = resultComposerPreparedCount;
+    lastActionScanTelemetry.result_send_click_count = resultSendClickCount;
+    lastActionScanTelemetry.result_confirm_success_count = resultConfirmSuccessCount;
+    lastActionScanTelemetry.last_result_submit_request_id = lastResultSubmitRequestId;
+    lastActionScanTelemetry.last_result_submit_stage = lastResultSubmitStage;
+  }
+
+  function findRolelessReadOnlyActionCandidate() {
+    if (typeof document === "undefined" || !currentBindingId() || !document.body
+        || typeof document.body.innerText !== "string") {
+      return null;
+    }
+    var bodyText = document.body.innerText;
+    var openMarker = "[" + DEVORCH_ACTION_V1 + "]";
+    var closeMarker = "[/" + DEVORCH_ACTION_V1 + "]";
+    var markerIndex = bodyText.lastIndexOf(openMarker);
+    if (markerIndex === -1) { return null; }
+
+    var boundedTail = bodyText.slice(markerIndex, markerIndex + ROLELESS_ACTION_TAIL_MAX_CHARS);
+    var closeIndex = boundedTail.indexOf(closeMarker);
+    if (closeIndex === -1) { return null; }
+    var bracketedEnvelope = boundedTail.slice(0, closeIndex + closeMarker.length);
+
+    // document.body.innerText has no trustworthy author provenance and may
+    // include user/composer self-injection. This fallback is intentionally
+    // safe only because it is hard-gated to READ_ONLY_ACTIONS. Never broaden
+    // this path to mutations or effectful confirmation flows.
+    try {
+      var composer = findComposer();
+      var composerText = composer && typeof composer.innerText === "string"
+        ? composer.innerText
+        : (composer && typeof composer.textContent === "string" ? composer.textContent : "");
+      if (composerText && composerText.indexOf(bracketedEnvelope) !== -1) { return null; }
+    } catch (e) {}
+
+    var envelope = parseActionEnvelope(bracketedEnvelope);
+    if (!envelope || !envelope.request_id || !isReadOnlyAction(envelope.action)) {
+      return null;
+    }
+    rolelessFallbackCandidateCount = Math.min(rolelessFallbackCandidateCount + 1, 10000);
+    lastRolelessFallbackRequestId = envelope.request_id.slice(0, 128);
+    updateRolelessFallbackTelemetry();
+    return envelope;
+  }
+
   function formatActionResult(requestId, status, dataOrError) {
     var payload = {
       protocol: DEVORCH_ACTION_RESULT_V1,
@@ -425,10 +516,14 @@
     return "[" + DEVORCH_ACTION_RESULT_V1 + " " + requestId + "]\n" + JSON.stringify(payload, null, 2) + "\n[/" + DEVORCH_ACTION_RESULT_V1 + "]";
   }
 
-  function getProcessedActions() {
+  function processedActionsStorageKey(bindingId) {
+    return BROWSER_CONTROL_PROCESSED_STORAGE_KEY + ":" + (bindingId || currentBindingId() || "unbound");
+  }
+
+  function getProcessedActions(bindingId) {
     try {
       if (typeof sessionStorage !== "undefined") {
-        var raw = sessionStorage.getItem(BROWSER_CONTROL_PROCESSED_STORAGE_KEY);
+        var raw = sessionStorage.getItem(processedActionsStorageKey(bindingId));
         if (raw) {
           var arr = JSON.parse(raw);
           if (Array.isArray(arr)) { return arr; }
@@ -438,24 +533,158 @@
     return [];
   }
 
-  function isActionProcessed(requestId) {
+  function isActionProcessed(requestId, bindingId) {
     if (!requestId) { return true; }
-    var list = getProcessedActions();
+    var list = getProcessedActions(bindingId);
     return list.indexOf(requestId) !== -1;
   }
 
-  function markActionProcessed(requestId) {
+  function markActionProcessed(requestId, bindingId) {
     if (!requestId) { return; }
     try {
       if (typeof sessionStorage !== "undefined") {
-        var list = getProcessedActions();
+        var list = getProcessedActions(bindingId);
         if (list.indexOf(requestId) === -1) {
           list.push(requestId);
           if (list.length > 200) { list.shift(); }
-          sessionStorage.setItem(BROWSER_CONTROL_PROCESSED_STORAGE_KEY, JSON.stringify(list));
+          sessionStorage.setItem(processedActionsStorageKey(bindingId), JSON.stringify(list));
         }
       }
     } catch (e) {}
+    clearPendingActionResult(requestId, bindingId);
+    clearStableIssuedAt(requestId, bindingId);
+  }
+
+  function actionScopedStorageKey(baseKey, bindingId) {
+    return baseKey + ":" + (bindingId || currentBindingId() || "unbound");
+  }
+
+  function readActionMap(baseKey, bindingId) {
+    try {
+      if (typeof sessionStorage === "undefined") { return {}; }
+      var raw = sessionStorage.getItem(actionScopedStorageKey(baseKey, bindingId));
+      if (!raw) { return {}; }
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function writeActionMap(baseKey, bindingId, value) {
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        sessionStorage.setItem(actionScopedStorageKey(baseKey, bindingId), JSON.stringify(value || {}));
+      }
+    } catch (e) {}
+  }
+
+  // Browser-control retries must be coherent across duplicate ChatGPT tabs.
+  // GM storage is private to this userscript and shared across its tabs, unlike
+  // sessionStorage. Only bounded request metadata / formatted read-only results
+  // live here; bearer capabilities remain in their existing dedicated key.
+  function readSharedActionMap(baseKey, bindingId) {
+    var key = actionScopedStorageKey(baseKey, bindingId);
+    try {
+      if (typeof GM_getValue === "function") {
+        var raw = GM_getValue(key, "");
+        if (typeof raw === "string" && raw) {
+          var parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return parsed;
+          }
+        }
+      }
+    } catch (e) {}
+    return readActionMap(baseKey, bindingId);
+  }
+
+  function writeSharedActionMap(baseKey, bindingId, value) {
+    var normalized = value || {};
+    var key = actionScopedStorageKey(baseKey, bindingId);
+    try {
+      if (typeof GM_setValue === "function") {
+        GM_setValue(key, JSON.stringify(normalized));
+      }
+    } catch (e) {}
+    writeActionMap(baseKey, bindingId, normalized);
+  }
+
+  function stableIssuedAtForAction(actionPayload, bindingId) {
+    var supplied = actionPayload && typeof actionPayload.issued_at === "string"
+      ? actionPayload.issued_at.trim()
+      : "";
+    if (supplied) { return supplied; }
+    var requestId = actionPayload && typeof actionPayload.request_id === "string"
+      ? actionPayload.request_id.trim()
+      : "";
+    if (!requestId) { return new Date().toISOString(); }
+
+    var entries = readSharedActionMap(BROWSER_CONTROL_ISSUED_AT_STORAGE_KEY, bindingId);
+    if (typeof entries[requestId] === "string" && entries[requestId]) {
+      return entries[requestId];
+    }
+    var issuedAt = new Date().toISOString();
+    entries[requestId] = issuedAt;
+    var keys = Object.keys(entries);
+    while (keys.length > 200) {
+      delete entries[keys.shift()];
+    }
+    writeSharedActionMap(BROWSER_CONTROL_ISSUED_AT_STORAGE_KEY, bindingId, entries);
+    return issuedAt;
+  }
+
+  function clearStableIssuedAt(requestId, bindingId) {
+    if (!requestId) { return; }
+    var entries = readSharedActionMap(BROWSER_CONTROL_ISSUED_AT_STORAGE_KEY, bindingId);
+    if (Object.prototype.hasOwnProperty.call(entries, requestId)) {
+      delete entries[requestId];
+      writeSharedActionMap(BROWSER_CONTROL_ISSUED_AT_STORAGE_KEY, bindingId, entries);
+    }
+  }
+
+  function pendingActionResult(requestId, bindingId) {
+    if (!requestId) { return null; }
+    var entries = readSharedActionMap(BROWSER_CONTROL_PENDING_RESULT_STORAGE_KEY, bindingId);
+    var entry = entries[requestId];
+    if (!entry || typeof entry.text !== "string" || !entry.text
+        || entry.text.length > BROWSER_CONTROL_PENDING_MAX_CHARS) {
+      return null;
+    }
+    return entry.text;
+  }
+
+  function savePendingActionResult(requestId, bindingId, resultText) {
+    if (!requestId || typeof resultText !== "string" || !resultText
+        || resultText.length > BROWSER_CONTROL_PENDING_MAX_CHARS) {
+      return false;
+    }
+    var entries = readSharedActionMap(BROWSER_CONTROL_PENDING_RESULT_STORAGE_KEY, bindingId);
+    entries[requestId] = { text: resultText, saved_at: new Date().toISOString() };
+    var keys = Object.keys(entries);
+    while (keys.length > BROWSER_CONTROL_PENDING_MAX_ITEMS) {
+      delete entries[keys.shift()];
+    }
+    writeSharedActionMap(BROWSER_CONTROL_PENDING_RESULT_STORAGE_KEY, bindingId, entries);
+    return true;
+  }
+
+  function clearPendingActionResult(requestId, bindingId) {
+    if (!requestId) { return; }
+    var entries = readSharedActionMap(BROWSER_CONTROL_PENDING_RESULT_STORAGE_KEY, bindingId);
+    if (Object.prototype.hasOwnProperty.call(entries, requestId)) {
+      delete entries[requestId];
+      writeSharedActionMap(BROWSER_CONTROL_PENDING_RESULT_STORAGE_KEY, bindingId, entries);
+    }
+  }
+
+  function submitPendingActionResult(requestId, bindingId) {
+    var pending = pendingActionResult(requestId, bindingId);
+    if (!pending) { return Promise.resolve(false); }
+    return submitActionResult(pending, requestId).then(function (submitted) {
+      if (submitted) { markActionProcessed(requestId, bindingId); }
+      return submitted;
+    });
   }
 
   function isActionResultInConversation(requestId) {
@@ -467,7 +696,14 @@
         return true;
       }
     }
-    return false;
+    if (messages.length !== 0 || !document.body || typeof document.body.innerText !== "string"
+        || document.body.innerText.indexOf(marker) === -1) {
+      return false;
+    }
+    var composer = findComposer();
+    if (!composer) { return false; }
+    var composerText = composer.innerText || composer.textContent || "";
+    return composerText.indexOf(marker) === -1;
   }
 
   function classifyHeartbeatResult(result) {
@@ -744,6 +980,7 @@
     shouldRemoteSyncReload: shouldRemoteSyncReload,
     isStopComposerButton: isStopComposerButton,
     findSendButton: findSendButton,
+    clickSendButton: clickSendButton,
     showProgressToast: showProgressToast,
     showUrgentProgressAlert: showUrgentProgressAlert,
     handleProgressNotification: handleProgressNotification,
@@ -761,6 +998,7 @@
     updateAdapterStatusDemoting: updateAdapterStatusDemoting,
     sendControlHeartbeat: sendControlHeartbeat,
     redeemControlPairing: redeemControlPairing,
+    redeemBrowserControlBootstrap: redeemBrowserControlBootstrap,
     parseActionEnvelope: parseActionEnvelope,
     validateActionEnvelope: validateActionEnvelope,
     formatActionResult: formatActionResult,
@@ -771,10 +1009,19 @@
     clearBrowserControlToken: clearBrowserControlToken,
     isActionProcessed: isActionProcessed,
     markActionProcessed: markActionProcessed,
+    stableIssuedAtForAction: stableIssuedAtForAction,
+    pendingActionResult: pendingActionResult,
+    savePendingActionResult: savePendingActionResult,
+    clearPendingActionResult: clearPendingActionResult,
+    submitPendingActionResult: submitPendingActionResult,
     isActionResultInConversation: isActionResultInConversation,
+    findComposer: findComposer,
+    findRolelessReadOnlyActionCandidate: findRolelessReadOnlyActionCandidate,
     dispatchBrowserControlAction: dispatchBrowserControlAction,
     showEffectfulConfirmationModal: showEffectfulConfirmationModal,
     submitActionResult: submitActionResult,
+    handleActionResult: handleActionResult,
+    collectActionScanTelemetry: collectActionScanTelemetry,
     scanAndProcessBrowserActions: scanAndProcessBrowserActions
   };
 
@@ -866,6 +1113,58 @@
     });
   }
 
+  function redeemBrowserControlBootstrap(projectId, bindingId, heartbeatCapability) {
+    if (
+      typeof projectId !== "string" || !projectId.trim() ||
+      typeof bindingId !== "string" || !bindingId.trim() ||
+      typeof heartbeatCapability !== "string" || !heartbeatCapability.trim()
+    ) {
+      return Promise.resolve(false);
+    }
+    if (browserControlBootstrapPromise) { return browserControlBootstrapPromise; }
+
+    browserControlBootstrapPromise = new Promise(function (resolve) {
+      var settled = false;
+      function finish(status, responseText) {
+        if (settled) { return; }
+        settled = true;
+        var body = parsedJsonText({ status: status, text: responseText });
+        var token = body && body.data && body.data.token;
+        if (status === 200 && typeof token === "string" && token.trim()) {
+          saveBrowserControlToken(token);
+          resolve(true);
+          return;
+        }
+        resolve(false);
+      }
+      if (typeof GM_xmlhttpRequest !== "function") {
+        finish(0, "");
+        return;
+      }
+      GM_xmlhttpRequest({
+        method: "POST",
+        url: CONTROL_BASE + BROWSER_CONTROL_BOOTSTRAP_PATH,
+        data: JSON.stringify({ project_id: projectId.trim(), adapter: ADAPTER_ID, binding_id: bindingId.trim() }),
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + heartbeatCapability.trim(),
+          "Origin": "https://chatgpt.com"
+        },
+        timeout: 8000,
+        onload: function (response) { finish(response.status, response.responseText); },
+        onerror: function () { finish(0, ""); },
+        ontimeout: function () { finish(0, ""); }
+      });
+    }).then(function (result) {
+      browserControlBootstrapPromise = null;
+      return result;
+    }, function () {
+      browserControlBootstrapPromise = null;
+      return false;
+    });
+    return browserControlBootstrapPromise;
+  }
+
   function sendControlHeartbeat() {
     var capRecord = storedCapabilityRecord();
     var capability = capRecord ? capRecord.token : storedCapability();
@@ -876,11 +1175,15 @@
       }
       return Promise.resolve(false);
     }
-    return controlPost(SESSION_HEARTBEAT_PATH, {
+    var heartbeatPayload = {
       adapter: ADAPTER_ID, binding_id: bindingId,
       title: (typeof document.title === "string" && document.title.trim()) || ("ChatGPT conversation " + bindingId),
       url: String(window.location.href), tab_instance_id: tabInstanceId()
-    }, capability).then(function (result) {
+    };
+    if (lastActionScanTelemetry) {
+      heartbeatPayload.action_scan = lastActionScanTelemetry;
+    }
+    return controlPost(SESSION_HEARTBEAT_PATH, heartbeatPayload, capability).then(function (result) {
       var classification = classifyHeartbeatResult(result);
       if (classification.shouldClear) {
         clearCapability();
@@ -900,6 +1203,13 @@
         var activeTabs = (sData && sData.session && sData.session.active_tab_count) || (sData && sData.active_tab_count) || 0;
         var dupTabs = activeTabs > 1;
         applyComputedState({ duplicateTabs: dupTabs });
+        var bootstrap = sData && sData.web_bridge_bootstrap;
+        if (
+          bootstrap && bootstrap.available === true &&
+          typeof sData.project_id === "string" && sData.project_id
+        ) {
+          return redeemBrowserControlBootstrap(sData.project_id, bindingId, capability).then(function () { return true; });
+        }
         return true;
       }
       if (classification.verdict === "store_unavailable") {
@@ -926,14 +1236,14 @@
       });
     });
     GM_registerMenuCommand("Forget DevOrchestrator heartbeat capability", clearCapability);
-    GM_registerMenuCommand("Pair DevOrchestrator browser control", function () {
-      var raw = typeof root.prompt === "function" ? root.prompt("Paste browser control capability token (from dev-orchestrator browser-token mint):") : "";
+    GM_registerMenuCommand("Pair DevOrchestrator read-only control", function () {
+      var raw = typeof root.prompt === "function" ? root.prompt("Paste the project-and-conversation-bound WebBridge capability token from DevOrchestrator:") : "";
       if (raw && raw.trim()) {
         saveBrowserControlToken(raw.trim());
-        if (typeof root.alert === "function") { root.alert("DevOrchestrator browser control token paired"); }
+        if (typeof root.alert === "function") { root.alert("DevOrchestrator read-only control token paired"); }
       }
     });
-    GM_registerMenuCommand("Forget DevOrchestrator browser control token", function () {
+    GM_registerMenuCommand("Forget DevOrchestrator read-only control token", function () {
       clearBrowserControlToken();
       if (typeof root.alert === "function") { root.alert("DevOrchestrator browser control token forgotten"); }
     });
@@ -1032,6 +1342,22 @@
   // separate deployment gate - automated tests never touch this path)
   // ------------------------------------------------------------------
 
+  function findComposer() {
+    if (typeof document === "undefined") { return null; }
+    var legacy = document.querySelector("#prompt-textarea");
+    if (legacy) { return legacy; }
+
+    var editables = document.querySelectorAll("[contenteditable='true']");
+    if (!editables || editables.length !== 1) { return null; }
+    var fallback = editables[0];
+    if (!fallback || typeof fallback.focus !== "function" || fallback.disabled
+        || fallback.hidden || fallback.isConnected === false
+        || (fallback.getAttribute && fallback.getAttribute("aria-disabled") === "true")) {
+      return null;
+    }
+    return fallback;
+  }
+
   function setComposerText(composer, text) {
     composer.focus();
     // Replace the entire composer, never append to a stale ChatGPT draft.
@@ -1063,27 +1389,74 @@
     return true;
   }
 
-  function isStopComposerButton(button) {
-    if (!button) { return false; }
+  function composerButtonText(button) {
+    if (!button) { return ""; }
     var parts = [
       button.getAttribute && button.getAttribute("data-testid"),
       button.getAttribute && button.getAttribute("aria-label"),
       button.getAttribute && button.getAttribute("title"),
       button.innerText
     ];
-    var text = parts.filter(function (part) { return typeof part === "string"; }).join(" ").toLowerCase();
+    return parts.filter(function (part) { return typeof part === "string"; }).join(" ").toLowerCase();
+  }
+
+  function isStopComposerButton(button) {
+    var text = composerButtonText(button);
     return text.indexOf("stop") !== -1 || text.indexOf("停止") !== -1;
+  }
+
+  function isSemanticSendButton(button) {
+    if (!button || button.disabled
+        || (button.getAttribute && button.getAttribute("aria-disabled") === "true")
+        || isStopComposerButton(button)) {
+      return false;
+    }
+    var text = composerButtonText(button);
+    return text.indexOf("send") !== -1
+      || text.indexOf("submit") !== -1
+      || text.indexOf("发送") !== -1;
+  }
+
+  function isComposerPrimaryButton(button) {
+    if (!button || button.disabled
+        || (button.getAttribute && button.getAttribute("aria-disabled") === "true")
+        || isStopComposerButton(button)) {
+      return false;
+    }
+    var classText = "";
+    if (typeof button.className === "string") {
+      classText = button.className;
+    } else if (button.getAttribute) {
+      classText = button.getAttribute("class") || "";
+    }
+    return classText.indexOf("bg-composer-primary") !== -1;
   }
 
   function findSendButton() {
     var legacy = document.querySelector("button[data-testid='send-button']");
-    if (legacy && !isStopComposerButton(legacy)) { return legacy; }
+    if (legacy && !legacy.disabled && !isStopComposerButton(legacy)) { return legacy; }
 
-    // ChatGPT's newer composer exposes the submit control by id. The same
-    // control can become "Stop answering" while a turn is streaming, so
-    // never use this fallback unless its accessible/test metadata is non-stop.
     var composerSubmit = document.querySelector("button#composer-submit-button");
-    if (composerSubmit && !isStopComposerButton(composerSubmit)) { return composerSubmit; }
+    if (composerSubmit && !composerSubmit.disabled && !isStopComposerButton(composerSubmit)) {
+      return composerSubmit;
+    }
+
+    var composer = findComposer();
+    var container = composer && composer.parentElement;
+    for (var depth = 0; container && depth < 4; depth += 1, container = container.parentElement) {
+      if (typeof container.querySelectorAll !== "function") { continue; }
+      var buttons = container.querySelectorAll("button");
+      var semantic = [];
+      var primary = [];
+      for (var i = 0; i < buttons.length; i++) {
+        if (isSemanticSendButton(buttons[i])) { semantic.push(buttons[i]); }
+        if (isComposerPrimaryButton(buttons[i])) { primary.push(buttons[i]); }
+      }
+      if (semantic.length === 1) { return semantic[0]; }
+      if (semantic.length > 1) { return null; }
+      if (primary.length === 1) { return primary[0]; }
+      if (primary.length > 1) { return null; }
+    }
     return null;
   }
 
@@ -1100,7 +1473,7 @@
     if (typeof document === "undefined") {
       return false;
     }
-    var composer = document.querySelector("#prompt-textarea");
+    var composer = findComposer();
     if (!composer) {
       return false;
     }
@@ -1315,20 +1688,45 @@
   function dispatchBrowserControlAction(actionPayload, confirmed) {
     var token = storedBrowserControlToken();
     if (!token) {
-      return Promise.resolve({
-        status: 401,
-        text: JSON.stringify({
-          status: "error",
-          reason: "Unauthorized",
-          error: "Browser control capability token not paired in Tampermonkey. Use 'Pair DevOrchestrator browser control' menu command."
-        })
+      return sendControlHeartbeat().then(function () {
+        var bootstrapped = storedBrowserControlToken();
+        if (bootstrapped) {
+          return dispatchBrowserControlAction(actionPayload, confirmed);
+        }
+        return {
+          status: 401,
+          text: JSON.stringify({
+            status: "error",
+            reason: "Unauthorized",
+            error: "Automatic read-only control bootstrap unavailable. Use 'Pair DevOrchestrator read-only control' menu command."
+          })
+        };
       });
     }
 
-    var payload = Object.assign({}, actionPayload);
-    if (confirmed) {
-      payload.confirmed = true;
+    var bindingId = currentBindingId();
+    if (!bindingId) {
+      return Promise.resolve({
+        status: 400,
+        text: JSON.stringify({ status: "error", reason: "Conversation Required", error: "Current URL is not a ChatGPT conversation" })
+      });
     }
+    var suppliedBinding = actionPayload && actionPayload.binding;
+    if (suppliedBinding && suppliedBinding.binding_id && suppliedBinding.binding_id !== bindingId) {
+      return Promise.resolve({
+        status: 403,
+        text: JSON.stringify({ status: "error", reason: "Binding Mismatch", error: "Action envelope targets a different conversation" })
+      });
+    }
+    var payload = {
+      protocol: DEVORCH_ACTION_V1,
+      request_id: actionPayload.request_id,
+      action: actionPayload.action,
+      project_id: actionPayload.project_id,
+      parameters: {},
+      binding: { adapter: ADAPTER_ID, binding_id: bindingId },
+      issued_at: stableIssuedAtForAction(actionPayload, bindingId)
+    };
 
     var url = BRIDGE_BASE + BROWSER_CONTROL_ACTION_PATH;
     var body = JSON.stringify(payload);
@@ -1460,28 +1858,59 @@
 
   function submitActionResult(resultText, requestId) {
     return new Promise(function (resolve) {
-      if (typeof document === "undefined") { resolve(false); return; }
+      resultSubmitAttemptCount = Math.min(resultSubmitAttemptCount + 1, 10000);
+      lastResultSubmitRequestId = typeof requestId === "string" && requestId.trim()
+        ? requestId.trim().slice(0, 128)
+        : null;
+      lastResultSubmitStage = "idle";
+      updateResultSubmitTelemetry();
+      if (typeof document === "undefined") {
+        lastResultSubmitStage = "no_composer";
+        updateResultSubmitTelemetry();
+        resolve(false);
+        return;
+      }
       var deadline = Date.now() + SUBMISSION_CONFIRM_MS;
       var prepared = false;
       var clicked = false;
 
       function attempt() {
         if (clicked && isActionResultInConversation(requestId)) {
+          resultConfirmSuccessCount = Math.min(resultConfirmSuccessCount + 1, 10000);
+          lastResultSubmitStage = "confirmed";
+          updateResultSubmitTelemetry();
           resolve(true);
           return;
         }
         if (Date.now() >= deadline) {
+          lastResultSubmitStage = "timeout";
+          updateResultSubmitTelemetry();
           resolve(false);
           return;
         }
         if (!prepared) {
-          var composer = document.querySelector("#prompt-textarea");
+          var composer = findComposer();
           if (composer) {
+            resultComposerFoundCount = Math.min(resultComposerFoundCount + 1, 10000);
+            updateResultSubmitTelemetry();
             setComposerText(composer, resultText);
             prepared = true;
+            resultComposerPreparedCount = Math.min(resultComposerPreparedCount + 1, 10000);
+            lastResultSubmitStage = "prepared";
+            updateResultSubmitTelemetry();
+          } else {
+            lastResultSubmitStage = "no_composer";
+            updateResultSubmitTelemetry();
           }
         } else if (!clicked) {
           clicked = clickSendButton();
+          if (clicked) {
+            resultSendClickCount = Math.min(resultSendClickCount + 1, 10000);
+            lastResultSubmitStage = "clicked";
+          } else {
+            lastResultSubmitStage = "no_send";
+          }
+          updateResultSubmitTelemetry();
         }
         setTimeout(attempt, 100);
       }
@@ -1491,11 +1920,228 @@
   }
 
   var actionScanActive = false;
+  var MAX_OPEN_SHADOW_ROOTS = 32;
+  var MAX_SHADOW_ROOT_DEPTH = 6;
+  var MAX_SHADOW_ELEMENTS_PER_ROOT = 10000;
+
+  function selectorCount(selector) {
+    try {
+      var nodes = document.querySelectorAll(selector);
+      return nodes ? Math.min(nodes.length, 10000) : 0;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  function collectOpenShadowTelemetry(documentElements) {
+    var result = {
+      open_shadow_root_count: 0,
+      shadow_total_element_count: 0,
+      shadow_primary_assistant_count: 0,
+      shadow_conversation_turn_count: 0,
+      shadow_article_count: 0,
+      shadow_agent_turn_class_count: 0,
+      shadow_conversation_turn_class_count: 0,
+      shadow_marker_root_count: 0,
+      shadow_marker_element_count: 0
+    };
+    var pending = [];
+    var seen = [];
+
+    function enqueue(rootNode, depth) {
+      if (!rootNode || depth > MAX_SHADOW_ROOT_DEPTH || seen.indexOf(rootNode) !== -1) { return; }
+      for (var queuedIndex = 0; queuedIndex < pending.length; queuedIndex++) {
+        if (pending[queuedIndex].root === rootNode) { return; }
+      }
+      if (seen.length + pending.length >= MAX_OPEN_SHADOW_ROOTS) { return; }
+      pending.push({ root: rootNode, depth: depth });
+    }
+
+    var documentElementCount = Math.min(documentElements ? documentElements.length : 0, MAX_SHADOW_ELEMENTS_PER_ROOT);
+    for (var documentIndex = 0; documentIndex < documentElementCount; documentIndex++) {
+      if (documentElements[documentIndex] && documentElements[documentIndex].shadowRoot) {
+        enqueue(documentElements[documentIndex].shadowRoot, 1);
+      }
+    }
+
+    while (pending.length > 0 && seen.length < MAX_OPEN_SHADOW_ROOTS) {
+      var entry = pending.shift();
+      var shadowRoot = entry.root;
+      if (!shadowRoot || seen.indexOf(shadowRoot) !== -1) { continue; }
+      seen.push(shadowRoot);
+      result.open_shadow_root_count += 1;
+
+      var elements = [];
+      try {
+        elements = typeof shadowRoot.querySelectorAll === "function" ? shadowRoot.querySelectorAll("*") : [];
+      } catch (e) {
+        elements = [];
+      }
+      var elementCount = Math.min(elements ? elements.length : 0, MAX_SHADOW_ELEMENTS_PER_ROOT);
+      result.shadow_total_element_count += elementCount;
+      var rootHasMarker = false;
+      var rootText = typeof shadowRoot.innerText === "string"
+        ? shadowRoot.innerText
+        : (shadowRoot.host && typeof shadowRoot.host.innerText === "string" ? shadowRoot.host.innerText : "");
+      if (rootText.indexOf(DEVORCH_ACTION_V1) !== -1) {
+        rootHasMarker = true;
+      }
+
+      for (var elementIndex = 0; elementIndex < elementCount; elementIndex++) {
+        var element = elements[elementIndex];
+        if (!element) { continue; }
+        function elementMatches(selector) {
+          try {
+            return typeof element.matches === "function" && element.matches(selector);
+          } catch (e) {
+            return false;
+          }
+        }
+        if (elementMatches("[data-message-author-role='assistant']")) { result.shadow_primary_assistant_count += 1; }
+        if (elementMatches("[data-testid^='conversation-turn-']")) { result.shadow_conversation_turn_count += 1; }
+        if (elementMatches("article")) { result.shadow_article_count += 1; }
+        if (elementMatches("[class*='agent-turn']")) { result.shadow_agent_turn_class_count += 1; }
+        if (elementMatches("[class*='conversation-turn']")) { result.shadow_conversation_turn_class_count += 1; }
+        var elementText = typeof element.innerText === "string" ? element.innerText : "";
+        if (elementText.indexOf(DEVORCH_ACTION_V1) !== -1) {
+          result.shadow_marker_element_count += 1;
+          rootHasMarker = true;
+        }
+        if (entry.depth < MAX_SHADOW_ROOT_DEPTH && element.shadowRoot) {
+          enqueue(element.shadowRoot, entry.depth + 1);
+        }
+      }
+      if (rootHasMarker) { result.shadow_marker_root_count += 1; }
+    }
+    return result;
+  }
+
+  function collectActionScanTelemetry() {
+    if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") {
+      return null;
+    }
+    var assistants = document.querySelectorAll("[data-message-author-role='assistant']");
+    var assistantCount = assistants ? Math.min(assistants.length, 10000) : 0;
+    var markerCount = 0;
+    var parsedCount = 0;
+    var recentRequestId = null;
+    var allElements = document.querySelectorAll("*");
+    var totalElementCount = allElements ? Math.min(allElements.length, 10000) : 0;
+    var shadowHostCount = 0;
+    for (var elementIndex = 0; elementIndex < totalElementCount; elementIndex++) {
+      if (allElements[elementIndex] && allElements[elementIndex].shadowRoot) {
+        shadowHostCount += 1;
+      }
+    }
+    var bodyText = document.body && typeof document.body.innerText === "string"
+      ? document.body.innerText
+      : "";
+    var shadowTelemetry = collectOpenShadowTelemetry(allElements);
+
+    var firstAssistant = Math.max(0, assistants.length - assistantCount);
+    for (var i = firstAssistant; i < assistants.length; i++) {
+      var text = (typeof assistants[i].innerText === "string") ? assistants[i].innerText : "";
+      if (text.indexOf(DEVORCH_ACTION_V1) !== -1) {
+        markerCount += 1;
+      }
+      var parsed = parseActionEnvelope(text);
+      if (parsed) {
+        parsedCount += 1;
+        if (typeof parsed.request_id === "string" && parsed.request_id.trim()) {
+          recentRequestId = parsed.request_id.trim().slice(0, 128);
+        }
+      }
+    }
+
+    lastActionScanTelemetry = {
+      scanned_at: new Date().toISOString(),
+      primary_assistant_count: assistantCount,
+      assistant_turn_count: selectorCount("[data-testid^='conversation-turn-'] [data-message-author-role='assistant']"),
+      conversation_turn_count: selectorCount("[data-testid^='conversation-turn-']"),
+      total_element_count: totalElementCount,
+      body_text_length: Math.min(bodyText.length, 1000000),
+      body_has_action_marker: bodyText.indexOf(DEVORCH_ACTION_V1) !== -1,
+      main_count: selectorCount("main"),
+      article_count: selectorCount("article"),
+      iframe_count: selectorCount("iframe"),
+      data_message_author_role_count: selectorCount("[data-message-author-role]"),
+      data_testid_count: selectorCount("[data-testid]"),
+      data_turn_count: selectorCount("[data-turn]"),
+      data_turn_id_count: selectorCount("[data-turn-id]"),
+      agent_turn_class_count: selectorCount("[class*='agent-turn']"),
+      conversation_turn_class_count: selectorCount("[class*='conversation-turn']"),
+      role_article_count: selectorCount("[role='article']"),
+      shadow_host_count: shadowHostCount,
+      open_shadow_root_count: shadowTelemetry.open_shadow_root_count,
+      shadow_total_element_count: shadowTelemetry.shadow_total_element_count,
+      shadow_primary_assistant_count: shadowTelemetry.shadow_primary_assistant_count,
+      shadow_conversation_turn_count: shadowTelemetry.shadow_conversation_turn_count,
+      shadow_article_count: shadowTelemetry.shadow_article_count,
+      shadow_agent_turn_class_count: shadowTelemetry.shadow_agent_turn_class_count,
+      shadow_conversation_turn_class_count: shadowTelemetry.shadow_conversation_turn_class_count,
+      shadow_marker_root_count: shadowTelemetry.shadow_marker_root_count,
+      shadow_marker_element_count: shadowTelemetry.shadow_marker_element_count,
+      marker_node_count: markerCount,
+      parsed_action_count: parsedCount,
+      most_recent_request_id: recentRequestId,
+      roleless_fallback_candidate_count: rolelessFallbackCandidateCount,
+      roleless_fallback_dispatch_count: rolelessFallbackDispatchCount,
+      last_roleless_fallback_request_id: lastRolelessFallbackRequestId,
+      prompt_textarea_count: selectorCount("#prompt-textarea"),
+      contenteditable_count: selectorCount("[contenteditable='true']"),
+      textarea_count: selectorCount("textarea"),
+      legacy_send_button_count: selectorCount("button[data-testid='send-button']"),
+      composer_submit_button_count: selectorCount("button#composer-submit-button"),
+      result_submit_attempt_count: resultSubmitAttemptCount,
+      result_composer_found_count: resultComposerFoundCount,
+      result_composer_prepared_count: resultComposerPreparedCount,
+      result_send_click_count: resultSendClickCount,
+      result_confirm_success_count: resultConfirmSuccessCount,
+      last_result_submit_request_id: lastResultSubmitRequestId,
+      last_result_submit_stage: lastResultSubmitStage,
+      action_scan_active: actionScanActive
+    };
+    return Object.assign({}, lastActionScanTelemetry);
+  }
 
   function scanAndProcessBrowserActions() {
-    if (actionScanActive || typeof document === "undefined") { return; }
+    if (typeof document === "undefined") { return; }
+    collectActionScanTelemetry();
+    // Duplicate/background tabs still maintain heartbeat presence, but only a
+    // visible conversation tab may consume browser-control actions.
+    if (document.visibilityState === "hidden") { return; }
+    if (actionScanActive) { return; }
     var assistants = document.querySelectorAll("[data-message-author-role='assistant']");
-    if (!assistants || assistants.length === 0) { return; }
+    if (!assistants || assistants.length === 0) {
+      var rolelessEnvelope = findRolelessReadOnlyActionCandidate();
+      if (!rolelessEnvelope) { return; }
+      var rolelessRequestId = rolelessEnvelope.request_id;
+      var rolelessBindingId = currentBindingId();
+      if (!rolelessBindingId || isActionProcessed(rolelessRequestId, rolelessBindingId)
+          || isActionResultInConversation(rolelessRequestId)) {
+        return;
+      }
+      if (pendingActionResult(rolelessRequestId, rolelessBindingId)) {
+        actionScanActive = true;
+        submitPendingActionResult(rolelessRequestId, rolelessBindingId).then(function () {
+          actionScanActive = false;
+        });
+        return;
+      }
+      // Do not route roleless body text through the effectful/modal branch.
+      // findRolelessReadOnlyActionCandidate() has already enforced the
+      // read-only allowlist, and this defense-in-depth check fails closed.
+      if (!isReadOnlyAction(rolelessEnvelope.action)) { return; }
+      actionScanActive = true;
+      rolelessFallbackDispatchCount = Math.min(rolelessFallbackDispatchCount + 1, 10000);
+      updateRolelessFallbackTelemetry();
+      dispatchBrowserControlAction(rolelessEnvelope, false).then(function (result) {
+        handleActionResult(rolelessEnvelope, result).then(function () {
+          actionScanActive = false;
+        });
+      });
+      return;
+    }
 
     for (var i = assistants.length - 1; i >= 0; i--) {
       var text = assistants[i].innerText || "";
@@ -1503,8 +2149,16 @@
       if (!envelope || !envelope.request_id) { continue; }
 
       var reqId = envelope.request_id;
-      if (isActionProcessed(reqId) || isActionResultInConversation(reqId)) {
+      var bindingId = currentBindingId();
+      if (isActionProcessed(reqId, bindingId) || isActionResultInConversation(reqId)) {
         continue;
+      }
+      if (pendingActionResult(reqId, bindingId)) {
+        actionScanActive = true;
+        submitPendingActionResult(reqId, bindingId).then(function () {
+          actionScanActive = false;
+        });
+        break;
       }
 
       actionScanActive = true;
@@ -1523,7 +2177,7 @@
           function onReject(reason) {
             var rejectedResult = formatActionResult(reqId, "rejected", reason);
             submitActionResult(rejectedResult, reqId).then(function (submitted) {
-              if (submitted) { markActionProcessed(reqId); }
+              if (submitted) { markActionProcessed(reqId, bindingId); }
               actionScanActive = false;
             });
           }
@@ -1541,6 +2195,12 @@
 
   function handleActionResult(envelope, result) {
     var reqId = envelope.request_id;
+    var bindingId = currentBindingId();
+    var existingPending = pendingActionResult(reqId, bindingId);
+    if (existingPending) {
+      return submitPendingActionResult(reqId, bindingId);
+    }
+
     var status = (result.status >= 200 && result.status < 300) ? "success" : "error";
     var body = null;
     try {
@@ -1550,8 +2210,11 @@
     }
     var dataOrError = (status === "success" && body && body.data !== undefined) ? body.data : body;
     var formatted = formatActionResult(reqId, status, dataOrError);
+    if (status === "success") {
+      savePendingActionResult(reqId, bindingId, formatted);
+    }
     return submitActionResult(formatted, reqId).then(function (submitted) {
-      if (submitted) { markActionProcessed(reqId); }
+      if (submitted) { markActionProcessed(reqId, bindingId); }
       return submitted;
     });
   }

@@ -28,6 +28,216 @@ def _moment(value: datetime | None) -> datetime:
     return result.astimezone(timezone.utc)
 
 
+_ACTION_SCAN_FIELDS = {
+    "scanned_at",
+    "primary_assistant_count",
+    "assistant_turn_count",
+    "conversation_turn_count",
+    "total_element_count",
+    "body_text_length",
+    "body_has_action_marker",
+    "main_count",
+    "article_count",
+    "iframe_count",
+    "data_message_author_role_count",
+    "data_testid_count",
+    "data_turn_count",
+    "data_turn_id_count",
+    "agent_turn_class_count",
+    "conversation_turn_class_count",
+    "role_article_count",
+    "shadow_host_count",
+    "open_shadow_root_count",
+    "shadow_total_element_count",
+    "shadow_primary_assistant_count",
+    "shadow_conversation_turn_count",
+    "shadow_article_count",
+    "shadow_agent_turn_class_count",
+    "shadow_conversation_turn_class_count",
+    "shadow_marker_root_count",
+    "shadow_marker_element_count",
+    "marker_node_count",
+    "parsed_action_count",
+    "most_recent_request_id",
+    "roleless_fallback_candidate_count",
+    "roleless_fallback_dispatch_count",
+    "last_roleless_fallback_request_id",
+    "prompt_textarea_count",
+    "contenteditable_count",
+    "textarea_count",
+    "legacy_send_button_count",
+    "composer_submit_button_count",
+    "result_submit_attempt_count",
+    "result_composer_found_count",
+    "result_composer_prepared_count",
+    "result_send_click_count",
+    "result_confirm_success_count",
+    "last_result_submit_request_id",
+    "last_result_submit_stage",
+    "action_scan_active",
+}
+_ACTION_SCAN_MAX_COUNT = 10_000
+_ACTION_SCAN_MAX_SHADOW_ROOTS = 32
+_ACTION_SCAN_MAX_SHADOW_COUNT = _ACTION_SCAN_MAX_SHADOW_ROOTS * _ACTION_SCAN_MAX_COUNT
+_ACTION_SCAN_MAX_BODY_TEXT_LENGTH = 1_000_000
+_ACTION_SCAN_MAX_REQUEST_ID = 128
+
+
+def _sanitize_action_scan(value: Any) -> dict[str, Any] | None:
+    """Return a bounded metadata-only action scan snapshot, or ignore it."""
+    if not isinstance(value, dict) or set(value) != _ACTION_SCAN_FIELDS:
+        return None
+
+    scanned_at = value.get("scanned_at")
+    if not isinstance(scanned_at, str) or not scanned_at or len(scanned_at) > 40:
+        return None
+    try:
+        parsed_at = datetime.fromisoformat(scanned_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed_at.tzinfo is None:
+        return None
+
+    count_fields = (
+        "primary_assistant_count",
+        "assistant_turn_count",
+        "conversation_turn_count",
+        "total_element_count",
+        "main_count",
+        "article_count",
+        "iframe_count",
+        "data_message_author_role_count",
+        "data_testid_count",
+        "data_turn_count",
+        "data_turn_id_count",
+        "agent_turn_class_count",
+        "conversation_turn_class_count",
+        "role_article_count",
+        "shadow_host_count",
+        "marker_node_count",
+        "parsed_action_count",
+        "roleless_fallback_candidate_count",
+        "roleless_fallback_dispatch_count",
+        "prompt_textarea_count",
+        "contenteditable_count",
+        "textarea_count",
+        "legacy_send_button_count",
+        "composer_submit_button_count",
+        "result_submit_attempt_count",
+        "result_composer_found_count",
+        "result_composer_prepared_count",
+        "result_send_click_count",
+        "result_confirm_success_count",
+    )
+    counts: dict[str, int] = {}
+    for field in count_fields:
+        count = value.get(field)
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= _ACTION_SCAN_MAX_COUNT:
+            return None
+        counts[field] = count
+    shadow_count_limits = {
+        "open_shadow_root_count": _ACTION_SCAN_MAX_SHADOW_ROOTS,
+        "shadow_total_element_count": _ACTION_SCAN_MAX_SHADOW_COUNT,
+        "shadow_primary_assistant_count": _ACTION_SCAN_MAX_SHADOW_COUNT,
+        "shadow_conversation_turn_count": _ACTION_SCAN_MAX_SHADOW_COUNT,
+        "shadow_article_count": _ACTION_SCAN_MAX_SHADOW_COUNT,
+        "shadow_agent_turn_class_count": _ACTION_SCAN_MAX_SHADOW_COUNT,
+        "shadow_conversation_turn_class_count": _ACTION_SCAN_MAX_SHADOW_COUNT,
+        "shadow_marker_root_count": _ACTION_SCAN_MAX_SHADOW_ROOTS,
+        "shadow_marker_element_count": _ACTION_SCAN_MAX_SHADOW_COUNT,
+    }
+    for field, limit in shadow_count_limits.items():
+        count = value.get(field)
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= limit:
+            return None
+        counts[field] = count
+    body_text_length = value.get("body_text_length")
+    if (
+        isinstance(body_text_length, bool)
+        or not isinstance(body_text_length, int)
+        or not 0 <= body_text_length <= _ACTION_SCAN_MAX_BODY_TEXT_LENGTH
+    ):
+        return None
+    body_has_action_marker = value.get("body_has_action_marker")
+    if not isinstance(body_has_action_marker, bool):
+        return None
+    if counts["marker_node_count"] > counts["primary_assistant_count"]:
+        return None
+    if counts["parsed_action_count"] > counts["marker_node_count"]:
+        return None
+    if counts["roleless_fallback_dispatch_count"] > counts["roleless_fallback_candidate_count"]:
+        return None
+    if not (
+        counts["result_confirm_success_count"]
+        <= counts["result_send_click_count"]
+        <= counts["result_composer_prepared_count"]
+        <= counts["result_composer_found_count"]
+        <= counts["result_submit_attempt_count"]
+    ):
+        return None
+    if counts["shadow_marker_root_count"] > counts["open_shadow_root_count"]:
+        return None
+    for field in (
+        "shadow_primary_assistant_count",
+        "shadow_conversation_turn_count",
+        "shadow_article_count",
+        "shadow_agent_turn_class_count",
+        "shadow_conversation_turn_class_count",
+        "shadow_marker_element_count",
+    ):
+        if counts[field] > counts["shadow_total_element_count"]:
+            return None
+
+    request_id = value.get("most_recent_request_id")
+    if request_id is not None:
+        if (
+            not isinstance(request_id, str)
+            or not request_id.strip()
+            or len(request_id) > _ACTION_SCAN_MAX_REQUEST_ID
+        ):
+            return None
+        request_id = request_id.strip()
+
+    fallback_request_id = value.get("last_roleless_fallback_request_id")
+    if fallback_request_id is not None:
+        if (
+            not isinstance(fallback_request_id, str)
+            or not fallback_request_id.strip()
+            or len(fallback_request_id) > _ACTION_SCAN_MAX_REQUEST_ID
+        ):
+            return None
+        fallback_request_id = fallback_request_id.strip()
+
+    result_request_id = value.get("last_result_submit_request_id")
+    if result_request_id is not None:
+        if (
+            not isinstance(result_request_id, str)
+            or not result_request_id.strip()
+            or len(result_request_id) > _ACTION_SCAN_MAX_REQUEST_ID
+        ):
+            return None
+        result_request_id = result_request_id.strip()
+
+    result_stage = value.get("last_result_submit_stage")
+    if result_stage not in {"idle", "no_composer", "prepared", "no_send", "clicked", "confirmed", "timeout"}:
+        return None
+
+    active = value.get("action_scan_active")
+    if not isinstance(active, bool):
+        return None
+    return {
+        "scanned_at": scanned_at,
+        **counts,
+        "body_text_length": body_text_length,
+        "body_has_action_marker": body_has_action_marker,
+        "most_recent_request_id": request_id,
+        "last_roleless_fallback_request_id": fallback_request_id,
+        "last_result_submit_request_id": result_request_id,
+        "last_result_submit_stage": result_stage,
+        "action_scan_active": active,
+    }
+
+
 class ConversationControlStore:
     def __init__(self, runtime_root: Path | str, *, session_presence_seconds: int = 300) -> None:
         if isinstance(session_presence_seconds, bool) or int(session_presence_seconds) <= 0:
@@ -53,7 +263,8 @@ class ConversationControlStore:
     def heartbeat(
         self, adapter: Any, binding_id: Any, *, title: Any, url: Any,
         tab_instance_id: Any, capability_id: Any = None,
-        capability_source: str = "capability", now: datetime | None = None,
+        capability_source: str = "capability", action_scan: Any = None,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
         adapter = _text(adapter, "adapter")
         binding_id = _text(binding_id, "binding_id")
@@ -81,12 +292,19 @@ class ConversationControlStore:
                 except Exception:
                     pass
             tabs = dict(prior.get("tabs") or {})
-            tabs[tab_instance_id] = {
+            prior_tab = tabs.get(tab_instance_id) if isinstance(tabs.get(tab_instance_id), dict) else {}
+            tab_record = {
                 "last_seen_at": observed,
                 "capability_pairing_id": cap_clean,
                 "capability_source": cap_source,
                 "verified_at": observed if cap_clean else None,
             }
+            clean_action_scan = _sanitize_action_scan(action_scan)
+            if clean_action_scan is not None:
+                tab_record["action_scan"] = clean_action_scan
+            elif isinstance(prior_tab.get("action_scan"), dict):
+                tab_record["action_scan"] = prior_tab["action_scan"]
+            tabs[tab_instance_id] = tab_record
             record = {
                 "adapter": adapter, "binding_id": binding_id, "title": title, "url": url,
                 "first_seen_at": prior.get("first_seen_at") or observed,

@@ -84,6 +84,22 @@ def test_capability_verdicts_and_store_unavailability(tmp_path: Path) -> None:
     assert capability_status(f"Bearer {token}", runtime_root=runtime)[0] == CapabilityVerdict.VALID
     assert capability_identity(f"Bearer {token}", runtime_root=runtime) == pairing_id
 
+    # Expiry is a non-authorizing state and must never remain reported VALID.
+    # The established vocabulary has no EXPIRED member, so UNKNOWN is the
+    # least-invasive truthful state; capability_status retains the reason.
+    data = json.loads(cap_file.read_text(encoding="utf-8"))
+    data["capabilities"][pairing_id]["expires_at_epoch"] = time.time() - 1
+    cap_file.write_text(json.dumps(data), encoding="utf-8")
+    assert capability_state(pairing_id, runtime_root=runtime) == CapabilityVerdict.UNKNOWN
+    verdict, reason, _ = capability_status(f"Bearer {token}", runtime_root=runtime)
+    assert verdict == CapabilityVerdict.UNKNOWN
+    assert reason == "capability expired"
+    assert capability_identity(f"Bearer {token}", runtime_root=runtime) is None
+
+    # Restore the row so the existing revocation assertion remains independent.
+    data["capabilities"][pairing_id].pop("expires_at_epoch")
+    cap_file.write_text(json.dumps(data), encoding="utf-8")
+
     # Revoke it
     sec.revoke_pairing(pairing_id)
     assert capability_state(pairing_id, runtime_root=runtime) == CapabilityVerdict.REVOKED
@@ -834,6 +850,7 @@ def test_cli_websol_status_and_probe(tmp_path: Path, capsys: pytest.CaptureFixtu
         )
         ret_probe = cmd_websol_probe(args_probe)
         assert ret_probe == 0
+        assert mock_probe.call_args.args[0].root == runtime / "bridge"
         probe_out = json.loads(capsys.readouterr().out)
         assert probe_out["status"] == "success"
         assert probe_out["request_id"] == "probe:mock"
@@ -850,7 +867,7 @@ def test_websol_probe_discovers_persisted_binding_when_binding_id_omitted(tmp_pa
     import argparse
 
     runtime = tmp_path / "runtime"
-    bridge = BrowserBridgeStore(runtime)
+    bridge = BrowserBridgeStore(runtime / "bridge")
     # A claim poll persists presence even when no request is queued.
     assert bridge.claim("chatgpt_web", "bind-discovered") is None
 
@@ -866,6 +883,7 @@ def test_websol_probe_discovers_persisted_binding_when_binding_id_omitted(tmp_pa
         )
         assert cmd_websol_probe(args) == 0
         mock_probe.assert_called_once()
+        assert mock_probe.call_args.args[0].root == runtime / "bridge"
         assert mock_probe.call_args.args[2] == "bind-discovered"
         assert json.loads(capsys.readouterr().out)["status"] == "success"
 
@@ -1591,4 +1609,3 @@ def test_probe_consecutive_failures_reset_clears_timestamps_single_write(tmp_pat
 
     mtime_subsequent = health_store.health_path.stat().st_mtime_ns
     assert mtime_subsequent == mtime_after_reset, "File was rewritten on subsequent should_probe calls (write amplification)"
-

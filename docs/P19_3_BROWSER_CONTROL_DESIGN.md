@@ -1,197 +1,220 @@
 # P19.3 ChatGPT Plus Browser Control Bridge
 
-P19.3 provides an interactive, secure browser-based control bridge enabling desktop Chrome
-ChatGPT Plus web conversations to inspect and operate local DevOrchestrator instances
-via Tampermonkey (`browser/chatgpt-web-adapter.user.js`), port 8765 bridge, and port 8770 control plane.
+P19.3 is a browser adapter for a bounded, read-only DevOrchestrator status flow:
 
-It achieves this with zero RDC calls, no OpenAI API billing, no Business workspace,
-no public exposure, and without weakening or replacing P19.2 (remote MCP).
-
----
-
-## 1. Architectural Boundaries and Roles
-
-```
-+-----------------------------------------------------------------------------------+
-| ChatGPT Plus Web Interface (https://chatgpt.com)                                  |
-|   - Assistant emits structured envelope: [DEVORCH_ACTION_V1] { ... }              |
-|   - Tampermonkey Adapter (browser/chatgpt-web-adapter.user.js):                   |
-|       * Scans assistant DOM for [DEVORCH_ACTION_V1] envelopes                     |
-|       * Read-only actions: dispatches automatically via loopback HTTP             |
-|       * Effectful actions: renders DOM confirmation modal (Approve / Reject)       |
-|       * Submits formatted [DEVORCH_ACTION_RESULT_V1] back to prompt textarea      |
-+------------------------------------------+----------------------------------------+
-                                           | HTTP POST (Origin: https://chatgpt.com)
-                                           v
-+-----------------------------------------------------------------------------------+
-| DevOrchestrator Bridge Listener (127.0.0.1:8765)                                   |
-|   - OPTIONS /v1/control/action: CORS preflight for https://chatgpt.com            |
-|   - GET /v1/control/health: health check and protocol version                     |
-|   - POST /v1/control/action: token validation, envelope parsing, and dispatch     |
-+------------------------------------------+----------------------------------------+
-                                           | In-Process Service Dispatch
-                                           v
-+-----------------------------------------------------------------------------------+
-| BrowserControlService & Shared Operations Layer (src/dev_orchestrator/control/)   |
-|   - Idempotency Store: runtime/control/browser_control_requests/ (locking & cache)|
-|   - Confirmation Enforcement: blocks unconfirmed effectful actions (400)          |
-|   - Shared Operations: spawn_job, poll_job, cancel_job, read_file                 |
-|   - Hardware fence protection: hardware commands marked non-selectable            |
-+-----------------------------------------------------------------------------------+
+```text
+ChatGPT Web conversation
+  -> Tampermonkey userscript
+  -> loopback Browser Bridge (127.0.0.1:8765)
+  -> authenticated WebBridge ingress (127.0.0.1:8770)
+  -> authoritative DevO project/overview read models
+  -> userscript
+  -> the same ChatGPT conversation
 ```
 
-### Critical Boundaries
-1. **Adapter / Transport Only**: Neither `chatgpt-web-adapter.user.js` nor the port 8765 bridge server is a lifecycle authority or state machine. Authoritative state remains strictly inside DevOrchestrator core and daemon stores.
-2. **Channel Separation**: DevOrchestrator control requests and results are strictly isolated from the Web Sol inference queue. Control actions never enter `BrowserBridgeStore` Web Sol queues, nor do they trigger automated AI decision loops.
-3. **Structured Protocol**: ChatGPT interactions use structured JSON envelopes (`DEVORCH_ACTION_V1`), explicitly prohibiting arbitrary shell execution or natural language execution.
+It does not use native ChatGPT MCP, the OpenAI API, Desktop Commander/RDC, or a
+public endpoint. Port 8770 remains the only control authority; port 8765 is a
+fixed transport adapter and never implements lifecycle decisions.
 
----
+## Implemented vertical slice
 
-## 2. Protocol Specification
+The browser surface accepts one action: `get_project_status`.
 
-### Action Envelope (`DEVORCH_ACTION_V1`)
-Emitted by the ChatGPT model in conversation:
-```json
+The result is a bounded projection containing:
+
+- project ID and Git branch/HEAD/dirty state;
+- current task, lifecycle state, paused state, and readiness;
+- the project's active execution and AI roles;
+- project-scoped active broker executions and current resource occupancy;
+- watchdog state;
+- exact conversation binding and live/stale session state.
+
+There is intentionally no browser-facing filesystem, shell, generic URL proxy,
+job execution, or lifecycle mutation operation. The older owner-authenticated
+8770 browser-control API is not part of this 8765 slice and its capability is
+not accepted by the read-only WebBridge ingress.
+
+## Protocol
+
+ChatGPT emits the existing versioned envelope:
+
+```text
 [DEVORCH_ACTION_V1]
 {
   "protocol": "DEVORCH_ACTION_V1",
   "request_id": "req-20260930-001",
-  "action": "start_task",
+  "action": "get_project_status",
   "project_id": "devorchestrator",
-  "parameters": {
-    "command_ref": "transport_compileall"
-  }
+  "parameters": {}
 }
 [/DEVORCH_ACTION_V1]
 ```
-Supported envelope formats:
-- Bracket marker: `[DEVORCH_ACTION_V1] { ... } [/DEVORCH_ACTION_V1]` or `[DEVORCH_ACTION_V1 { ... }]`
-- Code fence: ```` ```devorch_action { ... } ``` ````
-- Fallback marker: `DEVORCH_ACTION_V1 { ... }`
 
-### Result Envelope (`DEVORCH_ACTION_RESULT_V1`)
-Submitted into the prompt textarea by the userscript after dispatch:
+Before transport, the userscript derives the current conversation ID from the
+`https://chatgpt.com/c/<id>` URL and adds:
+
 ```json
+{
+  "binding": {
+    "adapter": "chatgpt_web",
+    "binding_id": "<current conversation id>"
+  },
+  "issued_at": "<UTC timestamp>"
+}
+```
+
+The userscript rejects an envelope that supplies a different binding. Port
+8765 validates a closed schema, maps the action to WebBridge operation
+`project_status`, and forwards only to the fixed loopback endpoint
+`POST /api/v1/control/web-bridge/requests` on port 8770. It is not a general
+proxy.
+
+Port 8770 then enforces all authoritative guards:
+
+- a revocable `web_bridge_control` capability bound to the exact project,
+  adapter, and conversation ID;
+- the project's durable `ConversationControlStore` binding;
+- a currently live session for that binding;
+- request freshness on every attempt;
+- durable request-ID idempotency over semantic request fields. The transport-only `issued_at` freshness timestamp is deliberately excluded from the idempotency hash, so a fresh retry of the same semantic request replays the cached response instead of conflicting; changes to operation/project/binding/revision/payload still conflict.
+
+The result is associated with the original request ID and formatted as:
+
+```text
 [DEVORCH_ACTION_RESULT_V1 req-20260930-001]
 {
   "protocol": "DEVORCH_ACTION_RESULT_V1",
   "request_id": "req-20260930-001",
-  "action": "start_task",
-  "project_id": "devorchestrator",
   "status": "success",
-  "data": {
-    "job_id": "job-0aac714c069b32bb",
-    "status": "queued",
-    "selected_transport": "local"
-  }
+  "data": { "project_id": "devorchestrator" }
 }
 [/DEVORCH_ACTION_RESULT_V1]
 ```
 
----
+The userscript inserts that result into the composer and submits it as a user
+message in the same conversation. A request is marked processed only after the
+message is observed in conversation history. Per-tab processed IDs remain
+conversation-scoped in `sessionStorage`; retry identity and pending successful
+formatted results are also stored in bounded Tampermonkey-private shared storage
+so duplicate tabs see the same retry state. Background/hidden tabs maintain
+heartbeat presence but do not consume actions, while the visible bound tab owns
+dispatch/result submission. This prevents duplicate-tab races without placing
+capabilities or result state in the page DOM.
 
-## 3. Closed Action Surface & Confirmation Policy
+## Presence and recovery
 
-| Action | Kind | Confirmation Required | Description |
-|---|---|---|---|
-| `status` | Read-Only | No | Authoritative project status, lifecycle state, owner gates, git status |
-| `commands_catalog` | Read-Only | No | Allowlisted commands, parameter schemas, hardware non-selectable flags |
-| `job_status` | Read-Only | No | Durable execution job status, exit code, terminal outcome |
-| `read_log` | Read-Only | No | Paginated, redacted logs from allowlisted sources (`events`, `runs`, etc.) |
-| `read_file` | Read-Only | No | Path-contained file reading (text content or base64) |
-| `start_task` | Effectful | **Strictly Yes** | Spawns allowlisted execution job via native transport |
-| `cancel_job` | Effectful | **Strictly Yes** | Cancels specific running execution job |
+The existing userscript heartbeat is independent of action dispatch. It:
 
-### Confirmation Gate Mechanism
-1. **Unconfirmed Attempt**: If an effectful action (`start_task`, `cancel_job`) arrives at the bridge without `confirmed: true`, `BrowserControlService` raises `BrowserControlConfirmationRequiredError`, returning HTTP 400:
-   ```json
-   {
-     "status": "error",
-     "status_code": 400,
-     "reason": "Confirmation Required",
-     "confirmation_required": true,
-     "action": "start_task",
-     "project_id": "devorchestrator",
-     "request_id": "req-20260930-001",
-     "details": {
-       "command_ref": "transport_compileall",
-       "job_id": null,
-       "parameters": {}
-     }
-   }
-   ```
-2. **Browser Modal**: The userscript displays a prominent floating DOM modal detailing the Action, Project, Command/Job, and Parameters.
-3. **User Decision**:
-   - **Approve**: Dispatches the action with `confirmed: true`.
-   - **Reject**: Submits a `status: "rejected"` result envelope into the prompt textarea explaining human rejection.
+- derives the binding dynamically from the current URL;
+- uses a `sessionStorage` tab instance ID, stable across reloads but different
+  in another tab;
+- heartbeats on startup, URL changes, visibility/focus changes, and its normal
+  interval;
+- re-establishes presence after a DevO restart without manual runtime edits;
+- lets a stale durable binding return to `live` when the page is active again.
 
----
+The heartbeat capability and browser read capability remain separate. Neither
+secret is inserted into the ChatGPT DOM, result text, or logs. The read token is
+stored only by the userscript manager and is sent through `GM_xmlhttpRequest`.
 
-## 4. Security & Isolation Invariants
+### Owner-initiated local bootstrap
 
-1. **Capability Tokens**: Every request requires a valid bearer token minted via CLI:
-   ```powershell
-   python -m dev_orchestrator browser-token mint --label "chrome-chatgpt" --ttl 86400
-   python -m dev_orchestrator browser-token list
-   python -m dev_orchestrator browser-token revoke <capability_id>
-   ```
-   Stored hashed in `runtime/control/browser-control-capabilities.json`. Tokens are compared via constant-time HMAC and never leaked in logs.
-2. **Loopback & CORS Restrictions**: Every browser-control route on port 8765
-   requires a loopback peer even if the shared bridge listener is configured
-   with a wildcard bind address. Preflight and action requests use parsed,
-   exact origin matching for `https://chatgpt.com` and HTTP loopback origins;
-   prefix/suffix-spoofed hosts are rejected.
-3. **Path Traversal Protection**: `read_file` validates canonical containment within configured project roots; relative path escapes (e.g. `../../windows/win.ini`) fail closed with HTTP 400.
-4. **Hardware Fence**: In `commands_catalog`, hardware-effect commands have `is_hardware: true` and `selectable: false`. Attempting to start hardware commands via the bridge fails closed.
-5. **Idempotency Protection**: `BrowserControlRequestStore` tracks all requests by
-   `request_id` under `runtime/control/browser_control_requests/`. A per-request
-   inter-process lock and durable `in_progress` claim serialize concurrent
-   requests. Identical completed resends return cached results without
-   re-executing; mismatched, corrupt, failed, or crash-ambiguous records fail
-   closed with HTTP 409 Conflict.
-6. **Zero-RDC Constraint**: All dispatched operations strictly assert native transport (`local` or `ssh`). RDC transport count must be 0.
+Normal pairing does not require copying the read token. After the heartbeat is
+live and the project is authoritatively bound to that conversation, the owner
+creates a pending permit from the local CLI:
 
----
+```powershell
+python -m dev_orchestrator.cli create-web-bridge-bootstrap devorchestrator <binding-id> --adapter chatgpt_web --ttl 60
+```
 
-## 5. Verification & Acceptance Evidence
+The permit contains no client-disclosed secret, is bound to the exact project,
+`chatgpt_web` adapter, and conversation ID, expires in at most 60 seconds, and
+is consumed atomically. Heartbeats only report non-secret pending availability;
+they never create a permit. The userscript may claim a pending permit using its
+existing heartbeat capability only when 8770 confirms that the same capability
+owns the exact live, owner-bound session. The resulting `web_bridge_control`
+bearer is returned directly to the userscript and stored in Tampermonkey
+storage. Neither it nor bootstrap state is inserted into the page DOM.
 
-### Separate-Process Acceptance Test
-The automated acceptance script verifies the complete live bridge and daemon flow:
+An expired, replayed, mismatched, wrong-origin, unverified-session, or
+non-loopback claim fails closed. Pending permits remain bounded across daemon
+restart; browser restart does not broaden them. The manual **Pair
+DevOrchestrator read-only control** Tampermonkey command remains the fallback.
+
+`ControlSecurity.capability_state()` uses the established non-authorizing
+`UNKNOWN` verdict for expired rows because the repository vocabulary has no
+`EXPIRED` member. Token validation also returns an explicit expiry reason and
+continues to deny the bearer.
+
+## Routes and storage
+
+Port 8765:
+
+- `GET /v1/control/health`
+- `OPTIONS /v1/control/action`
+- `POST /v1/control/action`
+
+Port 8770 authority used by this slice:
+
+- `POST /api/v1/control/session-heartbeats`
+- `POST /api/v1/control/web-bridge/bootstrap/redeem`
+- `POST /api/v1/control/web-bridge/requests`
+
+Durable WebBridge idempotency records are stored under
+`runtime/control/web_bridge_requests/`. Browser-control messages never enter the
+Web Sol claim/response queue.
+
+## Security invariants
+
+1. The browser listener and its fixed upstream must both be loopback HTTP.
+2. CORS accepts exact ChatGPT and loopback origins; suffix/prefix spoofing is
+   rejected without reflected CORS headers.
+3. Only `get_project_status` and empty parameters are accepted on 8765.
+4. Unknown fields, arbitrary URLs, shell text, paths, and mutation actions fail
+   closed before forwarding.
+5. Port 8770 revalidates capability scope, runtime binding, live presence, and
+   freshness. Port 8765 cannot manufacture authority.
+6. Exact replay returns the durable response; a changed payload under the same
+   request ID returns HTTP 409.
+7. Returned broker/watchdog/control objects are field-allowlisted rather than
+   forwarded wholesale.
+8. Bootstrap creation is an explicit local owner action; a heartbeat cannot
+   create authorization, and a claim requires its exact verified live session.
+
+## Verification
+
+Transport acceptance against a running daemon:
+
 ```powershell
 python ops/p19_3_browser_control_acceptance.py
 ```
-Verified steps:
-1. Bridge control health check (`GET /v1/control/health`).
-2. CORS preflight check from `Origin: https://chatgpt.com`.
-3. Suffix-spoofed ChatGPT Origin rejection without reflected CORS headers.
-4. Unauthorized request rejection (missing and invalid token).
-5. Capability token minting via `create_browser_control_capability`.
-6. Authoritative `status` inspection.
-7. `commands_catalog` discovery & hardware non-selectable assertion.
-8. `read_file` text inspection on `pyproject.toml`.
-9. Path traversal attempt fail-closed verification.
-10. Effectful `start_task` confirmation gate (HTTP 400 requirement).
-11. Confirmed `start_task` execution returning durable `job_id`.
-12. Idempotency exact replay returning identical job without re-spawn.
-13. Idempotency conflict rejection on altered payload (HTTP 409).
-14. `job_status` polling until terminal completion.
-15. Cancellable job lifecycle: spawn -> confirmation gate -> cancel gate -> cancel confirmed.
-16. Redacted `read_log` querying.
-17. Web Sol inference queue isolation (zero control actions in Web Sol queues).
-18. Capability revocation verification (HTTP 401).
-19. Transport audit: 0 RDC invocations, 100% native local transport.
+
+The script verifies health, exact CORS, authentication, the bounded status
+shape, exact replay, changed-payload conflict, wrong binding, cross-project
+routing, capability revocation, rejection of shell/filesystem/mutation inputs,
+and zero Web Sol queue pollution. It deliberately labels browser UI round-trip
+as not run; only real Chrome/Tampermonkey acceptance may establish that claim.
+
+Focused checks:
+
+```powershell
+python -m unittest tests_py.test_p19_3_browser_control
+python -m unittest tests_py.test_p13_web_bridge_adapter tests_py.test_p13_software_acceptance
+node --check browser/chatgpt-web-adapter.user.js
+python -m compileall -q src tests_py ops
+git diff --check
+```
 
 Evidence artifacts:
+
 - `docs/evidence/P19_3_BROWSER_CONTROL_ACCEPTANCE.json`
 - `docs/evidence/P19_3_BROWSER_CONTROL_OPERATIONS.ndjson`
+- live-browser observations in `agent/result.md` and the P19.3 handoff
 
-### Focused & Regression Test Suites
-```powershell
-python -m unittest tests_py/test_p19_3_browser_control.py
-python -m unittest tests_py/test_p19_2_remote_mcp.py
-python -m unittest tests_py/test_p19_web_console.py
-python -m unittest tests_py/test_p18_external_control.py
-python -m unittest tests_py/test_bridge_http.py
-python -m unittest tests_py/test_chatgpt_web_adapter.py
-node --check browser/chatgpt-web-adapter.user.js
-```
+## Deferred mutation phase
+
+Pause/resume/continue/retry/rereview/reconcile are not exposed by the current
+browser slice. A later mutation phase must reuse existing project-control
+commands, advertised capabilities, expected identity/revision guards, stale
+state protection, and human confirmation where appropriate. The userscript
+must never decide lifecycle transitions itself.

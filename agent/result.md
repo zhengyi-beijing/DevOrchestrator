@@ -1,6 +1,60 @@
 # DevOrchestrator Self-Hosting Result Log
 
-P19.3 ChatGPT Plus Browser Control Bridge (implementation & acceptance complete 2026-09-30):
+P19.3 live browser acceptance closeout (2026-10-03):
+- **READ-ONLY LIVE ACCEPTANCE: PASS.** Real ChatGPT Web same-conversation round trip succeeded with `req-20261003-p193-e2e-007`; returned branch `main`, HEAD `d17dd3e478703377fc15821ae61f0eacb8a1ea6c`, `READY_TO_RUN`, `current_task=P19.2`, `active_execution=null`, and live exact binding.
+- **Multi-tab isolation: PASS.** Two active tabs were present; the visible bound tab dispatched once and confirmed once, while the second active tab dispatched zero browser-control actions.
+- **Daemon restart recovery: PASS.** Daemon PID `11444` restarted as PID `27944`; heartbeat/session returned to live without rebinding or manual re-pairing; `req-20261003-p193-e2e-008` then completed another successful same-conversation browser round trip.
+- Browser acceptance `e2e-007/e2e-008` was captured on userscript `0.1.25`. Final-review remediation `0.1.26` is now installed; it retains the accepted behavior and additionally routes roleless composer self-injection detection through `findComposer()`.
+- Final related regression after review remediation: **109 passed in 23.59 s**; JavaScript syntax and `git diff --check` passed. The authoritative WebBridge idempotency hash now excludes freshness-only `issued_at`; a live 8765 double-submit probe with one request ID and two different fresh timestamps returned `200/200`, identical responses, and no conflict.
+- RDC was used for setup/diagnostics and daemon restart orchestration, but the accepted `e2e-007`/`e2e-008` action transports themselves were the browser bridge path, not RDC.
+- P19.3 is complete for its defined read-only `get_project_status` scope; mutation workflows remain out of scope.
+
+P19.3 local bootstrap and expiry remediation (2026-10-01):
+- **Design complete: yes. Implementation complete: yes. Focused tests: pass.**
+  Expired capability IDs now resolve to non-authorizing `UNKNOWN`, while bearer
+  validation still denies them with an explicit expiry reason.
+- Added an explicit owner CLI command that creates a non-secret, exact
+  project/`chatgpt_web`/binding permit for at most 60 seconds. Heartbeats only
+  report pending state; they never create authority. Exact verified live-session
+  ownership is required, redemption is atomic/single-use, and the resulting
+  read-only bearer remains only in Tampermonkey storage.
+- Replay, expiry, wrong project/binding/adapter, wrong heartbeat owner, invalid
+  origin, and unbound/stale owner CLI requests fail closed. Manual Tampermonkey
+  pairing remains as fallback. No shell, filesystem, URL dispatch, lifecycle
+  authority, or 8770 WebBridge checks were weakened.
+- Required suite: 85 passed in 18.33 seconds. New focused subset: 8 passed in
+  1.50 seconds. Node syntax, Python compilation, and `git diff --check` passed.
+- Historical state as of 2026-10-01: real browser E2E and RDC replacement were
+  not yet proven. This is superseded by the 2026-10-03 closeout above, which
+  records same-conversation E2E, multi-tab isolation, and daemon-restart recovery
+  as live-proven.
+
+P19.3 read-only Browser Control remediation result (2026-09-30, authoritative update):
+- **Implementation: complete.** The first-phase browser surface is now only
+  `get_project_status`; 8765 is a strict loopback translator into the existing
+  authenticated 8770 WebBridge ingress and owns no lifecycle authority.
+- **Automated verification: complete.** Full regression passed 1569 tests in
+  863.439 seconds. Focused coverage verifies valid/malformed/unsupported input,
+  wrong conversation, stale session, cross-project denial, durable idempotency,
+  duplicate-result/reload behavior, no shell/filesystem/mutation surface, and
+  no lifecycle dispatch in 8765.
+- **Runtime transport acceptance: pending live presence.** After the canonical
+  daemon restart, the durable binding correctly reported `stale`; the transport
+  acceptance refused to manufacture a heartbeat and stopped fail-closed.
+- **Live browser E2E: blocked, not claimed.** Real Chrome/Tampermonkey setup was
+  attempted without RDC, native MCP, or OpenAI API use. Existing Chrome
+  ChatGPT and Google sessions were expired, so the browser is at interactive
+  sign-in. Same-conversation result return, reload recovery, daemon-restart
+  recovery, and multi-tab isolation remain unproven until the owner signs in.
+- **RDC replacement verdict:** read-only design and implementation are complete;
+  RDC replacement is not yet proven because the required browser round trip has
+  not passed. Mutation workflows remain explicitly out of scope.
+- Updated implementation/design: `browser/chatgpt-web-adapter.user.js`,
+  `src/dev_orchestrator/bridge/server.py`, `src/dev_orchestrator/daemon.py`,
+  `src/dev_orchestrator/control/{adapter,browser_control,web_bridge}.py`,
+  `ops/p19_3_browser_control_acceptance.py`, tests, and P19.3/P13 docs.
+
+Historical P19.3 broad-control result (superseded by the read-only remediation above):
 - Review remediation completed after the initial acceptance: enforced loopback
   peers on the 8765 control routes, replaced prefix CORS matching with exact
   parsed origins, removed model-controlled `innerHTML` from the confirmation
@@ -8,7 +62,7 @@ P19.3 ChatGPT Plus Browser Control Bridge (implementation & acceptance complete 
   and delayed processed markers until result-turn delivery is confirmed.
 - Regression evidence: 22/22 focused P19.3 tests passed; the full `tests_py`
   suite passed with 1665 tests and 109 subtests. Post-remediation live
-  acceptance passed all 19 steps on 2026-09-30 (`20260930T041210Z`), including
+  acceptance passed all 19 steps on 2026-09-30, including
   suffix-spoofed Origin rejection, 6 native operations, and 0 RDC calls.
   The existing Chrome Tampermonkey profile still requires the userscript
   0.1.15 update and an interactive browser check.

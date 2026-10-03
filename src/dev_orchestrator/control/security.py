@@ -53,6 +53,8 @@ def _host_identity(value: str) -> str:
 class ControlSecurity:
     SESSION_TTL_SECONDS = 15 * 60
     PAIRING_TTL_SECONDS = 5 * 60
+    WEB_BRIDGE_BOOTSTRAP_TTL_SECONDS = 60
+    WEB_BRIDGE_CAPABILITY_TTL_SECONDS = 3600
 
     def __init__(self, runtime_root: Path | str | None = None) -> None:
         if runtime_root is None:
@@ -150,6 +152,7 @@ class ControlSecurity:
             "version": 1,
             "pairings": {},
             "capabilities": {},
+            "web_bridge_bootstrap_grants": {},
             "mobile_pairings": {},
             "mobile_devices": {},
             "mobile_revocation_generation": 0,
@@ -177,6 +180,7 @@ class ControlSecurity:
             "version": 1,
             "pairings": val.get("pairings") if isinstance(val.get("pairings"), dict) else {},
             "capabilities": val.get("capabilities") if isinstance(val.get("capabilities"), dict) else {},
+            "web_bridge_bootstrap_grants": val.get("web_bridge_bootstrap_grants") if isinstance(val.get("web_bridge_bootstrap_grants"), dict) else {},
             "mobile_pairings": val.get("mobile_pairings") if isinstance(val.get("mobile_pairings"), dict) else {},
             "mobile_devices": val.get("mobile_devices") if isinstance(val.get("mobile_devices"), dict) else {},
             "mobile_revocation_generation": int(val.get("mobile_revocation_generation", 0)),
@@ -188,6 +192,17 @@ class ControlSecurity:
     def _pairings(self) -> dict[str, Any]:
         val = self._load_canonical_pairings(for_mutation=True)
         return val if isinstance(val, dict) else self._empty_pairings()
+
+    @staticmethod
+    def _row_is_expired(row: dict[str, Any], *, now: float | None = None) -> bool:
+        """Treat a present but malformed expiry as expired (fail closed)."""
+        if "expires_at_epoch" not in row:
+            return False
+        try:
+            expires_at = float(row.get("expires_at_epoch"))
+        except (TypeError, ValueError):
+            return True
+        return expires_at <= (time.time() if now is None else now)
 
     def capability_state(self, pairing_id: str) -> CapabilityVerdict:
         """Return the structured capability verdict for a pairing_id."""
@@ -215,6 +230,11 @@ class ControlSecurity:
             return CapabilityVerdict.UNKNOWN
         if row.get("revoked"):
             return CapabilityVerdict.REVOKED
+        if self._row_is_expired(row):
+            # There is no EXPIRED member in the established verdict vocabulary.
+            # UNKNOWN is the existing non-authorizing state for a token/grant that
+            # is no longer usable without misreporting expiry as revocation.
+            return CapabilityVerdict.UNKNOWN
         return CapabilityVerdict.VALID
 
     def capability_status(self, header_or_token: str | None) -> tuple[CapabilityVerdict, str, dict[str, Any] | None]:
@@ -261,6 +281,8 @@ class ControlSecurity:
 
             if row.get("revoked"):
                 return CapabilityVerdict.REVOKED, "capability revoked", row
+            if self._row_is_expired(row, now=now):
+                return CapabilityVerdict.UNKNOWN, "capability expired", row
 
             return CapabilityVerdict.VALID, "valid", row
 
@@ -314,6 +336,8 @@ class ControlSecurity:
                 return False, "cannot renew: unknown or previous token", None
             if matched_row.get("revoked"):
                 return False, "cannot renew: capability revoked", None
+            if self._row_is_expired(matched_row, now=now):
+                return False, "cannot renew: capability expired", None
 
             new_token = secrets.token_urlsafe(32)
             matched_row["previous_token_hash"] = matched_row.get("token_hash")
@@ -393,34 +417,221 @@ class ControlSecurity:
         if not adapter or not isinstance(adapter, str):
             raise ValueError("adapter must be a nonblank string")
 
-        cap_id = secrets.token_urlsafe(12)
-        token = secrets.token_urlsafe(32)
         ttl = max(60, min(86400 * 30, int(expires_in_seconds)))
 
         with InterProcessFileLock(self.lock_path):
             data = self._pairings()
-            data["capabilities"][cap_id] = {
-                "capability_id": cap_id,
-                "token_hash": _digest(token),
-                "scope": "web_bridge_control",
-                "project_id": project_id.strip(),
-                "binding_id": binding_id.strip(),
-                "adapter": adapter.strip(),
-                "created_at": utc_now_iso(),
-                "expires_at_epoch": time.time() + ttl,
-                "revoked": False,
-            }
+            result = self._mint_web_bridge_capability_in_data(
+                data,
+                project_id=project_id.strip(),
+                binding_id=binding_id.strip(),
+                adapter=adapter.strip(),
+                expires_in_seconds=ttl,
+            )
             write_json(self.pairings_path, data, indent=2)
 
+        return result
+
+    @staticmethod
+    def _mint_web_bridge_capability_in_data(
+        data: dict[str, Any],
+        *,
+        project_id: str,
+        binding_id: str,
+        adapter: str,
+        expires_in_seconds: int,
+    ) -> dict[str, Any]:
+        """Mint into an already locked canonical document, disclosing the token once."""
+        cap_id = secrets.token_urlsafe(12)
+        token = secrets.token_urlsafe(32)
+        ttl = max(60, min(86400 * 30, int(expires_in_seconds)))
+        data.setdefault("capabilities", {})[cap_id] = {
+            "capability_id": cap_id,
+            "token_hash": _digest(token),
+            "scope": "web_bridge_control",
+            "project_id": project_id,
+            "binding_id": binding_id,
+            "adapter": adapter,
+            "created_at": utc_now_iso(),
+            "expires_at_epoch": time.time() + ttl,
+            "revoked": False,
+        }
         return {
             "capability_id": cap_id,
             "token": token,
             "scope": "web_bridge_control",
-            "project_id": project_id.strip(),
-            "binding_id": binding_id.strip(),
-            "adapter": adapter.strip(),
+            "project_id": project_id,
+            "binding_id": binding_id,
+            "adapter": adapter,
             "expires_in_seconds": ttl,
         }
+
+    @staticmethod
+    def _clean_web_bridge_identity(project_id: Any, binding_id: Any, adapter: Any) -> tuple[str, str, str]:
+        values = []
+        for name, value in (("project_id", project_id), ("binding_id", binding_id), ("adapter", adapter)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a nonblank string")
+            values.append(value.strip())
+        return values[0], values[1], values[2]
+
+    def create_web_bridge_bootstrap(
+        self,
+        project_id: str,
+        binding_id: str,
+        adapter: str,
+        *,
+        expires_in_seconds: int = 60,
+    ) -> dict[str, Any]:
+        """Owner-authorize one short-lived, non-secret bootstrap permit."""
+        project_id, binding_id, adapter = self._clean_web_bridge_identity(project_id, binding_id, adapter)
+        if adapter != "chatgpt_web":
+            raise ValueError("web bridge bootstrap adapter must be chatgpt_web")
+        ttl = max(1, min(self.WEB_BRIDGE_BOOTSTRAP_TTL_SECONDS, int(expires_in_seconds)))
+        now = time.time()
+
+        with InterProcessFileLock(self.lock_path):
+            data = self._pairings()
+            grants = data.setdefault("web_bridge_bootstrap_grants", {})
+            for row in grants.values():
+                if (
+                    isinstance(row, dict)
+                    and not row.get("used")
+                    and "expires_at_epoch" in row
+                    and not self._row_is_expired(row, now=now)
+                    and row.get("project_id") == project_id
+                    and row.get("binding_id") == binding_id
+                    and row.get("adapter") == adapter
+                ):
+                    return {
+                        "status": "pending",
+                        "project_id": project_id,
+                        "binding_id": binding_id,
+                        "adapter": adapter,
+                        "expires_in_seconds": max(0, int(float(row["expires_at_epoch"]) - now)),
+                    }
+
+            grant_id = secrets.token_urlsafe(12)
+            grants[grant_id] = {
+                "grant_id": grant_id,
+                "scope": "web_bridge_control_bootstrap",
+                "project_id": project_id,
+                "binding_id": binding_id,
+                "adapter": adapter,
+                "created_at": utc_now_iso(),
+                "expires_at_epoch": now + ttl,
+                "used": False,
+            }
+            write_json(self.pairings_path, data, indent=2)
+        return {
+            "status": "pending",
+            "project_id": project_id,
+            "binding_id": binding_id,
+            "adapter": adapter,
+            "expires_in_seconds": ttl,
+        }
+
+    def web_bridge_bootstrap_status(
+        self,
+        project_id: str,
+        binding_id: str,
+        adapter: str,
+    ) -> dict[str, Any]:
+        """Return non-secret availability for the exact bootstrap tuple."""
+        project_id, binding_id, adapter = self._clean_web_bridge_identity(project_id, binding_id, adapter)
+        data = self._load_canonical_pairings(for_mutation=False)
+        now = time.time()
+        grants = data.get("web_bridge_bootstrap_grants", {}) if isinstance(data, dict) else {}
+        available = any(
+            isinstance(row, dict)
+            and row.get("scope") == "web_bridge_control_bootstrap"
+            and not row.get("used")
+            and "expires_at_epoch" in row
+            and not self._row_is_expired(row, now=now)
+            and row.get("project_id") == project_id
+            and row.get("binding_id") == binding_id
+            and row.get("adapter") == adapter
+            for row in grants.values()
+        )
+        return {
+            "available": available,
+            "project_id": project_id,
+            "binding_id": binding_id,
+            "adapter": adapter,
+        }
+
+    def redeem_web_bridge_bootstrap(
+        self,
+        header_or_token: str | None,
+        project_id: str,
+        binding_id: str,
+        adapter: str,
+        *,
+        capability_expires_in_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically consume an exact bootstrap grant and mint its control token."""
+        project_id, binding_id, adapter = self._clean_web_bridge_identity(project_id, binding_id, adapter)
+        if not isinstance(header_or_token, str) or not header_or_token.strip():
+            raise ValueError("valid heartbeat capability required")
+        token = header_or_token[7:].strip() if header_or_token.startswith("Bearer ") else header_or_token.strip()
+        if not token:
+            raise ValueError("valid heartbeat capability required")
+        digest = _digest(token)
+        now = time.time()
+
+        with InterProcessFileLock(self.lock_path):
+            data = self._pairings()
+            heartbeat_row = None
+            for row in data.get("capabilities", {}).values():
+                if not isinstance(row, dict) or row.get("scope") != "session_heartbeat":
+                    continue
+                primary = hmac.compare_digest(str(row.get("token_hash") or ""), digest)
+                try:
+                    previous = bool(
+                        row.get("previous_token_hash")
+                        and hmac.compare_digest(str(row.get("previous_token_hash")), digest)
+                        and now < float(row.get("previous_token_expires_at") or 0)
+                    )
+                except (TypeError, ValueError):
+                    previous = False
+                if primary or previous:
+                    heartbeat_row = row
+                    break
+            if (
+                heartbeat_row is None
+                or heartbeat_row.get("revoked")
+                or self._row_is_expired(heartbeat_row, now=now)
+            ):
+                raise ValueError("valid heartbeat capability required")
+
+            grants = data.setdefault("web_bridge_bootstrap_grants", {})
+            grant = next((
+                row for row in grants.values()
+                if isinstance(row, dict)
+                and not row.get("used")
+                and "expires_at_epoch" in row
+                and not self._row_is_expired(row, now=now)
+                and row.get("scope") == "web_bridge_control_bootstrap"
+                and row.get("project_id") == project_id
+                and row.get("binding_id") == binding_id
+                and row.get("adapter") == adapter
+            ), None)
+            if grant is None:
+                raise ValueError("bootstrap grant missing, expired, already used, or mismatched")
+
+            # Consumption and token creation are one canonical-store write, so
+            # concurrent/replayed redemption cannot observe a reusable grant.
+            grant["used"] = True
+            grant["used_at"] = utc_now_iso()
+            result = self._mint_web_bridge_capability_in_data(
+                data,
+                project_id=project_id,
+                binding_id=binding_id,
+                adapter=adapter,
+                expires_in_seconds=capability_expires_in_seconds or self.WEB_BRIDGE_CAPABILITY_TTL_SECONDS,
+            )
+            write_json(self.pairings_path, data, indent=2)
+        return result
 
     def validate_web_bridge_capability(
         self,
@@ -453,8 +664,7 @@ class ControlSecurity:
                 continue
 
             # Check expiration
-            expires_at = float(row.get("expires_at_epoch") or 0)
-            if expires_at <= now:
+            if self._row_is_expired(row, now=now):
                 return False, "capability token expired", None
 
             # Check project match

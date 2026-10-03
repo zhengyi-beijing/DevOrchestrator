@@ -605,6 +605,7 @@ def run_daemon(
             bridge_store,
             runtime_root=runtime,
             config_path=config,
+            control_base_url=f"http://127.0.0.1:{server.server_address[1]}",
         )
     except Exception:
         # Never leave a live-looking pid file behind when a bind fails.

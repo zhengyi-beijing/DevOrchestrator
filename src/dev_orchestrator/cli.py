@@ -674,6 +674,35 @@ def cmd_create_web_bridge_capability(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_create_web_bridge_bootstrap(args: argparse.Namespace) -> int:
+    """Owner-authorize one short-lived bootstrap for an exact live binding."""
+    runtime = resolve_runtime_root(args.runtime_root)
+    from dev_orchestrator.control.security import ControlSecurity
+    from dev_orchestrator.control.store import ConversationControlStore
+    store = ConversationControlStore(runtime)
+    bound = store.binding_for_project(args.project_id)
+    if (
+        not isinstance(bound, dict)
+        or bound.get("adapter") != args.adapter
+        or bound.get("binding_id") != args.binding_id
+    ):
+        raise CliError("project is not owner-bound to the specified adapter and conversation")
+    session = store.session_status(args.adapter, args.binding_id)
+    if session.get("state") != "live" or not session.get("verified"):
+        raise CliError("specified conversation binding is not live and heartbeat-verified")
+    try:
+        res = ControlSecurity(runtime).create_web_bridge_bootstrap(
+            args.project_id,
+            args.binding_id,
+            args.adapter,
+            expires_in_seconds=args.ttl,
+        )
+    except ValueError as exc:
+        raise CliError(str(exc)) from exc
+    _print_json(res)
+    return 0
+
+
 def cmd_revoke_web_bridge_capability(args: argparse.Namespace) -> int:
     runtime = resolve_runtime_root(args.runtime_root)
     from dev_orchestrator.control.security import ControlSecurity
@@ -2012,7 +2041,11 @@ def cmd_websol_probe(args: argparse.Namespace) -> int:
     from dev_orchestrator.core.websol_health import WebSolHealthStore
     from dev_orchestrator.core.websol_probe import run_websol_probe
 
-    bridge_store = BrowserBridgeStore(runtime)
+    # The unified daemon and the :8765 listener persist Browser Bridge queues
+    # below ``runtime/bridge``.  Point the CLI at that same store; using the
+    # runtime root creates a second empty queues/presence tree and makes a live
+    # browser binding look unbound.
+    bridge_store = BrowserBridgeStore(runtime / "bridge")
     health_store = WebSolHealthStore(runtime)
 
     project_id = getattr(args, "project_id", None)
@@ -2264,6 +2297,16 @@ def build_parser() -> argparse.ArgumentParser:
     create_cap.add_argument("--adapter", default="chatgpt_web", help="control adapter name")
     create_cap.add_argument("--ttl", type=int, default=3600, help="time-to-live in seconds")
     create_cap.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
+
+    create_bootstrap = sub.add_parser(
+        "create-web-bridge-bootstrap",
+        help="authorize one short-lived read-only browser bootstrap for an exact live binding",
+    )
+    create_bootstrap.add_argument("project_id", help="target project ID")
+    create_bootstrap.add_argument("binding_id", help="browser conversation binding ID")
+    create_bootstrap.add_argument("--adapter", default="chatgpt_web", help="control adapter name")
+    create_bootstrap.add_argument("--ttl", type=int, default=60, help="bootstrap TTL in seconds (maximum: 60)")
+    create_bootstrap.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
     revoke_cap = sub.add_parser("revoke-web-bridge-capability", help="revoke an active capability token")
     revoke_cap.add_argument("capability_id", help="capability ID to revoke")
@@ -2612,6 +2655,7 @@ _COMMANDS = {
     "mcp-token": cmd_mcp_token,
     "browser-token": cmd_browser_token,
     "create-web-bridge-capability": cmd_create_web_bridge_capability,
+    "create-web-bridge-bootstrap": cmd_create_web_bridge_bootstrap,
     "revoke-web-bridge-capability": cmd_revoke_web_bridge_capability,
     "mobile-pair": cmd_mobile_pair,
     "import-rdc-evidence": cmd_import_rdc_evidence,

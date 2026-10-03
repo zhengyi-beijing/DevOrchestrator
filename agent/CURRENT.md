@@ -1,6 +1,30 @@
 # DevOrchestrator Self-Hosted Development State
 
-P19.3 ChatGPT Plus Browser Control Bridge (2026-09-30):
+P19.3 read-only Browser Control Bridge live closeout (2026-10-03, authoritative update):
+- Status: **COMPLETE / LIVE_BROWSER_E2E_PASS**.
+- Audit found that the prior 8765 implementation was not an adapter over the
+  authoritative 8770 WebBridge path: it accepted a project-only browser token,
+  dispatched jobs/files directly, and did not include or enforce the current
+  conversation binding. Prior server-only evidence therefore does not prove
+  ChatGPT Web -> Tampermonkey -> 8765 -> 8770 -> same-conversation operation.
+- The remediated first phase is intentionally read-only. The userscript accepts
+  only `get_project_status`, derives the current `/c/<binding_id>` URL, attaches
+  the exact binding and a fresh timestamp, and stores processed request IDs per
+  conversation. Port 8765 performs strict schema translation and fixed loopback
+  forwarding to 8770 `POST /api/v1/control/web-bridge/requests`; it has no
+  lifecycle, job, shell, filesystem, or generic-proxy dispatch.
+- Port 8770 remains the sole authority and checks the project-and-conversation
+  bound `web_bridge_control` capability, durable runtime binding, live session,
+  freshness, and request-ID idempotency. `project_status` returns a field-bounded
+  projection of Git, task/lifecycle/readiness, active execution/roles/resources,
+  watchdog, and conversation binding/session state.
+- Live browser acceptance is complete. `req-20261003-p193-e2e-007` and restart-recovery `e2e-008` were accepted on userscript `0.1.25`; post-acceptance final review installed `0.1.26`.
+- Multi-tab isolation is live-proven with two active tabs: the visible bound tab dispatched/confirmed once; the other active tab dispatched zero actions.
+- Daemon restart recovery is live-proven: PID `11444` restarted as PID `27944`; heartbeat automatically returned the durable binding to `live` without rebinding or manual re-pairing, and `req-20261003-p193-e2e-008` completed a second successful same-conversation round trip.
+- Final review fixed the remaining design-level replay issue: WebBridge freshness metadata `issued_at` is still validated on every request but is excluded from the semantic idempotency hash. A real 8765 runtime probe with one request ID and two distinct fresh timestamps returned `200/200`, identical cached responses, and no 409. Roleless self-injection detection now uses the current `findComposer()` path. Final related regression: **109 passed in 23.59 seconds**; userscript syntax and `git diff --check` pass. P19.3 remains complete for the defined read-only scope; mutation remains out of scope.
+- Authoritative design: `docs/P19_3_BROWSER_CONTROL_DESIGN.md`.
+
+Historical P19.3 broad-control implementation claims (superseded by the read-only remediation above):
 - Status: **REMEDIATION_COMPLETE** (server-side live acceptance passed after
   remediation; browser userscript update and interactive verification pending).
 - Review remediation:
@@ -35,12 +59,16 @@ P19.3 ChatGPT Plus Browser Control Bridge (2026-09-30):
 - Verification & Acceptance:
   - Remediation acceptance passed all 19 live steps on 2026-09-30 against the
     restarted loopback bridge (:8765) and daemon (:8770), including the new
-    suffix-spoofed-Origin rejection step. The evidence artifacts now record
-    this run (`20260930T041210Z`): 6 native operations, 0 RDC calls, enforced
+    suffix-spoofed-Origin rejection step. The latest evidence artifacts record
+    6 native operations, 0 RDC calls, enforced
     confirmation gate, Web Sol isolation, and capability revocation.
   - The Chrome Tampermonkey store predates the userscript 0.1.15 update. A
     browser interaction tool is needed to install and verify the updated
     script in the existing Chrome profile.
+  - Antigravity currently launches additional daemon processes against the
+    same `runtime` and loopback ports. The live acceptance above passed, but
+    one-daemon operational stability requires the concurrent Antigravity
+    launch activity to stop before final browser signoff.
   - Acceptance evidence: `docs/evidence/P19_3_BROWSER_CONTROL_ACCEPTANCE.json` and `docs/evidence/P19_3_BROWSER_CONTROL_OPERATIONS.ndjson` (result PASS, 6 native operations, 100% `local`, 0 RDC calls, confirmation gate enforced, channel isolation enforced).
   - Focused P19.3 suite: 22/22 passed. Full regression: 1665 passed and
     109 subtests passed. Adjacent P18/P19.2/Web Console/Bridge/Daemon/Adapter
@@ -92,7 +120,7 @@ P18 External Control Entrypoint closeout (2026-09-29):
 - Runtime mode: self-hosted canonical daemon on 8770 with AIBroker diagnostics on 8875.
 - Historical detached worktree C:\work\github\DevOrchestrator is not an active controller.
 
-Current task: **P19.3 ChatGPT Plus Browser Control Bridge** (Status: **COMPLETE**). Previous task: **P19.2 Remote MCP Interface** (Status: **REMEDIATION_COMPLETE**).
+Current closeout: **P19.3 ChatGPT Plus Browser Control Bridge** (Status: **COMPLETE / LIVE_BROWSER_E2E_PASS**, read-only scope). Runtime lifecycle still reports `current_task=P19.2`; this documentation closeout does not mutate lifecycle authority.
 
 P18 Owner-Authorized Technical Review Remediation Evidence (2026-09-28):
 - Addressed exactly the four remaining blockers from Claude Opus review `ai_review:ai_review:ai_review:ai_review:wd-plan-20875e9b2e8eb3ea-1:execute` at `d3ecdb9` without reopening planning:

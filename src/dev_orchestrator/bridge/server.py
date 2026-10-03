@@ -31,6 +31,7 @@ No generic prompt endpoint or arbitrary shell/Worker execution is exposed.
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 from dataclasses import asdict
@@ -41,13 +42,10 @@ from urllib.parse import parse_qs, urlsplit
 
 from dev_orchestrator.bridge.store import BridgeConflictError, BrowserBridgeStore
 from dev_orchestrator.control.browser_control import (
-    BrowserControlConflictError,
-    BrowserControlConfirmationRequiredError,
     BrowserControlError,
-    BrowserControlService,
     MAX_REQUEST_BYTES,
+    to_web_bridge_request,
 )
-from dev_orchestrator.control.security import validate_browser_control_capability
 
 _ALLOW = "GET, POST, OPTIONS"
 
@@ -105,22 +103,19 @@ class BridgeHTTPServer(ThreadingHTTPServer):
         store: BrowserBridgeStore,
         runtime_root: Optional[Path | str] = None,
         config_path: Optional[Path | str] = None,
+        control_base_url: str = "http://127.0.0.1:8770",
     ) -> None:
         self.store = store
         self.runtime_root = Path(runtime_root) if runtime_root else Path(store.root).parent
         self.config_path = Path(config_path) if config_path else None
-        self._browser_control_service: Optional[BrowserControlService] = None
+        parsed_control = urlsplit(control_base_url)
+        if parsed_control.scheme != "http" or not _is_loopback_address(parsed_control.hostname or ""):
+            raise ValueError("browser bridge control target must be loopback HTTP")
+        if parsed_control.path not in ("", "/") or parsed_control.query or parsed_control.fragment:
+            raise ValueError("browser bridge control target must not contain a path, query, or fragment")
+        self.control_host = parsed_control.hostname or "127.0.0.1"
+        self.control_port = parsed_control.port or 8770
         super().__init__(server_address, _BridgeHandler)
-
-    @property
-    def browser_control_service(self) -> BrowserControlService:
-        if self._browser_control_service is None:
-            self._browser_control_service = BrowserControlService(
-                runtime_root=self.runtime_root,
-                config_path=self.config_path,
-                bridge_store=self.store,
-            )
-        return self._browser_control_service
 
 
 class _BridgeHandler(BaseHTTPRequestHandler):
@@ -300,7 +295,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             return None
         try:
             raw = self.rfile.read(length)
-        except OSError:
+        except (OSError, http.client.HTTPException):
             return None
         try:
             data = json.loads(raw.decode("utf-8"))
@@ -399,36 +394,46 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             self._error(400, "Bad Request", "request body must be valid JSON object", extra_headers=cors)
             return
 
-        auth_header = self.headers.get("Authorization")
-        project_id = payload.get("project_id") or "devorchestrator"
-        action = payload.get("action")
-        auth_ok, auth_reason, cap_row = validate_browser_control_capability(
-            auth_header,
-            project_id=str(project_id) if project_id else None,
-            action=str(action) if action else None,
-            runtime_root=self.server.runtime_root,
-        )
-        if not auth_ok:
-            self._error(401, "Unauthorized", f"browser control unauthorized: {auth_reason}", extra_headers=cors)
-            return
-
-        cap_id = cap_row.get("capability_id", "unknown") if cap_row else "unknown"
-        service = self.server.browser_control_service
         try:
-            res = service.execute_action(
-                payload,
-                host_id="bridge-local",
-                capability_id=cap_id,
-            )
-            self._send(200, "OK", _json_bytes(res), extra_headers=cors)
-        except BrowserControlConfirmationRequiredError as exc:
-            self._send(400, "Confirmation Required", _json_bytes(exc.to_dict()), extra_headers=cors)
-        except BrowserControlConflictError as exc:
-            self._send(409, "Conflict", _json_bytes(exc.to_dict()), extra_headers=cors)
+            web_bridge_request = to_web_bridge_request(payload)
         except BrowserControlError as exc:
             self._send(exc.status_code, exc.reason, _json_bytes(exc.to_dict()), extra_headers=cors)
-        except Exception as exc:
-            self._send(500, "Internal Server Error", _json_bytes({"error": "internal_error", "message": str(exc)}), extra_headers=cors)
+            return
+
+        # 8765 is transport only.  Forward one fixed, structured request to the
+        # authoritative 8770 WebBridge ingress.  The browser capability is never
+        # exposed to the page DOM and is validated by 8770 against the exact
+        # project, conversation binding, live session, and capability scope.
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": "https://chatgpt.com",
+        }
+        auth_header = self.headers.get("Authorization")
+        if auth_header:
+            headers["Authorization"] = auth_header
+        conn = http.client.HTTPConnection(self.server.control_host, self.server.control_port, timeout=10)
+        try:
+            conn.request(
+                "POST",
+                "/api/v1/control/web-bridge/requests",
+                body=_json_bytes(web_bridge_request),
+                headers=headers,
+            )
+            response = conn.getresponse()
+            response_body = response.read()
+            reason = response.reason or "HTTP Response"
+            self._send(response.status, reason, response_body, extra_headers=cors)
+        except OSError:
+            self._send(
+                503,
+                "Service Unavailable",
+                _json_bytes({"status": "error", "reason": "control_api_unavailable"}),
+                extra_headers=cors,
+            )
+        finally:
+            conn.close()
+
 
 
 def make_bridge_server(
@@ -437,6 +442,10 @@ def make_bridge_server(
     store: BrowserBridgeStore,
     runtime_root: Optional[Path | str] = None,
     config_path: Optional[Path | str] = None,
+    control_base_url: str = "http://127.0.0.1:8770",
 ) -> BridgeHTTPServer:
     """Create (and bind) the bridge server owning ``store``."""
-    return BridgeHTTPServer((host, port), store, runtime_root=runtime_root, config_path=config_path)
+    return BridgeHTTPServer(
+        (host, port), store, runtime_root=runtime_root, config_path=config_path,
+        control_base_url=control_base_url,
+    )

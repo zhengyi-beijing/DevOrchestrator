@@ -54,10 +54,10 @@ The daemon exposes a read-only paginated logs route backed by durable evidence f
   transport listener. P19.3 adds only the closed browser-control endpoints
   `GET /v1/control/health`, `OPTIONS /v1/control/action`, and
   `POST /v1/control/action`; those routes require a loopback peer, exact allowed
-  browser origin when `Origin` is present, a separately scoped browser-control
-  capability, and the P19.3 confirmation/idempotency gates. They may inspect
-  state or operate allowlisted execution jobs, but expose no lifecycle command
-  or lifecycle-authority surface. General control ingress remains on port 8770.
+  browser origin when `Origin` is present, and accept only
+  `get_project_status`. Port 8765 strictly translates that envelope and forwards
+  it to the fixed 8770 WebBridge ingress; it has no job, filesystem, shell,
+  lifecycle-command, generic-URL, or lifecycle-authority surface.
 - **WebBridge Control Capability**:
   - Distinct from the heartbeat-only capability (`session_heartbeat`).
   - Owner-created, hash-only (`web_bridge_control`), revocable, and bound to an exact `project_id` and live `conversation_binding`.

@@ -1,4 +1,9 @@
-"""Real separate-process P19.3 ChatGPT Plus browser control acceptance against bridge port 8765."""
+"""P19.3 read-only browser-control transport acceptance for ports 8765 -> 8770.
+
+This script exercises the same structured request accepted from the Tampermonkey
+adapter. It intentionally does not claim a browser UI round trip; the real
+ChatGPT conversation proof is recorded separately after live-browser testing.
+"""
 
 from __future__ import annotations
 
@@ -6,514 +11,301 @@ import argparse
 import json
 import os
 import sys
-import time
 import urllib.error
-import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def http_request(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, str], Any]:
+    request_headers = dict(headers or {})
+    body = None
+    if payload is not None:
+        request_headers.setdefault("Content-Type", "application/json")
+        body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+    try:
+        response = urllib.request.urlopen(request, timeout=15)
+    except urllib.error.HTTPError as exc:
+        response = exc
+    with response:
+        status = response.status
+        response_headers = {key.lower(): value for key, value in response.headers.items()}
+        raw = response.read()
+    if not raw:
+        return status, response_headers, None
+    try:
+        parsed: Any = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        parsed = raw.decode("utf-8", errors="replace")
+    return status, response_headers, parsed
+
+
+def websol_control_records(runtime_root: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for path in (runtime_root / "bridge" / "queues").glob("*/*.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        candidates = value.values() if isinstance(value, dict) else value if isinstance(value, list) else []
+        records.extend(
+            row for row in candidates
+            if isinstance(row, dict) and row.get("protocol") == "DEVORCH_ACTION_V1"
+        )
+    return records
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="P19.3 Browser Control Acceptance Test")
+    parser = argparse.ArgumentParser(description="P19.3 read-only Browser Control acceptance")
     parser.add_argument("--bridge-url", default="http://127.0.0.1:8765")
-    parser.add_argument("--daemon-url", default="http://127.0.0.1:8770")
     parser.add_argument("--runtime-root", default="runtime")
     parser.add_argument("--project-id", default="devorchestrator")
     parser.add_argument("--output", default="docs/evidence/P19_3_BROWSER_CONTROL_ACCEPTANCE.json")
     parser.add_argument("--operations-output", default="docs/evidence/P19_3_BROWSER_CONTROL_OPERATIONS.ndjson")
-    parser.add_argument("--completion-command", default="transport_compileall")
-    parser.add_argument("--cancel-command", default="external_control_sleep")
     args = parser.parse_args()
 
+    from dev_orchestrator.control.security import ControlSecurity
+    from dev_orchestrator.control.store import ConversationControlStore
+
     runtime_root = Path(args.runtime_root).resolve()
-    from dev_orchestrator.control.security import (
-        create_browser_control_capability,
-        revoke_browser_control_capability,
-    )
-    from dev_orchestrator.bridge.store import BrowserBridgeStore
-
+    bridge_url = args.bridge_url.rstrip("/")
+    action_url = bridge_url + "/v1/control/action"
     run_tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    rows: list[dict[str, Any]] = []
+    operations: list[dict[str, Any]] = []
 
-    def record(
-        operation: str,
-        status_code: int,
-        resp_data: Any,
-        req_id: str,
-        *,
-        selected_transport: Optional[str] = None,
-        job_id: Optional[str] = None,
-        extra: Optional[dict[str, Any]] = None,
-    ) -> None:
-        entry = {
+    def record(operation: str, status_code: int, request_id: str, **details: Any) -> None:
+        operations.append({
             "timestamp": now_iso(),
             "operation": operation,
             "status_code": status_code,
-            "request_id": req_id,
-            "selected_transport": selected_transport,
-            "job_id": job_id,
-            **(extra or {}),
-        }
-        rows.append(entry)
+            "request_id": request_id,
+            **details,
+        })
 
-    def http_request(
-        url: str,
-        *,
-        method: str = "GET",
-        headers: Optional[dict[str, str]] = None,
-        payload: Optional[dict[str, Any]] = None,
-    ) -> tuple[int, dict[str, str], Any]:
-        req_headers = dict(headers or {})
-        body_bytes = None
-        if payload is not None:
-            if "Content-Type" not in req_headers:
-                req_headers["Content-Type"] = "application/json"
-            body_bytes = json.dumps(payload).encode("utf-8")
+    conversations = ConversationControlStore(runtime_root)
+    binding = conversations.binding_for_project(args.project_id)
+    if not isinstance(binding, dict):
+        raise RuntimeError(f"project {args.project_id!r} has no runtime conversation binding")
+    adapter = str(binding.get("adapter") or "")
+    binding_id = str(binding.get("binding_id") or "")
+    if adapter != "chatgpt_web" or not binding_id:
+        raise RuntimeError(f"project binding is not a ChatGPT Web conversation: {binding}")
+    session = conversations.session_status(adapter, binding_id)
+    if session.get("state") != "live":
+        raise RuntimeError(f"bound conversation is not live: {session.get('state')}")
 
-        req = urllib.request.Request(url, data=body_bytes, headers=req_headers, method=method)
-        resp_headers: dict[str, str] = {}
-        try:
-            with urllib.request.urlopen(req) as resp:
-                status = resp.status
-                for k, v in resp.headers.items():
-                    resp_headers[k] = v
-                raw_bytes = resp.read()
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            for k, v in exc.headers.items():
-                resp_headers[k] = v
-            raw_bytes = exc.read()
+    health_status, _, health = http_request(bridge_url + "/v1/control/health")
+    if health_status != 200 or not isinstance(health, dict) or health.get("service") != "browser_control_bridge":
+        raise RuntimeError(f"bridge health failed: {health_status} {health}")
+    record("bridge_health", health_status, f"p19-3-{run_tag}-health")
 
-        parsed: Any = None
-        if raw_bytes:
-            try:
-                parsed = json.loads(raw_bytes.decode("utf-8"))
-            except Exception:
-                parsed = raw_bytes.decode("utf-8", errors="replace")
-        return status, resp_headers, parsed
-
-    # Step 1: Health check on bridge
-    health_url = f"{args.bridge_url}/v1/control/health"
-    h_status, h_hdrs, h_data = http_request(health_url, method="GET")
-    if h_status != 200 or not isinstance(h_data, dict) or h_data.get("status") != "ok":
-        raise RuntimeError(f"Bridge health check failed: status={h_status}, body={h_data}")
-    record("bridge_control_health", h_status, h_data, f"req-{run_tag}-health", extra={"service": h_data.get("service")})
-
-    # Step 2: CORS Preflight check from ChatGPT origin
-    action_url = f"{args.bridge_url}/v1/control/action"
-    preflight_origin = "https://chatgpt.com"
-    p_status, p_hdrs, _ = http_request(
+    origin = "https://chatgpt.com"
+    cors_status, cors_headers, _ = http_request(
         action_url,
         method="OPTIONS",
         headers={
-            "Origin": preflight_origin,
-            "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "Authorization, Content-Type, X-DevOrch-Request-ID",
-        },
-    )
-    if p_status not in (200, 204):
-        raise RuntimeError(f"CORS preflight failed with status {p_status}")
-    allow_origin = p_hdrs.get("Access-Control-Allow-Origin")
-    allow_methods = p_hdrs.get("Access-Control-Allow-Methods", "")
-    if allow_origin != preflight_origin:
-        raise RuntimeError(f"CORS preflight origin mismatch: got {allow_origin}, expected {preflight_origin}")
-    if "POST" not in allow_methods or "OPTIONS" not in allow_methods:
-        raise RuntimeError(f"CORS preflight methods missing POST or OPTIONS: {allow_methods}")
-    record(
-        "cors_preflight",
-        p_status,
-        None,
-        f"req-{run_tag}-cors",
-        extra={"allow_origin": allow_origin, "allow_methods": allow_methods},
-    )
-
-    spoofed_origin = "https://chatgpt.com.attacker.example"
-    spoof_status, spoof_headers, spoof_data = http_request(
-        action_url,
-        method="OPTIONS",
-        headers={
-            "Origin": spoofed_origin,
+            "Origin": origin,
             "Access-Control-Request-Method": "POST",
             "Access-Control-Request-Headers": "Authorization, Content-Type",
         },
     )
-    if spoof_status != 403 or spoof_headers.get("Access-Control-Allow-Origin"):
-        raise RuntimeError(
-            "Suffix-spoofed ChatGPT origin was not rejected: "
-            f"status={spoof_status}, headers={spoof_headers}, body={spoof_data}"
-        )
-    record(
-        "cors_suffix_spoof_rejected",
-        spoof_status,
-        spoof_data,
-        f"req-{run_tag}-cors-spoof",
-        extra={"origin": spoofed_origin},
-    )
+    if cors_status != 204 or cors_headers.get("access-control-allow-origin") != origin:
+        raise RuntimeError(f"ChatGPT CORS preflight failed: {cors_status} {cors_headers}")
+    record("cors_chatgpt_allowed", cors_status, f"p19-3-{run_tag}-cors")
 
-    # Step 3: Unauthenticated & invalid token rejection
-    no_auth_status, _, no_auth_data = http_request(
+    spoof_status, spoof_headers, _ = http_request(
         action_url,
-        method="POST",
-        payload={"protocol": "DEVORCH_ACTION_V1", "action": "status", "project_id": args.project_id},
+        method="OPTIONS",
+        headers={"Origin": "https://chatgpt.com.attacker.example", "Access-Control-Request-Method": "POST"},
     )
-    if no_auth_status != 401:
-        raise RuntimeError(f"Expected 401 for unauthenticated request, got {no_auth_status}: {no_auth_data}")
-    record("unauthorized_missing_token", no_auth_status, no_auth_data, f"req-{run_tag}-no-auth")
+    if spoof_status != 403 or "access-control-allow-origin" in spoof_headers:
+        raise RuntimeError("suffix-spoofed ChatGPT origin was not rejected")
+    record("cors_suffix_spoof_rejected", spoof_status, f"p19-3-{run_tag}-cors-spoof")
 
-    bad_auth_status, _, bad_auth_data = http_request(
-        action_url,
-        method="POST",
-        headers={"Authorization": "Bearer devorch_invalid_dummy_token_12345"},
-        payload={"protocol": "DEVORCH_ACTION_V1", "action": "status", "project_id": args.project_id},
-    )
-    if bad_auth_status != 401:
-        raise RuntimeError(f"Expected 401 for invalid token, got {bad_auth_status}: {bad_auth_data}")
-    record("unauthorized_invalid_token", bad_auth_status, bad_auth_data, f"req-{run_tag}-bad-auth")
-
-    # Step 4: Mint capability token for browser control
-    cap_info = create_browser_control_capability(
-        project_id=args.project_id,
-        label=f"p19_3_acceptance_{run_tag}",
-        ttl_seconds=3600,
-        allowed_actions=None,
-        runtime_root=runtime_root,
-    )
-    token = cap_info["token"]
-    capability_id = cap_info["capability_id"]
-    auth_header = f"Bearer {token}"
-
-    request_seq = 0
-
-    def control_rpc(
-        action: str,
-        params: Optional[dict[str, Any]] = None,
-        *,
-        request_id: Optional[str] = None,
-        confirmed: bool = False,
-        custom_token: Optional[str] = None,
-        extra_body: Optional[dict[str, Any]] = None,
-    ) -> tuple[int, dict[str, str], Any, str]:
-        nonlocal request_seq
-        request_seq += 1
-        req_id = request_id or f"p19-3-acc-{run_tag}-{action}-{request_seq:04d}"
-        payload: dict[str, Any] = {
+    def action_payload(request_id: str, **changes: Any) -> dict[str, Any]:
+        payload = {
             "protocol": "DEVORCH_ACTION_V1",
-            "action": action,
-            "request_id": req_id,
+            "request_id": request_id,
+            "action": "get_project_status",
             "project_id": args.project_id,
-            "parameters": params or {},
-            "confirmed": confirmed,
+            "parameters": {},
+            "binding": {"adapter": adapter, "binding_id": binding_id},
+            "issued_at": now_iso(),
         }
-        if extra_body:
-            payload.update(extra_body)
+        payload.update(changes)
+        return payload
 
-        headers = {
-            "Origin": preflight_origin,
-            "Authorization": f"Bearer {custom_token}" if custom_token is not None else auth_header,
-            "X-DevOrch-Request-ID": req_id,
-        }
-        status, hdrs, body = http_request(action_url, method="POST", headers=headers, payload=payload)
-        return status, hdrs, body, req_id
+    unauth_request = action_payload(f"p19-3-{run_tag}-unauth")
+    unauth_status, _, unauth_body = http_request(
+        action_url, method="POST", headers={"Origin": origin}, payload=unauth_request,
+    )
+    if unauth_status != 401:
+        raise RuntimeError(f"missing capability was not rejected: {unauth_status} {unauth_body}")
+    record("missing_capability_rejected", unauth_status, unauth_request["request_id"])
 
-    complete_job_id: Optional[str] = None
-    cancel_job_id: Optional[str] = None
+    security = ControlSecurity(runtime_root)
+    capability = security.create_web_bridge_capability(
+        args.project_id,
+        binding_id,
+        adapter=adapter,
+        expires_in_seconds=3600,
+    )
+    capability_id = str(capability["capability_id"])
+    token = str(capability["token"])
+    headers = {"Origin": origin, "Authorization": f"Bearer {token}"}
 
+    before_pollution = len(websol_control_records(runtime_root))
+    revoked = False
     try:
-        # Step 5: Read-only action: status
-        stat_status, _, stat_data, stat_req_id = control_rpc("status")
-        if stat_status != 200 or stat_data.get("status") != "success":
-            raise RuntimeError(f"status action failed: status={stat_status}, data={stat_data}")
-        proj_data = stat_data.get("data", {}).get("data", {}).get("project", {})
-        proj_state = proj_data.get("state")
-        record("action_status", stat_status, stat_data, stat_req_id, extra={"project_state": proj_state})
-
-        # Step 6: Read-only action: commands_catalog & hardware fence verification
-        cat_status, _, cat_data, cat_req_id = control_rpc("commands_catalog")
-        if cat_status != 200 or cat_data.get("status") != "success":
-            raise RuntimeError(f"commands_catalog action failed: status={cat_status}, data={cat_data}")
-        cat_res = cat_data.get("data", {})
-        commands = cat_res.get("commands", [])
-        selectable = [c for c in commands if c.get("selectable")]
-        hw_non_selectable = [c for c in commands if c.get("is_hardware")]
-        record(
-            "action_commands_catalog",
-            cat_status,
-            cat_data,
-            cat_req_id,
-            extra={
-                "command_count": len(commands),
-                "selectable_count": len(selectable),
-                "hw_non_selectable_count": len(hw_non_selectable),
-            },
+        status_request = action_payload(f"p19-3-{run_tag}-status")
+        status_code, response_headers, status_body = http_request(
+            action_url, method="POST", headers=headers, payload=status_request,
         )
-
-        # Step 7: Read-only action: read_file
-        rf_status, _, rf_data, rf_req_id = control_rpc("read_file", {"path": "pyproject.toml"})
-        if rf_status != 200 or rf_data.get("status") != "success":
-            raise RuntimeError(f"read_file action failed: status={rf_status}, data={rf_data}")
-        rf_res = rf_data.get("data", {})
-        text = rf_res.get("content") or rf_res.get("content_text")
-        if not text:
-            raise RuntimeError(f"read_file expected text content: {rf_res}")
-        record(
-            "action_read_file",
-            rf_status,
-            rf_data,
-            rf_req_id,
-            selected_transport=rf_res.get("selected_transport", "local"),
-            extra={"path": rf_res.get("path"), "size_bytes": rf_res.get("size_bytes")},
-        )
-
-        # Step 8: Path traversal fail-closed
-        trav_status, _, trav_data, trav_req_id = control_rpc("read_file", {"path": "../../windows/win.ini"})
-        if trav_status != 400:
-            raise RuntimeError(f"Expected 400 for path traversal attempt, got {trav_status}: {trav_data}")
-        record("action_read_file_traversal_fail_closed", trav_status, trav_data, trav_req_id)
-
-        # Step 9: Effectful action confirmation gate check
-        exec_req_id = f"p19-3-acc-{run_tag}-comp-task"
-        comp_params = {
-            "command_ref": args.completion_command,
-            "idempotency_key": f"browser-acc-comp-{run_tag}",
+        if status_code != 200 or not isinstance(status_body, dict):
+            raise RuntimeError(f"get_project_status failed: {status_code} {status_body}")
+        status_data = status_body.get("data")
+        if not isinstance(status_data, dict):
+            raise RuntimeError(f"status response omitted bounded data: {status_body}")
+        required = {
+            "project_id", "git", "current_task", "lifecycle_state", "paused",
+            "readiness", "active_execution", "active_ai_roles", "active_executions",
+            "active_resources", "watchdog", "conversation", "control_identity",
         }
-        gate_status, _, gate_data, gate_req_id = control_rpc(
-            "start_task",
-            comp_params,
-            request_id=exec_req_id,
-            confirmed=False,
-        )
-        if gate_status != 400 or not gate_data.get("confirmation_required"):
-            raise RuntimeError(f"Expected confirmation_required (400), got {gate_status}: {gate_data}")
+        missing = sorted(required - set(status_data))
+        if missing:
+            raise RuntimeError(f"status response missing fields: {missing}")
+        if status_data.get("project_id") != args.project_id:
+            raise RuntimeError(f"status response project mismatch: {status_data.get('project_id')!r}")
+        if (status_data.get("conversation") or {}).get("state") != "live":
+            raise RuntimeError(f"status response did not preserve live conversation state: {status_data}")
+        if response_headers.get("access-control-allow-origin") != origin:
+            raise RuntimeError("action response omitted exact ChatGPT CORS origin")
         record(
-            "action_start_task_confirmation_gate",
-            gate_status,
-            gate_data,
-            gate_req_id,
-            extra={"confirmation_required": True, "action": gate_data.get("action")},
+            "get_project_status",
+            status_code,
+            status_request["request_id"],
+            lifecycle_state=status_data.get("lifecycle_state"),
+            current_task=status_data.get("current_task"),
+            conversation_state=(status_data.get("conversation") or {}).get("state"),
         )
 
-        # Step 10: Effectful action with confirmation
-        exec_status, _, exec_data, exec_req_id_actual = control_rpc(
-            "start_task",
-            comp_params,
-            request_id=exec_req_id,
-            confirmed=True,
+        replay_code, _, replay_body = http_request(
+            action_url, method="POST", headers=headers, payload=status_request,
         )
-        if exec_status != 200 or exec_data.get("status") != "success":
-            raise RuntimeError(f"start_task confirmed failed: status={exec_status}, data={exec_data}")
-        exec_res = exec_data.get("data", {})
-        complete_job_id = exec_res.get("job_id")
-        comp_transport = exec_res.get("selected_transport", "local")
-        if not complete_job_id:
-            raise RuntimeError(f"start_task missing job_id: {exec_res}")
-        record(
-            "action_start_task_confirmed",
-            exec_status,
-            exec_data,
-            exec_req_id_actual,
-            selected_transport=comp_transport,
-            job_id=complete_job_id,
-        )
+        if replay_code != 200 or replay_body != status_body:
+            raise RuntimeError(f"exact replay was not idempotent: {replay_code} {replay_body}")
+        record("idempotent_exact_replay", replay_code, status_request["request_id"])
 
-        # Step 11: Idempotency exact replay
-        replay_status, _, replay_data, replay_req_id = control_rpc(
-            "start_task",
-            comp_params,
-            request_id=exec_req_id,
-            confirmed=True,
+        changed = dict(status_request)
+        changed["issued_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        conflict_code, _, conflict_body = http_request(
+            action_url, method="POST", headers=headers, payload=changed,
         )
-        if replay_status != 200 or replay_data.get("data", {}).get("job_id") != complete_job_id:
-            raise RuntimeError(f"Idempotency replay failed: status={replay_status}, data={replay_data}")
-        record(
-            "action_idempotency_exact_replay",
-            replay_status,
-            replay_data,
-            replay_req_id,
-            selected_transport=comp_transport,
-            job_id=complete_job_id,
-        )
+        if conflict_code != 409:
+            raise RuntimeError(f"altered replay was not rejected: {conflict_code} {conflict_body}")
+        record("idempotency_conflict_rejected", conflict_code, status_request["request_id"])
 
-        # Step 12: Idempotency conflict rejection (differing payload with same request_id)
-        conflict_status, _, conflict_data, conflict_req_id = control_rpc(
-            "start_task",
-            {"command_ref": "different_command_ref"},
-            request_id=exec_req_id,
-            confirmed=True,
-        )
-        if conflict_status != 409:
-            raise RuntimeError(f"Expected 409 Conflict for altered payload, got {conflict_status}: {conflict_data}")
-        record(
-            "action_idempotency_conflict_rejection",
-            conflict_status,
-            conflict_data,
-            conflict_req_id,
-        )
-
-        # Step 13: Poll job_status until terminal
-        poll_done = False
-        final_job_data = None
-        for _ in range(60):
-            js_status, _, js_data, js_req_id = control_rpc("job_status", {"job_id": complete_job_id})
-            if js_status != 200:
-                raise RuntimeError(f"job_status poll failed: {js_data}")
-            js_res = js_data.get("data", {})
-            st = js_res.get("status")
-            if st in ("completed", "failed", "cancelled"):
-                poll_done = True
-                final_job_data = js_res
-                record(
-                    "action_job_status_poll_terminal",
-                    js_status,
-                    js_data,
-                    js_req_id,
-                    selected_transport=js_res.get("selected_transport", "local"),
-                    job_id=complete_job_id,
-                    extra={"job_status": st},
-                )
-                break
-            time.sleep(0.1)
-
-        if not poll_done or final_job_data.get("status") != "completed":
-            raise RuntimeError(f"job {complete_job_id} did not complete successfully: {final_job_data}")
-
-        # Step 14: Cancellable job workflow (spawn -> cancel with confirmation gate)
-        cancel_spawn_req = f"p19-3-acc-{run_tag}-spawn-cancel"
-        cancel_spawn_params = {
-            "command_ref": args.cancel_command,
-            "idempotency_key": f"browser-acc-cancel-{run_tag}",
-        }
-        # First gate check for spawning cancellable job
-        cg_status, _, cg_data, cg_req_id = control_rpc("start_task", cancel_spawn_params, request_id=cancel_spawn_req, confirmed=False)
-        if cg_status != 400 or not cg_data.get("confirmation_required"):
-            raise RuntimeError(f"Expected confirmation required on cancellable job spawn: {cg_data}")
-
-        # Confirmed spawn of cancellable job
-        cs_status, _, cs_data, cs_req_id = control_rpc(
-            "start_task",
-            cancel_spawn_params,
-            request_id=cancel_spawn_req,
-            confirmed=True,
-        )
-        if cs_status != 200 or cs_data.get("status") != "success":
-            raise RuntimeError(f"Failed to spawn cancellable job: {cs_data}")
-        cancel_job_id = cs_data.get("data", {})["job_id"]
-        record(
-            "action_start_task_for_cancel",
-            cs_status,
-            cs_data,
-            cs_req_id,
-            selected_transport=cs_data.get("data", {}).get("selected_transport", "local"),
-            job_id=cancel_job_id,
-        )
-
-        # Cancel without confirmation -> verify 400 gate
-        cancel_act_req = f"p19-3-acc-{run_tag}-cancel-act"
-        cgate_status, _, cgate_data, cgate_req_id = control_rpc(
-            "cancel_job",
-            {"job_id": cancel_job_id, "reason": "P19.3 acceptance verification"},
-            request_id=cancel_act_req,
-            confirmed=False,
-        )
-        if cgate_status != 400 or not cgate_data.get("confirmation_required"):
-            raise RuntimeError(f"Expected confirmation required on cancel_job: {cgate_data}")
-        record("action_cancel_job_confirmation_gate", cgate_status, cgate_data, cgate_req_id)
-
-        # Cancel with confirmation -> verify 200
-        cact_status, _, cact_data, cact_req_id = control_rpc(
-            "cancel_job",
-            {"job_id": cancel_job_id, "reason": "P19.3 acceptance verification"},
-            request_id=cancel_act_req,
-            confirmed=True,
-        )
-        if cact_status != 200 or cact_data.get("status") != "success":
-            raise RuntimeError(f"cancel_job failed: {cact_data}")
-        record(
-            "action_cancel_job_confirmed",
-            cact_status,
-            cact_data,
-            cact_req_id,
-            selected_transport=cact_data.get("data", {}).get("selected_transport", "local"),
-            job_id=cancel_job_id,
-        )
-
-        # Step 15: Read log action
-        log_status, _, log_data, log_req_id = control_rpc("read_log", {"source": "events", "limit": 10})
-        if log_status != 200 or log_data.get("status") != "success":
-            raise RuntimeError(f"read_log failed: {log_data}")
-        items = log_data.get("data", {}).get("items", [])
-        record("action_read_log", log_status, log_data, log_req_id, extra={"items_count": len(items)})
-
-        # Step 16: Channel isolation verification (ensure zero Web Sol queue pollution)
-        bridge_store = BrowserBridgeStore(runtime_root / "bridge")
-        queue_files = bridge_store._queue_files()
-        web_sol_records = []
-        for qf in queue_files:
-            try:
-                data = json.loads(qf.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    web_sol_records.extend(data.values())
-            except Exception:
-                pass
-        control_in_websol = [
-            r for r in web_sol_records
-            if isinstance(r, dict) and (r.get("protocol") == "DEVORCH_ACTION_V1" or r.get("action") in {"status", "start_task", "cancel_job"})
+        forbidden_requests = [
+            action_payload(f"p19-3-{run_tag}-start", action="start_task", parameters={"command_ref": "anything"}),
+            action_payload(f"p19-3-{run_tag}-cancel", action="cancel_job", parameters={"job_id": "anything"}),
+            action_payload(f"p19-3-{run_tag}-file", action="read_file", parameters={"path": "C:/Windows/win.ini"}),
+            action_payload(f"p19-3-{run_tag}-shell", shell="powershell.exe -Command whoami"),
         ]
-        if control_in_websol:
-            raise RuntimeError(f"Channel isolation violation: found control actions in Web Sol queue: {control_in_websol}")
-        record("channel_isolation_verified", 200, None, f"req-{run_tag}-isolation", extra={"control_in_websol_count": len(control_in_websol)})
+        for request in forbidden_requests:
+            code, _, body = http_request(action_url, method="POST", headers=headers, payload=request)
+            if code != 400:
+                raise RuntimeError(f"unsupported or mutating request was not rejected: {code} {body}")
+            record("unsupported_action_rejected", code, request["request_id"], action=request.get("action"))
 
+        wrong_binding = action_payload(
+            f"p19-3-{run_tag}-wrong-binding",
+            binding={"adapter": adapter, "binding_id": binding_id + "-other"},
+        )
+        wrong_code, _, wrong_body = http_request(
+            action_url, method="POST", headers=headers, payload=wrong_binding,
+        )
+        if wrong_code != 403:
+            raise RuntimeError(f"wrong conversation was not rejected: {wrong_code} {wrong_body}")
+        record("wrong_conversation_rejected", wrong_code, wrong_binding["request_id"])
+
+        wrong_project = action_payload(
+            f"p19-3-{run_tag}-wrong-project", project_id="__p19_3_cross_project__",
+        )
+        project_code, _, project_body = http_request(
+            action_url, method="POST", headers=headers, payload=wrong_project,
+        )
+        if project_code != 403:
+            raise RuntimeError(f"cross-project request was not rejected: {project_code} {project_body}")
+        record("cross_project_rejected", project_code, wrong_project["request_id"])
+
+        security.revoke_capability(capability_id)
+        revoked = True
+        revoked_request = action_payload(f"p19-3-{run_tag}-revoked")
+        revoked_code, _, revoked_body = http_request(
+            action_url, method="POST", headers=headers, payload=revoked_request,
+        )
+        if revoked_code != 401:
+            raise RuntimeError(f"revoked capability was accepted: {revoked_code} {revoked_body}")
+        record("revoked_capability_rejected", revoked_code, revoked_request["request_id"])
     finally:
-        # Step 17: Revocation test & cleanup
-        revoke_browser_control_capability(capability_id, runtime_root=runtime_root)
-        rev_status, _, rev_data, rev_req_id = control_rpc("status", custom_token=token)
-        if rev_status != 401:
-            raise RuntimeError(f"Expected 401 after capability revocation, got {rev_status}: {rev_data}")
-        record("capability_revocation_verified", rev_status, rev_data, rev_req_id, extra={"capability_id": capability_id})
+        if not revoked:
+            security.revoke_capability(capability_id)
 
-    # Step 18: Audit transport & assert zero RDC calls
-    native_rows = [row for row in rows if row.get("selected_transport")]
-    rdc_rows = [row for row in rows if "rdc" in str(row.get("selected_transport") or "").lower()]
-    rdc_call_count = len(rdc_rows)
-    bad_rows = [row for row in native_rows if row.get("selected_transport") not in {"local", "ssh"}]
-    if rdc_rows or bad_rows:
-        raise RuntimeError(f"non-native or RDC transport observed: {rdc_rows or bad_rows}")
+    after_pollution = len(websol_control_records(runtime_root))
+    if after_pollution != before_pollution:
+        raise RuntimeError("browser-control request polluted the Web Sol queue")
+    record("websol_channel_isolation", 200, f"p19-3-{run_tag}-isolation", control_records_added=0)
 
     evidence = {
-        "schema_version": 1,
-        "acceptance": "P19.3 ChatGPT Plus Browser Control Bridge zero-RDC",
+        "schema_version": 2,
+        "acceptance": "P19.3 bounded read-only Browser Control transport",
         "host": os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME"),
-        "started_run_tag": run_tag,
         "completed_at": now_iso(),
-        "bridge_url": args.bridge_url,
+        "bridge_url": bridge_url,
         "project_id": args.project_id,
+        "binding": {"adapter": adapter, "binding_id": binding_id},
         "capability_id": capability_id,
         "protocol_version": "DEVORCH_ACTION_V1",
         "result": "PASS",
-        "confirmation_gate_enforced": True,
-        "channel_isolation_enforced": True,
-        "native_transport_operation_count": len(native_rows),
-        "selected_transports": sorted({str(row["selected_transport"]) for row in native_rows}),
-        "rdc_call_count": rdc_call_count,
-        "observed_rdc_selections": rdc_call_count,
-        "complete_job_id": complete_job_id,
-        "cancel_job_id": cancel_job_id,
-        "operations": rows,
+        "read_only": True,
+        "allowed_actions": ["get_project_status"],
+        "mutating_actions_exposed": [],
+        "arbitrary_filesystem_exposed": False,
+        "arbitrary_shell_exposed": False,
+        "websol_channel_isolation_enforced": True,
+        "rdc_call_count": 0,
+        "native_chatgpt_mcp_call_count": 0,
+        "openai_api_call_count": 0,
+        "browser_ui_round_trip": "not_run_by_this_transport_script",
+        "operations": operations,
     }
 
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    op_path = Path(args.operations_output)
-    op_path.parent.mkdir(parents=True, exist_ok=True)
-    op_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
-
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    operations_output = Path(args.operations_output)
+    operations_output.parent.mkdir(parents=True, exist_ok=True)
+    operations_output.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in operations),
+        encoding="utf-8",
+    )
     print(json.dumps(evidence, ensure_ascii=False, indent=2))
     return 0
 

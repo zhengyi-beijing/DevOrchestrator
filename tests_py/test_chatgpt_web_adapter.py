@@ -146,7 +146,7 @@ class ChatGptWebAdapterTests(unittest.TestCase):
 
     def test_userscript_raises_transport_alert_from_server_attention_metadata(self):
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('// @version      0.1.15', source)
+        self.assertIn('// @version      0.1.26', source)
         self.assertIn('// @grant        GM_notification', source)
         self.assertIn('notification.attention !== "urgent"', source)
         self.assertIn('GM_notification({', source)
@@ -211,6 +211,36 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         self.assertNotIn("Authorization", payload["requests"][0]["headers"])
         self.assertEqual(payload["requests"][1]["headers"]["Authorization"], "Bearer scoped-cap")
         self.assertEqual(payload["requests"][1]["data"]["binding_id"], "conv")
+
+    def test_userscript_redeems_bootstrap_into_gm_storage_only(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "const values={},requests=[];"
+            "globalThis.GM_getValue=(k,d)=>Object.prototype.hasOwnProperty.call(values,k)?values[k]:d;"
+            "globalThis.GM_setValue=(k,v)=>{values[k]=v};globalThis.GM_deleteValue=(k)=>{delete values[k]};"
+            "globalThis.GM_xmlhttpRequest=(o)=>{requests.push({url:o.url,headers:o.headers,data:JSON.parse(o.data)});"
+            "o.onload({status:200,responseText:JSON.stringify({data:{token:'control-secret',scope:'web_bridge_control'}})})};"
+            "require(" + json.dumps(script) + ");const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "(async()=>{const ok=await a.redeemBrowserControlBootstrap('p1','conv-1','heartbeat-secret');"
+            "console.log(JSON.stringify({ok,token:a.storedBrowserControlToken(),requests,hasDocument:typeof document!=='undefined'}));process.exit(0)})()"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["token"], "control-secret")
+        self.assertFalse(payload["hasDocument"])
+        self.assertEqual(len(payload["requests"]), 1)
+        request = payload["requests"][0]
+        self.assertEqual(
+            request["url"],
+            "http://127.0.0.1:8770/api/v1/control/web-bridge/bootstrap/redeem",
+        )
+        self.assertEqual(request["headers"]["Authorization"], "Bearer heartbeat-secret")
+        self.assertEqual(request["data"], {"project_id": "p1", "adapter": "chatgpt_web", "binding_id": "conv-1"})
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('GM_registerMenuCommand("Pair DevOrchestrator read-only control"', source)
 
     def test_userscript_compute_adapter_state_authoritative_contract(self):
         script = SCRIPT.as_posix()

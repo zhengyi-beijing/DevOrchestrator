@@ -157,6 +157,186 @@ class ControlAdapterClient:
             return self._request("GET", f"/api/v1/control/projects/{safe_id}")
         return self._request("GET", "/api/v1/control/overview")
 
+    def project_status(self, project_id: str) -> dict[str, Any]:
+        """Return the bounded read-only status bundle used by browser control.
+
+        The data is composed exclusively from the authoritative 8770 project and
+        overview projections.  This client-side composition deliberately adds no
+        lifecycle authority and exposes no generic URL, shell, or filesystem
+        primitive.
+        """
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ValueError("project_id must be a nonblank string")
+        project_id = project_id.strip()
+
+        project_envelope = self.status(project_id)
+        overview_envelope = self.status()
+        project = project_envelope.get("data")
+        overview = overview_envelope.get("data")
+        if not isinstance(project, dict):
+            raise ControlAdapterNotFoundError(f"project not found: {project_id!r}")
+        if not isinstance(overview, dict):
+            raise ControlAdapterError("overview projection data is unavailable")
+
+        def bounded(value: Any, fields: tuple[str, ...]) -> dict[str, Any] | None:
+            if not isinstance(value, dict):
+                return None
+            return {name: value.get(name) for name in fields if name in value}
+
+        control_identity = project.get("control_identity")
+        if not isinstance(control_identity, dict):
+            control_identity = {}
+        authoritative = project.get("authoritative_lifecycle")
+        if not isinstance(authoritative, dict):
+            authoritative = {}
+        conversation = project.get("conversation")
+        if not isinstance(conversation, dict):
+            conversation = {}
+        binding = conversation.get("binding")
+        if not isinstance(binding, dict):
+            binding = project.get("conversation_binding")
+        if not isinstance(binding, dict):
+            binding = None
+
+        binding_id = (
+            str(binding.get("binding_id") or "") if isinstance(binding, dict)
+            else str(control_identity.get("binding_id") or "")
+        )
+        binding_adapter = (
+            str(binding.get("adapter") or "") if isinstance(binding, dict)
+            else str(control_identity.get("binding_adapter") or "")
+        )
+        sessions = overview.get("sessions") if isinstance(overview.get("sessions"), list) else []
+        session = next(
+            (
+                row for row in sessions
+                if isinstance(row, dict)
+                and row.get("binding_id") == binding_id
+                and row.get("adapter") == binding_adapter
+            ),
+            None,
+        )
+
+        watchdog_root = overview.get("watchdog")
+        watchdog_projects = (
+            watchdog_root.get("projects")
+            if isinstance(watchdog_root, dict) and isinstance(watchdog_root.get("projects"), dict)
+            else {}
+        )
+        watchdog = watchdog_projects.get(project_id)
+
+        executions_root = overview.get("executions")
+        executions = (
+            executions_root.get("executions")
+            if isinstance(executions_root, dict) and isinstance(executions_root.get("executions"), list)
+            else []
+        )
+        terminal_execution_states = {"completed", "failed", "cancelled", "succeeded"}
+        active_broker_executions = [
+            row for row in executions
+            if isinstance(row, dict)
+            and str(row.get("status") or "").lower() not in terminal_execution_states
+        ]
+        active_resource_ids = {
+            str(row.get("resource_id")) for row in active_broker_executions if row.get("resource_id")
+        }
+        resources_root = overview.get("resources")
+        resources = (
+            resources_root.get("resources")
+            if isinstance(resources_root, dict) and isinstance(resources_root.get("resources"), list)
+            else []
+        )
+        active_resources = [
+            bounded(row, (
+                "resource_id", "provider", "model", "status", "state", "busy",
+                "health", "execution_id",
+            ))
+            for row in resources
+            if isinstance(row, dict) and str(row.get("resource_id") or "") in active_resource_ids
+        ]
+
+        git = project.get("git") if isinstance(project.get("git"), dict) else {}
+        telemetry = project.get("telemetry") if isinstance(project.get("telemetry"), dict) else {}
+        current_task = (
+            authoritative.get("current_task_id")
+            or control_identity.get("task_id")
+            or telemetry.get("task_id")
+        )
+        active_executions = [
+            bounded(row, (
+                "execution_id", "request_id", "project_id", "task_id", "role",
+                "resource_id", "provider", "model", "status", "state",
+                "started_at", "updated_at",
+            ))
+            for row in active_broker_executions
+            if row.get("project_id") == project_id
+        ]
+        raw_readiness = project.get("readiness")
+        readiness = (
+            bounded(raw_readiness, ("state", "status", "valid", "ready", "reason"))
+            if isinstance(raw_readiness, dict)
+            else raw_readiness
+        )
+        active_roles = project.get("active_roles") if isinstance(project.get("active_roles"), list) else []
+        safe_roles = [
+            bounded(row, ("role", "status", "state", "provider", "model", "resource_id", "execution_id"))
+            if isinstance(row, dict) else row
+            for row in active_roles
+            if isinstance(row, (dict, str))
+        ]
+        return {
+            "schema_version": 1,
+            "generated_at": overview_envelope.get("generated_at") or project_envelope.get("generated_at"),
+            "data": {
+                "project_id": project_id,
+                "git": {
+                    "branch": git.get("branch"),
+                    "head": git.get("head"),
+                    "dirty": git.get("dirty"),
+                    "changed_entries": git.get("changed_entries"),
+                },
+                "current_task": current_task,
+                "lifecycle_state": (
+                    authoritative.get("lifecycle_state")
+                    or control_identity.get("lifecycle_state")
+                    or project.get("lifecycle_state")
+                    or project.get("state")
+                ),
+                "paused": control_identity.get("paused"),
+                "readiness": readiness,
+                "active_execution": bounded(project.get("active_execution"), (
+                    "execution_id", "request_id", "project_id", "task_id", "role",
+                    "resource_id", "provider", "model", "status", "state",
+                    "started_at", "updated_at",
+                )),
+                "active_ai_roles": safe_roles,
+                "active_executions": active_executions,
+                "active_resources": active_resources,
+                "watchdog": bounded(watchdog, (
+                    "schema_version", "state", "status", "stage", "last_progress_at",
+                    "last_observed_at", "stalled_since", "recovery_state", "reason",
+                    "degraded_reason",
+                )),
+                "conversation": {
+                    "binding": bounded(binding, (
+                        "project_id", "state", "adapter", "binding_id", "title",
+                        "url", "bound_at", "updated_at", "provenance",
+                    )),
+                    "session": bounded(session, (
+                        "adapter", "binding_id", "title", "url", "state", "last_seen_at",
+                        "active_tab_count", "stale_tab_count", "verified",
+                    )),
+                    "state": session.get("state") if isinstance(session, dict) else "undiscovered",
+                },
+                "control_identity": bounded(control_identity, (
+                    "project_id", "task_id", "lifecycle_state", "paused",
+                    "binding_id", "binding_adapter",
+                )),
+            },
+            "warnings": list(project_envelope.get("warnings") or []) + list(overview_envelope.get("warnings") or []),
+            "sources": list(project_envelope.get("sources") or []) + list(overview_envelope.get("sources") or []),
+        }
+
     def external_status(self, project_id: str | None = None) -> dict[str, Any]:
         """Inspect the authenticated, bounded external-control status view."""
         path = "/api/v1/control/external/status"

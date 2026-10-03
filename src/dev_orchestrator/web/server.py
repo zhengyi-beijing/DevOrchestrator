@@ -731,6 +731,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 "/api/v1/control/session-heartbeats",
                 "/api/v1/control/bridge/requests",
                 "/api/v1/control/web-bridge/requests",
+                "/api/v1/control/web-bridge/bootstrap/redeem",
             }
             or self.headers.get("Origin") != "https://chatgpt.com"
         ):
@@ -1659,6 +1660,55 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(renewal)), False,
                        {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"} if origin else None)
             return
+        if path == "/api/v1/control/web-bridge/bootstrap/redeem":
+            if self.headers.get("Origin") != "https://chatgpt.com":
+                self._error(403, "Forbidden", "bootstrap redemption requires the ChatGPT origin", False); return
+            value = self._read_control_json(max_bytes=4096)
+            if value is None: return
+            required = {"project_id", "adapter", "binding_id"}
+            if set(value) != required:
+                self._error(400, "Bad Request", "bootstrap request must contain only project_id, adapter, and binding_id", False); return
+            project_id = value.get("project_id")
+            adapter = value.get("adapter")
+            binding_id = value.get("binding_id")
+            if not all(isinstance(item, str) and item.strip() for item in (project_id, adapter, binding_id)):
+                self._error(400, "Bad Request", "bootstrap identity fields must be nonblank strings", False); return
+            if adapter != "chatgpt_web":
+                self._error(403, "Forbidden", "unsupported bootstrap adapter", False); return
+
+            auth_header = self.headers.get("Authorization")
+            verdict, _, cap_row = security.capability_status(auth_header)
+            if verdict != CapabilityVerdict.VALID or not isinstance(cap_row, dict):
+                self._error(401, "Unauthorized", "valid heartbeat capability required", False); return
+            pairing_id = str(cap_row.get("pairing_id") or cap_row.get("capability_id") or "")
+            session = self.server.conversation_store.session_status(adapter, binding_id)
+            if not isinstance(session, dict) or session.get("state") != "live":
+                self._error(403, "Forbidden", "exact live conversation binding required", False); return
+            bound = self.server.conversation_store.binding_for_project(project_id)
+            if (
+                not isinstance(bound, dict)
+                or bound.get("state") != "bound"
+                or bound.get("adapter") != adapter
+                or bound.get("binding_id") != binding_id
+            ):
+                self._error(403, "Forbidden", "project is not bound to the specified conversation", False); return
+            if session.get("capability_pairing_id") != pairing_id or not session.get("verified"):
+                self._error(403, "Forbidden", "heartbeat capability does not own the live conversation session", False); return
+            try:
+                result = security.redeem_web_bridge_bootstrap(
+                    auth_header,
+                    project_id=project_id,
+                    binding_id=binding_id,
+                    adapter=adapter,
+                )
+            except ValueError:
+                self._error(409, "Conflict", "bootstrap grant unavailable", False); return
+            self._send(
+                200, "OK", "application/json; charset=utf-8",
+                _json_bytes(_control_envelope(result)), False,
+                {"Access-Control-Allow-Origin": "https://chatgpt.com", "Vary": "Origin"},
+            )
+            return
         if path == "/api/v1/control/session-heartbeats":
             origin = self.headers.get("Origin")
             if origin not in (None, "https://chatgpt.com") and not self._same_origin():
@@ -1690,11 +1740,22 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     adapter, binding_id, title=value.get("title"),
                     url=value.get("url"), tab_instance_id=value.get("tab_instance_id"),
                     capability_id=cap_id, capability_source=cap_source,
+                    action_scan=value.get("action_scan"),
                 )
             except ValueError as exc:
                 self._error(400, "Bad Request", str(exc), False); return
 
-            proj_id = value.get("project_id")
+            # Resolve the project from the owner-controlled durable binding;
+            # the page/userscript does not get to select bootstrap authority.
+            proj_id = None
+            for candidate in self.server.conversation_store.list_bindings():
+                if (
+                    candidate.get("state") == "bound"
+                    and candidate.get("adapter") == adapter
+                    and candidate.get("binding_id") == binding_id
+                ):
+                    proj_id = candidate.get("project_id")
+                    break
             if not proj_id and self.server.config_path and self.server.config_path.exists():
                 try:
                     cfg = load_projects_config(self.server.config_path)
@@ -1711,11 +1772,29 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 h_rec = self.server.websol_health_store.get(proj_id, adapter, binding_id)
                 websol_health = h_rec.to_dict() if h_rec else None
 
+            bootstrap = {"available": False}
+            if cap_id and isinstance(proj_id, str) and proj_id:
+                bound = self.server.conversation_store.binding_for_project(proj_id)
+                live_session = self.server.conversation_store.session_status(adapter, binding_id)
+                if (
+                    isinstance(bound, dict)
+                    and bound.get("state") == "bound"
+                    and bound.get("adapter") == adapter
+                    and bound.get("binding_id") == binding_id
+                    and live_session.get("state") == "live"
+                ):
+                    try:
+                        bootstrap = security.web_bridge_bootstrap_status(proj_id, binding_id, adapter)
+                    except ValueError:
+                        bootstrap = {"available": False}
+
             response_payload = {
                 **session,
                 "session": session,
                 "websol_health": websol_health,
                 "capability_id": cap_id,
+                "project_id": proj_id,
+                "web_bridge_bootstrap": bootstrap,
             }
 
             self._send(200, "OK", "application/json; charset=utf-8", _json_bytes(_control_envelope(response_payload)), False,
