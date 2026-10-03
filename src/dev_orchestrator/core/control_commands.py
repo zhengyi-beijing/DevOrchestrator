@@ -28,7 +28,7 @@ from dev_orchestrator.control.surface import (
 )
 from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
 from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
-from dev_orchestrator.core.lifecycle_authority import TERMINAL_LIFECYCLE_STATES
+from dev_orchestrator.core.lifecycle_authority import TERMINAL_LIFECYCLE_STATES, task_has_terminal_settlement
 from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lifecycle
 from dev_orchestrator.core.project_status import project_runtime_status
 from dev_orchestrator.core.repository import read_repository_truth
@@ -57,6 +57,26 @@ def _safe_command_id(value: Any) -> str | None:
 def _continuation_id(source_request_id: str) -> str:
     digest = hashlib.sha256(source_request_id.encode("utf-8")).hexdigest()[:24]
     return "auto-" + digest
+
+
+def _terminal_settled_predecessor(executor: Any, project_id: str, task_id: str) -> bool:
+    """Read terminal evidence from the sole authority, never from Markdown."""
+    state = executor.state()
+    authority = (state.get("lifecycle") or {}).get(project_id) if isinstance(state, dict) else None
+    if not isinstance(authority, dict):
+        return False
+    return (
+        authority.get("current_task_id") == task_id
+        and authority.get("lifecycle_state") in TERMINAL_LIFECYCLE_STATES
+        and authority.get("owner_gate") is None
+        and authority.get("active_owner") is None
+        and task_has_terminal_settlement(state, project_id, task_id)
+        and not any(
+            isinstance(row, dict) and row.get("project_id") == project_id
+            and row.get("state") in {"launching", "running"}
+            for row in (state.get("executions") or {}).values()
+        )
+    )
 
 
 def _paths(runtime_root: Path | str) -> tuple[Path, Path]:
@@ -324,7 +344,9 @@ class ControlCommandCoordinator:
             if row.get("reviewed_ready") is True:
                 status_ok = status_obj.is_ready_to_run()
             else:
-                status_ok = status_obj.is_completed()
+                status_ok = status_obj.is_completed() or _terminal_settled_predecessor(
+                    executor, project_id, _nonblank(row.get("task_id")) or "",
+                )
             if staged_successor != next_task_id or (
                 not successor_already_current
                 and (current_task != _nonblank(row.get("task_id")) or not status_ok)

@@ -2801,6 +2801,32 @@ class TerminalRoadmapSuccessorEndToEndTests(unittest.TestCase):
         attempts = wrow.get("lifecycle_recovery_attempts") or {}
         self.assertEqual([a.get("state") for a in attempts.values()], ["recovered"])
 
+    def test_terminal_settlement_consumes_successor_with_stale_ready_markdown(self):
+        from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
+        from dev_orchestrator.core.control_commands import ControlCommandCoordinator
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator
+
+        next_path = self.repo / "agent" / "next.md"
+        next_path.write_text(
+            next_path.read_text(encoding="utf-8").replace("**COMPLETE**", "**READY_TO_RUN**"),
+            encoding="utf-8", newline="\n",
+        )
+        _commit(self.repo, "stale ready projection after terminal acceptance")
+        planner = AIPlannerCoordinator(self.runtime, self.port)
+        controls = ControlCommandCoordinator(self.runtime, planner)
+        watchdog = WatchdogCoordinator(self.runtime, planner=planner)
+        self._tick(planner, controls, watchdog)
+        self._tick(planner, controls, watchdog)
+        plans = list(planner.state()["plans"].values())
+        self.assertEqual(len(plans), 1, "durable terminal acceptance must outrank stale Markdown")
+        self.assertEqual(plans[0]["task_id"], "P2")
+        self.assertTrue(self._handoffs()[0].get("handoff_consumed"))
+        for _ in range(2):
+            self._tick(planner, controls, watchdog)
+        self.assertEqual(len(self._handoffs()), 1)
+        self.assertEqual(len(planner.state()["plans"]), 1)
+        self.assertEqual(self._owner_commands(), [])
+
     def test_dirty_worktree_waits_without_gating_then_recovers(self):
         from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
         from dev_orchestrator.core.control_commands import ControlCommandCoordinator
