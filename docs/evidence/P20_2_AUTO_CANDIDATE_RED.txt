@@ -1,0 +1,129 @@
+FFFFF..                                                                  [100%]
+================================== FAILURES ===================================
+____ test_automatic_capture_creates_linked_typed_candidate_without_python _____
+
+tmp_path = WindowsPath('C:/work/github/p20-preserved-review-evidence/auto-wiring-final-red-20261004/test_automatic_capture_creates0')
+
+    def test_automatic_capture_creates_linked_typed_candidate_without_python(tmp_path):
+        family = capture(tmp_path)
+>       candidate = resolve_regression_candidate(tmp_path, family["candidate_id"])
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+runtime\p20-drafts\test_auto_candidate_wiring.py:28: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+runtime_root = WindowsPath('C:/work/github/p20-preserved-review-evidence/auto-wiring-final-red-20261004/test_automatic_capture_creates0')
+candidate_id = 'cand-a8e4efb41ef9'
+
+    def resolve_regression_candidate(runtime_root: Path | str, candidate_id: str) -> dict[str, Any]:
+        """Resolve a persisted regression candidate by ID."""
+        cand_file = Path(runtime_root) / "incident-packets" / "candidates" / candidate_id / "regression_candidate.json"
+        if not cand_file.is_file():
+>           raise KeyError(f"Regression candidate {candidate_id} not found at {cand_file}")
+E           KeyError: 'Regression candidate cand-a8e4efb41ef9 not found at C:\\work\\github\\p20-preserved-review-evidence\\auto-wiring-final-red-20261004\\test_automatic_capture_creates0\\incident-packets\\candidates\\cand-a8e4efb41ef9\\regression_candidate.json'
+
+src\dev_orchestrator\incidents\regression_candidate.py:247: KeyError
+______________ test_harvest_tick_enters_the_typed_candidate_path ______________
+
+tmp_path = WindowsPath('C:/work/github/p20-preserved-review-evidence/auto-wiring-final-red-20261004/test_harvest_tick_enters_the_t0')
+
+    def test_harvest_tick_enters_the_typed_candidate_path(tmp_path):
+        (tmp_path / "ai-planner.json").write_text(json.dumps({"plans": {
+            "plan-1": {"project_id": "probe-project", "task_id": "probe-task",
+                       "state": "failed", "planner_last_failure": "planner timed out"}
+        }}), encoding="utf-8")
+        harvest_tick(tmp_path, config={"projects": [{"project_id": "probe-project"}]})
+        store = load_incident_store(tmp_path)
+        assert len(store.index["families"]) == 1
+        family = next(iter(store.index["families"].values()))
+>       candidate = resolve_regression_candidate(tmp_path, family["candidate_id"])
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+runtime\p20-drafts\test_auto_candidate_wiring.py:51: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+runtime_root = WindowsPath('C:/work/github/p20-preserved-review-evidence/auto-wiring-final-red-20261004/test_harvest_tick_enters_the_t0')
+candidate_id = 'cand-b9f51ebfb58c'
+
+    def resolve_regression_candidate(runtime_root: Path | str, candidate_id: str) -> dict[str, Any]:
+        """Resolve a persisted regression candidate by ID."""
+        cand_file = Path(runtime_root) / "incident-packets" / "candidates" / candidate_id / "regression_candidate.json"
+        if not cand_file.is_file():
+>           raise KeyError(f"Regression candidate {candidate_id} not found at {cand_file}")
+E           KeyError: 'Regression candidate cand-b9f51ebfb58c not found at C:\\work\\github\\p20-preserved-review-evidence\\auto-wiring-final-red-20261004\\test_harvest_tick_enters_the_t0\\incident-packets\\candidates\\cand-b9f51ebfb58c\\regression_candidate.json'
+
+src\dev_orchestrator\incidents\regression_candidate.py:247: KeyError
+____________ test_repeat_restart_and_replay_preserve_one_candidate ____________
+
+tmp_path = WindowsPath('C:/work/github/p20-preserved-review-evidence/auto-wiring-final-red-20261004/test_repeat_restart_and_replay0')
+
+    def test_repeat_restart_and_replay_preserve_one_candidate(tmp_path):
+        first = capture(tmp_path)
+>       original = resolve_regression_candidate(tmp_path, first["candidate_id"])
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+runtime\p20-drafts\test_auto_candidate_wiring.py:58: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+runtime_root = WindowsPath('C:/work/github/p20-preserved-review-evidence/auto-wiring-final-red-20261004/test_repeat_restart_and_replay0')
+candidate_id = 'cand-a8e4efb41ef9'
+
+    def resolve_regression_candidate(runtime_root: Path | str, candidate_id: str) -> dict[str, Any]:
+        """Resolve a persisted regression candidate by ID."""
+        cand_file = Path(runtime_root) / "incident-packets" / "candidates" / candidate_id / "regression_candidate.json"
+        if not cand_file.is_file():
+>           raise KeyError(f"Regression candidate {candidate_id} not found at {cand_file}")
+E           KeyError: 'Regression candidate cand-a8e4efb41ef9 not found at C:\\work\\github\\p20-preserved-review-evidence\\auto-wiring-final-red-20261004\\test_repeat_restart_and_replay0\\incident-packets\\candidates\\cand-a8e4efb41ef9\\regression_candidate.json'
+
+src\dev_orchestrator\incidents\regression_candidate.py:247: KeyError
+___________ test_unbound_automatic_candidate_cannot_become_verified ___________
+
+tmp_path = WindowsPath('C:/work/github/p20-preserved-review-evidence/auto-wiring-final-red-20261004/test_unbound_automatic_candida0')
+
+    def test_unbound_automatic_candidate_cannot_become_verified(tmp_path):
+        family = capture(tmp_path)
+>       result = verify_regression_candidate(tmp_path, family["candidate_id"])
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+runtime\p20-drafts\test_auto_candidate_wiring.py:71: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+runtime_root = WindowsPath('C:/work/github/p20-preserved-review-evidence/auto-wiring-final-red-20261004/test_unbound_automatic_candida0')
+candidate_id = 'cand-a8e4efb41ef9', corpus_dir = None, config = None
+
+    def verify_regression_candidate(
+        runtime_root: Path | str,
+        candidate_id: str,
+        *,
+        corpus_dir: Path | str | None = None,
+        config: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute replay verification for candidate and durably persist outcome."""
+        _check_store_fence(runtime_root)
+    
+        cand_file = Path(runtime_root) / "incident-packets" / "candidates" / candidate_id / "regression_candidate.json"
+        if not cand_file.is_file():
+>           raise KeyError(f"Candidate {candidate_id} not found at {cand_file}")
+E           KeyError: 'Candidate cand-a8e4efb41ef9 not found at C:\\work\\github\\p20-preserved-review-evidence\\auto-wiring-final-red-20261004\\test_unbound_automatic_candida0\\incident-packets\\candidates\\cand-a8e4efb41ef9\\regression_candidate.json'
+
+src\dev_orchestrator\incidents\regression_candidate.py:264: KeyError
+______ test_automatic_candidate_capacity_is_checked_before_family_commit ______
+
+tmp_path = WindowsPath('C:/work/github/p20-preserved-review-evidence/auto-wiring-final-red-20261004/test_automatic_candidate_capac0')
+
+    def test_automatic_candidate_capacity_is_checked_before_family_commit(tmp_path):
+        policy = {"incidents": {"max_regression_candidates": 1}}
+        capture(tmp_path, config=policy)
+        revision = load_incident_store(tmp_path).index["revision"]
+>       with pytest.raises(IncidentCapacityExceededError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE IncidentCapacityExceededError
+
+runtime\p20-drafts\test_auto_candidate_wiring.py:81: Failed
+=========================== short test summary info ===========================
+FAILED runtime/p20-drafts/test_auto_candidate_wiring.py::test_automatic_capture_creates_linked_typed_candidate_without_python
+FAILED runtime/p20-drafts/test_auto_candidate_wiring.py::test_harvest_tick_enters_the_typed_candidate_path
+FAILED runtime/p20-drafts/test_auto_candidate_wiring.py::test_repeat_restart_and_replay_preserve_one_candidate
+FAILED runtime/p20-drafts/test_auto_candidate_wiring.py::test_unbound_automatic_candidate_cannot_become_verified
+FAILED runtime/p20-drafts/test_auto_candidate_wiring.py::test_automatic_candidate_capacity_is_checked_before_family_commit
+5 failed, 2 passed in 0.44s

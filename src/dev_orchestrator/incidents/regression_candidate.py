@@ -282,6 +282,10 @@ def verify_regression_candidate(
             "reason": "vacuous_synthetic_oracle_ineligible",
             "evaluated_at": now,
         }
+    elif cand_data.get("replayability") != "deterministic_replayable":
+        status = "rejected"
+        rejection_reason = "unbound_or_non_replayable_source"
+        verification_evidence = {"reason": rejection_reason, "evaluated_at": now}
     else:
         # Resolve corpus directory from stable anchor
         if corpus_dir is None:

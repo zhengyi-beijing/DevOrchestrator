@@ -1,5 +1,31 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P20.2 automatic typed candidate integration follow-up (2026-10-04):
+- P20.1 has independent ACCEPT; P20.2 normal remediation review accepted
+  a648a9c3. A supplemental automatic-path probe nevertheless reproduced a
+  missing integration: typed replay was enabled but capture created only a
+  legacy synthetic candidate. Normal owner pause prevents premature advancement.
+- Genuine behavioral RED: 5 failed / 2 passed against accepted a648a9c3;
+  saved in docs/evidence/P20_2_AUTO_CANDIDATE_RED.txt.
+- Default capture now persists the typed proposal in the family/packet
+  transaction, enforces capacity before commit, and generates no Python oracle.
+  Unknown reproduction cannot be verified. Recurrence preserves rejection and
+  legacy files; a crash before index publication replays one complete transaction.
+- GREEN: 118 passed in 15.10s across ten integration tests, P20.1/P20.2,
+  incident store, harvesting and legacy candidate operation suites. The legacy
+  synthetic test explicitly selects legacy mode; its assertions remain intact
+  and its results do not qualify P20 reliability.
+- Supplemental independent Technical Review: ACCEPT, Anthropic claude-opus-5.
+  Reviewer independently ran 10 focused / 149 related / 62 additional tests.
+  Six NON_BLOCKING notes and failed quota requests are preserved in
+  docs/evidence/P20_2_AUTO_CANDIDATE_REVIEW.json. RED provenance is the initial
+  seven-test draft; the three added tests are final GREEN evidence only.
+- Legacy cand-7dd84495b777 now has a persisted typed rejected status with
+  vacuous_synthetic_oracle_ineligible via normal candidate API after full
+  incident-store backup; original manifest/Python file hashes unchanged.
+- P20.3 and six-hour live soak have not started. Next action is quiescent reload
+  and normal resume/handoff. This is a bounded P20.2 correctness follow-up.
+
 P20.2 Automatic Failure Harvesting & Regression Promotion technical review remediation result (2026-10-04):
 - **Remediation: COMPLETE. Verification: PASS. Technical Review: PENDING.**
 - **Technical Review Findings Remediated (9 Concrete Findings Closed):**

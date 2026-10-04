@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,45 @@ def capture_incident(
     cand_id_to_generate: str | None = None
     packet_id_for_cand: str | None = None
 
+    def _ensure_typed_candidate(idx: dict[str, Any], family: dict[str, Any], now_ts: str) -> dict[str, str]:
+        """Reserve a source-bound proposal in the incident's own transaction.
+
+        Capturing a failure is not a replay proof. An automatic proposal stays
+        unknown until a separately reviewed, allowlisted reproduction is bound.
+        """
+        if not policy.get("auto_synthesis") or not policy.get("typed_replay_candidates"):
+            return {}
+        from dev_orchestrator.incidents.regression_candidate import RegressionCandidate, normalize_regression_candidate
+
+        cid = family.get("candidate_id") or f"cand-{fp[:12]}"
+        candidates = idx.setdefault("regression_candidates", {})
+        if cid in candidates:
+            return {}
+        limit = int(policy["max_regression_candidates"])
+        if len(candidates) >= limit:
+            raise IncidentCapacityExceededError(f"max_regression_candidates exceeded ({len(candidates)} >= {limit})")
+        digest = hashlib.sha256(json.dumps(
+            {"semantic": clean_semantic, "evidence": clean_evidence},
+            sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest()
+        candidate = normalize_regression_candidate(RegressionCandidate(
+            schema_version=1, candidate_id=cid, project_id=family["project_id"],
+            source_family_id=family["family_id"], source_failure_signature=fp,
+            source_incident_ids=list(family.get("packet_ids") or [family["packet_id"]]),
+            minimal_reproduction={"corpus_case_id": None, "replay_op": None,
+                                  "inputs_digest": f"sha256:{digest}", "reason": "unbound_replay_context"},
+            expected_invariant=str(clean_semantic.get("invariant_identifier") or "progress_must_not_stall"),
+            actual_outcome=str(family.get("taxonomy_class") or classification),
+            regression_class=str(family.get("taxonomy_class") or classification),
+            replayability="unknown", verification_status="proposed",
+            created_at=now_ts, updated_at=now_ts,
+        ).to_dict())
+        candidates[cid] = {"candidate_id": cid, "family_id": family["family_id"],
+                           "verification_status": "proposed", "replayability": "unknown",
+                           "rejection_reason": None, "verification_evidence": None}
+        family["candidate_id"] = cid
+        return {f"candidates/{cid}/regression_candidate.json": json.dumps(candidate, indent=2)}
+
     def _capture_mutator(idx: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
         nonlocal cand_id_to_generate, packet_id_for_cand
         fams = idx.setdefault("families", {})
@@ -112,7 +152,7 @@ def capture_incident(
                 dropped = len(ev_refs) - max_refs
                 fam["evidence_references"] = ev_refs[-max_refs:]
                 fam["dropped_evidence_count"] = int(fam.get("dropped_evidence_count", 0)) + dropped
-            return idx, {}
+            return idx, _ensure_typed_candidate(idx, fam, now_ts)
 
         # First occurrence: create immutable packet and initial family
         if len(fams) >= max_families:
@@ -182,12 +222,13 @@ def capture_incident(
         packet_rel = f"packets/{packet_id}.json"
         side_files = {packet_rel: json.dumps(packet_data, indent=2)}
 
-        if policy.get("auto_synthesis"):
+        if policy.get("auto_synthesis") and not policy.get("typed_replay_candidates"):
             cand_id = f"cand-{fp[:12]}"
             new_family["candidate_id"] = cand_id
             cand_id_to_generate = cand_id
             packet_id_for_cand = packet_id
 
+        side_files.update(_ensure_typed_candidate(idx, new_family, now_ts))
         fams[fp] = new_family
         return idx, side_files
 

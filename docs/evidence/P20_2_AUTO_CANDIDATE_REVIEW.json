@@ -1,0 +1,190 @@
+{
+  "scope": "P20.2 supplemental automatic typed capture integration only; not soak acceptance",
+  "result": {
+    "request_id": "p20-2-auto-candidate-technical-review-20261004-r3",
+    "role_run_id": "reviewer-p20-auto-candidate-r3",
+    "status": "succeeded",
+    "output": "Review complete. Repository, Git, runtime ledgers and documents were left untouched; every reviewer test ran with a unique basetemp under `C:/work/github/p20-preserved-review-evidence/indep-tr-20261004-*`.\n\n**What I verified independently**\n\n- **Evidence binding**: all 7 paths in `runtime/p20-auto-candidate-review-manifest.json` hash-match the working-tree bytes.\n- **Tests**: new file 10 passed; related regression selection 149 passed in 15.19s (superset of the claimed 118); remaining candidate-touching suites 62 passed. `git diff --check` clean, `py_compile` clean.\n- **Probes** (external temp roots): nested secrets in semantic *and* evidence payloads leak nowhere (candidate carries only a sha256 digest, `reason=unbound_replay_context`, no `.py`); default policy and `harvest_tick()` both produce one source-linked `unknown`/`proposed` record; injected `os.replace` failure at the commit point replays family+packet+candidate as a single transaction with no revision amplification and no journal/orphan residue; candidate-capacity exhaustion aborts precommit with a stable revision; `verify_regression_candidate()` durably rejects with `unbound_or_non_replayable_source` and recurrence does not rewrite it; legacy mode and legacy history are preserved byte-for-byte.\n- **No verified-by-unrelated-corpus**: corpus defect anchors emit mechanical outcomes (`signature_drift`, `dedup_failed`, `intent_unreconciled`, `same_outcome`) disjoint from taxonomy classes, so rebinding any allowlisted case yields `defect_anchor_outcome_mismatch`; the new replayability fence is a second independent barrier.\n\n```json\n{\"verdict\":\"ACCEPT\",\"findings\":[{\"classification\":\"NON_BLOCKING\",\"file\":\"src/dev_orchestrator/incidents/capture.py\",\"reason\":\"_ensure_typed_candidate dedups solely on the index entry (`if cid in candidates`) and never on the presence of candidates/<cid>/regression_candidate.json. Confirmed repro: inject a crash during a later verify_regression_candidate side-file write; reconcile takes the payload_unverified branch and moves the previously committed regression_candidate.json into orphans/, after which the index still reports `rejected`, the family still links the cid, resolve_regression_candidate raises KeyError permanently, and no recurrence re-reserves the proposal. Not blocking: the record survives under orphans/, the index status remains authoritative, the reconcile code is unchanged pre-existing store behavior shared with HEAD's create/verify path, and it needs a crash inside a narrow operator-invoked verify window. Suggest also requiring the side file to exist before skipping reservation so the automatic path self-heals.\"},{\"classification\":\"NON_BLOCKING\",\"file\":\"src/dev_orchestrator/incidents/capture.py\",\"reason\":\"max_regression_candidates is now enforced inside the family/packet transaction, so candidate saturation can suppress durable incident capture itself. Confirmed with max_regression_candidates=2 and max_families=50: capture of a third, new failure signature raises IncidentCapacityExceededError, no family or packet is written (revision stable), and harvest_tick swallows the exception, so the anomaly is silently dropped and re-dropped on every tick while recurrences of already-reserved families still succeed. Not blocking: fail-closed on capacity is documented in contract section 6 and consistent with the existing max_families/max_total_occurrences semantics, and the default 1000/1000 makes max_families bind first. Recommend an operator note to keep max_regression_candidates >= max_families.\"},{\"classification\":\"NON_BLOCKING\",\"file\":\"src/dev_orchestrator/incidents/capture.py\",\"reason\":\"In a legacy-upgraded store one candidate_id now carries two independent records: index[\\\"candidates\\\"][cid] (legacy manifest + synthetic test_candidate_<cid>.py) and index[\\\"regression_candidates\\\"][cid] (typed, unknown/proposed). Confirmed: a family created with typed_replay_candidates=false and then recurring under the default gains regression_candidate.json beside the untouched legacy artifacts, with both index entries live. The legacy five-gate evaluate/review/promote pipeline does not consult the typed verification_status, so a typed `rejected` does not fence legacy promotion of the same ID. Not blocking: promotion remains explicitly operator-gated through the pre-existing P16.10 CLI surfaces, the delta only adds a rejection that did not exist at HEAD, and section 6 already excludes legacy synthetic gate results from P20 qualification. The live runtime store (20 families, 15 legacy candidates, 0 typed) will enter this mixed state on the next recurrence, so the precedence between the two records is worth stating explicitly.\"},{\"classification\":\"NON_BLOCKING\",\"file\":\"docs/P20_2_HARVEST_REGRESSION_CONTRACT.md\",\"reason\":\"Section 6 cites docs/evidence/P20_2_AUTO_CANDIDATE_RED.txt as the RED record for tests_py/test_p20_2_auto_candidate_wiring.py, but that transcript was produced from runtime/p20-drafts/test_auto_candidate_wiring.py (7 tests, 5 failed / 2 passed) while the committed file contains 10 tests. The three later tests (legacy recurrence, journal-replay reconciliation, durable-rejection preservation) have no recorded failure at a648a9c3, so the RED evidence does not bind the final test bytes. Not blocking: the RED is genuine and behavioral, the missing three provably fail at HEAD for the same reason (no regression_candidate.json), and GREEN was independently reproduced (10 passed; 149 passed across the related selection). Worth noting the draft provenance so the evidence chain is auditable.\"},{\"classification\":\"NON_BLOCKING\",\"file\":\"src/dev_orchestrator/incidents/capture.py\",\"reason\":\"Two small hygiene points inside _ensure_typed_candidate. It hardcodes schema_version=1 instead of REGRESSION_CANDIDATE_SCHEMA_VERSION, which will silently drift if the typed schema is bumped. It also indexes family[\\\"project_id\\\"], family[\\\"family_id\\\"] and family[\\\"packet_id\\\"] directly while the surrounding recurrence branch is uniformly defensive with .get(), so a family record missing any of the three would raise KeyError and abort an otherwise valid recurrence capture (swallowed by harvest_tick). Currently unreachable: all 20 families in the live runtime index carry those keys, and only capture_incident creates families.\"},{\"classification\":\"NON_BLOCKING\",\"file\":\"src/dev_orchestrator/incidents/regression_candidate.py\",\"reason\":\"The automatic proposal sets actual_outcome to the taxonomy class, while every allowlisted corpus defect anchor emits a mechanical outcome (signature_drift, dedup_failed, intent_unreconciled, same_outcome). Verified by probe: binding case_01 to an auto-harvested proposal yields defect_anchor_outcome_mismatch, never `verified`. This is exactly why the \\\"no verified status from an unrelated allowlisted corpus\\\" requirement holds structurally, and the new replayability != deterministic_replayable fence adds a second independent barrier, so the safety direction is correct. The consequence worth documenting is that an operator rebinding a real reproduction must restate actual_outcome in the value space of the replay anchors (create_regression_candidate with the same candidate_id), and that rebinding is refused when the candidate table is already at max_regression_candidates even though it replaces an existing ID.\"}]}\n```",
+    "error": null,
+    "dispatch_id": "32d1ca85-951b-4bc8-a1de-938d576af57a",
+    "decision_id": "20bc160d-2e0d-498a-9725-b071dc08dc64",
+    "execution_id": "4b80773f-3889-45e5-b960-61e8264f669c",
+    "session_id": "b17dd011-4028-4880-85f5-e55e4d9e0637",
+    "resource_context": {
+      "resource_id": "claude/default/opus",
+      "provider": "anthropic",
+      "account": "default",
+      "model": "claude-opus-5"
+    },
+    "usage": {
+      "input_tokens": "[REDACTED]",
+      "cache_creation_input_tokens": "[REDACTED]",
+      "cache_read_input_tokens": "[REDACTED]",
+      "output_tokens": "[REDACTED]",
+      "output_tokens_details": "[REDACTED]",
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": "[REDACTED]",
+        "ephemeral_5m_input_tokens": "[REDACTED]"
+      },
+      "inference_geo": "not_available",
+      "iterations": [
+        {
+          "input_tokens": "[REDACTED]",
+          "output_tokens": "[REDACTED]",
+          "cache_read_input_tokens": "[REDACTED]",
+          "cache_creation_input_tokens": "[REDACTED]",
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": "[REDACTED]",
+            "ephemeral_1h_input_tokens": "[REDACTED]"
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard",
+      "modelUsage": {
+        "claude-opus-5": {
+          "inputTokens": "[REDACTED]",
+          "outputTokens": "[REDACTED]",
+          "cacheReadInputTokens": "[REDACTED]",
+          "cacheCreationInputTokens": "[REDACTED]",
+          "webSearchRequests": 0,
+          "costUSD": 3.27514,
+          "contextWindow": 1000000,
+          "maxOutputTokens": "[REDACTED]",
+          "thinkingTokens": "[REDACTED]",
+          "canonicalModel": "claude-opus-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "total_cost_usd": 3.27514
+    },
+    "usage_source": "reported",
+    "started_at": "2026-10-04T01:20:35.111297+00:00",
+    "finished_at": "2026-10-04T01:29:29.593202+00:00",
+    "first_output_at": null,
+    "quota_observation": null,
+    "rate_limit_observation": null,
+    "failure_classification": null
+  },
+  "tested_file_sha256": {
+    "src/dev_orchestrator/incidents/capture.py": "9d8558e45503b37e75541bb1f6dbf8c4ace5a7a67fd16b6a8082363096de0d44",
+    "src/dev_orchestrator/incidents/regression_candidate.py": "2f03418e271e505c3beada179bd2fae12ad971e0c2ecf0e2d04e974f7dfe7bca",
+    "tests_py/test_p20_2_auto_candidate_wiring.py": "73dcc1c7a3b0514c1dd3231f6001043d35af0c470384d0bc2f13fc019bde3617",
+    "tests_py/test_p1610_candidate_promotion.py": "c0fdac7dcdfd88fe565c8a1e7ca490cc3a3c243d0773663d144cfc6c509e3291",
+    "docs/P20_2_HARVEST_REGRESSION_CONTRACT.md": "09cf6ad15b580e09551bd287efe7f03e158220122f244173609f13f6a29fcab2",
+    "docs/evidence/P20_2_AUTO_CANDIDATE_RED.txt": "c1b6053b630ed59164740de1fa64ceb2d7f32eb8ab0fe9ff7b660058fd88f630",
+    "docs/evidence/P20_2_AUTO_CANDIDATE_GREEN.txt": "00630cba96e4d9564c96f5d92071b05414337a22e12328856d1dc4360336315f"
+  },
+  "red_provenance": "Initial seven behavioral tests in runtime/p20-drafts/test_auto_candidate_wiring.py: five failed, two passed against accepted a648a9c3. Three subsequent restart/history/rejection tests added before final GREEN; no separate RED claimed for them.",
+  "root_green": "118 passed in 15.10s; final ten integration tests included",
+  "quota_failures": [
+    {
+      "request_id": "p20-2-auto-candidate-technical-review-20261004-r1",
+      "role_run_id": "reviewer-p20-auto-candidate-r1",
+      "status": "failed",
+      "output": "You've hit your session limit · resets 9:20am (Asia/Shanghai)",
+      "error": "You've hit your session limit · resets 9:20am (Asia/Shanghai)",
+      "dispatch_id": "a2b3e877-5274-4d7d-818e-7fac4a6edbf3",
+      "decision_id": "8e37c7f4-eb8d-498b-8e8a-f403cf091a80",
+      "execution_id": "489177f4-23aa-4ce3-887a-e060fb5eba6c",
+      "session_id": "b17dd011-4028-4880-85f5-e55e4d9e0637",
+      "resource_context": {
+        "resource_id": "claude/default/opus",
+        "provider": "anthropic",
+        "account": "default",
+        "model": "claude-opus-5"
+      },
+      "usage": {
+        "output_tokens_details": "[REDACTED]",
+        "input_tokens": "[REDACTED]",
+        "cache_creation_input_tokens": "[REDACTED]",
+        "cache_read_input_tokens": "[REDACTED]",
+        "output_tokens": "[REDACTED]",
+        "server_tool_use": {
+          "web_search_requests": 0,
+          "web_fetch_requests": 0
+        },
+        "service_tier": "standard",
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": "[REDACTED]",
+          "ephemeral_5m_input_tokens": "[REDACTED]"
+        },
+        "inference_geo": "",
+        "iterations": [],
+        "speed": "standard",
+        "modelUsage": {},
+        "total_cost_usd": 0
+      },
+      "usage_source": "reported",
+      "started_at": "2026-10-04T01:18:16.982036+00:00",
+      "finished_at": "2026-10-04T01:18:20.620124+00:00",
+      "first_output_at": null,
+      "quota_observation": null,
+      "rate_limit_observation": null,
+      "failure_classification": "quota_exhausted"
+    },
+    {
+      "request_id": "p20-2-auto-candidate-technical-review-20261004-r2",
+      "role_run_id": "reviewer-p20-auto-candidate-r2",
+      "status": "failed",
+      "output": "You've hit your session limit · resets 9:20am (Asia/Shanghai)",
+      "error": "You've hit your session limit · resets 9:20am (Asia/Shanghai)",
+      "dispatch_id": "82eba3db-17ab-4c89-addd-a6131bb69f99",
+      "decision_id": "8e9ce537-6b59-4f1c-8700-d4967bccf906",
+      "execution_id": "f9861295-ddd1-40b3-9e24-e8d1d0414380",
+      "session_id": "b17dd011-4028-4880-85f5-e55e4d9e0637",
+      "resource_context": {
+        "resource_id": "claude/default/opus",
+        "provider": "anthropic",
+        "account": "default",
+        "model": "claude-opus-5"
+      },
+      "usage": {
+        "output_tokens_details": "[REDACTED]",
+        "input_tokens": "[REDACTED]",
+        "cache_creation_input_tokens": "[REDACTED]",
+        "cache_read_input_tokens": "[REDACTED]",
+        "output_tokens": "[REDACTED]",
+        "server_tool_use": {
+          "web_search_requests": 0,
+          "web_fetch_requests": 0
+        },
+        "service_tier": "standard",
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": "[REDACTED]",
+          "ephemeral_5m_input_tokens": "[REDACTED]"
+        },
+        "inference_geo": "",
+        "iterations": [],
+        "speed": "standard",
+        "modelUsage": {},
+        "total_cost_usd": 0
+      },
+      "usage_source": "reported",
+      "started_at": "2026-10-04T01:19:39.011651+00:00",
+      "finished_at": "2026-10-04T01:19:42.735171+00:00",
+      "first_output_at": null,
+      "quota_observation": null,
+      "rate_limit_observation": null,
+      "failure_classification": "quota_exhausted"
+    }
+  ],
+  "legacy_rejection": {
+    "operation": "normal IncidentStore candidate API; no lifecycle mutation",
+    "backup": "C:\\work\\github\\DevOrchestrator-dev\\runtime\\backup-p20-legacy-candidate-rejection-20261004-013029",
+    "candidate_id": "cand-7dd84495b777",
+    "verification_status": "rejected",
+    "rejection_reason": "vacuous_synthetic_oracle_ineligible",
+    "legacy_file_hashes_preserved": {
+      "manifest.json": "31575718ca72145dfba4e577577c8a1b2dc58b9bd2472715e901522e49338d3e",
+      "test_candidate_cand-7dd84495b777.py": "beda722ba8b97bd4137103d4744d49c4f1550e7edcd8b6e3dc58602a88960704"
+    },
+    "observed_at": "2026-10-04T01:30:29.347916+00:00"
+  }
+}

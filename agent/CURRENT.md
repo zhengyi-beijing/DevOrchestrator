@@ -1,3 +1,19 @@
+# P20.2 automatic candidate integration follow-up — 2026-10-04
+
+Owner pause is intentional while this confirmed acceptance gap is closed.
+P20.1 has independent acceptance. P20.2's normal review accepted a648a9c3,
+but supplemental execution probes found that automatic harvest still generated
+only legacy candidates. The default path now creates a typed proposal atomically,
+with unknown replayability, bounded capacity and no synthetic Python oracle.
+Ten integration tests and 118 related tests pass. Supplemental independent
+Technical Review ACCEPT (independent Anthropic Opus; 10 focused, 149 related,
+62 additional candidate tests). Six NON_BLOCKING notes are retained in
+docs/evidence/P20_2_AUTO_CANDIDATE_REVIEW.json. No live soak has started.
+The historical vacuous candidate now has a durable typed rejection via normal
+IncidentStore API, with all legacy file hashes unchanged. Next: quiescent daemon
+reload and normal resume/handoff to P20.3.
+Authority remains with the existing lifecycle APIs; no runtime ledger was edited.
+
 # P20.2 Automatic Failure Harvesting & Regression Promotion Technical Review Remediation State (2026-10-04)
 
 P20.2 Automatic Failure Harvesting & Regression Promotion technical review remediation complete:

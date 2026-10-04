@@ -122,6 +122,46 @@ Corpus test cases reside in `tests_py/data/p20_2_replay_corpus/*.json` with sche
 
 ## 6. Verification Lifecycle & Rejection Reasons
 
+### Automatic capture integration
+
+With the default `auto_synthesis=true` and `typed_replay_candidates=true`,
+`capture_incident()` reserves one source-bound typed proposal in the same
+transaction as its initial family and packet. `harvest_tick()` therefore enters
+the typed candidate store directly. Capacity exhaustion aborts the transaction;
+journal replay recovers the family, packet and candidate together. Repeated
+events add no candidate, and recurrence preserves existing verification status.
+
+An automatic proposal records the source family, full signature, packet IDs,
+sanitized-input digest and invariant hint. It has `replayability=unknown` until
+a real allowlisted reproduction is supplied through the reviewed candidate API.
+Verification rejects an unknown/non-replayable source with
+`unbound_or_non_replayable_source`; capturing an incident is never proof of a
+regression. Default automatic capture generates no Python oracle. The explicit
+`typed_replay_candidates=false` mode preserves legacy operator compatibility;
+its synthetic gate results are excluded from P20 qualification. A new recurrence
+of a legacy family adds a typed proposal without rewriting its historical files.
+
+Integration evidence: `tests_py/test_p20_2_auto_candidate_wiring.py`,
+`docs/evidence/P20_2_AUTO_CANDIDATE_RED.txt` (5 behavioral failures), and
+`docs/evidence/P20_2_AUTO_CANDIDATE_GREEN.txt` (118 focused/related tests passed).
+
+The RED transcript covers the initial seven-test runtime draft (five failed,
+two passed) against accepted a648a9c3. Three history/restart/rejection tests were
+added before final GREEN; no separate RED is claimed for them. Independent
+Anthropic Technical Review accepted the delta and independently passed ten
+integration, 149 related and 62 additional candidate tests. Full verdict,
+tested-byte hashes and six NON_BLOCKING notes are preserved in
+`docs/evidence/P20_2_AUTO_CANDIDATE_REVIEW.json`.
+
+Operational limits from that review: keep candidate capacity at least family
+capacity, because saturation aborts capture. A pre-existing interrupted verify
+can orphan a candidate side file while its index status remains durable; retain
+the orphan and fail closed rather than infer verification. In a migrated store,
+the legacy and typed APIs still maintain separate records for the same ID;
+legacy operator gates are not P20 proof. Binding a real reproduction requires
+source-correlated inputs and a mechanical `actual_outcome` matching the replay,
+not merely a taxonomy label. These limitations remain explicit follow-up inputs.
+
 ### Verification Transitions
 1. `verify_regression_candidate()` executes the allowlisted op across `defect_anchor` and `corrected_anchor` at least twice.
 2. Status transitions:

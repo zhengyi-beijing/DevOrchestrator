@@ -389,7 +389,9 @@ class TestCandidatePromotion(unittest.TestCase):
             semantic=semantic,
             evidence={"log": "stall"},
             occurrence_key="test-occ-1",
-            config={"incidents": {"enabled": True, "auto_synthesis": True}},
+            # Explicit legacy compatibility mode; P20's default automatic path
+            # is covered by typed-candidate integration tests, not this oracle.
+            config={"incidents": {"enabled": True, "auto_synthesis": True, "typed_replay_candidates": False}},
         )
         cand_id = family.get("candidate_id")
         self.assertIsNotNone(cand_id)
