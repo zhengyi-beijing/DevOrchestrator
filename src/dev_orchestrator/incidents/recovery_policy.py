@@ -168,11 +168,19 @@ def decide_recovery(
         1 for att in previous_attempts
         if isinstance(att, dict) and att.get("strategy_key") == strategy_key
     )
+    # Compute family attempts count from family record and previous attempts for this family
+    family_record_count = 0
+    if isinstance(family, dict):
+        family_record_count = int(family.get("recovery_attempt") or family.get("attempt_count") or family.get("previous_attempts") or 0)
+    family_attempts_from_prev = sum(
+        1 for att in previous_attempts
+        if isinstance(att, dict) and str(att.get("family_id") or "") == family_id
+    )
     total_incident_attempts = len(previous_attempts)
-
+    family_attempts_count = max(family_record_count, family_attempts_from_prev)
     same_strategy_remaining = max(0, max_same_strategy - same_strategy_attempts)
     incident_recoveries_remaining = max(0, max_recoveries_incident - total_incident_attempts)
-    family_attempts_remaining = max(0, max_family_attempts - total_incident_attempts)
+    family_attempts_remaining = max(0, max_family_attempts - family_attempts_count)
 
     remaining_budget: dict[str, Any] = {
         "same_strategy_remaining": same_strategy_remaining,
@@ -286,12 +294,20 @@ def decide_recovery(
             gate_code="UNKNOWN_SAFETY_GATE",
         )
 
-    # Exhausted total budget
+    # Exhausted total budget per incident
     if incident_recoveries_remaining <= 0:
         return _make_decision(
             action="OWNER_GATE",
             reason=f"recovery_budget_exhausted: {total_incident_attempts} attempts consumed (max {max_recoveries_incident})",
             gate_code="RECOVERY_BUDGET_EXHAUSTED",
+        )
+
+    # Exhausted per-family recovery budget
+    if family_attempts_remaining <= 0:
+        return _make_decision(
+            action="OWNER_GATE",
+            reason=f"family_recovery_budget_exhausted: {family_attempts_count} attempts consumed for family {family_id} (max {max_family_attempts})",
+            gate_code="FAMILY_RECOVERY_BUDGET_EXHAUSTED",
         )
 
     # -------------------------------------------------------------

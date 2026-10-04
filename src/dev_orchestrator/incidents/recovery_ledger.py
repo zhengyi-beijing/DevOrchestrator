@@ -367,7 +367,13 @@ def load_recovery_attempts(
     return results
 
 
-def recovery_budget_state(attempts: Sequence[dict[str, Any]], budgets: Mapping[str, Any]) -> dict[str, Any]:
+def recovery_budget_state(
+    attempts: Sequence[dict[str, Any]],
+    budgets: Mapping[str, Any],
+    *,
+    family_id: str | None = None,
+    family_attempts: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Compute budget consumption and remaining attempts from durable attempts."""
     max_same = int(budgets.get("max_same_strategy_retries", 1))
     max_incident = int(budgets.get("max_recoveries_per_incident", 3))
@@ -379,11 +385,18 @@ def recovery_budget_state(attempts: Sequence[dict[str, Any]], budgets: Mapping[s
         sk = str(att.get("strategy_key") or "unknown")
         strategy_counts[sk] = strategy_counts.get(sk, 0) + 1
 
+    if family_attempts is not None:
+        family_count = len(family_attempts)
+    elif family_id:
+        family_count = sum(1 for att in attempts if str(att.get("family_id") or "") == family_id)
+    else:
+        family_count = total_attempts
+
     return {
         "total_attempts": total_attempts,
         "max_recoveries_per_incident": max_incident,
         "incident_remaining": max(0, max_incident - total_attempts),
-        "family_remaining": max(0, max_family - total_attempts),
+        "family_remaining": max(0, max_family - family_count),
         "strategy_counts": strategy_counts,
         "max_same_strategy_retries": max_same,
     }
@@ -391,7 +404,7 @@ def recovery_budget_state(attempts: Sequence[dict[str, Any]], budgets: Mapping[s
 
 def reconcile_recovery_attempts(
     runtime_root: Path | str,
-    project_id: str,
+    project_id: str | None = None,
     *,
     executor: Any = None,
     planner: Any = None,
@@ -402,11 +415,47 @@ def reconcile_recovery_attempts(
     """Restart and replay reconciliation for reserved and actuated recovery attempts.
 
     Binds to single existing effect if present.
-    Marks abandoned on proven absence.
+    Marks abandoned on proven absence for unactuated reservations.
     Emits durable actionable OWNER_GATE on crash ambiguity.
     Never launches a duplicate Worker, job, or handoff.
     """
     runtime = Path(runtime_root)
+
+    if project_id is None:
+        # Reconcile across all projects present in recovery store
+        store = load_incident_store(runtime)
+        attempts_dict = store.index.get("recovery_attempts") or {}
+        project_ids: set[str] = {
+            str(att.get("project_id"))
+            for att in attempts_dict.values()
+            if isinstance(att, dict) and att.get("project_id")
+        }
+        attempts_dir = runtime / "incident-packets" / "recovery-attempts"
+        if attempts_dir.is_dir():
+            for p in attempts_dir.glob("*.json"):
+                loaded = read_json(p, None)
+                if isinstance(loaded, dict) and loaded.get("project_id"):
+                    project_ids.add(str(loaded["project_id"]))
+        if not project_ids:
+            pdir = runtime / "projects"
+            if pdir.is_dir():
+                for p in pdir.glob("*.json"):
+                    project_ids.add(p.stem)
+        reconciled_all: list[dict[str, Any]] = []
+        for pid in sorted(project_ids):
+            reconciled_all.extend(
+                reconcile_recovery_attempts(
+                    runtime_root,
+                    pid,
+                    executor=executor,
+                    planner=planner,
+                    reviewer=reviewer,
+                    jobs=jobs,
+                    now=now,
+                )
+            )
+        return reconciled_all
+
     attempts = load_recovery_attempts(runtime, project_id)
     reconciled_results: list[dict[str, Any]] = []
 
@@ -445,12 +494,16 @@ def reconcile_recovery_attempts(
         # 1. Handoff effect reconciliation (CPF-02, CPF-03, CPF-07)
         if eff_kind == "handoff" or "handoff" in eff_kind:
             found_handoff = None
-            if isinstance(handoffs_dict, dict):
+            if isinstance(handoffs_dict, dict) and eff_id:
                 for h_key, h_val in handoffs_dict.items():
-                    if eff_id and (h_key == eff_id or (isinstance(h_val, dict) and h_val.get("handoff_id") == eff_id)):
-                        found_handoff = h_key
-                        break
-                    elif not eff_id and isinstance(h_val, dict):
+                    if h_key == eff_id or (
+                        isinstance(h_val, dict)
+                        and (
+                            h_val.get("handoff_id") == eff_id
+                            or h_val.get("target_id") == eff_id
+                            or h_val.get("task_id") == eff_id
+                        )
+                    ):
                         found_handoff = h_key
                         break
             if found_handoff:
@@ -458,9 +511,22 @@ def reconcile_recovery_attempts(
                     runtime, project_id, aid, "reconciled", effect_id=found_handoff, reason="bound_to_replayed_handoff"
                 )
                 reconciled_results.append(updated)
-            else:
+            elif status == "reserved":
                 updated = record_recovery_outcome(
                     runtime, project_id, aid, "abandoned", reason="handoff_proven_absent"
+                )
+                reconciled_results.append(updated)
+            else:
+                from dev_orchestrator.control.owner_store import OwnerControlStore
+                gate_id = f"gate-handoff-ambig-{aid[:12]}"
+                OwnerControlStore(runtime).record_gate(
+                    project_id=project_id,
+                    gate_id=gate_id,
+                    reason=f"CRASH_AMBIGUITY: actuated handoff attempt {aid} (effect {eff_id}) not found",
+                    active=True,
+                )
+                updated = record_recovery_outcome(
+                    runtime, project_id, aid, "gated", owner_gate_id=gate_id, reason="crash_ambiguity_actuated_handoff_missing"
                 )
                 reconciled_results.append(updated)
             continue
@@ -472,27 +538,48 @@ def reconcile_recovery_attempts(
                     runtime, project_id, aid, "reconciled", effect_id=eff_id, reason="bound_to_existing_durable_job"
                 )
                 reconciled_results.append(updated)
-            else:
+            elif status == "reserved":
                 updated = record_recovery_outcome(
                     runtime, project_id, aid, "abandoned", reason="durable_job_proven_absent"
                 )
                 reconciled_results.append(updated)
+            else:
+                from dev_orchestrator.control.owner_store import OwnerControlStore
+                gate_id = f"gate-job-ambig-{aid[:12]}"
+                OwnerControlStore(runtime).record_gate(
+                    project_id=project_id,
+                    gate_id=gate_id,
+                    reason=f"CRASH_AMBIGUITY: actuated job attempt {aid} (job {eff_id}) not found",
+                    active=True,
+                )
+                updated = record_recovery_outcome(
+                    runtime, project_id, aid, "gated", owner_gate_id=gate_id, reason="crash_ambiguity_actuated_job_missing"
+                )
+                reconciled_results.append(updated)
             continue
 
-        # 3. Worker execution / runtime reconciliation (CPF-01, CPF-07 crash ambiguity)
+        # 3. Control command / continue reconciliation (e.g. watchdog attempts)
+        from dev_orchestrator.control.command_store import ControlCommandStore
+        cmd_store = ControlCommandStore(runtime)
+        found_cmd = cmd_store.get(eff_id) if eff_id else None
+        if found_cmd is not None:
+            updated = record_recovery_outcome(
+                runtime, project_id, aid, "reconciled", effect_id=eff_id, reason="bound_to_existing_control_command"
+            )
+            reconciled_results.append(updated)
+            continue
+
+        # 4. Worker execution / runtime reconciliation (CPF-01, CPF-07 crash ambiguity)
         if lineage_corrupt:
             # Crash ambiguity: fail closed to OWNER_GATE
             from dev_orchestrator.control.owner_store import OwnerControlStore
             gate_id = f"gate-ambig-{aid[:12]}"
-            try:
-                OwnerControlStore(runtime).record_gate(
-                    project_id=project_id,
-                    gate_id=gate_id,
-                    reason=f"CRASH_AMBIGUITY: recovery attempt {aid} has corrupt lineage evidence",
-                    active=True,
-                )
-            except Exception:
-                pass
+            OwnerControlStore(runtime).record_gate(
+                project_id=project_id,
+                gate_id=gate_id,
+                reason=f"CRASH_AMBIGUITY: recovery attempt {aid} has corrupt lineage evidence",
+                active=True,
+            )
             updated = record_recovery_outcome(
                 runtime, project_id, aid, "gated", owner_gate_id=gate_id, reason="crash_ambiguity_corrupt_lineage"
             )
@@ -504,7 +591,19 @@ def reconcile_recovery_attempts(
         if isinstance(lineage_data, dict):
             records = lineage_data.get("records") or {}
             for r_key, r_val in records.items():
-                if eff_id and r_key == eff_id:
+                if eff_id and (
+                    r_key == eff_id
+                    or r_key == f"{project_id}:{eff_id}"
+                    or (
+                        isinstance(r_val, dict)
+                        and (
+                            r_val.get("source_request_id") == eff_id
+                            or r_val.get("command_id") == eff_id
+                            or r_val.get("request_id") == eff_id
+                            or r_val.get("execution_id") == eff_id
+                        )
+                    )
+                ):
                     found_exec = r_key
                     break
 
@@ -513,9 +612,22 @@ def reconcile_recovery_attempts(
                 runtime, project_id, aid, "reconciled", effect_id=found_exec, reason="bound_to_existing_execution"
             )
             reconciled_results.append(updated)
-        else:
+        elif status == "reserved":
             updated = record_recovery_outcome(
                 runtime, project_id, aid, "abandoned", reason="effect_proven_absent"
+            )
+            reconciled_results.append(updated)
+        else:
+            from dev_orchestrator.control.owner_store import OwnerControlStore
+            gate_id = f"gate-exec-ambig-{aid[:12]}"
+            OwnerControlStore(runtime).record_gate(
+                project_id=project_id,
+                gate_id=gate_id,
+                reason=f"CRASH_AMBIGUITY: actuated execution attempt {aid} (effect {eff_id}) not found in lineage",
+                active=True,
+            )
+            updated = record_recovery_outcome(
+                runtime, project_id, aid, "gated", owner_gate_id=gate_id, reason="crash_ambiguity_actuated_execution_missing"
             )
             reconciled_results.append(updated)
 

@@ -1,42 +1,53 @@
 === P20.3 Focused Test Suites & Bootstrap Timeout Contract Tests ===
 Command: python -m unittest tests_py/test_p20_3_recovery_policy.py tests_py/test_p20_3_recovery_durability.py tests_py/test_p20_readonly_review_timeout.py
-Date: 2026-10-04T10:35:53+08:00
+Date: 2026-10-04T11:03:00+08:00
 
-.................................................
+......................................................
 ----------------------------------------------------------------------
-Ran 49 tests in 3.819s
+Ran 54 tests in 4.062s
 
 OK
 
 Test breakdown:
-- tests_py/test_p20_3_recovery_policy.py: 18 tests (pure decision matrix, budgets, anti-loop, escalation eligibility, provider independence)
-- tests_py/test_p20_3_recovery_durability.py: 23 tests (reservation, outcome, restart, replay reconciliation, watchdog recovery, CPF-01..10, bootstrap gaps 1, 1b, 2, 3, telemetry integration)
+- tests_py/test_p20_3_recovery_policy.py: 19 tests (pure decision matrix, budgets, anti-loop, escalation eligibility, provider independence, family recovery budget exhaustion)
+- tests_py/test_p20_3_recovery_durability.py: 27 tests (reservation, outcome, restart, replay reconciliation, watchdog recovery, CPF-01..10, bootstrap gaps 1, 1b, 2, 3, telemetry integration, daemon multi-project sweep, actuated control command reconciliation, crash ambiguity gating, non-arbitrary handoff binding)
 - tests_py/test_p20_readonly_review_timeout.py: 8 tests (bootstrap timeout contract, resource budget, zero budget, cancelled/no_candidate, missing resource, semantic timeout, worker classification)
-Total: 49 passed, 0 failed.
+Total: 54 passed, 0 failed.
+
+=== Production Call Site Verification ===
+Command: python runtime/p20-3-root-integration-probes.py
+Result:
+- decide_recovery: ["src/dev_orchestrator/core/watchdog.py:1785"]
+- adjudicate_plan_delta: ["src/dev_orchestrator/core/ai_planner.py:2214"]
+- cleanup_stale_role_tool_children: ["src/dev_orchestrator/core/ai_planner.py:1822", "src/dev_orchestrator/core/ai_reviewer.py:1838"]
 
 === Adjacent Regression Suites ===
 1. P20.1 & P20.2 Suites:
-   python -m unittest tests_py/test_p20_1_reliability.py tests_py/test_p20_2_harvest_regression.py
-   Ran 73 tests in 1.702s - OK
+   python -m unittest tests_py/test_p20_1_reliability.py tests_py/test_p20_2_harvest_regression.py tests_py/test_p20_2_auto_candidate_wiring.py
+   Ran 73 tests in 1.495s - OK
 
-2. Lifecycle, Successor Consistency & Invariant Workflows:
-   python -m unittest tests_py/test_p1613_successor_consistency.py tests_py/test_p1614_invariant_workflow.py
-   Ran 132 tests in 79.241s - OK
-
-3. Watchdog Suites:
+2. Watchdog Suites:
    python -m unittest discover -s tests_py -p "test_watchdog*.py"
-   Ran 119 tests in 20.622s - OK
+   Ran 119 tests in 20.644s - OK
 
-4. Staged Handoff & Roadmap:
+3. Staged Handoff & Roadmap:
    python -m unittest tests_py/test_staged_handoff.py tests_py/test_p20_bootstrap_handoff.py tests_py/test_p20_roadmap.py
-   Ran 16 tests in 18.158s - OK
+   Ran 16 tests in 16.534s - OK
 
-5. AI Planner & Planning Convergence:
+4. AI Planner & Planning Convergence:
    python -m unittest tests_py/test_ai_planner.py tests_py/test_planning_convergence_recovery.py
-   Ran 47 tests in 27.633s - OK
+   Ran 47 tests in 28.245s - OK
+
+5. Control Commands & AI Reviewer:
+   python -m unittest tests_py/test_control_commands.py tests_py/test_ai_reviewer.py
+   Ran 29 tests in 7.129s - OK
+
+6. Lifecycle, Successor Consistency & Invariant Workflows:
+   python -m unittest tests_py/test_p1613_successor_consistency.py tests_py/test_p1614_invariant_workflow.py
+   Ran 132 tests in 79.252s - OK
 
 === Conformance & Code Quality ===
 - Fault Registry Validation: validate_fault_registry() returned ERRORS: []
 - Python compilation: python -m compileall -q src tests_py ops (clean)
 - Git diff check: git diff --check (clean)
-- Graphify knowledge graph: 9118 nodes, 24741 edges, 344 communities
+- Graphify knowledge graph: 9131 nodes, 24799 edges, 357 communities

@@ -1819,6 +1819,14 @@ class AIPlannerCoordinator:
                     self._handle_inconclusive_review_transport_loss(plan_id, review_request, reconciled, exc)
                     return None
 
+                cleanup_stale_role_tool_children(
+                    self.runtime_root,
+                    role="reviewer",
+                    max_age_seconds=review_request.timeout_seconds,
+                    request_id=review_request.request_id,
+                    resource_id=review_request.previous_resource_context.resource_id if review_request.previous_resource_context else None,
+                )
+
                 self._finish(plan_id, "failed", f"plan review failed: {review_failure}")
                 return None
             finally:
@@ -2202,6 +2210,17 @@ class AIPlannerCoordinator:
                         )
                     restart_recovery_cycle = True
                     break
+
+                adjudication = self.adjudicate_plan_delta(
+                    record["project_id"],
+                    record["task_id"],
+                    accepted_contract=plan or {},
+                    unresolved_delta={"blocking_finding": reason, "rejection_reason": reason},
+                )
+                if adjudication.get("disposition") == "bounded_patch" and adjudication.get("patch"):
+                    if isinstance(plan, dict):
+                        plan.update(adjudication["patch"])
+                    continue
 
                 exhaust_reason = (
                     f"plan remediation hit its bound after {max_remediation_rounds} rounds (exhausted); "
@@ -2816,16 +2835,13 @@ class AIPlannerCoordinator:
         resource_id = prev_res.resource_id if prev_res else None
         reason = f"transport response loss while broker running: request_id={req_id}, resource={resource_id}"
 
-        try:
-            from dev_orchestrator.control.owner_store import OwnerControlStore
-            OwnerControlStore(self.runtime_root).record_gate(
-                project_id=review_request.project_id,
-                gate_id=gate_id,
-                reason=reason,
-                active=True,
-            )
-        except Exception:
-            pass
+        from dev_orchestrator.control.owner_store import OwnerControlStore
+        OwnerControlStore(self.runtime_root).record_gate(
+            project_id=review_request.project_id,
+            gate_id=gate_id,
+            reason=reason,
+            active=True,
+        )
 
         if self.accounting is not None:
             self.accounting.open_owner_gate(

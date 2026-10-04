@@ -22,6 +22,17 @@ from .store import ConversationControlStore
 
 def latest_owner_gate(runtime: Path | str, project_id: str) -> dict[str, Any] | None:
     rt = Path(runtime)
+    owner_ctl = read_json(rt / "owner-control.json", {})
+    projects_ctl = owner_ctl.get("projects") if isinstance(owner_ctl, dict) else None
+    row_ctl = projects_ctl.get(project_id) if isinstance(projects_ctl, dict) else None
+    if isinstance(row_ctl, dict):
+        gate_ctl = row_ctl.get("owner_gate")
+        if isinstance(gate_ctl, dict) and gate_ctl.get("active", True):
+            result = copy.deepcopy(gate_ctl)
+            result.setdefault("gate_source", "owner_control")
+            result.setdefault("state", "owner_gate")
+            result.setdefault("project_id", project_id)
+            return result
     watchdog = read_json(rt / "watchdog.json", {})
     projects = watchdog.get("projects") if isinstance(watchdog, dict) else None
     row = projects.get(project_id) if isinstance(projects, dict) else None

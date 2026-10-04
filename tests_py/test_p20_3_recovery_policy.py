@@ -581,6 +581,45 @@ class TestP203RecoveryStrategyKeyAndAntiLoop(unittest.TestCase):
         self.assertEqual(dec.action, "OWNER_GATE")
         self.assertEqual(dec.remaining_budget.get("incident_recoveries_remaining"), 0)
 
+    def test_family_recovery_budget_exhaustion_gates_to_owner(self) -> None:
+        """When family recovery attempts reach family budget limit, decide_recovery gates."""
+        incident = {
+            "incident_id": "inc-fam-fresh",
+            "project_id": "proj-1",
+            "task_id": "P20.3",
+            "failure_class": "planner_timeout",
+            "failure_signature": "sig-fam",
+        }
+        family = {
+            "family_id": "fam-exhausted-01",
+            "recovery_attempt": 5,
+            "previous_attempts": 5,
+        }
+        # Zero previous attempts for this new incident, but family has 5 prior attempts
+        inputs = RecoveryInputs(
+            authority={
+                "project_id": "proj-1",
+                "current_task_id": "P20.3",
+                "lifecycle_state": "PENDING_DESIGN",
+                "lifecycle_generation": 12,
+                "lifecycle_transition_id": "trans-1",
+                "git": {"head": "abc", "branch": "main", "dirty": False},
+                "repository_projection": {"task_id": "P20.3", "state": "PENDING_DESIGN", "matches_authority": True},
+            },
+            owner_gate={"resolved": True, "pending": False, "gate_id": None, "gate_source": None, "paused": False, "reason": "ok"},
+            incident=incident,
+            family=family,
+            previous_attempts=(),
+            liveness=None,
+            resource_availability={"eligible_candidates": [{"resource_id": "c1", "provider": "p1", "model": "m1"}], "ineligible_candidates": [], "heterogeneous_candidates": [], "independent_candidates": []},
+            existing_effects=None,
+            budgets={"max_same_strategy_retries": 1, "max_recoveries_per_incident": 3, "max_recovery_attempts_per_family": 5, "heterogeneous_required_classes": [], "recovery_enabled": True},
+        )
+        dec = decide_recovery(inputs, now="2026-10-04T12:00:00+00:00")
+        self.assertEqual(dec.action, "OWNER_GATE")
+        self.assertEqual(dec.gate_code, "FAMILY_RECOVERY_BUDGET_EXHAUSTED")
+        self.assertEqual(dec.remaining_budget.get("family_attempts_remaining"), 0)
+
 
 class TestP203ResourceAvailabilityAndIndependence(unittest.TestCase):
     """Test pure adapter for real resource availability and provider-level reviewer independence."""

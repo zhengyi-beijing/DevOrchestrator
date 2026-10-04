@@ -1717,50 +1717,107 @@ class WatchdogCoordinator:
 
         attempt_number = len(attempts) + 1
         command_id = f"wd-plan-{fingerprint[:16]}-{attempt_number}"
+
+        from dev_orchestrator.incidents.recovery_ledger import (
+            load_recovery_attempts,
+            reserve_recovery_attempt,
+            record_recovery_outcome,
+        )
+        from dev_orchestrator.incidents.recovery_policy import (
+            RecoveryInputs,
+            decide_recovery,
+            build_resource_availability,
+        )
+        from dev_orchestrator.incidents.owner_gate import resolve_owner_gate_authority
+
+        routing_cfg = None
+        if hasattr(self, "config") and isinstance(self.config, dict):
+            routing_cfg = self.config.get("routing")
+        pool_telemetry = None
+        if hasattr(self, "resource_pool") and self.resource_pool is not None:
+            pool_telemetry = getattr(self.resource_pool, "telemetry", None)
+
+        res_avail = build_resource_availability(
+            pool_telemetry,
+            routing_cfg,
+            role="planner",
+            independence="none",
+        )
+
+        owner_gate_auth = resolve_owner_gate_authority(self.runtime_root, snapshot)
+        prev_attempts = load_recovery_attempts(self.runtime_root, pid, incident_id=f"inc-{fingerprint[:16]}")
+
+        inputs = RecoveryInputs(
+            authority={
+                "project_id": pid,
+                "current_task_id": task_id,
+                "lifecycle_state": str(snapshot.get("lifecycle_state") or snapshot.get("state") or ""),
+                "lifecycle_generation": authority.get("generation") if isinstance(authority, dict) else None,
+                "git": {"head": str(truth.head or ""), "branch": str(truth.branch or ""), "dirty": bool(truth.dirty)},
+                "repository_projection": {"task_id": task_id, "state": str(snapshot.get("state") or ""), "matches_authority": True},
+            },
+            owner_gate=owner_gate_auth,
+            incident={
+                "incident_id": f"inc-{fingerprint[:16]}",
+                "project_id": pid,
+                "task_id": task_id,
+                "failure_class": "RESOURCE_TRANSIENT",
+                "failure_signature": fingerprint,
+                "role": "planner",
+            },
+            family={
+                "family_id": f"fam-{fingerprint[:12]}",
+                "recovery_attempt": attempt_number,
+                "previous_attempts": len(attempts),
+            },
+            previous_attempts=prev_attempts,
+            liveness=None,
+            resource_availability=res_avail,
+            existing_effects=None,
+            budgets={
+                "max_same_strategy_retries": int(policy.get("max_same_strategy_retries", 1)),
+                "max_recoveries_per_incident": int(policy.get("max_attempts_per_run", limit)),
+                "max_recovery_attempts_per_family": int(policy.get("max_recovery_attempts_per_family", 5)),
+                "heterogeneous_required_classes": policy.get("heterogeneous_required_classes", []),
+                "recovery_enabled": bool(policy.get("recovery_enabled", True)),
+            },
+        )
+        rcv_decision = decide_recovery(inputs, now=utc_now_iso())
+
+        if rcv_decision.action == "OWNER_GATE":
+            problem["state"] = "exhausted"
+            problem["reason"] = f"recovery gated by policy: {rcv_decision.reason}"
+            self._save_state(self._cached_state)
+            gate_id = f"gate-wd-{fingerprint[:12]}-{attempt_number}"
+            from dev_orchestrator.control.owner_store import OwnerControlStore
+            OwnerControlStore(self.runtime_root).record_gate(
+                project_id=pid,
+                gate_id=gate_id,
+                reason=rcv_decision.reason,
+                active=True,
+            )
+            return {"project_id": pid, "status": "planning_recovery_gated", "reason": rcv_decision.reason}
+
+        if rcv_decision.action == "NO_ACTION_ALREADY_RECOVERED":
+            problem["state"] = "resolved"
+            problem["reason"] = rcv_decision.reason
+            self._save_state(self._cached_state)
+            return {"project_id": pid, "status": "planning_recovery_already_recovered"}
+
         attempt = {
             "attempt": attempt_number,
             "failed_plan_id": failed_plan_id,
             "command_id": command_id,
             "state": "reserved",
             "reserved_at": utc_now_iso(),
+            "action": rcv_decision.action,
+            "strategy_key": rcv_decision.strategy_key,
         }
         attempts.append(attempt)
         problem["state"] = "retrying"
         self._save_state(self._cached_state)
 
-        try:
-            from dev_orchestrator.incidents.recovery_ledger import (
-                reserve_recovery_attempt,
-                record_recovery_outcome,
-            )
-            from dev_orchestrator.incidents.recovery_policy import RecoveryDecision
-            rcv_decision = RecoveryDecision(
-                action="RETRY_SAME_STRATEGY",
-                reason="watchdog_automatic_planning_recovery",
-                authorized_effect={"effect_kind": "continue", "target_id": task_id},
-                expected_authority_anchor={
-                    "project_id": pid,
-                    "task_id": task_id,
-                    "lifecycle_generation": authority.get("generation") if isinstance(authority, dict) else None,
-                    "head": str(truth.head or ""),
-                },
-                expected_source_anchor={
-                    "incident_id": f"inc-{fingerprint[:16]}",
-                    "family_id": f"fam-{fingerprint[:12]}",
-                    "failure_signature": fingerprint,
-                },
-                remaining_budget={
-                    "same_strategy_remaining": max(0, limit - attempt_number),
-                    "incident_recoveries_remaining": max(0, limit - attempt_number),
-                },
-                strategy_key=f"watchdog_plan_recovery:{task_id}",
-                attempt_id=command_id,
-                idempotency_key=f"idem-{command_id}",
-                requires_heterogeneous=False,
-            )
-            reserve_recovery_attempt(self.runtime_root, pid, rcv_decision)
-        except Exception:
-            pass
+        reserve_recovery_attempt(self.runtime_root, pid, rcv_decision)
 
         try:
             from dev_orchestrator.core.control_commands import submit_control_command
@@ -1772,12 +1829,9 @@ class WatchdogCoordinator:
                 expected=identity,
                 source="watchdog_planning_recovery",
             )
-            try:
-                record_recovery_outcome(
-                    self.runtime_root, pid, command_id, "actuated", effect_id=command_id
-                )
-            except Exception:
-                pass
+            record_recovery_outcome(
+                self.runtime_root, pid, rcv_decision.attempt_id, "actuated", effect_id=command_id
+            )
             attempt["state"] = "requested"
             attempt["requested_at"] = utc_now_iso()
             self._save_state(self._cached_state)

@@ -162,30 +162,47 @@ def compute_reliability_telemetry(
     auto_rec_success_count = 0
     seen_recovery_attempt_ids: set[str] = set()
     seen_recovery_success_ids: set[str] = set()
-    rec_coverage = Coverage.FULL
-    rec_reason = None
     rec_source = "runtime/incident-packets/index.json"
     ledger_latencies: list[float] = []
 
+    ledger_attempts_read = False
+    ledger_has_malformed = False
+    ledger_error = None
     try:
         from dev_orchestrator.incidents.recovery_ledger import load_recovery_attempts
         ledger_attempts = load_recovery_attempts(runtime, project_id)
+        ledger_attempts_read = True
         if ledger_attempts:
             for att in ledger_attempts:
                 ts = att.get("reserved_at") or att.get("settled_at") or att.get("actuated_at")
                 if _is_event_in_run(ts, opened_at, closed_at):
                     aid = str(att.get("attempt_id") or "")
-                    if aid and aid not in seen_recovery_attempt_ids:
-                        seen_recovery_attempt_ids.add(aid)
-                        auto_rec_count += 1
-                        if att.get("status") in {"succeeded", "reconciled"}:
-                            seen_recovery_success_ids.add(aid)
-                            auto_rec_success_count += 1
+                    if aid:
+                        if aid not in seen_recovery_attempt_ids:
+                            seen_recovery_attempt_ids.add(aid)
+                            auto_rec_count += 1
+                            if att.get("status") in {"succeeded", "reconciled"}:
+                                seen_recovery_success_ids.add(aid)
+                                auto_rec_success_count += 1
+                    else:
+                        ledger_has_malformed = True
                     lat = att.get("recovery_latency")
                     if isinstance(lat, (int, float)):
                         ledger_latencies.append(float(lat))
-    except Exception:
-        pass
+    except Exception as exc:
+        ledger_error = str(exc)
+
+    if ledger_attempts_read:
+        if ledger_has_malformed:
+            rec_coverage = Coverage.PARTIAL
+            rec_reason = "recovery attempt record missing attempt_id"
+        else:
+            rec_coverage = Coverage.FULL
+            rec_reason = None
+        rec_source = "runtime/incident-packets/index.json"
+    else:
+        rec_coverage = Coverage.UNKNOWN
+        rec_reason = f"recovery ledger unavailable: {ledger_error or 'not loaded'}"
 
     if events_file.is_file():
         try:
@@ -250,19 +267,29 @@ def compute_reliability_telemetry(
                                         seen_recovery_success_ids.add(rec_id)
                                         auto_rec_success_count += 1
                             else:
-                                rec_reason = "attempt_outcome recovery row missing attempt_id"
+                                if not ledger_attempts_read:
+                                    rec_coverage = Coverage.PARTIAL
+                                    rec_reason = "attempt_outcome recovery row missing attempt_id"
+            if not ledger_attempts_read and rec_coverage == Coverage.UNKNOWN:
+                rec_coverage = Coverage.PARTIAL
+                rec_reason = "recovery counts sourced from fallback events.jsonl; recovery ledger unpopulated or absent"
+                rec_source = "runtime/execution-accounting/events.jsonl"
         except Exception as exc:
             gate_coverage = Coverage.UNKNOWN
             gate_reason = f"error reading events.jsonl: {exc}"
             rev_coverage = Coverage.UNKNOWN
             rev_reason = f"error reading events.jsonl: {exc}"
-            rec_coverage = Coverage.UNKNOWN
-            rec_reason = f"error reading events.jsonl: {exc}"
+            if not ledger_attempts_read:
+                rec_coverage = Coverage.UNKNOWN
+                rec_reason = f"error reading events.jsonl: {exc}"
     else:
         gate_coverage = Coverage.UNKNOWN
         gate_reason = "execution-accounting/events.jsonl ledger not found"
         rev_coverage = Coverage.UNKNOWN
         rev_reason = "events.jsonl not found"
+        if not ledger_attempts_read:
+            rec_coverage = Coverage.UNKNOWN
+            rec_reason = "execution-accounting/events.jsonl ledger not found and recovery ledger unavailable"
 
     metrics["owner_gate_count"] = MetricResult(
         name="owner_gate_count",

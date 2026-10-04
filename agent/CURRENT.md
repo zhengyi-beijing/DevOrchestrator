@@ -1,36 +1,39 @@
-# P20.3 Deterministic Recovery & Heterogeneous Escalation State (2026-10-04)
+# P20.3 Deterministic Recovery & Heterogeneous Escalation Technical Review Remediation State (2026-10-04)
 
-P20.3 Deterministic Recovery & Heterogeneous Escalation implementation complete:
-- Status: **IMPLEMENTATION_COMPLETE / TECHNICAL_REVIEW_PENDING**.
+P20.3 Deterministic Recovery & Heterogeneous Escalation technical review remediation complete:
+- Status: **REMEDIATION_COMPLETE / TECHNICAL_REVIEW_PENDING**.
 - Control-Plane Impact:
   - Invariants: CURRENT_TASK_MATCHES_ACTIVE_EXECUTION, TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION, PENDING_DESIGN_NOT_EXECUTING, SUCCESSOR_HANDOFF_LINEAGE_VALID, NEXT_TASK_WITHOUT_HANDOFF, SINGLE_ACTIVE_LIFECYCLE_OWNER.
   - Transition boundaries: authority_reconciliation, watchdog_recovery, owner_gate_transition, successor_handoff, handoff_publication, worker_launch.
   - Fault scenarios: CPF-01, CPF-02, CPF-03, CPF-04, CPF-05, CPF-06, CPF-07, CPF-08, CPF-09, CPF-10.
   - Convergence evidence: Durable bounded attempts reconcile exactly one existing effect, unknown safety gates once, independent reviewers remain eligible, all CPF faults converge without manual continuation.
-- Architecture & Delivered Components:
-  1. Pure Deterministic Recovery Policy (`src/dev_orchestrator/incidents/recovery_policy.py`):
-     - Eight authorized actions: `NO_ACTION_ALREADY_RECOVERED`, `OWNER_GATE`, `RECONCILE_RUNTIME`, `RESTART_COMPONENT`, `HETEROGENEOUS_ESCALATION`, `SWITCH_RESOURCE`, `RETRY_CHANGED_STRATEGY`, `RETRY_SAME_STRATEGY`.
-     - Pure total function `decide_recovery(inputs, *, now=None)`; no IO, subprocess, git, network, or ambient clock reads.
-     - Fail-closed evaluation order: resolved incident no-op -> contradictory authority / exhausted budget / stale HEAD / dirty worktree owner gate -> ambiguous liveness reconcile runtime -> component restart -> heterogeneous escalation -> resource switch -> retry changed strategy -> retry same strategy.
-     - Anti-loop strategy key normalization (`resolve_recovery_strategy_key`): excludes volatile fields, AGY account, resource rotation, timestamps.
-  2. Durable In-Transaction Recovery Ledger (`src/dev_orchestrator/incidents/recovery_ledger.py`):
-     - Schema version 1, `RecoveryAttempt` dataclass, status set: `reserved`, `actuated`, `succeeded`, `failed`, `abandoned`, `reconciled`, `gated`.
-     - In-transaction reservation (`reserve_recovery_attempt`) inside `IncidentStore.execute_txn` under inter-process file lock before effect; deterministic `attempt_id` deduplication.
-     - Settlement (`record_recovery_outcome`) with latency and effect identity; idempotent terminal transitions.
-     - Replay reconciliation (`reconcile_recovery_attempts`) binds single existing effect, marks proven absent abandoned, and gates closed on crash ambiguity without duplicate Worker or job.
-  3. Closed Three Confirmed Bootstrap Recovery Gaps:
-     - Gap 1: Cumulative semantic remediation budget carry & rejection chain across failovers/cycles/restart (`remediation_round` preserved, not reset to 0 in `ai_planner.py`).
-     - Gap 1b: Bounded read-only delta adjudication after remediation rounds exhausted (`adjudicate_plan_delta`).
-     - Gap 2: Inconclusive transport loss while broker runs emits durable actionable `OWNER_GATE` (`_handle_inconclusive_review_transport_loss`).
-     - Gap 3: Bounded cleanup of timed-out read-only reviewer harness sessions and tool children (`cleanup_stale_role_tool_children`).
-  4. Telemetry Integration (`src/dev_orchestrator/incidents/reliability_telemetry.py`):
-     - Sourced `automatic_recovery_count`, `automatic_recovery_success_count`, `recovery_latency_seconds`, and `recovery_latency_sample_count` from recovery ledger first (with accounting fallback), using `identity_key="attempt_id"` and honest computed coverage.
+- Technical Review Remediations (Concrete Findings Closed):
+  1. Daemon reconcile signature: `reconcile_recovery_attempts(runtime, project_id=None, ...)` defaults to `None`, supporting daemon restart sweep across all project directories and indices.
+  2. OwnerControlStore gate persistence: Added `record_gate` to `OwnerControlStore` to durably persist gates in `owner-control.json` (`paused=True`, `suppress_static_starts=True`); updated `surface.py:latest_owner_gate` to check `owner-control.json`; unpausing clears active gates. Removed bare `try/except: pass` in `recovery_ledger.py` and `ai_planner.py`.
+  3. Production actuation call sites wired:
+     - In `watchdog.py`: wired `decide_recovery` and `build_resource_availability` replacing hardcoded `RETRY_SAME_STRATEGY`, validating budgets, dirty worktree, stale HEAD, and owner gates.
+     - In `ai_planner.py`: wired `adjudicate_plan_delta` on exhausted remediation rounds.
+     - In `ai_planner.py` and `ai_reviewer.py`: wired `cleanup_stale_role_tool_children` on review failures and timeouts.
+     - AST call sites verified by `runtime/p20-3-root-integration-probes.py`.
+  4. Replay reconciliation hardening:
+     - Enforced non-empty `eff_id` matching in handoff reconciliation so empty IDs never bind arbitrarily.
+     - Bound actuated watchdog control commands (`wd-plan-...`) via `ControlCommandStore`.
+     - Actuated attempts with unresolvable effects fail closed to `OWNER_GATE` (crash ambiguity) instead of falsely marking `abandoned`.
+  5. Per-family budget derivation & enforcement:
+     - Derived `family_attempts_remaining` from actual family attempts count.
+     - `decide_recovery` enforces per-family budget limit and fails closed to `OWNER_GATE` (`FAMILY_RECOVERY_BUDGET_EXHAUSTED`).
+     - Updated `recovery_budget_state` in `recovery_ledger.py`.
+  6. Honest telemetry coverage:
+     - `reliability_telemetry.py` dynamically derives `rec_coverage`: `Coverage.FULL` when recovery ledger loads cleanly without malformed records, `Coverage.PARTIAL` when using fallback `events.jsonl` or missing attempt ID, and `Coverage.UNKNOWN` when missing or unreadable.
+  7. Roadmap invariant preserved:
+     - Preserved `Status: **PENDING DESIGN**` in `agent/staged/P20.3.md` so that `test_p20_roadmap.py` and roadmap lineage invariants pass.
 - Verification & Evidence:
-  - Focused test suites: `test_p20_3_recovery_policy.py` (18 tests), `test_p20_3_recovery_durability.py` (23 tests), `test_p20_readonly_review_timeout.py` (8 tests) — 49 passed in 3.82s.
-  - Adjacent regressions: P20.1/P20.2 (73 tests passed), successor/invariants (132 tests passed), watchdog (119 tests passed), handoff/roadmap (16 tests passed), planner (47 tests passed) — 436 total regression tests passed.
+  - Focused test suites: `test_p20_3_recovery_policy.py` (19 tests), `test_p20_3_recovery_durability.py` (27 tests), `test_p20_readonly_review_timeout.py` (8 tests) — 54 passed in 4.06s.
+  - Adjacent regressions: P20.1/P20.2 (73 tests passed), watchdog (119 tests passed), handoff/roadmap (16 tests passed), planner (47 tests passed), reviewer/control (29 tests passed), successor/invariants (132 tests passed) — 416 regression tests passed.
+  - Fault registry: `validate_fault_registry()` returns `ERRORS: []`.
   - Python `compileall`: clean.
   - `git diff --check`: clean.
-  - `graphify update .`: completed (9118 nodes, 24741 edges, 344 communities).
+  - `graphify update .`: completed (9131 nodes, 24799 edges, 357 communities).
   - Contract documentation: `docs/P20_3_RECOVERY_CONTRACT.md`.
   - RED evidence preserved in `docs/evidence/P20_3_RED.txt`; GREEN evidence in `docs/evidence/P20_3_GREEN.txt`.
 - Staged successor `agent/staged/P20.4.md` remains strictly `PENDING DESIGN`. No P20.4 soak harness, no P21, no push.

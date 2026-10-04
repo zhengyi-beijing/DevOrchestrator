@@ -268,7 +268,129 @@ class TestP203ReplayReconciliationAndNoDuplicateActuation(unittest.TestCase):
         reconciled = reconcile_recovery_attempts(self.runtime_root, self.project_id)
         self.assertEqual(len(reconciled), 1)
         self.assertEqual(reconciled[0]["status"], "gated")
-        self.assertIsNotNone(reconciled[0].get("owner_gate_id"))
+        gate_id = reconciled[0].get("owner_gate_id")
+        self.assertIsNotNone(gate_id)
+
+        # Durably recorded in OwnerControlStore and inhibits background actuation
+        from dev_orchestrator.control.owner_store import OwnerControlStore
+        from dev_orchestrator.control.surface import latest_owner_gate
+
+        owner_store = OwnerControlStore(self.runtime_root)
+        self.assertTrue(owner_store.is_paused(self.project_id))
+        proj_state = owner_store.project_state(self.project_id)
+        self.assertEqual(proj_state.get("owner_gate_id"), gate_id)
+        self.assertEqual(proj_state.get("owner_gate", {}).get("gate_id"), gate_id)
+
+        # Observable as latest owner gate
+        gate = latest_owner_gate(self.runtime_root, self.project_id)
+        self.assertIsNotNone(gate)
+        self.assertEqual(gate.get("gate_id"), gate_id)
+
+    def test_reconcile_recovery_attempts_without_project_id_executes_cleanly(self) -> None:
+        """Daemon invocation of reconcile_recovery_attempts(runtime) without project_id succeeds."""
+        decision = RecoveryDecision(
+            action="RESTART_COMPONENT",
+            reason="component_loss",
+            authorized_effect={"effect_kind": "durable_job", "target_id": "job-multi-1"},
+            expected_authority_anchor={"project_id": self.project_id, "task_id": "P20.3", "head": "abc"},
+            expected_source_anchor={"incident_id": "inc-m", "family_id": "fam-m", "failure_signature": "sig-m"},
+            remaining_budget={"incident_recoveries_remaining": 2},
+            strategy_key="strat-multi",
+            attempt_id="rcv-multi-01",
+            idempotency_key="idem-multi-01",
+            requires_heterogeneous=False,
+        )
+        reserve_recovery_attempt(self.runtime_root, self.project_id, decision)
+
+        # Invoke without project_id (signature test for daemon)
+        reconciled = reconcile_recovery_attempts(self.runtime_root)
+        self.assertEqual(len(reconciled), 1)
+
+    def test_reconcile_actuated_control_command_binds_to_command_in_store(self) -> None:
+        """Actuated watchdog attempt storing a control-command ID binds to command store."""
+        from dev_orchestrator.control.surface import project_identity
+        from dev_orchestrator.core.control_commands import submit_control_command
+
+        cmd_id = "wd-plan-test-cmd-01"
+        snapshot = {"project_id": self.project_id, "state": "READY_TO_RUN", "telemetry": {"task_id": "P20.3"}}
+        submit_control_command(
+            self.runtime_root,
+            self.project_id,
+            "continue",
+            command_id=cmd_id,
+            expected=project_identity(snapshot, self.runtime_root),
+            source="watchdog_planning_recovery",
+        )
+
+        decision = RecoveryDecision(
+            action="RETRY_SAME_STRATEGY",
+            reason="watchdog_retry",
+            authorized_effect={"effect_kind": "continue", "target_id": "P20.3"},
+            expected_authority_anchor={"project_id": self.project_id, "task_id": "P20.3", "head": "abc"},
+            expected_source_anchor={"incident_id": "inc-cmd", "family_id": "fam-cmd", "failure_signature": "sig-cmd"},
+            remaining_budget={"incident_recoveries_remaining": 2},
+            strategy_key="strat-cmd",
+            attempt_id=cmd_id,
+            idempotency_key=f"idem-{cmd_id}",
+            requires_heterogeneous=False,
+        )
+        reserve_recovery_attempt(self.runtime_root, self.project_id, decision)
+        record_recovery_outcome(self.runtime_root, self.project_id, cmd_id, "actuated", effect_id=cmd_id)
+
+        reconciled = reconcile_recovery_attempts(self.runtime_root, self.project_id)
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["status"], "reconciled")
+        self.assertEqual(reconciled[0]["effect_id"], cmd_id)
+
+    def test_reconcile_actuated_attempt_with_missing_effect_gates_on_crash_ambiguity(self) -> None:
+        """Actuated attempt whose launched effect cannot be found fails closed to OWNER_GATE."""
+        decision = RecoveryDecision(
+            action="RETRY_SAME_STRATEGY",
+            reason="watchdog_retry",
+            authorized_effect={"effect_kind": "continue", "target_id": "P20.3"},
+            expected_authority_anchor={"project_id": self.project_id, "task_id": "P20.3", "head": "abc"},
+            expected_source_anchor={"incident_id": "inc-lost", "family_id": "fam-lost", "failure_signature": "sig-lost"},
+            remaining_budget={"incident_recoveries_remaining": 2},
+            strategy_key="strat-lost",
+            attempt_id="rcv-lost-01",
+            idempotency_key="idem-lost-01",
+            requires_heterogeneous=False,
+        )
+        reserve_recovery_attempt(self.runtime_root, self.project_id, decision)
+        record_recovery_outcome(self.runtime_root, self.project_id, "rcv-lost-01", "actuated", effect_id="nonexistent-cmd")
+
+        reconciled = reconcile_recovery_attempts(self.runtime_root, self.project_id)
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["status"], "gated")
+
+    def test_reconcile_handoff_with_empty_effect_id_does_not_bind_arbitrarily(self) -> None:
+        """Empty effect_id does not arbitrarily bind to unrelated handoffs."""
+        decision = RecoveryDecision(
+            action="RETRY_CHANGED_STRATEGY",
+            reason="replayed_handoff",
+            authorized_effect={"effect_kind": "handoff"},  # empty target_id / effect_id
+            expected_authority_anchor={"project_id": self.project_id, "task_id": "P20.3", "head": "abc"},
+            expected_source_anchor={"incident_id": "inc-h", "family_id": "fam-h", "failure_signature": "sig-h"},
+            remaining_budget={"incident_recoveries_remaining": 2},
+            strategy_key="strat-handoff",
+            attempt_id="rcv-handoff-empty",
+            idempotency_key="idem-handoff-empty",
+            requires_heterogeneous=False,
+        )
+        reserve_recovery_attempt(self.runtime_root, self.project_id, decision)
+
+        # Transition executor has an unrelated handoff
+        write_json(self.runtime_root / "transition-executor.json", {
+            "handoffs": {
+                "unrelated-handoff-999": {"handoff_id": "unrelated-handoff-999", "task_id": "P99.9"}
+            }
+        })
+
+        reconciled = reconcile_recovery_attempts(self.runtime_root, self.project_id)
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["status"], "abandoned")
+        self.assertNotEqual(reconciled[0].get("effect_id"), "unrelated-handoff-999")
+
 
 
 class TestP203ControlPlaneFaultScenarios(unittest.TestCase):
