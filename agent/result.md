@@ -1,5 +1,13 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P20.3 live-restart supplement (2026-10-04): prior implementation 15abd1a has
+independent ACCEPT; new local task/gate-scope corrections await descendant
+Review. A preserved P19 recovery failure cannot gate an authoritative later
+task, and inactive resolved gates no longer suppress new gates. 275 related
+tests and 22 subtests pass; evidence uses P20_3_SUCCESSOR_SCOPE_* and
+P20_3_RESOLVED_GATE_RED.txt. Ordinary pause retained for reload and reviewed
+settlement. P20.4 remains unactivated; no soak started, no raw ledger editing.
+
 P20.3 Technical Review ACCEPT (2026-10-04T07:35:13Z), implementation HEAD
 15abd1a. Normal runtime released its owner and generated the P20.4 planning
 handoff. Evidence: docs/evidence/P20_3_COMMAND_OUTCOME_REVIEW.json. All blocking

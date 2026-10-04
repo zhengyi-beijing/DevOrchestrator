@@ -1,4 +1,24 @@
-# P20.3 accepted; P20.4 preparation (2026-10-04)
+# P20.3 accepted base; live restart supplement pending (2026-10-04)
+
+The 15abd1a implementation has independent ACCEPT. A normal reload exposed two
+additional task/gate-scope defects in preserved legacy watchdog history:
+an old P19 planning failure could gate current P20.3, and an inactive resolved
+gate could suppress a later real gate. Both have genuine focused RED and bounded
+corrections. Watchdog and recovery ledger retain old-task attempts as history
+without gating an authoritative successor; latest_gate excludes active=False.
+275 related tests and 22 subtests pass in 87.40s. Evidence/source hashes use
+docs/evidence/P20_3_SUCCESSOR_SCOPE_*, plus P20_3_RESOLVED_GATE_RED.txt.
+This supplemental candidate awaits independent descendant Review.
+
+Normal resume resolved the stale historical P19 gate; normal pause was restored
+for reload. Authority remains P20.3 READY_TO_RUN, with no owner/gate, all six
+invariants, and an unconsumed P20.4 handoff. A decision produced before the latest
+pause is intentionally fenced from automatic actuation. Reload corrected code,
+resume, then request the normal descendant Review at the final clean HEAD;
+keep agent/ artifacts unchanged until normal accepted settlement/activation.
+Do not override runtime or re-execute P20.3. No soak has started.
+
+# Historical P20.3 accepted; P20.4 preparation (2026-10-04)
 
 Independent Technical Review accepted clean implementation HEAD 15abd1a at
 2026-10-04T07:35:13Z (decision NEXT). Evidence:

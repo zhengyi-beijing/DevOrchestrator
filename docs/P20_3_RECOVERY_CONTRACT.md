@@ -2,6 +2,13 @@
 
 Status: **FROZEN / IMPLEMENTED / TECHNICAL REVIEW ACCEPT (2026-10-04)**
 
+Accepted base 15abd1a has a pending live-restart supplement: old-task recovery
+attempts remain audit history and cannot gate a known authoritative successor;
+inactive resolved gates are excluded from latest_gate. Focused RED and
+275-test/22-subtest GREEN are recorded under P20_3_SUCCESSOR_SCOPE_* and
+P20_3_RESOLVED_GATE_RED.txt. Supplement awaits independent descendant Review;
+the accepted base verdict below is not silently transferred to changed code.
+
 Independent ACCEPT at 15abd1a, 2026-10-04T07:35:13Z. All blocking findings below
 are closed; earlier pending labels are historical. Evidence:
 docs/evidence/P20_3_COMMAND_OUTCOME_REVIEW.json. Accepted NON_BLOCKING inputs

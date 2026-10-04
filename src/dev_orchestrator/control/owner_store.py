@@ -117,4 +117,4 @@ class OwnerControlStore:
         """Return the active owner gate dictionary for a project if one exists."""
         state = self.project_state(project_id)
         gate = state.get("owner_gate")
-        return dict(gate) if isinstance(gate, dict) else None
+        return dict(gate) if isinstance(gate, dict) and gate.get("active") is not False else None

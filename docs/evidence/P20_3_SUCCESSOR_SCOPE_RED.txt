@@ -1,0 +1,17 @@
+F                                                                        [100%]
+================================== FAILURES ===================================
+_ TestP203SecondRoundReviewRemediation.test_historical_recovery_failure_cannot_gate_an_authoritative_successor _
+
+self = <test_p20_3_recovery_durability.TestP203SecondRoundReviewRemediation testMethod=test_historical_recovery_failure_cannot_gate_an_authoritative_successor>
+
+    def test_historical_recovery_failure_cannot_gate_an_authoritative_successor(self) -> None:
+>       self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="blocked", superseded=True)
+
+tests_py\test_p20_3_recovery_durability.py:847: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests_py\test_p20_3_recovery_durability.py:1002: in test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project
+    self.assertFalse(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+E   AssertionError: True is not false
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_3_recovery_durability.py::TestP203SecondRoundReviewRemediation::test_historical_recovery_failure_cannot_gate_an_authoritative_successor
+1 failed, 42 deselected in 0.89s

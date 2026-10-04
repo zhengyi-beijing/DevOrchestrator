@@ -843,7 +843,13 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
     def test_recovery_outcome_preserves_an_existing_owner_decision_gate(self) -> None:
         self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="blocked", preserve_gate=True)
 
-    def test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(self, *, enqueue_failure=False, crash_after_enqueue=False, command_outcome=None, crash_before_enqueue=False, fresh_reservation=False, exhaust_budget=False, preserve_gate=False) -> None:
+    def test_historical_recovery_failure_cannot_gate_an_authoritative_successor(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="blocked", superseded=True)
+
+    def test_a_resolved_gate_cannot_suppress_a_new_recovery_gate(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="blocked", resolved_gate=True)
+
+    def test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(self, *, enqueue_failure=False, crash_after_enqueue=False, command_outcome=None, crash_before_enqueue=False, fresh_reservation=False, exhaust_budget=False, preserve_gate=False, superseded=False, resolved_gate=False) -> None:
         """Finding 1: Watchdog uses real resource/routing config; transient failure retry doesn't pause project on 2nd attempt."""
         import subprocess
         from dev_orchestrator.core.watchdog import WatchdogCoordinator, resolve_watchdog_policy
@@ -983,17 +989,25 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
             from dev_orchestrator.control.command_store import ControlCommandStore
             commands = ControlCommandStore(self.runtime_root)
             prior_gate = None
-            if preserve_gate:
+            if preserve_gate or resolved_gate:
                 OwnerControlStore(self.runtime_root).record_gate(project_id=self.project_id, gate_id="existing-owner-decision", reason="preserve owner evidence", active=True)
                 prior_gate = OwnerControlStore(self.runtime_root).latest_gate(self.project_id)
+                if resolved_gate:
+                    OwnerControlStore(self.runtime_root).set_paused(self.project_id, False, command_id="owner-resolved-old-gate", action="resume")
             if command_outcome != "pending":
                 commands.settle(commands.inbox / (rec_1["command_id"] + ".json"), {**commands.get(rec_1["command_id"]), "state": command_outcome, "reason": "selected recovery resource no longer available"})
+            if superseded:
+                write_json(self.runtime_root / "transition-executor.json", {"executions": {}, "lifecycle": {self.project_id: {"current_task_id": "P20.4", "lifecycle_state": "PENDING_DESIGN", "active_owner": None}}})
             fresh = WatchdogCoordinator(self.runtime_root)
             fresh._reconcile_recoveries()
             reconcile_recovery_attempts(self.runtime_root, self.project_id)
             attempt = load_recovery_attempts(self.runtime_root, self.project_id)[0]
             problem = next(iter(fresh._cached_state["projects"][self.project_id]["planning_recovery_problems"].values()))
-            if command_outcome == "accepted":
+            if superseded:
+                self.assertFalse(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+                self.assertEqual(problem["attempts"][0]["state"], "requested")
+                self.assertEqual(attempt["status"], "actuated")
+            elif command_outcome == "accepted":
                 self.assertEqual(problem["attempts"][0]["state"], "completed")
                 self.assertEqual(attempt["status"], "reconciled")
                 self.assertFalse(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
@@ -1006,6 +1020,9 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
                 self.assertEqual(problem["attempts"][0]["state"], "blocked")
                 self.assertEqual(attempt["status"], "gated")
                 gate = OwnerControlStore(self.runtime_root).latest_gate(self.project_id)
+                self.assertIs(gate["active"], True)
+                if resolved_gate:
+                    self.assertNotEqual(gate["gate_id"], prior_gate["gate_id"])
                 if preserve_gate:
                     self.assertEqual(gate, prior_gate)
                 fresh._reconcile_recoveries()

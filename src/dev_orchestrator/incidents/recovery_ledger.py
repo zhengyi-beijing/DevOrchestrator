@@ -505,6 +505,12 @@ def reconcile_recovery_attempts(
             lineage_corrupt = True
 
     for att in attempts:
+        current_task = (trans_data.get("lifecycle", {}).get(project_id, {}) if isinstance(trans_data, dict) else {}).get("current_task_id")
+        attempt_task = (att.get("expected_authority_anchor") or {}).get("task_id")
+        if current_task and attempt_task and current_task != attempt_task:
+            # Old attempts remain audit history, not authority over a successor.
+            reconciled_results.append(dict(att))
+            continue
         status = att.get("status")
         control_effect = att.get("effect_kind") in {"control_continue", "continue", "control_command"}
         if status == "reconciled" and not control_effect:

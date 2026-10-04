@@ -1,0 +1,17 @@
+F                                                                        [100%]
+================================== FAILURES ===================================
+_ TestP203SecondRoundReviewRemediation.test_a_resolved_gate_cannot_suppress_a_new_recovery_gate _
+
+self = <test_p20_3_recovery_durability.TestP203SecondRoundReviewRemediation testMethod=test_a_resolved_gate_cannot_suppress_a_new_recovery_gate>
+
+    def test_a_resolved_gate_cannot_suppress_a_new_recovery_gate(self) -> None:
+>       self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="blocked", resolved_gate=True)
+
+tests_py\test_p20_3_recovery_durability.py:850: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests_py\test_p20_3_recovery_durability.py:1019: in test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project
+    self.assertTrue(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+E   AssertionError: False is not true
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_3_recovery_durability.py::TestP203SecondRoundReviewRemediation::test_a_resolved_gate_cannot_suppress_a_new_recovery_gate
+1 failed, 43 deselected in 0.88s

@@ -1480,10 +1480,15 @@ class WatchdogCoordinator:
         problems = prow.get("planning_recovery_problems") or {}
         if not isinstance(problems, dict) or not problems:
             return
+        authority = read_json(self.runtime_root / "transition-executor.json", {}).get("lifecycle", {}).get(pid, {})
+        current_task = authority.get("current_task_id")
         commands = ControlCommandStore(self.runtime_root)
         ledger = {row.get("effect_id"): row for row in load_recovery_attempts(self.runtime_root, pid)}
         for problem in problems.values():
             if not isinstance(problem, dict):
+                continue
+            if current_task and problem.get("task_id") and problem["task_id"] != current_task:
+                # Retain historical outcomes; they cannot gate a later task.
                 continue
             for attempt in problem.get("attempts") or []:
                 if not isinstance(attempt, dict) or attempt.get("state") == "completed" or attempt.get("owner_gate_id"):

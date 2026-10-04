@@ -1,0 +1,57 @@
+{
+  "observed_at": "2026-10-04T07:51:10.528119+00:00",
+  "kind": "read_only_live_restart_observation",
+  "current_task_id": "P20.3",
+  "lifecycle_state": "READY_TO_RUN",
+  "paused": true,
+  "historical_owner_gate": {
+    "gate_id": "gate-planning-outcome-43a4fbe5e6b81ae290a2f2ec",
+    "reason": "planner failed after 3 attempts: planner implementation_steps entries must be bounded strings",
+    "active": false,
+    "created_at": "2026-10-04T07:37:57.580125+00:00",
+    "updated_at": "2026-10-04T07:37:57.580125+00:00"
+  },
+  "planning_recovery_problems": {
+    "20875e9b2e8eb3eaa1c78f3c5cf8e5a9": {
+      "problem_id": "planning-recovery:20875e9b2e8eb3eaa1c78f3c5cf8e5a9",
+      "normalized_fingerprint": "20875e9b2e8eb3eaa1c78f3c5cf8e5a9",
+      "failure_class": "RESOURCE_TRANSIENT",
+      "semantic_error_family": "repository_changed_during_planning",
+      "task_id": "P18",
+      "attempts": [
+        {
+          "attempt": 1,
+          "failed_plan_id": "ai_plan:auto-1a46712d6fe21ed3b3e44f0a",
+          "command_id": "wd-plan-20875e9b2e8eb3ea-1",
+          "state": "completed",
+          "reserved_at": "2026-09-28T01:12:47.325730+00:00",
+          "requested_at": "2026-09-28T01:12:47.337738+00:00",
+          "resolved_at": "2026-10-04T07:37:57.562158+00:00"
+        }
+      ],
+      "state": "retry_accepted"
+    },
+    "6d839681e6ae00da13f1e8a5b9af8472": {
+      "problem_id": "planning-recovery:6d839681e6ae00da13f1e8a5b9af8472",
+      "normalized_fingerprint": "6d839681e6ae00da13f1e8a5b9af8472",
+      "failure_class": "RESOURCE_TRANSIENT",
+      "semantic_error_family": "repository_changed_during_planning",
+      "task_id": "P19",
+      "attempts": [
+        {
+          "attempt": 1,
+          "failed_plan_id": "ai_plan:auto-73fa9927be68bac14e57fcf6",
+          "command_id": "wd-plan-6d839681e6ae00da-1",
+          "state": "blocked",
+          "reserved_at": "2026-09-29T04:10:55.515125+00:00",
+          "requested_at": "2026-09-29T04:10:55.527460+00:00",
+          "owner_gate_id": "gate-planning-outcome-43a4fbe5e6b81ae290a2f2ec",
+          "reason": "planner failed after 3 attempts: planner implementation_steps entries must be bounded strings"
+        }
+      ],
+      "state": "blocked",
+      "reason": "planner failed after 3 attempts: planner implementation_steps entries must be bounded strings"
+    }
+  },
+  "qualification": "Historical P19 failure newly gated a later task on reviewed-code reload; normal resume/pause retained history; not soak evidence."
+}

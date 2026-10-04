@@ -1,4 +1,18 @@
-# P20.3 accepted / P20.4 activation checkpoint (2026-10-04)
+# P20.3 live-restart supplement / P20.4 activation checkpoint (2026-10-04)
+
+Accepted base 15abd1a remains preserved. Normal fresh-code reload exposed
+historical P19 recovery gating the later task and inactive gate reuse. Bounded
+supplement fixes both with RED and 275-test/22-subtest GREEN; independent
+descendant Review pending. Root restored ordinary pause for the corrected
+reload, with no live Worker/Reviewer and no active authority gate. Then resume
+before requesting the new Review, so its accepted decision is newer than the
+pause fence and can settle through ordinary coordinators. Keep tracked agent/
+artifacts unchanged during/after that Review until normal successor activation.
+The recovered P20.4 handoff retains its original source/spec history; never edit
+its ledger to make it eligible. No soak has started; root must continue until a
+durable real run is RUNNING before ending this session. Earlier sections follow.
+
+# Historical P20.3 accepted / P20.4 activation checkpoint (2026-10-04)
 
 P20.3 independent ACCEPT at implementation HEAD 15abd1a; normal runtime owner
 released and P20.4 planning handoff published. Acceptance evidence is
