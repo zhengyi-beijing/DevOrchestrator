@@ -2,6 +2,17 @@
 
 Status: **FROZEN / IMPLEMENTED / TECHNICAL REVIEW PENDING (2026-10-04)**
 
+Latest command-outcome delta: planning recovery dedup is paired with inbox and
+history reconciliation. A pending command is an actuated retry, not convergence;
+only accepted command evidence settles it. Rejected/unknown outcomes, enqueue
+failure, expired unpublished reservations and exhausted budgets gate durably.
+Fresh reservations keep their configured lease. Existing owner-decision gates
+and evidence are preserved. Legacy prematurely reconciled control bindings are
+rechecked against actual outcomes; no replacement effect is launched. Independent
+8cbc30df Review confirmed the preceding corrections and returned REMEDIATE for
+this bounded delta. 273 tests and 22 subtests pass; current evidence uses
+P20_3_COMMAND_*. Acceptance is pending.
+
 Latest local review delta: an already-consumed semantic budget exceeding a
 lowered configuration terminates in a stable durable owner gate. Recovery
 reservations bind the actual control-command ID before enqueue; restart can

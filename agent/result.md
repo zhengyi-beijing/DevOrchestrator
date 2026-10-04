@@ -1,5 +1,16 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P20.3 command-outcome remediation (2026-10-04): implementation and regression
+complete; independent descendant Technical Review pending. 273 tests and
+22 subtests passed in 86.18s; compileall, diff check and Graphify update passed.
+The independent 8cbc30df Review confirmed the prior three fixes, then found
+planning-recovery dedup could silently retain a rejected, failed or unpublished
+command. Watchdog and recovery ledger now reconcile actual command outcomes,
+preserve fresh leases, gate non-accepted terminal/missing outcomes and exhausted
+budgets, and retain existing owner-decision gate evidence. Focused RED and latest
+GREEN/source manifest use docs/evidence/P20_3_COMMAND_*. P20.3 acceptance and
+P20.4 soak remain pending. No push or direct lifecycle ledger edit.
+
 P20.3 final local review delta (2026-10-04): verification PASS; descendant
 Technical Review PENDING; authoritative acceptance NOT YET. 265 tests and
 22 subtests passed in 81.87s. The independent ac2cf329 Review confirmed the

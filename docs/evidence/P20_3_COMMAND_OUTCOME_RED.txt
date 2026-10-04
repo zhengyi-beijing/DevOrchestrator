@@ -1,0 +1,71 @@
+FFFFF                                                                    [100%]
+================================== FAILURES ===================================
+_ TestP203SecondRoundReviewRemediation.test_accepted_planning_recovery_settles_without_gate_or_duplicate _
+
+self = <test_p20_3_recovery_durability.TestP203SecondRoundReviewRemediation testMethod=test_accepted_planning_recovery_settles_without_gate_or_duplicate>
+
+    def test_accepted_planning_recovery_settles_without_gate_or_duplicate(self) -> None:
+>       self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="accepted")
+
+tests_py\test_p20_3_recovery_durability.py:829: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests_py\test_p20_3_recovery_durability.py:979: in test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project
+    self.assertEqual(problem["attempts"][0]["state"], "completed")
+E   AssertionError: 'requested' != 'completed'
+E   - requested
+E   + completed
+_ TestP203SecondRoundReviewRemediation.test_blocked_planning_recovery_is_a_durable_owner_gate_after_restart _
+
+self = <test_p20_3_recovery_durability.TestP203SecondRoundReviewRemediation testMethod=test_blocked_planning_recovery_is_a_durable_owner_gate_after_restart>
+
+    def test_blocked_planning_recovery_is_a_durable_owner_gate_after_restart(self) -> None:
+>       self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="blocked")
+
+tests_py\test_p20_3_recovery_durability.py:823: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests_py\test_p20_3_recovery_durability.py:983: in test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project
+    self.assertTrue(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+E   AssertionError: False is not true
+_ TestP203SecondRoundReviewRemediation.test_expired_pre_enqueue_crash_is_a_durable_owner_gate _
+
+self = <test_p20_3_recovery_durability.TestP203SecondRoundReviewRemediation testMethod=test_expired_pre_enqueue_crash_is_a_durable_owner_gate>
+
+    def test_expired_pre_enqueue_crash_is_a_durable_owner_gate(self) -> None:
+>       self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(crash_before_enqueue=True)
+
+tests_py\test_p20_3_recovery_durability.py:832: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests_py\test_p20_3_recovery_durability.py:958: in test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project
+    self.assertTrue(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+E   AssertionError: False is not true
+_ TestP203SecondRoundReviewRemediation.test_unknown_planning_recovery_outcome_is_not_convergence _
+
+self = <test_p20_3_recovery_durability.TestP203SecondRoundReviewRemediation testMethod=test_unknown_planning_recovery_outcome_is_not_convergence>
+
+    def test_unknown_planning_recovery_outcome_is_not_convergence(self) -> None:
+>       self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="unknown")
+
+tests_py\test_p20_3_recovery_durability.py:826: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests_py\test_p20_3_recovery_durability.py:983: in test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project
+    self.assertTrue(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+E   AssertionError: False is not true
+_ TestP203SecondRoundReviewRemediation.test_watchdog_enqueue_failure_settles_actual_reserved_attempt _
+
+self = <test_p20_3_recovery_durability.TestP203SecondRoundReviewRemediation testMethod=test_watchdog_enqueue_failure_settles_actual_reserved_attempt>
+
+    def test_watchdog_enqueue_failure_settles_actual_reserved_attempt(self) -> None:
+>       self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(enqueue_failure=True)
+
+tests_py\test_p20_3_recovery_durability.py:817: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests_py\test_p20_3_recovery_durability.py:946: in test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project
+    self.assertTrue(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+E   AssertionError: False is not true
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_3_recovery_durability.py::TestP203SecondRoundReviewRemediation::test_accepted_planning_recovery_settles_without_gate_or_duplicate
+FAILED tests_py/test_p20_3_recovery_durability.py::TestP203SecondRoundReviewRemediation::test_blocked_planning_recovery_is_a_durable_owner_gate_after_restart
+FAILED tests_py/test_p20_3_recovery_durability.py::TestP203SecondRoundReviewRemediation::test_expired_pre_enqueue_crash_is_a_durable_owner_gate
+FAILED tests_py/test_p20_3_recovery_durability.py::TestP203SecondRoundReviewRemediation::test_unknown_planning_recovery_outcome_is_not_convergence
+FAILED tests_py/test_p20_3_recovery_durability.py::TestP203SecondRoundReviewRemediation::test_watchdog_enqueue_failure_settles_actual_reserved_attempt
+5 failed, 33 deselected in 3.16s

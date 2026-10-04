@@ -342,7 +342,7 @@ class TestP203ReplayReconciliationAndNoDuplicateActuation(unittest.TestCase):
 
         reconciled = reconcile_recovery_attempts(self.runtime_root, self.project_id)
         self.assertEqual(len(reconciled), 1)
-        self.assertEqual(reconciled[0]["status"], "reconciled")
+        self.assertEqual(reconciled[0]["status"], "actuated")
         self.assertEqual(reconciled[0]["effect_id"], cmd_id)
 
     def test_reconcile_actuated_attempt_with_missing_effect_gates_on_crash_ambiguity(self) -> None:
@@ -819,7 +819,31 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
     def test_crash_after_command_publish_reconciles_reserved_recovery_binding(self) -> None:
         self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(crash_after_enqueue=True)
 
-    def test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(self, *, enqueue_failure=False, crash_after_enqueue=False) -> None:
+    def test_blocked_planning_recovery_is_a_durable_owner_gate_after_restart(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="blocked")
+
+    def test_unknown_planning_recovery_outcome_is_not_convergence(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="unknown")
+
+    def test_accepted_planning_recovery_settles_without_gate_or_duplicate(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="accepted")
+
+    def test_expired_pre_enqueue_crash_is_a_durable_owner_gate(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(crash_before_enqueue=True)
+
+    def test_pending_control_command_is_not_recovery_success(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="pending")
+
+    def test_fresh_pre_enqueue_reservation_retains_its_lease(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(crash_before_enqueue=True, fresh_reservation=True)
+
+    def test_planning_recovery_budget_exhaustion_is_owner_visible(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(exhaust_budget=True)
+
+    def test_recovery_outcome_preserves_an_existing_owner_decision_gate(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(command_outcome="blocked", preserve_gate=True)
+
+    def test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(self, *, enqueue_failure=False, crash_after_enqueue=False, command_outcome=None, crash_before_enqueue=False, fresh_reservation=False, exhaust_budget=False, preserve_gate=False) -> None:
         """Finding 1: Watchdog uses real resource/routing config; transient failure retry doesn't pause project on 2nd attempt."""
         import subprocess
         from dev_orchestrator.core.watchdog import WatchdogCoordinator, resolve_watchdog_policy
@@ -929,6 +953,24 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
             self.assertEqual(len(attempts), 1)
             self.assertEqual(attempts[0]["status"], "failed")
             self.assertIn("injected inbox failure", attempts[0]["reason"])
+            fresh = WatchdogCoordinator(self.runtime_root)
+            fresh._reconcile_recoveries()
+            self.assertTrue(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+            self.assertEqual(len(load_recovery_attempts(self.runtime_root, self.project_id)), 1)
+            return
+
+        if crash_before_enqueue:
+            from unittest.mock import patch
+            stamp = utc_now_iso() if fresh_reservation else "2020-01-01T00:00:00+00:00"
+            with patch("dev_orchestrator.core.watchdog.utc_now_iso", return_value=stamp), patch("dev_orchestrator.incidents.recovery_ledger.utc_now_iso", return_value=stamp), patch("dev_orchestrator.core.control_commands.submit_control_command", side_effect=KeyboardInterrupt("crash before publish")):
+                with self.assertRaises(KeyboardInterrupt):
+                    coord._recover_cleared_automatic_planning_failure(project_config, snapshot, prow, {"plans": {plan_1: failed_1}}, policy)
+            fresh = WatchdogCoordinator(self.runtime_root)
+            fresh._reconcile_recoveries()
+            reconcile_recovery_attempts(self.runtime_root, self.project_id)
+            self.assertEqual(OwnerControlStore(self.runtime_root).is_paused(self.project_id), not fresh_reservation)
+            self.assertEqual(load_recovery_attempts(self.runtime_root, self.project_id)[0]["status"], "reserved" if fresh_reservation else "gated")
+            self.assertEqual(list((self.runtime_root / "control" / "inbox").glob("*.json")), [])
             return
 
         rec_1 = coord._recover_cleared_automatic_planning_failure(
@@ -936,6 +978,41 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
         )
         self.assertIsNotNone(rec_1)
         self.assertEqual(rec_1.get("status"), "planning_recovery_requested")
+
+        if command_outcome:
+            from dev_orchestrator.control.command_store import ControlCommandStore
+            commands = ControlCommandStore(self.runtime_root)
+            prior_gate = None
+            if preserve_gate:
+                OwnerControlStore(self.runtime_root).record_gate(project_id=self.project_id, gate_id="existing-owner-decision", reason="preserve owner evidence", active=True)
+                prior_gate = OwnerControlStore(self.runtime_root).latest_gate(self.project_id)
+            if command_outcome != "pending":
+                commands.settle(commands.inbox / (rec_1["command_id"] + ".json"), {**commands.get(rec_1["command_id"]), "state": command_outcome, "reason": "selected recovery resource no longer available"})
+            fresh = WatchdogCoordinator(self.runtime_root)
+            fresh._reconcile_recoveries()
+            reconcile_recovery_attempts(self.runtime_root, self.project_id)
+            attempt = load_recovery_attempts(self.runtime_root, self.project_id)[0]
+            problem = next(iter(fresh._cached_state["projects"][self.project_id]["planning_recovery_problems"].values()))
+            if command_outcome == "accepted":
+                self.assertEqual(problem["attempts"][0]["state"], "completed")
+                self.assertEqual(attempt["status"], "reconciled")
+                self.assertFalse(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+            elif command_outcome == "pending":
+                self.assertEqual(attempt["status"], "actuated")
+                self.assertEqual(problem["attempts"][0]["state"], "requested")
+                self.assertFalse(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+            else:
+                self.assertTrue(OwnerControlStore(self.runtime_root).is_paused(self.project_id))
+                self.assertEqual(problem["attempts"][0]["state"], "blocked")
+                self.assertEqual(attempt["status"], "gated")
+                gate = OwnerControlStore(self.runtime_root).latest_gate(self.project_id)
+                if preserve_gate:
+                    self.assertEqual(gate, prior_gate)
+                fresh._reconcile_recoveries()
+                self.assertEqual(OwnerControlStore(self.runtime_root).latest_gate(self.project_id), gate)
+            self.assertEqual(len(list(commands.inbox.glob("*.json"))), 1 if command_outcome == "pending" else 0)
+            self.assertEqual(len(load_recovery_attempts(self.runtime_root, self.project_id)), 1)
+            return
 
         store = OwnerControlStore(self.runtime_root)
         self.assertFalse(store.is_paused(self.project_id))
@@ -976,14 +1053,24 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
             self.assertEqual(pending['effect_id'], command['command_id'])
             rows = reconcile_recovery_attempts(self.runtime_root, self.project_id)
             recovered = next(a for a in rows if a['attempt_id'] == pending['attempt_id'])
-            self.assertEqual(recovered['status'], 'reconciled')
+            self.assertEqual(recovered['status'], 'actuated')
             self.assertEqual(recovered['effect_id'], command['command_id'])
             return
 
+        if exhaust_budget:
+            from dev_orchestrator.control.command_store import ControlCommandStore
+            commands = ControlCommandStore(self.runtime_root)
+            commands.settle(commands.inbox / (rec_1["command_id"] + ".json"), {**commands.get(rec_1["command_id"]), "state": "accepted"})
+            policy["max_attempts_per_run"] = 1
         rec_2 = coord._recover_cleared_automatic_planning_failure(
             project_config, snapshot, prow, {"plans": {plan_1: failed_1, plan_2: failed_2}}, policy,
         )
         self.assertIsNotNone(rec_2)
+        if exhaust_budget:
+            self.assertEqual(rec_2["status"], "planning_recovery_exhausted")
+            self.assertTrue(store.is_paused(self.project_id))
+            self.assertEqual(len(load_recovery_attempts(self.runtime_root, self.project_id)), 1)
+            return
         # Verify second attempt is requested within max_attempts_per_run=2 and does not pause project
         self.assertEqual(rec_2.get("status"), "planning_recovery_requested")
         self.assertFalse(store.is_paused(self.project_id))

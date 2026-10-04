@@ -506,10 +506,11 @@ def reconcile_recovery_attempts(
 
     for att in attempts:
         status = att.get("status")
-        if status == "reconciled":
+        control_effect = att.get("effect_kind") in {"control_continue", "continue", "control_command"}
+        if status == "reconciled" and not control_effect:
             reconciled_results.append(dict(att))
             continue
-        if status not in {"reserved", "actuated"}:
+        if status not in {"reserved", "actuated", "reconciled"}:
             continue
 
         aid = str(att["attempt_id"])
@@ -604,11 +605,46 @@ def reconcile_recovery_attempts(
         # 3. Control command / continue reconciliation (e.g. watchdog attempts)
         from dev_orchestrator.control.command_store import ControlCommandStore
         cmd_store = ControlCommandStore(runtime)
-        found_cmd = cmd_store.get(eff_id) if eff_id else None
+        command_error = None
+        try:
+            found_cmd = cmd_store.get(eff_id) if eff_id else None
+        except (OSError, ValueError, RuntimeError) as exc:
+            found_cmd = None
+            command_error = f"control command evidence unreadable ({type(exc).__name__})"
         if found_cmd is not None:
-            updated = record_recovery_outcome(
-                runtime, project_id, aid, "reconciled", effect_id=eff_id, reason="bound_to_existing_control_command"
-            )
+            outcome = found_cmd.get("state")
+            if found_cmd.get("project_id") != project_id or found_cmd.get("command_id") != eff_id:
+                command_error = "control command identity mismatch"
+            elif outcome == "accepted":
+                updated = record_recovery_outcome(
+                    runtime, project_id, aid, "reconciled", effect_id=eff_id, reason="accepted_control_command"
+                ) if status != "reconciled" else dict(att)
+                reconciled_results.append(updated)
+                continue
+            elif outcome == "pending":
+                updated = record_recovery_outcome(
+                    runtime, project_id, aid, "actuated", effect_id=eff_id, reason="awaiting_control_command_outcome"
+                ) if status != "actuated" else dict(att)
+                reconciled_results.append(updated)
+                continue
+            else:
+                command_error = f"control command did not accept recovery: {outcome}: {found_cmd.get('reason') or ''}"
+        elif control_effect:
+            if status == "reserved" and not reservation_expired and command_error is None:
+                reconciled_results.append(dict(att))
+                continue
+            command_error = command_error or "control command missing after publication or reservation expiry"
+        if command_error:
+            from dev_orchestrator.control.owner_store import OwnerControlStore
+            import hashlib
+            gate_id = "gate-control-outcome-" + hashlib.sha256(aid.encode()).hexdigest()[:24]
+            owner_store = OwnerControlStore(runtime)
+            current_gate = owner_store.latest_gate(project_id)
+            if current_gate:
+                gate_id = current_gate["gate_id"]
+            else:
+                owner_store.record_gate(project_id=project_id, gate_id=gate_id, reason=command_error, active=True)
+            updated = record_recovery_outcome(runtime, project_id, aid, "gated", owner_gate_id=gate_id, reason=command_error)
             reconciled_results.append(updated)
             continue
 

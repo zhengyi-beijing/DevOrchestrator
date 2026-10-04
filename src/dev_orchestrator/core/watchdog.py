@@ -1380,6 +1380,7 @@ class WatchdogCoordinator:
         for pid, prow in projects.items():
             if not isinstance(prow, dict):
                 continue
+            self._reconcile_planning_recoveries(pid, prow)
             attempts = prow.get("attempts") or {}
             for att in attempts.values():
                 if not isinstance(att, dict):
@@ -1471,6 +1472,66 @@ class WatchdogCoordinator:
                         slot["phase"] = "unresolved"
                         slot["resolved_at"] = utc_now_iso()
                         slot["reason"] = "command was reserved but never enqueued before crash"
+
+    def _reconcile_planning_recoveries(self, pid: str, prow: dict[str, Any]) -> None:
+        """A deduplicated planning retry must have an outcome or a visible gate."""
+        from dev_orchestrator.control.command_store import ControlCommandStore
+        from dev_orchestrator.incidents.recovery_ledger import load_recovery_attempts, reconcile_recovery_attempts
+        problems = prow.get("planning_recovery_problems") or {}
+        if not isinstance(problems, dict) or not problems:
+            return
+        commands = ControlCommandStore(self.runtime_root)
+        ledger = {row.get("effect_id"): row for row in load_recovery_attempts(self.runtime_root, pid)}
+        for problem in problems.values():
+            if not isinstance(problem, dict):
+                continue
+            for attempt in problem.get("attempts") or []:
+                if not isinstance(attempt, dict) or attempt.get("state") == "completed" or attempt.get("owner_gate_id"):
+                    continue
+                cid = attempt.get("command_id")
+                try:
+                    command = commands.get(cid) if cid else None
+                except (OSError, ValueError, RuntimeError) as exc:
+                    command = None
+                    attempt["reason"] = f"control evidence unreadable ({type(exc).__name__})"
+                row = ledger.get(cid) or {}
+                if command and command.get("state") == "accepted" and command.get("project_id") == pid:
+                    attempt["state"] = "completed"
+                    attempt["resolved_at"] = utc_now_iso()
+                    problem["state"] = "retry_accepted"
+                    reconcile_recovery_attempts(self.runtime_root, pid)
+                    self._save_state(self._cached_state)
+                elif command and command.get("state") == "pending" and command.get("project_id") == pid and attempt.get("state") != "blocked":
+                    if attempt.get("state") != "requested":
+                        attempt["state"] = "requested"
+                        self._save_state(self._cached_state)
+                else:
+                    reserved = parse_utc(attempt.get("reserved_at"))
+                    try:
+                        ttl = float(row.get("reservation_ttl_seconds", attempt.get("reservation_ttl_seconds", 300)))
+                        fresh = reserved is not None and 0 <= (datetime.now(timezone.utc) - reserved).total_seconds() < ttl
+                    except (TypeError, ValueError):
+                        fresh = False
+                    if not command and attempt.get("state") == "reserved" and fresh and not attempt.get("reason"):
+                        continue
+                    reason = (command or {}).get("reason") or attempt.get("reason") or "planning recovery command missing or not accepted"
+                    reconcile_recovery_attempts(self.runtime_root, pid)
+                    self._gate_planning_recovery(pid, problem, attempt, str(reason))
+
+    def _gate_planning_recovery(self, pid: str, problem: dict[str, Any], attempt: dict[str, Any], reason: str) -> None:
+        from dev_orchestrator.control.owner_store import OwnerControlStore
+        store = OwnerControlStore(self.runtime_root)
+        existing = store.latest_gate(pid)
+        gate_id = (existing or {}).get("gate_id") or "gate-planning-outcome-" + hashlib.sha256(
+            f"{pid}:{attempt.get('command_id')}".encode()).hexdigest()[:24]
+        if not existing:
+            store.record_gate(project_id=pid, gate_id=gate_id, reason=reason, active=True)
+        attempt.update(state="blocked", owner_gate_id=gate_id, reason=reason)
+        problem.update(state="blocked", reason=reason)
+        self._save_state(self._cached_state)
+        self._emit_milestone(pid, "OWNER_GATE", task_id=problem.get("task_id"),
+            occurrence_key=f"{attempt.get('command_id')}:planning-recovery-outcome",
+            details={"source": "watchdog", "gate_id": gate_id, "command_id": attempt.get("command_id"), "reason": reason})
 
     @staticmethod
     def _reset_epoch_state(project_row: dict[str, Any]) -> None:
@@ -1583,6 +1644,7 @@ class WatchdogCoordinator:
         pid = str(project_config.get("project_id") or project_config.get("id") or "")
         if not pid or not policy.get("auto_recovery", False):
             return None
+        self._reconcile_planning_recoveries(pid, project_row)
 
         authority = snapshot.get("authoritative_lifecycle")
         telemetry = snapshot.get("telemetry")
@@ -1712,6 +1774,9 @@ class WatchdogCoordinator:
         if limit <= 0 or len(attempts) >= limit:
             problem["state"] = "exhausted"
             problem["reason"] = f"automatic planning recovery budget exhausted ({limit})"
+            self._gate_planning_recovery(pid, problem,
+                {"command_id": f"wd-plan-{fingerprint[:16]}-budget"}, problem["reason"])
+            problem["state"] = "exhausted"
             self._save_state(self._cached_state)
             return {"project_id": pid, "status": "planning_recovery_exhausted"}
 
@@ -1834,6 +1899,8 @@ class WatchdogCoordinator:
             "reserved_at": utc_now_iso(),
             "action": rcv_decision.action,
             "strategy_key": rcv_decision.strategy_key,
+            "recovery_attempt_id": rcv_decision.attempt_id,
+            "reservation_ttl_seconds": incident_policy["recovery_attempt_reservation_ttl_seconds"],
         }
         attempts.append(attempt)
         problem["state"] = "retrying"
@@ -1890,7 +1957,7 @@ class WatchdogCoordinator:
             attempt["state"] = "blocked"
             attempt["reason"] = f"enqueue failed: {exc}"
             problem["state"] = "blocked"
-            self._save_state(self._cached_state)
+            self._gate_planning_recovery(pid, problem, attempt, attempt["reason"])
             return {"project_id": pid, "status": "planning_recovery_blocked", "reason": str(exc)}
 
     def advance(

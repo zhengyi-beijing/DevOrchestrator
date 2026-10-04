@@ -1,0 +1,7 @@
+Command: C:\Users\yizhe\AppData\Local\Programs\Python\Python312\python.exe -m pytest tests_py/test_p20_3_recovery_policy.py tests_py/test_p20_3_recovery_durability.py tests_py/test_ai_planner.py tests_py/test_ai_reviewer.py tests_py/test_p20_3_planner_bounds.py tests_py/test_p20_3_cleanup_identity.py tests_py/test_p20_3_adjudication_evidence.py tests_py/test_p20_3_policy_controls.py tests_py/test_p20_3_broker_resource_snapshot.py tests_py/test_control_commands.py tests_py/test_watchdog_recovery.py tests_py/test_watchdog.py tests_py/test_p145_reviewer_harness.py tests_py/test_p14_durable_jobs.py tests_py/test_planning_convergence_recovery.py -q
+Observed at: 2026-10-04T07:20:11.491527+00:00
+........................................................................ [ 26%]
+........................................................................ [ 52%]
+................................................................... [ 77%]
+..............................................................                                                                  [100%]
+273 passed, 22 subtests passed in 86.18s (0:01:26)

@@ -1,4 +1,31 @@
-# P20.3 Final local technical-review delta (2026-10-04)
+# P20.3 Planning recovery command-outcome delta (2026-10-04)
+
+Latest state: bounded implementation and regression complete; independent
+descendant Technical Review pending. P20.3 is not accepted; no soak has started.
+The independent 8cbc30df Review confirmed all three preceding corrections,
+then reproduced missing outcome convergence in the planning-recovery path.
+
+Watchdog now reconciles planning_recovery_problems attempts against normal
+control-command inbox/history. Accepted commands settle the retry; pending
+commands retain ownership and do not count as recovery success. Blocked/unknown
+outcomes, enqueue failure and expired unpublished reservations produce stable
+durable owner gates. Fresh reservations retain the configured lease. Budget
+exhaustion preserves its existing state and adds an actionable gate. Existing
+owner-decision gates and evidence are preserved; no retry or duplicate is
+launched during reconciliation. Recovery ledger checks actual command outcomes,
+including legacy prematurely reconciled command bindings.
+
+Focused RED evidence: P20_3_COMMAND_OUTCOME_RED.txt, COMMAND_BUDGET_RED.txt and
+COMMAND_GATE_PRESERVATION_RED.txt. Current verification: 273 passed, 22 subtests
+passed in 86.18s; compileall, diff check and Graphify update passed. GREEN/source
+hashes are in P20_3_COMMAND_OUTCOME_GREEN.txt and MANIFEST.json.
+Independent Review evidence: P20_3_FINAL_LOCAL_DELTA_REVIEW.json (REMEDIATE).
+It reported 1878 full-directory tests and 130 subtests passing, plus two
+pre-existing/environmental failures (P16 SID detection and P17 import boundary).
+That report is not a full-suite PASS or soak evidence. The sections below are
+historical. No push or direct lifecycle ledger edit.
+
+# Historical P20.3 Final local technical-review delta (2026-10-04)
 
 Latest state: three local blocking findings from the independent ac2cf329
 Review are fixed; descendant Technical Review pending. P20.3 is not accepted,
