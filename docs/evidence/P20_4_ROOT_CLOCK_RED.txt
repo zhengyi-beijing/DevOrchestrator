@@ -25,20 +25,20 @@ self = <test_p20_4_live_contract.LiveContractTests testMethod=test_resume_is_obs
         resumed = resume_soak_run(self.fixture.permit)
 >       self.assertEqual(resumed['segments'], first['segments'])
 E       AssertionError: Lists differ: [{'bo[124 chars]:00'}, {'boot_id': '1790953908.8104973', 'star[90 chars]00'}] != [{'bo[124 chars]:00'}]
-E       
+E
 E       First list contains 1 additional elements.
 E       First extra element 1:
 E       {'boot_id': '1790953908.8104973', 'start_mono': 151559.984, 'end_mono': 151559.984, 'resumed_at': '2026-10-04T09:17:47.968626+00:00'}
-E       
+E
 E         [{'boot_id': '1790953908.8104973',
 E           'end_mono': 151559.984,
 E           'start_mono': 151559.984,
 E       -   'started_at': '2026-10-04T09:17:47.961625+00:00'},
 E       ?                                                    ^
-E       
+E
 E       +   'started_at': '2026-10-04T09:17:47.961625+00:00'}]
 E       ?                                                    ^
-E       
+E
 E       -  {'boot_id': '1790953908.8104973',
 E       -   'end_mono': 151559.984,
 E       -   'resumed_at': '2026-10-04T09:17:47.968626+00:00',

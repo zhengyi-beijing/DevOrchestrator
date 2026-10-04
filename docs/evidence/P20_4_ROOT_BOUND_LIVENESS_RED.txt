@@ -44,7 +44,7 @@ __________ test_owned_job_process_and_source_generation_are_observed __________
 >           assert live['verdict'] == 'alive', live
 E           AssertionError: {'verdict': 'dead', 'reason': 'broker reports terminal status succeeded', 'timestamp': '2026-10-04T13:28:08.712192+00:...e': 'project_claims', 'timestamp': '2026-10-04T13:28:08.712192+00:00', 'worker_state': None, 'active_roles': []}], ...}
 E           assert 'dead' == 'alive'
-E             
+E
 E             - alive
 E             + dead
 
