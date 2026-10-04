@@ -39,6 +39,9 @@ def test_owned_job_process_and_source_generation_are_observed():
         assert facts is not None, reason
         assert facts['child_pid'] != facts['supervisor_pid']
         assert facts['supervisor_start_token']
+        from dev_orchestrator.soak.timeline import load_soak_run, compute_run_duration
+        duration = compute_run_duration(load_soak_run(fixture.disposable_runtime, fixture.permit.run_id))
+        assert duration['continuity_ok'], duration
         from dev_orchestrator.core.execution_lifecycle import resolve_execution_liveness
         from unittest.mock import Mock
         port = Mock()

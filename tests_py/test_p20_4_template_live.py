@@ -2,7 +2,7 @@
 from pathlib import Path
 import tempfile
 from dev_orchestrator.soak.permit import create_soak_permit
-from dev_orchestrator.soak.template import generate_soak_project
+from dev_orchestrator.soak.template import generate_soak_project, _git
 from dev_orchestrator.monitor.telemetry import extract_task_id
 from dev_orchestrator.config import load_projects_config
 
@@ -19,8 +19,12 @@ def test_generated_tasks_use_native_identity_and_real_ai_configuration():
         assert config['projects'][0]['execution']['engine'] == 'aibroker'
         assert config['projects'][0]['ai_roles']['planner']['enabled'] is True
         for task in manifest['task_ids']:
-            title = (root / 'repo/agent/staged' / (task + '.md')).read_text(encoding='utf-8').splitlines()[0]
+            path = root / 'repo/agent/staged' / (task + '.md')
+            assert b'\r' not in path.read_bytes(), 'native staged metadata requires LF-only bytes'
+            title = path.read_text(encoding='utf-8').splitlines()[0]
             assert extract_task_id(title) == task
+        _git(root / 'repo', '-c', 'core.autocrlf=true', 'checkout-index', '-f', '-a')
+        assert all(b'\r' not in path.read_bytes() for path in (root / 'repo/agent/staged').glob('*.md'))
         assert 'NotImplementedError' in (root / 'repo/soak_app.py').read_text(encoding='utf-8')
         assert 'class RecordStore' not in (root / 'repo/soak_app.py').read_text(encoding='utf-8')
         assert generate_soak_project(permit)['initial_commit'] == manifest['initial_commit']

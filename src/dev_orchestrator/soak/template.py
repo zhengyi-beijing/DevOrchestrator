@@ -110,12 +110,13 @@ def generate_soak_project(permit, template_root=None):
     (repo / 'tests').mkdir()
     (repo / 'config').mkdir()
     (repo / '.gitignore').write_text('.devorch/\n__pycache__/\n.pytest_cache/\n*.pyc\n', encoding='utf-8')
+    (repo / '.gitattributes').write_text('* text=auto\n*.md text eol=lf\n', encoding='utf-8', newline='\n')
     (repo / 'soak_app.py').write_text(BASE_SOURCE, encoding='utf-8')
     (repo / 'tests/test_baseline.py').write_text(BASE_TESTS, encoding='utf-8')
     (repo / 'pyproject.toml').write_text('[tool.pytest.ini_options]\npythonpath = ["."]\ntestpaths = ["tests"]\n', encoding='utf-8')
     (repo / 'AGENTS.md').write_text('Pure software fixture only. Work on the current task only. Use tests and real commits; preserve past evidence. No push, hardware, remote calls, daemon shutdown or runtime ledger editing. DevOrchestrator owns task transitions. Future tasks stay pending design.\n', encoding='utf-8')
     for name in ('CURRENT.md', 'HANDOFF.md', 'result.md'):
-        (agent / name).write_text('# Isolated P20 run\nNo task accepted yet.\n', encoding='utf-8')
+        (agent / name).write_text('# Isolated P20 run\nNo task accepted yet.\n', encoding='utf-8', newline='\n')
     roadmap = []
     for index, task in enumerate(SOAK_TASK_SPECS):
         successor = SOAK_TASK_SPECS[index + 1]['task_id'] if index + 1 < len(SOAK_TASK_SPECS) else None
@@ -124,9 +125,9 @@ def generate_soak_project(permit, template_root=None):
                 f"Successor: {successor or 'TBD / owner decision required'}\n\n"
                 f"## Objective\n{task['description']}\n\n## Acceptance\n"
                 'Real implementation, regression tests, actual successful pytest output, clean local commit, independent Technical Review ACCEPT. No other task or runtime mutation.\n')
-        (agent / 'staged' / (task['task_id'] + '.md')).write_text(text, encoding='utf-8')
+        (agent / 'staged' / (task['task_id'] + '.md')).write_text(text, encoding='utf-8', newline='\n')
         if index == 0:
-            (agent / 'next.md').write_text(text, encoding='utf-8')
+            (agent / 'next.md').write_text(text, encoding='utf-8', newline='\n')
         roadmap.append({'task_id': task['task_id'], 'successor': successor,
                         'successor_spec_path': f"agent/staged/{successor}.md" if successor else None})
     write_json(agent / 'staged/roadmap.json', {'schema_version': 1, 'tasks': roadmap})
@@ -141,12 +142,9 @@ def generate_soak_project(permit, template_root=None):
                                'heartbeat_interval_seconds': 5}}}}})
     # Deterministic CPF evidence remains explicitly separate from real AI/fault evidence.
     jobs = read_json(runtime / 'execution-jobs.json', {})
-    from dev_orchestrator.config import REPO_ROOT
     jobs['projects'][permit.soak_project_id]['commands']['cpf_replay'] = {
-        'argv': [sys.executable, '-m', 'pytest', '-q',
-            str(REPO_ROOT / 'tests_py/test_p17_cpf_scenarios_part1.py'),
-            str(REPO_ROOT / 'tests_py/test_p17_cpf_scenarios_part2.py'),
-            '--junitxml={job_dir}/cpf.xml'], 'cwd': '.', 'effect_class': 'read_only',
+        'argv': [sys.executable, '-m', 'dev_orchestrator.soak.cpf_runner',
+            '--job-dir', '{job_dir}'], 'cwd': '.', 'effect_class': 'read_only',
         'max_runtime_seconds': 300, 'heartbeat_interval_seconds': 5}
     write_json(runtime / 'execution-jobs.json', jobs)
     _git(repo, 'init', '-b', 'main')

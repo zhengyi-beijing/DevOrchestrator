@@ -1,0 +1,44 @@
+F                                                                        [100%]
+================================== FAILURES ===================================
+__________ test_owned_job_process_and_source_generation_are_observed __________
+
+    def test_owned_job_process_and_source_generation_are_observed():
+        fixture = fixtures.TestExternalExecutionBinding()
+        fixture.setUp()
+        job = None
+        try:
+            runtime = fixture.canonical_runtime
+            script = ('import time; from dev_orchestrator.soak.permit import load_soak_permit; '
+                      'from dev_orchestrator.soak.timeline import open_soak_run; '
+                      f'open_soak_run(load_soak_permit({str(fixture.permit_path)!r})); time.sleep(12)')
+            write_json(runtime / 'execution-jobs.json', {'enabled': True, 'runtime_root': str(runtime),
+                'projects': {'devorchestrator': {'repo_path': str(fixture.canonical_repo), 'commands': {
+                    'p20_soak_supervisor': {'argv': [sys.executable, '-c', script], 'cwd': '.',
+                        'max_runtime_seconds': 20, 'heartbeat_interval_seconds': 1, 'effect_class': 'idempotent'}}}}})
+            service = JobService(runtime)
+            source = 'owned-unit-source'
+            job = service.submit(JobSpec(project_id='devorchestrator', task_id='P20.4', kind='soak',
+                source_request_id=source, command_ref='p20_soak_supervisor',
+                idempotency_key=f'soak:{fixture.permit.run_id}:{source}', parameters_digest=fixture.permit.fingerprint))
+            record = {'repo_path': str(fixture.canonical_repo), 'source_request_id': source, 'project_id': 'devorchestrator'}
+            binding = {'job_id': job.job_id, 'permit_path': str(fixture.permit_path),
+                'permit_fingerprint': fixture.permit.fingerprint, 'soak_run_id': fixture.permit.run_id,
+                'soak_project_id': fixture.permit.soak_project_id}
+            until = time.monotonic() + 8
+            facts, reason = None, None
+            while facts is None and time.monotonic() < until:
+                facts, reason = observe_owned_job(runtime, record, binding)
+                time.sleep(.1)
+            assert facts is not None, reason
+            assert facts['child_pid'] != facts['supervisor_pid']
+            assert facts['supervisor_start_token']
+            from dev_orchestrator.soak.timeline import load_soak_run, compute_run_duration
+            duration = compute_run_duration(load_soak_run(fixture.disposable_runtime, fixture.permit.run_id))
+>           assert duration['continuity_ok'], duration
+E           AssertionError: {'wall_seconds': 0.001, 'monotonic_seconds': 0.0, 'segments': [{'boot_id': '1790953909.8629932', 'start_mono': 167851.156, 'end_mono': 167851.156, 'started_at': '2026-10-04T13:49:20.862993+00:00'}], 'continuity_ok': False, ...}
+E           assert False
+
+tests_py\test_p20_4_owned_job.py:44: AssertionError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_4_owned_job.py::test_owned_job_process_and_source_generation_are_observed
+1 failed in 1.48s

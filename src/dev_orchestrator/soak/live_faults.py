@@ -82,7 +82,7 @@ class LiveFaultDriver:
                 {'task_id': 'P204.1', 'successor': None, 'successor_spec_path': None}]})
             for path in (agent / 'next.md', agent / 'staged/P204.1.md'):
                 content = path.read_text(encoding='utf-8').replace('Successor: P204.2', 'Successor: TBD / owner decision required')
-                path.write_text(content, encoding='utf-8')
+                path.write_text(content, encoding='utf-8', newline='\n')
             _git(permit.disposable_repo_path, 'add', 'agent')
             _git(permit.disposable_repo_path, 'commit', '-m', 'test: bound isolated fault case to one task')
         runtime = Path(permit.disposable_runtime_root)

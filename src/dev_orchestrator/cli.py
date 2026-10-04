@@ -2279,13 +2279,16 @@ def cmd_soak_status(args: argparse.Namespace) -> int:
     faults = run_state.get("fault_dispositions") or {}
     status_out = {
         "run_id": permit.run_id,
+        "status": run_state.get("status"),
         "started_at": run_state.get("started_at"),
         "elapsed_seconds": elapsed,
+        "clock_continuity": dur.get("continuity_ok"),
         "completed_tasks": tasks,
         "incidents": list(run_state.get("incidents", {}).keys()) if isinstance(run_state.get("incidents"), dict) else [],
         "recovery_results": faults,
-        "current_execution": run_state.get("current_execution") or "supervisor_running",
-        "next_scheduled_fault": run_state.get("next_fault") or "none",
+        "current_execution": run_state.get("current_execution"),
+        "pending_faults": run_state.get("pending_faults") or [],
+        "next_scheduled_fault": run_state.get("next_fault"),
         "resume_command": f"python -m dev_orchestrator soak-resume --permit {args.permit}",
     }
     print(json.dumps(status_out, indent=2))
@@ -2311,8 +2314,11 @@ def cmd_soak_resume(args: argparse.Namespace) -> int:
         "completed_tasks": tasks,
         "incidents": list(run_state.get("incidents", {}).keys()) if isinstance(run_state.get("incidents"), dict) else [],
         "recovery_results": faults,
-        "current_execution": run_state.get("current_execution") or "supervisor_resumed",
-        "next_scheduled_fault": run_state.get("next_fault") or "none",
+        "current_execution": run_state.get("current_execution"),
+        "pending_faults": run_state.get("pending_faults") or [],
+        "next_scheduled_fault": run_state.get("next_fault"),
+        "status": run_state.get("status"),
+        "clock_continuity": dur.get("continuity_ok"),
         "resume_command": f"python -m dev_orchestrator soak-resume --permit {args.permit}",
     }
     print(json.dumps(status_out, indent=2))

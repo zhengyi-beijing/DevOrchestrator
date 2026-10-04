@@ -1,3 +1,20 @@
+# P20.4 original live run checkpoint (2026-10-04)
+
+P20 is NOT COMPLETE. Canonical authority remains P20.4 EXECUTING with the original externally bound owner p20-4-live-bootstrap-worker-fresh-20261004. Its foreground Broker Worker finished; durable owned job job-cf58d9f173ff286f remains running. Original supervisor child PID 36400 opened p20-live-20261004-a at 2026-10-04T13:37:21.464641+00:00 (21:37:21 Shanghai). Do not reset its start, replace its supervisor, accumulate segments, or claim six hours early. The earliest six-hour instant is 2026-10-05 03:37:21 Shanghai; reaching that instant alone is insufficient.
+
+The 2026-10-04T14:08:53Z checkpoint verifies the same process generation and fresh heartbeat, ~1889 actual seconds, 1/5 independently accepted AI tasks, 0/15 verified live fault dispositions, and 10/10 deterministic CPF proofs after normal durable retry. Full checkpoint: runtime/p20-4-running-checkpoint.json. It contains binding PID/start-token/source identity, tasks, incidents, pending cases, actual recovery results, and exact observation procedure.
+
+The primary flow is BLOCKED: after real P204.1 ACCEPT, native handoff rejected CRLF staged metadata. A subsequent auto-ready P204.1 Worker attempt failed authentication. A genuine 153.899538-second normal-observation gap also makes the continuous hard-zero coverage UNKNOWN. These defects prevent current qualification. Preserve the failed actuation and measured primary unchanged; do not manually repair the primary during measurement or erase the gap. F01 reached its finite case observation limit without a verified outcome; F02 was still being observed. Pending is not PASS or an accepted owner gate.
+
+Root fixed cross-process Windows psutil boot precision, the telemetry NameError, CPF test cwd and source-correlated bounded retry verification, and LF template generation/checkout. 92 related regression tests pass; these repairs still need independent final Technical Review. The original supervisor retains its original imports and clocks; final qualification imports the new read-only verification module only after the actual minimum duration. Cached checkpoint CPF/metric mirrors may lag fresh source verification. Further lifecycle/recovery defects exposed by this run remain for remediation and an honest acceptance path; this checkpoint grants no final acceptance.
+
+Read-only observation, from the canonical repository:
+python -m dev_orchestrator soak-resume --permit C:/work/github/DevOrchestrator-dev/runtime/p20-live-permit.json
+
+Resume means inspect this same durable run. No replacement run or clock reset has been performed. P20.5 remains pending; no P21, push, reset, or history rewrite.
+
+---
+
 # P20.4 actual live-run preparation (2026-10-04)
 
 P20.3 independently ACCEPTED at 41f2bfc; normal settlement activated P20.4. The first Worker committed e98baf6a, stopped its daemon and was cancelled. Root corrected the invalid live-evidence and startup boundaries. See docs/P20_4_LIVE_BOOTSTRAP.md and genuine RED/GREEN evidence. Current state: owner-paused P20.4 READY_TO_RUN, no active AI role, no soak yet. Next: clean source commit, normal quiescent daemon reload, local isolated initialization, bounded original-source job binding. The exact run/checkpoint will be stored in runtime/p20-4-running-checkpoint.json once actually RUNNING. Never reset that run, claim six hours early, or bypass normal final Technical Review. P20.5 is pending; no P21 or push.

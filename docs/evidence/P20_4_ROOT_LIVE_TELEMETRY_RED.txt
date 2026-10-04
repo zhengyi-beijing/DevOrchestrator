@@ -1,0 +1,24 @@
+F.                                                                       [100%]
+================================== FAILURES ===================================
+________________ test_run_scoped_escape_observations_are_read _________________
+
+tmp_path = WindowsPath('C:/Users/yizhe/AppData/Local/Temp/pytest-of-yizhe/pytest-563/test_run_scoped_escape_observa0')
+
+    def test_run_scoped_escape_observations_are_read(tmp_path):
+        run = open_reliability_run(tmp_path, 'fixture')
+        path = tmp_path / 'reliability/invariant-observations.jsonl'
+        row = {'project_id': 'fixture', 'recorded_at': run['opened_at'],
+               'invariant_code': 'CURRENT_TASK_MATCHES_ACTIVE_EXECUTION',
+               'transition_id': 't1', 'holds': False, 'escaped_to_authority': True}
+        path.write_text(json.dumps(row) + '\n', encoding='utf-8')
+        metric = compute_reliability_telemetry(tmp_path, run['run_id']).metrics['lifecycle_invariant_escape_count']
+>       assert metric.coverage == 'full'
+E       AssertionError: assert 'unknown' == 'full'
+E
+E         - full
+E         + unknown
+
+tests_py\test_p20_4_live_verification.py:17: AssertionError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_4_live_verification.py::test_run_scoped_escape_observations_are_read
+1 failed, 1 passed in 0.30s

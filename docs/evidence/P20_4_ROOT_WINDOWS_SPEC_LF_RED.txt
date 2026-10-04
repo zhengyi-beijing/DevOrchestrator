@@ -1,0 +1,27 @@
+F                                                                        [100%]
+================================== FAILURES ===================================
+_____ test_generated_tasks_use_native_identity_and_real_ai_configuration ______
+
+    def test_generated_tasks_use_native_identity_and_real_ai_configuration():
+        with tempfile.TemporaryDirectory(prefix='p20-template-native-') as temporary:
+            root = Path(temporary)
+            canonical = root / 'canonical'
+            canonical.mkdir()
+            permit = create_soak_permit('native-contract', 'native-project', root / 'repo', root / 'runtime',
+                                        canonical, canonical / 'runtime')
+            manifest = generate_soak_project(permit)
+            config = load_projects_config(manifest['config_path'])
+            assert config['projects'][0]['execution']['engine'] == 'aibroker'
+            assert config['projects'][0]['ai_roles']['planner']['enabled'] is True
+            for task in manifest['task_ids']:
+                path = root / 'repo/agent/staged' / (task + '.md')
+>               assert b'\r' not in path.read_bytes(), 'native staged metadata requires LF-only bytes'
+E               AssertionError: native staged metadata requires LF-only bytes
+E               assert b'\r' not in b'# P204.1 \xe2\x80\x94 Add label normalization\r\n\r\nStatus: **PENDING DESIGN**\r\n\r\nPredecessor: none\r\nSuccesso...cessful pytest output, clean local commit, independent Technical Review ACCEPT. No other task or runtime mutation.\r\n'
+E                +  where b'# P204.1 \xe2\x80\x94 Add label normalization\r\n\r\nStatus: **PENDING DESIGN**\r\n\r\nPredecessor: none\r\nSuccesso...cessful pytest output, clean local commit, independent Technical Review ACCEPT. No other task or runtime mutation.\r\n' = read_bytes()
+E                +    where read_bytes = WindowsPath('C:/Users/yizhe/AppData/Local/Temp/p20-template-native-h4wyce5n/repo/agent/staged/P204.1.md').read_bytes
+
+tests_py\test_p20_4_template_live.py:23: AssertionError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_4_template_live.py::test_generated_tasks_use_native_identity_and_real_ai_configuration
+1 failed in 0.61s

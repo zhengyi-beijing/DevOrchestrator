@@ -22,6 +22,21 @@ def _current_boot_id() -> str:
         return f"boot-{int(time.time() - time.monotonic())}"
 
 
+def _same_boot(recorded: Any, current: str) -> bool:
+    if recorded == current:
+        return True
+    # psutil's Windows boot_time estimate fluctuates by up to one second
+    # between processes (psutil issue 1007). Preserve the original clock and
+    # apply only that documented precision to legacy numeric boot identities.
+    if os.name == 'nt' and isinstance(recorded, str):
+        try:
+            left, right = float(recorded), float(current)
+            return math.isfinite(left) and math.isfinite(right) and abs(left - right) <= 1.
+        except ValueError:
+            pass
+    return False
+
+
 def open_soak_run(permit: SoakPermit) -> dict[str, Any]:
     """Open a new soak run and create initial state and timeline log."""
     rt = Path(permit.disposable_runtime_root)
@@ -198,7 +213,7 @@ def compute_run_duration(run_state: dict[str, Any]) -> dict[str, Any]:
             continuity_ok = False
             discontinuity_reason = f"monotonic_went_backwards_in_segment_{idx}"
             break
-        if seg.get('boot_id') != _current_boot_id():
+        if not _same_boot(seg.get('boot_id'), _current_boot_id()):
             continuity_ok = False
             discontinuity_reason = 'system_boot_discontinuity'
             break

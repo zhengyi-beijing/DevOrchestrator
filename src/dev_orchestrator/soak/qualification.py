@@ -49,13 +49,15 @@ def evaluate_soak_qualification(
         reasons.append('permit_invalid: ' + str(refusal))
     if run_state.get('run_id') != permit.run_id or run_state.get('project_id') != permit.soak_project_id:
         reasons.append('run_identity_mismatch')
-    from dev_orchestrator.soak.evidence import accepted_tasks, observed_faults, measured_metrics, cpf_proofs
+    from dev_orchestrator.soak.evidence import accepted_tasks, observed_faults, measured_metrics
+    from dev_orchestrator.soak.verification_sources import cpf_retry_proofs, continuous_escape_metric
     declared_tasks = list(run_state.get('completed_tasks') or [])
     try:
         actual_tasks = accepted_tasks(permit)
         actual_faults = observed_faults(permit, run_state)
         values, coverage, _ = measured_metrics(permit, run_state)
-        actual_cpfs = cpf_proofs(permit, run_state)
+        values['lifecycle_invariant_escape'], coverage['lifecycle_invariant_escape'] = continuous_escape_metric(permit, run_state)
+        actual_cpfs = cpf_retry_proofs(permit, run_state)
     except (OSError, ValueError, TypeError, KeyError):
         actual_tasks, actual_faults, values, coverage, actual_cpfs = {}, {}, {}, {}, {}
         reasons.append('source_evidence_unavailable_or_corrupt')
