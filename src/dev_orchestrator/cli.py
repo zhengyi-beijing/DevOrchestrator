@@ -2208,11 +2208,13 @@ def cmd_soak_init(args: argparse.Namespace) -> int:
         sys.stderr.write(f"Permit at {args.permit} not found or invalid.\n")
         return 1
     rt = resolve_runtime_root(args.runtime_root)
-    ok, reason = validate_soak_permit(permit, REPO_ROOT, rt)
+    ok, reason = validate_soak_permit(permit, REPO_ROOT, rt, require_marker=False)
     if not ok:
         sys.stderr.write(f"Permit validation failed: {reason}\n")
         return 1
     res = generate_soak_project(permit)
+    from dev_orchestrator.soak.bootstrap import initialize_primary
+    res = initialize_primary(permit, res)
     print(json.dumps(res, indent=2))
     return 0
 
@@ -2231,22 +2233,32 @@ def cmd_soak_start(args: argparse.Namespace) -> int:
     if not ok:
         sys.stderr.write(f"Permit validation failed: {reason}\n")
         return 1
-    run_state = open_soak_run(permit)
-    js = JobService(rt)
-    spec = JobSpec(
-        project_id="devorchestrator",
-        command_ref="p20_soak_supervisor",
-        idempotency_key=f"soak-sup-{permit.run_id}",
-        metadata={"parameters": {"permit_path": str(Path(args.permit).resolve())}},
-    )
-    job_rec = js.submit(spec)
-    out = {
-        "status": "started",
-        "run_id": permit.run_id,
-        "supervisor_job_id": job_rec.job_id,
-        "run_state": run_state,
-    }
+    from dev_orchestrator.control.command_store import ControlCommandStore
+    from dev_orchestrator.control.surface import project_control_view
+    snapshot = read_json(rt / 'projects/devorchestrator.json', None)
+    if not isinstance(snapshot, dict):
+        raise CliError('canonical daemon snapshot missing')
+    store = ControlCommandStore(rt)
+    command_id = 'soak-bind-' + permit.run_id
+    out = store.get(command_id)
+    if out is None:
+        out = store.submit({'schema_version': 1, 'command_id': command_id,
+            'project_id': 'devorchestrator', 'action': 'soak_bind',
+            'expected': project_control_view(snapshot, rt)['control_identity'],
+            'target': {'source_request_id': args.source_request_id,
+                       'permit_path': str(Path(args.permit).resolve())}}, source='p20_local_cli')
     print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_soak_prepare(args: argparse.Namespace) -> int:
+    from dev_orchestrator.soak.bootstrap import prepare_bootstrap
+    from dev_orchestrator.core.repository import read_repository_truth
+    truth = read_repository_truth(REPO_ROOT)
+    if not truth.valid or truth.dirty:
+        raise CliError('soak preparation requires a clean committed source')
+    result = prepare_bootstrap(resolve_runtime_root(args.runtime_root), REPO_ROOT, truth.head, args.permit)
+    print(json.dumps(result, indent=2))
     return 0
 
 
@@ -2809,6 +2821,10 @@ def build_parser() -> argparse.ArgumentParser:
     soak_start = sub.add_parser("soak-start", help="start soak run supervisor")
     soak_start.add_argument("--permit", required=True)
     soak_start.add_argument("--runtime-root", default=None)
+    soak_start.add_argument('--source-request-id', required=True)
+    soak_prepare = sub.add_parser('soak-prepare', help='prepare local bounded durable-job handoff')
+    soak_prepare.add_argument('--permit', required=True)
+    soak_prepare.add_argument('--runtime-root', default=None)
 
     soak_status = sub.add_parser("soak-status", help="show soak run status")
     soak_status.add_argument("--permit", required=True)
@@ -2831,6 +2847,7 @@ _COMMANDS = {
     "soak-permit-show": cmd_soak_permit_show,
     "soak-init": cmd_soak_init,
     "soak-start": cmd_soak_start,
+    'soak-prepare': cmd_soak_prepare,
     "soak-status": cmd_soak_status,
     "soak-resume": cmd_soak_resume,
     "soak-verify": cmd_soak_verify,

@@ -14,6 +14,7 @@ from dev_orchestrator.accounting import ExecutionRecorder
 from dev_orchestrator.control.binding_resolver import resolve_effective_projects
 from dev_orchestrator.control.command_store import (
     CONTROL_ACTIONS,
+    LOCAL_CONTROL_ACTIONS,
     ControlCommandStore,
     safe_command_id,
 )
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 CONTROL_DIR = "control"
 CONTROL_VERSION = 1
-_SUPPORTED_ACTIONS = CONTROL_ACTIONS
+_SUPPORTED_ACTIONS = CONTROL_ACTIONS | LOCAL_CONTROL_ACTIONS
 
 
 def _nonblank(value: Any) -> str | None:
@@ -509,6 +510,8 @@ class ControlCommandCoordinator:
         action = _nonblank(record.get("action"))
         if action not in _SUPPORTED_ACTIONS:
             return self._blocked(command_id, project_id, action, "unsupported control action", now, record)
+        if action in LOCAL_CONTROL_ACTIONS and record.get('source') != 'p20_local_cli':
+            return self._blocked(command_id, project_id, action, 'local soak source required', now, record)
         if project_id is None or project_id not in projects:
             from dev_orchestrator.core.activation import load_activation_requests, _record_pending_intent_for_activation
             from dev_orchestrator.core.blockers import explain_block
@@ -557,6 +560,12 @@ class ControlCommandCoordinator:
         if not valid:
             return self._blocked(command_id, project_id, action, reason, now, record)
         target = record.get("target") if isinstance(record.get("target"), dict) else {}
+        if action == 'soak_bind':
+            result = executor.start_and_bind_soak(
+                target.get('source_request_id'), target.get('permit_path'),
+            )
+            return {**record, 'state': 'accepted' if result.get('status') == 'bound' else 'blocked',
+                    'processed_at': now, 'effect': 'local_owned_soak_binding', **result}
         gate_id = _nonblank(target.get("gate_id"))
         if action == "approve_owner_gate" and gate_id != _nonblank(observed.get("gate_id")):
             return self._blocked(

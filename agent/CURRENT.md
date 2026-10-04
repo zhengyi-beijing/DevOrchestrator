@@ -1,3 +1,11 @@
+# P20.4 actual live-run preparation (2026-10-04)
+
+P20.3 independently ACCEPTED at 41f2bfc; normal settlement activated P20.4. The first Worker committed e98baf6a, stopped its daemon and was cancelled. Root corrected the invalid live-evidence and startup boundaries. See docs/P20_4_LIVE_BOOTSTRAP.md and genuine RED/GREEN evidence. Current state: owner-paused P20.4 READY_TO_RUN, no active AI role, no soak yet. Next: clean source commit, normal quiescent daemon reload, local isolated initialization, bounded original-source job binding. The exact run/checkpoint will be stored in runtime/p20-4-running-checkpoint.json once actually RUNNING. Never reset that run, claim six hours early, or bypass normal final Technical Review. P20.5 is pending; no P21 or push.
+
+Read-only status/resume: python -m dev_orchestrator soak-resume --permit C:/work/github/DevOrchestrator-dev/runtime/p20-live-permit.json
+
+---
+
 # P20.3 accepted base; live restart supplement pending (2026-10-04)
 
 The 15abd1a implementation has independent ACCEPT. A normal reload exposed two

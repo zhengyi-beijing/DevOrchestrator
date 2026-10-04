@@ -68,7 +68,7 @@ class TestSoakRunClock(unittest.TestCase):
         self.assertIn("boot_id", seg)
         self.assertIn("start_mono", seg)
 
-    def test_resume_preserves_started_at_and_appends_segment(self) -> None:
+    def test_resume_preserves_started_at_without_appending_segment(self) -> None:
         run1 = open_soak_run(self.permit)
         started_at = run1["started_at"]
         checkpoint_soak_run(self.disposable_runtime, run1)
@@ -78,9 +78,9 @@ class TestSoakRunClock(unittest.TestCase):
         run2 = resume_soak_run(self.permit)
         self.assertEqual(run2["run_id"], "soak-run-001")
         self.assertEqual(run2["started_at"], started_at)
-        self.assertGreaterEqual(len(run2["segments"]), 2)
+        self.assertEqual(run2['segments'], run1['segments'])
 
-    def test_compute_duration_measures_monotonic_time(self) -> None:
+    def test_compute_duration_rejects_summed_different_boots(self) -> None:
         run = open_soak_run(self.permit)
         # Mock 2 segments: segment 1 ran 100s, segment 2 ran 200s
         run["segments"] = [
@@ -88,8 +88,18 @@ class TestSoakRunClock(unittest.TestCase):
             {"boot_id": "boot-2", "start_mono": 500.0, "end_mono": 700.0},
         ]
         duration_info = compute_run_duration(run)
-        self.assertTrue(duration_info["continuity_ok"])
-        self.assertAlmostEqual(duration_info["monotonic_seconds"], 300.0, places=1)
+        self.assertFalse(duration_info['continuity_ok'])
+        self.assertEqual(duration_info['monotonic_seconds'], 0.)
+
+    def test_compute_duration_measures_actual_elapsed_single_process(self):
+        run = open_soak_run(self.permit)
+        time.sleep(.1)
+        checkpoint_soak_run(self.disposable_runtime, run)
+        duration = compute_run_duration(run)
+        self.assertTrue(duration['continuity_ok'])
+        self.assertGreaterEqual(duration['monotonic_seconds'], .05)
+        # Windows monotonic ticks may have a 15.6 ms resolution.
+        self.assertLess(abs(duration['wall_seconds'] - duration['monotonic_seconds']), .03)
 
     def test_discontinuity_flags_failure(self) -> None:
         run = open_soak_run(self.permit)

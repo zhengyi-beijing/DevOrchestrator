@@ -1,0 +1,15 @@
+........F                                                                [100%]
+================================== FAILURES ===================================
+_______ LiveContractTests.test_start_requires_existing_owned_execution ________
+
+self = <test_p20_4_live_contract.LiveContractTests testMethod=test_start_requires_existing_owned_execution>
+
+    def test_start_requires_existing_owned_execution(self):
+>       result = self.fixture.executor.start_and_bind_soak('missing', str(self.fixture.permit_path))
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'TransitionExecutor' object has no attribute 'start_and_bind_soak'
+
+tests_py\test_p20_4_live_contract.py:24: AttributeError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_4_live_contract.py::LiveContractTests::test_start_requires_existing_owned_execution
+1 failed, 8 passed in 0.47s

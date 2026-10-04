@@ -1,0 +1,46 @@
+FF                                                                       [100%]
+================================== FAILURES ===================================
+___ LiveContractTests.test_labels_and_unobserved_zero_counts_do_not_qualify ___
+
+self = <test_p20_4_live_contract.LiveContractTests testMethod=test_labels_and_unobserved_zero_counts_do_not_qualify>
+
+    def test_labels_and_unobserved_zero_counts_do_not_qualify(self):
+        permit = self.fixture.permit
+        state = open_soak_run(permit)
+        state['completed_tasks'] = [f'T{i}' for i in range(1, 6)]
+        state['task_evidence'] = {}
+        state['fault_dispositions'] = {
+            fault.fault_id: {'disposition': 'automatic_recovery'} for fault in SOAK_FAULTS
+        }
+        state['cpf_convergences'] = {f'CPF-{i:02d}': 'unproved' for i in range(1, 11)}
+        state['hard_zeros'] = {key: 0 for key in (
+            'manual_continue', 'lifecycle_repair', 'duplicate_worker', 'duplicate_job',
+            'duplicate_handoff', 'duplicate_successor', 'wrong_task_execution',
+            'lifecycle_invariant_escape', 'silent_stall', 'infinite_retry', 'restart_regression',
+        )}
+        duration = {'continuity_ok': True, 'monotonic_seconds': 21601.,
+                    'wall_seconds': 21601., 'segments': [], 'discontinuity_reason': None}
+        with patch('dev_orchestrator.soak.qualification.load_soak_run', return_value=state), \
+             patch('dev_orchestrator.soak.qualification.compute_run_duration', return_value=duration):
+            report = evaluate_soak_qualification(self.fixture.canonical_runtime, permit)
+>       self.assertNotEqual(report['verdict'], 'ACCEPT')
+E       AssertionError: 'ACCEPT' == 'ACCEPT'
+
+tests_py\test_p20_4_live_contract.py:46: AssertionError
+____ LiveContractTests.test_missing_permit_and_nonexistent_job_cannot_bind ____
+
+self = <test_p20_4_live_contract.LiveContractTests testMethod=test_missing_permit_and_nonexistent_job_cannot_bind>
+
+    def test_missing_permit_and_nonexistent_job_cannot_bind(self):
+        result = self.fixture.executor.bind_external_execution('req-p20-4-001', {
+            'binding_kind': 'p20_soak_run', 'job_id': 'nonexistent-job',
+            'soak_run_id': 'unproved-run', 'terminally_satisfied': True,
+        })
+>       self.assertNotEqual(result.get('status'), 'bound')
+E       AssertionError: 'bound' == 'bound'
+
+tests_py\test_p20_4_live_contract.py:25: AssertionError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_4_live_contract.py::LiveContractTests::test_labels_and_unobserved_zero_counts_do_not_qualify
+FAILED tests_py/test_p20_4_live_contract.py::LiveContractTests::test_missing_permit_and_nonexistent_job_cannot_bind
+2 failed in 0.30s

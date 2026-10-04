@@ -15,7 +15,7 @@ import shutil
 import tempfile
 from pathlib import Path
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from dev_orchestrator.core.transition_executor import TransitionExecutor
 from dev_orchestrator.soak.permit import create_soak_permit, save_soak_permit
@@ -28,6 +28,8 @@ class TestExternalExecutionBinding(unittest.TestCase):
         self.canonical_runtime = self.canonical_repo / "runtime"
         self.canonical_repo.mkdir(parents=True, exist_ok=True)
         self.canonical_runtime.mkdir(parents=True, exist_ok=True)
+        import subprocess
+        subprocess.run(['git', 'init', str(self.canonical_repo)], check=True, capture_output=True)
 
         self.disposable_dir = self.temp_dir / "disposable_project"
         self.disposable_repo = self.disposable_dir / "repo"
@@ -79,6 +81,21 @@ class TestExternalExecutionBinding(unittest.TestCase):
         ledger_path.write_text(json.dumps(initial_ledger), encoding="utf-8")
         self.executor = TransitionExecutor(self.canonical_runtime)
 
+    def bind_with_observed_fixture(self, binding_data):
+        # Deterministic unit seam for verified live facts; no live acceptance claim.
+        data = self.executor.state()
+        data['executions']['req-p20-4-001'].update(state='running', repo_path=str(self.canonical_repo),
+            branch='main', head='fixture-head', source_request_id='req-p20-4-001')
+        self.executor._save_ledger(data)
+        facts = {'supervisor_pid': 12345, 'supervisor_start_token': 'fixture-token',
+            'supervisor_create_time': 1., 'child_pid': 12346, 'child_create_time': 2.,
+            'soak_started_at': '2026-10-04T08:00:00Z', 'heartbeat_at': '2026-10-04T08:00:01Z'}
+        truth = MagicMock(valid=True, dirty=False, branch='main', head='fixture-head')
+        with patch('dev_orchestrator.soak.binding.observe_owned_job', return_value=(facts, None)), \
+             patch('dev_orchestrator.core.transition_executor.read_repository_truth', return_value=truth), \
+             patch('dev_orchestrator.core.repository.is_git_ancestor', return_value=True):
+            return self.executor.bind_external_execution('req-p20-4-001', binding_data)
+
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
@@ -94,7 +111,7 @@ class TestExternalExecutionBinding(unittest.TestCase):
             "permit_path": str(self.permit_path),
             "permit_fingerprint": self.permit.fingerprint,
         }
-        res = self.executor.bind_external_execution("req-p20-4-001", binding_data)
+        res = self.bind_with_observed_fixture(binding_data)
         self.assertEqual(res["status"], "bound")
 
         # Verify query
@@ -136,7 +153,7 @@ class TestExternalExecutionBinding(unittest.TestCase):
             "permit_path": str(self.permit_path),
             "permit_fingerprint": self.permit.fingerprint,
         }
-        self.executor.bind_external_execution("req-p20-4-001", binding_data)
+        self.assertEqual(self.bind_with_observed_fixture(binding_data)['status'], 'bound')
 
         # Simulate broker worker thread completion
         fake_result = MagicMock()

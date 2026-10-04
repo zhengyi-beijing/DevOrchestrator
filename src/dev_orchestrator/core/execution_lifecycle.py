@@ -540,6 +540,19 @@ def resolve_execution_liveness(
         "state": ledger_state,
         "source_request_id": source_request_id,
     })
+    external_wait = isinstance(exec_row, dict) and bool(
+        exec_row.get('external_execution_binding') or exec_row.get('external_execution_preparation'))
+    if external_wait and exec_row.get('external_execution_binding'):
+        runtime_root = kwargs.get('runtime_root') or getattr(executor, 'runtime_root', None)
+        facts, refusal = None, 'external_runtime_identity_unavailable'
+        if runtime_root is not None:
+            from dev_orchestrator.soak.binding import observe_owned_job
+            facts, refusal = observe_owned_job(runtime_root, exec_row, exec_row['external_execution_binding'])
+        probes.append({'probe': 'owned_external_job', 'timestamp': now_iso,
+                       'status': 'alive' if facts is not None else 'unknown', 'reason': refusal})
+        if facts is not None:
+            has_live_proof = True
+            live_reasons.append('exact owned external job process generation and fresh heartbeat')
 
     # Probe 2: Exact broker request status
     engine = lineage_record.get("engine") or (exec_row.get("engine") if isinstance(exec_row, dict) else None)
@@ -687,6 +700,9 @@ def resolve_execution_liveness(
     if has_live_proof:
         verdict = LIVENESS_ALIVE
         reason = "; ".join(live_reasons)
+    elif external_wait:
+        verdict = LIVENESS_UNKNOWN
+        reason = 'external job/preparation evidence is unresolved; binding reconciler owns the fail-closed gate'
     elif conclusive_death_proof and not has_live_proof:
         verdict = LIVENESS_DEAD
         reason = "; ".join(death_reasons)
@@ -940,6 +956,7 @@ def observe_executions(
                 # Probe liveness without early exit
                 liveness = resolve_execution_liveness(
                     lrec,
+                    runtime_root=runtime,
                     snapshot=snapshot,
                     executor_state=executor_state,
                     ai_execution_port=ai_execution_port,

@@ -1,0 +1,36 @@
+..FF                                                                     [100%]
+================================== FAILURES ===================================
+__ LiveContractTests.test_permit_canonical_identity_cannot_be_self_declared ___
+
+self = <test_p20_4_live_contract.LiveContractTests testMethod=test_permit_canonical_identity_cannot_be_self_declared>
+
+    def test_permit_canonical_identity_cannot_be_self_declared(self):
+        permit = self.fixture.permit
+        permit.canonical_runtime_root = str(self.fixture.temp_dir / 'unrelated-runtime')
+        permit.fingerprint = permit_fingerprint(permit)
+        ok, _ = validate_soak_permit(permit, self.fixture.canonical_repo, self.fixture.canonical_runtime)
+>       self.assertFalse(ok)
+E       AssertionError: True is not false
+
+tests_py\test_p20_4_live_contract.py:54: AssertionError
+_ LiveContractTests.test_permit_identifiers_cannot_escape_evidence_directory __
+
+self = <test_p20_4_live_contract.LiveContractTests testMethod=test_permit_identifiers_cannot_escape_evidence_directory>
+
+    def test_permit_identifiers_cannot_escape_evidence_directory(self):
+        permit = self.fixture.permit
+        permit.run_id = '../escape'
+        permit.fingerprint = permit_fingerprint(permit)
+        # A matching untrusted marker cannot make a traversal-bearing identifier safe.
+        import json
+        (self.fixture.disposable_repo / '.devorch-disposable-soak').write_text(
+            json.dumps({'run_id': permit.run_id, 'project_id': permit.soak_project_id}), encoding='utf-8')
+        ok, _ = validate_soak_permit(permit, self.fixture.canonical_repo, self.fixture.canonical_runtime)
+>       self.assertFalse(ok)
+E       AssertionError: True is not false
+
+tests_py\test_p20_4_live_contract.py:65: AssertionError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_4_live_contract.py::LiveContractTests::test_permit_canonical_identity_cannot_be_self_declared
+FAILED tests_py/test_p20_4_live_contract.py::LiveContractTests::test_permit_identifiers_cannot_escape_evidence_directory
+2 failed, 2 passed in 0.33s

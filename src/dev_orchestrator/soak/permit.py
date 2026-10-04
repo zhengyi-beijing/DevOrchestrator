@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -123,6 +124,7 @@ def validate_soak_permit(
     permit: SoakPermit | None,
     canonical_repo_path: Path | str,
     canonical_runtime_root: Path | str,
+    *, require_marker: bool = True,
 ) -> tuple[bool, str | None]:
     """Fail-closed validation of soak permit and path isolation."""
     if permit is None:
@@ -133,9 +135,21 @@ def validate_soak_permit(
         return False, "unsupported_schema_version"
     if permit.permit_source != "local_cli":
         return False, "invalid_permit_source"
+    if any(not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,96}', value)
+           for value in (permit.run_id, permit.soak_project_id)):
+        return False, 'invalid_run_or_project_identifier'
+    if permit.disposable_marker_name != DEFAULT_DISPOSABLE_MARKER:
+        return False, 'invalid_marker_name'
+    from dev_orchestrator.jobs.config import canonical_path, is_path_contained
+    if (canonical_path(permit.canonical_repo_path) != canonical_path(canonical_repo_path)
+            or canonical_path(permit.canonical_runtime_root) != canonical_path(canonical_runtime_root)):
+        return False, 'canonical_identity_mismatch'
 
     # Fingerprint check
-    expected_fp = permit_fingerprint(permit)
+    try:
+        expected_fp = permit_fingerprint(permit)
+    except (TypeError, ValueError, OSError):
+        return False, 'malformed_permit_fields'
     if permit.fingerprint != expected_fp:
         return False, "fingerprint_mismatch"
 
@@ -147,6 +161,12 @@ def validate_soak_permit(
         disp_rt = Path(permit.disposable_runtime_root).resolve()
     except Exception as exc:
         return False, f"path_resolution_error: {exc}"
+    for protected in (can_repo, can_rt):
+        for disposable in (disp_repo, disp_rt):
+            if is_path_contained(protected, disposable) or is_path_contained(disposable, protected):
+                return False, 'canonical_overlap'
+    if not require_marker:
+        return True, None
 
     # Path traversal / containment / overlap checks
     # Windows paths are case-insensitive

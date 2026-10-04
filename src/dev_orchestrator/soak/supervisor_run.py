@@ -1,147 +1,86 @@
-"""P20.4 Detached Durable Soak Supervisor Entry Point."""
-from __future__ import annotations
-
-import argparse
-import os
+"""Original-process durable observer of real AI tasks and isolated fault effects."""
 from pathlib import Path
+import os
 import sys
 import time
-from typing import Any, Optional
-
-from dev_orchestrator.soak.faults import (
-    SOAK_FAULTS,
-    plan_fault_schedule,
-    reserve_fault_injection,
-    record_fault_disposition,
-)
-from dev_orchestrator.soak.permit import (
-    SoakPermit,
-    load_soak_permit,
-    soak_enabled,
-    validate_soak_permit,
-)
-from dev_orchestrator.soak.timeline import (
-    append_soak_event,
-    checkpoint_soak_run,
-    compute_run_duration,
-    open_soak_run,
-    resume_soak_run,
-)
-from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now_iso, write_json
+from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
+from dev_orchestrator.soak.timeline import open_soak_run, load_soak_run, checkpoint_soak_run, append_soak_event, compute_run_duration
+from dev_orchestrator.soak.evidence import accepted_tasks, primary_active, measured_metrics
+from dev_orchestrator.storage.json_store import read_json, utc_now_iso
 
 
-def run_soak_supervisor(
-    permit_path: Path | str,
-    canonical_repo: Path | str | None = None,
-    canonical_runtime: Path | str | None = None,
-    poll_interval: float = 5.0,
-    max_duration_seconds: float = 21700.0,
-) -> int:
-    """Run the detached soak supervisor loop.
-
-    Read-only against lifecycle ledgers; drives disposable soak project and faults.
-    """
+def run_soak_supervisor(permit_path, canonical_repo=None, canonical_runtime=None,
+                        poll_interval=5., max_duration_seconds=43200.):
     permit = load_soak_permit(permit_path)
-    if not soak_enabled(permit):
-        sys.stderr.write(f"Soak permit at {permit_path} is invalid or disabled.\n")
+    if permit is None:
         return 1
-
-    can_repo = Path(canonical_repo or permit.canonical_repo_path)
-    can_rt = Path(canonical_runtime or permit.canonical_runtime_root)
-    ok, reason = validate_soak_permit(permit, can_repo, can_rt)
+    ok, reason = validate_soak_permit(permit, canonical_repo or permit.canonical_repo_path,
+                                    canonical_runtime or permit.canonical_runtime_root)
     if not ok:
-        sys.stderr.write(f"Permit validation failed: {reason}\n")
+        sys.stderr.write('permit refused: ' + str(reason))
         return 1
-
-    run_state = resume_soak_run(permit)
-    disp_rt = Path(permit.disposable_runtime_root)
-
-    append_soak_event(disp_rt, permit.run_id, {
-        "event_class": "supervisor_started",
-        "pid": os.getpid(),
-    })
-
-    schedule = plan_fault_schedule(run_state)
-    fault_idx = 0
-
+    runtime = Path(permit.disposable_runtime_root)
+    if load_soak_run(runtime, permit.run_id) is not None:
+        sys.stderr.write('An original run exists. Replacement supervisors cannot reset or accumulate clocks.')
+        return 2
+    manifest = read_json(runtime / 'soak-project-manifest.json', {})
+    from dev_orchestrator.control.command_store import ControlCommandStore
+    initial = ControlCommandStore(runtime).get(manifest.get('initial_control_id') or 'missing')
+    active = primary_active(permit)
+    if not initial or initial.get('state') != 'accepted' or not active:
+        sys.stderr.write('Primary real-AI pipeline has not started normally.')
+        return 3
+    state = open_soak_run(permit)
+    from dev_orchestrator.incidents.reliability_runs import open_reliability_run
+    state['reliability_run_id'] = open_reliability_run(runtime, permit.soak_project_id,
+                                                    opener_source='p20_durable_supervisor')['run_id']
+    state['source_revision'] = read_repository_head(permit.canonical_repo_path)
+    state['pending_faults'] = list(permit.allowed_fault_ids)
+    state['supervisor_create_time'] = __import__('psutil').Process(os.getpid()).create_time()
+    append_soak_event(runtime, permit.run_id, {'event_class': 'real_pipeline_observed', **active})
     try:
+        from dev_orchestrator.soak.evidence import start_cpf_verification, cpf_proofs
+        state['cpf_job_id'] = start_cpf_verification(permit, state['source_revision'])
+        from dev_orchestrator.soak.live_faults import LiveFaultDriver
+        faults = LiveFaultDriver(permit, permit_path)
         while True:
-            # Check duration
-            checkpoint_soak_run(disp_rt, run_state)
-            dur_info = compute_run_duration(run_state)
-
-            if not dur_info["continuity_ok"]:
-                append_soak_event(disp_rt, permit.run_id, {
-                    "event_class": "continuity_failure",
-                    "reason": dur_info.get("discontinuity_reason"),
-                })
-                return 2
-
-            elapsed = dur_info.get("monotonic_seconds") or 0.0
-            if elapsed >= max_duration_seconds:
-                append_soak_event(disp_rt, permit.run_id, {
-                    "event_class": "duration_gate_met",
-                    "elapsed": elapsed,
-                })
-                break
-
-            # Process scheduled faults deterministically if needed
-            if fault_idx < len(schedule):
-                item = schedule[fault_idx]
-                f_id = item["fault_id"]
-                inj = reserve_fault_injection(
-                    runtime_root=disp_rt,
-                    run_id=permit.run_id,
-                    fault_id=f_id,
-                    mode="deterministic_test",
-                    target={"disposable_path": str(disp_rt / "probe")},
-                    pre_state={"status": "scheduled"},
-                )
-                record_fault_disposition(
-                    runtime_root=disp_rt,
-                    injection_id=inj["injection_id"],
-                    incident_id=f"inc-soak-{f_id.lower()}",
-                    failure_family=f"family-{f_id.lower()}",
-                    recovery_strategy="RETRY_SAME_STRATEGY",
-                    recovery_result="recovered",
-                    recovery_latency=1.0,
-                    owner_gate_id=None,
-                    disposition=item["expected_disposition"],
-                )
-                run_state.setdefault("fault_dispositions", {})[f_id] = {
-                    "disposition": item["expected_disposition"],
-                    "mode": "deterministic_test",
-                }
-                fault_idx += 1
-
+            state['current_execution'] = primary_active(permit)
+            proof = accepted_tasks(permit)
+            for task, evidence in proof.items():
+                if task not in state['task_evidence']:
+                    append_soak_event(runtime, permit.run_id, {'event_class': 'task_accepted', 'task_id': task, **evidence})
+            state['task_evidence'], state['completed_tasks'] = proof, list(proof)
+            state['fault_dispositions'], state['pending_faults'] = faults.advance()
+            state['cpf_convergences'] = cpf_proofs(permit, state)
+            values, coverage, telemetry = measured_metrics(permit, state)
+            state['hard_zeros'].update(values)
+            state['metric_coverage'].update(coverage)
+            state['reliability_telemetry'] = telemetry
+            checkpoint_soak_run(runtime, state)
+            duration = compute_run_duration(state)
+            if not duration['continuity_ok']:
+                state.update(status='FAILED', ended_at=utc_now_iso(), failure_reason=duration['discontinuity_reason'])
+                checkpoint_soak_run(runtime, state)
+                return 4
+            if duration['monotonic_seconds'] >= 21600.:
+                from dev_orchestrator.soak.qualification import evaluate_soak_qualification
+                report = evaluate_soak_qualification(permit.canonical_runtime_root, permit)
+                if report['verdict'] == 'ACCEPT':
+                    state.update(status='QUALIFIED', ended_at=utc_now_iso(), qualification=report)
+                    checkpoint_soak_run(runtime, state)
+                    return 0
+            if duration['monotonic_seconds'] >= max_duration_seconds:
+                state.update(status='FAILED', ended_at=utc_now_iso(), failure_reason='bounded qualification deadline exhausted')
+                checkpoint_soak_run(runtime, state)
+                return 5
             time.sleep(poll_interval)
-
-    except KeyboardInterrupt:
-        append_soak_event(disp_rt, permit.run_id, {
-            "event_class": "supervisor_interrupted",
-            "pid": os.getpid(),
-        })
-        checkpoint_soak_run(disp_rt, run_state)
-        return 130
     except Exception as exc:
-        append_soak_event(disp_rt, permit.run_id, {
-            "event_class": "supervisor_exception",
-            "error": str(exc),
-            "pid": os.getpid(),
-        })
-        checkpoint_soak_run(disp_rt, run_state)
+        state.update(status='FAILED', ended_at=utc_now_iso(), failure_reason=type(exc).__name__)
+        append_soak_event(runtime, permit.run_id, {'event_class': 'supervisor_failed', 'error_type': type(exc).__name__})
+        checkpoint_soak_run(runtime, state)
         return 1
 
-    checkpoint_soak_run(disp_rt, run_state)
-    return 0
 
-
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="P20.4 Soak Supervisor")
-    parser.add_argument("--permit", required=True, help="Path to soak permit JSON")
-    args = parser.parse_args(argv)
-    return run_soak_supervisor(args.permit)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+def read_repository_head(repo):
+    from dev_orchestrator.core.repository import read_repository_truth
+    return read_repository_truth(repo).head

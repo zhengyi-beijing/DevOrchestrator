@@ -720,7 +720,7 @@ def collect_progress_signals(
                             try:
                                 hb_data = read_json(hb_file, None)
                                 if isinstance(hb_data, dict):
-                                    hb_ts = hb_data.get("timestamp") or hb_data.get("observed_at")
+                                    hb_ts = hb_data.get('reported_at') or hb_data.get("timestamp") or hb_data.get("observed_at")
                             except Exception:
                                 pass
                         ts = (
@@ -738,6 +738,17 @@ def collect_progress_signals(
                                 }
                                 latest_job_timestamp = _latest_timestamp_value((latest_job_timestamp, ts))
 
+    # Only a verified job bound to this active Worker may extend an external wait.
+    executor_state = read_json(Path(runtime_root) / 'transition-executor.json', {}) if runtime_root is not None else None
+    if runtime_root is not None and isinstance(executor_state, dict):
+        for row in executor_state.get('executions', {}).values():
+            if (row.get('project_id') != project_id or row.get('state') not in {'running', 'launching'}
+                    or not isinstance(row.get('external_execution_binding'), dict)):
+                continue
+            from dev_orchestrator.soak.binding import observe_owned_job
+            facts, _ = observe_owned_job(runtime_root, row, row['external_execution_binding'])
+            if facts is not None:
+                latest_job_timestamp = _latest_timestamp_value((latest_job_timestamp, facts['heartbeat_at']))
     # Determine latest durable progress timestamp
     last_progress_at = _latest_timestamp_value((safe_last_activity, latest_role_timestamp, latest_progress_timestamp, latest_job_timestamp))
 

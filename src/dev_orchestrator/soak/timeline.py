@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import time
+import math
 from typing import Any, Optional
 
 from dev_orchestrator.soak.permit import SoakPermit
@@ -25,6 +26,11 @@ def open_soak_run(permit: SoakPermit) -> dict[str, Any]:
     """Open a new soak run and create initial state and timeline log."""
     rt = Path(permit.disposable_runtime_root)
     rt.mkdir(parents=True, exist_ok=True)
+    existing = load_soak_run(rt, permit.run_id)
+    if existing is not None:
+        if existing.get('run_id') != permit.run_id or existing.get('project_id') != permit.soak_project_id:
+            raise ValueError('existing run identity mismatch')
+        return existing
 
     boot_id = _current_boot_id()
     now_mono = time.monotonic()
@@ -36,6 +42,7 @@ def open_soak_run(permit: SoakPermit) -> dict[str, Any]:
         "started_at": now_iso,
         "updated_at": now_iso,
         "supervisor_pid": os.getpid(),
+        "status": "RUNNING",
         "segments": [
             {
                 "boot_id": boot_id,
@@ -62,6 +69,8 @@ def open_soak_run(permit: SoakPermit) -> dict[str, Any]:
             "restart_regression": 0,
         },
     }
+    run_state['hard_zeros'] = {key: None for key in run_state['hard_zeros']}
+    run_state['metric_coverage'] = {}
 
     checkpoint_soak_run(rt, run_state)
     append_soak_event(rt, permit.run_id, {
@@ -78,30 +87,9 @@ def resume_soak_run(permit: SoakPermit) -> dict[str, Any]:
     run_file = rt / f"run-{permit.run_id}.json"
     existing = read_json(run_file, None)
     if not isinstance(existing, dict):
-        return open_soak_run(permit)
-
-    boot_id = _current_boot_id()
-    now_mono = time.monotonic()
-    now_iso = utc_now_iso()
-
-    segments = list(existing.get("segments") or [])
-    segments.append({
-        "boot_id": boot_id,
-        "start_mono": now_mono,
-        "end_mono": now_mono,
-        "resumed_at": now_iso,
-    })
-
-    existing["segments"] = segments
-    existing["supervisor_pid"] = os.getpid()
-    existing["updated_at"] = now_iso
-
-    checkpoint_soak_run(rt, existing)
-    append_soak_event(rt, permit.run_id, {
-        "event_class": "run_resumed",
-        "run_id": permit.run_id,
-        "supervisor_pid": os.getpid(),
-    })
+        raise ValueError('run has not started; resume cannot start or reset a run')
+    if existing.get('run_id') != permit.run_id or existing.get('project_id') != permit.soak_project_id:
+        raise ValueError('run identity mismatch')
     return existing
 
 
@@ -111,26 +99,35 @@ def append_soak_event(runtime_root: Path | str, run_id: str, event: dict[str, An
     rt.mkdir(parents=True, exist_ok=True)
     timeline_file = rt / "timeline.jsonl"
 
-    row = dict(event)
+    from dev_orchestrator.incidents.sanitize import sanitize_incident_payload
+    row = sanitize_incident_payload(dict(event))
     row.setdefault("run_id", run_id)
     row.setdefault("timestamp", utc_now_iso())
     row.setdefault("monotonic", time.monotonic())
 
     line = json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n"
-    with open(timeline_file, "a", encoding="utf-8") as f:
-        f.write(line)
+    from dev_orchestrator.accounting.events import InterProcessFileLock
+    with InterProcessFileLock(rt / 'soak-timeline.lock'):
+        if timeline_file.exists() and timeline_file.stat().st_size > 64 * 1024 * 1024:
+            raise ValueError('bounded soak timeline capacity exhausted')
+        with open(timeline_file, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
     return row
 
 
 def checkpoint_soak_run(
     runtime_root: Path | str,
     run_state: dict[str, Any],
-    update_monotonic: bool = False,
+    update_monotonic: bool = True,
 ) -> dict[str, Any]:
     """Atomically checkpoint the current run state."""
     rt = Path(runtime_root)
     rt.mkdir(parents=True, exist_ok=True)
     run_id = str(run_state.get("run_id") or "")
+    if run_state.get('supervisor_pid') != os.getpid():
+        raise ValueError('only the original supervisor may checkpoint its run')
     run_file = rt / f"run-{run_id}.json"
 
     if update_monotonic:
@@ -161,7 +158,7 @@ def compute_run_duration(run_state: dict[str, Any]) -> dict[str, Any]:
     started_dt = parse_utc(started_at_str)
     wall_seconds = 0.0
     if started_dt is not None:
-        now_dt = utc_now()
+        now_dt = parse_utc(run_state.get('updated_at')) or started_dt
         wall_seconds = max(0.0, (now_dt - started_dt).total_seconds())
 
     segments = run_state.get("segments") or []
@@ -177,6 +174,9 @@ def compute_run_duration(run_state: dict[str, Any]) -> dict[str, Any]:
             "continuity_ok": False,
             "discontinuity_reason": "no_segments_found",
         }
+    if len(segments) != 1:
+        return {'wall_seconds': wall_seconds, 'monotonic_seconds': 0., 'segments': segments,
+                'continuity_ok': False, 'discontinuity_reason': 'multiple_discontinuous_segments'}
 
     for idx, seg in enumerate(segments):
         if not isinstance(seg, dict):
@@ -189,11 +189,24 @@ def compute_run_duration(run_state: dict[str, Any]) -> dict[str, Any]:
             continuity_ok = False
             discontinuity_reason = f"missing_monotonic_in_segment_{idx}"
             break
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                   for v in (s_mono, e_mono)):
+            continuity_ok = False
+            discontinuity_reason = 'invalid_monotonic_value'
+            break
         if e_mono < s_mono:
             continuity_ok = False
             discontinuity_reason = f"monotonic_went_backwards_in_segment_{idx}"
             break
+        if seg.get('boot_id') != _current_boot_id():
+            continuity_ok = False
+            discontinuity_reason = 'system_boot_discontinuity'
+            break
         delta = float(e_mono - s_mono)
+        if started_dt is None or abs(delta - wall_seconds) > 10.:
+            continuity_ok = False
+            discontinuity_reason = 'wall_monotonic_discontinuity'
+            break
         monotonic_seconds += delta
 
     return {

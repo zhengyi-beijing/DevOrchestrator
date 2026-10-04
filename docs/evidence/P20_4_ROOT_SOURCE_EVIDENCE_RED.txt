@@ -1,0 +1,28 @@
+........F.                                                               [100%]
+================================== FAILURES ===================================
+_ LiveContractTests.test_self_declared_verification_flags_cannot_replace_source_ledgers _
+
+self = <test_p20_4_live_contract.LiveContractTests testMethod=test_self_declared_verification_flags_cannot_replace_source_ledgers>
+
+    def test_self_declared_verification_flags_cannot_replace_source_ledgers(self):
+        state = open_soak_run(self.fixture.permit)
+        state['completed_tasks'] = [f'SOAK-T{i}' for i in range(1, 6)]
+        state['task_evidence'] = {task: {'planner_id': 'invented-plan', 'worker_source_request_id': 'invented-worker',
+            'review_id': 'invented-review', 'commit': 'invented-commit', 'worker_provider': 'a',
+            'reviewer_provider': 'b', 'ledger_verified': True} for task in state['completed_tasks']}
+        state['fault_dispositions'] = {fault.fault_id: {'injection_id': 'invented-injection',
+            'incident_id': 'invented-incident', 'failure_family': 'invented-family',
+            'evidence_verified': True, 'mode': 'live_injection', 'disposition': 'automatic_recovery'} for fault in SOAK_FAULTS}
+        state['cpf_convergences'] = {f'CPF-{i:02d}': 'invented-convergence' for i in range(1, 11)}
+        state['hard_zeros'] = {key: 0 for key in state['hard_zeros']}
+        state['metric_coverage'] = {key: {'coverage': 'full', 'source': 'invented-source'} for key in state['hard_zeros']}
+        duration = {'continuity_ok': True, 'monotonic_seconds': 21601., 'wall_seconds': 21601.}
+        with patch('dev_orchestrator.soak.qualification.load_soak_run', return_value=state), \
+             patch('dev_orchestrator.soak.qualification.compute_run_duration', return_value=duration):
+>           self.assertNotEqual(evaluate_soak_qualification(self.fixture.canonical_runtime, self.fixture.permit)['verdict'], 'ACCEPT')
+E           AssertionError: 'ACCEPT' == 'ACCEPT'
+
+tests_py\test_p20_4_live_contract.py:90: AssertionError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_4_live_contract.py::LiveContractTests::test_self_declared_verification_flags_cannot_replace_source_ledgers
+1 failed, 9 passed in 0.91s

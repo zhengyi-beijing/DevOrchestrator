@@ -1,0 +1,25 @@
+F                                                                        [100%]
+================================== FAILURES ===================================
+_____ test_generated_tasks_use_native_identity_and_real_ai_configuration ______
+
+    def test_generated_tasks_use_native_identity_and_real_ai_configuration():
+        with tempfile.TemporaryDirectory(prefix='p20-template-native-') as temporary:
+            root = Path(temporary)
+            canonical = root / 'canonical'
+            canonical.mkdir()
+            permit = create_soak_permit('native-contract', 'native-project', root / 'repo', root / 'runtime',
+                                        canonical, canonical / 'runtime')
+            manifest = generate_soak_project(permit)
+            config = load_projects_config(manifest['config_path'])
+            assert config['projects'][0]['execution']['engine'] == 'aibroker'
+            assert config['projects'][0]['ai_roles']['planner']['enabled'] is True
+            for task in manifest['task_ids']:
+                title = (root / 'repo/agent/staged' / (task + '.md')).read_text(encoding='utf-8').splitlines()[0]
+>               assert extract_task_id(title) == task
+E               AssertionError: assert None == 'SOAK-T1'
+E                +  where None = extract_task_id('# SOAK-T1 ¡ª Add label normalization')
+
+tests_py\test_p20_4_template_live.py:23: AssertionError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_4_template_live.py::test_generated_tasks_use_native_identity_and_real_ai_configuration
+1 failed in 0.60s

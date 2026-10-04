@@ -569,6 +569,11 @@ def _run_orchestration_tick(
         projected = _attach_actuation_errors(projected, project_errors)
         if actuation_error is None:
             actuation_error = _first_actuation_error(project_errors)
+    try:
+        from dev_orchestrator.incidents.observations import record_post_tick_observations
+        record_post_tick_observations(runtime, projected, executor)
+    except Exception as exc:
+        projected['_post_tick_observation_error'] = type(exc).__name__
     return _persist_tick_projection(
         projected, runtime, pid=pid,
         actuation_error=actuation_error,

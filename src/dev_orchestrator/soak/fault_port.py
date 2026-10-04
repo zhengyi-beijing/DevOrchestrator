@@ -1,0 +1,122 @@
+"""Explicit local disposable-only fault boundary around the real execution port."""
+from dataclasses import replace
+from pathlib import Path
+import threading
+import time
+from dev_orchestrator.storage.json_store import read_json, write_json, utc_now_iso
+from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
+from dev_orchestrator.soak.faults import reserve_fault_injection, assert_target_disposable
+
+
+def wrap_fault_port(port, runtime_root):
+    runtime = Path(runtime_root).resolve()
+    envelope = read_json(runtime / 'p20-local-fault.json', None)
+    if envelope is None:
+        return port
+    permit = load_soak_permit((envelope or {}).get('permit_path') or '')
+    from dev_orchestrator.config import REPO_ROOT
+    parent = load_soak_permit((envelope or {}).get('parent_permit_path') or '')
+    if (permit is None or parent is None or Path(permit.disposable_runtime_root).resolve() != runtime
+            or envelope.get('fault_id') not in permit.allowed_fault_ids
+            or envelope.get('fault_id') not in parent.allowed_fault_ids
+            or Path(parent.canonical_repo_path).resolve() != REPO_ROOT.resolve()):
+        raise ValueError('disposable fault permit identity unproved')
+    for candidate in (permit, parent):
+        ok, reason = validate_soak_permit(candidate, REPO_ROOT, parent.canonical_runtime_root)
+        if not ok:
+            raise ValueError('fault permit refused: ' + str(reason))
+    if not runtime.is_relative_to(Path(parent.disposable_runtime_root).resolve() / 'fault-cases'):
+        raise ValueError('case runtime outside parent disposable ownership')
+    return FaultPort(port, permit, envelope['fault_id'])
+
+
+class FaultPort:
+    def __init__(self, port, permit, fault_id):
+        self.port, self.permit, self.fault_id = port, permit, fault_id
+        self.lock = threading.Lock()
+        self.effect_path = Path(permit.disposable_runtime_root) / 'fault-effect.json'
+
+    def __getattr__(self, name):
+        return getattr(self.port, name)
+
+    def execute(self, request):
+        # Preserve real execution routing and independent-resource selection for all ordinary calls.
+        fid = self.fault_id
+        role = 'worker' if fid.startswith('F03') else 'reviewer' if fid.startswith(('F04', 'F14')) else 'planner'
+        if request.project_id != self.permit.soak_project_id or request.role != role:
+            return self.port.execute(request)
+        if fid.startswith('F14') and request.stage_run_id != 'review':
+            return self.port.execute(request)
+        if Path(request.working_directory).resolve() != Path(self.permit.disposable_repo_path).resolve():
+            raise ValueError('fault request repository differs from owned case')
+        with self.lock:
+            previous = read_json(self.effect_path, {})
+            maximum = 4 if fid.startswith('F15') else 1
+            attempt = int(previous.get('attempt', 0))
+            if attempt >= maximum or fid[:3] not in {'F01', 'F02', 'F03', 'F04', 'F05', 'F06', 'F07', 'F14', 'F15'}:
+                return self.port.execute(request)
+            target = {'path': self.permit.disposable_runtime_root, 'request_id': request.request_id}
+            assert_target_disposable(self.permit, target)
+            intent = reserve_fault_injection(self.permit.disposable_runtime_root, self.permit.run_id,
+                fid, 'live_injection', target, {'role': request.role, 'request_id': request.request_id})
+            effect = {'fault_id': fid, 'attempt': attempt + 1, 'injection_id': intent['injection_id'],
+                'request_id': request.request_id, 'role': request.role, 'reserved_at': utc_now_iso(),
+                'effect_mode': 'injected_execution_boundary', 'state': 'reserved'}
+            write_json(self.effect_path, effect)
+        if fid.startswith('F07'):
+            # Actual call fails at the local transport boundary; the production Broker stays untouched.
+            effect.update(state='injected', injected_at=utc_now_iso(), effect_mode='injected_transport_boundary')
+            write_json(self.effect_path, effect)
+            from dev_orchestrator.ai.aibroker_subprocess import AIBrokerInvocationError
+            raise AIBrokerInvocationError('P20 isolated injected AIBroker transport unavailable')
+        if fid.startswith('F03'):
+            def interrupt_owned():
+                until = time.monotonic() + 60
+                while time.monotonic() < until:
+                    fact = self.port.status(request.request_id)
+                    if isinstance(fact, dict) and fact.get('request_id') == request.request_id and fact.get('status') == 'running':
+                        result = self.port.interrupt(request.request_id, 'P20 isolated owned Worker killed once')
+                        # Broker's normal managed process-tree interruption API owns target verification.
+                        effect.update(state='injected', injected_at=utc_now_iso(),
+                            effect_mode='owned_broker_worker_interrupt', interrupt_status=(result or {}).get('status'))
+                        write_json(self.effect_path, effect)
+                        return
+                    time.sleep(.5)
+            threading.Thread(target=interrupt_owned, daemon=True).start()
+            return self.port.execute(request)
+        if fid.startswith('F02'):
+            # Real provider dispatch with an explicitly injected short timeout, never a mock clock.
+            result = self.port.execute(replace(request, timeout_seconds=1.))
+            effect.update(state='injected', injected_at=utc_now_iso(), effect_mode='real_dispatch_timeout',
+                dispatch_id=result.dispatch_id, execution_id=result.execution_id)
+            write_json(self.effect_path, effect)
+            return result
+        result = self.port.execute(request)
+        if result.status != 'succeeded':
+            effect.update(state='not_injected', reason='real upstream request failed before injection')
+            write_json(self.effect_path, effect)
+            return result
+        if fid.startswith(('F01', 'F15')):
+            changed = replace(result, output='P20 isolated malformed response: no protocol envelope')
+        elif fid.startswith('F04'):
+            # Parser-visible rejection is injected after a real independent reviewer executed.
+            changed = replace(result, output='{"decision":"reject","reason":"P20 injected rejection: include a regression proving empty normalized labels raise ValueError in the implementation verification plan."}')
+        elif fid.startswith('F05'):
+            changed = replace(result, status='failed', output=None, error='P20 isolated provider quota exhausted',
+                              failure_classification='quota_exhausted')
+        elif fid.startswith('F06'):
+            changed = replace(result, status='failed', output=None, error='P20 isolated provider temporarily unavailable',
+                              failure_classification='provider_temporarily_unavailable')
+        elif fid.startswith('F14'):
+            effect.update(state='triggered', injected_at=utc_now_iso(),
+                effect_mode='injected_transient_technical_review_failure', dispatch_id=result.dispatch_id,
+                execution_id=result.execution_id)
+            write_json(self.effect_path, effect)
+            from dev_orchestrator.ai.aibroker_subprocess import AIBrokerInvocationError
+            raise AIBrokerInvocationError('P20 isolated transient technical review failure before duplicate retry')
+        else:
+            return result
+        effect.update(state='injected', injected_at=utc_now_iso(), dispatch_id=result.dispatch_id,
+                      execution_id=result.execution_id, effect_mode='injected_real_response_boundary')
+        write_json(self.effect_path, effect)
+        return changed

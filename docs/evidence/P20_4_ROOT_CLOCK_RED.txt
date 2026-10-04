@@ -1,0 +1,51 @@
+F....F                                                                   [100%]
+================================== FAILURES ===================================
+_____ LiveContractTests.test_discontinuous_boot_segments_cannot_be_summed _____
+
+self = <test_p20_4_live_contract.LiveContractTests testMethod=test_discontinuous_boot_segments_cannot_be_summed>
+
+    def test_discontinuous_boot_segments_cannot_be_summed(self):
+        state = open_soak_run(self.fixture.permit)
+        state['segments'] = [
+            {'boot_id': 'old-boot', 'start_mono': 0., 'end_mono': 10800.},
+            {'boot_id': 'new-boot', 'start_mono': 0., 'end_mono': 10800.},
+        ]
+>       self.assertFalse(compute_run_duration(state)['continuity_ok'])
+E       AssertionError: True is not false
+
+tests_py\test_p20_4_live_contract.py:81: AssertionError
+___ LiveContractTests.test_resume_is_observation_without_new_clock_segment ____
+
+self = <test_p20_4_live_contract.LiveContractTests testMethod=test_resume_is_observation_without_new_clock_segment>
+
+    def test_resume_is_observation_without_new_clock_segment(self):
+        first = open_soak_run(self.fixture.permit)
+        path = self.fixture.disposable_runtime / ('run-' + self.fixture.permit.run_id + '.json')
+        before = path.read_bytes()
+        resumed = resume_soak_run(self.fixture.permit)
+>       self.assertEqual(resumed['segments'], first['segments'])
+E       AssertionError: Lists differ: [{'bo[124 chars]:00'}, {'boot_id': '1790953908.8104973', 'star[90 chars]00'}] != [{'bo[124 chars]:00'}]
+E       
+E       First list contains 1 additional elements.
+E       First extra element 1:
+E       {'boot_id': '1790953908.8104973', 'start_mono': 151559.984, 'end_mono': 151559.984, 'resumed_at': '2026-10-04T09:17:47.968626+00:00'}
+E       
+E         [{'boot_id': '1790953908.8104973',
+E           'end_mono': 151559.984,
+E           'start_mono': 151559.984,
+E       -   'started_at': '2026-10-04T09:17:47.961625+00:00'},
+E       ?                                                    ^
+E       
+E       +   'started_at': '2026-10-04T09:17:47.961625+00:00'}]
+E       ?                                                    ^
+E       
+E       -  {'boot_id': '1790953908.8104973',
+E       -   'end_mono': 151559.984,
+E       -   'resumed_at': '2026-10-04T09:17:47.968626+00:00',
+E       -   'start_mono': 151559.984}]
+
+tests_py\test_p20_4_live_contract.py:72: AssertionError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_4_live_contract.py::LiveContractTests::test_discontinuous_boot_segments_cannot_be_summed
+FAILED tests_py/test_p20_4_live_contract.py::LiveContractTests::test_resume_is_observation_without_new_clock_segment
+2 failed, 4 passed in 0.37s

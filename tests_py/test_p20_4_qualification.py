@@ -78,7 +78,8 @@ class TestSoakQualification(unittest.TestCase):
         report = evaluate_soak_qualification(self.canonical_runtime, self.permit)
         self.assertEqual(report["verdict"], "FAIL")
         self.assertIn("tasks_gate_failed", report["reasons"])
-        self.assertEqual(report["tasks"]["completed_count"], 2)
+        self.assertEqual(report['tasks']['completed_count'], 0)
+        self.assertEqual(report['tasks']['declared_count'], 2)
 
     def test_qualification_fails_on_clock_discontinuity(self) -> None:
         run = open_soak_run(self.permit)
@@ -92,7 +93,7 @@ class TestSoakQualification(unittest.TestCase):
         self.assertEqual(report["verdict"], "FAIL")
         self.assertIn("clock_discontinuity", report["reasons"])
 
-    def test_qualification_passes_when_all_gates_satisfied(self) -> None:
+    def test_fabricated_labels_and_clock_never_satisfy_live_gates(self) -> None:
         run = open_soak_run(self.permit)
         run["segments"] = [
             {"boot_id": "boot-1", "start_mono": 1000.0, "end_mono": 23000.0},  # 22000s
@@ -131,10 +132,9 @@ class TestSoakQualification(unittest.TestCase):
         checkpoint_soak_run(self.disposable_runtime, run)
 
         report = evaluate_soak_qualification(self.canonical_runtime, self.permit)
-        self.assertEqual(report["verdict"], "ACCEPT")
-        self.assertEqual(len(report["reasons"]), 0)
-        self.assertGreaterEqual(report["duration"]["monotonic_seconds"], 21600.0)
-        self.assertEqual(report["tasks"]["completed_count"], 5)
+        self.assertEqual(report['verdict'], 'FAIL')
+        self.assertIn('clock_discontinuity', report['reasons'])
+        self.assertTrue(any('uncorrelated_task' in reason for reason in report['reasons']))
 
 
 if __name__ == "__main__":

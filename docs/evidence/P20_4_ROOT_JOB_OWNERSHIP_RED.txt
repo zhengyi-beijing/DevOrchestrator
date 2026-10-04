@@ -1,0 +1,24 @@
+...F...                                                                  [100%]
+================================== FAILURES ===================================
+______ LiveContractTests.test_permit_alone_does_not_prove_job_ownership _______
+
+self = <test_p20_4_live_contract.LiveContractTests testMethod=test_permit_alone_does_not_prove_job_ownership>
+
+    def test_permit_alone_does_not_prove_job_ownership(self):
+        data = self.fixture.executor.state()
+        data['executions']['req-p20-4-001']['state'] = 'running'
+        self.fixture.executor._save_ledger(data)  # isolated test fixture only
+        result = self.fixture.executor.bind_external_execution('req-p20-4-001', {
+            'binding_kind': 'p20_soak_run', 'job_id': 'nonexistent-job',
+            'permit_path': str(self.fixture.permit_path),
+            'permit_fingerprint': self.fixture.permit.fingerprint,
+            'soak_run_id': self.fixture.permit.run_id,
+            'soak_project_id': self.fixture.permit.soak_project_id,
+        })
+>       self.assertNotEqual(result.get('status'), 'bound')
+E       AssertionError: 'bound' == 'bound'
+
+tests_py\test_p20_4_live_contract.py:39: AssertionError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_4_live_contract.py::LiveContractTests::test_permit_alone_does_not_prove_job_ownership
+1 failed, 6 passed in 0.39s

@@ -92,7 +92,7 @@ def load_aibroker_execution_port(
         else:
             raise ValueError(f"unsupported transport type: {ttype!r}")
 
-    return AIBrokerExecutionPort(
+    port = AIBrokerExecutionPort(
         AIBrokerClientConfig(
             python_executable=Path(raw["python_executable"]),
             broker_repo=Path(raw["broker_repo"]),
@@ -106,3 +106,6 @@ def load_aibroker_execution_port(
         transport=transport,
         accounting=accounting,
     )
+    # Fault injection is absent by default and cannot be enabled by ordinary remote controls.
+    from dev_orchestrator.soak.fault_port import wrap_fault_port
+    return wrap_fault_port(port, runtime)

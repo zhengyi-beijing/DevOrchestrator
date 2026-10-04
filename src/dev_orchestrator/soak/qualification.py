@@ -42,6 +42,30 @@ def evaluate_soak_qualification(
             "hard_zeros": None,
         }
 
+    valid, refusal = validate_soak_permit(
+        permit, permit.canonical_repo_path, production_runtime_root,
+    )
+    if not valid:
+        reasons.append('permit_invalid: ' + str(refusal))
+    if run_state.get('run_id') != permit.run_id or run_state.get('project_id') != permit.soak_project_id:
+        reasons.append('run_identity_mismatch')
+    from dev_orchestrator.soak.evidence import accepted_tasks, observed_faults, measured_metrics, cpf_proofs
+    declared_tasks = list(run_state.get('completed_tasks') or [])
+    try:
+        actual_tasks = accepted_tasks(permit)
+        actual_faults = observed_faults(permit, run_state)
+        values, coverage, _ = measured_metrics(permit, run_state)
+        actual_cpfs = cpf_proofs(permit, run_state)
+    except (OSError, ValueError, TypeError, KeyError):
+        actual_tasks, actual_faults, values, coverage, actual_cpfs = {}, {}, {}, {}, {}
+        reasons.append('source_evidence_unavailable_or_corrupt')
+    for task in declared_tasks:
+        if task not in actual_tasks:
+            reasons.append('uncorrelated_task: ' + str(task))
+    run_state = {**run_state, 'completed_tasks': list(actual_tasks), 'task_evidence': actual_tasks,
+                 'fault_dispositions': actual_faults, 'hard_zeros': values,
+                 'metric_coverage': coverage, 'cpf_convergences': actual_cpfs}
+
     # 1. Duration & Clock Continuity Gate
     duration_info = compute_run_duration(run_state)
     if not duration_info["continuity_ok"]:
@@ -60,6 +84,17 @@ def evaluate_soak_qualification(
         reasons.append("tasks_gate_failed")
 
     task_evidence = run_state.get("task_evidence") or {}
+    if len(set(completed_tasks)) != task_count:
+        reasons.append('duplicate_task_labels')
+    for task in completed_tasks:
+        evidence = task_evidence.get(task)
+        if not isinstance(evidence, dict) or not all(evidence.get(key) for key in (
+            'planner_id', 'worker_source_request_id', 'review_id', 'commit',
+            'worker_provider', 'reviewer_provider', 'ledger_verified',
+        )):
+            reasons.append('uncorrelated_task: ' + str(task))
+        elif evidence['worker_provider'] == evidence['reviewer_provider']:
+            reasons.append('reviewer_not_independent: ' + str(task))
 
     # 3. Fault Dispositions Gate (15/15)
     fault_disps = run_state.get("fault_dispositions") or {}
@@ -69,11 +104,19 @@ def evaluate_soak_qualification(
     missing_faults = []
     for f in SOAK_FAULTS:
         # Check by full id or short id
-        short_id = f.fault_id.split("_")[0]
-        if f.fault_id not in recorded_fault_keys and short_id not in recorded_fault_keys:
+        if f.fault_id not in recorded_fault_keys:
             missing_faults.append(f.fault_id)
     if missing_faults:
         reasons.append(f"missing_fault_dispositions: {sorted(missing_faults)}")
+    for fault_id, evidence in fault_disps.items():
+        if not isinstance(evidence, dict) or not all(evidence.get(key) for key in (
+            'injection_id', 'incident_id', 'failure_family', 'evidence_verified',
+        )):
+            reasons.append('uncorrelated_fault: ' + str(fault_id))
+        elif evidence.get('disposition') not in {'automatic_recovery', 'owner_gate'}:
+            reasons.append('invalid_fault_disposition: ' + str(fault_id))
+        elif evidence.get('mode') != 'live_injection':
+            reasons.append('fault_not_injected_during_run: ' + str(fault_id))
 
     # 4. CPF Scenarios Gate (10/10)
     cpf_convergences = run_state.get("cpf_convergences") or {}
@@ -96,11 +139,16 @@ def evaluate_soak_qualification(
         "silent_stall",
         "infinite_retry",
         "restart_regression",
+        'fabricated_successor',
+        'lost_lifecycle_authority',
     ]
     for zk in expected_zero_keys:
         val = hard_zeros.get(zk)
         if val is None or val != 0:
             reasons.append(f"hard_zero_breach: {zk}={val}")
+        coverage = (run_state.get('metric_coverage') or {}).get(zk)
+        if not isinstance(coverage, dict) or str(coverage.get('coverage')).upper() != 'FULL' or not coverage.get('source'):
+            reasons.append('hard_zero_coverage_unknown: ' + zk)
 
     verdict = "ACCEPT" if not reasons else "FAIL"
 
@@ -112,6 +160,7 @@ def evaluate_soak_qualification(
             "completed_count": task_count,
             "completed_tasks": completed_tasks,
             "evidence": task_evidence,
+            'declared_count': len(declared_tasks),
         },
         "faults": {
             "dispositions_count": len(fault_disps),

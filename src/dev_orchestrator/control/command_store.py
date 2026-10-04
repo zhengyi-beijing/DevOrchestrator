@@ -18,6 +18,7 @@ CONTROL_ACTIONS = frozenset({
     "approve_owner_gate", "bind_conversation", "unbind_conversation",
     "rebind_conversation",
 })
+LOCAL_CONTROL_ACTIONS = frozenset({'soak_bind'})
 EXPECTED_IDENTITY_FIELDS = (
     "revision", "project_id", "repo_path", "branch", "head", "dirty",
     "status_hash", "task_id", "lifecycle_state", "gate_id", "paused",
@@ -52,7 +53,7 @@ def _nonblank(value: Any, name: str) -> str:
     return value.strip()
 
 
-def canonical_request(value: dict[str, Any]) -> dict[str, Any]:
+def canonical_request(value: dict[str, Any], *, local: bool = False) -> dict[str, Any]:
     allowed = {"schema_version", "command_id", "project_id", "action", "expected", "target"}
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -66,7 +67,7 @@ def canonical_request(value: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(target, dict):
         raise ValueError("target must be an object")
     action = _nonblank(value.get("action"), "action")
-    if action not in CONTROL_ACTIONS:
+    if action not in CONTROL_ACTIONS and not (local and action in LOCAL_CONTROL_ACTIONS):
         raise ValueError("unsupported control action")
     expected_allowed = set(EXPECTED_IDENTITY_FIELDS) | set(EXPECTED_OPTIONAL_FIELDS)
     expected_unknown = sorted(set(expected) - expected_allowed)
@@ -83,6 +84,7 @@ def canonical_request(value: dict[str, Any]) -> dict[str, Any]:
         "bind_conversation": {"adapter", "binding_id"},
         "unbind_conversation": set(),
         "rebind_conversation": {"adapter", "binding_id"},
+        'soak_bind': {'permit_path', 'source_request_id'},
     }[action]
     target_unknown = sorted(set(target) - target_allowed)
     if target_unknown:
@@ -97,8 +99,8 @@ def canonical_request(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def request_hash(value: dict[str, Any]) -> str:
-    raw = json.dumps(canonical_request(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+def request_hash(value: dict[str, Any], *, local: bool = False) -> str:
+    raw = json.dumps(canonical_request(value, local=local), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -131,17 +133,18 @@ class ControlCommandStore:
         if isinstance(stored, str) and stored:
             return stored
         try:
-            return request_hash(value)
+            return request_hash(value, local=value.get('source') == 'p20_local_cli')
         except ValueError:
             return None
 
     def submit(self, value: dict[str, Any], *, source: str) -> dict[str, Any]:
         normalized_source = _nonblank(source, "source")
-        canonical = canonical_request(value)
+        local = normalized_source == 'p20_local_cli'
+        canonical = canonical_request(value, local=local)
         command_id = safe_command_id(canonical["command_id"])
         if command_id is None:
             raise ValueError("invalid command_id")
-        digest = request_hash(canonical)
+        digest = request_hash(canonical, local=local)
         with InterProcessFileLock(self.lock_path):
             existing = self._read_existing(command_id)
             if existing is not None:

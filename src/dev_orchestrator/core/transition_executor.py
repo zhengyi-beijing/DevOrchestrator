@@ -693,6 +693,13 @@ class TransitionExecutor:
             for record in ledger["executions"].values():
                 if record.get("state") not in _ACTIVE_STATES:
                     continue
+                if record.get('external_execution_binding') or record.get('external_execution_preparation'):
+                    # The durable job owns completion. Broker foreground completion is insufficient.
+                    record['state'] = 'running'
+                    record['wait_type'] = 'external_durable_job'
+                    record['recovered_at'] = utc_now_iso()
+                    changed = True
+                    continue
                 recovered_at = utc_now_iso()
                 fact = None
                 broker_request_id = record.get("broker_request_id")
@@ -1142,6 +1149,11 @@ class TransitionExecutor:
             telemetry["task_id"] = authority.get("current_task_id")
             snapshot["telemetry"] = telemetry
             snapshot["authoritative_lifecycle"] = copy.deepcopy(authority)
+            owner = authority.get('active_owner') or {}
+            current_execution = ledger.get('executions', {}).get(owner.get('id'), {})
+            if current_execution.get('external_execution_binding') or current_execution.get('external_execution_preparation'):
+                snapshot['wait_type'] = 'external_durable_job'
+                snapshot['deadline_at'] = current_execution.get('deadline_at') or (current_execution.get('external_execution_preparation') or {}).get('deadline_at')
             state = str(authority.get("lifecycle_state") or "UNKNOWN")
             snapshot["lifecycle_state"] = state
             if state == "EXECUTING":
@@ -1811,6 +1823,13 @@ class TransitionExecutor:
         failure_environment = environment_for_project(project)
         policy_role = "remediator" if source_kind == "remediation" else "worker"
         effective_worker_prompt = inject_workflow_policy(worker_prompt, policy_role)
+        if project.get('project_id') == 'devorchestrator' and task_id == 'P20.4':
+            from dev_orchestrator.soak.bootstrap import prepared_bootstrap, bootstrap_prompt
+            prepared = prepared_bootstrap(self.runtime_root, project.get('repo_path'), head)
+            if prepared is not None:
+                effective_worker_prompt = inject_workflow_policy(
+                    bootstrap_prompt(prepared, source_request_id, self.runtime_root), policy_role,
+                )
         if context_block:
             effective_worker_prompt += "\n\n" + context_block
         if self.failure_memory is not None:
@@ -2354,6 +2373,14 @@ class TransitionExecutor:
                 **({"replayed_from_block": replayed_from_block} if replayed_from_block is not None else {}),
                 **(copy.deepcopy(lineage) if lineage else {}),
             }
+            if project_id == 'devorchestrator' and task_id == 'P20.4':
+                from dev_orchestrator.soak.bootstrap import prepared_bootstrap
+                prepared = prepared_bootstrap(self.runtime_root, project['repo_path'], head)
+                if prepared is not None:
+                    from datetime import timedelta
+                    ledger['executions'][source_request_id]['external_execution_preparation'] = {
+                        **prepared, 'deadline_at': (utc_now() + timedelta(seconds=180)).isoformat(),
+                    }
             authority = ledger["lifecycle"].get(project_id)
             if isinstance(authority, dict):
                 authority["active_owner"] = {
@@ -2740,15 +2767,16 @@ class TransitionExecutor:
         if failed_resource_ids:
             extra_record["failover_from_resource_ids"] = sorted(failed_resource_ids)
 
-        ext_binding = self.external_binding_for(source_request_id)
-        is_bound_wait = False
-        if ext_binding and not ext_binding.get("terminally_satisfied"):
-            if state == "completed":
-                state = "running"
-                is_bound_wait = True
-                extra_record["wait_type"] = "external_durable_job"
-                from datetime import timedelta
-                extra_record["deadline_at"] = (utc_now() + timedelta(seconds=86400)).isoformat()
+        record = self.state().get('executions', {}).get(source_request_id, {})
+        ext_binding = record.get('external_execution_binding')
+        preparation = record.get('external_execution_preparation')
+        is_bound_wait = bool(ext_binding or preparation)
+        if is_bound_wait:
+            state = 'running'
+            extra_record['wait_type'] = 'external_durable_job'
+            extra_record['deadline_at'] = (ext_binding or preparation).get('deadline_at')
+        if resource_payload is None:
+            resource_payload = record.get('resource_context')
 
         req_id = getattr(current_request, "request_id", None) or getattr(request, "request_id", None) or getattr(request, "broker_request_id", None)
         self._update_record(
@@ -2846,6 +2874,59 @@ class TransitionExecutor:
         except Exception:
             pass
 
+    def start_and_bind_soak(self, source_request_id: str, permit_path: str) -> dict[str, Any]:
+        """Local inbox only: one existing Worker, one reserved idempotent durable job."""
+        from dev_orchestrator.soak.bootstrap import prepared_bootstrap
+        from dev_orchestrator.soak.permit import load_soak_permit
+        from dev_orchestrator.jobs.models import JobSpec
+        from dev_orchestrator.jobs.service import JobService
+        from dev_orchestrator.soak.binding import observe_owned_job
+        import time
+        with self._lock:
+            ledger = self._load_ledger()
+            record = ledger['executions'].get(source_request_id)
+            if not isinstance(record, dict):
+                return {'status': 'rejected', 'reason': 'execution_not_found'}
+            authority = ledger.get('lifecycle', {}).get(record.get('project_id'), {})
+            if (record.get('task_id') != 'P20.4' or record.get('project_id') != 'devorchestrator'
+                    or record.get('state') not in _ACTIVE_STATES or authority.get('owner_gate')
+                    or (authority.get('active_owner') or {}).get('id') != source_request_id):
+                return {'status': 'rejected', 'reason': 'active_p20_worker_ownership_required'}
+            truth = read_repository_truth(record.get('repo_path') or '')
+            prepared = prepared_bootstrap(self.runtime_root, record.get('repo_path'), truth.head)
+            permit = load_soak_permit(permit_path or '')
+            if (not prepared or not permit or truth.dirty or truth.head != record.get('head')
+                    or prepared.get('permit_fingerprint') != permit.fingerprint):
+                return {'status': 'rejected', 'reason': 'clean_prepared_permit_required'}
+            existing = record.get('external_execution_binding')
+            if existing:
+                if existing.get('permit_fingerprint') == permit.fingerprint:
+                    return {'status': 'bound', 'job_id': existing['job_id'], 'source_request_id': source_request_id}
+                return {'status': 'rejected', 'reason': 'execution_already_bound'}
+            spec = JobSpec(project_id=record['project_id'], task_id='P20.4', kind='soak',
+                source_request_id=source_request_id, command_ref='p20_soak_supervisor',
+                idempotency_key=f'soak:{permit.run_id}:{source_request_id}',
+                parameters_digest=permit.fingerprint)
+            from dev_orchestrator.jobs.models import job_id_for
+            record['external_execution_start_intent'] = {'job_id': job_id_for(spec),
+                'run_id': permit.run_id, 'permit_fingerprint': permit.fingerprint,
+                'reserved_at': utc_now_iso()}
+            self._save_ledger(ledger)
+            try:
+                job = JobService(self.runtime_root).submit(spec)
+                binding = {'binding_kind': 'p20_soak_run', 'job_id': job.job_id,
+                    'permit_path': str(Path(permit_path).resolve()), 'permit_fingerprint': permit.fingerprint,
+                    'soak_run_id': permit.run_id, 'soak_project_id': permit.soak_project_id}
+                until = time.monotonic() + 25
+                while time.monotonic() < until:
+                    facts, reason = observe_owned_job(self.runtime_root, record, binding)
+                    if facts is not None:
+                        return self.bind_external_execution(source_request_id, binding)
+                    time.sleep(.5)
+                return {'status': 'pending', 'job_id': job.job_id, 'reason': reason}
+            except Exception as exc:
+                return {'status': 'rejected', 'reason': 'owned_job_start_failed: ' + type(exc).__name__}
+
     def bind_external_execution(self, source_request_id: str, binding: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             ledger = self._load_ledger()
@@ -2862,21 +2943,47 @@ class TransitionExecutor:
             curr_task = str(authority.get("current_task_id") or "")
             if curr_task != task_id:
                 return {"status": "rejected", "reason": "task_mismatch"}
+            if task_id != 'P20.4' or binding.get('binding_kind') != 'p20_soak_run':
+                return {"status": "rejected", "reason": "unsupported_external_binding"}
+            if record.get('state') not in {'running', 'launching'}:
+                return {"status": "rejected", "reason": "execution_not_active"}
+            if binding.get('terminally_satisfied'):
+                return {"status": "rejected", "reason": "caller_cannot_assert_terminal_evidence"}
 
             active_owner = authority.get("active_owner")
             if not isinstance(active_owner, dict) or active_owner.get("id") != source_request_id:
                 return {"status": "rejected", "reason": "owner_mismatch"}
 
             permit_path = binding.get("permit_path")
+            if not permit_path:
+                return {"status": "rejected", "reason": "local_permit_required"}
             if permit_path:
                 from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
                 permit = load_soak_permit(permit_path)
-                can_repo = self.runtime_root.parent
+                can_repo = record.get('repo_path') or ''
                 ok, reason = validate_soak_permit(permit, can_repo, self.runtime_root)
                 if not ok:
                     return {"status": "rejected", "reason": f"permit_invalid: {reason}"}
 
+            from dev_orchestrator.soak.binding import observe_owned_job
+            facts, refusal = observe_owned_job(self.runtime_root, record, binding)
+            if facts is None:
+                return {'status': 'rejected', 'reason': refusal}
+            from dev_orchestrator.core.repository import is_git_ancestor
+            truth = read_repository_truth(record.get('repo_path') or '')
+            if (not truth.valid or truth.dirty or truth.branch != record.get('branch')
+                    or not is_git_ancestor(record['repo_path'], record.get('head') or '', truth.head)):
+                return {'status': 'rejected', 'reason': 'clean_descendant_repository_required'}
+            binding = {**binding, **{key: facts[key] for key in (
+                'supervisor_pid', 'supervisor_start_token', 'supervisor_create_time',
+                'child_pid', 'child_create_time', 'soak_started_at',
+            )}, 'last_live_heartbeat_at': facts['heartbeat_at']}
+
             record["external_execution_binding"] = dict(binding)
+            from datetime import timedelta
+            binding['deadline_at'] = (parse_utc(facts['soak_started_at']) + timedelta(seconds=43200)).isoformat()
+            record['external_execution_binding'] = dict(binding)
+            record['deadline_at'] = binding['deadline_at']
             record["wait_type"] = "external_durable_job"
             self._save_ledger(ledger)
             return {"status": "bound", "source_request_id": source_request_id}
@@ -2900,49 +3007,68 @@ class TransitionExecutor:
                 if record.get("state") not in _ACTIVE_STATES:
                     continue
                 ext_bind = record.get("external_execution_binding")
-                if not isinstance(ext_bind, dict):
+                preparation = record.get('external_execution_preparation')
+                if not isinstance(ext_bind, dict) and not isinstance(preparation, dict):
                     continue
-
-                job_id = ext_bind.get("job_id")
-                if not job_id:
-                    continue
-
                 reconciled += 1
-                job_rec = None
-                try:
-                    from dev_orchestrator.jobs.service import JobService
-                    js = JobService(self.runtime_root)
-                    job_rec = js.status(job_id)
-                except Exception:
-                    job_rec = None
-
-                if job_rec is not None:
-                    expected_token = ext_bind.get("supervisor_start_token")
-                    actual_token = getattr(job_rec, "start_token", None) or (job_rec.heartbeat.get("start_token") if hasattr(job_rec, "heartbeat") and isinstance(job_rec.heartbeat, dict) else None)
-                    if expected_token and actual_token and expected_token != actual_token:
-                        record["state"] = "failed"
-                        record["reason"] = "supervisor_start_token_mismatch"
-                        changed = True
+                if not isinstance(ext_bind, dict):
+                    intent = record.get('external_execution_start_intent')
+                    if intent:
+                        result = self.start_and_bind_soak(req_id, preparation.get('permit_path'))
+                        if result.get('status') == 'bound':
+                            changed = True
+                            continue
+                    deadline = parse_utc(preparation.get('deadline_at'))
+                    if deadline and utc_now() < deadline:
                         continue
-
-                    if job_rec.state in ("completed", "failed", "cancelled"):
-                        permit_path = ext_bind.get("permit_path")
-                        from dev_orchestrator.soak.permit import load_soak_permit
+                    refusal = 'bounded_soak_preparation_deadline_expired; inspect the reserved job; no automatic duplicate launch'
+                else:
+                    from dev_orchestrator.soak.binding import observe_owned_job
+                    facts, refusal = observe_owned_job(self.runtime_root, record, ext_bind, require_live=False)
+                    deadline = parse_utc(ext_bind.get('deadline_at'))
+                    if facts is not None and facts['job_state'] in {'queued', 'running'} and deadline and utc_now() < deadline:
+                        self._update_record(req_id, external_execution_binding={**ext_bind,
+                            'last_live_heartbeat_at': facts['heartbeat_at']})
+                        continue
+                    if facts is not None and facts['job_state'] == 'completed':
                         from dev_orchestrator.soak.qualification import evaluate_soak_qualification
-                        permit = load_soak_permit(permit_path) if permit_path else None
-                        report = evaluate_soak_qualification(self.runtime_root, permit) if permit else {"verdict": "FAIL"}
-                        if report.get("verdict") == "ACCEPT":
-                            ext_bind["terminally_satisfied"] = True
-                            record["state"] = "completed"
-                            record["completed_at"] = utc_now_iso()
-                        else:
-                            record["state"] = "failed"
-                            record["reason"] = f"soak_qualification_failed: {report.get('reasons')}"
-                        changed = True
-
-            if changed:
-                self._save_ledger(ledger)
+                        report = evaluate_soak_qualification(self.runtime_root, facts['permit'])
+                        if report.get('verdict') == 'ACCEPT':
+                            self._update_record(req_id, state='completed', completed_at=utc_now_iso(),
+                                external_execution_binding={**ext_bind, 'terminally_satisfied': True})
+                            close_lineage_record(self.runtime_root, record['project_id'], req_id,
+                                terminal_outcome='completed', completed_at=utc_now_iso())
+                            from dev_orchestrator.core.execution_context import record_role_completion, set_next_action
+                            record_role_completion(self.runtime_root, record['project_id'], 'worker',
+                                {'task_id': record['task_id'], 'state': 'completed'})
+                            set_next_action(self.runtime_root, record['project_id'], 'technical_review', disposition='advance')
+                            if self._progress_channel is not None:
+                                self._progress_channel.emit({'project_id': record['project_id']}, 'WORKER_DONE',
+                                    task_id=record['task_id'], occurrence_key=req_id,
+                                    details={'status': 'verified_soak_completed'})
+                            changed = True
+                            continue
+                        refusal = 'soak_qualification_failed: ' + str(report.get('reasons'))
+                    elif facts is not None:
+                        refusal = 'owned_soak_job_terminal_or_deadline_expired: ' + facts['job_state']
+                self._gate_external_execution(req_id, str(refusal))
+                changed = True
             return {"reconciled_count": reconciled, "changed": changed}
+
+    def _gate_external_execution(self, source_request_id, reason):
+        """Durable authority gate, never a relaunch authorization."""
+        with self._lock:
+            ledger = self._load_ledger()
+            record = ledger['executions'][source_request_id]
+            record.update(state='recovery_required', reason=reason, recovery_safe_retry=False)
+            authority = ledger['lifecycle'][record['project_id']]
+            authority.update(lifecycle_state='OWNER_GATE', active_owner=None,
+                owner_gate={'gate_id': 'soak-' + source_request_id, 'code': 'SOAK_EVIDENCE_UNRESOLVED',
+                    'task_id': record['task_id'], 'reason': reason,
+                    'required_owner_decision': 'Inspect the same reserved job and original run; explicitly authorize recovery. Never reset clocks or launch a duplicate.',
+                    'created_at': utc_now_iso()})
+            self._save_ledger(ledger)
+            write_execution_status(copy.deepcopy(record), self.runtime_root)
 
     def reconcile_historical_repository_lineage(
         self,
@@ -3589,6 +3715,8 @@ class TransitionExecutor:
 
             row = executions.get(source_request_id)
             anchor = dict(expected_anchor or {})
+            if isinstance(row, dict) and (row.get('external_execution_binding') or row.get('external_execution_preparation')):
+                return {'status': 'unavailable', 'reason': 'external binding reconciler owns completion and recovery'}
 
             # Case 1: Row disappeared from executor ledger
             if row is None:
