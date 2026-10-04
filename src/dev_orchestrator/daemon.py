@@ -206,6 +206,14 @@ def _run_orchestration_tick(
     planner_obj = getattr(controls, "planner", None) if controls is not None else None
     planner_state_fn = getattr(planner_obj, "state", None)
     reviewer_state_fn = getattr(reviewer, "state", None) if reviewer is not None else None
+    reconcile_external_bindings = getattr(executor, "reconcile_external_execution_bindings", None)
+    if callable(reconcile_external_bindings):
+        try:
+            reconcile_external_bindings()
+        except Exception as _ext_exc:
+            actuation_error = _record_contained_tick_fault(
+                executor, _ext_exc, phase="external_execution_bindings",
+            )
     reconcile_authority = getattr(executor, "reconcile_lifecycle_authority", None)
     overlay_authority = getattr(executor, "overlay_lifecycle_authority", None)
     if callable(reconcile_authority):

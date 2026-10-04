@@ -2170,6 +2170,157 @@ def _display_url(address: str, port: int) -> str:
 # parser
 # --------------------------------------------------------------------------
 
+
+
+def cmd_soak_permit_create(args: argparse.Namespace) -> int:
+    from dev_orchestrator.soak.permit import create_soak_permit, save_soak_permit
+    rt = resolve_runtime_root(args.runtime_root)
+    permit = create_soak_permit(
+        run_id=args.run_id,
+        soak_project_id=args.project_id,
+        disposable_repo_path=args.disposable_repo,
+        disposable_runtime_root=args.disposable_runtime,
+        canonical_repo_path=REPO_ROOT,
+        canonical_runtime_root=rt,
+        allowed_fault_ids=args.allowed_faults.split(",") if args.allowed_faults else [],
+    )
+    out_path = Path(args.out) if args.out else Path(args.disposable_runtime) / "soak-permit.json"
+    save_soak_permit(out_path, permit)
+    print(json.dumps(permit.to_dict(), indent=2))
+    return 0
+
+
+def cmd_soak_permit_show(args: argparse.Namespace) -> int:
+    from dev_orchestrator.soak.permit import load_soak_permit
+    permit = load_soak_permit(args.permit)
+    if not permit:
+        sys.stderr.write(f"Permit at {args.permit} not found or invalid.\n")
+        return 1
+    print(json.dumps(permit.to_dict(), indent=2))
+    return 0
+
+
+def cmd_soak_init(args: argparse.Namespace) -> int:
+    from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
+    from dev_orchestrator.soak.template import generate_soak_project
+    permit = load_soak_permit(args.permit)
+    if not permit:
+        sys.stderr.write(f"Permit at {args.permit} not found or invalid.\n")
+        return 1
+    rt = resolve_runtime_root(args.runtime_root)
+    ok, reason = validate_soak_permit(permit, REPO_ROOT, rt)
+    if not ok:
+        sys.stderr.write(f"Permit validation failed: {reason}\n")
+        return 1
+    res = generate_soak_project(permit)
+    print(json.dumps(res, indent=2))
+    return 0
+
+
+def cmd_soak_start(args: argparse.Namespace) -> int:
+    from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
+    from dev_orchestrator.soak.timeline import open_soak_run
+    from dev_orchestrator.jobs.service import JobService
+    from dev_orchestrator.jobs.models import JobSpec
+    permit = load_soak_permit(args.permit)
+    if not permit:
+        sys.stderr.write(f"Permit at {args.permit} not found or invalid.\n")
+        return 1
+    rt = resolve_runtime_root(args.runtime_root)
+    ok, reason = validate_soak_permit(permit, REPO_ROOT, rt)
+    if not ok:
+        sys.stderr.write(f"Permit validation failed: {reason}\n")
+        return 1
+    run_state = open_soak_run(permit)
+    js = JobService(rt)
+    spec = JobSpec(
+        project_id="devorchestrator",
+        command_ref="p20_soak_supervisor",
+        idempotency_key=f"soak-sup-{permit.run_id}",
+        metadata={"parameters": {"permit_path": str(Path(args.permit).resolve())}},
+    )
+    job_rec = js.submit(spec)
+    out = {
+        "status": "started",
+        "run_id": permit.run_id,
+        "supervisor_job_id": job_rec.job_id,
+        "run_state": run_state,
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_soak_status(args: argparse.Namespace) -> int:
+    from dev_orchestrator.soak.permit import load_soak_permit
+    from dev_orchestrator.soak.timeline import load_soak_run, compute_run_duration
+    permit = load_soak_permit(args.permit)
+    if not permit:
+        sys.stderr.write(f"Permit at {args.permit} not found or invalid.\n")
+        return 1
+    run_state = load_soak_run(permit.disposable_runtime_root, permit.run_id)
+    if not run_state:
+        sys.stderr.write(f"Run state for {permit.run_id} not found.\n")
+        return 1
+    dur = compute_run_duration(run_state)
+    elapsed = dur.get("monotonic_seconds") or 0.0
+    tasks = run_state.get("completed_tasks") or []
+    faults = run_state.get("fault_dispositions") or {}
+    status_out = {
+        "run_id": permit.run_id,
+        "started_at": run_state.get("started_at"),
+        "elapsed_seconds": elapsed,
+        "completed_tasks": tasks,
+        "incidents": list(run_state.get("incidents", {}).keys()) if isinstance(run_state.get("incidents"), dict) else [],
+        "recovery_results": faults,
+        "current_execution": run_state.get("current_execution") or "supervisor_running",
+        "next_scheduled_fault": run_state.get("next_fault") or "none",
+        "resume_command": f"python -m dev_orchestrator soak-resume --permit {args.permit}",
+    }
+    print(json.dumps(status_out, indent=2))
+    return 0
+
+
+def cmd_soak_resume(args: argparse.Namespace) -> int:
+    from dev_orchestrator.soak.permit import load_soak_permit
+    from dev_orchestrator.soak.timeline import resume_soak_run, compute_run_duration
+    permit = load_soak_permit(args.permit)
+    if not permit:
+        sys.stderr.write(f"Permit at {args.permit} not found or invalid.\n")
+        return 1
+    run_state = resume_soak_run(permit)
+    dur = compute_run_duration(run_state)
+    elapsed = dur.get("monotonic_seconds") or 0.0
+    tasks = run_state.get("completed_tasks") or []
+    faults = run_state.get("fault_dispositions") or {}
+    status_out = {
+        "run_id": permit.run_id,
+        "started_at": run_state.get("started_at"),
+        "elapsed_seconds": elapsed,
+        "completed_tasks": tasks,
+        "incidents": list(run_state.get("incidents", {}).keys()) if isinstance(run_state.get("incidents"), dict) else [],
+        "recovery_results": faults,
+        "current_execution": run_state.get("current_execution") or "supervisor_resumed",
+        "next_scheduled_fault": run_state.get("next_fault") or "none",
+        "resume_command": f"python -m dev_orchestrator soak-resume --permit {args.permit}",
+    }
+    print(json.dumps(status_out, indent=2))
+    return 0
+
+
+def cmd_soak_verify(args: argparse.Namespace) -> int:
+    from dev_orchestrator.soak.permit import load_soak_permit
+    from dev_orchestrator.soak.qualification import evaluate_soak_qualification
+    permit = load_soak_permit(args.permit)
+    rt = resolve_runtime_root(args.runtime_root)
+    report = evaluate_soak_qualification(rt, permit)
+    print(json.dumps(report, indent=2))
+    return 0 if report.get("verdict") == "ACCEPT" else 1
+
+
+def cmd_soak_supervise(args: argparse.Namespace) -> int:
+    from dev_orchestrator.soak.supervisor_run import run_soak_supervisor
+    return run_soak_supervisor(args.permit)
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dev_orchestrator",
@@ -2637,10 +2788,54 @@ def build_parser() -> argparse.ArgumentParser:
     websol_probe.add_argument("--config", default=None, help="path to projects.json")
     websol_probe.add_argument("--runtime-root", default=None, help="DevOrchestrator runtime root")
 
+
+    # Soak subcommands (local-only argparse, not exposed to remote/mcp/web)
+    soak_create = sub.add_parser("soak-permit-create", help="create a local soak permit")
+    soak_create.add_argument("--run-id", required=True)
+    soak_create.add_argument("--project-id", required=True)
+    soak_create.add_argument("--disposable-repo", required=True)
+    soak_create.add_argument("--disposable-runtime", required=True)
+    soak_create.add_argument("--allowed-faults", default=None)
+    soak_create.add_argument("--out", default=None)
+    soak_create.add_argument("--runtime-root", default=None)
+
+    soak_show = sub.add_parser("soak-permit-show", help="show local soak permit")
+    soak_show.add_argument("--permit", required=True)
+
+    soak_init = sub.add_parser("soak-init", help="initialize disposable soak project")
+    soak_init.add_argument("--permit", required=True)
+    soak_init.add_argument("--runtime-root", default=None)
+
+    soak_start = sub.add_parser("soak-start", help="start soak run supervisor")
+    soak_start.add_argument("--permit", required=True)
+    soak_start.add_argument("--runtime-root", default=None)
+
+    soak_status = sub.add_parser("soak-status", help="show soak run status")
+    soak_status.add_argument("--permit", required=True)
+
+    soak_resume = sub.add_parser("soak-resume", help="resume soak run")
+    soak_resume.add_argument("--permit", required=True)
+
+    soak_verify = sub.add_parser("soak-verify", help="verify soak qualification")
+    soak_verify.add_argument("--permit", required=True)
+    soak_verify.add_argument("--runtime-root", default=None)
+
+    soak_supervise = sub.add_parser("soak-supervise", help="run detached soak supervisor")
+    soak_supervise.add_argument("--permit", required=True)
+
     return parser
 
 
 _COMMANDS = {
+    "soak-permit-create": cmd_soak_permit_create,
+    "soak-permit-show": cmd_soak_permit_show,
+    "soak-init": cmd_soak_init,
+    "soak-start": cmd_soak_start,
+    "soak-status": cmd_soak_status,
+    "soak-resume": cmd_soak_resume,
+    "soak-verify": cmd_soak_verify,
+    "soak-supervise": cmd_soak_supervise,
+
     "validate-config": cmd_validate_config,
     "project-context": cmd_project_context,
     "project-status": cmd_project_status,

@@ -1,0 +1,42 @@
+P20.4 GREEN Test Evidence - 2026-10-04T08:51:22Z
+Command: python -m pytest tests_py/test_p20_4_permit_isolation.py tests_py/test_p20_4_fault_registry.py tests_py/test_p20_4_external_binding.py tests_py/test_p20_4_run_clock.py tests_py/test_p20_4_cpf_convergence.py tests_py/test_p20_4_qualification.py -v
+
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.6.0 -- C:\Users\yizhe\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+rootdir: C:\work\github\DevOrchestrator-dev
+configfile: pyproject.toml
+collecting ... collected 30 items
+
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_assert_target_disposable_refuses_canonical_targets PASSED [  3%]
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_permit_rejects_canonical_overlap PASSED [  6%]
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_permit_rejects_marker_run_id_mismatch PASSED [ 10%]
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_permit_rejects_missing_marker PASSED [ 13%]
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_permit_rejects_non_local_source PASSED [ 16%]
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_permit_rejects_tampered_fingerprint PASSED [ 20%]
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_permit_rejects_unsupported_schema_version PASSED [ 23%]
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_permit_roundtrip_save_and_load PASSED [ 26%]
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_remote_surfaces_expose_no_soak_or_fault_actions PASSED [ 30%]
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_soak_disabled_by_default_when_permit_absent PASSED [ 33%]
+tests_py/test_p20_4_permit_isolation.py::TestSoakPermitIsolation::test_valid_permit_passes_validation PASSED [ 36%]
+tests_py/test_p20_4_fault_registry.py::TestSoakFaultRegistry::test_cpf_coverage_mapping_complete PASSED [ 40%]
+tests_py/test_p20_4_fault_registry.py::TestSoakFaultRegistry::test_fifteen_faults_registered_with_correct_disposition PASSED [ 43%]
+tests_py/test_p20_4_fault_registry.py::TestSoakFaultRegistry::test_injection_reservation_and_disposition PASSED [ 46%]
+tests_py/test_p20_4_fault_registry.py::TestSoakFaultRegistry::test_secret_sanitization_in_fault_payloads PASSED [ 50%]
+tests_py/test_p20_4_external_binding.py::TestExternalExecutionBinding::test_bind_external_execution_rejects_wrong_task PASSED [ 53%]
+tests_py/test_p20_4_external_binding.py::TestExternalExecutionBinding::test_bind_external_execution_success PASSED [ 56%]
+tests_py/test_p20_4_external_binding.py::TestExternalExecutionBinding::test_worker_completion_fenced_while_binding_active PASSED [ 60%]
+tests_py/test_p20_4_run_clock.py::TestSoakRunClock::test_compute_duration_measures_monotonic_time PASSED [ 63%]
+tests_py/test_p20_4_run_clock.py::TestSoakRunClock::test_discontinuity_flags_failure PASSED [ 66%]
+tests_py/test_p20_4_run_clock.py::TestSoakRunClock::test_open_run_establishes_initial_segment PASSED [ 70%]
+tests_py/test_p20_4_run_clock.py::TestSoakRunClock::test_resume_preserves_started_at_and_appends_segment PASSED [ 73%]
+tests_py/test_p20_4_cpf_convergence.py::TestSoakCPFConvergence::test_cpf_01_stale_predecessor_worker_fenced_from_external_binding PASSED [ 76%]
+tests_py/test_p20_4_cpf_convergence.py::TestSoakCPFConvergence::test_cpf_06_repeated_ticks_under_binding_are_idempotent PASSED [ 80%]
+tests_py/test_p20_4_cpf_convergence.py::TestSoakCPFConvergence::test_cpf_07_crash_after_reserved_intent_does_not_inject_twice PASSED [ 83%]
+tests_py/test_p20_4_cpf_convergence.py::TestSoakCPFConvergence::test_cpf_all_ten_scenarios_exist_in_registry PASSED [ 86%]
+tests_py/test_p20_4_qualification.py::TestSoakQualification::test_qualification_fails_on_clock_discontinuity PASSED [ 90%]
+tests_py/test_p20_4_qualification.py::TestSoakQualification::test_qualification_fails_when_duration_below_21600s PASSED [ 93%]
+tests_py/test_p20_4_qualification.py::TestSoakQualification::test_qualification_fails_when_tasks_under_5 PASSED [ 96%]
+tests_py/test_p20_4_qualification.py::TestSoakQualification::test_qualification_passes_when_all_gates_satisfied PASSED [100%]
+
+============================= 30 passed in 0.73s ==============================

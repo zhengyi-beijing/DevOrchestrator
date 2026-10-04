@@ -1,0 +1,73 @@
+P20.4 RED Test Evidence - 2026-10-04T08:42:35Z
+Command: python -m pytest tests_py/test_p20_4_permit_isolation.py tests_py/test_p20_4_fault_registry.py tests_py/test_p20_4_external_binding.py tests_py/test_p20_4_run_clock.py tests_py/test_p20_4_cpf_convergence.py tests_py/test_p20_4_qualification.py -q
+
+=================================== ERRORS ====================================
+__________ ERROR collecting tests_py/test_p20_4_permit_isolation.py ___________
+ImportError while importing test module 'C:\work\github\DevOrchestrator-dev\tests_py\test_p20_4_permit_isolation.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Users\yizhe\AppData\Local\Programs\Python\Python312\Lib\importlib\__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests_py\test_p20_4_permit_isolation.py:19: in <module>
+    from dev_orchestrator.soak.permit import (
+E   ModuleNotFoundError: No module named 'dev_orchestrator.soak'
+___________ ERROR collecting tests_py/test_p20_4_fault_registry.py ____________
+ImportError while importing test module 'C:\work\github\DevOrchestrator-dev\tests_py\test_p20_4_fault_registry.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Users\yizhe\AppData\Local\Programs\Python\Python312\Lib\importlib\__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests_py\test_p20_4_fault_registry.py:19: in <module>
+    from dev_orchestrator.soak.faults import (
+E   ModuleNotFoundError: No module named 'dev_orchestrator.soak'
+__________ ERROR collecting tests_py/test_p20_4_external_binding.py ___________
+ImportError while importing test module 'C:\work\github\DevOrchestrator-dev\tests_py\test_p20_4_external_binding.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Users\yizhe\AppData\Local\Programs\Python\Python312\Lib\importlib\__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests_py\test_p20_4_external_binding.py:21: in <module>
+    from dev_orchestrator.soak.permit import create_soak_permit, save_soak_permit
+E   ModuleNotFoundError: No module named 'dev_orchestrator.soak'
+______________ ERROR collecting tests_py/test_p20_4_run_clock.py ______________
+ImportError while importing test module 'C:\work\github\DevOrchestrator-dev\tests_py\test_p20_4_run_clock.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Users\yizhe\AppData\Local\Programs\Python\Python312\Lib\importlib\__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests_py\test_p20_4_run_clock.py:19: in <module>
+    from dev_orchestrator.soak.timeline import (
+E   ModuleNotFoundError: No module named 'dev_orchestrator.soak'
+___________ ERROR collecting tests_py/test_p20_4_cpf_convergence.py ___________
+ImportError while importing test module 'C:\work\github\DevOrchestrator-dev\tests_py\test_p20_4_cpf_convergence.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Users\yizhe\AppData\Local\Programs\Python\Python312\Lib\importlib\__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests_py\test_p20_4_cpf_convergence.py:25: in <module>
+    from dev_orchestrator.soak.faults import (
+E   ModuleNotFoundError: No module named 'dev_orchestrator.soak'
+____________ ERROR collecting tests_py/test_p20_4_qualification.py ____________
+ImportError while importing test module 'C:\work\github\DevOrchestrator-dev\tests_py\test_p20_4_qualification.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+C:\Users\yizhe\AppData\Local\Programs\Python\Python312\Lib\importlib\__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests_py\test_p20_4_qualification.py:19: in <module>
+    from dev_orchestrator.soak.qualification import evaluate_soak_qualification
+E   ModuleNotFoundError: No module named 'dev_orchestrator.soak'
+=========================== short test summary info ===========================
+ERROR tests_py/test_p20_4_permit_isolation.py
+ERROR tests_py/test_p20_4_fault_registry.py
+ERROR tests_py/test_p20_4_external_binding.py
+ERROR tests_py/test_p20_4_run_clock.py
+ERROR tests_py/test_p20_4_cpf_convergence.py
+ERROR tests_py/test_p20_4_qualification.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 6 errors during collection !!!!!!!!!!!!!!!!!!!
+6 errors in 0.44s

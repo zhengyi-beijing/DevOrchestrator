@@ -714,8 +714,18 @@ def collect_progress_signals(
                         jid = str(jdata.get("job_id") or "")
                         if jid.startswith("wd-") or jdata.get("source") == "watchdog" or str(jdata.get("command_ref") or "").startswith("wd-"):
                             continue
+                        hb_ts = None
+                        hb_file = Path(runtime_root) / "jobs" / jid / "heartbeat.json"
+                        if hb_file.is_file():
+                            try:
+                                hb_data = read_json(hb_file, None)
+                                if isinstance(hb_data, dict):
+                                    hb_ts = hb_data.get("timestamp") or hb_data.get("observed_at")
+                            except Exception:
+                                pass
                         ts = (
-                            jdata.get("finished_at")
+                            hb_ts
+                            or jdata.get("finished_at")
                             or jdata.get("started_at")
                             or jdata.get("updated_at")
                             or jdata.get("created_at")

@@ -717,6 +717,34 @@ def compute_reliability_telemetry(
                             seen_escape_keys.add(key)
                             escape_count += 1
 
+    obs_file = Path(runtime_root) / "reliability" / "invariant-observations.jsonl"
+    if obs_file.is_file():
+        try:
+            for line in obs_file.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    continue
+                if row.get("project_id") != project_id:
+                    continue
+                rec_at = row.get("recorded_at") or row.get("timestamp")
+                if rec_at and run_started_at and rec_at < run_started_at:
+                    continue
+                if rec_at and run_settled_at and rec_at > run_settled_at:
+                    continue
+                if "escaped_to_authority" in row:
+                    has_escape_evidence_field = True
+                    if row.get("holds") is False and row.get("escaped_to_authority"):
+                        inv_code = str(row.get("invariant_code") or row.get("code") or "unknown")
+                        trans_id = str(row.get("transition_id") or row.get("execution_id") or "none")
+                        key = (inv_code, trans_id)
+                        if key not in seen_escape_keys:
+                            seen_escape_keys.add(key)
+                            escape_count += 1
+        except Exception:
+            pass
+
     if not has_escape_evidence_field:
         escape_coverage = Coverage.UNKNOWN
         escape_reason = "no escape evidence field produced"

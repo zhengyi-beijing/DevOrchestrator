@@ -622,7 +622,11 @@ def evaluate_lifecycle_invariants(
     )
 
 
-def invariant_payload(findings: tuple[InvariantFinding, ...]) -> list[dict[str, Any]]:
+def invariant_payload(
+    findings: tuple[InvariantFinding, ...],
+    escaped_to_authority: bool = False,
+    actuation_observed: bool = False,
+) -> list[dict[str, Any]]:
     return [
         {
             "code": item.code,
@@ -630,6 +634,8 @@ def invariant_payload(findings: tuple[InvariantFinding, ...]) -> list[dict[str, 
             "recoverable": item.recoverable,
             "reason": item.reason,
             "evidence": item.evidence,
+            "escaped_to_authority": False if item.holds else escaped_to_authority,
+            "actuation_observed": actuation_observed,
         }
         for item in findings
     ]

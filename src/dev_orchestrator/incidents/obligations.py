@@ -27,8 +27,19 @@ def resolve_progress_obligation(
     wait_type = snapshot.get("wait_type")
     startup_grace = bool(snapshot.get("startup_grace"))
 
-    # Explicit legal wait conditions
-    is_legal_wait = bool(gate or paused or wait_type or startup_grace)
+    deadline_at = snapshot.get("deadline_at")
+    deadline_expired = False
+    if deadline_at:
+        try:
+            from dev_orchestrator.storage.json_store import parse_utc, utc_now
+            deadline_dt = parse_utc(deadline_at)
+            if deadline_dt and utc_now() > deadline_dt:
+                deadline_expired = True
+        except Exception:
+            pass
+
+    # Explicit legal wait conditions: an expired external wait is NOT legal!
+    is_legal_wait = bool(gate or paused or (wait_type and not deadline_expired) or startup_grace)
 
     if lifecycle == "REVIEWING":
         return {
