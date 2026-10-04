@@ -1,6 +1,11 @@
 # P20.3 Deterministic Recovery & Heterogeneous Escalation Contract
 
-Status: **FROZEN / IMPLEMENTED / TECHNICAL REVIEW PENDING (2026-10-04)**
+Status: **FROZEN / IMPLEMENTED / TECHNICAL REVIEW ACCEPT (2026-10-04)**
+
+Independent ACCEPT at 15abd1a, 2026-10-04T07:35:13Z. All blocking findings below
+are closed; earlier pending labels are historical. Evidence:
+docs/evidence/P20_3_COMMAND_OUTCOME_REVIEW.json. Accepted NON_BLOCKING inputs
+are carried into docs/P20_4_SOAK_IMPLEMENTATION_NOTES.md. No soak evidence yet.
 
 Latest command-outcome delta: planning recovery dedup is paired with inbox and
 history reconciliation. A pending command is an actuated retry, not convergence;

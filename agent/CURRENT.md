@@ -1,4 +1,23 @@
-# P20.3 Planning recovery command-outcome delta (2026-10-04)
+# P20.3 accepted; P20.4 preparation (2026-10-04)
+
+Independent Technical Review accepted clean implementation HEAD 15abd1a at
+2026-10-04T07:35:13Z (decision NEXT). Evidence:
+docs/evidence/P20_3_COMMAND_OUTCOME_REVIEW.json. All bounded blocking findings
+are closed; 273 related tests and 22 subtests pass. Reviewer additionally
+reported 208 adjacent tests and 17 subtests passing. It did not count its still
+running full-directory job as a full-suite PASS; the two known parent failures
+remain documented. No live-soak qualification is claimed.
+
+Runtime released the P20.3 owner and published the P20.4 planning handoff through
+normal coordinators. Root backed up runtime and stopped the daemon at a paused,
+quiescent boundary to load reviewed code before normal P20.4 activation.
+P20.4 and the six-hour soak have not started. Worker/Planner verification notes
+and accepted NON_BLOCKING inputs are in docs/P20_4_SOAK_IMPLEMENTATION_NOTES.md.
+Use the normal reviewed pipeline and retain sole execution authority during the
+external durable job. No push, ledger override, reset or invented successor.
+The sections below are historical.
+
+# Historical P20.3 Planning recovery command-outcome delta (2026-10-04)
 
 Latest state: bounded implementation and regression complete; independent
 descendant Technical Review pending. P20.3 is not accepted; no soak has started.

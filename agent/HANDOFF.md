@@ -1,4 +1,22 @@
-# P20 restoration and design checkpoint (2026-10-04)
+# P20.3 accepted / P20.4 activation checkpoint (2026-10-04)
+
+P20.3 independent ACCEPT at implementation HEAD 15abd1a; normal runtime owner
+released and P20.4 planning handoff published. Acceptance evidence is
+docs/evidence/P20_3_COMMAND_OUTCOME_REVIEW.json. Related regression: 273 tests
+and 22 subtests pass. No soak has started. Owner pause retained for a normal
+quiescent daemon reload into reviewed source before P20.4 activation.
+
+P20.4 Planner/Worker should read docs/P20_4_SOAK_IMPLEMENTATION_NOTES.md together
+with staged direction and owner requirements. It describes actual existing
+entry points, missing durable wait binding, fresh-runtime ordering, telemetry
+coverage and accepted NON_BLOCKING inputs. It is preparation, not acceptance.
+Resume through normal start-daemon/project-control APIs; verify the same
+authoritative successor handoff is consumed once. No raw runtime ledger edits,
+push, P21, production fault injection or clock reset. Do not end this session
+before a real durable P20.4 soak is RUNNING; then record the exact same-run
+checkpoint specified by owner section 18. Historical handoffs follow.
+
+# Historical P20 restoration and design checkpoint (2026-10-04)
 
 P20.1-P20.5 direction: agent/staged/P20.md. Owner contract:
 docs/P20_OWNER_REQUIREMENTS.md. Unique sequence staged from P19.2;
