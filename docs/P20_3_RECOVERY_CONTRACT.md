@@ -2,6 +2,19 @@
 
 Status: **FROZEN / IMPLEMENTED / TECHNICAL REVIEW PENDING (2026-10-04)**
 
+Latest local review delta: an already-consumed semantic budget exceeding a
+lowered configuration terminates in a stable durable owner gate. Recovery
+reservations bind the actual control-command ID before enqueue; restart can
+reconcile publication before settlement without abandoning a live effect.
+The durable Reviewer runner publishes the actual packet request, and Harness
+status correlates Broker-selected reviewer resource with owned spawn identity.
+Timeout cleanup uses only those verified bindings and records an owner gate
+before any relaunch. Graphify cleanup recognizes the actual read-only command.
+265 tests and 22 subtests pass; current evidence is P20_3_FINAL_*.
+The independent ac2cf329 Review returned REMEDIATE, confirming the previous
+seven fixes and requesting these three local corrections. Its evidence and the
+earlier verification below remain historical. Acceptance and soak are pending.
+
 Root bounded remediation supersedes round-2 implementation claims. Default
 semantic remediation is cumulative and capped at two across resource recovery;
 resource recovery preserves the candidate rather than restarting full planning.

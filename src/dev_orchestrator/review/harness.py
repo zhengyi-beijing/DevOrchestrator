@@ -8,7 +8,7 @@ from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 from dev_orchestrator.jobs.models import JobSpec
 from dev_orchestrator.jobs.service import JobService
-from dev_orchestrator.storage.json_store import utc_now_iso
+from dev_orchestrator.storage.json_store import read_json, utc_now_iso
 
 from .models import (
     ReviewCoverage,
@@ -55,6 +55,7 @@ class DefaultReviewerHarness:
         ocr_adapter_factory: Optional[Callable[[Path], OpenCodeReviewAdapter]] = None,
         ocr_executable: Optional[str] = None,
         command_ref: str = "review-runner",
+        execution_port: Any = None,
     ) -> None:
         self.runtime_root = Path(runtime_root).resolve()
         self.session_store = session_store or ReviewSessionStore(self.runtime_root)
@@ -62,6 +63,7 @@ class DefaultReviewerHarness:
         self.ocr_executable = ocr_executable
         self.command_ref = command_ref
         self._ocr_adapter_factory = ocr_adapter_factory
+        self._execution_port = execution_port
 
     def submit(self, request: ReviewRequest) -> ReviewSession:
         """Prepare review manifest and submit as P14 durable job."""
@@ -183,10 +185,40 @@ class DefaultReviewerHarness:
 
         heartbeat = job_rec.heartbeat or {}
         if (heartbeat.get("start_token") == job_rec.supervisor.get("start_token")
+                and isinstance(heartbeat.get("start_token"), str) and heartbeat["start_token"]
                 and heartbeat.get("pid") == job_rec.supervisor.get("pid")
                 and isinstance(heartbeat.get("child_pid"), int)
                 and isinstance(heartbeat.get("child_create_time"), (int, float))):
             self.record_child_pid(session_id, heartbeat["child_pid"], created=heartbeat["child_create_time"])
+
+        try:
+            artifact = self.job_service.get_artifact(session.job_id, "active-review-dispatch.json")
+        except (ValueError, OSError):
+            # The runner has not published a dispatch yet, or this is a legacy
+            # job. Absence never supplies cleanup permission.
+            artifact = None
+        dispatch = artifact.get("content") if isinstance(artifact, dict) else None
+        if (isinstance(dispatch, dict) and dispatch.get("session_id") == session_id
+                and dispatch.get("role") == "reviewer" and isinstance(dispatch.get("request_id"), str)):
+            request_id = dispatch["request_id"]
+            registry = read_json(self.runtime_root / "harness-sessions.json", {})
+            existing = (registry.get("sessions") or {}).get(request_id) or {}
+            if not existing.get("resource_id"):
+                if self._execution_port is None:
+                    from dev_orchestrator.ai.runtime_config import load_aibroker_execution_port
+                    self._execution_port = load_aibroker_execution_port(self.runtime_root)
+                try:
+                    fact = self._execution_port.status(request_id) if self._execution_port else None
+                except (RuntimeError, ValueError, OSError) as exc:
+                    session.failure_reason = f"reviewer resource identity not yet verifiable ({type(exc).__name__})"
+                    fact = None
+                if isinstance(fact, dict) and fact.get("request_id") == request_id and fact.get("resource_id"):
+                    from dev_orchestrator.core.ai_planner import persist_harness_session
+                    parent = (registry.get("sessions") or {}).get(session_id) or {}
+                    persist_harness_session(self.runtime_root, request_id, role="reviewer",
+                        request_id=request_id, resource_id=fact["resource_id"], parent_session_id=session_id,
+                        started_at=session.timestamps.get("started_at"),
+                        child_pids=parent.get("child_pids", []), child_create_times=parent.get("child_create_times", {}))
 
         if job_rec.state == "completed":
             # Load result and output artifacts
@@ -251,6 +283,17 @@ class DefaultReviewerHarness:
             self.session_store.save_session(session)
 
         return session
+
+    def cleanup_timed_out(self, session_id: str, *, max_age_seconds: float) -> int:
+        """Use only observed actual reviewer identities, never the prior Worker."""
+        from dev_orchestrator.core.ai_planner import cleanup_stale_role_tool_children
+        data = read_json(self.runtime_root / "harness-sessions.json", {})
+        count = 0
+        for row in (data.get("sessions") or {}).values():
+            if row.get("parent_session_id") == session_id and row.get("request_id") and row.get("resource_id"):
+                count += cleanup_stale_role_tool_children(self.runtime_root, role="reviewer", max_age_seconds=max_age_seconds,
+                    request_id=row["request_id"], resource_id=row["resource_id"])
+        return count
 
     def reconcile(self, session_id: str) -> ReviewSession:
         """Reconcile session and underlying P14 execution job."""

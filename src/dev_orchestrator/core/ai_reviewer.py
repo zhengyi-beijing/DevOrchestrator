@@ -1834,13 +1834,13 @@ class AIReviewerCoordinator:
                 time.sleep(poll_interval)
 
             if session.state not in ("completed", "failed", "cancelled"):
-                from dev_orchestrator.core.ai_planner import cleanup_stale_role_tool_children
-                cleanup_stale_role_tool_children(
-                    self.runtime_root,
-                    role="reviewer",
-                    max_age_seconds=timeout,
-                    request_id=source_request_id,
-                )
+                cleanup = getattr(harness, "cleanup_timed_out", None)
+                if callable(cleanup):
+                    cleanup(session.session_id, max_age_seconds=timeout)
+                gate_id = "gate-reviewer-timeout-" + hashlib.sha256(review_id.encode()).hexdigest()[:24]
+                from dev_orchestrator.control.owner_store import OwnerControlStore
+                OwnerControlStore(self.runtime_root).record_gate(project_id=project_id, gate_id=gate_id,
+                    reason=f"Reviewer harness timeout: session={session.session_id}; verify exact owned dispatch/child termination before resuming", active=True)
                 raise TimeoutError("review session timed out waiting for completion")
 
             if session.state != "completed":

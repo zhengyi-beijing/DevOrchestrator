@@ -1,0 +1,33 @@
+F                                                                        [100%]
+================================== FAILURES ===================================
+___ test_production_coordinator_timeout_uses_harness_correlation_and_gates ____
+
+tmp_path = WindowsPath('C:/Users/yizhe/AppData/Local/Temp/pytest-of-yizhe/pytest-544/test_production_coordinator_ti0')
+
+    def test_production_coordinator_timeout_uses_harness_correlation_and_gates(tmp_path):
+        from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
+        from dev_orchestrator.control.owner_store import OwnerControlStore
+        coordinator = AIReviewerCoordinator(tmp_path, None)
+        (tmp_path/'ai-reviewer.json').write_text(json.dumps({'reviews': {'review-1': {
+            'state': 'launching', 'project_id': 'p1', 'task_id': 'T1', 'source_request_id': 'worker-1'}}}))
+        harness = MagicMock()
+        session = SimpleNamespace(session_id='review-1', job_id='job-1', state='running')
+        harness.submit.return_value = session
+        harness.status.return_value = session
+        truth = SimpleNamespace(branch='main', head='abc', status_hash=None)
+        with patch.object(coordinator, '_get_harness', return_value=harness):
+            coordinator._run_harness_review('review-1', 'worker-1', 'p1', 'T1', str(tmp_path), truth,
+                {'timeout_seconds': .01, 'poll_interval_seconds': .001},
+                {'resource_context': {'resource_id': 'worker-resource', 'provider': 'worker', 'account': 'a', 'model': 'm'}},
+                None, {'timeout_seconds': .01, 'independence': 'provider', 'quality': 'high'})
+        harness.cleanup_timed_out.assert_called_once_with('review-1', max_age_seconds=.01)
+>       assert OwnerControlStore(tmp_path).is_paused('p1')
+E       AssertionError: assert False
+E        +  where False = is_paused('p1')
+E        +    where is_paused = <dev_orchestrator.control.owner_store.OwnerControlStore object at 0x00000258EBE0E0F0>.is_paused
+E        +      where <dev_orchestrator.control.owner_store.OwnerControlStore object at 0x00000258EBE0E0F0> = <class 'dev_orchestrator.control.owner_store.OwnerControlStore'>(WindowsPath('C:/Users/yizhe/AppData/Local/Temp/pytest-of-yizhe/pytest-544/test_production_coordinator_ti0'))
+
+tests_py\test_p20_3_cleanup_identity.py:112: AssertionError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_3_cleanup_identity.py::test_production_coordinator_timeout_uses_harness_correlation_and_gates
+1 failed in 0.29s

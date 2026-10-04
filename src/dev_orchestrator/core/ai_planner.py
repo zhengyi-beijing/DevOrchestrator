@@ -1914,6 +1914,19 @@ class AIPlannerCoordinator:
             )
 
         max_remediation_rounds = policy["max_plan_remediation_rounds"]
+        consumed_rounds = int(record.get("cumulative_remediation_rounds") or 0)
+        if consumed_rounds > max_remediation_rounds:
+            reason = f"semantic remediation budget lowered below consumed rounds ({consumed_rounds}>{max_remediation_rounds}); preserved plan requires owner disposition"
+            gate_id = "gate-plan-budget-" + hashlib.sha256(plan_id.encode()).hexdigest()[:24]
+            self.owner_store.record_gate(project_id=record["project_id"], gate_id=gate_id, reason=reason, active=True)
+            if self.accounting is not None:
+                self.accounting.open_owner_gate(plan_id, project_id=record["project_id"], task_id=record["task_id"],
+                    role="owner", request_id=plan_id, source_request_id=gate_id)
+            if self.progress_channel is not None:
+                self.progress_channel.emit(self._project_payload(record, project), "OWNER_GATE", task_id=record["task_id"],
+                    occurrence_key=gate_id, details={"plan_id": plan_id, "reason": reason})
+            self._finish(plan_id, "owner_gate", reason)
+            return
         max_recovery_cycles = policy["max_plan_recovery_cycles"]
         hard_total_review_rejects = policy["hard_total_review_rejects"]
         recovery_cycle = int(record.get("recovery_cycle") or 0)
@@ -3023,6 +3036,7 @@ def persist_harness_session(
     started_at: str | None = None,
     child_pids: Sequence[int] = (),
     child_create_times: dict[str, float] | None = None,
+    parent_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Persist role harness session to runtime/harness-sessions.json for cleanup correlation."""
     runtime = Path(runtime_root)
@@ -3039,8 +3053,11 @@ def persist_harness_session(
         "started_at": started_at or existing.get("started_at") or utc_now_iso(),
         "child_pids": combined_pids,
         "child_create_times": {**existing.get("child_create_times", {}), **(child_create_times or {})},
+        "parent_session_id": parent_session_id or existing.get("parent_session_id"),
     }
     sessions[session_id] = entry
+    if entry == existing:
+        return entry
     write_json(harness_sessions_file, data)
     return entry
 
@@ -3108,8 +3125,10 @@ def cleanup_stale_role_tool_children(
                         continue
                     argv = p.cmdline()
                     cmdline = " ".join(argv)
-                    tool = any("graphify" in str(part).lower() for part in argv)
-                    readonly = any(str(part).lower() in {"query", "path", "explain"} for part in argv)
+                    tool_index = next((i for i, part in enumerate(argv) if Path(str(part)).name.lower()
+                                       in {"graphify", "graphify.exe", "graphify.py", "graphify.__main__"}), None)
+                    tool = tool_index is not None
+                    readonly = tool and tool_index + 1 < len(argv) and str(argv[tool_index + 1]).lower() in {"query", "path", "explain"}
                     if tool and readonly and request_id in cmdline and resource_id in cmdline:
                         p.terminate()
                         terminated_count += 1

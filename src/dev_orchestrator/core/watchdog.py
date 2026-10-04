@@ -1764,7 +1764,7 @@ class WatchdogCoordinator:
             independence="none",
             previous_provider=failed_resource.get("provider"),
             previous_model=failed_resource.get("model"),
-            quality=(project_config.get("ai_roles", {}).get("planner", {}).get("quality") or "high"),
+            quality=((project_config.get("ai_roles") or {}).get("planner") or {}).get("quality") or "high",
         )
 
         owner_gate_auth = resolve_owner_gate_authority(self.runtime_root, snapshot)
@@ -1839,7 +1839,8 @@ class WatchdogCoordinator:
         problem["state"] = "retrying"
         self._save_state(self._cached_state)
 
-        reserve_recovery_attempt(self.runtime_root, pid, rcv_decision, config=project_config)
+        reserve_recovery_attempt(self.runtime_root, pid, rcv_decision, config=project_config,
+                                 effect_id=command_id, effect_kind="control_continue")
 
         try:
             from dev_orchestrator.core.control_commands import submit_control_command

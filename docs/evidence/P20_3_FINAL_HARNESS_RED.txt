@@ -1,0 +1,25 @@
+F                                                                        [100%]
+================================== FAILURES ===================================
+_ test_normal_harness_status_binds_actual_reviewer_dispatch_and_timeout_cleanup _
+
+tmp_path = WindowsPath('C:/Users/yizhe/AppData/Local/Temp/pytest-of-yizhe/pytest-540/test_normal_harness_status_bin0')
+
+    def test_normal_harness_status_binds_actual_reviewer_dispatch_and_timeout_cleanup(tmp_path):
+        from dev_orchestrator.review.harness import DefaultReviewerHarness
+        session = SimpleNamespace(state='running', result=None, job_id='job-1', session_id='review-1',
+            timestamps={'started_at': '2026-10-04T00:00:00+00:00'})
+        jobs = MagicMock()
+        jobs.status.return_value = SimpleNamespace(state='running', heartbeat={
+            'pid': 11, 'start_token': 'owned-start', 'child_pid': 22, 'child_create_time': 123.0},
+            supervisor={'pid': 11, 'start_token': 'owned-start'})
+        jobs.get_artifact.return_value = {'content': {'session_id': 'review-1', 'role': 'reviewer', 'request_id': 'packet-request-1'}}
+        port = MagicMock()
+        port.status.return_value = {'request_id': 'packet-request-1', 'resource_id': 'actual-reviewer-resource', 'status': 'running'}
+>       harness = DefaultReviewerHarness(tmp_path, job_service=jobs, execution_port=port)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: DefaultReviewerHarness.__init__() got an unexpected keyword argument 'execution_port'
+
+tests_py\test_p20_3_cleanup_identity.py:81: TypeError
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_3_cleanup_identity.py::test_normal_harness_status_binds_actual_reviewer_dispatch_and_timeout_cleanup
+1 failed in 0.25s

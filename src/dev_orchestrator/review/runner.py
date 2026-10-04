@@ -412,6 +412,12 @@ class ReviewRunner:
             )
 
             res = None
+            # Publish the exact upcoming Broker request under this owned job.
+            # The parent observes Broker's selected reviewer identity while the
+            # synchronous dispatch is still running; worker identity is not used.
+            self.store.save_output_artifact(rec.job_id, "active-review-dispatch.json", {
+                "session_id": request.request_id, "request_id": ai_req.request_id,
+                "role": "reviewer", "started_at": utc_now_iso()})
             if self.port is not None:
                 try:
                     res = self.port.execute(ai_req)

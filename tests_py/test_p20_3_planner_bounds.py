@@ -98,3 +98,20 @@ def test_restart_and_resource_recovery_preserve_consumed_semantic_budget():
         assert len([r for r in port.requests if r.role == 'planner']) == before
         assert recovered['state'] == 'owner_gate'
         assert len(recovered['rejection_chain']) == 2
+
+
+def test_lowered_budget_cannot_leave_active_planning_record(tmp_path):
+    import json
+    from dev_orchestrator.control.owner_store import OwnerControlStore
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    row = {'plan_id': 'ai_plan:lowered', 'project_id': 'p1', 'task_id': 'P14',
+           'command_id': 'lowered', 'state': 'planning', 'cumulative_remediation_rounds': 3}
+    port = AlwaysRejectReviewerPort()
+    coordinator = AIPlannerCoordinator(runtime, port)
+    (runtime/'ai-planner.json').write_text(json.dumps({'plans': {'ai_plan:lowered': row}}), encoding='utf-8')
+    coordinator._run_cycle('ai_plan:lowered', {'project_id': 'p1'}, {
+        'max_plan_remediation_rounds': 1, 'max_plan_recovery_cycles': 2, 'hard_total_review_rejects': 5})
+    assert coordinator.state()['plans']['ai_plan:lowered']['state'] == 'owner_gate'
+    assert OwnerControlStore(runtime).is_paused('p1')
+    assert not port.requests

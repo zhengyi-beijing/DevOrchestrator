@@ -1,5 +1,15 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P20.3 final local review delta (2026-10-04): verification PASS; descendant
+Technical Review PENDING; authoritative acceptance NOT YET. 265 tests and
+22 subtests passed in 81.87s. The independent ac2cf329 Review confirmed the
+previous seven fixes and requested three bounded corrections: exhausted-budget
+terminal gate, actual Reviewer packet/resource correlation, and pre-enqueue
+control-command binding. All three now have regression evidence in
+docs/evidence/P20_3_FINAL_*. Reviewer timeout records a durable gate before
+relaunch, and cleanup recognizes the actual read-only Graphify subcommand.
+Earlier evidence and results below are retained as history. No soak has started.
+
 P20.3 root bounded review delta (2026-10-04): verification PASS; independent
 descendant Technical Review PENDING; authoritative acceptance NOT YET.
 241 tests and 22 subtests passed. See

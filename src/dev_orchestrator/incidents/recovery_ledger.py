@@ -182,6 +182,8 @@ def reserve_recovery_attempt(
     decision: Any,
     *,
     config: dict[str, Any] | None = None,
+    effect_id: str | None = None,
+    effect_kind: str | None = None,
 ) -> dict[str, Any]:
     """Reserve a recovery attempt record inside IncidentStore under lock.
 
@@ -235,9 +237,9 @@ def reserve_recovery_attempt(
             attempt_index=attempt_index,
             status="reserved",
             reserved_at=utc_now_iso(),
-            effect_kind=eff_dict.get("effect_kind"),
+            effect_kind=effect_kind or eff_dict.get("effect_kind"),
             authorized_effect=eff_dict,
-            effect_id=eff_dict.get("target_id") or eff_dict.get("target_resource_id") or eff_dict.get("effect_id"),
+            effect_id=effect_id or eff_dict.get("target_id") or eff_dict.get("target_resource_id") or eff_dict.get("effect_id"),
             expected_authority_anchor=auth_anchor,
             expected_source_anchor=src_anchor,
             reason=reason,

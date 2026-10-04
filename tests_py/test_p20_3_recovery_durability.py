@@ -816,7 +816,10 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
     def test_watchdog_enqueue_failure_settles_actual_reserved_attempt(self) -> None:
         self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(enqueue_failure=True)
 
-    def test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(self, *, enqueue_failure=False) -> None:
+    def test_crash_after_command_publish_reconciles_reserved_recovery_binding(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(crash_after_enqueue=True)
+
+    def test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(self, *, enqueue_failure=False, crash_after_enqueue=False) -> None:
         """Finding 1: Watchdog uses real resource/routing config; transient failure retry doesn't pause project on 2nd attempt."""
         import subprocess
         from dev_orchestrator.core.watchdog import WatchdogCoordinator, resolve_watchdog_policy
@@ -960,6 +963,22 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
             "source": "automatic_review_handoff",
             "state": "blocked",
         })
+
+        if crash_after_enqueue:
+            from unittest.mock import patch
+            with patch("dev_orchestrator.incidents.recovery_ledger.record_recovery_outcome", side_effect=KeyboardInterrupt("crash after publish")):
+                with self.assertRaises(KeyboardInterrupt):
+                    coord._recover_cleared_automatic_planning_failure(project_config, snapshot, prow,
+                        {"plans": {plan_1: failed_1, plan_2: failed_2}}, policy)
+            pending = [a for a in load_recovery_attempts(self.runtime_root, self.project_id) if a['status'] == 'reserved'][0]
+            commands = list((self.runtime_root/'control'/'inbox').glob('*.json'))
+            command = next(read_json(p, {}) for p in commands if read_json(p, {}).get('target', {}).get('recovery_attempt_id') == pending['attempt_id'])
+            self.assertEqual(pending['effect_id'], command['command_id'])
+            rows = reconcile_recovery_attempts(self.runtime_root, self.project_id)
+            recovered = next(a for a in rows if a['attempt_id'] == pending['attempt_id'])
+            self.assertEqual(recovered['status'], 'reconciled')
+            self.assertEqual(recovered['effect_id'], command['command_id'])
+            return
 
         rec_2 = coord._recover_cleared_automatic_planning_failure(
             project_config, snapshot, prow, {"plans": {plan_1: failed_1, plan_2: failed_2}}, policy,

@@ -1,4 +1,28 @@
-# P20.3 Root bounded technical-review delta (2026-10-04)
+# P20.3 Final local technical-review delta (2026-10-04)
+
+Latest state: three local blocking findings from the independent ac2cf329
+Review are fixed; descendant Technical Review pending. P20.3 is not accepted,
+and P20.4 has not started. Owner pause remains in place, with no live Worker.
+
+Lowering the configured semantic budget below consumed rounds now produces a
+stable durable owner gate rather than leaving an active planner wedged.
+Recovery reservations bind the control-command ID before enqueue, so a crash
+between publication and settlement reconciles the same command. The durable
+Reviewer runner publishes its actual packet request; Harness status correlates
+that request with Broker-selected reviewer resource and owned spawn heartbeat.
+Timeout cleanup uses only those observed identities and records a stable owner
+gate before any relaunch. Unknown provider children remain outside permission.
+Read-only Graphify recognition checks the actual subcommand, not token presence.
+Unchanged harness identity polls do not rewrite the registry; nullable role
+configuration is handled safely.
+
+Verification: 265 passed and 22 subtests passed in 81.87s; compileall and diff
+check passed. Current source hashes, deterministic GREEN and focused RED are
+under docs/evidence/P20_3_FINAL_*. These are not live-soak qualification.
+The ac2cf329 independent REMEDIATE evidence remains preserved separately.
+No push or direct lifecycle ledger edit. The sections below are historical.
+
+# Historical P20.3 Root bounded technical-review delta (2026-10-04)
 
 Latest state: implementation and regression complete; independent descendant
 Technical Review pending. P20.3 is not accepted and P20.4 soak has not started.

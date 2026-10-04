@@ -1,0 +1,43 @@
+FF                                                                       [100%]
+================================== FAILURES ===================================
+___________ test_lowered_budget_cannot_leave_active_planning_record ___________
+
+tmp_path = WindowsPath('C:/Users/yizhe/AppData/Local/Temp/pytest-of-yizhe/pytest-538/test_lowered_budget_cannot_lea0')
+
+    def test_lowered_budget_cannot_leave_active_planning_record(tmp_path):
+        import json
+        from dev_orchestrator.control.owner_store import OwnerControlStore
+        runtime = tmp_path / 'runtime'
+        runtime.mkdir()
+        row = {'plan_id': 'ai_plan:lowered', 'project_id': 'p1', 'task_id': 'P14',
+               'command_id': 'lowered', 'state': 'planning', 'cumulative_remediation_rounds': 3}
+        port = AlwaysRejectReviewerPort()
+        coordinator = AIPlannerCoordinator(runtime, port)
+        (runtime/'ai-planner.json').write_text(json.dumps({'plans': {'ai_plan:lowered': row}}), encoding='utf-8')
+        coordinator._run_cycle('ai_plan:lowered', {'project_id': 'p1'}, {
+            'max_plan_remediation_rounds': 1, 'max_plan_recovery_cycles': 2, 'hard_total_review_rejects': 5})
+>       assert coordinator.state()['plans']['ai_plan:lowered']['state'] == 'owner_gate'
+E       AssertionError: assert 'planning' == 'owner_gate'
+E         
+E         - owner_gate
+E         + planning
+
+tests_py\test_p20_3_planner_bounds.py:115: AssertionError
+_ TestP203SecondRoundReviewRemediation.test_crash_after_command_publish_reconciles_reserved_recovery_binding _
+
+self = <test_p20_3_recovery_durability.TestP203SecondRoundReviewRemediation testMethod=test_crash_after_command_publish_reconciles_reserved_recovery_binding>
+
+    def test_crash_after_command_publish_reconciles_reserved_recovery_binding(self) -> None:
+>       self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(crash_after_enqueue=True)
+
+tests_py\test_p20_3_recovery_durability.py:820: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+tests_py\test_p20_3_recovery_durability.py:976: in test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project
+    self.assertEqual(pending['effect_id'], command['command_id'])
+E   AssertionError: 'anthropic/claude-opus' != 'wd-plan-9f2f68f1014939a9-2'
+E   - anthropic/claude-opus
+E   + wd-plan-9f2f68f1014939a9-2
+=========================== short test summary info ===========================
+FAILED tests_py/test_p20_3_planner_bounds.py::test_lowered_budget_cannot_leave_active_planning_record
+FAILED tests_py/test_p20_3_recovery_durability.py::TestP203SecondRoundReviewRemediation::test_crash_after_command_publish_reconciles_reserved_recovery_binding
+2 failed in 1.06s
