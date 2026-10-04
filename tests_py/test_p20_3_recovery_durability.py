@@ -243,7 +243,10 @@ class TestP203ReplayReconciliationAndNoDuplicateActuation(unittest.TestCase):
         jobs_dir.mkdir(parents=True, exist_ok=True)
         write_json(jobs_dir / "index.json", {"jobs": {}})
 
-        reconciled = reconcile_recovery_attempts(self.runtime_root, self.project_id)
+        from datetime import datetime, timedelta
+        reserved = load_recovery_attempts(self.runtime_root, self.project_id)[0]
+        expired = datetime.fromisoformat(reserved["reserved_at"]) + timedelta(seconds=301)
+        reconciled = reconcile_recovery_attempts(self.runtime_root, self.project_id, now=expired)
         self.assertEqual(len(reconciled), 1)
         self.assertEqual(reconciled[0]["status"], "abandoned")
 
@@ -386,7 +389,10 @@ class TestP203ReplayReconciliationAndNoDuplicateActuation(unittest.TestCase):
             }
         })
 
-        reconciled = reconcile_recovery_attempts(self.runtime_root, self.project_id)
+        from datetime import datetime, timezone, timedelta
+        reserved = load_recovery_attempts(self.runtime_root, self.project_id)[0]
+        expired = datetime.fromisoformat(reserved["reserved_at"]) + timedelta(seconds=301)
+        reconciled = reconcile_recovery_attempts(self.runtime_root, self.project_id, now=expired)
         self.assertEqual(len(reconciled), 1)
         self.assertEqual(reconciled[0]["status"], "abandoned")
         self.assertNotEqual(reconciled[0].get("effect_id"), "unrelated-handoff-999")
@@ -807,7 +813,10 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(self) -> None:
+    def test_watchdog_enqueue_failure_settles_actual_reserved_attempt(self) -> None:
+        self.test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(enqueue_failure=True)
+
+    def test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(self, *, enqueue_failure=False) -> None:
         """Finding 1: Watchdog uses real resource/routing config; transient failure retry doesn't pause project on 2nd attempt."""
         import subprocess
         from dev_orchestrator.core.watchdog import WatchdogCoordinator, resolve_watchdog_policy
@@ -848,6 +857,11 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
             }
         }
 
+        project_config["resource_pool"] = {"resources": [
+            {"resource_id": "google/gemini-pro", "provider": "google", "model": "gemini-pro", "roles": ["planner"], "qualities": ["high"], "available": True},
+            {"resource_id": "anthropic/claude-opus", "provider": "anthropic", "model": "claude-opus", "roles": ["planner"], "qualities": ["high"], "available": True},
+        ]}
+        project_config["routing"] = {"escalation_fallback_resources": ["google/gemini-pro", "anthropic/claude-opus"]}
         coord = WatchdogCoordinator(self.runtime_root)
         prow = coord._cached_state["projects"].setdefault(self.project_id, {"attempts": {}})
         policy = resolve_watchdog_policy(project_config)
@@ -864,6 +878,7 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
             "branch": truth.branch,
             "head": truth.head,
             "state": "failed",
+            "planner_resource": {"resource_id": "google/gemini-pro", "provider": "google", "model": "gemini-pro"},
             "reason": "repository changed during planning",
             "completed_at": "2026-10-04T10:00:00+00:00",
         }
@@ -901,6 +916,18 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
             },
         }
 
+        if enqueue_failure:
+            from unittest.mock import patch
+            with patch("dev_orchestrator.core.control_commands.submit_control_command", side_effect=OSError("injected inbox failure")):
+                blocked = coord._recover_cleared_automatic_planning_failure(
+                    project_config, snapshot, prow, {"plans": {plan_1: failed_1}}, policy)
+            self.assertEqual(blocked["status"], "planning_recovery_blocked")
+            attempts = load_recovery_attempts(self.runtime_root, self.project_id)
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0]["status"], "failed")
+            self.assertIn("injected inbox failure", attempts[0]["reason"])
+            return
+
         rec_1 = coord._recover_cleared_automatic_planning_failure(
             project_config, snapshot, prow, {"plans": {plan_1: failed_1}}, policy,
         )
@@ -922,6 +949,7 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
             "branch": truth.branch,
             "head": truth.head,
             "state": "failed",
+            "planner_resource": {"resource_id": "google/gemini-pro", "provider": "google", "model": "gemini-pro"},
             "reason": "repository changed during planning",
             "completed_at": "2026-10-04T10:05:00+00:00",
         }
@@ -941,6 +969,15 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
         self.assertEqual(rec_2.get("status"), "planning_recovery_requested")
         self.assertFalse(store.is_paused(self.project_id))
 
+
+        attempts = load_recovery_attempts(self.runtime_root, self.project_id)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[-1]["action"], "HETEROGENEOUS_ESCALATION")
+        self.assertEqual(attempts[-1]["authorized_effect"]["target_resource_id"], "anthropic/claude-opus")
+        command = read_json(self.runtime_root / "control" / "inbox" / (rec_2["command_id"] + ".json"), {})
+        self.assertEqual(command["target"]["recovery_excluded_resource_ids"], ["google/gemini-pro"])
+        self.assertEqual(command["target"]["recovery_attempt_id"], attempts[-1]["attempt_id"])
+
     def test_reviewer_timeout_cleanup_terminates_only_correlated_aged_tool_children_and_counts_them(self) -> None:
         """Finding 2: cleanup_stale_role_tool_children respects max_age_seconds and request/resource correlation."""
         from datetime import datetime, timezone, timedelta
@@ -959,7 +996,7 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
             request_id="req-corr",
             resource_id="res-corr",
             started_at=aged_time,
-            child_pids=[1001],
+            child_pids=[1001], child_create_times={"1001": 123.0},
         )
 
         # Session 2: correlated but young (30s < 600s) -> should NOT be terminated
@@ -989,7 +1026,8 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
         def mock_process(pid: int) -> MagicMock:
             proc = MagicMock()
             proc.pid = pid
-            proc.cmdline.return_value = ["python", "-m", "graphify", "query"]
+            proc.create_time.return_value = 123.0
+            proc.cmdline.return_value = ["python", "-m", "graphify", "query", "req-corr res-corr"]
             def fake_terminate():
                 terminated_pids.append(pid)
             proc.terminate = fake_terminate
@@ -1019,22 +1057,35 @@ class TestP203SecondRoundReviewRemediation(unittest.TestCase):
         from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
         from dev_orchestrator.control.owner_store import OwnerControlStore
 
-        coord = AIPlannerCoordinator(self.runtime_root, None)
-
-        # Part A: Resolvable delta against contract produces bounded_patch
+        from unittest.mock import Mock
+        from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
         accepted_contract = {
-            "resolutions": {"schema drift": "use version 2 schema"},
-            "invariants": ["SINGLE_ACTIVE_LIFECYCLE_OWNER"],
+            "task_id": "P20.3", "summary": "Preserved accepted contract",
+            "implementation_steps": ["Keep sole authority"], "interfaces": ["Existing schema"],
+            "validation": ["Run existing tests"], "risks": ["Schema drift"], "out_of_scope": ["Redesign"],
         }
+        original = copy.deepcopy(accepted_contract)
+        previous = ResourceContext("planner-a", "provider-a", "account-a", "model-a")
+        port = Mock()
+        def result(request):
+            self.assertEqual(request.role, "adjudicator")
+            self.assertTrue(request.metadata["read_only"])
+            self.assertEqual(request.previous_resource_context, previous)
+            return AIRoleResult(request.request_id, request.role_run_id, "succeeded",
+                output=json.dumps({"disposition": "bounded_patch", "reason": "Explicit version contract",
+                    "resolved_findings": ["schema drift"], "resolution_evidence": "Version 2 schema is already authoritative; specify compatibility verification",
+                    "patch": {"validation": ["Check version 2 backward compatibility"]}}),
+                resource_context=ResourceContext("adjudicator-b", "provider-b", "account-b", "model-b"))
+        port.execute.side_effect = result
+        coord = AIPlannerCoordinator(self.runtime_root, port)
         res_resolvable = coord.adjudicate_plan_delta(
-            project_id=self.project_id,
-            task_id="P20.3",
-            accepted_contract=accepted_contract,
+            project_id=self.project_id, task_id="P20.3", accepted_contract=accepted_contract,
             unresolved_delta={"blocking_finding": "schema drift"},
-        )
+            repository_path=self.temp_dir, previous_resource=previous)
         self.assertEqual(res_resolvable["disposition"], "bounded_patch")
-        self.assertIn("patch", res_resolvable)
-        self.assertTrue(bool(res_resolvable["patch"]))
+        self.assertEqual(res_resolvable["patch"], {"validation": ["Check version 2 backward compatibility"]})
+        self.assertEqual(accepted_contract, original)
+        self.assertEqual(port.execute.call_count, 1)
 
         # Part B: Unresolvable delta produces owner_gate with DELTA_ADJUDICATION_UNRESOLVED
         res_unresolvable = coord.adjudicate_plan_delta(

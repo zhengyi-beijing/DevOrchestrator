@@ -158,6 +158,13 @@ def run_supervisor(job_dir_path: Path | str) -> int:
         log_writer.append(f"spawn failed: {exc}", stream="system")
         return 1
 
+    # Capture process identity immediately at spawn, never from a later reused PID.
+    try:
+        import psutil
+        child_create_time = psutil.Process(child.pid).create_time()
+    except Exception:
+        child_create_time = None
+
     # Thread to stream stdout lines to bounded log
     def _stream_output():
         try:
@@ -199,6 +206,7 @@ def run_supervisor(job_dir_path: Path | str) -> int:
             "reported_at": utc_now_iso(),
             "pid": my_pid,
             "child_pid": child.pid,
+            "child_create_time": child_create_time,
             "start_token": start_token,
             "progress": "running",
         }

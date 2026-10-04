@@ -1,4 +1,34 @@
-# P20.3 Deterministic Recovery & Heterogeneous Escalation Technical Review Round 2 Remediation State (2026-10-04)
+# P20.3 Root bounded technical-review delta (2026-10-04)
+
+Latest state: implementation and regression complete; independent descendant
+Technical Review pending. P20.3 is not accepted and P20.4 soak has not started.
+The historical round-2 claims below are preserved as history and superseded by
+this delta: the normal round-2 Technical Review returned REMEDIATE with seven
+blocking findings. Root fixed the concrete delta at an owner-paused boundary
+with no live Worker or Reviewer and without editing lifecycle authority.
+
+Semantic remediation counts and rejection evidence survive resource recovery;
+the exhausted default budget proceeds to a real independent read-only delta
+Adjudicator or durable owner gate. It cannot restart full planning. A plan's
+mention of a blocker cannot resolve it. The patch only adds bounded content.
+Resource availability comes from authenticated Broker health plus whitelisted
+configured role/quality capabilities. Heterogeneity requires a known previous
+provider/model and a real change. Watchdog selection is carried by a command
+bound to its recovery attempt. Disabled recovery and quarantined families fence
+effects. Fresh reservations retain their durable configured lease; enqueue
+failure settles the actual attempt. Cleanup requires exact request/resource,
+age, spawn-time creation identity and read-only Graphify argv. Unknown native
+Broker children are not authorized for termination; this is not proof of
+cleaning every provider-owned tool process. P14 supervisor heartbeat now emits
+spawn identity consumed by the normal Reviewer Harness status path.
+
+Verification: 241 passed, 22 subtests passed in 73.55s; compileall and diff check
+passed. Evidence: docs/evidence/P20_3_ROOT_BOUNDED_DELTA_GREEN.txt and its
+source-hash manifest. Deterministic fixtures and read-only SDK resource snapshots
+do not qualify as real AI tasks or soak. Preserved RED evidence is under
+runtime/p20-3-bound-probes; malformed draft fixture failures are not valid RED.
+
+# Historical P20.3 Technical Review Round 2 Remediation State (2026-10-04)
 
 P20.3 Deterministic Recovery & Heterogeneous Escalation second-round technical review remediation complete:
 - Status: **REMEDIATION_COMPLETE / TECHNICAL_REVIEW_PENDING**.

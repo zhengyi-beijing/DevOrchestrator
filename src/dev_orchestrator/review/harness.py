@@ -133,8 +133,6 @@ class DefaultReviewerHarness:
         res_id = (
             request.metadata.get("resource_id")
             or (request.metadata.get("resource_context") or {}).get("resource_id")
-            or (request.metadata.get("worker_resource_context") or {}).get("resource_id")
-            or (request.metadata.get("previous_resource_context") or {}).get("resource_id")
         )
         child_pids = list(request.metadata.get("child_pids") or [])
         try:
@@ -153,7 +151,7 @@ class DefaultReviewerHarness:
 
         return session
 
-    def record_child_pid(self, session_id: str, pid: int) -> None:
+    def record_child_pid(self, session_id: str, pid: int, *, created: float) -> None:
         """Register a spawned child PID under the active harness session."""
         try:
             from dev_orchestrator.core.ai_planner import persist_harness_session
@@ -162,6 +160,7 @@ class DefaultReviewerHarness:
                 session_id=session_id,
                 role="reviewer",
                 child_pids=[pid],
+                child_create_times={str(pid): created},
             )
         except Exception:
             pass
@@ -181,6 +180,13 @@ class DefaultReviewerHarness:
         job_rec = self.job_service.status(session.job_id)
         if job_rec is None:
             return session
+
+        heartbeat = job_rec.heartbeat or {}
+        if (heartbeat.get("start_token") == job_rec.supervisor.get("start_token")
+                and heartbeat.get("pid") == job_rec.supervisor.get("pid")
+                and isinstance(heartbeat.get("child_pid"), int)
+                and isinstance(heartbeat.get("child_create_time"), (int, float))):
+            self.record_child_pid(session_id, heartbeat["child_pid"], created=heartbeat["child_create_time"])
 
         if job_rec.state == "completed":
             # Load result and output artifacts

@@ -236,6 +236,46 @@ class AIBrokerExecutionPort:
         self._record_provider_evidence(request, result)
         return result
 
+    def resource_snapshot(self) -> dict[str, Any]:
+        """Read configured capabilities and current Broker controls/health.
+
+        Only whitelisted identity/capability fields cross the process boundary;
+        credentials and provider environment configuration never leave Broker.
+        """
+        if not self.config.service_url:
+            return {"resources": [], "routing": {}, "availability_error": "broker resource service unavailable"}
+        code = (
+            "import json,sys,yaml; from pathlib import Path; "
+            "d=yaml.safe_load(Path(sys.argv[1]).read_text(encoding='utf-8-sig')); "
+            "print(json.dumps([{'resource_id':r.get('resource_id'),'provider':r.get('provider'),"
+            "'model':r.get('model'),'account_id':r.get('account'),"
+            "'roles':r.get('metadata',{}).get('dispatch_roles',[]),"
+            "'qualities':r.get('metadata',{}).get('dispatch_qualities',[])} "
+            "for r in d.get('resources',[])]))"
+        )
+        try:
+            configured = subprocess.run(
+                [str(self.config.python_executable), "-c", code, str(self.config.config_path)],
+                cwd=str(self.config.broker_repo), env=self._build_env(), timeout=5,
+                capture_output=True, text=True, encoding="utf-8", check=True,
+                **hidden_subprocess_kwargs(),
+            )
+            identities = json.loads(configured.stdout)
+            health = self._service_call("/api/resources", None, timeout_seconds=5.0)
+            states = {r["resource_id"]: r for r in health.get("resources", []) if isinstance(r, dict) and r.get("resource_id")}
+            resources = []
+            for identity in identities:
+                live = states.get(identity.get("resource_id"), {})
+                state = live.get("state") or {}
+                resources.append({**identity, "available": live.get("enabled") is True
+                                  and live.get("override_enabled") is not False and state.get("available") is True,
+                                  "observed_at": state.get("last_probe_at")})
+            ids = [r["resource_id"] for r in resources if r.get("resource_id")]
+            return {"resources": resources, "routing": {"escalation_fallback_resources": ids,
+                    "independent_reviewer_resources": ids}, "source": "broker_configuration_and_resource_service"}
+        except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError, AIBrokerInvocationError) as exc:
+            return {"resources": [], "routing": {}, "availability_error": type(exc).__name__}
+
 
     def _record_provider_evidence(self, request: AIRoleRequest, result: AIRoleResult) -> None:
         """Record only fields returned by Broker or carried by the exact request."""
@@ -372,7 +412,7 @@ class AIBrokerExecutionPort:
             timeout = max(timeout, float(requested) + 60.0)
         return timeout
 
-    def _service_call(self, path: str, payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    def _service_call(self, path: str, payload: Mapping[str, Any] | None, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         base = validate_loopback_url(self.config.service_url or "")
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         headers = {"Accept": "application/json"}
@@ -390,7 +430,7 @@ class AIBrokerExecutionPort:
         try:
             with _SERVICE_OPENER.open(
                 req,
-                timeout=self._service_timeout_seconds(path, payload),
+                timeout=timeout_seconds if timeout_seconds is not None else self._service_timeout_seconds(path, payload),
             ) as response:
                 body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:

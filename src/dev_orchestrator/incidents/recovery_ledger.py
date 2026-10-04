@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -55,6 +56,8 @@ class RecoveryAttempt:
     owner_gate_id: str | None = None
     reason: str | None = None
     schema_version: int = RECOVERY_ATTEMPT_SCHEMA_VERSION
+    reservation_ttl_seconds: float = 300.0
+    authorized_effect: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.status not in RECOVERY_ATTEMPT_STATUSES:
@@ -84,6 +87,8 @@ class RecoveryAttempt:
             "expected_source_anchor": dict(self.expected_source_anchor or {}),
             "owner_gate_id": self.owner_gate_id,
             "reason": self.reason,
+            "reservation_ttl_seconds": self.reservation_ttl_seconds,
+            "authorized_effect": dict(self.authorized_effect or {}),
         }
 
     @classmethod
@@ -109,6 +114,8 @@ class RecoveryAttempt:
             owner_gate_id=data.get("owner_gate_id"),
             reason=data.get("reason"),
             schema_version=int(data.get("schema_version", RECOVERY_ATTEMPT_SCHEMA_VERSION)),
+            reservation_ttl_seconds=float(data.get("reservation_ttl_seconds", 300.0)),
+            authorized_effect=data.get("authorized_effect"),
         )
 
 
@@ -183,6 +190,8 @@ def reserve_recovery_attempt(
     """
     runtime = Path(runtime_root)
     store = IncidentStore(runtime)
+    from dev_orchestrator.incidents.policy import resolve_incident_policy
+    reservation_ttl = resolve_incident_policy(config)["recovery_attempt_reservation_ttl_seconds"]
 
     attempt_id = getattr(decision, "attempt_id", None) or decision.get("attempt_id")
     strategy_key = getattr(decision, "strategy_key", None) or decision.get("strategy_key")
@@ -227,10 +236,12 @@ def reserve_recovery_attempt(
             status="reserved",
             reserved_at=utc_now_iso(),
             effect_kind=eff_dict.get("effect_kind"),
+            authorized_effect=eff_dict,
             effect_id=eff_dict.get("target_id") or eff_dict.get("target_resource_id") or eff_dict.get("effect_id"),
             expected_authority_anchor=auth_anchor,
             expected_source_anchor=src_anchor,
             reason=reason,
+            reservation_ttl_seconds=reservation_ttl,
         ).to_dict()
 
         recovery_attempts[attempt_id] = attempt_record
@@ -421,6 +432,7 @@ def reconcile_recovery_attempts(
     reviewer: Any = None,
     jobs: Any = None,
     now: Any = None,
+    reservation_ttl_seconds: float = 300.0,
 ) -> list[dict[str, Any]]:
     """Restart and replay reconciliation for reserved and actuated recovery attempts.
 
@@ -462,6 +474,7 @@ def reconcile_recovery_attempts(
                     reviewer=reviewer,
                     jobs=jobs,
                     now=now,
+                    reservation_ttl_seconds=reservation_ttl_seconds,
                 )
             )
         return reconciled_all
@@ -500,6 +513,18 @@ def reconcile_recovery_attempts(
         aid = str(att["attempt_id"])
         eff_kind = str(att.get("effect_kind") or "")
         eff_id = str(att.get("effect_id") or "")
+        reservation_expired = True
+        if status == "reserved":
+            try:
+                observed = now if isinstance(now, datetime) else datetime.fromisoformat(now.replace("Z", "+00:00")) if isinstance(now, str) else datetime.now(timezone.utc)
+                reserved = datetime.fromisoformat(str(att["reserved_at"]).replace("Z", "+00:00"))
+                if reserved.tzinfo is None or observed.tzinfo is None:
+                    raise ValueError("reservation timestamp must have a timezone")
+                ttl = float(att.get("reservation_ttl_seconds", reservation_ttl_seconds))
+                reservation_expired = (observed - reserved).total_seconds() >= ttl
+            except (KeyError, TypeError, ValueError):
+                # Unproven age cannot authorize abandonment or a replacement.
+                reservation_expired = False
 
         # 1. Handoff effect reconciliation (CPF-02, CPF-03, CPF-07)
         if eff_kind == "handoff" or "handoff" in eff_kind:
@@ -522,6 +547,9 @@ def reconcile_recovery_attempts(
                 )
                 reconciled_results.append(updated)
             elif status == "reserved":
+                if not reservation_expired:
+                    reconciled_results.append(dict(att))
+                    continue
                 updated = record_recovery_outcome(
                     runtime, project_id, aid, "abandoned", reason="handoff_proven_absent"
                 )
@@ -549,6 +577,9 @@ def reconcile_recovery_attempts(
                 )
                 reconciled_results.append(updated)
             elif status == "reserved":
+                if not reservation_expired:
+                    reconciled_results.append(dict(att))
+                    continue
                 updated = record_recovery_outcome(
                     runtime, project_id, aid, "abandoned", reason="durable_job_proven_absent"
                 )
@@ -623,6 +654,9 @@ def reconcile_recovery_attempts(
             )
             reconciled_results.append(updated)
         elif status == "reserved":
+            if not reservation_expired:
+                reconciled_results.append(dict(att))
+                continue
             updated = record_recovery_outcome(
                 runtime, project_id, aid, "abandoned", reason="effect_proven_absent"
             )

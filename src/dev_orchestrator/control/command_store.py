@@ -76,7 +76,7 @@ def canonical_request(value: dict[str, Any]) -> dict[str, Any]:
     if expected_missing:
         raise ValueError("expected identity missing fields: " + ", ".join(expected_missing))
     target_allowed = {
-        "continue": {"gate_id"},
+        "continue": {"gate_id", "recovery_attempt_id", "recovery_excluded_resource_ids"},
         "pause": set(), "resume": set(), "stop": set(),
         "retry": {"target_id"}, "rereview": {"target_id"}, "reconcile": {"target_id"},
         "approve_owner_gate": {"gate_id"},

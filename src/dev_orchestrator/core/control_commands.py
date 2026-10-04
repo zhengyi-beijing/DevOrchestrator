@@ -872,7 +872,28 @@ class ControlCommandCoordinator:
                     "lifecycle_action": "plan_review", "plan_id": review_plan_id,
                     "reason": review_reason,
                 }
-            plan_id, reason = self.planner.start(projects[project_id], snapshot, command_id)
+            recovery_target = record.get("target") or {}
+            recovery_excluded = recovery_target.get("recovery_excluded_resource_ids")
+            if recovery_excluded is not None and record.get("source") == "watchdog_planning_recovery":
+                from dev_orchestrator.incidents.recovery_ledger import load_recovery_attempts
+                reserved = next((r for r in load_recovery_attempts(self.runtime_root, project_id)
+                                 if r["attempt_id"] == recovery_target.get("recovery_attempt_id")
+                                 and r.get("effect_id") == command_id), None)
+                if not reserved or not isinstance(recovery_excluded, list) or not all(isinstance(r, str) and r for r in recovery_excluded):
+                    return self._blocked(command_id, project_id, action, "unbound resource recovery command", now, record)
+                selected = (reserved.get("authorized_effect") or {}).get("target_resource_id")
+                if not selected or selected in recovery_excluded or reserved.get("action") not in {"HETEROGENEOUS_ESCALATION", "SWITCH_RESOURCE"}:
+                    return self._blocked(command_id, project_id, action, "invalid selected recovery resource", now, record)
+                resource_reader = getattr(getattr(self.planner, "port", None), "resource_snapshot", None)
+                if callable(resource_reader):
+                    resources = resource_reader().get("resources", [])
+                    if not any(r.get("resource_id") == selected and r.get("available") is True for r in resources):
+                        return self._blocked(command_id, project_id, action, "selected recovery resource no longer available", now, record)
+                    recovery_excluded = sorted({r["resource_id"] for r in resources if r.get("resource_id") and r["resource_id"] != selected})
+                plan_id, reason = self.planner.start(projects[project_id], snapshot, command_id,
+                    recovery_excluded_resource_ids=recovery_excluded)
+            else:
+                plan_id, reason = self.planner.start(projects[project_id], snapshot, command_id)
             if plan_id is None:
                 return self._blocked(command_id, project_id, action, reason, now, record)
             return {**record, "state":"accepted", "processed_at":now, "lifecycle_action":"plan", "plan_id":plan_id, "reason":reason}

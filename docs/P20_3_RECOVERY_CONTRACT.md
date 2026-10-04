@@ -1,6 +1,31 @@
 # P20.3 Deterministic Recovery & Heterogeneous Escalation Contract
 
-Status: **FROZEN / IMPLEMENTED (2026-10-04)**
+Status: **FROZEN / IMPLEMENTED / TECHNICAL REVIEW PENDING (2026-10-04)**
+
+Root bounded remediation supersedes round-2 implementation claims. Default
+semantic remediation is cumulative and capped at two across resource recovery;
+resource recovery preserves the candidate rather than restarting full planning.
+Legacy exhausted gates can add a semantic round only with an explicit finite
+increase of the configured semantic budget. Exhaustion invokes an actual
+independent read-only adjudicator, requiring exact resolved blocker evidence,
+request correlation and a validated additive patch; textual presence is never
+an approval. Owner-gate identity is deterministic.
+
+Availability merges authenticated Broker controls/health with configured
+resource identity, role and quality. A heterogeneous candidate requires known
+previous provider/model and a change of that pair; account rotation is not
+heterogeneity. Watchdog resource selection reaches the Planner via a durable
+command bound to the recovery reservation. Recovery disable and quarantine
+inhibit effects, reservation TTL survives restart, and enqueue failure settles
+the actual reserved attempt.
+
+Cleanup requires exact request/resource, age, captured creation identity and
+positively identified read-only Graphify argv. P14 heartbeat captures child
+creation time at spawn and Reviewer Harness consumes the authenticated job
+heartbeat. Unknown provider-native children remain outside cleanup permission.
+241 tests plus 22 subtests pass; current evidence and source hashes are in
+docs/evidence/P20_3_ROOT_BOUNDED_DELTA_GREEN.txt and MANIFEST.json. This is
+deterministic verification, not real AI or six-hour qualification.
 
 Authoritative sources:
 - `docs/P20_OWNER_REQUIREMENTS.md` (Section 5)

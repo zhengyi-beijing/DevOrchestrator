@@ -180,8 +180,6 @@ def decide_recovery(
     total_incident_attempts = len(previous_attempts)
     family_attempts_count = max(family_record_count, family_attempts_from_prev)
     is_transient = "transient" in failure_class.lower() or failure_class in {"RESOURCE_TRANSIENT", "TRANSIENT"}
-    if is_transient and max_same_strategy < max_recoveries_incident:
-        max_same_strategy = max_recoveries_incident
     same_strategy_remaining = max(0, max_same_strategy - same_strategy_attempts)
     incident_recoveries_remaining = max(0, max_recoveries_incident - total_incident_attempts)
     family_attempts_remaining = max(0, max_family_attempts - family_attempts_count)
@@ -220,7 +218,7 @@ def decide_recovery(
     # (1) already-resolved/terminal incident -> NO_ACTION_ALREADY_RECOVERED
     # -------------------------------------------------------------
     terminal_disp = str(incident.get("terminal_disposition") or (family.get("terminal_disposition") if family else "") or "")
-    if terminal_disp in {"resolved", "terminal", "closed", "already_recovered"} or (family and family.get("state") == "resolved"):
+    if terminal_disp in {"resolved", "terminal", "closed", "already_recovered", "quarantined"} or (family and family.get("state") in {"resolved", "quarantined", "corrupt", "corruption_fenced"}):
         return _make_decision(
             action="NO_ACTION_ALREADY_RECOVERED",
             reason=f"incident_already_resolved: terminal_disposition={terminal_disp or 'resolved'}",
@@ -229,6 +227,11 @@ def decide_recovery(
     # -------------------------------------------------------------
     # (2) Fail-closed safety gates & authority -> OWNER_GATE
     # -------------------------------------------------------------
+    if budgets.get("recovery_enabled", True) is not True:
+        return _make_decision(
+            action="OWNER_GATE", reason="automatic_recovery_disabled",
+            gate_code="RECOVERY_DISABLED",
+        )
     # Check owner gate input
     if owner_gate is not None:
         if owner_gate.get("pending") is True or owner_gate.get("gate_id") is not None:
@@ -406,13 +409,6 @@ def decide_recovery(
                 reason=f"heterogeneous_escalation_exhausted: no heterogeneous candidates configured for {failure_class}",
                 gate_code="HETEROGENEOUS_RESOURCE_UNAVAILABLE",
             )
-        else:
-            # Candidate lists are empty/not configured; for transient classes keep max_attempts_per_run budget authoritative
-            if is_transient and same_strategy_attempts < max_recoveries_incident:
-                return _make_decision(
-                    action="RETRY_SAME_STRATEGY",
-                    reason=f"retry_transient_within_budget: attempt={same_strategy_attempts + 1}/{max_recoveries_incident}",
-                )
 
     # -------------------------------------------------------------
     # (6) Resource-class failure with available non-excluded resource -> SWITCH_RESOURCE
@@ -476,6 +472,8 @@ def build_resource_availability(
     independence: str = "none",
     excluded_resource_ids: Sequence[str] = (),
     previous_provider: str | None = None,
+    previous_model: str | None = None,
+    quality: str | None = None,
 ) -> dict[str, Any]:
     """Pure adapter over AGYResourcePool telemetry and RoutingPolicyConfig.
 
@@ -502,8 +500,8 @@ def build_resource_availability(
 
     for res in pool_resources:
         res_id = getattr(res, "resource_id", None) or (res.get("resource_id") if isinstance(res, Mapping) else None)
-        provider = getattr(res, "provider", None) or (res.get("provider") if isinstance(res, Mapping) else "agy")
-        model = getattr(res, "model", None) or (res.get("model") if isinstance(res, Mapping) else "gemini-2.5-pro")
+        provider = getattr(res, "provider", None) or (res.get("provider") if isinstance(res, Mapping) else None)
+        model = getattr(res, "model", None) or (res.get("model") if isinstance(res, Mapping) else None)
         account_id = getattr(res, "account_id", None) or (res.get("account_id") if isinstance(res, Mapping) else "")
         roles = getattr(res, "roles", None) or (res.get("roles") if isinstance(res, Mapping) else ())
 
@@ -517,6 +515,16 @@ def build_resource_availability(
             "account_id": account_id,
             "is_heterogeneous": False,
         }
+        if not provider or not model:
+            ineligible.append({**item, "reason": "resource_identity_unknown"})
+            continue
+        if isinstance(res, Mapping) and res.get("available") is False:
+            ineligible.append({**item, "reason": "resource_unavailable_or_disabled"})
+            continue
+        qualities = res.get("qualities", ()) if isinstance(res, Mapping) else ()
+        if quality and qualities and quality not in qualities:
+            ineligible.append({**item, "reason": "quality_not_supported"})
+            continue
 
         # Check exclusion
         if res_id in excluded_set:
@@ -555,45 +563,19 @@ def build_resource_availability(
         indep_fallbacks = routing_config.get("independent_reviewer_resources", ())
 
     for fb_str in fallbacks:
-        parts = fb_str.split("/")
-        fb_provider = parts[0] if parts else "fallback"
-        fb_model = parts[2] if len(parts) >= 3 else (parts[1] if len(parts) >= 2 else "default")
-        fb_item = {
-            "resource_id": fb_str,
-            "provider": fb_provider,
-            "model": fb_model,
-            "account_id": parts[1] if len(parts) >= 2 else "default",
-            "is_heterogeneous": True,
-        }
-
-        if fb_str in excluded_set:
-            ineligible.append({**fb_item, "reason": "excluded_failed_resource"})
+        known = next((item for item in eligible if item["resource_id"] == fb_str), None)
+        if known is None or not previous_provider or not previous_model:
             continue
-
-        if role in {"reviewer", "adjudicator"} and independence == "provider" and previous_provider:
-            if fb_provider.lower() == previous_provider.lower():
-                ineligible.append({**fb_item, "reason": f"provider independence required from '{previous_provider}'"})
-                continue
-
-        eligible.append(fb_item)
-        heterogeneous.append(fb_item)
+        if (known["provider"].lower(), known["model"].lower()) == (previous_provider.lower(), previous_model.lower()):
+            continue
+        # Configured fallback labels cannot create available resources.
+        heterogeneous.append({**known, "is_heterogeneous": True})
 
     for ind_str in indep_fallbacks:
-        parts = ind_str.split("/")
-        ind_provider = parts[0] if parts else "independent"
-        ind_model = parts[2] if len(parts) >= 3 else (parts[1] if len(parts) >= 2 else "default")
-        ind_item = {
-            "resource_id": ind_str,
-            "provider": ind_provider,
-            "model": ind_model,
-            "account_id": parts[1] if len(parts) >= 2 else "default",
-            "is_heterogeneous": True,
-        }
-        if ind_str in excluded_set:
+        known = next((item for item in eligible if item["resource_id"] == ind_str), None)
+        if known is None or (previous_provider and known["provider"].lower() == previous_provider.lower()):
             continue
-        if previous_provider and ind_provider.lower() == previous_provider.lower():
-            continue
-        independent.append(ind_item)
+        independent.append({**known, "is_heterogeneous": True})
 
     return {
         "eligible_candidates": eligible,

@@ -1390,7 +1390,7 @@ class AIPlannerTests(unittest.TestCase):
             self.assertEqual(captures[1]["repair_index"], 1)
             self.assertIn("Do not reconsider", repair_requests[0].prompt)
 
-    def test_plan_rejection_soft_bound_enters_recovery_cycle_and_switches_planner(self):
+    def test_plan_rejection_semantic_bound_adjudicates_delta_without_full_planner_restart(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; runtime = base / "runtime"
             make_repo(repo)
@@ -1414,20 +1414,11 @@ class AIPlannerTests(unittest.TestCase):
             }
             plan_id, _ = coordinator.start(project, snapshot, "command-recovery-cycle")
             row = wait_terminal(coordinator, plan_id)
-            self.assertEqual(row["state"], "ready", row)
-            self.assertEqual(row["recovery_cycle"], 1)
+            self.assertEqual(row["state"], "owner_gate", row)
             self.assertEqual(len(row["rejection_chain"]), 2)
-            recovery_planners = [
-                req for req in port.requests
-                if req.role == "planner" and ":recovery-1" in req.request_id
-            ]
-            self.assertEqual(len(recovery_planners), 1)
-            self.assertIn("planner-a", recovery_planners[0].excluded_resource_ids)
-            self.assertEqual(row["planner_resource"]["resource_id"], "planner-b")
-            recovery_events = [e for e in progress.emissions if e["milestone"] == "PLAN_RECOVERY"]
-            self.assertEqual(len(recovery_events), 1)
-            self.assertEqual(recovery_events[0]["details"]["recovery_cycle"], 1)
-            self.assertEqual(recovery_events[0]["details"]["rejection_chain_length"], 2)
+            self.assertEqual(len([r for r in port.requests if r.role == "planner"]), 2)
+            self.assertEqual(len([r for r in port.requests if r.role == "adjudicator"]), 1)
+            self.assertEqual(row.get("recovery_cycle", 0), 0)
 
     def test_legacy_exhausted_gate_can_resume_into_recovery_cycle(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1459,7 +1450,7 @@ class AIPlannerTests(unittest.TestCase):
                 **initial_project,
                 "ai_roles": {"planner": {
                     "enabled": True,
-                    "max_plan_remediation_rounds": 1,
+                    "max_plan_remediation_rounds": 2,
                     "max_plan_recovery_cycles": 1,
                     "hard_total_review_rejects": 4,
                 }},
@@ -1520,7 +1511,7 @@ class AIPlannerTests(unittest.TestCase):
                 **initial_project,
                 "ai_roles": {"planner": {
                     "enabled": True,
-                    "max_plan_remediation_rounds": 1,
+                    "max_plan_remediation_rounds": 2,
                     "max_plan_recovery_cycles": 1,
                     "hard_total_review_rejects": 4,
                 }},
@@ -1546,7 +1537,7 @@ class AIPlannerTests(unittest.TestCase):
                 "execution": {"engine": "aibroker"},
                 "ai_roles": {"planner": {
                     "enabled": True,
-                    "max_plan_remediation_rounds": 1,
+                    "max_plan_remediation_rounds": 3,
                     "max_plan_recovery_cycles": 2,
                     "hard_total_review_rejects": 3,
                 }},
@@ -1561,7 +1552,7 @@ class AIPlannerTests(unittest.TestCase):
             self.assertEqual(row["state"], "owner_gate", row)
             self.assertIn("hard reject limit reached (3)", row["reason"])
             self.assertEqual(len(row["rejection_chain"]), 3)
-            self.assertEqual(row["recovery_cycle"], 1)
+            self.assertEqual(row.get("recovery_cycle", 0), 0)
 
     def test_remediation_prompt_and_resource_propagation(self):
         with tempfile.TemporaryDirectory() as td:

@@ -611,7 +611,7 @@ class AIPlannerCoordinator:
         thread.start()
         return plan_id, "planning started"
 
-    def start(self, project: dict[str, Any], snapshot: dict[str, Any], command_id: str) -> tuple[str | None, str]:
+    def start(self, project: dict[str, Any], snapshot: dict[str, Any], command_id: str, *, recovery_excluded_resource_ids: Sequence[str] = ()) -> tuple[str | None, str]:
         if self.port is None:
             return None, "AIBroker execution port unavailable"
         policy, error = _planner_policy(project)
@@ -635,7 +635,8 @@ class AIPlannerCoordinator:
         except OSError:
             return None, "agent/next.md unavailable"
         return self._begin_lifecycle(
-            project, policy, command_id, task_id, truth, {"next_text": next_text}
+            project, policy, command_id, task_id, truth, {"next_text": next_text,
+                "recovery_excluded_planner_resource_ids": list(recovery_excluded_resource_ids)}
         )
 
     def start_deferred(
@@ -957,6 +958,10 @@ class AIPlannerCoordinator:
             return False, "plan hard reject limit already reached"
         if recovery_cycle >= policy["max_plan_recovery_cycles"]:
             return False, "plan recovery cycle limit already reached"
+        spent = max(int(record.get("cumulative_remediation_rounds") or 0),
+                    int(record.get("remediation_round") or 0), max(0, reject_count - 1))
+        if spent >= policy["max_plan_remediation_rounds"]:
+            return False, "semantic remediation budget exhausted; only unresolved-delta adjudication may proceed"
         truth = read_repository_truth(repo_path)
         if not truth.valid or truth.dirty or truth.branch != record.get("branch"):
             return False, "repository changed since recoverable plan gate opened"
@@ -995,7 +1000,8 @@ class AIPlannerCoordinator:
                 "status_hash": truth.status_hash,
                 "next_text": next_text,
                 "recovery_cycle": next_cycle,
-                "remediation_round": 0,
+                "remediation_round": spent + 1,
+                "cumulative_remediation_rounds": spent + 1,
                 "recovery_rejection": current.get("review_reason"),
                 "recovery_prior_plan": copy.deepcopy(current.get("plan")),
                 "recovery_prior_resource": copy.deepcopy(current.get("planner_resource")),
@@ -1216,6 +1222,13 @@ class AIPlannerCoordinator:
         base_fields = {
             "next_text": next_text,
             "seed_plan": copy.deepcopy(plan),
+            "rejection_chain": copy.deepcopy(source.get("rejection_chain") or []),
+            "reviewer_attempts": copy.deepcopy(source.get("reviewer_attempts") or []),
+            "cumulative_remediation_rounds": max(
+                int(source.get("cumulative_remediation_rounds") or 0),
+                int(source.get("remediation_round") or 0),
+                max(0, len(source.get("rejection_chain") or []) - 1),
+            ),
             "seed_planner_resource": copy.deepcopy(resource),
             "seed_planner_dispatch_id": source.get("planner_dispatch_id"),
             "seed_planner_execution_id": source.get("planner_execution_id"),
@@ -1610,8 +1623,17 @@ class AIPlannerCoordinator:
             )
         else:
             base_request_id = plan_id + ":reviewer" if round_no == 0 else f"{plan_id}:reviewer:remediate-{round_no}"
-        failed_resource_ids: set[str] = set()
-        failed_resources: list[Any] = []
+        prior_failures = [row.get("resource") for row in record.get("reviewer_attempts", [])
+                          if row.get("failure_classification") in _ROLE_RESOURCE_FAILURES and isinstance(row.get("resource"), dict)]
+        failed_resource_ids: set[str] = {r["resource_id"] for r in prior_failures if r.get("resource_id")}
+        failed_resources: list[Any] = [ResourceContext(r.get("resource_id"), r.get("provider"), r.get("account"), r.get("model")) for r in prior_failures]
+        # Exhausted account rotations exclude the whole configured provider/model.
+        if callable(getattr(self.port, "resource_snapshot", None)) and prior_failures:
+            resources = self.port.resource_snapshot().get("resources", [])
+            exhausted = {(r.provider, r.model) for r in failed_resources
+                         if sum((x.provider, x.model) == (r.provider, r.model) for x in failed_resources) >= 2}
+            failed_resource_ids.update(r["resource_id"] for r in resources
+                                       if (r.get("provider"), r.get("model")) in exhausted and r.get("resource_id"))
         max_attempts = 1 + policy["max_reviewer_resource_failovers"]
 
         for attempt in range(1, max_attempts + 1):
@@ -1845,7 +1867,7 @@ class AIPlannerCoordinator:
                     role="reviewer",
                     max_age_seconds=review_request.timeout_seconds,
                     request_id=review_request.request_id,
-                    resource_id=review_request.previous_resource_context.resource_id if review_request.previous_resource_context else None,
+                    resource_id=resource.resource_id if resource else None,
                 )
 
                 self._finish(plan_id, "failed", f"plan review failed: {review_failure}")
@@ -1914,11 +1936,12 @@ class AIPlannerCoordinator:
 
         while True:
             restart_recovery_cycle = False
-            for round_no in range(max_remediation_rounds + 1):
+            first_round = int(record.get("cumulative_remediation_rounds") or 0)
+            for round_no in range(first_round, max_remediation_rounds + 1):
                 with self._lock:
                     current_state = self._load_state()["plans"].get(plan_id, {})
                     rejection_chain = copy.deepcopy(current_state.get("rejection_chain") or [])
-                seeded = recovery_cycle == 0 and round_no == 0 and isinstance(record.get("seed_plan"), dict)
+                seeded = round_no == first_round and isinstance(record.get("seed_plan"), dict)
                 if seeded:
                     plan = copy.deepcopy(record["seed_plan"])
                     resource = record.get("seed_planner_resource") or {}
@@ -1941,7 +1964,7 @@ class AIPlannerCoordinator:
                         prior_plan=prior_plan,
                         prior_resource=prior_resource,
                         recovery_cycle=recovery_cycle,
-                        initial_excluded_resource_ids=tuple(sorted(recovery_excluded_resource_ids if round_no == 0 else set())),
+                        initial_excluded_resource_ids=tuple(sorted(recovery_excluded_resource_ids if round_no == first_round else set())),
                         rejection_chain=rejection_chain,
                     )
                     if attempts_res is None:
@@ -2166,6 +2189,7 @@ class AIPlannerCoordinator:
                         current.update({
                             "state": "remediating",
                             "remediation_round": round_no + 1,
+                            "cumulative_remediation_rounds": round_no + 1,
                             "recovery_cycle": recovery_cycle,
                             "review_reason": reason,
                             "remediation_started_at": utc_now_iso(),
@@ -2189,58 +2213,21 @@ class AIPlannerCoordinator:
                     prior_resource = previous
                     continue
 
-                if round_no < 2 and recovery_cycle < max_recovery_cycles:
-                    recovery_cycle += 1
-                    rejection = reason
-                    prior_plan = plan
-                    prior_resource = previous
-                    recovery_excluded_resource_ids = {
-                        previous.resource_id
-                    } if previous is not None and previous.resource_id else set()
-                    with self._lock:
-                        state = self._load_state()
-                        current = state["plans"].get(plan_id)
-                        if not isinstance(current, dict):
-                            return
-                        current.update({
-                            "state": "remediating",
-                            "recovery_cycle": recovery_cycle,
-                            "remediation_round": current.get("remediation_round", round_no),
-                            "cumulative_remediation_rounds": int(current.get("cumulative_remediation_rounds") or current.get("remediation_round") or round_no),
-                            "review_reason": reason,
-                            "recovery_rejection": reason,
-                            "recovery_prior_plan": copy.deepcopy(plan),
-                            "recovery_prior_resource": self._resource_payload(previous),
-                            "recovery_excluded_planner_resource_ids": sorted(recovery_excluded_resource_ids),
-                            "recovery_started_at": utc_now_iso(),
-                        })
-                        self._save_state(state)
-                    if self.progress_channel is not None:
-                        self.progress_channel.emit(
-                            self._project_payload(record, project),
-                            "PLAN_RECOVERY",
-                            task_id=record["task_id"],
-                            occurrence_key=f"{plan_id}:recovery-{recovery_cycle}",
-                            details={
-                                "plan_id": plan_id,
-                                "recovery_cycle": recovery_cycle,
-                                "reason": reason,
-                                "rejection_chain_length": chain_len,
-                                "excluded_planner_resource_ids": sorted(recovery_excluded_resource_ids),
-                            },
-                        )
-                    restart_recovery_cycle = True
-                    break
-
+                # Resource recovery reuses the candidate plan; it must never
+                # open another full Planner loop after the semantic budget.
                 adjudication = self.adjudicate_plan_delta(
                     record["project_id"],
                     record["task_id"],
                     accepted_contract=plan or {},
                     unresolved_delta={"blocking_finding": reason, "rejection_reason": reason},
+                    repository_path=record["repo_path"], previous_resource=previous,
+                    timeout_seconds=policy["review_timeout_seconds"],
+                    independence=policy["review_independence"],
                 )
                 if adjudication.get("disposition") == "bounded_patch" and adjudication.get("patch"):
                     if isinstance(plan, dict):
-                        plan.update(adjudication["patch"])
+                        for key, additions in adjudication["patch"].items():
+                            plan[key] = list(dict.fromkeys([*plan.get(key, []), *additions]))
                     if self.accounting is not None:
                         self.accounting.record_attempt_outcome(
                             f"{plan_id}:adjudicated",
@@ -2272,7 +2259,7 @@ class AIPlannerCoordinator:
                 if adjudication.get("disposition") == "owner_gate":
                     gate_reason = adjudication.get("reason") or f"unresolved plan delta: {reason}"
                     gate_code = adjudication.get("gate_code") or "DELTA_ADJUDICATION_UNRESOLVED"
-                    gate_id = f"gate-adjudicate-{record['task_id']}-{int(time.time())}"
+                    gate_id = "gate-adjudicate-" + hashlib.sha256(f"{plan_id}:{gate_code}:{gate_reason}".encode()).hexdigest()[:24]
                     from dev_orchestrator.control.owner_store import OwnerControlStore
                     OwnerControlStore(self.runtime_root).record_gate(
                         project_id=record["project_id"],
@@ -2883,6 +2870,11 @@ class AIPlannerCoordinator:
         task_id: str,
         accepted_contract: dict[str, Any],
         unresolved_delta: dict[str, Any],
+        *,
+        repository_path: Path | str | None = None,
+        previous_resource: ResourceContext | None = None,
+        timeout_seconds: float = 900.0,
+        independence: str = "provider",
     ) -> dict[str, Any]:
         """Read-only bounded delta adjudication per docs/development-workflow.md.
 
@@ -2899,27 +2891,60 @@ class AIPlannerCoordinator:
                 "patch": {},
             }
 
-        # Check for explicit resolvable patch in unresolved delta
-        if isinstance(unresolved_delta.get("patch"), dict) and unresolved_delta["patch"]:
-            return {
-                "disposition": "bounded_patch",
-                "reason": "delta_resolved_via_patch",
-                "patch": dict(unresolved_delta["patch"]),
-            }
-
-        # Check if delta is resolvable against accepted_contract read-only
-        contract_text = json.dumps(accepted_contract).lower() if isinstance(accepted_contract, dict) else ""
-        blocking_str = str(blocking).strip().lower()
-        if unresolved_delta.get("resolvable") is True or (blocking_str and blocking_str in contract_text):
-            return {
-                "disposition": "bounded_patch",
-                "reason": "delta_resolved_against_accepted_contract",
-                "patch": {"adjudicated_resolution": f"reconciled against accepted contract: {blocking}"},
-            }
-
+        # Only an actual independent read-only role result can close a blocker.
+        # Caller flags, repeated words and candidate-plan labels are not proof.
+        adjudication_failure = ""
+        if self.port is not None and repository_path and previous_resource is not None:
+            payload = {"accepted_contract": accepted_contract, "unresolved_delta": unresolved_delta}
+            digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            try:
+                request = AIRoleRequest(
+                    project_id=project_id, task_run_id=task_id, stage_run_id="delta_adjudication",
+                    role_run_id="delta-adjudicator-" + digest[:16],
+                    request_id=f"adjudicate:{project_id}:{task_id}:{digest}", role="adjudicator",
+                    working_directory=Path(repository_path), quality="high", independence=independence,
+                    previous_resource_context=previous_resource, timeout_seconds=timeout_seconds,
+                    metadata={"read_only": True, "semantic_remediation_budget_exhausted": True},
+                    prompt=("Read-only delta adjudication. Do not edit files or redesign/rewrite the plan. "
+                            "Adjudicate only the unresolved blocker against the preserved contract and read-only repository evidence. "
+                            "Return one JSON object with disposition=bounded_patch or owner_gate, reason, "
+                            "resolved_findings (exact blocker strings), resolution_evidence (concrete nonblank explanation), "
+                            "and patch. Patch may only ADD at most eight bounded strings across at most two of "
+                            "implementation_steps, interfaces, validation, risks. Preserve all accepted content. "
+                            "A mention of a blocker or a caller's resolvable flag is not evidence. "
+                            "If resolution is uncertain, return owner_gate.\n" + json.dumps(payload)),
+                )
+                result = self.port.execute(request)
+                data = json.loads(result.output or "") if result.status == "succeeded" else {}
+                patch = data.get("patch") if isinstance(data, dict) else None
+                result_resource = result.resource_context
+                independent = (result_resource is not None and (
+                    independence == "none"
+                    or independence == "provider" and bool(result_resource.provider) and result_resource.provider != previous_resource.provider
+                    or independence == "account" and bool(result_resource.account) and (result_resource.provider, result_resource.account) != (previous_resource.provider, previous_resource.account)
+                    or independence == "resource" and bool(result_resource.resource_id) and result_resource.resource_id != previous_resource.resource_id))
+                if (isinstance(data, dict) and independent and data.get("disposition") == "bounded_patch" and isinstance(patch, dict)
+                        and 0 < len(patch) <= 2
+                        and set(patch) <= {"implementation_steps", "interfaces", "validation", "risks"}
+                        and all(isinstance(v, list) and v and all(isinstance(s, str) and 0 < len(s.strip()) <= 1000 for s in v) for v in patch.values())
+                        and sum(map(len, patch.values())) <= 8
+                        and result.request_id == request.request_id
+                        and isinstance(data.get("resolved_findings"), list)
+                        and str(blocking) in data["resolved_findings"]
+                        and isinstance(data.get("resolution_evidence"), str) and data["resolution_evidence"].strip()):
+                    candidate = copy.deepcopy(accepted_contract)
+                    for key, additions in patch.items():
+                        candidate[key] = list(dict.fromkeys([*candidate.get(key, []), *additions]))
+                    _parse_plan(json.dumps(candidate), task_id)
+                    return {"disposition": "bounded_patch", "reason": str(data.get("reason") or data["resolution_evidence"]),
+                            "patch": copy.deepcopy(patch), "request_id": request.request_id,
+                            "resource_context": self._resource_payload(result.resource_context)}
+            except (ValueError, TypeError, AttributeError, RuntimeError) as exc:
+                # Malformed or unavailable adjudication cannot authorize execution.
+                adjudication_failure = f"; adjudicator unavailable or invalid ({type(exc).__name__})"
         return {
             "disposition": "owner_gate",
-            "reason": f"unresolved_delta_requires_owner: {blocking}",
+            "reason": f"unresolved_delta_requires_owner: {blocking}{adjudication_failure}",
             "gate_code": "DELTA_ADJUDICATION_UNRESOLVED",
             "task_id": task_id,
             "project_id": project_id,
@@ -2997,6 +3022,7 @@ def persist_harness_session(
     resource_id: str | None = None,
     started_at: str | None = None,
     child_pids: Sequence[int] = (),
+    child_create_times: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Persist role harness session to runtime/harness-sessions.json for cleanup correlation."""
     runtime = Path(runtime_root)
@@ -3012,6 +3038,7 @@ def persist_harness_session(
         "resource_id": resource_id or existing.get("resource_id"),
         "started_at": started_at or existing.get("started_at") or utc_now_iso(),
         "child_pids": combined_pids,
+        "child_create_times": {**existing.get("child_create_times", {}), **(child_create_times or {})},
     }
     sessions[session_id] = entry
     write_json(harness_sessions_file, data)
@@ -3034,6 +3061,10 @@ def cleanup_stale_role_tool_children(
     """
     runtime = Path(runtime_root)
     terminated_count = 0
+    # A stored PID is not an execution identity. Missing correlation is never
+    # authorization to signal every session in the registry.
+    if not request_id or not resource_id or role not in {"reviewer", "adjudicator"}:
+        return 0
     harness_sessions_file = runtime / "harness-sessions.json"
     if not harness_sessions_file.is_file():
         return 0
@@ -3060,8 +3091,10 @@ def cleanup_stale_role_tool_children(
                     age = (now_dt - s_dt).total_seconds()
                     if age < max_age_seconds:
                         continue
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    continue
+            else:
+                continue
 
             child_pids = list(s_info.get("child_pids") or [])
             surviving_pids = []
@@ -3069,15 +3102,22 @@ def cleanup_stale_role_tool_children(
                 try:
                     import psutil
                     p = psutil.Process(c_pid)
-                    cmdline = " ".join(p.cmdline()).lower() if callable(getattr(p, "cmdline", None)) else ""
-                    if not cmdline or any(k in cmdline for k in ("graphify", "reviewer", "review", "ocr", "python", "node")):
+                    expected_created = (s_info.get("child_create_times") or {}).get(str(c_pid))
+                    if not isinstance(expected_created, (int, float)) or p.create_time() != expected_created:
+                        surviving_pids.append(c_pid)
+                        continue
+                    argv = p.cmdline()
+                    cmdline = " ".join(argv)
+                    tool = any("graphify" in str(part).lower() for part in argv)
+                    readonly = any(str(part).lower() in {"query", "path", "explain"} for part in argv)
+                    if tool and readonly and request_id in cmdline and resource_id in cmdline:
                         p.terminate()
                         terminated_count += 1
                         modified = True
                     else:
                         surviving_pids.append(c_pid)
                 except Exception:
-                    pass
+                    surviving_pids.append(c_pid)
             s_info["child_pids"] = surviving_pids
         if modified:
             write_json(harness_sessions_file, data)

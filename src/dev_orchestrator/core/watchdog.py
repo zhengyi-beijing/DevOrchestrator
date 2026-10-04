@@ -1740,7 +1740,10 @@ class WatchdogCoordinator:
         )
         pool_telemetry = None
         port = getattr(self, "ai_execution_port", None)
-        if port is not None:
+        if port is not None and callable(getattr(port, "resource_snapshot", None)):
+            pool_telemetry = port.resource_snapshot()
+            routing_cfg = pool_telemetry.get("routing", {})
+        elif port is not None:
             pool = getattr(port, "resource_pool", None) or getattr(port, "pool", None)
             if pool is not None:
                 pool_telemetry = pool.telemetry() if callable(getattr(pool, "telemetry", None)) else getattr(pool, "telemetry", None)
@@ -1753,15 +1756,21 @@ class WatchdogCoordinator:
         if pool_telemetry is None:
             pool_telemetry = project_config.get("resource_pool") or project_config.get("pool_telemetry")
 
+        failed_resource = failed.get("planner_resource") or {}
         res_avail = build_resource_availability(
             pool_telemetry,
             routing_cfg,
             role="planner",
             independence="none",
+            previous_provider=failed_resource.get("provider"),
+            previous_model=failed_resource.get("model"),
+            quality=(project_config.get("ai_roles", {}).get("planner", {}).get("quality") or "high"),
         )
 
         owner_gate_auth = resolve_owner_gate_authority(self.runtime_root, snapshot)
         prev_attempts = load_recovery_attempts(self.runtime_root, pid, incident_id=f"inc-{fingerprint[:16]}")
+        from dev_orchestrator.incidents.policy import resolve_incident_policy
+        incident_policy = resolve_incident_policy(project_config)
 
         inputs = RecoveryInputs(
             authority={
@@ -1791,11 +1800,8 @@ class WatchdogCoordinator:
             resource_availability=res_avail,
             existing_effects=None,
             budgets={
-                "max_same_strategy_retries": int(policy.get("max_same_strategy_retries", limit)),
-                "max_recoveries_per_incident": int(policy.get("max_attempts_per_run", limit)),
-                "max_recovery_attempts_per_family": int(policy.get("max_recovery_attempts_per_family", 5)),
-                "heterogeneous_required_classes": policy.get("heterogeneous_required_classes", []),
-                "recovery_enabled": bool(policy.get("recovery_enabled", True)),
+                **incident_policy,
+                "max_recoveries_per_incident": min(limit, incident_policy["max_recoveries_per_incident"]),
             },
         )
         rcv_decision = decide_recovery(inputs, now=utc_now_iso())
@@ -1833,7 +1839,7 @@ class WatchdogCoordinator:
         problem["state"] = "retrying"
         self._save_state(self._cached_state)
 
-        reserve_recovery_attempt(self.runtime_root, pid, rcv_decision)
+        reserve_recovery_attempt(self.runtime_root, pid, rcv_decision, config=project_config)
 
         try:
             from dev_orchestrator.core.control_commands import submit_control_command
@@ -1843,6 +1849,10 @@ class WatchdogCoordinator:
                 "continue",
                 command_id=command_id,
                 expected=identity,
+                target={"recovery_attempt_id": rcv_decision.attempt_id,
+                        "recovery_excluded_resource_ids": [r["resource_id"] for r in [*res_avail["eligible_candidates"], *res_avail["ineligible_candidates"]]
+                            if r["resource_id"] != (rcv_decision.authorized_effect or {}).get("target_resource_id")]}
+                       if rcv_decision.action in {"HETEROGENEOUS_ESCALATION", "SWITCH_RESOURCE"} else None,
                 source="watchdog_planning_recovery",
             )
             record_recovery_outcome(
@@ -1872,10 +1882,10 @@ class WatchdogCoordinator:
         except Exception as exc:
             try:
                 record_recovery_outcome(
-                    self.runtime_root, pid, command_id, "failed", reason=str(exc)
+                    self.runtime_root, pid, rcv_decision.attempt_id, "failed", reason=str(exc)
                 )
-            except Exception:
-                pass
+            except Exception as settlement_error:
+                attempt["settlement_error"] = str(settlement_error)
             attempt["state"] = "blocked"
             attempt["reason"] = f"enqueue failed: {exc}"
             problem["state"] = "blocked"
