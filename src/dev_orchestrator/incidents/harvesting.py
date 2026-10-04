@@ -1,8 +1,9 @@
 """Automated failure harvesting with named detector registry and durable anomaly derivation."""
 from __future__ import annotations
 
-from pathlib import Path
+import hashlib
 import json
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from dev_orchestrator.control.command_store import ControlCommandStore
@@ -12,6 +13,7 @@ from dev_orchestrator.incidents.liveness import resolve_role_liveness
 from dev_orchestrator.incidents.obligations import resolve_progress_obligation
 from dev_orchestrator.incidents.owner_gate import resolve_owner_gate_authority
 from dev_orchestrator.incidents.policy import resolve_incident_policy
+from dev_orchestrator.incidents.store import load_incident_store
 from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now, utc_now_iso
 
 
@@ -89,9 +91,11 @@ def _detect_execution_loss(
         pid = str(rec.get("project_id") or "")
         inv_key = rec.get("invariant_key")
         term_outcome = rec.get("terminal_outcome")
-        if term_outcome == "explicitly_reconciled" or rec.get("loss_detected"):
+        if term_outcome in ("explicitly_reconciled", "missing_execution_record") or rec.get("loss_detected") or rec.get("state") == "lost":
+            fclass = "missing_execution_record" if term_outcome == "missing_execution_record" else "worker_process_lost"
             semantic = {
-                "failure_class": "execution_loss",
+                "failure_class": fclass,
+                "role": "worker",
                 "diagnosis_code": "worker_vanished_without_terminal_state",
                 "lifecycle_class": "executing",
                 "contract_class": "durability",
@@ -103,7 +107,7 @@ def _detect_execution_loss(
                 "ACTIONABLE_EXECUTION_LOSS",
                 semantic,
                 rec,
-                f"ex_loss:{pid}:{lkey}",
+                f"worker_loss:{pid}:{lkey}",
             ))
     return anomalies
 
@@ -128,8 +132,12 @@ def _detect_unconsumed_plan_or_review(
             for rid, rdata in reviews.items():
                 if isinstance(rdata, dict) and rdata.get("state") == "failed":
                     pid = str(rdata.get("project_id") or "")
+                    dec_id = rdata.get("decision_id") or "1"
+                    reason = str(rdata.get("reason") or "").lower()
+                    fclass = "reviewer_timeout" if ("timeout" in reason or "deadline" in reason) else "reviewer_rejected"
                     semantic = {
-                        "failure_class": "reviewer_failure",
+                        "failure_class": fclass,
+                        "role": "reviewer",
                         "diagnosis_code": "reviewer_failed",
                         "lifecycle_class": "reviewing",
                         "contract_class": "technical_review",
@@ -140,7 +148,7 @@ def _detect_unconsumed_plan_or_review(
                         "UNCONSUMED_REVIEWER_FAILURE",
                         semantic,
                         rdata,
-                        f"rev_fail:{pid}:{rid}",
+                        f"rev_fail:{pid}:{rid}:{dec_id}",
                     ))
     return anomalies
 
@@ -518,7 +526,7 @@ def _detect_worker_loss(
         tid = rec.get("task_id")
         inv_key = rec.get("invariant_key")
         term_outcome = rec.get("terminal_outcome")
-        if rec.get("loss_detected") or term_outcome in ("explicitly_reconciled", "stale_predecessor_fenced") or rec.get("state") == "lost":
+        if rec.get("loss_detected") or term_outcome in ("explicitly_reconciled", "stale_predecessor_fenced", "missing_execution_record") or rec.get("state") == "lost":
             if term_outcome == "missing_execution_record":
                 fclass = "missing_execution_record"
             else:
@@ -668,6 +676,8 @@ def _detect_daemon_restart_failure(
         return anomalies
     latest_boot = boots[-1]
     boot_id = str(latest_boot.get("boot_id") or f"boot-{len(boots)}")
+    boot_ts_raw = latest_boot.get("started_at") or latest_boot.get("recorded_at")
+    boot_dt = parse_utc(boot_ts_raw) if boot_ts_raw else None
 
     te_file = runtime_root / "transition-executor.json"
     if not te_file.is_file():
@@ -686,19 +696,46 @@ def _detect_daemon_restart_failure(
         tid = edata.get("task_id")
         state = edata.get("state")
 
-        if state in ("running", "handoff"):
-            if state == "handoff":
-                fclass = "daemon_restart_during_handoff"
-            else:
-                fclass = "daemon_restart_during_execution"
-            semantic = {
-                "failure_class": fclass,
-                "lifecycle_class": "executing" if state == "running" else "handoff",
-                "contract_class": "daemon_lifecycle",
-                "restart_kind": "handoff" if state == "handoff" else "execution",
-            }
-            occ_key = f"boot_restart:{pid}:{boot_id}:{eid}"
-            anomalies.append((str(pid), tid, "DAEMON_RESTART_FAILURE", semantic, edata, occ_key))
+        # Skip settled executions
+        if edata.get("handoff_consumed") or edata.get("completed_at") or edata.get("settled_at") or edata.get("terminal_outcome"):
+            continue
+        if edata.get("predecessor_terminal_state") == "settled" and (edata.get("handoff_consumed_at") or edata.get("predecessor_settled_at")):
+            if edata.get("handoff_consumed") or edata.get("outcome") in ("planning_required", "accepted"):
+                continue
+
+        if state not in ("running", "handoff"):
+            continue
+
+        # Correlate with boot window
+        if edata.get("interrupted") or edata.get("in_flight"):
+            pass
+        elif boot_dt is not None:
+            exec_start_raw = edata.get("started_at") or edata.get("recorded_at")
+            if not exec_start_raw:
+                continue
+            exec_start_dt = parse_utc(exec_start_raw)
+            if exec_start_dt > boot_dt:
+                # Started after the boot
+                continue
+            exec_term_raw = edata.get("completed_at") or edata.get("handoff_consumed_at") or edata.get("settled_at")
+            if exec_term_raw:
+                exec_term_dt = parse_utc(exec_term_raw)
+                if exec_term_dt < boot_dt:
+                    # Completed before the boot
+                    continue
+
+        if state == "handoff":
+            fclass = "daemon_restart_during_handoff"
+        else:
+            fclass = "daemon_restart_during_execution"
+        semantic = {
+            "failure_class": fclass,
+            "lifecycle_class": "executing" if state == "running" else "handoff",
+            "contract_class": "daemon_lifecycle",
+            "restart_kind": "handoff" if state == "handoff" else "execution",
+        }
+        occ_key = f"boot_restart:{pid}:{boot_id}:{eid}"
+        anomalies.append((str(pid), tid, "DAEMON_RESTART_FAILURE", semantic, edata, occ_key))
 
     return anomalies
 
@@ -808,7 +845,8 @@ def _detect_execution_transport_failure(
                     pid = row.get("project_id")
                     if not pid:
                         continue
-                    op_id = row.get("operation_id") or row.get("request_id") or f"op-{hash(json.dumps(row))}"
+                    stable_hash = hashlib.sha256(json.dumps(row, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+                    op_id = row.get("operation_id") or row.get("request_id") or f"op-{stable_hash}"
                     semantic = {
                         "failure_class": "transport_unavailable",
                         "contract_class": "execution_transport",
@@ -888,6 +926,12 @@ DETECTORS: dict[str, Callable[..., list[tuple[str, str | None, str, dict[str, An
     "orchestrator_alive_task_stalled": _detect_orchestrator_alive_task_stalled,
 }
 
+SUPERSEDED_DETECTORS: dict[str, str] = {
+    "execution_loss": "worker_loss",
+    "actionable_execution_loss": "worker_loss",
+    "unconsumed_plan_or_review": "reviewer_failure",
+}
+
 
 def harvest_tick(
     runtime_root: Path | str,
@@ -911,8 +955,20 @@ def harvest_tick(
         if not policy.get("enabled"):
             return []
 
+        store = load_incident_store(runtime)
+        known_families_by_key: dict[str, dict[str, Any]] = {}
+        for fam in store.index.get("families", {}).values():
+            if not isinstance(fam, dict):
+                continue
+            for occ in fam.get("occurrences", []):
+                k = occ if isinstance(occ, str) else occ.get("occurrence_key")
+                if k:
+                    known_families_by_key[k] = fam
+
         seen_detectors = set()
         for detector_name, detector_fn in DETECTORS.items():
+            if detector_name in SUPERSEDED_DETECTORS and SUPERSEDED_DETECTORS[detector_name] in DETECTORS:
+                continue
             if detector_fn in seen_detectors:
                 continue
             seen_detectors.add(detector_fn)
@@ -928,6 +984,10 @@ def harvest_tick(
                     now=now,
                 )
                 for pid, tid, classification, semantic, ev, occ_key in findings:
+                    if occ_key in known_families_by_key:
+                        captured_families.append(known_families_by_key[occ_key])
+                        continue
+
                     family = capture_incident(
                         runtime_root=runtime,
                         project_id=pid,
@@ -939,6 +999,7 @@ def harvest_tick(
                         config=config,
                     )
                     captured_families.append(family)
+                    known_families_by_key[occ_key] = family
             except Exception:
                 # Individual detector failure must not abort other detectors or daemon tick
                 continue

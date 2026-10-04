@@ -1,61 +1,31 @@
-# P20.2 Automatic Failure Harvesting & Regression Promotion State (2026-10-04)
+# P20.2 Automatic Failure Harvesting & Regression Promotion Technical Review Remediation State (2026-10-04)
 
-P20.2 Automatic Failure Harvesting & Regression Promotion implementation complete:
-- Status: **IMPLEMENTATION_COMPLETE / TECHNICAL_REVIEW_PENDING**.
+P20.2 Automatic Failure Harvesting & Regression Promotion technical review remediation complete:
+- Status: **REMEDIATION_COMPLETE / TECHNICAL_REVIEW_PENDING**.
 - Control-Plane Impact:
   - Invariants: CURRENT_TASK_MATCHES_ACTIVE_EXECUTION, TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION, PENDING_DESIGN_NOT_EXECUTING, SUCCESSOR_HANDOFF_LINEAGE_VALID, NEXT_TASK_WITHOUT_HANDOFF, SINGLE_ACTIVE_LIFECYCLE_OWNER.
   - Transition boundaries: authority_reconciliation, watchdog_recovery, owner_gate_transition, successor_handoff, worker_launch.
   - Fault scenarios: CPF-01, CPF-02, CPF-03, CPF-04, CPF-05, CPF-06, CPF-07, CPF-08, CPF-09, CPF-10.
   - Convergence evidence: Every failure source yields bounded sanitized durable evidence; concurrent replay changes no execution identity; verified fixtures discriminate real invariant behavior; CPF tests preserve sole authority.
-- Implemented Capabilities:
-  1. Nine Durable-Source Failure Detectors (`src/dev_orchestrator/incidents/harvesting.py`):
-     - `planner_failure`: `runtime/ai-planner.json` -> `planner_timeout`, `malformed_ai_output`.
-     - `worker_loss`: `runtime/execution-lineage.json` -> `worker_process_lost`, `missing_execution_record` (CPF-01).
-     - `reviewer_failure`: `runtime/ai-reviewer.json` -> `reviewer_timeout`, `reviewer_rejected`.
-     - `watchdog_recovery`: `runtime/watchdog.json` -> `watchdog_stall` and mapped taxonomy classes.
-     - `transition_executor_failure`: `runtime/transition-executor.json` -> `lost_handoff` (CPF-02), `lifecycle_projection_mismatch`, `duplicate_request`.
-     - `daemon_restart_failure`: `runtime/daemon-boots.jsonl` + in-flight transitions -> `daemon_restart_during_handoff` (CPF-03), `daemon_restart_during_execution`.
-     - `aibroker_routing_failure`: `runtime/execution-accounting/events.jsonl` -> `provider_quota_exhausted`, `provider_unavailable`, `aibroker_unavailable`.
-     - `execution_transport_failure`: `runtime/logs/transport-operations.ndjson` -> `transport_unavailable`.
-     - `durable_job_failure`: `runtime/jobs/index.json` -> `transport_unavailable`, `worker_process_lost`, `duplicate_request`.
-  2. Taxonomy Mapping Without Signature Drift (`src/dev_orchestrator/incidents/taxonomy.py`):
-     - Pure helper `map_to_failure_class` mapping findings to 19 contract `FAILURE_CLASSES`.
-     - Persists non-signature fields (`taxonomy_class`, `taxonomy_source`) without altering `ALLOWED_FINGERPRINT_FIELDS`, preserving bootstrap family `fam-689a96fe6ea9` and CPF-10 byte stability.
-  3. Durable Occurrence Identity (CPF-06, CPF-09):
-     - Derived from source-event IDs (`attempt_id`, `request_id`, `boot_id`, `handoff_idempotency_key`, `job_id`, `operation_id`), never wall clocks or ticks. Repeated ticks or replayed requests yield 0 new occurrences.
-  4. RegressionCandidate Contract (`src/dev_orchestrator/incidents/regression_candidate.py`):
-     - Schema version 1, dataclass with validation/normalization, statuses (`proposed`, `reproducible`, `verified`, `rejected`, `promoted`), replayability, persisted rejection reasons and evidence.
-     - Store persistence in `runtime/incident-packets/candidates/{candidate_id}/` via `execute_txn`.
-  5. Allowlisted ReplayRunner (`src/dev_orchestrator/incidents/replay_runner.py`):
-     - `REPLAY_OPS`: `fingerprint_stability`, `incident_capture_dedup`, `store_journal_reconcile`, `convergence_replay_case`, `convergence_invariants`.
-     - Strict fixture validation: rejects code strings/injection (`ReplayFixtureInvalidError`), unknown ops (`ReplayOpNotAllowedError`), and oversized payloads.
-     - Determinism and non-vacuous discrimination: runs anchors >= 2 times, enforces defect/corrected outcome discrimination.
-  6. Tracked Replay Corpus (`tests_py/data/p20_2_replay_corpus/*.json`):
-     - Bounded deterministic cases anchored to CPF scenarios and regression classes.
-  7. Legacy Bootstrap Ineligibility:
-     - Preserves `fam-689a96fe6ea9` (recurrence 2) unchanged.
-     - Candidate `cand-7dd84495b777` permanently marked `rejected` (`vacuous_synthetic_oracle_ineligible`), refusing promotion.
-  8. Runtime-Only Promotion With Write Fence (CPF-05):
-     - Refuses non-runtime destinations (including `tests_py` and tracked repo paths); worktree remains 100% unmutated.
-  9. Policy & Compaction Bounds:
-     - Extended `policy.py` with `typed_replay_candidates`, `max_regression_candidates`, `max_replay_corpus_cases`, `max_replay_fixture_bytes`, `max_replay_repeats`.
-     - `compact_incident_store` preserves totals, identities, statuses, candidate linkages, and dedup keys.
-  10. Fail-Closed Fencing (CPF-08):
-      - Active `corruption-fence.json` or malformed records refuse verification and promotion with `IncidentStoreFencedError`.
-  11. Dynamic CPF Observation Matrix:
-      - Validated all 10 scenarios (CPF-01 through CPF-10) against real computed outputs.
+- Technical Review Remediations (9 Concrete Findings Closed):
+  1. Finding 1 (`replay_runner.py`, replay corpus): Anti-vacuous replay oracle derives outcomes solely from computed execution results rather than fixture string literals; rejects defect/corrected outcome mismatch with `defect_anchor_outcome_mismatch` or `vacuous_oracle_non_discriminating`. Rewrote corpus cases 01, 02, 03, 06, 07, 09 so anchors differ in real inputs.
+  2. Finding 2 (`harvesting.py`, `capture.py`, `store.py`): `harvest_tick` loads existing occurrence-key set once per tick and skips `capture_incident` on known keys; `capture_incident` short-circuits across all families; `IncidentStore.execute_txn` avoids revision bumps and commits on unmodified mutator outcomes, guaranteeing zero revision increments on idempotent ticks over unchanged ledgers (CPF-06).
+  3. Finding 3 (`harvesting.py`): `_detect_execution_transport_failure` uses deterministic `hashlib.sha256(json.dumps(row, sort_keys=True).encode("utf-8")).hexdigest()[:16]` for stable occurrence keys across process restarts without relying on process-salted `hash()`.
+  4. Finding 4 (`harvesting.py`): `_detect_daemon_restart_failure` correlates boot timestamps with execution active windows (`started_at` .. `completed_at`/`settled_at`), filters settled records (`handoff_consumed`, `terminal_outcome`, etc.), eliminating false positives.
+  5. Finding 5 (`harvesting.py`): Retired overlap between `worker_loss` vs `execution_loss` and `reviewer_failure` vs `unconsumed_plan_or_review` via `SUPERSEDED_DETECTORS` and unified occurrence key formulas, ensuring single incident family per lineage record.
+  6. Finding 6 (`harvesting.py`): Added `missing_execution_record` to `_detect_worker_loss` guard and emits `missing_execution_record` failure class.
+  7. Finding 7 (`regression_candidate.py`): Enforced strict destination fence in `promote_verified_regression` using `dest_p.resolve().is_relative_to(allowed_base.resolve())` and refusing `tests_py` or sibling prefix paths.
+  8. Finding 8 (`policy.py`, `regression_candidate.py`, `replay_runner.py`): Enforced all five policy limits (`typed_replay_candidates`, `max_regression_candidates`, `max_replay_corpus_cases`, `max_replay_fixture_bytes`, `max_replay_repeats`) fail-closed.
+  9. Finding 9 (`regression_candidate.py`): Resolved default corpus directory from stable anchor `__file__` repository root rather than process CWD.
 - Verification & Evidence:
-  - Saved RED evidence: `docs/evidence/P20_2_RED.txt`.
-  - Focused test suite: `tests_py/test_p20_2_harvest_regression.py` (29 passed in 1.01s).
-  - Regression Group 1 (Incidents & Reliability, 9 suites): 104 passed in 16.72s.
-  - Regression Group 2 (Lifecycle, Successor, Invariant, P17 Replay, 4 suites): 143 passed, 12 subtests passed in 78.40s.
-  - Regression Group 3 (Planner, Reviewer, AIBroker, Transport, Jobs, Watchdog, Daemon, 11 suites): 211 passed, 5 subtests passed in 61.84s.
-  - Total across regression suites: 487 passed, 17 subtests passed, 0 failed.
+  - Focused test suite: `tests_py/test_p20_2_harvest_regression.py` (38 passed in 0.94s, including all 9 review regression tests).
+  - Regression Group 1 (Incidents & Reliability, 9 suites): 104 passed in 16.80s.
+  - Regression Group 2 (Lifecycle, Successor, Invariant, P17 Replay, 4 suites): 146 passed in 80.17s.
   - Python `compileall`: clean.
   - `git diff --check`: clean.
-  - `graphify update .`: completed (8925 nodes, 24275 edges, 365 communities).
+  - `graphify update .`: completed (8948 nodes, 24333 edges, 372 communities).
   - Contract documentation: `docs/P20_2_HARVEST_REGRESSION_CONTRACT.md`.
-- Staged successor `agent/staged/P20.3.md` remains strictly `PENDING DESIGN`. No P21, no push, no unapproved successor activation.
+- Staged successor `agent/staged/P20.3.md` remains strictly `PENDING DESIGN`. No P20.3 implementation, no P21, no push.
 
 # P20.1 Technical Review Remediation State (2026-10-04)
 

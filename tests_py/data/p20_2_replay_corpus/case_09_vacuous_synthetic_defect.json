@@ -5,12 +5,10 @@
   "expected_invariant": "ANY",
   "expected_defect_outcome": "same_outcome",
   "defect_anchor": {
-    "failure_class": "planner_timeout",
-    "outcome": "same_outcome"
+    "failure_class": "planner_timeout"
   },
   "corrected_anchor": {
-    "failure_class": "planner_timeout",
-    "outcome": "same_outcome"
+    "failure_class": "planner_timeout"
   },
   "regression_class": "planner_timeout",
   "cpf_scenarios": [

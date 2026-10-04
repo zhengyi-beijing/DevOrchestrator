@@ -49,6 +49,18 @@ def capture_incident(
 
     store = load_incident_store(runtime, max_journal_intents=max_journal_intents)
 
+    # Short-circuit if occurrence key is already recorded in the store
+    fams = store.index.get("families", {})
+    if isinstance(fams, dict):
+        for fam in fams.values():
+            if not isinstance(fam, dict):
+                continue
+            occs = fam.get("occurrences", [])
+            seen_keys = {o if isinstance(o, str) else o.get("occurrence_key") for o in occs}
+            if occurrence_key in seen_keys:
+                # Idempotent: already captured, short-circuit without executing transaction
+                return fam
+
     raw_latency = clean_semantic.get("recovery_latency") if clean_semantic else None
     if raw_latency is None and clean_evidence:
         raw_latency = clean_evidence.get("recovery_latency")

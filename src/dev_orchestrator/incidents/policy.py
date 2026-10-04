@@ -68,6 +68,8 @@ def resolve_incident_policy(config: dict[str, Any] | None = None) -> dict[str, A
 
     if isinstance(config.get("incidents"), dict):
         raw = config["incidents"]
+    elif isinstance(config.get("incident_policy"), dict):
+        raw = config["incident_policy"]
     elif not any(k in config for k in FOREIGN_TOP_LEVEL_SECTIONS) and any(k in config for k in KNOWN_INCIDENT_KEYS):
         raw = config
     else:
@@ -103,11 +105,11 @@ def resolve_incident_policy(config: dict[str, Any] | None = None) -> dict[str, A
         if "max_regression_candidates" in raw and isinstance(raw["max_regression_candidates"], int):
             policy["max_regression_candidates"] = max(1, min(100000, raw["max_regression_candidates"]))
         if "max_replay_corpus_cases" in raw and isinstance(raw["max_replay_corpus_cases"], int):
-            policy["max_replay_corpus_cases"] = max(1, min(50000, raw["max_replay_corpus_cases"]))
+            policy["max_replay_corpus_cases"] = max(0, min(50000, raw["max_replay_corpus_cases"]))
         if "max_replay_fixture_bytes" in raw and isinstance(raw["max_replay_fixture_bytes"], int):
-            policy["max_replay_fixture_bytes"] = max(1024, min(1048576, raw["max_replay_fixture_bytes"]))
+            policy["max_replay_fixture_bytes"] = max(1, min(1048576, raw["max_replay_fixture_bytes"]))
         if "max_replay_repeats" in raw and isinstance(raw["max_replay_repeats"], int):
-            policy["max_replay_repeats"] = max(2, min(10, raw["max_replay_repeats"]))
+            policy["max_replay_repeats"] = max(1, min(10, raw["max_replay_repeats"]))
 
     if "regression_owner" in config:
         policy["regression_owner"] = config["regression_owner"]

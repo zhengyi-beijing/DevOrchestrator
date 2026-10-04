@@ -5,14 +5,38 @@
   "expected_invariant": "SINGLE_ACTIVE_LIFECYCLE_OWNER",
   "expected_defect_outcome": "intent_unreconciled",
   "defect_anchor": {
+    "intent": {
+      "txn_id": "txn-defect-01",
+      "prior_revision": 0,
+      "target_revision": 1,
+      "payload_hashes": {
+        "packets/pkt-01.json": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "side_files": ["packets/pkt-01.json"]
+    },
+    "side_files": {
+      "packets/pkt-01.json": "{\"actual\": \"content_mismatch\"}"
+    },
     "outcome": "intent_unreconciled"
   },
   "corrected_anchor": {
+    "intent": {
+      "txn_id": "txn-corrected-01",
+      "prior_revision": 0,
+      "target_revision": 1,
+      "payload_hashes": {
+        "packets/pkt-02.json": "249eb956abcf88f9afd9a0c387df931b304ecec270ea41752b66f6f051a89f7f"
+      },
+      "side_files": ["packets/pkt-02.json"]
+    },
+    "side_files": {
+      "packets/pkt-02.json": "{\"actual\": \"valid\"}"
+    },
     "outcome": "journal_reconciled"
   },
   "regression_class": "store_corruption",
   "cpf_scenarios": [
     "CPF-07"
   ],
-  "notes": "CPF-07 crash after intent before publication"
+  "notes": "CPF-07 crash after intent before publication reconciles cleanly"
 }

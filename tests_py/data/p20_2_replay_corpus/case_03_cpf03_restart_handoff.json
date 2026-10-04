@@ -1,20 +1,24 @@
 {
   "case_id": "case_03_cpf03_restart_handoff",
   "replay_op": "fingerprint_stability",
-  "source_failure_signature": "daemon_restart_sig",
-  "expected_invariant": "SUCCESSOR_HANDOFF_LINEAGE_VALID",
-  "expected_defect_outcome": "restart_untracked",
+  "source_failure_signature": "ffe605f21d36e151f8ed297c49fe58f6",
+  "expected_invariant": "signature_matches",
+  "expected_defect_outcome": "signature_drift",
   "defect_anchor": {
-    "failure_class": "daemon_restart_during_handoff",
-    "outcome": "restart_untracked"
+    "failure_class": "unknown_restart_defect",
+    "lifecycle_class": "handoff",
+    "source_failure_signature": "ffe605f21d36e151f8ed297c49fe58f6",
+    "outcome": "signature_drift"
   },
   "corrected_anchor": {
     "failure_class": "daemon_restart_during_handoff",
-    "outcome": "SUCCESSOR_HANDOFF_LINEAGE_VALID"
+    "lifecycle_class": "handoff",
+    "source_failure_signature": "ffe605f21d36e151f8ed297c49fe58f6",
+    "outcome": "signature_matches"
   },
   "regression_class": "daemon_restart_during_handoff",
   "cpf_scenarios": [
     "CPF-03"
   ],
-  "notes": "CPF-03 daemon restart mid-transition"
+  "notes": "CPF-03 daemon restart mid-transition signature stability"
 }

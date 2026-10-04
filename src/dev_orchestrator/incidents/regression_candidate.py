@@ -20,8 +20,10 @@ from dev_orchestrator.incidents.replay_runner import (
     load_replay_case,
     run_replay_case,
 )
+from dev_orchestrator.incidents.policy import resolve_incident_policy
 from dev_orchestrator.incidents.sanitize import sanitize_incident_payload
 from dev_orchestrator.incidents.store import (
+    IncidentCapacityExceededError,
     IncidentStoreFencedError,
     load_incident_store,
 )
@@ -167,7 +169,16 @@ def create_regression_candidate(
 ) -> dict[str, Any]:
     """Create a new regression candidate in proposed status and persist it in the store."""
     _check_store_fence(runtime_root)
+    policy = resolve_incident_policy(config)
+    if not policy.get("typed_replay_candidates", True):
+        raise RuntimeError("typed_replay_candidates is disabled by policy")
+
     store = load_incident_store(runtime_root)
+    cands = store.index.get("regression_candidates", {})
+    if isinstance(cands, dict) and len(cands) >= int(policy.get("max_regression_candidates", 1000)):
+        raise IncidentCapacityExceededError(
+            f"max_regression_candidates exceeded ({len(cands)} >= {policy['max_regression_candidates']})"
+        )
 
     cid = candidate_id or f"cand-{uuid4().hex[:12]}"
     now = utc_now_iso()
@@ -258,6 +269,7 @@ def verify_regression_candidate(
     if errors:
         raise ValueError(f"Corrupt or invalid candidate record: {errors}")
 
+    policy = resolve_incident_policy(config)
     now = utc_now_iso()
 
     # Step 12 check: legacy synthetic candidate cand-7dd84495b777 is permanently ineligible
@@ -271,11 +283,22 @@ def verify_regression_candidate(
             "evaluated_at": now,
         }
     else:
-        # Resolve corpus directory
+        # Resolve corpus directory from stable anchor
         if corpus_dir is None:
-            c_dir = Path("tests_py/data/p20_2_replay_corpus")
+            repo_root = Path(__file__).resolve().parents[3]
+            c_dir = (repo_root / "tests_py" / "data" / "p20_2_replay_corpus").resolve()
+            if not c_dir.is_dir():
+                c_dir = Path("tests_py/data/p20_2_replay_corpus").resolve()
         else:
-            c_dir = Path(corpus_dir)
+            c_dir = Path(corpus_dir).resolve()
+
+        if c_dir.is_dir():
+            corpus_files = list(c_dir.glob("*.json"))
+            max_cases = int(policy.get("max_replay_corpus_cases", 500))
+            if len(corpus_files) > max_cases:
+                raise IncidentCapacityExceededError(
+                    f"max_replay_corpus_cases exceeded ({len(corpus_files)} > {max_cases})"
+                )
 
         case_file = c_dir / (f"{corpus_case_id}.json" if not str(corpus_case_id).endswith(".json") else str(corpus_case_id))
         if not case_file.is_file():
@@ -300,7 +323,9 @@ def verify_regression_candidate(
                     notes=spec.notes,
                 )
 
-            replay_res = run_replay_case(spec, repeats=2)
+            repeats = int(policy.get("max_replay_repeats", 2))
+            max_bytes = int(policy.get("max_replay_fixture_bytes", 65536))
+            replay_res = run_replay_case(spec, repeats=repeats, max_fixture_bytes=max_bytes)
             verification_evidence = replay_res
 
             if not replay_res["deterministic"]:
@@ -308,7 +333,7 @@ def verify_regression_candidate(
                 rejection_reason = "non_deterministic_replay"
             elif not replay_res["discriminating"]:
                 status = "rejected"
-                rejection_reason = "vacuous_oracle_non_discriminating"
+                rejection_reason = replay_res.get("reason") or "vacuous_oracle_non_discriminating"
             else:
                 defect_out = replay_res["defect_outcome"]
                 actual_out = cand_data.get("actual_outcome")
@@ -370,13 +395,12 @@ def promote_verified_regression(
     specifically refusing tests_py or tracked repository paths.
     """
     _check_store_fence(runtime_root)
-    allowed_base = Path(runtime_root) / "incident-packets"
+    allowed_base = (Path(runtime_root) / "incident-packets").resolve()
 
     if destination is not None:
-        dest_p = Path(destination)
+        dest_p = Path(destination).resolve()
         dest_str = str(dest_p).replace("\\", "/")
-        allowed_str = str(allowed_base).replace("\\", "/")
-        if "tests_py" in dest_str or not dest_str.startswith(allowed_str):
+        if "tests_py" in dest_str or not dest_p.is_relative_to(allowed_base):
             raise ValueError(
                 f"Promotion to destination '{destination}' is refused: automatic promotion writes only beneath runtime/incident-packets"
             )

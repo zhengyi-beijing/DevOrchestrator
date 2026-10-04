@@ -2,24 +2,30 @@
   "case_id": "case_06_cpf10_same_head_byte_stable",
   "replay_op": "fingerprint_stability",
   "source_failure_signature": "689a96fe6ea97a6a428e20efbf82ccc0",
-  "expected_invariant": "SIGNATURE_MATCHES",
-  "expected_defect_outcome": "signature_matches",
+  "expected_invariant": "signature_matches",
+  "expected_defect_outcome": "signature_drift",
   "defect_anchor": {
-    "failure_class": "planner_timeout",
-    "stage": "planning",
-    "role": "planner",
-    "outcome": "signature_matches"
+    "failure_class": "reviewer_timeout",
+    "role_class": "stale_plan_reviewer_unstable",
+    "lifecycle_class": "PLANNING",
+    "contract_class": "broker_codex_harness_deadline",
+    "invariant_identifier": "bounded_independent_review_recovery",
+    "source_failure_signature": "689a96fe6ea97a6a428e20efbf82ccc0",
+    "outcome": "signature_drift"
   },
   "corrected_anchor": {
-    "failure_class": "planner_timeout",
-    "stage": "planning",
-    "role": "planner",
-    "outcome": "SIGNATURE_MATCHES"
+    "failure_class": "reviewer_timeout",
+    "role_class": "plan_reviewer",
+    "lifecycle_class": "PLANNING",
+    "contract_class": "broker_codex_harness_deadline",
+    "invariant_identifier": "bounded_independent_review_recovery",
+    "source_failure_signature": "689a96fe6ea97a6a428e20efbf82ccc0",
+    "outcome": "signature_matches"
   },
   "regression_class": "planner_timeout",
   "cpf_scenarios": [
     "CPF-10",
     "CPF-06"
   ],
-  "notes": "Validates signature byte stability and discrimination between defect and corrected anchors."
+  "notes": "Validates signature byte stability and real discrimination between defect and corrected anchors."
 }

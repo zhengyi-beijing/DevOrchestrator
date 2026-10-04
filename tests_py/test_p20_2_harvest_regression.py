@@ -24,6 +24,7 @@ Covers:
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -660,8 +661,8 @@ class TestP202RegressionCandidateAndReplay(unittest.TestCase):
             family_id="fam-689a96fe6ea9",
             source_incident_ids=["pkt-01"],
             corpus_case_id="case_06_cpf10_same_head_byte_stable",
-            expected_invariant="SIGNATURE_MATCHES",
-            actual_outcome="signature_matches",
+            expected_invariant="signature_matches",
+            actual_outcome="signature_drift",
             regression_class="planner_timeout",
             replay_op="fingerprint_stability",
         )
@@ -720,8 +721,8 @@ class TestP202RegressionCandidateAndReplay(unittest.TestCase):
             family_id="fam-689a96fe6ea9",
             source_incident_ids=["pkt-01"],
             corpus_case_id="case_06_cpf10_same_head_byte_stable",
-            expected_invariant="SIGNATURE_MATCHES",
-            actual_outcome="signature_matches",
+            expected_invariant="signature_matches",
+            actual_outcome="signature_drift",
             regression_class="planner_timeout",
             replay_op="fingerprint_stability",
         )
@@ -751,8 +752,8 @@ class TestP202RegressionCandidateAndReplay(unittest.TestCase):
             family_id="fam-689a96fe6ea9",
             source_incident_ids=["pkt-01"],
             corpus_case_id="case_06_cpf10_same_head_byte_stable",
-            expected_invariant="SIGNATURE_MATCHES",
-            actual_outcome="signature_matches",
+            expected_invariant="signature_matches",
+            actual_outcome="signature_drift",
             regression_class="planner_timeout",
             replay_op="fingerprint_stability",
         )
@@ -818,8 +819,8 @@ class TestP202SanitizationAndFencing(unittest.TestCase):
             family_id="fam-689a96fe6ea9",
             source_incident_ids=["pkt-01"],
             corpus_case_id="case_06_cpf10_same_head_byte_stable",
-            expected_invariant="SIGNATURE_MATCHES",
-            actual_outcome="signature_matches",
+            expected_invariant="signature_matches",
+            actual_outcome="signature_drift",
             regression_class="planner_timeout",
         )
         cid = cand["candidate_id"]
@@ -838,8 +839,8 @@ class TestP202SanitizationAndFencing(unittest.TestCase):
             family_id="fam-689a96fe6ea9",
             source_incident_ids=["pkt-01"],
             corpus_case_id="case_06_cpf10_same_head_byte_stable",
-            expected_invariant="SIGNATURE_MATCHES",
-            actual_outcome="signature_matches",
+            expected_invariant="signature_matches",
+            actual_outcome="signature_drift",
             regression_class="planner_timeout",
             replay_op="fingerprint_stability",
         )
@@ -986,8 +987,8 @@ class TestP202CPFObservationMatrix(unittest.TestCase):
                 family_id="fam-cpf05",
                 source_incident_ids=["pkt-cpf05"],
                 corpus_case_id="case_06_cpf10_same_head_byte_stable",
-                expected_invariant="INVARIANT_HOLDS",
-                actual_outcome="invariant_holds",
+                expected_invariant="signature_matches",
+                actual_outcome="signature_drift",
                 regression_class="planner_timeout",
                 replay_op="fingerprint_stability",
             )
@@ -995,12 +996,21 @@ class TestP202CPFObservationMatrix(unittest.TestCase):
             with self.assertRaises(ValueError):
                 promote_verified_regression(rt, cand05["candidate_id"], destination=Path("tests_py"))
 
-            # CPF-06: repeated ticks byte-stable idempotent
+            # CPF-06: repeated ticks byte-stable idempotent with zero new revisions
             c_tick1 = harvest_tick(rt, config=cfg)
+            store06_t1 = load_incident_store(rt)
+            rev_t1 = store06_t1.revision
+            occs_t1 = sum(len(f.get("occurrences", [])) for f in store06_t1.index.get("families", {}).values() if isinstance(f, dict))
+
             c_tick2 = harvest_tick(rt, config=cfg)
-            store06 = load_incident_store(rt)
+            store06_t2 = load_incident_store(rt)
+            rev_t2 = store06_t2.revision
+            occs_t2 = sum(len(f.get("occurrences", [])) for f in store06_t2.index.get("families", {}).values() if isinstance(f, dict))
+
+            self.assertEqual(rev_t2, rev_t1)
+            self.assertEqual(occs_t2, occs_t1)
             # Re-running harvest_tick over unchanged ledgers adds 0 new occurrences
-            for fam in store06.index["families"].values():
+            for fam in store06_t2.index["families"].values():
                 occ_keys = [o["occurrence_key"] if isinstance(o, dict) else o for o in fam["occurrences"]]
                 self.assertEqual(len(occ_keys), len(set(occ_keys)))
 
@@ -1065,6 +1075,334 @@ class TestP202CPFObservationMatrix(unittest.TestCase):
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+
+class TestP202TechnicalReviewRemediation(unittest.TestCase):
+    """Specific regression tests covering the 9 technical review findings for P20.2."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.mkdtemp()
+        self.runtime_root = Path(self.temp_dir) / "runtime"
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        self.project_id = "test-proj"
+        self.config = {"projects": [{"project_id": self.project_id}]}
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_declared_outcome_cannot_establish_discrimination_identical_anchors_rejected_vacuous(self) -> None:
+        """Finding 1: REPLAY_OPS derives outcome strictly from executed behavior.
+        Identical anchor inputs with divergent declared outcome strings cannot trick the oracle.
+        """
+        # Spec with identical payloads but conflicting declared outcomes
+        spec_divergent_declared = ReplayCaseSpec(
+            case_id="case_identical_with_declared_outcomes",
+            replay_op="fingerprint_stability",
+            defect_anchor={
+                "failure_class": "planner_timeout",
+                "role_class": "plan_reviewer",
+                "outcome": "divergent_defect_outcome",
+            },
+            corrected_anchor={
+                "failure_class": "planner_timeout",
+                "role_class": "plan_reviewer",
+                "outcome": "divergent_corrected_outcome",
+            },
+            expected_invariant="signature_matches",
+            expected_defect_outcome="divergent_defect_outcome",
+            cpf_scenarios=["CPF-10"],
+        )
+        res1 = run_replay_case(spec_divergent_declared)
+        self.assertFalse(res1["discriminating"])
+        self.assertIn(res1["reason"], ("defect_anchor_outcome_mismatch", "vacuous_oracle_non_discriminating"))
+
+        # Spec with completely identical anchors and no declared outcome strings
+        spec_identical_no_declared = ReplayCaseSpec(
+            case_id="case_identical_anchors",
+            replay_op="fingerprint_stability",
+            defect_anchor={"failure_class": "planner_timeout", "role_class": "plan_reviewer"},
+            corrected_anchor={"failure_class": "planner_timeout", "role_class": "plan_reviewer"},
+            expected_invariant="signature_matches",
+            expected_defect_outcome="any",
+            cpf_scenarios=["CPF-10"],
+        )
+        res2 = run_replay_case(spec_identical_no_declared)
+        self.assertFalse(res2["discriminating"])
+        self.assertEqual(res2["reason"], "vacuous_oracle_non_discriminating")
+
+    def test_repeated_harvest_tick_over_unchanged_ledgers_adds_zero_revisions_cpf06(self) -> None:
+        """Finding 2: Repeated harvest_tick over unchanged ledgers costs 0 new revisions and 0 new occurrences."""
+        # Seed ledgers with records
+        lineage_file = self.runtime_root / "execution-lineage.json"
+        lineage_data = {
+            "records": {
+                "lkey-rep-1": {
+                    "project_id": self.project_id,
+                    "task_id": "T1",
+                    "loss_detected": True,
+                    "invariant_key": "inv-ex",
+                }
+            }
+        }
+        write_json(lineage_file, lineage_data, indent=2)
+
+        rev_file = self.runtime_root / "ai-reviewer.json"
+        rev_data = {
+            "reviews": {
+                "rev-rep-1": {
+                    "project_id": self.project_id,
+                    "task_id": "T1",
+                    "state": "failed",
+                    "reason": "reviewer timeout deadline exceeded",
+                }
+            }
+        }
+        write_json(rev_file, rev_data, indent=2)
+
+        # Tick 1: captures initial incidents
+        harvest_tick(self.runtime_root, config=self.config)
+        store1 = load_incident_store(self.runtime_root)
+        rev1 = store1.revision
+        self.assertGreater(rev1, 0)
+        occs1 = sum(len(f.get("occurrences", [])) for f in store1.index.get("families", {}).values() if isinstance(f, dict))
+        self.assertGreater(occs1, 0)
+
+        # Tick 2: repeated tick over unchanged ledgers must produce ZERO revisions and ZERO new occurrences
+        harvest_tick(self.runtime_root, config=self.config)
+        store2 = load_incident_store(self.runtime_root)
+        self.assertEqual(store2.revision, rev1)
+        occs2 = sum(len(f.get("occurrences", [])) for f in store2.index.get("families", {}).values() if isinstance(f, dict))
+        self.assertEqual(occs2, occs1)
+
+        # Tick 3: repeated again
+        harvest_tick(self.runtime_root, config=self.config)
+        store3 = load_incident_store(self.runtime_root)
+        self.assertEqual(store3.revision, rev1)
+        occs3 = sum(len(f.get("occurrences", [])) for f in store3.index.get("families", {}).values() if isinstance(f, dict))
+        self.assertEqual(occs3, occs1)
+
+    def test_transport_occurrence_key_is_process_stable_without_operation_id(self) -> None:
+        """Finding 3: Occurrence key without operation_id derives deterministically from sha256 of sorted row content."""
+        logs_dir = self.runtime_root / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        logs_file = logs_dir / "transport-operations.ndjson"
+
+        row = {"project_id": self.project_id, "status": "failed", "channel": "http_pool", "error": "conn_reset"}
+        logs_file.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+        detector = DETECTORS["execution_transport_failure"]
+        anomalies = detector(self.runtime_root, self.config, {}, None, None, None, None, None)
+        self.assertEqual(len(anomalies), 1)
+
+        expected_hash = hashlib.sha256(json.dumps(row, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        expected_key = f"transport_op:{self.project_id}:op-{expected_hash}"
+        self.assertEqual(anomalies[0][5], expected_key)
+
+    def test_daemon_restart_detector_ignores_executions_not_interrupted_by_boot(self) -> None:
+        """Finding 4: Daemon restart detector correlates boot window and ignores settled / non-interrupted executions."""
+        boot_line = {
+            "boot_id": "boot-test-01",
+            "started_at": "2026-10-04T10:00:00Z",
+            "recorded_at": "2026-10-04T10:00:00Z",
+        }
+        (self.runtime_root / "daemon-boots.jsonl").write_text(json.dumps(boot_line) + "\n", encoding="utf-8")
+
+        te_file = self.runtime_root / "transition-executor.json"
+        te_data = {
+            "executions": {
+                # 1. Settled execution: handoff_consumed=True
+                "e_settled": {
+                    "execution_id": "e_settled",
+                    "project_id": self.project_id,
+                    "task_id": "T_settled",
+                    "state": "handoff",
+                    "started_at": "2026-10-04T08:00:00Z",
+                    "handoff_consumed": True,
+                },
+                # 2. Started AFTER boot
+                "e_after": {
+                    "execution_id": "e_after",
+                    "project_id": self.project_id,
+                    "task_id": "T_after",
+                    "state": "running",
+                    "started_at": "2026-10-04T11:00:00Z",
+                },
+                # 3. Completed BEFORE boot
+                "e_before": {
+                    "execution_id": "e_before",
+                    "project_id": self.project_id,
+                    "task_id": "T_before",
+                    "state": "running",
+                    "started_at": "2026-10-04T07:00:00Z",
+                    "completed_at": "2026-10-04T09:00:00Z",
+                },
+                # 4. In-flight during boot (started before, not completed)
+                "e_interrupted": {
+                    "execution_id": "e_interrupted",
+                    "project_id": self.project_id,
+                    "task_id": "T_interrupted",
+                    "state": "running",
+                    "started_at": "2026-10-04T09:30:00Z",
+                },
+            }
+        }
+        write_json(te_file, te_data, indent=2)
+
+        detector = DETECTORS["daemon_restart_failure"]
+        anomalies = detector(self.runtime_root, self.config, {}, None, None, None, None, None)
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0][4]["execution_id"], "e_interrupted")
+        self.assertEqual(anomalies[0][3]["failure_class"], "daemon_restart_during_execution")
+
+    def test_single_lineage_loss_record_yields_exactly_one_incident_family(self) -> None:
+        """Finding 5: Single lineage loss record does not produce double incident families."""
+        lineage_file = self.runtime_root / "execution-lineage.json"
+        lineage_data = {
+            "records": {
+                "lkey-single-1": {
+                    "project_id": self.project_id,
+                    "task_id": "T_single",
+                    "loss_detected": True,
+                    "invariant_key": "inv-single",
+                }
+            }
+        }
+        write_json(lineage_file, lineage_data, indent=2)
+
+        harvest_tick(self.runtime_root, config=self.config)
+        store = load_incident_store(self.runtime_root)
+        fams = store.index.get("families", {})
+        self.assertEqual(len(fams), 1)
+        fam = next(iter(fams.values()))
+        self.assertEqual(len(fam.get("occurrences", [])), 1)
+
+    def test_worker_loss_detector_emits_missing_execution_record_class(self) -> None:
+        """Finding 6: _detect_worker_loss harvests terminal_outcome == 'missing_execution_record'."""
+        lineage_file = self.runtime_root / "execution-lineage.json"
+        lineage_data = {
+            "records": {
+                "lkey-missing-1": {
+                    "project_id": self.project_id,
+                    "task_id": "T_missing",
+                    "state": "completed",
+                    "terminal_outcome": "missing_execution_record",
+                    "invariant_key": "inv-missing",
+                }
+            }
+        }
+        write_json(lineage_file, lineage_data, indent=2)
+
+        detector = DETECTORS["worker_loss"]
+        anomalies = detector(self.runtime_root, self.config, {}, None, None, None, None, None)
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0][3]["failure_class"], "missing_execution_record")
+
+    def test_promotion_fence_refuses_sibling_prefix_and_traversal_destinations_cpf05(self) -> None:
+        """Finding 7: Promotion fence uses is_relative_to and refuses sibling-prefix and traversal destinations."""
+        cand = create_regression_candidate(
+            self.runtime_root,
+            project_id=self.project_id,
+            family_id="fam-689a96fe6ea9",
+            source_incident_ids=["pkt-01"],
+            corpus_case_id="case_06_cpf10_same_head_byte_stable",
+            expected_invariant="signature_matches",
+            actual_outcome="signature_drift",
+            regression_class="planner_timeout",
+            replay_op="fingerprint_stability",
+        )
+        cid = cand["candidate_id"]
+        verify_regression_candidate(self.runtime_root, cid)
+
+        # 1. Sibling prefix destination (<runtime>/incident-packets-escape)
+        sibling_dest = self.runtime_root / "incident-packets-escape"
+        with self.assertRaises(ValueError) as ctx1:
+            promote_verified_regression(self.runtime_root, cid, destination=sibling_dest)
+        self.assertIn("refused", str(ctx1.exception).lower())
+
+        # 2. Traversal destination (<runtime>/incident-packets/../escaped)
+        traversal_dest = self.runtime_root / "incident-packets" / ".." / "escaped"
+        with self.assertRaises(ValueError) as ctx2:
+            promote_verified_regression(self.runtime_root, cid, destination=traversal_dest)
+        self.assertIn("refused", str(ctx2.exception).lower())
+
+    def test_regression_policy_limits_are_enforced_not_just_resolved(self) -> None:
+        """Finding 8: Policy limits are strictly enforced on candidate creation and replay verification."""
+        # 1. typed_replay_candidates=False refuses candidate creation
+        cfg_no_typed = {"incident_policy": {"typed_replay_candidates": False}}
+        with self.assertRaises(RuntimeError) as ctx1:
+            create_regression_candidate(
+                self.runtime_root,
+                project_id=self.project_id,
+                family_id="fam-689a96fe6ea9",
+                source_incident_ids=["pkt-01"],
+                corpus_case_id="case_06_cpf10_same_head_byte_stable",
+                expected_invariant="signature_matches",
+                actual_outcome="signature_drift",
+                regression_class="planner_timeout",
+                config=cfg_no_typed,
+            )
+        self.assertIn("typed_replay_candidates", str(ctx1.exception))
+
+        # 2. max_regression_candidates cap
+        cfg_max_cands = {"incident_policy": {"max_regression_candidates": 1}}
+        cand1 = create_regression_candidate(
+            self.runtime_root,
+            project_id=self.project_id,
+            family_id="fam-689a96fe6ea9",
+            source_incident_ids=["pkt-01"],
+            corpus_case_id="case_06_cpf10_same_head_byte_stable",
+            expected_invariant="signature_matches",
+            actual_outcome="signature_drift",
+            regression_class="planner_timeout",
+            config=cfg_max_cands,
+        )
+        with self.assertRaises(IncidentCapacityExceededError):
+            create_regression_candidate(
+                self.runtime_root,
+                project_id=self.project_id,
+                family_id="fam-689a96fe6ea9",
+                source_incident_ids=["pkt-02"],
+                corpus_case_id="case_06_cpf10_same_head_byte_stable",
+                expected_invariant="signature_matches",
+                actual_outcome="signature_drift",
+                regression_class="planner_timeout",
+                config=cfg_max_cands,
+            )
+
+        # 3. max_replay_fixture_bytes cap in verification
+        cfg_small_bytes = {"incident_policy": {"max_replay_fixture_bytes": 10}}
+        with self.assertRaises(ReplayFixtureInvalidError):
+            verify_regression_candidate(self.runtime_root, cand1["candidate_id"], config=cfg_small_bytes)
+
+        # 4. max_replay_corpus_cases cap in verification
+        cfg_no_cases = {"incident_policy": {"max_replay_corpus_cases": 0}}
+        with self.assertRaises(IncidentCapacityExceededError):
+            verify_regression_candidate(self.runtime_root, cand1["candidate_id"], config=cfg_no_cases)
+
+    def test_verify_regression_candidate_resolves_corpus_independent_of_cwd(self) -> None:
+        """Finding 9: verify_regression_candidate finds default corpus directory when CWD is not repo root."""
+        cand = create_regression_candidate(
+            self.runtime_root,
+            project_id=self.project_id,
+            family_id="fam-689a96fe6ea9",
+            source_incident_ids=["pkt-01"],
+            corpus_case_id="case_06_cpf10_same_head_byte_stable",
+            expected_invariant="signature_matches",
+            actual_outcome="signature_drift",
+            regression_class="planner_timeout",
+            replay_op="fingerprint_stability",
+        )
+        cid = cand["candidate_id"]
+
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(self.temp_dir)
+            verified = verify_regression_candidate(self.runtime_root, cid)
+            self.assertEqual(verified["verification_status"], "verified")
+            self.assertIsNone(verified["rejection_reason"])
+        finally:
+            os.chdir(orig_cwd)
 
 
 if __name__ == "__main__":

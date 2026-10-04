@@ -121,14 +121,19 @@ def load_replay_case(path_or_mapping: str | Path | Mapping[str, Any]) -> ReplayC
 def _op_fingerprint_stability(anchor: Mapping[str, Any]) -> dict[str, Any]:
     """Execute failure_signature over anchor semantic dictionary."""
     semantic = anchor.get("semantic", anchor)
-    payload = {k: v for k, v in semantic.items() if k not in ("outcome", "__code__")}
+    payload = {
+        k: v for k, v in semantic.items()
+        if k not in ("outcome", "__code__", "expected_signature", "source_failure_signature", "expected_outcome", "repeats")
+    }
     sig = failure_signature(payload)
-    outcome = anchor.get("outcome")
-    if outcome is None:
-        outcome = "computed_signature"
+    expected_sig = anchor.get("expected_signature") or anchor.get("source_failure_signature")
+    if expected_sig:
+        computed_outcome = "signature_matches" if sig == expected_sig else "signature_drift"
+    else:
+        computed_outcome = sig
     return {
         "signature": sig,
-        "outcome": outcome,
+        "outcome": computed_outcome,
         "status": "ok",
     }
 
@@ -136,6 +141,7 @@ def _op_fingerprint_stability(anchor: Mapping[str, Any]) -> dict[str, Any]:
 def _op_incident_capture_dedup(anchor: Mapping[str, Any]) -> dict[str, Any]:
     """Execute incident capture dedup against an isolated temporary store."""
     from dev_orchestrator.incidents.capture import capture_incident
+    from dev_orchestrator.incidents.store import load_incident_store
 
     tmp = tempfile.mkdtemp()
     try:
@@ -143,25 +149,32 @@ def _op_incident_capture_dedup(anchor: Mapping[str, Any]) -> dict[str, Any]:
         task_id = anchor.get("task_id", "P20.2")
         classification = anchor.get("classification", "lost_handoff")
         semantic = anchor.get("semantic", {"failure_class": classification})
-        occ_key = anchor.get("occurrence_key", "occ-test-01")
+        base_key = anchor.get("occurrence_key", "occ-test-01")
         repeats = int(anchor.get("repeats", 2))
+        keys = anchor.get("occurrence_keys")
+        if not keys:
+            if anchor.get("varying_keys"):
+                keys = [f"{base_key}_{i}" for i in range(repeats)]
+            else:
+                keys = [base_key] * repeats
         c = None
-        for _ in range(repeats):
+        for k in keys:
             c = capture_incident(
                 tmp,
                 project_id=project_id,
                 task_id=task_id,
                 classification=classification,
                 semantic=semantic,
-                occurrence_key=occ_key,
+                occurrence_key=k,
             )
-        outcome = anchor.get("outcome") or (
-            "dedup_confirmed" if c and c.get("recurrence_count") == 1 else "dedup_failed"
-        )
+        store = load_incident_store(tmp)
+        fams = store.index.get("families", {})
+        total_occs = sum(len(f.get("occurrences", [])) for f in fams.values() if isinstance(f, dict))
+        computed_outcome = "dedup_confirmed" if total_occs == 1 else "dedup_failed"
         return {
             "family_id": c.get("family_id") if c else None,
-            "recurrence_count": c.get("recurrence_count") if c else 0,
-            "outcome": outcome,
+            "total_occurrences": total_occs,
+            "outcome": computed_outcome,
             "status": "ok",
         }
     finally:
@@ -171,15 +184,34 @@ def _op_incident_capture_dedup(anchor: Mapping[str, Any]) -> dict[str, Any]:
 def _op_store_journal_reconcile(anchor: Mapping[str, Any]) -> dict[str, Any]:
     """Execute journal reconciliation replay against an isolated store."""
     from dev_orchestrator.incidents.store import load_incident_store
+    from dev_orchestrator.storage.json_store import write_json
 
     tmp = tempfile.mkdtemp()
     try:
+        intent_info = anchor.get("intent")
+        if isinstance(intent_info, dict):
+            jdir = Path(tmp) / "incident-packets" / "journal"
+            jdir.mkdir(parents=True, exist_ok=True)
+            txn_id = intent_info.get("txn_id", "txn-01")
+            write_json(jdir / f"{txn_id}.json", intent_info)
+            side_files = anchor.get("side_files", {})
+            if isinstance(side_files, dict):
+                for rel_p, content in side_files.items():
+                    fp = Path(tmp) / "incident-packets" / rel_p
+                    fp.parent.mkdir(parents=True, exist_ok=True)
+                    fp.write_text(content, encoding="utf-8")
         store = load_incident_store(tmp)
-        intents = store.reconcile_journal()
-        outcome = anchor.get("outcome") or "journal_reconciled"
+        results = store.reconcile_journal()
+        if results and all(r.get("status") in ("committed_confirmed", "reapplied") for r in results):
+            computed_outcome = "journal_reconciled"
+        elif results and any(r.get("status") == "payload_unverified" for r in results):
+            computed_outcome = "intent_unreconciled"
+        else:
+            computed_outcome = "journal_reconciled" if not intent_info else "intent_unreconciled"
         return {
-            "reconciled_count": len(intents),
-            "outcome": outcome,
+            "reconciled_count": len(results),
+            "results": results,
+            "outcome": computed_outcome,
             "status": "ok",
         }
     finally:
@@ -193,11 +225,11 @@ def _op_convergence_replay_case(anchor: Mapping[str, Any]) -> dict[str, Any]:
     harness = ReplayHarness()
     case = ReplayCase.from_dict(anchor)
     res = harness.run_case(case)
-    outcome = anchor.get("outcome") or (res.v0_decision if res else "unknown")
+    computed_outcome = res.v0_decision if res else "unknown"
     return {
         "passed": res.passed if res else False,
         "v0_decision": res.v0_decision if res else "",
-        "outcome": outcome,
+        "outcome": computed_outcome,
         "status": "ok",
     }
 
@@ -207,12 +239,12 @@ def _op_convergence_invariants(anchor: Mapping[str, Any]) -> dict[str, Any]:
     from dev_orchestrator.convergence.invariants import evaluate_convergence_invariants
 
     verdicts = evaluate_convergence_invariants(anchor)
-    all_passed = all(verdicts.values())
-    outcome = anchor.get("outcome") or ("invariants_satisfied" if all_passed else "invariant_violation")
+    all_passed = all(v.holds if hasattr(v, "holds") else bool(v) for v in verdicts.values())
+    computed_outcome = "invariants_satisfied" if all_passed else "invariant_violation"
     return {
-        "verdicts": verdicts,
+        "verdicts": {k: (v.holds if hasattr(v, "holds") else bool(v)) for k, v in verdicts.items()},
         "all_passed": all_passed,
-        "outcome": outcome,
+        "outcome": computed_outcome,
         "status": "ok",
     }
 
@@ -226,18 +258,24 @@ REPLAY_OPS: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
 }
 
 
-def run_replay_case(spec: ReplayCaseSpec, *, repeats: int = 2) -> dict[str, Any]:
+def run_replay_case(
+    spec: ReplayCaseSpec,
+    *,
+    repeats: int = 2,
+    max_fixture_bytes: int = 65536,
+) -> dict[str, Any]:
     """Execute allowlisted replay operation against defect and corrected anchors.
 
     Runs each anchor at least twice to test determinism and returns discriminating outcome.
+    Derives outcome strictly from executed behavior.
     """
     if spec.replay_op not in REPLAY_OPS:
         raise ReplayOpNotAllowedError(f"Replay op {spec.replay_op!r} is not allowed")
 
     _validate_anchor_safety(spec.defect_anchor)
     _validate_anchor_safety(spec.corrected_anchor)
-    _check_fixture_size(spec.defect_anchor)
-    _check_fixture_size(spec.corrected_anchor)
+    _check_fixture_size(spec.defect_anchor, max_bytes=max_fixture_bytes)
+    _check_fixture_size(spec.corrected_anchor, max_bytes=max_fixture_bytes)
 
     op = REPLAY_OPS[spec.replay_op]
     repeats = max(2, int(repeats))
@@ -254,10 +292,20 @@ def run_replay_case(spec: ReplayCaseSpec, *, repeats: int = 2) -> dict[str, Any]
     corrected_deterministic = all(r == corrected_results[0] for r in corrected_results)
     deterministic = defect_deterministic and corrected_deterministic
 
-    defect_outcome = defect_results[0].get("outcome", defect_results[0])
-    corrected_outcome = corrected_results[0].get("outcome", corrected_results[0])
+    defect_outcome = defect_results[0].get("outcome")
+    corrected_outcome = corrected_results[0].get("outcome")
 
-    discriminating = bool(deterministic and (defect_outcome != corrected_outcome))
+    declared_defect = spec.defect_anchor.get("outcome")
+    declared_corrected = spec.corrected_anchor.get("outcome")
+    defect_diverged = (declared_defect is not None and declared_defect != defect_outcome)
+    corrected_diverged = (declared_corrected is not None and declared_corrected != corrected_outcome)
+
+    discriminating = bool(
+        deterministic
+        and not defect_diverged
+        and not corrected_diverged
+        and (defect_outcome != corrected_outcome)
+    )
 
     digest_content = {
         "case_id": spec.case_id,
@@ -272,6 +320,10 @@ def run_replay_case(spec: ReplayCaseSpec, *, repeats: int = 2) -> dict[str, Any]
     reason: str | None = None
     if not deterministic:
         reason = "non_deterministic_replay"
+    elif defect_diverged:
+        reason = "defect_anchor_outcome_mismatch"
+    elif corrected_diverged:
+        reason = "corrected_anchor_outcome_mismatch"
     elif not discriminating:
         reason = "vacuous_oracle_non_discriminating"
 

@@ -6,8 +6,11 @@
   "expected_defect_outcome": "dedup_failed",
   "defect_anchor": {
     "classification": "lost_handoff",
-    "occurrence_key": "cpf02_key",
-    "repeats": 1,
+    "occurrence_keys": [
+      "cpf02_key_att1",
+      "cpf02_key_att2"
+    ],
+    "repeats": 2,
     "outcome": "dedup_failed"
   },
   "corrected_anchor": {

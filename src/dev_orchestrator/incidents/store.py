@@ -225,6 +225,9 @@ class IncidentStore:
             txn_id = f"txn-{uuid4().hex[:12]}"
 
             next_index, side_files = mutator(copy.deepcopy(current_index))
+            if not side_files and next_index == current_index:
+                return current_index, current_index.get("last_txn_id") or ""
+
             next_index["schema_version"] = STORE_SCHEMA_VERSION
             next_index["revision"] = target_rev
             next_index["last_txn_id"] = txn_id
