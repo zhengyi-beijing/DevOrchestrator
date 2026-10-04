@@ -1,0 +1,21 @@
+{
+  "source": "Windows System event log and Win32_OperatingSystem",
+  "captured_utc": "2026-10-04T22:57:51.7145780Z",
+  "last_boot_utc": "2026-10-02T15:11:42.5000000Z",
+  "events": [
+    {
+      "record_id": 65287,
+      "time_utc": "2026-10-04T20:55:17.0419803Z",
+      "event_id": 1,
+      "provider": "Microsoft-Windows-Kernel-General",
+      "message": "系统时间已从 ‎2026‎-‎10‎-‎04T20:55:17.039633800Z.\r\n时间增量更改为 ‎2026‎-‎10‎-‎04T20:55:17.040069200Z： 0 ms\r\n\r\n更改原因： An application or system component changed the time.\r\n进程： '\\Device\\HarddiskVolume7\\Windows\\System32\\svchost.exe' (PID 31676).\r\n\r\nRTC 时间： ‎2026‎-‎10‎-‎05T04:55:17.040069200Z\r\n当前时区偏差 -480\r\nRTC 时间以 UTC： false\r\n系统时间基于 RTC 时间： false"
+    },
+    {
+      "record_id": 65285,
+      "time_utc": "2026-10-04T20:55:17.0398793Z",
+      "event_id": 1,
+      "provider": "Microsoft-Windows-Kernel-General",
+      "message": "系统时间已从 ‎2026‎-‎10‎-‎04T20:55:15.332800600Z.\r\n时间增量更改为 ‎2026‎-‎10‎-‎04T20:55:17.037904400Z： 1705 ms\r\n\r\n更改原因： An application or system component changed the time.\r\n进程： '\\Device\\HarddiskVolume7\\Windows\\System32\\svchost.exe' (PID 31676).\r\n\r\nRTC 时间： ‎2026‎-‎10‎-‎05T04:55:17.037904400Z\r\n当前时区偏差 -480\r\nRTC 时间以 UTC： false\r\n系统时间基于 RTC 时间： false"
+    }
+  ]
+}

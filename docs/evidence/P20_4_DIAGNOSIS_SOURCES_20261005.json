@@ -1,0 +1,935 @@
+{
+  "captured_at": "2026-10-04T23:01:05.489043+00:00",
+  "run_id": "p20-live-20261004-a",
+  "source_head": "3fa462f6",
+  "run": {
+    "status": "FAILED",
+    "started_at": "2026-10-04T13:37:21.464641+00:00",
+    "ended_at": "2026-10-04T20:55:17.111870+00:00",
+    "updated_at": "2026-10-04T20:55:17.111870+00:00",
+    "failure_reason": "system_boot_discontinuity",
+    "source_revision": "6e7ddd496189ce671b42b89e62b453604d52dfe3"
+  },
+  "canonical_authority": {
+    "current_task_id": "P20.4",
+    "lifecycle_state": "OWNER_GATE",
+    "owner_gate": {
+      "gate_id": "soak-p20-4-live-bootstrap-worker-fresh-20261004",
+      "code": "SOAK_EVIDENCE_UNRESOLVED",
+      "task_id": "P20.4",
+      "reason": "owned_soak_job_terminal_or_deadline_expired: failed",
+      "required_owner_decision": "Inspect the same reserved job and original run; explicitly authorize recovery. Never reset clocks or launch a duplicate.",
+      "created_at": "2026-10-04T20:55:20.519112+00:00"
+    },
+    "active_owner": null
+  },
+  "original_job_result": {
+    "job_id": "job-cf58d9f173ff286f",
+    "exit_code": 4,
+    "outcome": "failed",
+    "error": "process exited with return code 4",
+    "finished_at": "2026-10-04T20:55:17.396527+00:00",
+    "truncated_lines": 0,
+    "truncated_bytes": 0
+  },
+  "pure_clock_replay": {
+    "note": "same original segment in memory, recorded boot estimate vs +1.705104s; never changes run or qualification",
+    "same_boot_continuity": true,
+    "recorded_monotonic_delta_seconds": 26273.937999999995,
+    "recorded_wall_delta_seconds": 26275.647229,
+    "wall_minus_monotonic_seconds": 1.7092290000036883,
+    "time_correction_continuity": false,
+    "time_correction_failure_reason": "system_boot_discontinuity"
+  },
+  "primary_workers": [
+    {
+      "source_request_id": "initial-p20-live-20261004-a:execute",
+      "source_kind": "control",
+      "task_id": "P204.1",
+      "head": "05ec31a2e9cbcd72b75d6b6a5d11c2251192c32e",
+      "state": "completed",
+      "started_at": "2026-10-04T13:45:03.933073+00:00",
+      "completed_at": "2026-10-04T13:48:55.237632+00:00",
+      "dispatch_id": "ea7c2213-9d19-4fcd-8db5-3a8f769bf1f7",
+      "execution_id": "3bcf0ca4-0c9e-4ac4-81f7-3cdfa71bc77a",
+      "resource_context": {
+        "resource_id": "agy/agy-1/gemini-3.8-flash-high",
+        "provider": "agy",
+        "account": "agy-1",
+        "model": "gemini-3.8-flash-high"
+      }
+    },
+    {
+      "source_request_id": "auto-ready:P204.1:c73688ddfca9",
+      "source_kind": "ready",
+      "task_id": "P204.1",
+      "head": "c73688ddfca9c32318c301bca173c8b09e23270b",
+      "state": "failed",
+      "started_at": "2026-10-04T13:48:58.072508+00:00",
+      "completed_at": "2026-10-04T13:51:21.855857+00:00",
+      "dispatch_id": "de8531ff-1721-4bd2-9a4a-12a5e46a4a70",
+      "execution_id": "81637c87-f0b5-4e8d-8d78-418ba502cb0e",
+      "resource_context": {
+        "resource_id": "agy/agy-1/gemini-3.8-flash-high",
+        "provider": "agy",
+        "account": "agy-1",
+        "model": "gemini-3.8-flash-high"
+      }
+    }
+  ],
+  "primary_review": [
+    {
+      "review_id": "ai_review:initial-p20-live-20261004-a:execute",
+      "state": "completed",
+      "decision": "next",
+      "started_at": "2026-10-04T13:48:57.476481+00:00",
+      "completed_at": "2026-10-04T13:50:09.915186+00:00",
+      "dispatch_id": "f9df2023-dbd5-47b6-9dd5-8e9392b7ade1"
+    }
+  ],
+  "primary_block": {
+    "state": "blocked",
+    "reason": "ROADMAP_SUCCESSOR_INCONSISTENT: staged roadmap invalid: STAGED_SUCCESSOR_CLAIM_UNUSABLE: agent/staged/P204.1.md has unreadable or malformed metadata: spec contains CRLF/CR bytes; staged specs must be LF-only; agent/staged/P204.2.md declares predecessor P204.1: spec contains CRLF/CR bytes; staged specs must be LF-only",
+    "recorded_at": "2026-10-04T13:51:25.502905+00:00"
+  },
+  "staged_spec_bytes": [
+    {
+      "path": "C:\\work\\p20-soak\\20261004-live-a\\repo\\agent\\staged\\P204.1.md",
+      "sha256": "35d67e2a47ca4161ed20b17745df6d629e9d2cb9089f51b4a13b0da73e395276",
+      "CRLF_count": 12
+    },
+    {
+      "path": "C:\\work\\p20-soak\\20261004-live-a\\repo\\agent\\staged\\P204.2.md",
+      "sha256": "2985e8df1f75a77f1209454ebbad67982ef1b825afc9effde6dedc3593dad7a2",
+      "CRLF_count": 12
+    },
+    {
+      "path": "C:\\work\\p20-soak\\20261004-live-a\\repo\\agent\\staged\\P204.3.md",
+      "sha256": "7dbbbe1c46a4ddc2c608ce46b7f56841a46fd88dba54be0c4b0af436d7856572",
+      "CRLF_count": 12
+    },
+    {
+      "path": "C:\\work\\p20-soak\\20261004-live-a\\repo\\agent\\staged\\P204.4.md",
+      "sha256": "1f08a6c15139f50c9ef23467c7a56972319734024551b1a955ceb4293f07ae05",
+      "CRLF_count": 12
+    },
+    {
+      "path": "C:\\work\\p20-soak\\20261004-live-a\\repo\\agent\\staged\\P204.5.md",
+      "sha256": "f7c3e911b8d5cc3501ab711e67246783f44650d4f2eb48ff26b957ec7cd19d32",
+      "CRLF_count": 12
+    }
+  ],
+  "fault_cases": [
+    {
+      "fault_id": "F01_MALFORMED_PLANNER",
+      "effect_state": "injected",
+      "effect_mode": "injected_real_response_boundary",
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 46912,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F02_PLANNER_TIMEOUT",
+      "effect_state": "injected",
+      "effect_mode": "real_dispatch_timeout",
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 45480,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F03_WORKER_KILLED",
+      "effect_state": null,
+      "effect_mode": null,
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 22496,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F04_REVIEWER_REJECT",
+      "effect_state": "not_injected",
+      "effect_mode": "injected_execution_boundary",
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 27704,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F05_QUOTA_EXHAUSTED",
+      "effect_state": "injected",
+      "effect_mode": "injected_real_response_boundary",
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 21240,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F06_PROVIDER_UNAVAILABLE",
+      "effect_state": "injected",
+      "effect_mode": "injected_real_response_boundary",
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 48356,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F07_BROKER_UNAVAILABLE",
+      "effect_state": "injected",
+      "effect_mode": "injected_transport_boundary",
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 48056,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F08_DAEMON_RESTART_ACTIVE",
+      "effect_state": "injected",
+      "effect_mode": "isolated_native_boundary",
+      "plan_state": "recovery_required",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 30448,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F09_DAEMON_RESTART_HANDOFF",
+      "effect_state": null,
+      "effect_mode": null,
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 47484,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F10_STALE_HEAD",
+      "effect_state": "injected",
+      "effect_mode": "isolated_native_boundary",
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 46296,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F11_UNEXPECTED_DIRT",
+      "effect_state": "injected",
+      "effect_mode": "isolated_native_boundary",
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 4080,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F12_MISSING_PROJECTION",
+      "effect_state": "injected",
+      "effect_mode": "isolated_native_boundary",
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 28736,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F13_LOST_HANDOFF",
+      "effect_state": null,
+      "effect_mode": null,
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 34888,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F14_DUPLICATE_RETRY",
+      "effect_state": null,
+      "effect_mode": null,
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 24744,
+      "owned_daemon_alive": true
+    },
+    {
+      "fault_id": "F15_REPEATED_SIGNATURE",
+      "effect_state": "not_injected",
+      "effect_mode": "injected_execution_boundary",
+      "plan_state": "failed",
+      "control_synced": true,
+      "authority_state": "PENDING_DESIGN",
+      "authority_owner_gate": null,
+      "watchdog_owner_gate": null,
+      "watchdog_attempt_counts": {},
+      "owned_daemon_pid": 32236,
+      "owned_daemon_alive": true
+    }
+  ],
+  "failed_plan_projection_replay": {
+    "role_projection": "PLAN_FAILED",
+    "authority_projection": "PENDING_DESIGN",
+    "watchdog_monitored": false,
+    "watchdog_breached": false
+  },
+  "routing": [
+    {
+      "request_id": "ai_plan:initial-p20-live-20261004-a-F01:reviewer:failover-1",
+      "decision_id": "77f77738-1dc9-4fbd-8fea-13268faa8ea3",
+      "selected": "agy/agy-3/claude-opus-4-6-thinking",
+      "eligible_resources": [
+        "agy/agy-1/gemini-3.8-flash-high-adjudicator",
+        "agy/agy-1/claude-opus-4-6-thinking",
+        "agy/agy-3/claude-opus-4-6-thinking"
+      ],
+      "candidates": [
+        {
+          "resource_id": "agy/agy-1/gemini-3.8-flash-high",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-2/gemini-3.8-flash-high",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable",
+            "quota_ratio_unknown_for_reserve"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-3/gemini-3.8-flash-high",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable",
+            "quota_ratio_unknown_for_reserve"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-1/gemini-3.8-flash-high-adjudicator",
+          "eligible": true,
+          "reasons": []
+        },
+        {
+          "resource_id": "agy/agy-2/gemini-3.8-flash-high-adjudicator",
+          "eligible": false,
+          "reasons": [
+            "unavailable",
+            "quota_ratio_unknown_for_reserve"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-3/gemini-3.8-flash-high-adjudicator",
+          "eligible": false,
+          "reasons": [
+            "unavailable",
+            "quota_ratio_unknown_for_reserve"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-1/claude-opus-4-6-thinking",
+          "eligible": true,
+          "reasons": []
+        },
+        {
+          "resource_id": "agy/agy-2/claude-opus-4-6-thinking",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-3/claude-opus-4-6-thinking",
+          "eligible": true,
+          "reasons": []
+        },
+        {
+          "resource_id": "copilot/default/claude-sonnet-4.6",
+          "eligible": false,
+          "reasons": [
+            "unavailable"
+          ]
+        },
+        {
+          "resource_id": "claude/default/opus",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded"
+          ]
+        },
+        {
+          "resource_id": "claude/default/claude-sonnet-5",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable"
+          ]
+        },
+        {
+          "resource_id": "dsh/default/deepseek-v4-flash",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable"
+          ]
+        },
+        {
+          "resource_id": "codex/default/gpt-5.6-sol",
+          "eligible": false,
+          "reasons": [
+            "disabled",
+            "unavailable",
+            "missing_capabilities:execute"
+          ]
+        },
+        {
+          "resource_id": "chatgpt/default/sol",
+          "eligible": false,
+          "reasons": [
+            "unavailable"
+          ]
+        }
+      ]
+    },
+    {
+      "request_id": "ai_plan:initial-p20-live-20261004-a-F02:planner:retry-1",
+      "decision_id": "7bcf8913-df30-4982-b0a8-7dba7157cb45",
+      "selected": null,
+      "eligible_resources": [],
+      "candidates": [
+        {
+          "resource_id": "agy/agy-1/gemini-3.8-flash-high",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-2/gemini-3.8-flash-high",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable",
+            "quota_ratio_unknown_for_reserve"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-3/gemini-3.8-flash-high",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable",
+            "quota_ratio_unknown_for_reserve"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-1/gemini-3.8-flash-high-adjudicator",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-2/gemini-3.8-flash-high-adjudicator",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable",
+            "quota_ratio_unknown_for_reserve"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-3/gemini-3.8-flash-high-adjudicator",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable",
+            "quota_ratio_unknown_for_reserve"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-1/claude-opus-4-6-thinking",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-2/claude-opus-4-6-thinking",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded"
+          ]
+        },
+        {
+          "resource_id": "agy/agy-3/claude-opus-4-6-thinking",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded"
+          ]
+        },
+        {
+          "resource_id": "copilot/default/claude-sonnet-4.6",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable"
+          ]
+        },
+        {
+          "resource_id": "claude/default/opus",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded"
+          ]
+        },
+        {
+          "resource_id": "claude/default/claude-sonnet-5",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable"
+          ]
+        },
+        {
+          "resource_id": "dsh/default/deepseek-v4-flash",
+          "eligible": false,
+          "reasons": [
+            "resource_excluded",
+            "unavailable"
+          ]
+        },
+        {
+          "resource_id": "codex/default/gpt-5.6-sol",
+          "eligible": false,
+          "reasons": [
+            "disabled",
+            "unavailable",
+            "missing_capabilities:execute"
+          ]
+        },
+        {
+          "resource_id": "chatgpt/default/sol",
+          "eligible": false,
+          "reasons": [
+            "unavailable"
+          ]
+        }
+      ]
+    }
+  ],
+  "observation_gaps": [
+    {
+      "from": "2026-10-04T13:48:51.940968+00:00",
+      "to": "2026-10-04T13:51:25.840506+00:00",
+      "seconds": 153.899538
+    },
+    {
+      "from": "2026-10-04T19:56:48.134365+00:00",
+      "to": "2026-10-04T20:55:17.111870+00:00",
+      "seconds": 3508.977505
+    }
+  ],
+  "observation_capacity": {
+    "limit_bytes": 67108864,
+    "actual_bytes": 67125464,
+    "last_observation_at": "2026-10-04T19:56:48.134365+00:00",
+    "summary_observation_error": "ValueError"
+  },
+  "fault_driver": {
+    "run_id": "p20-live-20261004-a",
+    "dispositions": {},
+    "pending": [
+      "F01_MALFORMED_PLANNER",
+      "F02_PLANNER_TIMEOUT",
+      "F03_WORKER_KILLED",
+      "F04_REVIEWER_REJECT",
+      "F05_QUOTA_EXHAUSTED",
+      "F06_PROVIDER_UNAVAILABLE",
+      "F07_BROKER_UNAVAILABLE",
+      "F08_DAEMON_RESTART_ACTIVE",
+      "F09_DAEMON_RESTART_HANDOFF",
+      "F10_STALE_HEAD",
+      "F11_UNEXPECTED_DIRT",
+      "F12_MISSING_PROJECTION",
+      "F13_LOST_HANDOFF",
+      "F14_DUPLICATE_RETRY",
+      "F15_REPEATED_SIGNATURE"
+    ]
+  },
+  "source_artifacts": {
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\run-p20-live-20261004-a.json": {
+      "sha256": "e782e815aa956f049ce765e67987b685d928011bad13189ecd8af081956b72c0",
+      "bytes": 10259
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\transition-executor.json": {
+      "sha256": "35f45587b83493b07e8799b7f60c6906367a56a2d8795bf54a041d16ad423291",
+      "bytes": 7991
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\ai-reviewer.json": {
+      "sha256": "a23cf71158c4715a513d284bcbbd3a018e0a44db0ed28fc93455c23eb552074c",
+      "bytes": 5410
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\repo\\config\\projects.json": {
+      "sha256": "9e7aa39242d2961f2914a57186a9f98e6f8bf64fc4017d7629ab69de12948b5d",
+      "bytes": 1699
+    },
+    "C:\\work\\github\\DevOrchestrator-dev\\runtime\\transition-executor.json": {
+      "sha256": "7da4054063d0d53a6b6c19f1ee452f824eefb4a5b95d766b98eddd4d4fa9794a",
+      "bytes": 121022
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F01_MALFORMED_PLANNER\\runtime\\transition-executor.json": {
+      "sha256": "e24eeef6b46b7306acdeb87ae7f9b427b6e04f01d2ac8d959b03789ffaf50d6d",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F01_MALFORMED_PLANNER\\runtime\\ai-planner.json": {
+      "sha256": "0e20d82cbbdc480940fea50f02ca99dff41999e449415032c7408afe767a3943",
+      "bytes": 25841
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F01_MALFORMED_PLANNER\\runtime\\watchdog.json": {
+      "sha256": "310119b6c7a6325977467b88fa0398c1aab38a48988eee3d016b90d46e0cbc79",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F01_MALFORMED_PLANNER\\runtime\\daemon.json": {
+      "sha256": "37a4e7c20c256f5c2edc1cdcc2eace756a5b50f795c0432900c08a3867ff9756",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F01_MALFORMED_PLANNER\\runtime\\fault-effect.json": {
+      "sha256": "db2e8052c17fe99361ae74413829013452d07b2a92d5a905acafa4e8e7539bea",
+      "bytes": 473
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F02_PLANNER_TIMEOUT\\runtime\\transition-executor.json": {
+      "sha256": "5015496c4118a3a05a2915a3754506fb749f960285870c2dceb1e94d231069af",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F02_PLANNER_TIMEOUT\\runtime\\ai-planner.json": {
+      "sha256": "d55c077fd7f8096676d06a9a5b1a7dd0d230b09e548f4291d60d409d3fb3a086",
+      "bytes": 5280
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F02_PLANNER_TIMEOUT\\runtime\\watchdog.json": {
+      "sha256": "5ec0a7128e4030d431b90f39d637af20a71d6d0f4c959e48b72f726eaa4f4687",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F02_PLANNER_TIMEOUT\\runtime\\daemon.json": {
+      "sha256": "08260f1b2e503671c329e248db5efcc2ed79f7079ebceb4ce7955a810a6fd6e6",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F02_PLANNER_TIMEOUT\\runtime\\fault-effect.json": {
+      "sha256": "8578db97b46fe51b21654e4aa7b7193d6b061370dc8bb170342835495278c62c",
+      "bytes": 459
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F03_WORKER_KILLED\\runtime\\transition-executor.json": {
+      "sha256": "65731cd2a3967a5f87b04fd9095443bfe88c237c1540eeb88f05d78a3c0023c0",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F03_WORKER_KILLED\\runtime\\ai-planner.json": {
+      "sha256": "04c59bc13a2c3f9d1bf4a0258eb0fe12220970bb5aaf7388244c70937dd64589",
+      "bytes": 28121
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F03_WORKER_KILLED\\runtime\\watchdog.json": {
+      "sha256": "9338bed18a9477f21c0e91bc532eb9fc72e75c685af031c7e6681827fdb5000b",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F03_WORKER_KILLED\\runtime\\daemon.json": {
+      "sha256": "e4f4b044a9fe68bc043a2f3f059d28d1af6fd95c5058265730f719a5b167efc9",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F04_REVIEWER_REJECT\\runtime\\transition-executor.json": {
+      "sha256": "9d866bb837ca5ad67a8721e9e8a544870a3ba55b4e97ac614b8d1ecb683cf29f",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F04_REVIEWER_REJECT\\runtime\\ai-planner.json": {
+      "sha256": "5db998b3e0fea17dfa61a2d50485429e85779e182deac7b7a8edeaed0a1d41e3",
+      "bytes": 25581
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F04_REVIEWER_REJECT\\runtime\\watchdog.json": {
+      "sha256": "7b203bdc816c25e070c14a87d27fdcd6a96bd6376a42846c803fc3b99ae1eba0",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F04_REVIEWER_REJECT\\runtime\\daemon.json": {
+      "sha256": "645ad142687bee5bf71be8fa3e3a8f0dd27d9aaa3b719f611b2e0d47ba712ac5",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F04_REVIEWER_REJECT\\runtime\\fault-effect.json": {
+      "sha256": "029c162361e1b0ef889980e4c34570098a266f4fc70f98ef670c17c020b6f7a4",
+      "bytes": 368
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F05_QUOTA_EXHAUSTED\\runtime\\transition-executor.json": {
+      "sha256": "5a1249f6c70c8be386cff8e3689cfe2ab99ef9271bed562dd79f3a74d2d27fe9",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F05_QUOTA_EXHAUSTED\\runtime\\ai-planner.json": {
+      "sha256": "c744b88ef4a992578cc206de046329384d49dab8cf1f92dbb63d29a6546b15b1",
+      "bytes": 5263
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F05_QUOTA_EXHAUSTED\\runtime\\watchdog.json": {
+      "sha256": "55ffb37f6e03cc6f15fa235a5366825e85d12ee072a758e06a2c4a575c4ead04",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F05_QUOTA_EXHAUSTED\\runtime\\daemon.json": {
+      "sha256": "2db7014a3d60fba5f024bc2ff4276aac906d8378a5e9ccaffe3b7993ddb325b4",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F05_QUOTA_EXHAUSTED\\runtime\\fault-effect.json": {
+      "sha256": "3090fd3540126a09fc439811ca5e0a7622f1ab5280e660f13c5f2e8e03b2c372",
+      "bytes": 469
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F06_PROVIDER_UNAVAILABLE\\runtime\\transition-executor.json": {
+      "sha256": "f6ebf1ecd1e617c9638d35599d30349b09613c855c9e4389ff7b70d233daed96",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F06_PROVIDER_UNAVAILABLE\\runtime\\ai-planner.json": {
+      "sha256": "d8a2af318c143e76307064ae9da760ef90a731214af533a30913248740778498",
+      "bytes": 5293
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F06_PROVIDER_UNAVAILABLE\\runtime\\watchdog.json": {
+      "sha256": "d7bfdcd8b0d411943f9ac7977f695ba2d5b54f085cce3f4a1cd283c261bd00ea",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F06_PROVIDER_UNAVAILABLE\\runtime\\daemon.json": {
+      "sha256": "a9ac629c0930edb6995a2cdcdf2aa4948a4f734ae23a3b304296df0a5823fa32",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F06_PROVIDER_UNAVAILABLE\\runtime\\fault-effect.json": {
+      "sha256": "f8a83f5aed413a3a825c18222dbcb34e1f9638d5750b9fd164eb41cc3f910698",
+      "bytes": 479
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F07_BROKER_UNAVAILABLE\\runtime\\transition-executor.json": {
+      "sha256": "4a468ea9fc7fe02bb1a3e54f7bb572056c311462e88ef65aa56f5caaa4e3319a",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F07_BROKER_UNAVAILABLE\\runtime\\ai-planner.json": {
+      "sha256": "8ee84682fedf205e59c193180947cfed33236e94c2232a74115f5e52e670dbaf",
+      "bytes": 24615
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F07_BROKER_UNAVAILABLE\\runtime\\watchdog.json": {
+      "sha256": "d7ed53df4947439c97dc44a0e5c8527f228ab5c8e383e5e12a2d50f910bbc676",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F07_BROKER_UNAVAILABLE\\runtime\\daemon.json": {
+      "sha256": "b84fe27635af2965bb504fcf6b4a2dd5d59b0438d5f1c0ed64f5ed119b16f5f8",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F07_BROKER_UNAVAILABLE\\runtime\\fault-effect.json": {
+      "sha256": "5093de3ff9f548ec3c553671c974def1f2ee1f236efd259cb70def543fdb0229",
+      "bytes": 360
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F08_DAEMON_RESTART_ACTIVE\\runtime\\transition-executor.json": {
+      "sha256": "6dfe1b3947a56d282544f027d9092262383d6e0a1886a174cbb0ad3c8816019b",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F08_DAEMON_RESTART_ACTIVE\\runtime\\ai-planner.json": {
+      "sha256": "ffaf87ac8093f0643602bc6a319a9d28ce2d074e5411dacb511f1d9002bc33f5",
+      "bytes": 2508
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F08_DAEMON_RESTART_ACTIVE\\runtime\\watchdog.json": {
+      "sha256": "74735c8924ec02c2386d9fd565eb035b12d3b3e4bcfdf039ac82b3836cd3d5e2",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F08_DAEMON_RESTART_ACTIVE\\runtime\\daemon.json": {
+      "sha256": "a714f3a699ff204e24920aa2fae409c5134fdf75582881935b3697f8bddb6013",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F08_DAEMON_RESTART_ACTIVE\\runtime\\fault-effect.json": {
+      "sha256": "f0ba93acc74a26e0c9a1f0e0837fae51bb224c7539fc652aa542fde33d32ca4f",
+      "bytes": 265
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F09_DAEMON_RESTART_HANDOFF\\runtime\\transition-executor.json": {
+      "sha256": "22edf086b2f5f3b9c75213df605b7af9f1eabc527ab5c1d126aa1d0f1bfd9bb0",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F09_DAEMON_RESTART_HANDOFF\\runtime\\ai-planner.json": {
+      "sha256": "71afdbaedf47ced08801431d976904e32a30a58ed7bd1cecbf693b5652f8932c",
+      "bytes": 23204
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F09_DAEMON_RESTART_HANDOFF\\runtime\\watchdog.json": {
+      "sha256": "d140774a5bc86f70c630fdecdb6b9957456767ad88979167b8cb3288dd3beb70",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F09_DAEMON_RESTART_HANDOFF\\runtime\\daemon.json": {
+      "sha256": "5f9088f1a9fceb05f60fc6ec59895a65e76f31bfb8b5c96e7ba999327e9eb982",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F10_STALE_HEAD\\runtime\\transition-executor.json": {
+      "sha256": "9ae302cee1d2448f9c0f5737bc31fb93b6dfc51093526b4c69c306f8d8d48644",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F10_STALE_HEAD\\runtime\\ai-planner.json": {
+      "sha256": "ee431f4c6d13717ed76170553aa09788b9db81ef0760807017bfd596228f90e7",
+      "bytes": 29724
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F10_STALE_HEAD\\runtime\\watchdog.json": {
+      "sha256": "3564d17e53d6d60a615b96c007a94208c092620eee60f39e9f9bc4b5bd70813b",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F10_STALE_HEAD\\runtime\\daemon.json": {
+      "sha256": "2add9e20ba5b2f00f1d38c480f25bc09cfd7465aac45abdc7c0af829a838a66c",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F10_STALE_HEAD\\runtime\\fault-effect.json": {
+      "sha256": "b3cdaae28fd4d4c0a6b941f7f8ffec341c355669ca89927aad0aa23b5edf3843",
+      "bytes": 243
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F11_UNEXPECTED_DIRT\\runtime\\transition-executor.json": {
+      "sha256": "9af53525bfeee442e6c6a40c1f924d128a752087f98ca232507dd98ff760140d",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F11_UNEXPECTED_DIRT\\runtime\\ai-planner.json": {
+      "sha256": "adb047c17a6984ff85a9b5e123a866fda4971ecd3cc7eddeb1ce2770d13911a1",
+      "bytes": 29413
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F11_UNEXPECTED_DIRT\\runtime\\watchdog.json": {
+      "sha256": "c4f8fe5ffe4c3af830abc4ad31628dd89d60b63a0b5af269495fe36e51202037",
+      "bytes": 6167
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F11_UNEXPECTED_DIRT\\runtime\\daemon.json": {
+      "sha256": "0fa062985a52e0e38c388c646d1ecf4537b75ea7aee8f69914284a01b412061d",
+      "bytes": 284
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F11_UNEXPECTED_DIRT\\runtime\\fault-effect.json": {
+      "sha256": "6e3ed6178eaa8a80c0291b550d2ba0cd035277178bf1041bddaf6360c581aef5",
+      "bytes": 253
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F12_MISSING_PROJECTION\\runtime\\transition-executor.json": {
+      "sha256": "d030b3833ea13e207e3e2f3f5268d8f90e07e9787ec85378e786b140ed356cca",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F12_MISSING_PROJECTION\\runtime\\ai-planner.json": {
+      "sha256": "7b9c58d955d0c5065012dace440b37f9dd6a89cf9b10563608f75e8be7515f4c",
+      "bytes": 25073
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F12_MISSING_PROJECTION\\runtime\\watchdog.json": {
+      "sha256": "c03c03214c290b0f1cbbd8c33e825d56a5139463584a2e0996ed5fe8fecd3428",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F12_MISSING_PROJECTION\\runtime\\daemon.json": {
+      "sha256": "195c19fd84fdfee2b10401af79c459478b93ab3dfe4b542872d5146621bb1752",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F12_MISSING_PROJECTION\\runtime\\fault-effect.json": {
+      "sha256": "2ce9bcad3195ddab33cfffebd6bf8fff44f13baaf90929dc2b6068d3daf951f5",
+      "bytes": 259
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F13_LOST_HANDOFF\\runtime\\transition-executor.json": {
+      "sha256": "9fe65584337b62a919d94d4b4d5d503f3cd0e233df09ec4c0875bcd59b2d8702",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F13_LOST_HANDOFF\\runtime\\ai-planner.json": {
+      "sha256": "033f1689e5c11b1a214d6593114f5f3cb6f016e88af4a0eb7fdebc5fa42df7d3",
+      "bytes": 24742
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F13_LOST_HANDOFF\\runtime\\watchdog.json": {
+      "sha256": "023dae111e44454fa44a9b34f96dd4968f9c29277694a52b1b15d2e4708bddfa",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F13_LOST_HANDOFF\\runtime\\daemon.json": {
+      "sha256": "8b88de2e84d1e50e4ea2ab501468182dcbfc4a2277f352d5ca6eb56dd848ac69",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F14_DUPLICATE_RETRY\\runtime\\transition-executor.json": {
+      "sha256": "a3cd2cb0bf8942222021131e871506aec212a77023099ef6bb7e016b472c12bc",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F14_DUPLICATE_RETRY\\runtime\\ai-planner.json": {
+      "sha256": "8dbfbc370b0ac323afcff6ac17289f0cde8f7d530d3cb72cc5b231cce908e3bc",
+      "bytes": 24919
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F14_DUPLICATE_RETRY\\runtime\\watchdog.json": {
+      "sha256": "65e00b3b834c821acdfd2926053686bb6d3634d00d94c86b9e3293266776f28b",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F14_DUPLICATE_RETRY\\runtime\\daemon.json": {
+      "sha256": "aa3b3723e27e38f9d70b4a29882c635bab0210541daa8661f1c45baedac1632a",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F15_REPEATED_SIGNATURE\\runtime\\transition-executor.json": {
+      "sha256": "a631d5b6c4707c0199c2463d367b8c4d411be1bf8ec6d159ae3c641a539c1cb1",
+      "bytes": 2597
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F15_REPEATED_SIGNATURE\\runtime\\ai-planner.json": {
+      "sha256": "f75afb33f303607abddcd6ca15238f18681070e3e1c0c31c037298890d90131c",
+      "bytes": 7383
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F15_REPEATED_SIGNATURE\\runtime\\watchdog.json": {
+      "sha256": "ca5fe0a70cc64419a42b040a49027f41bc7d0bfc1830b00106f86b99d7ac7413",
+      "bytes": 6042
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F15_REPEATED_SIGNATURE\\runtime\\daemon.json": {
+      "sha256": "cb5d0b89b54b2233e7af1c942bee7ab27ead7785fdec1942992b24d99b45e4ce",
+      "bytes": 285
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-cases\\F15_REPEATED_SIGNATURE\\runtime\\fault-effect.json": {
+      "sha256": "b7f9477f86b5be828c4dbac00207c30fd82d489446df64352b43eb01fa248db4",
+      "bytes": 380
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\reliability\\invariant-observations.jsonl": {
+      "sha256": "5e971b841ed7bb4802e2b71e4f5a39dc8105eaa2c15850acddaaad7dab2ef4d9",
+      "bytes": 67125464
+    },
+    "C:\\work\\github\\DevOrchestrator-dev\\runtime\\jobs\\job-cf58d9f173ff286f\\result.json": {
+      "sha256": "b261f7c9ae05219e60fbecc7da78d3ac9bd767a5e6effef082b30dd52bf1accb",
+      "bytes": 228
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\summary.json": {
+      "sha256": "3c5409d343874d5caf5eb0087f3f4201aa4a99e16e8d5543ada132101bb37f9c",
+      "bytes": 5177
+    },
+    "C:\\work\\p20-soak\\20261004-live-a\\runtime\\fault-driver.json": {
+      "sha256": "e6f33e787a2d4d8ea1ade98401969d364ecb0686efdcc71cd759e0dafac37045",
+      "bytes": 430
+    }
+  }
+}

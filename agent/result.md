@@ -1,3 +1,13 @@
+# P20.4 FAILED / diagnosis checkpoint (2026-10-05)
+
+The original run p20-live-20261004-a FAILED at 2026-10-04T20:55:17Z (2026-10-05 04:55:17 Shanghai), exit code 4, system_boot_discontinuity. Canonical authority is P20.4 OWNER_GATE / SOAK_EVIDENCE_UNRESOLVED with no active Worker. P20 remains incomplete; do not treat the historical RUNNING checkpoint below as current state.
+
+Full diagnosis: docs/P20_4_FAILED_RUN_DIAGNOSIS_20261005.md. Source evidence: docs/evidence/P20_4_DIAGNOSIS_SOURCES_20261005.json and P20_4_DIAGNOSIS_WINDOWS_CLOCK_20261005.json. Windows corrected the wall clock by ~1.705 seconds without reboot; the clock verifier incorrectly used psutil boot-time estimate as identity. Other independently blocking defects include CRLF staged specs, unauthorized static relaunch of P204.1 during pending Review, failed Planner hidden by PENDING_DESIGN authority, local gates not promoted to authority, resource failover limitations, 64-MiB observation exhaustion and weak duplicate history metrics, and 15 surviving case daemons.
+
+The original run, clocks, ledgers, failed actuation, owner gate, Broker configuration and owned processes were preserved during this diagnosis. No replacement soak or recovery was launched. Five-task live qualification and independent final Review remain required; deterministic CPF 10/10 and earlier 92-test GREEN do not qualify this failed run. Remediate the diagnosed contract/verification gaps in isolated fixtures before normal authorized recovery. Never rewrite or concatenate the old timing evidence. P20.5 remains pending, no P21 or push.
+
+---
+
 # P20.4 original live run checkpoint (2026-10-04)
 
 P20 is NOT COMPLETE. Canonical authority remains P20.4 EXECUTING with the original externally bound owner p20-4-live-bootstrap-worker-fresh-20261004. Its foreground Broker Worker finished; durable owned job job-cf58d9f173ff286f remains running. Original supervisor child PID 36400 opened p20-live-20261004-a at 2026-10-04T13:37:21.464641+00:00 (21:37:21 Shanghai). Do not reset its start, replace its supervisor, accumulate segments, or claim six hours early. The earliest six-hour instant is 2026-10-05 03:37:21 Shanghai; reaching that instant alone is insufficient.
