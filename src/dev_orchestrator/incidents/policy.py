@@ -23,6 +23,17 @@ DEFAULT_INCIDENT_POLICY: dict[str, Any] = {
     "max_replay_corpus_cases": 500,
     "max_replay_fixture_bytes": 65536,
     "max_replay_repeats": 2,
+    "max_same_strategy_retries": 1,
+    "max_recoveries_per_incident": 3,
+    "max_recovery_attempts_per_family": 5,
+    "recovery_attempt_reservation_ttl_seconds": 300.0,
+    "heterogeneous_required_classes": (
+        "malformed_ai_output",
+        "reviewer_rejected",
+        "retry_without_progress",
+        "unknown_requires_owner",
+    ),
+    "recovery_enabled": True,
 }
 
 
@@ -44,6 +55,12 @@ KNOWN_INCIDENT_KEYS = frozenset({
     "max_replay_corpus_cases",
     "max_replay_fixture_bytes",
     "max_replay_repeats",
+    "max_same_strategy_retries",
+    "max_recoveries_per_incident",
+    "max_recovery_attempts_per_family",
+    "recovery_attempt_reservation_ttl_seconds",
+    "heterogeneous_required_classes",
+    "recovery_enabled",
 })
 
 FOREIGN_TOP_LEVEL_SECTIONS = frozenset({
@@ -110,6 +127,18 @@ def resolve_incident_policy(config: dict[str, Any] | None = None) -> dict[str, A
             policy["max_replay_fixture_bytes"] = max(1, min(1048576, raw["max_replay_fixture_bytes"]))
         if "max_replay_repeats" in raw and isinstance(raw["max_replay_repeats"], int):
             policy["max_replay_repeats"] = max(1, min(10, raw["max_replay_repeats"]))
+        if "max_same_strategy_retries" in raw and isinstance(raw["max_same_strategy_retries"], int):
+            policy["max_same_strategy_retries"] = max(0, min(10, raw["max_same_strategy_retries"]))
+        if "max_recoveries_per_incident" in raw and isinstance(raw["max_recoveries_per_incident"], int):
+            policy["max_recoveries_per_incident"] = max(1, min(20, raw["max_recoveries_per_incident"]))
+        if "max_recovery_attempts_per_family" in raw and isinstance(raw["max_recovery_attempts_per_family"], int):
+            policy["max_recovery_attempts_per_family"] = max(1, min(50, raw["max_recovery_attempts_per_family"]))
+        if "recovery_attempt_reservation_ttl_seconds" in raw and isinstance(raw["recovery_attempt_reservation_ttl_seconds"], (int, float)):
+            policy["recovery_attempt_reservation_ttl_seconds"] = max(1.0, float(raw["recovery_attempt_reservation_ttl_seconds"]))
+        if "heterogeneous_required_classes" in raw and isinstance(raw["heterogeneous_required_classes"], (list, tuple, set, frozenset)):
+            policy["heterogeneous_required_classes"] = tuple(str(x) for x in raw["heterogeneous_required_classes"])
+        if "recovery_enabled" in raw:
+            policy["recovery_enabled"] = bool(raw["recovery_enabled"])
 
     if "regression_owner" in config:
         policy["regression_owner"] = config["regression_owner"]

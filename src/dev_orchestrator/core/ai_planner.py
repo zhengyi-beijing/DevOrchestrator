@@ -1804,8 +1804,22 @@ class AIPlannerCoordinator:
                         plan_id, "failed",
                         "plan review failed: all eligible reviewer resources exhausted/unavailable: " + review_failure,
                     )
-                else:
-                    self._finish(plan_id, "failed", f"plan review failed: {review_failure}")
+                    return None
+
+                is_inconclusive = (
+                    isinstance(reconciled, dict)
+                    and (
+                        str(reconciled.get("status") or "").lower() in {"running", "in_flight", "dispatched", "pending", "inconclusive"}
+                        or reconciled.get("broker_running") is True
+                        or str(reconciled.get("broker_status") or "").lower() in {"running", "in_flight", "dispatched"}
+                        or (str(reconciled.get("status") or "").lower() not in {"failed", "cancelled", "no_candidate", "accepted", "rejected", "completed"} and bool(reconciled.get("status")))
+                    )
+                )
+                if is_inconclusive:
+                    self._handle_inconclusive_review_transport_loss(plan_id, review_request, reconciled, exc)
+                    return None
+
+                self._finish(plan_id, "failed", f"plan review failed: {review_failure}")
                 return None
             finally:
                 if self.accounting is not None:
@@ -2162,7 +2176,8 @@ class AIPlannerCoordinator:
                         current.update({
                             "state": "remediating",
                             "recovery_cycle": recovery_cycle,
-                            "remediation_round": 0,
+                            "remediation_round": current.get("remediation_round", round_no),
+                            "cumulative_remediation_rounds": int(current.get("cumulative_remediation_rounds") or current.get("remediation_round") or round_no),
                             "review_reason": reason,
                             "recovery_rejection": reason,
                             "recovery_prior_plan": copy.deepcopy(plan),
@@ -2755,3 +2770,141 @@ class AIPlannerCoordinator:
                 record["control_synced"] = True
                 record["control_synced_at"] = utc_now_iso()
                 self._save_state(state)
+
+    def adjudicate_plan_delta(
+        self,
+        project_id: str,
+        task_id: str,
+        accepted_contract: dict[str, Any],
+        unresolved_delta: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Read-only bounded delta adjudication per docs/development-workflow.md.
+
+        Receives only the unresolved blocking delta and accepted contract.
+        Preserves accepted plan content and candidate plan.
+        Cannot modify the repository.
+        Returns {"disposition": "bounded_patch" | "owner_gate", "reason": ..., "patch": ...}.
+        """
+        if not unresolved_delta or not unresolved_delta.get("blocking_finding"):
+            return {
+                "disposition": "bounded_patch",
+                "reason": "delta_resolved",
+                "patch": {},
+            }
+        return {
+            "disposition": "owner_gate",
+            "reason": f"unresolved_delta_requires_owner: {unresolved_delta.get('blocking_finding') or unresolved_delta.get('rejection_reason')}",
+            "gate_code": "DELTA_ADJUDICATION_UNRESOLVED",
+            "task_id": task_id,
+            "project_id": project_id,
+        }
+
+    def _handle_inconclusive_review_transport_loss(
+        self,
+        plan_id: str,
+        review_request: AIRoleRequest,
+        broker_status: dict[str, Any] | None,
+        exc: Exception | None = None,
+    ) -> dict[str, Any]:
+        """Handle inconclusive review transport response loss while broker runs.
+
+        Replaces silent terminal failed plan with a durable actionable OWNER_GATE.
+        """
+        req_id = review_request.request_id
+        gate_id = f"gate-inconclusive-{req_id[:16]}"
+        prev_res = review_request.previous_resource_context
+        resource_id = prev_res.resource_id if prev_res else None
+        reason = f"transport response loss while broker running: request_id={req_id}, resource={resource_id}"
+
+        try:
+            from dev_orchestrator.control.owner_store import OwnerControlStore
+            OwnerControlStore(self.runtime_root).record_gate(
+                project_id=review_request.project_id,
+                gate_id=gate_id,
+                reason=reason,
+                active=True,
+            )
+        except Exception:
+            pass
+
+        if self.accounting is not None:
+            self.accounting.open_owner_gate(
+                plan_id,
+                project_id=review_request.project_id,
+                task_id=review_request.task_run_id,
+                role="owner",
+                request_id=req_id,
+                source_request_id=gate_id,
+            )
+
+        if self.progress_channel is not None:
+            self.progress_channel.emit(
+                {"project_id": review_request.project_id},
+                "OWNER_GATE",
+                task_id=review_request.task_run_id,
+                occurrence_key=f"{plan_id}:{gate_id}",
+                details={
+                    "plan_id": plan_id,
+                    "request_id": req_id,
+                    "gate_id": gate_id,
+                    "resource_id": resource_id,
+                    "broker_status": broker_status,
+                    "reason": reason,
+                },
+            )
+
+        with self._lock:
+            state = self._load_state()
+            current = state.get("plans", {}).get(plan_id)
+            if isinstance(current, dict):
+                current["state"] = "owner_gate"
+                current["owner_gate_id"] = gate_id
+                current["reason"] = reason
+                self._save_state(state)
+
+        return {"gate_id": gate_id, "reason": reason}
+
+
+def cleanup_stale_role_tool_children(
+    runtime_root: Path | str,
+    role: str = "reviewer",
+    max_age_seconds: float = 600.0,
+    request_id: str | None = None,
+    resource_id: str | None = None,
+) -> int:
+    """Bounded cleanup for timed-out read-only role harness sessions and their tool children.
+
+    Correlated to exact source request and resource identity.
+    Only terminates verified read-only children (such as graphify query children);
+    never touches daemon, worker, or user processes.
+    """
+    runtime = Path(runtime_root)
+    terminated_count = 0
+    harness_sessions_file = runtime / "harness-sessions.json"
+    if harness_sessions_file.is_file():
+        try:
+            data = read_json(harness_sessions_file, {})
+            sessions = data.get("sessions") or {}
+            for s_id, s_info in list(sessions.items()):
+                if not isinstance(s_info, dict):
+                    continue
+                if s_info.get("role") != role:
+                    continue
+                if request_id and s_info.get("request_id") != request_id:
+                    continue
+                if resource_id and s_info.get("resource_id") != resource_id:
+                    continue
+                child_pids = s_info.get("child_pids") or []
+                for c_pid in child_pids:
+                    try:
+                        import psutil
+                        p = psutil.Process(c_pid)
+                        cmdline = " ".join(p.cmdline()).lower()
+                        if "graphify" in cmdline or "reviewer" in cmdline:
+                            p.terminate()
+                            terminated_count += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return terminated_count

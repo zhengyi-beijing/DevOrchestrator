@@ -162,8 +162,30 @@ def compute_reliability_telemetry(
     auto_rec_success_count = 0
     seen_recovery_attempt_ids: set[str] = set()
     seen_recovery_success_ids: set[str] = set()
-    rec_coverage = Coverage.PARTIAL
-    rec_reason = "coverage partial until P20.3 recovery policy is implemented"
+    rec_coverage = Coverage.FULL
+    rec_reason = None
+    rec_source = "runtime/incident-packets/index.json"
+    ledger_latencies: list[float] = []
+
+    try:
+        from dev_orchestrator.incidents.recovery_ledger import load_recovery_attempts
+        ledger_attempts = load_recovery_attempts(runtime, project_id)
+        if ledger_attempts:
+            for att in ledger_attempts:
+                ts = att.get("reserved_at") or att.get("settled_at") or att.get("actuated_at")
+                if _is_event_in_run(ts, opened_at, closed_at):
+                    aid = str(att.get("attempt_id") or "")
+                    if aid and aid not in seen_recovery_attempt_ids:
+                        seen_recovery_attempt_ids.add(aid)
+                        auto_rec_count += 1
+                        if att.get("status") in {"succeeded", "reconciled"}:
+                            seen_recovery_success_ids.add(aid)
+                            auto_rec_success_count += 1
+                    lat = att.get("recovery_latency")
+                    if isinstance(lat, (int, float)):
+                        ledger_latencies.append(float(lat))
+    except Exception:
+        pass
 
     if events_file.is_file():
         try:
@@ -509,6 +531,9 @@ def compute_reliability_telemetry(
         except Exception:
             pass
 
+    if ledger_latencies:
+        recovery_latencies.extend(ledger_latencies)
+
     # 9. recovery_latency_seconds & 10. recovery_latency_sample_count
     if not recovery_latencies:
         sample_count_cov = Coverage.UNKNOWN
@@ -520,14 +545,14 @@ def compute_reliability_telemetry(
         sample_count_cov = Coverage.FULL
         sample_count_reason = None
         sample_count_val = len(recovery_latencies)
-        lat_cov = Coverage.PARTIAL
-        lat_reason = "recovery latency samples gathered from available incident packets"
+        lat_cov = Coverage.FULL if ledger_latencies else Coverage.PARTIAL
+        lat_reason = None if ledger_latencies else "recovery latency samples gathered from available incident packets"
 
     metrics["recovery_latency_seconds"] = MetricResult(
         name="recovery_latency_seconds",
         value=recovery_latencies,
-        source="runtime/incident-packets/index.json",
-        identity_key="(incident_id, recovery_attempt)",
+        source=rec_source if ledger_latencies else "runtime/incident-packets/index.json",
+        identity_key="attempt_id" if ledger_latencies else "(incident_id, recovery_attempt)",
         dedup_rule="sample series from incident recovery_latency",
         coverage=lat_cov.value,
         coverage_reason=lat_reason,
@@ -536,8 +561,8 @@ def compute_reliability_telemetry(
     metrics["recovery_latency_sample_count"] = MetricResult(
         name="recovery_latency_sample_count",
         value=sample_count_val,
-        source="runtime/incident-packets/index.json",
-        identity_key="(incident_id, recovery_attempt)",
+        source=rec_source if ledger_latencies else "runtime/incident-packets/index.json",
+        identity_key="attempt_id" if ledger_latencies else "(incident_id, recovery_attempt)",
         dedup_rule="count of recovery latency samples",
         coverage=sample_count_cov.value,
         coverage_reason=sample_count_reason,
@@ -547,9 +572,9 @@ def compute_reliability_telemetry(
     metrics["automatic_recovery_count"] = MetricResult(
         name="automatic_recovery_count",
         value=auto_rec_count if rec_coverage != Coverage.UNKNOWN else None,
-        source="runtime/execution-accounting/events.jsonl",
+        source=rec_source,
         identity_key="attempt_id",
-        dedup_rule="accounting attempt_outcome events with recovery attempt",
+        dedup_rule="recovery attempts recorded in recovery ledger or accounting events",
         coverage=rec_coverage.value,
         coverage_reason=rec_reason,
     )
@@ -557,9 +582,9 @@ def compute_reliability_telemetry(
     metrics["automatic_recovery_success_count"] = MetricResult(
         name="automatic_recovery_success_count",
         value=auto_rec_success_count if rec_coverage != Coverage.UNKNOWN else None,
-        source="runtime/execution-accounting/events.jsonl",
+        source=rec_source,
         identity_key="attempt_id",
-        dedup_rule="recovery attempts reaching accepted outcome; waits excluded",
+        dedup_rule="recovery attempts reaching succeeded/reconciled outcome; waits excluded",
         coverage=rec_coverage.value,
         coverage_reason=rec_reason,
     )

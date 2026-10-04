@@ -19,6 +19,26 @@ from dev_orchestrator.incidents.obligations import resolve_progress_obligation
 from dev_orchestrator.incidents.owner_gate import resolve_owner_gate_authority
 from dev_orchestrator.incidents.policy import resolve_incident_policy
 from dev_orchestrator.incidents.promotion import promote_candidate, resolve_promotion_state
+from dev_orchestrator.incidents.recovery_ledger import (
+    RECOVERY_ATTEMPT_SCHEMA_VERSION,
+    RECOVERY_ATTEMPT_STATUSES,
+    RecoveryAttempt,
+    load_recovery_attempts,
+    normalize_recovery_attempt,
+    reconcile_recovery_attempts,
+    record_recovery_outcome,
+    recovery_budget_state,
+    reserve_recovery_attempt,
+    resolve_recovery_strategy_key,
+    validate_recovery_attempt,
+)
+from dev_orchestrator.incidents.recovery_policy import (
+    RECOVERY_ACTIONS,
+    RecoveryDecision,
+    RecoveryInputs,
+    build_resource_availability,
+    decide_recovery,
+)
 from dev_orchestrator.incidents.regression_candidate import (
     REGRESSION_CANDIDATE_SCHEMA_VERSION,
     REPLAYABILITY_VALUES,
@@ -124,4 +144,20 @@ __all__ = [
     "ReplayOpNotAllowedError",
     "ReplayFixtureInvalidError",
     "map_to_failure_class",
+    "RECOVERY_ACTIONS",
+    "RecoveryDecision",
+    "RecoveryInputs",
+    "build_resource_availability",
+    "decide_recovery",
+    "RECOVERY_ATTEMPT_SCHEMA_VERSION",
+    "RECOVERY_ATTEMPT_STATUSES",
+    "RecoveryAttempt",
+    "load_recovery_attempts",
+    "normalize_recovery_attempt",
+    "reconcile_recovery_attempts",
+    "record_recovery_outcome",
+    "recovery_budget_state",
+    "reserve_recovery_attempt",
+    "resolve_recovery_strategy_key",
+    "validate_recovery_attempt",
 ]

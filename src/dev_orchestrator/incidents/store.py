@@ -91,6 +91,7 @@ def _empty_index(degraded: bool = False, degraded_reason: str | None = None) -> 
         "families": {},
         "candidates": {},
         "regression_candidates": {},
+        "recovery_attempts": {},
     }
 
 
@@ -112,6 +113,7 @@ class IncidentStore:
         self.fence_path = _fence_path(self.runtime_root)
         self.packets_dir = self.base_dir / "packets"
         self.candidates_dir = self.base_dir / "candidates"
+        self.recovery_attempts_dir = self.base_dir / "recovery-attempts"
         self.journal_dir = self.base_dir / "journal"
         self.intents_dir = self.journal_dir
         self.orphans_dir = self.base_dir / "orphans"
@@ -135,7 +137,7 @@ class IncidentStore:
         return self.fence_path.is_file()
 
     def _ensure_dirs(self) -> None:
-        for directory in (self.base_dir, self.packets_dir, self.candidates_dir, self.journal_dir, self.orphans_dir):
+        for directory in (self.base_dir, self.packets_dir, self.candidates_dir, self.recovery_attempts_dir, self.journal_dir, self.orphans_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
     def _load_index_failclosed(self) -> dict[str, Any]:
@@ -175,6 +177,8 @@ class IncidentStore:
             data["candidates"] = {}
         if not isinstance(data.get("regression_candidates"), dict):
             data["regression_candidates"] = {}
+        if not isinstance(data.get("recovery_attempts"), dict):
+            data["recovery_attempts"] = {}
         if "revision" not in data or not isinstance(data["revision"], int):
             data["revision"] = 0
         if "schema_version" not in data:

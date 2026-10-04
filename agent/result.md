@@ -1,5 +1,38 @@
 # DevOrchestrator Self-Hosting Result Log
 
+P20.3 Deterministic Recovery & Heterogeneous Escalation implementation result (2026-10-04):
+- **Implementation: COMPLETE. Verification: PASS. Technical Review: PENDING.**
+- **Pure Deterministic Recovery Policy (`recovery_policy.py`):**
+  - Eight authorized actions: `NO_ACTION_ALREADY_RECOVERED`, `OWNER_GATE`, `RECONCILE_RUNTIME`, `RESTART_COMPONENT`, `HETEROGENEOUS_ESCALATION`, `SWITCH_RESOURCE`, `RETRY_CHANGED_STRATEGY`, `RETRY_SAME_STRATEGY`.
+  - Pure, total, deterministic `decide_recovery(inputs, *, now=None)`; no IO, subprocess, git, network, or ambient clock access.
+  - Fail-closed evaluation order: resolved incident no-op -> contradictory authority / exhausted budget / stale HEAD / dirty worktree owner gate -> ambiguous liveness reconcile runtime -> component restart -> heterogeneous escalation -> resource switch -> retry changed strategy -> retry same strategy.
+  - Anti-loop strategy key normalization (`resolve_recovery_strategy_key`): excludes volatile fields, AGY account, resource rotation, and timestamps.
+- **In-Transaction Durable Recovery Ledger (`recovery_ledger.py`):**
+  - Schema version 1, validated `RecoveryAttempt` dataclass with status set: `reserved`, `actuated`, `succeeded`, `failed`, `abandoned`, `reconciled`, `gated`.
+  - In-transaction reservation (`reserve_recovery_attempt`) inside `IncidentStore.execute_txn` under inter-process file lock before effect; deterministic `attempt_id` deduplication.
+  - Settlement (`record_recovery_outcome`) with latency and effect identity; idempotent terminal transitions.
+  - Replay reconciliation (`reconcile_recovery_attempts`) binds single existing effect, marks proven absent abandoned, and gates closed on crash ambiguity without duplicate Worker or job.
+- **Three Confirmed Bootstrap Recovery Gaps Closed:**
+  - Gap 1: Cumulative semantic remediation budget carry & rejection chain across failovers/cycles/restart (`remediation_round` preserved, not reset to 0).
+  - Gap 1b: Bounded read-only delta adjudication after remediation rounds exhausted (`adjudicate_plan_delta`).
+  - Gap 2: Inconclusive transport loss while broker runs emits durable actionable `OWNER_GATE` (`_handle_inconclusive_review_transport_loss`).
+  - Gap 3: Bounded cleanup of timed-out read-only reviewer harness sessions and tool children (`cleanup_stale_role_tool_children`).
+- **Telemetry Integration (`reliability_telemetry.py`):**
+  - Sourced `automatic_recovery_count`, `automatic_recovery_success_count`, `recovery_latency_seconds`, and `recovery_latency_sample_count` from recovery ledger first (with accounting fallback), using `identity_key="attempt_id"` and honest computed coverage.
+- **Control-Plane Impact & Fault Scenarios:**
+  - Preserves invariants: `CURRENT_TASK_MATCHES_ACTIVE_EXECUTION`, `TERMINAL_TASK_HAS_NO_RUNNING_EXECUTION`, `PENDING_DESIGN_NOT_EXECUTING`, `SUCCESSOR_HANDOFF_LINEAGE_VALID`, `NEXT_TASK_WITHOUT_HANDOFF`, `SINGLE_ACTIVE_LIFECYCLE_OWNER`.
+  - Conforms to boundaries: `authority_reconciliation`, `watchdog_recovery`, `owner_gate_transition`, `successor_handoff`, `handoff_publication`, `worker_launch`.
+  - All ten fault scenarios CPF-01..CPF-10 verified; `validate_fault_registry()` returns `ERRORS: []`.
+- **Verification Evidence:**
+  - Focused suites: `test_p20_3_recovery_policy.py` (18 tests), `test_p20_3_recovery_durability.py` (23 tests), `test_p20_readonly_review_timeout.py` (8 tests) — 49 passed in 3.82s.
+  - Adjacent regressions: P20.1/P20.2 (73 tests passed), successor/invariants (132 tests passed), watchdog (119 tests passed), handoff/roadmap (16 tests passed), planner (47 tests passed) — 436 total regression tests passed.
+  - Python `compileall`: clean.
+  - `git diff --check`: clean.
+  - `graphify update .`: completed (9118 nodes, 24741 edges, 344 communities).
+  - Contract documentation: `docs/P20_3_RECOVERY_CONTRACT.md`.
+  - RED evidence preserved in `docs/evidence/P20_3_RED.txt`; GREEN evidence in `docs/evidence/P20_3_GREEN.txt`.
+- **Lifecycle Posture:** Staged successor `agent/staged/P20.4.md` remains strictly `PENDING DESIGN`. No P20.4 soak harness, no P21, no push.
+
 P20.2 automatic typed candidate integration follow-up (2026-10-04):
 - P20.1 has independent ACCEPT; P20.2 normal remediation review accepted
   a648a9c3. A supplemental automatic-path probe nevertheless reproduced a

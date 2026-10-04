@@ -538,6 +538,19 @@ def _run_orchestration_tick(
     except Exception as _harv_exc:
         projected = dict(projected) if isinstance(projected, dict) else {"projects": [], "summary": projected}
         projected["_harvesting_tick_error"] = str(_harv_exc)
+    try:
+        from dev_orchestrator.incidents.recovery_ledger import reconcile_recovery_attempts
+        if not authority_fenced:
+            reconcile_recovery_attempts(
+                runtime,
+                executor=executor,
+                planner=planner_obj,
+                reviewer=reviewer,
+                jobs=job_recovery,
+            )
+    except Exception as _recov_exc:
+        projected = dict(projected) if isinstance(projected, dict) else {"projects": [], "summary": projected}
+        projected["_recovery_tick_error"] = str(_recov_exc)
     if job_recovery is not None and not authority_fenced:
         try:
             job_recovery.advance()

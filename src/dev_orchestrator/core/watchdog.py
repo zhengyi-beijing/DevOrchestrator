@@ -1729,6 +1729,40 @@ class WatchdogCoordinator:
         self._save_state(self._cached_state)
 
         try:
+            from dev_orchestrator.incidents.recovery_ledger import (
+                reserve_recovery_attempt,
+                record_recovery_outcome,
+            )
+            from dev_orchestrator.incidents.recovery_policy import RecoveryDecision
+            rcv_decision = RecoveryDecision(
+                action="RETRY_SAME_STRATEGY",
+                reason="watchdog_automatic_planning_recovery",
+                authorized_effect={"effect_kind": "continue", "target_id": task_id},
+                expected_authority_anchor={
+                    "project_id": pid,
+                    "task_id": task_id,
+                    "lifecycle_generation": authority.get("generation") if isinstance(authority, dict) else None,
+                    "head": str(truth.head or ""),
+                },
+                expected_source_anchor={
+                    "incident_id": f"inc-{fingerprint[:16]}",
+                    "family_id": f"fam-{fingerprint[:12]}",
+                    "failure_signature": fingerprint,
+                },
+                remaining_budget={
+                    "same_strategy_remaining": max(0, limit - attempt_number),
+                    "incident_recoveries_remaining": max(0, limit - attempt_number),
+                },
+                strategy_key=f"watchdog_plan_recovery:{task_id}",
+                attempt_id=command_id,
+                idempotency_key=f"idem-{command_id}",
+                requires_heterogeneous=False,
+            )
+            reserve_recovery_attempt(self.runtime_root, pid, rcv_decision)
+        except Exception:
+            pass
+
+        try:
             from dev_orchestrator.core.control_commands import submit_control_command
             submit_control_command(
                 self.runtime_root,
@@ -1738,6 +1772,12 @@ class WatchdogCoordinator:
                 expected=identity,
                 source="watchdog_planning_recovery",
             )
+            try:
+                record_recovery_outcome(
+                    self.runtime_root, pid, command_id, "actuated", effect_id=command_id
+                )
+            except Exception:
+                pass
             attempt["state"] = "requested"
             attempt["requested_at"] = utc_now_iso()
             self._save_state(self._cached_state)
@@ -1760,6 +1800,12 @@ class WatchdogCoordinator:
                 "problem_id": problem["problem_id"],
             }
         except Exception as exc:
+            try:
+                record_recovery_outcome(
+                    self.runtime_root, pid, command_id, "failed", reason=str(exc)
+                )
+            except Exception:
+                pass
             attempt["state"] = "blocked"
             attempt["reason"] = f"enqueue failed: {exc}"
             problem["state"] = "blocked"
