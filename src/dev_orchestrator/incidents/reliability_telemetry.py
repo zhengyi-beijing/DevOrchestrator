@@ -192,6 +192,7 @@ def compute_reliability_telemetry(
     except Exception as exc:
         ledger_error = str(exc)
 
+    ledger_contributed_count = len(seen_recovery_attempt_ids)
     if ledger_attempts_read:
         if ledger_has_malformed:
             rec_coverage = Coverage.PARTIAL
@@ -204,6 +205,7 @@ def compute_reliability_telemetry(
         rec_coverage = Coverage.UNKNOWN
         rec_reason = f"recovery ledger unavailable: {ledger_error or 'not loaded'}"
 
+    events_fallback_contributed = 0
     if events_file.is_file():
         try:
             with events_file.open("r", encoding="utf-8") as f:
@@ -256,6 +258,7 @@ def compute_reliability_telemetry(
                                 if rec_id not in seen_recovery_attempt_ids:
                                     seen_recovery_attempt_ids.add(rec_id)
                                     auto_rec_count += 1
+                                    events_fallback_contributed += 1
 
                                 is_wait_deferral = (
                                     outcome in {"wait", "deferral", "deferred", "owner_wait"}
@@ -267,10 +270,17 @@ def compute_reliability_telemetry(
                                         seen_recovery_success_ids.add(rec_id)
                                         auto_rec_success_count += 1
                             else:
-                                if not ledger_attempts_read:
-                                    rec_coverage = Coverage.PARTIAL
-                                    rec_reason = "attempt_outcome recovery row missing attempt_id"
-            if not ledger_attempts_read and rec_coverage == Coverage.UNKNOWN:
+                                rec_coverage = Coverage.PARTIAL
+                                rec_reason = "attempt_outcome recovery row missing attempt_id"
+            if events_fallback_contributed > 0 and ledger_contributed_count == 0:
+                rec_coverage = Coverage.PARTIAL
+                rec_reason = "recovery counts sourced from fallback events.jsonl; recovery ledger was empty"
+                rec_source = "runtime/execution-accounting/events.jsonl"
+            elif events_fallback_contributed > 0 and ledger_contributed_count > 0:
+                rec_coverage = Coverage.PARTIAL
+                rec_reason = "recovery counts partially contributed by accounting fallback"
+                rec_source = "runtime/incident-packets/index.json; runtime/execution-accounting/events.jsonl"
+            elif not ledger_attempts_read and rec_coverage == Coverage.UNKNOWN:
                 rec_coverage = Coverage.PARTIAL
                 rec_reason = "recovery counts sourced from fallback events.jsonl; recovery ledger unpopulated or absent"
                 rec_source = "runtime/execution-accounting/events.jsonl"

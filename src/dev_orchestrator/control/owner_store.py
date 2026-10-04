@@ -112,3 +112,9 @@ class OwnerControlStore:
             data["projects"][project_id] = state
             write_json(self.path, data, indent=2)
             return dict(state)
+
+    def latest_gate(self, project_id: str) -> dict[str, Any] | None:
+        """Return the active owner gate dictionary for a project if one exists."""
+        state = self.project_state(project_id)
+        gate = state.get("owner_gate")
+        return dict(gate) if isinstance(gate, dict) else None

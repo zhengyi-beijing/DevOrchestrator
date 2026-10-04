@@ -205,6 +205,16 @@ def reserve_recovery_attempt(
             # Idempotent short circuit: unchanged index, no side files
             return index, {}
 
+        scoped_prior_attempts = [
+            att for att in recovery_attempts.values()
+            if isinstance(att, dict) and (
+                (family_id and att.get("family_id") == family_id)
+                or (incident_id and att.get("incident_id") == incident_id)
+            )
+        ]
+        scoped_prior_count = len(scoped_prior_attempts)
+        attempt_index = scoped_prior_count + 1
+
         attempt_record = RecoveryAttempt(
             attempt_id=attempt_id,
             project_id=project_id,
@@ -213,7 +223,7 @@ def reserve_recovery_attempt(
             failure_signature=failure_sig,
             strategy_key=strategy_key,
             action=action,
-            attempt_index=len(recovery_attempts) + 1,
+            attempt_index=attempt_index,
             status="reserved",
             reserved_at=utc_now_iso(),
             effect_kind=eff_dict.get("effect_kind"),
@@ -237,7 +247,7 @@ def reserve_recovery_attempt(
             fam = fams[family_id]
             fam["recovery_strategy"] = strategy_key
             fam["recovery_attempt"] = attempt_record["attempt_index"]
-            fam["previous_attempts"] = len(recovery_attempts)
+            fam["previous_attempts"] = scoped_prior_count
 
         return index, side_files
 

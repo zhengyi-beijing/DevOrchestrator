@@ -128,7 +128,43 @@ class DefaultReviewerHarness:
             },
         )
         self.session_store.save_session(session)
+
+        # Step 5: Persist role harness session for timeout/cleanup tracking
+        res_id = (
+            request.metadata.get("resource_id")
+            or (request.metadata.get("resource_context") or {}).get("resource_id")
+            or (request.metadata.get("worker_resource_context") or {}).get("resource_id")
+            or (request.metadata.get("previous_resource_context") or {}).get("resource_id")
+        )
+        child_pids = list(request.metadata.get("child_pids") or [])
+        try:
+            from dev_orchestrator.core.ai_planner import persist_harness_session
+            persist_harness_session(
+                self.runtime_root,
+                session_id=session.session_id,
+                role="reviewer",
+                request_id=request.source_request_id or request.request_id,
+                resource_id=res_id,
+                started_at=now,
+                child_pids=child_pids,
+            )
+        except Exception:
+            pass
+
         return session
+
+    def record_child_pid(self, session_id: str, pid: int) -> None:
+        """Register a spawned child PID under the active harness session."""
+        try:
+            from dev_orchestrator.core.ai_planner import persist_harness_session
+            persist_harness_session(
+                self.runtime_root,
+                session_id=session_id,
+                role="reviewer",
+                child_pids=[pid],
+            )
+        except Exception:
+            pass
 
     def status(self, session_id: str) -> ReviewSession:
         """Poll job status and update session state."""

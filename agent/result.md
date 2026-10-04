@@ -1,8 +1,14 @@
 # DevOrchestrator Self-Hosting Result Log
 
-P20.3 Deterministic Recovery & Heterogeneous Escalation technical review remediation result (2026-10-04):
+P20.3 Deterministic Recovery & Heterogeneous Escalation technical review round 2 remediation result (2026-10-04):
 - **Remediation: COMPLETE. Verification: PASS. Technical Review: PENDING.**
-- **Technical Review Findings Remediated (Concrete Findings Closed):**
+- **Round 2 Technical Review Findings Remediated (5 Concrete Findings Closed):**
+  1. `watchdog.py`, `recovery_policy.py`: Watchdog passes real routing configuration and pool telemetry from `project_config` and `ai_execution_port` instead of `(None, None)` into `build_resource_availability`. In `recovery_policy.py`, `max_attempts_per_run` is kept authoritative for transient classes so cleared repo races do not pause the project; candidate lists must be non-empty before treating heterogeneous escalation as exhausted.
+  2. `harness.py`, `ai_planner.py`: Wired `persist_harness_session` into `DefaultReviewerHarness.submit(request)` and added `record_child_pid(session_id, pid)` helper. Enhanced `persist_harness_session` to merge `child_pids` and preserve timestamps; updated `cleanup_stale_role_tool_children` to filter by `max_age_seconds`, require request/resource correlation, terminate matching children, and prune child PIDs.
+  3. `ai_planner.py`, `owner_store.py`: `adjudicate_plan_delta` evaluates unresolved delta against `accepted_contract` read-only; returns `bounded_patch` when resolvable or `owner_gate` with `DELTA_ADJUDICATION_UNRESOLVED`. Planning loop applies plan with patch when adjudication returns `bounded_patch`, or records durable gate via `OwnerControlStore` with `DELTA_ADJUDICATION_UNRESOLVED` and bound-exhaustion reason. `resume_exhausted_technical_gate` unpauses the project in `OwnerControlStore` so resumed gates unblock the launch barrier. Added `latest_gate` helper to `OwnerControlStore`.
+  4. `recovery_ledger.py`: `attempt_index` and `fam['previous_attempts']` in `reserve_recovery_attempt` are scoped to attempts sharing the same `family_id` (or `incident_id`) rather than store-global, counting only prior attempts so the current attempt is not pre-charged against the budget.
+  5. `reliability_telemetry.py`: Tracks `events_fallback_contributed` vs `ledger_contributed_count`; when the ledger is readable but empty, reports `coverage=partial` with source `runtime/execution-accounting/events.jsonl` and explicit reason.
+- **Round 1 Technical Review Findings Remediated (Preserved):**
   1. `recovery_ledger.py`: Daemon reconcile signature supports `project_id: str | None = None` defaulting to `None`, sweeping all projects in index, side files, and runtime on daemon startup.
   2. `owner_store.py`, `surface.py`: Added durable `record_gate` to `OwnerControlStore` setting `paused=True` and `suppress_static_starts=True` in `owner-control.json`; updated `latest_owner_gate` to query `owner-control.json`; unpausing clears active gates. Removed bare `try/except: pass` in `recovery_ledger.py` and `ai_planner.py`.
   3. Production actuation call sites wired & verified:
@@ -27,11 +33,13 @@ P20.3 Deterministic Recovery & Heterogeneous Escalation technical review remedia
   - Conforms to boundaries: `authority_reconciliation`, `watchdog_recovery`, `owner_gate_transition`, `successor_handoff`, `handoff_publication`, `worker_launch`.
   - All ten fault scenarios CPF-01..CPF-10 verified; `validate_fault_registry()` returns `ERRORS: []`.
 - **Verification Evidence:**
-  - Focused suites: `test_p20_3_recovery_policy.py` (19 tests), `test_p20_3_recovery_durability.py` (27 tests), `test_p20_readonly_review_timeout.py` (8 tests) — 54 passed in 4.06s.
-  - Adjacent regressions: P20.1/P20.2 (73 tests passed), watchdog (119 tests passed), handoff/roadmap (16 tests passed), planner (47 tests passed), reviewer/control (29 tests passed), successor/invariants (132 tests passed) — 416 regression tests passed.
-  - Python `compileall`: clean.
-  - `git diff --check`: clean.
-  - `graphify update .`: completed (9131 nodes, 24799 edges, 357 communities).
+  - Focused test suites: `test_p20_3_recovery_durability.py` (32 tests), `test_p20_3_recovery_policy.py` (19 tests), `runtime/p20-3-bound-probes/test_p203_production_bounds.py` (3 tests) — 54 passed in 3.34s.
+  - AI Planner test suite: `test_ai_planner.py` (40 passed in 22.66s).
+  - Planning convergence & Reviewer harness suites: `test_planning_convergence_recovery.py`, `test_p145_reviewer_harness.py` (40 passed in 16.41s).
+  - Watchdog suite: `test_watchdog.py` (7 passed in 1.36s).
+  - Python `compileall`: clean across `src/` and `tests_py/`.
+  - `git diff --check`: clean (0 errors).
+  - `graphify update .`: completed (9154 nodes, 24860 edges, 356 communities).
   - Contract documentation: `docs/P20_3_RECOVERY_CONTRACT.md`.
   - RED evidence preserved in `docs/evidence/P20_3_RED.txt`; GREEN evidence in `docs/evidence/P20_3_GREEN.txt`.
 - **Lifecycle Posture:** Staged successor `agent/staged/P20.4.md` remains strictly `PENDING DESIGN`. No P20.4 soak harness, no P21, no push.

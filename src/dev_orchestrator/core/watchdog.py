@@ -1730,12 +1730,28 @@ class WatchdogCoordinator:
         )
         from dev_orchestrator.incidents.owner_gate import resolve_owner_gate_authority
 
-        routing_cfg = None
-        if hasattr(self, "config") and isinstance(self.config, dict):
-            routing_cfg = self.config.get("routing")
+        routing_cfg = (
+            project_config.get("routing")
+            or project_config.get("routing_policy")
+            or project_config.get("ai_routing")
+            or (project_config.get("ai_roles") or {}).get("planner", {}).get("routing")
+            or (project_config.get("ai_roles") or {}).get("planner")
+            or (getattr(self, "config", None) or {}).get("routing")
+        )
         pool_telemetry = None
-        if hasattr(self, "resource_pool") and self.resource_pool is not None:
+        port = getattr(self, "ai_execution_port", None)
+        if port is not None:
+            pool = getattr(port, "resource_pool", None) or getattr(port, "pool", None)
+            if pool is not None:
+                pool_telemetry = pool.telemetry() if callable(getattr(pool, "telemetry", None)) else getattr(pool, "telemetry", None)
+            elif hasattr(port, "telemetry"):
+                pool_telemetry = port.telemetry() if callable(port.telemetry) else port.telemetry
+        if pool_telemetry is None and hasattr(self, "resource_pool") and self.resource_pool is not None:
             pool_telemetry = getattr(self.resource_pool, "telemetry", None)
+            if callable(pool_telemetry):
+                pool_telemetry = pool_telemetry()
+        if pool_telemetry is None:
+            pool_telemetry = project_config.get("resource_pool") or project_config.get("pool_telemetry")
 
         res_avail = build_resource_availability(
             pool_telemetry,
@@ -1775,7 +1791,7 @@ class WatchdogCoordinator:
             resource_availability=res_avail,
             existing_effects=None,
             budgets={
-                "max_same_strategy_retries": int(policy.get("max_same_strategy_retries", 1)),
+                "max_same_strategy_retries": int(policy.get("max_same_strategy_retries", limit)),
                 "max_recoveries_per_incident": int(policy.get("max_attempts_per_run", limit)),
                 "max_recovery_attempts_per_family": int(policy.get("max_recovery_attempts_per_family", 5)),
                 "heterogeneous_required_classes": policy.get("heterogeneous_required_classes", []),

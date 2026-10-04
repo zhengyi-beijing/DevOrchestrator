@@ -140,6 +140,7 @@ def decide_recovery(
     }
 
     incident_id = str(incident.get("incident_id") or "")
+    failure_class = str(incident.get("failure_class") or "")
     family_id = str((family.get("family_id") if isinstance(family, dict) else "") or incident.get("failure_family") or (f"fam-{incident_id[:12]}" if incident_id else "fam-unknown"))
     failure_sig = str(incident.get("failure_signature") or "")
     source_event_id = str(incident.get("occurrence_key") or incident.get("source_event_id") or incident_id)
@@ -178,6 +179,9 @@ def decide_recovery(
     )
     total_incident_attempts = len(previous_attempts)
     family_attempts_count = max(family_record_count, family_attempts_from_prev)
+    is_transient = "transient" in failure_class.lower() or failure_class in {"RESOURCE_TRANSIENT", "TRANSIENT"}
+    if is_transient and max_same_strategy < max_recoveries_incident:
+        max_same_strategy = max_recoveries_incident
     same_strategy_remaining = max(0, max_same_strategy - same_strategy_attempts)
     incident_recoveries_remaining = max(0, max_recoveries_incident - total_incident_attempts)
     family_attempts_remaining = max(0, max_family_attempts - family_attempts_count)
@@ -389,18 +393,31 @@ def decide_recovery(
                 authorized_effect={"effect_kind": "escalate_resource", "target_resource_id": target_res_id},
                 requires_heterogeneous=True,
             )
-        else:
-            # Fails closed to OWNER_GATE when no eligible heterogeneous resource exists
+        elif hetero_candidates:
+            # Resolved heterogeneous candidate list was non-empty, but all candidates were excluded or ineligible
             return _make_decision(
                 action="OWNER_GATE",
                 reason=f"heterogeneous_escalation_exhausted: no eligible heterogeneous resource configured for {failure_class}",
                 gate_code="HETEROGENEOUS_RESOURCE_UNAVAILABLE",
             )
+        elif is_high_risk:
+            return _make_decision(
+                action="OWNER_GATE",
+                reason=f"heterogeneous_escalation_exhausted: no heterogeneous candidates configured for {failure_class}",
+                gate_code="HETEROGENEOUS_RESOURCE_UNAVAILABLE",
+            )
+        else:
+            # Candidate lists are empty/not configured; for transient classes keep max_attempts_per_run budget authoritative
+            if is_transient and same_strategy_attempts < max_recoveries_incident:
+                return _make_decision(
+                    action="RETRY_SAME_STRATEGY",
+                    reason=f"retry_transient_within_budget: attempt={same_strategy_attempts + 1}/{max_recoveries_incident}",
+                )
 
     # -------------------------------------------------------------
     # (6) Resource-class failure with available non-excluded resource -> SWITCH_RESOURCE
     # -------------------------------------------------------------
-    if failure_class in _RESOURCE_FAILURE_CLASSES or "resource" in failure_class:
+    if failure_class in _RESOURCE_FAILURE_CLASSES or ("resource" in failure_class.lower() and not is_transient):
         eligible_candidates = res_avail.get("eligible_candidates") or []
         if eligible_candidates:
             target_res = eligible_candidates[0]

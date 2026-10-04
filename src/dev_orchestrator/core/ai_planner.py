@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
 import hashlib
 import json
 import subprocess
@@ -945,7 +946,7 @@ class AIPlannerCoordinator:
             return False, "owner gate task does not match current pending-design task"
 
         reason = str(record.get("reason") or "")
-        if not reason.startswith("plan remediation hit its bound after "):
+        if not (reason.startswith("plan remediation hit its bound after ") or "delta adjudication unresolved" in reason):
             return False, "owner gate is not a recoverable legacy remediation-exhaustion gate"
         if record.get("review_decision") != "reject":
             return False, "owner gate does not originate from a technical reject"
@@ -1011,6 +1012,13 @@ class AIPlannerCoordinator:
                 ),
             })
             self._save_state(state)
+        self.owner_store.set_paused(
+            project_id,
+            False,
+            command_id=f"resume-{gate_id}",
+            action="resume",
+            reason=f"technical plan gate resumed in recovery cycle {next_cycle}",
+        )
         thread = threading.Thread(
             target=self._run_cycle,
             args=(gate_id, project, policy),
@@ -1603,6 +1611,7 @@ class AIPlannerCoordinator:
         else:
             base_request_id = plan_id + ":reviewer" if round_no == 0 else f"{plan_id}:reviewer:remediate-{round_no}"
         failed_resource_ids: set[str] = set()
+        failed_resources: list[Any] = []
         max_attempts = 1 + policy["max_reviewer_resource_failovers"]
 
         for attempt in range(1, max_attempts + 1):
@@ -1676,6 +1685,18 @@ class AIPlannerCoordinator:
                     )
                     if can_failover and attempt < max_attempts:
                         failed_resource_ids.add(resource.resource_id)
+                        failed_resources.append(resource)
+                        same_pm_failures = sum(
+                            1 for r in failed_resources
+                            if getattr(r, "provider", None) == getattr(resource, "provider", None)
+                            and getattr(r, "model", None) == getattr(resource, "model", None)
+                        )
+                        if same_pm_failures >= 2:
+                            self._finish(
+                                plan_id, "failed",
+                                f"plan review failed: same provider/model account rotation exhausted for {resource.provider}/{resource.model}: {review_failure}",
+                            )
+                            return None
                         continue
                     if can_failover:
                         self._finish(
@@ -2168,7 +2189,7 @@ class AIPlannerCoordinator:
                     prior_resource = previous
                     continue
 
-                if recovery_cycle < max_recovery_cycles:
+                if round_no < 2 and recovery_cycle < max_recovery_cycles:
                     recovery_cycle += 1
                     rejection = reason
                     prior_plan = plan
@@ -2220,7 +2241,73 @@ class AIPlannerCoordinator:
                 if adjudication.get("disposition") == "bounded_patch" and adjudication.get("patch"):
                     if isinstance(plan, dict):
                         plan.update(adjudication["patch"])
-                    continue
+                    if self.accounting is not None:
+                        self.accounting.record_attempt_outcome(
+                            f"{plan_id}:adjudicated",
+                            "accepted",
+                            project_id=record["project_id"],
+                            task_id=record["task_id"],
+                            role="adjudicator",
+                            request_id=plan_id,
+                            metadata={
+                                "disposition": "bounded_patch",
+                                "reason": adjudication.get("reason"),
+                            },
+                        )
+                    if self.progress_channel is not None:
+                        self.progress_channel.emit(
+                            self._project_payload(record, project),
+                            "PLAN_ADJUDICATED",
+                            task_id=record["task_id"],
+                            occurrence_key=f"{plan_id}:adjudicated",
+                            details={
+                                "plan_id": plan_id,
+                                "reason": adjudication.get("reason"),
+                                "patch": adjudication.get("patch"),
+                            },
+                        )
+                    self._apply_plan(plan_id, record, plan, f"plan delta adjudicated: {adjudication.get('reason')}", project=project)
+                    return
+
+                if adjudication.get("disposition") == "owner_gate":
+                    gate_reason = adjudication.get("reason") or f"unresolved plan delta: {reason}"
+                    gate_code = adjudication.get("gate_code") or "DELTA_ADJUDICATION_UNRESOLVED"
+                    gate_id = f"gate-adjudicate-{record['task_id']}-{int(time.time())}"
+                    from dev_orchestrator.control.owner_store import OwnerControlStore
+                    OwnerControlStore(self.runtime_root).record_gate(
+                        project_id=record["project_id"],
+                        gate_id=gate_id,
+                        reason=gate_reason,
+                        active=True,
+                    )
+                    if self.accounting is not None:
+                        self.accounting.open_owner_gate(
+                            plan_id,
+                            project_id=record["project_id"],
+                            task_id=record["task_id"],
+                            role="owner",
+                            request_id=plan_id,
+                            source_request_id=record["command_id"],
+                        )
+                    if self.progress_channel is not None:
+                        self.progress_channel.emit(
+                            self._project_payload(record, project),
+                            "OWNER_GATE",
+                            task_id=record["task_id"],
+                            occurrence_key=f"{plan_id}:owner_gate:delta-adjudication",
+                            details={
+                                "plan_id": plan_id,
+                                "gate_code": gate_code,
+                                "reason": gate_reason,
+                                "rejection_chain_length": chain_len,
+                            },
+                        )
+                    self._finish(
+                        plan_id,
+                        "owner_gate",
+                        f"plan remediation hit its bound after {max_remediation_rounds} rounds (exhausted); plan delta adjudication unresolved ({gate_code}): {gate_reason}",
+                    )
+                    return
 
                 exhaust_reason = (
                     f"plan remediation hit its bound after {max_remediation_rounds} rounds (exhausted); "
@@ -2804,15 +2891,35 @@ class AIPlannerCoordinator:
         Cannot modify the repository.
         Returns {"disposition": "bounded_patch" | "owner_gate", "reason": ..., "patch": ...}.
         """
-        if not unresolved_delta or not unresolved_delta.get("blocking_finding"):
+        blocking = (unresolved_delta or {}).get("blocking_finding") or (unresolved_delta or {}).get("rejection_reason")
+        if not blocking:
             return {
                 "disposition": "bounded_patch",
                 "reason": "delta_resolved",
                 "patch": {},
             }
+
+        # Check for explicit resolvable patch in unresolved delta
+        if isinstance(unresolved_delta.get("patch"), dict) and unresolved_delta["patch"]:
+            return {
+                "disposition": "bounded_patch",
+                "reason": "delta_resolved_via_patch",
+                "patch": dict(unresolved_delta["patch"]),
+            }
+
+        # Check if delta is resolvable against accepted_contract read-only
+        contract_text = json.dumps(accepted_contract).lower() if isinstance(accepted_contract, dict) else ""
+        blocking_str = str(blocking).strip().lower()
+        if unresolved_delta.get("resolvable") is True or (blocking_str and blocking_str in contract_text):
+            return {
+                "disposition": "bounded_patch",
+                "reason": "delta_resolved_against_accepted_contract",
+                "patch": {"adjudicated_resolution": f"reconciled against accepted contract: {blocking}"},
+            }
+
         return {
             "disposition": "owner_gate",
-            "reason": f"unresolved_delta_requires_owner: {unresolved_delta.get('blocking_finding') or unresolved_delta.get('rejection_reason')}",
+            "reason": f"unresolved_delta_requires_owner: {blocking}",
             "gate_code": "DELTA_ADJUDICATION_UNRESOLVED",
             "task_id": task_id,
             "project_id": project_id,
@@ -2881,12 +2988,43 @@ class AIPlannerCoordinator:
         return {"gate_id": gate_id, "reason": reason}
 
 
+def persist_harness_session(
+    runtime_root: Path | str,
+    session_id: str,
+    *,
+    role: str = "reviewer",
+    request_id: str | None = None,
+    resource_id: str | None = None,
+    started_at: str | None = None,
+    child_pids: Sequence[int] = (),
+) -> dict[str, Any]:
+    """Persist role harness session to runtime/harness-sessions.json for cleanup correlation."""
+    runtime = Path(runtime_root)
+    harness_sessions_file = runtime / "harness-sessions.json"
+    data = read_json(harness_sessions_file, {}) or {}
+    sessions = data.setdefault("sessions", {})
+    existing = sessions.get(session_id) or {}
+    combined_pids = list(dict.fromkeys(list(existing.get("child_pids") or []) + list(child_pids)))
+    entry = {
+        "session_id": session_id,
+        "role": role or existing.get("role", "reviewer"),
+        "request_id": request_id or existing.get("request_id"),
+        "resource_id": resource_id or existing.get("resource_id"),
+        "started_at": started_at or existing.get("started_at") or utc_now_iso(),
+        "child_pids": combined_pids,
+    }
+    sessions[session_id] = entry
+    write_json(harness_sessions_file, data)
+    return entry
+
+
 def cleanup_stale_role_tool_children(
     runtime_root: Path | str,
     role: str = "reviewer",
     max_age_seconds: float = 600.0,
     request_id: str | None = None,
     resource_id: str | None = None,
+    now: datetime | None = None,
 ) -> int:
     """Bounded cleanup for timed-out read-only role harness sessions and their tool children.
 
@@ -2897,30 +3035,52 @@ def cleanup_stale_role_tool_children(
     runtime = Path(runtime_root)
     terminated_count = 0
     harness_sessions_file = runtime / "harness-sessions.json"
-    if harness_sessions_file.is_file():
-        try:
-            data = read_json(harness_sessions_file, {})
-            sessions = data.get("sessions") or {}
-            for s_id, s_info in list(sessions.items()):
-                if not isinstance(s_info, dict):
-                    continue
-                if s_info.get("role") != role:
-                    continue
-                if request_id and s_info.get("request_id") != request_id:
-                    continue
-                if resource_id and s_info.get("resource_id") != resource_id:
-                    continue
-                child_pids = s_info.get("child_pids") or []
-                for c_pid in child_pids:
-                    try:
-                        import psutil
-                        p = psutil.Process(c_pid)
-                        cmdline = " ".join(p.cmdline()).lower()
-                        if "graphify" in cmdline or "reviewer" in cmdline:
-                            p.terminate()
-                            terminated_count += 1
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+    if not harness_sessions_file.is_file():
+        return 0
+
+    now_dt = now or datetime.now(timezone.utc)
+    try:
+        data = read_json(harness_sessions_file, {})
+        sessions = data.get("sessions") or {}
+        modified = False
+        for s_id, s_info in list(sessions.items()):
+            if not isinstance(s_info, dict):
+                continue
+            if s_info.get("role") != role:
+                continue
+            if request_id is not None and s_info.get("request_id") != request_id:
+                continue
+            if resource_id is not None and s_info.get("resource_id") != resource_id:
+                continue
+
+            started_at_str = s_info.get("started_at")
+            if started_at_str:
+                try:
+                    s_dt = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+                    age = (now_dt - s_dt).total_seconds()
+                    if age < max_age_seconds:
+                        continue
+                except Exception:
+                    pass
+
+            child_pids = list(s_info.get("child_pids") or [])
+            surviving_pids = []
+            for c_pid in child_pids:
+                try:
+                    import psutil
+                    p = psutil.Process(c_pid)
+                    cmdline = " ".join(p.cmdline()).lower() if callable(getattr(p, "cmdline", None)) else ""
+                    if not cmdline or any(k in cmdline for k in ("graphify", "reviewer", "review", "ocr", "python", "node")):
+                        p.terminate()
+                        terminated_count += 1
+                        modified = True
+                    else:
+                        surviving_pids.append(c_pid)
+                except Exception:
+                    pass
+            s_info["child_pids"] = surviving_pids
+        if modified:
+            write_json(harness_sessions_file, data)
+    except Exception:
+        pass
     return terminated_count

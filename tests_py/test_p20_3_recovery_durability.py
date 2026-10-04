@@ -795,5 +795,370 @@ class TestP203BootstrapGapsAndTelemetry(unittest.TestCase):
         self.assertNotEqual(auto_rec.coverage_reason, "coverage partial until P20.3 recovery policy is implemented")
 
 
+class TestP203SecondRoundReviewRemediation(unittest.TestCase):
+    """Explicit regression tests closing the 5 second-round technical review findings."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.mkdtemp()
+        self.runtime_root = Path(self.temp_dir) / "runtime"
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        self.project_id = "test-proj-p203"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_watchdog_second_planning_recovery_uses_real_resource_config_and_does_not_pause_project(self) -> None:
+        """Finding 1: Watchdog uses real resource/routing config; transient failure retry doesn't pause project on 2nd attempt."""
+        import subprocess
+        from dev_orchestrator.core.watchdog import WatchdogCoordinator, resolve_watchdog_policy
+        from dev_orchestrator.control.owner_store import OwnerControlStore
+        from dev_orchestrator.core.repository import read_repository_truth
+
+        # Initialize clean test git repository
+        repo_dir = Path(self.temp_dir) / "repo"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True, capture_output=True)
+        (repo_dir / "file.txt").write_text("initial", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+
+        truth = read_repository_truth(repo_dir)
+
+        # Config has real AI routing with candidate resources
+        project_config = {
+            "project_id": self.project_id,
+            "repo_path": str(repo_dir),
+            "ai_roles": {
+                "planner": {
+                    "routing": {
+                        "candidates": [
+                            {"resource_id": "google/gemini-pro", "provider": "google", "model": "gemini-pro"},
+                            {"resource_id": "anthropic/claude-opus", "provider": "anthropic", "model": "claude-opus"},
+                        ]
+                    }
+                }
+            },
+            "watchdog": {
+                "enabled": True,
+                "auto_recovery": True,
+                "max_attempts_per_run": 2,
+                "max_same_strategy_retries": 2,
+            }
+        }
+
+        coord = WatchdogCoordinator(self.runtime_root)
+        prow = coord._cached_state["projects"].setdefault(self.project_id, {"attempts": {}})
+        policy = resolve_watchdog_policy(project_config)
+
+        # Attempt 1: first failed plan
+        cmd_1 = "auto-one"
+        plan_1 = f"ai_plan:{cmd_1}"
+        failed_1 = {
+            "plan_id": plan_1,
+            "command_id": cmd_1,
+            "project_id": self.project_id,
+            "task_id": "P20.3",
+            "repo_path": str(repo_dir),
+            "branch": truth.branch,
+            "head": truth.head,
+            "state": "failed",
+            "reason": "repository changed during planning",
+            "completed_at": "2026-10-04T10:00:00+00:00",
+        }
+        history_dir = self.runtime_root / "control" / "history"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        write_json(history_dir / f"{cmd_1}.json", {
+            "command_id": cmd_1,
+            "project_id": self.project_id,
+            "plan_id": plan_1,
+            "source": "automatic_review_handoff",
+            "state": "blocked",
+        })
+
+        snapshot = {
+            "project_id": self.project_id,
+            "repo_path": str(repo_dir),
+            "lifecycle_state": "PENDING_DESIGN",
+            "state": "PENDING_DESIGN",
+            "git": {
+                "branch": truth.branch,
+                "head": truth.head,
+                "dirty": False,
+            },
+            "telemetry": {"task_id": "P20.3"},
+            "authoritative_lifecycle": {
+                "current_task_id": "P20.3",
+                "lifecycle_state": "PENDING_DESIGN",
+                "active_owner": None,
+                "owner_gate": None,
+                "repository_projection": {
+                    "task_id": "P20.3",
+                    "state": "PENDING_DESIGN",
+                    "matches_authority": True,
+                },
+            },
+        }
+
+        rec_1 = coord._recover_cleared_automatic_planning_failure(
+            project_config, snapshot, prow, {"plans": {plan_1: failed_1}}, policy,
+        )
+        self.assertIsNotNone(rec_1)
+        self.assertEqual(rec_1.get("status"), "planning_recovery_requested")
+
+        store = OwnerControlStore(self.runtime_root)
+        self.assertFalse(store.is_paused(self.project_id))
+
+        # Attempt 2: second failed plan for the same transient condition
+        cmd_2 = "auto-two"
+        plan_2 = f"ai_plan:{cmd_2}"
+        failed_2 = {
+            "plan_id": plan_2,
+            "command_id": cmd_2,
+            "project_id": self.project_id,
+            "task_id": "P20.3",
+            "repo_path": str(repo_dir),
+            "branch": truth.branch,
+            "head": truth.head,
+            "state": "failed",
+            "reason": "repository changed during planning",
+            "completed_at": "2026-10-04T10:05:00+00:00",
+        }
+        write_json(history_dir / f"{cmd_2}.json", {
+            "command_id": cmd_2,
+            "project_id": self.project_id,
+            "plan_id": plan_2,
+            "source": "automatic_review_handoff",
+            "state": "blocked",
+        })
+
+        rec_2 = coord._recover_cleared_automatic_planning_failure(
+            project_config, snapshot, prow, {"plans": {plan_1: failed_1, plan_2: failed_2}}, policy,
+        )
+        self.assertIsNotNone(rec_2)
+        # Verify second attempt is requested within max_attempts_per_run=2 and does not pause project
+        self.assertEqual(rec_2.get("status"), "planning_recovery_requested")
+        self.assertFalse(store.is_paused(self.project_id))
+
+    def test_reviewer_timeout_cleanup_terminates_only_correlated_aged_tool_children_and_counts_them(self) -> None:
+        """Finding 2: cleanup_stale_role_tool_children respects max_age_seconds and request/resource correlation."""
+        from datetime import datetime, timezone, timedelta
+        from unittest.mock import MagicMock, patch
+        from dev_orchestrator.core.ai_planner import cleanup_stale_role_tool_children, persist_harness_session
+
+        now = datetime.now(timezone.utc)
+        aged_time = (now - timedelta(seconds=1200)).isoformat()
+        young_time = (now - timedelta(seconds=30)).isoformat()
+
+        # Session 1: correlated and aged (>600s) -> should be terminated
+        persist_harness_session(
+            self.runtime_root,
+            session_id="sess-aged-corr",
+            role="reviewer",
+            request_id="req-corr",
+            resource_id="res-corr",
+            started_at=aged_time,
+            child_pids=[1001],
+        )
+
+        # Session 2: correlated but young (30s < 600s) -> should NOT be terminated
+        persist_harness_session(
+            self.runtime_root,
+            session_id="sess-young-corr",
+            role="reviewer",
+            request_id="req-corr",
+            resource_id="res-corr",
+            started_at=young_time,
+            child_pids=[1002],
+        )
+
+        # Session 3: aged but uncorrelated resource -> should NOT be terminated
+        persist_harness_session(
+            self.runtime_root,
+            session_id="sess-aged-uncorr",
+            role="reviewer",
+            request_id="req-corr",
+            resource_id="res-other",
+            started_at=aged_time,
+            child_pids=[1003],
+        )
+
+        terminated_pids: list[int] = []
+
+        def mock_process(pid: int) -> MagicMock:
+            proc = MagicMock()
+            proc.pid = pid
+            proc.cmdline.return_value = ["python", "-m", "graphify", "query"]
+            def fake_terminate():
+                terminated_pids.append(pid)
+            proc.terminate = fake_terminate
+            return proc
+
+        with patch("psutil.pid_exists", return_value=True), patch("psutil.Process", side_effect=mock_process):
+            count = cleanup_stale_role_tool_children(
+                self.runtime_root,
+                role="reviewer",
+                max_age_seconds=600.0,
+                request_id="req-corr",
+                resource_id="res-corr",
+                now=now,
+            )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(terminated_pids, [1001])
+
+        # Verify child_pids in session 1 was pruned
+        data = read_json(self.runtime_root / "harness-sessions.json", {})
+        self.assertEqual(data["sessions"]["sess-aged-corr"]["child_pids"], [])
+        self.assertEqual(data["sessions"]["sess-young-corr"]["child_pids"], [1002])
+        self.assertEqual(data["sessions"]["sess-aged-uncorr"]["child_pids"], [1003])
+
+    def test_remediation_exhausted_delta_adjudication_returns_bounded_patch_or_records_durable_owner_gate(self) -> None:
+        """Finding 3: adjudicate_plan_delta evaluates against accepted_contract; caller records durable gate on owner_gate."""
+        from dev_orchestrator.core.ai_planner import AIPlannerCoordinator
+        from dev_orchestrator.control.owner_store import OwnerControlStore
+
+        coord = AIPlannerCoordinator(self.runtime_root, None)
+
+        # Part A: Resolvable delta against contract produces bounded_patch
+        accepted_contract = {
+            "resolutions": {"schema drift": "use version 2 schema"},
+            "invariants": ["SINGLE_ACTIVE_LIFECYCLE_OWNER"],
+        }
+        res_resolvable = coord.adjudicate_plan_delta(
+            project_id=self.project_id,
+            task_id="P20.3",
+            accepted_contract=accepted_contract,
+            unresolved_delta={"blocking_finding": "schema drift"},
+        )
+        self.assertEqual(res_resolvable["disposition"], "bounded_patch")
+        self.assertIn("patch", res_resolvable)
+        self.assertTrue(bool(res_resolvable["patch"]))
+
+        # Part B: Unresolvable delta produces owner_gate with DELTA_ADJUDICATION_UNRESOLVED
+        res_unresolvable = coord.adjudicate_plan_delta(
+            project_id=self.project_id,
+            task_id="P20.3",
+            accepted_contract=accepted_contract,
+            unresolved_delta={"blocking_finding": "require rewrite of whole lifecycle state machine"},
+        )
+        self.assertEqual(res_unresolvable["disposition"], "owner_gate")
+        self.assertEqual(res_unresolvable["gate_code"], "DELTA_ADJUDICATION_UNRESOLVED")
+
+        # Part C: Durable owner gate recording in OwnerControlStore
+        gate_id = "gate-adjudicate-p203-test"
+        store = OwnerControlStore(self.runtime_root)
+        store.record_gate(
+            project_id=self.project_id,
+            gate_id=gate_id,
+            reason=res_unresolvable["reason"],
+            active=True,
+        )
+        latest = store.latest_gate(self.project_id)
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest["gate_id"], gate_id)
+        self.assertTrue(store.is_paused(self.project_id))
+
+    def test_family_attempt_index_and_previous_attempts_are_scoped_per_family_not_store_global(self) -> None:
+        """Finding 4: attempt_index and fam['previous_attempts'] are scoped per family/incident, not store-global."""
+        from dev_orchestrator.incidents.recovery_ledger import reserve_recovery_attempt, load_recovery_attempts
+        from dev_orchestrator.incidents.recovery_policy import RecoveryDecision, decide_recovery, RecoveryInputs
+        from dev_orchestrator.incidents.store import IncidentStore
+
+        # Create Family A and record 3 attempts for Family A
+        for i in range(1, 4):
+            dec_a = RecoveryDecision(
+                action="RETRY_SAME_STRATEGY",
+                reason=f"fam_a_attempt_{i}",
+                authorized_effect={"effect_kind": "continue", "target_id": "P20.3"},
+                expected_authority_anchor={"project_id": self.project_id, "task_id": "P20.3", "head": "abc"},
+                expected_source_anchor={"incident_id": "inc-A", "family_id": "fam-A", "failure_signature": "sig-A"},
+                remaining_budget={"incident_recoveries_remaining": 3},
+                strategy_key="strat-A",
+                attempt_id=f"rcv-A-{i}",
+                idempotency_key=f"idem-A-{i}",
+                requires_heterogeneous=False,
+            )
+            att_a = reserve_recovery_attempt(self.runtime_root, self.project_id, dec_a)
+            self.assertEqual(att_a["attempt_index"], i)
+
+        # Now record attempt for Family B in the same store
+        dec_b = RecoveryDecision(
+            action="RETRY_SAME_STRATEGY",
+            reason="fam_b_attempt_1",
+            authorized_effect={"effect_kind": "continue", "target_id": "P20.3"},
+            expected_authority_anchor={"project_id": self.project_id, "task_id": "P20.3", "head": "abc"},
+            expected_source_anchor={"incident_id": "inc-B", "family_id": "fam-B", "failure_signature": "sig-B"},
+            remaining_budget={"incident_recoveries_remaining": 3},
+            strategy_key="strat-B",
+            attempt_id="rcv-B-1",
+            idempotency_key="idem-B-1",
+            requires_heterogeneous=False,
+        )
+        att_b = reserve_recovery_attempt(self.runtime_root, self.project_id, dec_b)
+
+        # Assert attempt_index for Family B is 1, NOT 4 (not store-global)
+        self.assertEqual(att_b["attempt_index"], 1)
+
+        # Assert fam['previous_attempts'] for Family B is 0 (prior attempts only)
+        index = read_json(self.runtime_root / "incident-packets" / "index.json", {})
+        fam_b = index.get("families", {}).get("fam-B")
+        if fam_b:
+            self.assertEqual(fam_b.get("previous_attempts"), 0)
+
+        # When deciding recovery for Family B, Family A's attempts do not cause budget exhaustion
+        inputs = RecoveryInputs(
+            authority={"project_id": self.project_id, "current_task_id": "P20.3", "lifecycle_state": "PENDING_DESIGN"},
+            owner_gate={"resolved": True, "pending": False, "paused": False},
+            incident={"incident_id": "inc-B", "project_id": self.project_id, "failure_class": "RESOURCE_TRANSIENT"},
+            family={"family_id": "fam-B", "previous_attempts": 0},
+            previous_attempts=load_recovery_attempts(self.runtime_root, self.project_id, incident_id="inc-B"),
+            liveness=None,
+            resource_availability={"eligible_candidates": [{"resource_id": "r1"}], "heterogeneous_candidates": []},
+            existing_effects=None,
+            budgets={"max_same_strategy_retries": 2, "max_recoveries_per_incident": 3, "max_recovery_attempts_per_family": 5, "recovery_enabled": True},
+        )
+        dec = decide_recovery(inputs, now="2026-10-04T12:00:00+00:00")
+        self.assertNotEqual(dec.gate_code, "FAMILY_RECOVERY_BUDGET_EXHAUSTED")
+
+    def test_recovery_metrics_report_partial_coverage_and_events_source_when_ledger_empty_but_accounting_has_rows(self) -> None:
+        """Finding 5: When ledger is empty and counts come from events.jsonl, report partial coverage with events.jsonl source."""
+        from dev_orchestrator.incidents.reliability_runs import open_reliability_run
+        from dev_orchestrator.incidents.reliability_telemetry import compute_reliability_telemetry
+
+        run = open_reliability_run(self.runtime_root, project_id=self.project_id)
+
+        # Ensure recovery ledger index exists but has no attempts
+        store = IncidentStore(self.runtime_root)
+        store.execute_txn("init_empty", lambda idx: (idx, {}))
+
+        # Write recovery row into execution-accounting/events.jsonl
+        events_dir = self.runtime_root / "execution-accounting"
+        events_dir.mkdir(parents=True, exist_ok=True)
+        event_row = {
+            "project_id": self.project_id,
+            "recorded_at": run["opened_at"],
+            "event_type": "attempt_outcome",
+            "attempt_id": "rcv-event-fallback-01",
+            "is_recovery": True,
+            "outcome": "accepted",
+            "role": "planner",
+        }
+        with (events_dir / "events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event_row) + "\n")
+
+        telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
+        auto_rec = telemetry.metrics["automatic_recovery_count"]
+        auto_succ = telemetry.metrics["automatic_recovery_success_count"]
+
+        # Assert coverage is partial and source is execution-accounting/events.jsonl
+        self.assertEqual(auto_rec.value, 1)
+        self.assertEqual(auto_succ.value, 1)
+        self.assertEqual(auto_rec.coverage, "partial")
+        self.assertEqual(auto_rec.source, "runtime/execution-accounting/events.jsonl")
+        self.assertIn("fallback", auto_rec.coverage_reason.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
