@@ -114,15 +114,17 @@ def generate_soak_project(permit, template_root=None):
     (repo / 'soak_app.py').write_text(BASE_SOURCE, encoding='utf-8')
     (repo / 'tests/test_baseline.py').write_text(BASE_TESTS, encoding='utf-8')
     (repo / 'pyproject.toml').write_text('[tool.pytest.ini_options]\npythonpath = ["."]\ntestpaths = ["tests"]\n', encoding='utf-8')
-    (repo / 'AGENTS.md').write_text('Pure software fixture only. Work on the current task only. Use tests and real commits; preserve past evidence. No push, hardware, remote calls, daemon shutdown or runtime ledger editing. DevOrchestrator owns task transitions. Future tasks stay pending design.\n', encoding='utf-8')
+    (repo / 'AGENTS.md').write_text('Pure software fixture only. Work on the current task only. Use tests and real commits; preserve past evidence. No push, hardware, remote calls, daemon shutdown or runtime ledger editing. DevOrchestrator owns task transitions. Future tasks stay pending design. An accepted final end-of-roadmap task returns NEXT so DevOrchestrator can settle task_complete without inventing a successor.\n', encoding='utf-8')
     for name in ('CURRENT.md', 'HANDOFF.md', 'result.md'):
         (agent / name).write_text('# Isolated P20 run\nNo task accepted yet.\n', encoding='utf-8', newline='\n')
     roadmap = []
     for index, task in enumerate(SOAK_TASK_SPECS):
         successor = SOAK_TASK_SPECS[index + 1]['task_id'] if index + 1 < len(SOAK_TASK_SPECS) else None
+        successor_text = (successor if successor else
+            'none (end of roadmap); an accepted review returns NEXT and settles task_complete')
         text = (f"# {task['task_id']} — {task['title']}\n\nStatus: **PENDING DESIGN**\n\n"
                 f"Predecessor: {SOAK_TASK_SPECS[index-1]['task_id'] if index else 'none'}\n"
-                f"Successor: {successor or 'TBD / owner decision required'}\n\n"
+                f"Successor: {successor_text}\n\n"
                 f"## Objective\n{task['description']}\n\n## Acceptance\n"
                 'Real implementation, regression tests, actual successful pytest output, clean local commit, independent Technical Review ACCEPT. No other task or runtime mutation.\n')
         (agent / 'staged' / (task['task_id'] + '.md')).write_text(text, encoding='utf-8', newline='\n')

@@ -5,7 +5,12 @@ import sys
 import time
 from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
 from dev_orchestrator.soak.timeline import open_soak_run, load_soak_run, checkpoint_soak_run, append_soak_event, compute_run_duration
-from dev_orchestrator.soak.evidence import accepted_tasks, primary_active, measured_metrics
+from dev_orchestrator.soak.evidence import (
+    accepted_tasks,
+    measured_metrics,
+    primary_active,
+    primary_terminal_blocker,
+)
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso
 
 
@@ -59,6 +64,21 @@ def run_soak_supervisor(permit_path, canonical_repo=None, canonical_runtime=None
             state['metric_coverage'].update(coverage)
             state['reliability_telemetry'] = telemetry
             checkpoint_soak_run(runtime, state)
+            blocker = primary_terminal_blocker(permit)
+            if blocker is not None:
+                state.update(
+                    status='FAILED',
+                    ended_at=utc_now_iso(),
+                    failure_reason='primary_pipeline_terminal_blocker:' + blocker['code'],
+                    primary_blocker=blocker,
+                )
+                append_soak_event(runtime, permit.run_id, {
+                    'event_class': 'primary_pipeline_terminal_blocker',
+                    **blocker,
+                })
+                checkpoint_soak_run(runtime, state)
+                exit_code = 6
+                break
             duration = compute_run_duration(state)
             if not duration['continuity_ok']:
                 state.update(status='FAILED', ended_at=utc_now_iso(), failure_reason=duration['discontinuity_reason'])

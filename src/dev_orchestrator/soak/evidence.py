@@ -1,4 +1,5 @@
 """Read-only source correlation; checkpoint labels never establish acceptance."""
+import hashlib
 from pathlib import Path
 from dev_orchestrator.storage.json_store import read_json, parse_utc
 from dev_orchestrator.core.repository import is_git_ancestor, read_repository_truth
@@ -73,6 +74,62 @@ def primary_active(permit):
         for key, row in rows.items():
             if row.get('project_id') == permit.soak_project_id and row.get('state') in states:
                 return {'role_record_id': key, 'task_id': row.get('task_id'), 'state': row.get('state')}
+    return None
+
+
+def primary_terminal_blocker(permit):
+    """Return a durable primary-pipeline blocker that cannot make soak progress.
+
+    This is diagnostic only.  It never consumes a gate, changes a review
+    decision, or manufactures final-task acceptance.
+    """
+    runtime = Path(permit.disposable_runtime_root)
+    if primary_active(permit) is not None:
+        return None
+    manifest = read_json(runtime / 'soak-project-manifest.json', {})
+    task_ids = manifest.get('task_ids') if isinstance(manifest, dict) else None
+    final_task = task_ids[-1] if isinstance(task_ids, list) and task_ids else None
+    authority = read_json(runtime / 'transition-executor.json', {}).get(
+        'lifecycle', {}).get(permit.soak_project_id, {})
+    current_task = authority.get('current_task_id')
+    reviews = read_json(runtime / 'ai-reviewer.json', {}).get('reviews', {})
+    completed_reviews = [
+        (review_id, review) for review_id, review in reviews.items()
+        if isinstance(review, dict)
+        and review.get('project_id') == permit.soak_project_id
+        and review.get('task_id') == current_task
+        and review.get('state') == 'completed'
+    ]
+    latest = max(completed_reviews,
+                 key=lambda item: (str(item[1].get('completed_at') or ''), item[0]),
+                 default=None)
+    if latest and (latest[1].get('decision') == 'owner_gate'
+                   or latest[1].get('next_action') == 'stop'):
+        review_id, review = latest
+        reason = str(review.get('reason') or 'completed review requires owner decision')
+        return {
+            'code': ('PRIMARY_FINAL_REVIEW_OWNER_GATE'
+                     if current_task and current_task == final_task
+                     else 'PRIMARY_REVIEW_OWNER_GATE'),
+            'task_id': current_task,
+            'review_id': review_id,
+            'decision': review.get('decision'),
+            'next_action': review.get('next_action'),
+            'completed_at': review.get('completed_at'),
+            'reason_sha256': hashlib.sha256(reason.encode('utf-8')).hexdigest(),
+            'reason': reason[:256],
+        }
+    gate = authority.get('owner_gate')
+    if isinstance(gate, dict) and gate.get('reason') and not authority.get('active_owner'):
+        reason = str(gate['reason'])
+        return {
+            'code': 'PRIMARY_AUTHORITY_OWNER_GATE',
+            'task_id': current_task,
+            'gate_id': gate.get('gate_id'),
+            'gate_code': gate.get('code'),
+            'reason_sha256': hashlib.sha256(reason.encode('utf-8')).hexdigest(),
+            'reason': reason[:256],
+        }
     return None
 
 

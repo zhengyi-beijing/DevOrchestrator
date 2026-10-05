@@ -2397,6 +2397,41 @@ def cmd_soak_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_soak_settle_stopped(args: argparse.Namespace) -> int:
+    """Fail an exact stopped owned run without rewriting its measured evidence."""
+    from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
+    from dev_orchestrator.soak.timeline import settle_stopped_soak_run
+    from dev_orchestrator.jobs.service import JobService
+    permit = load_soak_permit(args.permit)
+    if not permit:
+        raise CliError('soak permit not found or invalid')
+    rt = resolve_runtime_root(args.runtime_root)
+    ok, reason = validate_soak_permit(permit, REPO_ROOT, rt)
+    if not ok:
+        raise CliError('permit validation failed: ' + str(reason))
+    owner = read_json(rt / 'owner-control.json', {}).get('projects', {}).get('devorchestrator', {})
+    if owner.get('paused') is not True:
+        raise CliError('canonical project must be paused before stopped-run settlement')
+    ledger = read_json(rt / 'transition-executor.json', {})
+    execution = next((row for row in ledger.get('executions', {}).values()
+                      if isinstance(row, dict)
+                      and (row.get('external_execution_binding') or {}).get('job_id') == args.job_id
+                      and (row.get('external_execution_binding') or {}).get('soak_run_id') == permit.run_id
+                      and (row.get('external_execution_binding') or {}).get('permit_fingerprint') == permit.fingerprint), None)
+    if not execution or execution.get('state') != 'recovery_required':
+        raise CliError('exact recovery_required external execution binding not found')
+    authority = ledger.get('lifecycle', {}).get('devorchestrator', {})
+    gate = authority.get('owner_gate') if isinstance(authority, dict) else None
+    if not isinstance(gate, dict) or gate.get('code') != 'SOAK_EVIDENCE_UNRESOLVED':
+        raise CliError('exact SOAK_EVIDENCE_UNRESOLVED authority gate not found')
+    record = JobService(rt).status(args.job_id)
+    if record is None:
+        raise CliError('owned soak job not found')
+    result = settle_stopped_soak_run(permit, record.to_dict())
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def cmd_soak_verify(args: argparse.Namespace) -> int:
     from dev_orchestrator.soak.permit import load_soak_permit
     from dev_orchestrator.soak.qualification import evaluate_soak_qualification
@@ -2920,6 +2955,14 @@ def build_parser() -> argparse.ArgumentParser:
     soak_resume = sub.add_parser("soak-resume", help="resume soak run")
     soak_resume.add_argument("--permit", required=True)
 
+    soak_settle = sub.add_parser(
+        "soak-settle-stopped",
+        help="fail an exact stopped owned soak while preserving measured evidence",
+    )
+    soak_settle.add_argument("--permit", required=True)
+    soak_settle.add_argument("--job-id", required=True)
+    soak_settle.add_argument("--runtime-root", default=None)
+
     soak_verify = sub.add_parser("soak-verify", help="verify soak qualification")
     soak_verify.add_argument("--permit", required=True)
     soak_verify.add_argument("--runtime-root", default=None)
@@ -2939,6 +2982,7 @@ _COMMANDS = {
     "soak-recover": cmd_soak_recover,
     "soak-status": cmd_soak_status,
     "soak-resume": cmd_soak_resume,
+    "soak-settle-stopped": cmd_soak_settle_stopped,
     "soak-verify": cmd_soak_verify,
     "soak-supervise": cmd_soak_supervise,
 

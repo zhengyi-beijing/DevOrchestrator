@@ -130,6 +130,71 @@ def resume_soak_run(permit: SoakPermit) -> dict[str, Any]:
     return existing
 
 
+def _process_generation_alive(pid: Any, create_time: Any) -> bool:
+    try:
+        import psutil
+        process = psutil.Process(int(pid))
+        return process.is_running() and abs(process.create_time() - float(create_time)) < 0.001
+    except (psutil.Error, TypeError, ValueError, OverflowError):
+        return False
+
+
+def settle_stopped_soak_run(permit: SoakPermit, job: dict[str, Any]) -> dict[str, Any]:
+    """Fail an exact RUNNING run whose owned durable job is already terminal.
+
+    The transition is intentionally one-way and evidence preserving.  It does
+    not resume a clock, accept a task, consume an owner gate, or authorize a
+    replacement measurement.
+    """
+    if not isinstance(job, dict):
+        raise TypeError('terminal owned job record is required')
+    if job.get('state') not in {'failed', 'cancelled'}:
+        raise ValueError('owned soak job must be failed or cancelled')
+    if (job.get('kind') != 'soak' or job.get('project_id') != 'devorchestrator'
+            or job.get('command_ref') != 'p20_soak_supervisor'
+            or job.get('parameters_digest') != permit.fingerprint):
+        raise ValueError('owned soak job identity mismatch')
+    job_id = str(job.get('job_id') or '').strip()
+    if not job_id:
+        raise ValueError('owned soak job_id missing')
+    runtime = Path(permit.disposable_runtime_root)
+    run_file = runtime / f'run-{permit.run_id}.json'
+    from dev_orchestrator.accounting.events import InterProcessFileLock
+    with InterProcessFileLock(runtime / 'soak-run-settlement.lock'):
+        run = read_json(run_file, None)
+        if not isinstance(run, dict):
+            raise ValueError('run has not started')
+        if run.get('run_id') != permit.run_id or run.get('project_id') != permit.soak_project_id:
+            raise ValueError('run identity mismatch')
+        if run.get('status') == 'FAILED' and run.get('settlement_job_id') == job_id:
+            return run
+        if run.get('status') != 'RUNNING':
+            raise ValueError('only a RUNNING owned soak may be settled')
+        heartbeat = job.get('heartbeat') if isinstance(job.get('heartbeat'), dict) else {}
+        if (heartbeat.get('child_pid') != run.get('supervisor_pid')
+                or heartbeat.get('child_create_time') != run.get('supervisor_create_time')):
+            raise ValueError('owned job child identity does not match original supervisor')
+        if _process_generation_alive(run.get('supervisor_pid'), run.get('supervisor_create_time')):
+            raise RuntimeError('original supervisor is still alive')
+        now = utc_now_iso()
+        run.update({
+            'status': 'FAILED',
+            'ended_at': now,
+            'updated_at': now,
+            'failure_reason': 'owned_soak_job_terminal:' + str(job['state']),
+            'settlement_job_id': job_id,
+            'settled_at': now,
+        })
+        write_json(run_file, run, indent=2)
+    append_soak_event(runtime, permit.run_id, {
+        'event_class': 'stopped_run_settled',
+        'status': 'FAILED',
+        'failure_reason': run['failure_reason'],
+        'job_id': job_id,
+    })
+    return run
+
+
 def append_soak_event(runtime_root: Path | str, run_id: str, event: dict[str, Any]) -> dict[str, Any]:
     """Append a typed event to timeline.jsonl."""
     rt = Path(runtime_root)
