@@ -54,6 +54,96 @@ def prepare_bootstrap(runtime_root, repo_path, head, permit_path):
     return data
 
 
+def prepare_recovery_bootstrap(
+    runtime_root,
+    repo_path,
+    head,
+    permit_path,
+    *,
+    previous_run_id,
+):
+    """Replace only the local bootstrap pointer after explicit owner recovery.
+
+    The previous run remains immutable evidence.  This helper is intentionally
+    local-only and does not mutate lifecycle authority; callers must perform
+    the owner-gate transition through TransitionExecutor.
+    """
+    permit = load_soak_permit(permit_path)
+    ok, reason = validate_soak_permit(permit, repo_path, runtime_root)
+    if not ok:
+        raise ValueError('invalid local permit: ' + str(reason))
+    if permit.run_id == previous_run_id:
+        raise ValueError('replacement soak identity must be new')
+
+    runtime = Path(runtime_root)
+    bootstrap_path = runtime / BOOTSTRAP_FILE
+    existing = read_json(bootstrap_path, None)
+    history_dir = runtime / 'soak-bootstrap-history'
+    history_dir.mkdir(parents=True, exist_ok=True)
+    history_path = history_dir / (previous_run_id + '.json')
+
+    # Crash/replay window: the previous invocation may have archived the old
+    # bootstrap and published this exact replacement before lifecycle authority
+    # was durably updated.  Recognize only that exact prepared replacement.
+    if isinstance(existing, dict) and existing.get('run_id') == permit.run_id:
+        historical = read_json(history_path, None)
+        exact_replacement = (
+            existing.get('replacement_of_run_id') == previous_run_id
+            and existing.get('permit_fingerprint') == permit.fingerprint
+            and Path(str(existing.get('permit_path') or '')).resolve()
+               == Path(permit_path).resolve()
+            and existing.get('prepared_head') == head
+        )
+        if (
+            not exact_replacement
+            or not isinstance(historical, dict)
+            or historical.get('run_id') != previous_run_id
+        ):
+            raise ValueError('replacement soak bootstrap replay evidence mismatch')
+        return existing
+
+    if not isinstance(existing, dict) or existing.get('run_id') != previous_run_id:
+        raise ValueError('previous soak bootstrap identity mismatch')
+
+    if history_path.exists():
+        historical = read_json(history_path, None)
+        if historical != existing:
+            raise ValueError('previous soak bootstrap archive mismatch')
+    else:
+        write_json(history_path, existing, indent=2)
+
+    jobs_path = runtime / 'execution-jobs.json'
+    config = read_json(jobs_path, None)
+    if config is None:
+        config = {'enabled': True, 'runtime_root': str(runtime.resolve()), 'projects': {}}
+    if not isinstance(config, dict):
+        raise ValueError('existing job configuration is invalid')
+    project = config.setdefault('projects', {}).setdefault('devorchestrator', {
+        'repo_path': str(Path(repo_path).resolve()), 'file_roots': [], 'commands': {},
+    })
+    if Path(project['repo_path']).resolve() != Path(repo_path).resolve():
+        raise ValueError('job project repository identity differs')
+    project.setdefault('commands', {})['p20_soak_supervisor'] = {
+        'argv': [sys.executable, '-m', 'dev_orchestrator', 'soak-supervise',
+                 '--permit', str(Path(permit_path).resolve())],
+        'cwd': '.', 'duration_class': 'long', 'effect_class': 'idempotent',
+        'max_runtime_seconds': 43200, 'heartbeat_interval_seconds': 10,
+    }
+    write_json(jobs_path, config)
+
+    data = {
+        'run_id': permit.run_id,
+        'permit_path': str(Path(permit_path).resolve()),
+        'permit_fingerprint': permit.fingerprint,
+        'prepared_head': head,
+        'prepared_at': utc_now_iso(),
+        'source': 'p20_local_owner_recovery',
+        'replacement_of_run_id': previous_run_id,
+    }
+    write_json(bootstrap_path, data)
+    return data
+
+
 def bootstrap_prompt(data, source_request_id, runtime_root):
     return (
         'P20.4 IMPLEMENTATION PREPARATION IS COMPLETE AT THIS CLEAN HEAD. '

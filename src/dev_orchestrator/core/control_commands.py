@@ -530,6 +530,64 @@ class ControlCommandCoordinator:
         snapshot = snapshots.get(project_id)
         if snapshot is None:
             return self._blocked(command_id, project_id, action, "project snapshot is unavailable", now, record)
+
+        # Crash/replay idempotency for local P20.4 recovery: authority may have
+        # committed the exact authorization before this command's history row
+        # was settled.  Recover that durable success before stale revision
+        # validation; changed command/permit identity is never accepted here.
+        target = record.get("target") if isinstance(record.get("target"), dict) else {}
+        if action == "soak_recover":
+            from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
+
+            submitted_fingerprint = _nonblank(target.get("permit_fingerprint"))
+            permit_path = _nonblank(target.get("permit_path"))
+            submitted_permit = load_soak_permit(permit_path or "")
+            if (
+                submitted_fingerprint is None
+                or submitted_permit is None
+                or submitted_permit.fingerprint != submitted_fingerprint
+            ):
+                return self._blocked(
+                    command_id,
+                    project_id,
+                    action,
+                    "submitted soak permit fingerprint no longer matches",
+                    now,
+                    record,
+                )
+            project_repo = (
+                projects[project_id].get("repo_path")
+                or projects[project_id].get("root")
+                or ""
+            )
+            permit_ok, permit_reason = validate_soak_permit(
+                submitted_permit, project_repo, self.runtime_root
+            )
+            if not permit_ok:
+                return self._blocked(
+                    command_id,
+                    project_id,
+                    action,
+                    "submitted soak permit is no longer valid: " + str(permit_reason),
+                    now,
+                    record,
+                )
+            committed = executor.committed_soak_recovery(
+                project_id,
+                command_id,
+                permit_path,
+                expected_permit_fingerprint=submitted_fingerprint,
+            )
+            if committed is not None:
+                return {
+                    **record,
+                    "state": "accepted",
+                    "processed_at": now,
+                    "effect": "local_owner_soak_recovery_authorization",
+                    "replayed_committed_authorization": True,
+                    **committed,
+                }
+
         # Retry is advertised from durable reviewer state, which can be newer than
         # the raw monitor snapshot consumed at the start of the next daemon tick.
         # Project only that reviewer lifecycle for retry identity validation; all
@@ -559,13 +617,26 @@ class ControlCommandCoordinator:
         }
         if not valid:
             return self._blocked(command_id, project_id, action, reason, now, record)
-        target = record.get("target") if isinstance(record.get("target"), dict) else {}
         if action == 'soak_bind':
             result = executor.start_and_bind_soak(
                 target.get('source_request_id'), target.get('permit_path'),
             )
             return {**record, 'state': 'accepted' if result.get('status') == 'bound' else 'blocked',
                     'processed_at': now, 'effect': 'local_owned_soak_binding', **result}
+        if action == 'soak_recover':
+            result = executor.authorize_soak_recovery(
+                projects[project_id],
+                target.get('permit_path'),
+                command_id=command_id,
+                expected_permit_fingerprint=target.get('permit_fingerprint'),
+            )
+            return {
+                **record,
+                'state': 'accepted' if result.get('status') == 'authorized' else 'blocked',
+                'processed_at': now,
+                'effect': 'local_owner_soak_recovery_authorization',
+                **result,
+            }
         gate_id = _nonblank(target.get("gate_id"))
         if action == "approve_owner_gate" and gate_id != _nonblank(observed.get("gate_id")):
             return self._blocked(

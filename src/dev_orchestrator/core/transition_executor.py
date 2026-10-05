@@ -2965,6 +2965,305 @@ class TransitionExecutor:
         except Exception:
             pass
 
+    def authorize_soak_recovery(
+        self,
+        project: dict[str, Any],
+        permit_path: str,
+        *,
+        command_id: str,
+        expected_permit_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        """Authorize one fresh P20.4 measurement after a failed owned soak.
+
+        This is a local owner-decision adapter. It never restarts the failed run,
+        never launches a Worker, and never reuses the failed execution identity.
+        It only proves the old run/job are terminal, prepares a distinct local
+        permit/bootstrap, and clears the exact SOAK_EVIDENCE_UNRESOLVED gate so
+        the normal explicit continue path can create the next Worker owner.
+        """
+        project_id = str(project.get("project_id") or "").strip()
+        repo_path = str(project.get("repo_path") or project.get("root") or "").strip()
+        if project_id != "devorchestrator" or not repo_path:
+            return {"status": "rejected", "reason": "canonical_devorchestrator_project_required"}
+        if not self.owner_store.is_paused(project_id):
+            return {"status": "rejected", "reason": "owner_pause_required_before_soak_recovery"}
+
+        truth = read_repository_truth(repo_path)
+        if not truth.valid or truth.dirty:
+            return {"status": "rejected", "reason": "clean_repository_required"}
+
+        from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
+        replacement = load_soak_permit(permit_path or "")
+        ok, reason = validate_soak_permit(replacement, repo_path, self.runtime_root)
+        if not ok or replacement is None:
+            return {"status": "rejected", "reason": "replacement_permit_invalid: " + str(reason)}
+        if (
+            expected_permit_fingerprint is not None
+            and replacement.fingerprint != str(expected_permit_fingerprint)
+        ):
+            return {
+                "status": "rejected",
+                "reason": "submitted soak permit fingerprint no longer matches",
+            }
+
+        with self._lock:
+            ledger = self._load_ledger()
+            authority = ledger.get("lifecycle", {}).get(project_id)
+            if not isinstance(authority, dict):
+                return {"status": "rejected", "reason": "lifecycle_authority_missing"}
+
+            existing_auth = authority.get("soak_recovery_authorization")
+            if (
+                not authority.get("owner_gate")
+                and isinstance(existing_auth, dict)
+                and existing_auth.get("command_id") == command_id
+                and existing_auth.get("replacement_permit_fingerprint") == replacement.fingerprint
+            ):
+                return {
+                    "status": "authorized",
+                    "previous_run_id": existing_auth.get("previous_run_id"),
+                    "replacement_run_id": replacement.run_id,
+                    "old_run_sha256": existing_auth.get("old_run_sha256"),
+                }
+
+            gate = authority.get("owner_gate")
+            if not (
+                isinstance(gate, dict)
+                and gate.get("code") == "SOAK_EVIDENCE_UNRESOLVED"
+                and gate.get("task_id") == "P20.4"
+                and authority.get("current_task_id") == "P20.4"
+                and authority.get("active_owner") is None
+            ):
+                return {"status": "rejected", "reason": "exact_soak_owner_gate_required"}
+
+            active_rows = [
+                rid for rid, row in ledger.get("executions", {}).items()
+                if isinstance(row, dict)
+                and row.get("project_id") == project_id
+                and row.get("state") in _ACTIVE_STATES
+            ]
+            if active_rows:
+                return {
+                    "status": "rejected",
+                    "reason": "active_execution_prevents_soak_recovery",
+                    "active_execution_ids": active_rows,
+                }
+
+            gate_id = str(gate.get("gate_id") or "")
+            if not gate_id.startswith("soak-"):
+                return {"status": "rejected", "reason": "soak_gate_identity_invalid"}
+            previous_source_id = gate_id[len("soak-"):]
+            previous = ledger.get("executions", {}).get(previous_source_id)
+            if not (
+                isinstance(previous, dict)
+                and previous.get("project_id") == project_id
+                and previous.get("task_id") == "P20.4"
+                and previous.get("state") == "recovery_required"
+            ):
+                return {"status": "rejected", "reason": "failed_soak_execution_not_found"}
+
+            binding = previous.get("external_execution_binding")
+            if not isinstance(binding, dict) or binding.get("binding_kind") != "p20_soak_run":
+                return {"status": "rejected", "reason": "failed_soak_binding_missing"}
+            previous_permit = load_soak_permit(binding.get("permit_path") or "")
+            if previous_permit is None:
+                return {"status": "rejected", "reason": "previous_soak_permit_unreadable"}
+            previous_ok, previous_reason = validate_soak_permit(
+                previous_permit, repo_path, self.runtime_root
+            )
+            if not previous_ok:
+                return {
+                    "status": "rejected",
+                    "reason": "previous_soak_permit_invalid: " + str(previous_reason),
+                }
+            if (
+                binding.get("permit_fingerprint") != previous_permit.fingerprint
+                or binding.get("soak_run_id") != previous_permit.run_id
+                or binding.get("soak_project_id") != previous_permit.soak_project_id
+            ):
+                return {"status": "rejected", "reason": "previous_soak_binding_permit_mismatch"}
+
+            from dev_orchestrator.soak.timeline import load_soak_run
+            previous_run = load_soak_run(
+                previous_permit.disposable_runtime_root, previous_permit.run_id
+            )
+            if not isinstance(previous_run, dict) or previous_run.get("status") != "FAILED":
+                return {"status": "rejected", "reason": "previous_soak_run_not_terminal_failed"}
+
+            old_run_path = (
+                Path(previous_permit.disposable_runtime_root)
+                / ("run-" + previous_permit.run_id + ".json")
+            )
+            if not old_run_path.is_file():
+                return {"status": "rejected", "reason": "previous_soak_run_evidence_missing"}
+            old_run_sha256 = hashlib.sha256(old_run_path.read_bytes()).hexdigest()
+
+            if (
+                replacement.run_id == previous_permit.run_id
+                or replacement.fingerprint == previous_permit.fingerprint
+                or Path(replacement.disposable_repo_path).resolve()
+                   == Path(previous_permit.disposable_repo_path).resolve()
+                or Path(replacement.disposable_runtime_root).resolve()
+                   == Path(previous_permit.disposable_runtime_root).resolve()
+            ):
+                return {"status": "rejected", "reason": "replacement_soak_identity_must_be_new"}
+            if load_soak_run(
+                replacement.disposable_runtime_root, replacement.run_id
+            ) is not None:
+                return {"status": "rejected", "reason": "replacement_soak_run_already_exists"}
+
+            from dev_orchestrator.jobs.service import JobService
+            old_job = JobService(self.runtime_root).status(str(binding.get("job_id") or ""))
+            if old_job is None or old_job.state not in {"completed", "failed", "cancelled"}:
+                return {"status": "rejected", "reason": "previous_soak_job_not_terminal"}
+            if (
+                getattr(old_job, "project_id", None) != project_id
+                or getattr(old_job, "task_id", None) != "P20.4"
+                or getattr(old_job, "source_request_id", None) != previous_source_id
+                or getattr(old_job, "kind", None) != "soak"
+                or getattr(old_job, "command_ref", None) != "p20_soak_supervisor"
+                or getattr(old_job, "transport", None) != "local"
+                or getattr(old_job, "parameters_digest", None) != previous_permit.fingerprint
+                or getattr(old_job, "idempotency_key", None)
+                   != f"soak:{previous_permit.run_id}:{previous_source_id}"
+            ):
+                return {"status": "rejected", "reason": "previous_soak_job_identity_mismatch"}
+
+            # The owned soak job/run are now independently proven terminal failed.
+            # Settle any real execution obligation before clearing the owner gate;
+            # otherwise execution-loss detection will later misclassify this
+            # intentionally failed execution as a vanished Worker.
+            from dev_orchestrator.core.execution_lifecycle import lineage_key_for
+            lineage_state = load_execution_lineage(self.runtime_root)
+            if lineage_state.get("degraded"):
+                return {"status": "rejected", "reason": "previous_execution_lineage_degraded"}
+            previous_lineage_key = lineage_key_for(project_id, previous_source_id)
+            previous_lineage = (lineage_state.get("records") or {}).get(previous_lineage_key)
+            if isinstance(previous_lineage, dict):
+                if previous_lineage.get("lifecycle_phase") == "terminal":
+                    if previous_lineage.get("terminal_outcome") != "failed":
+                        return {
+                            "status": "rejected",
+                            "reason": "previous_execution_lineage_terminal_mismatch",
+                        }
+                else:
+                    closed = close_lineage_record(
+                        self.runtime_root,
+                        project_id,
+                        previous_source_id,
+                        terminal_outcome="failed",
+                        reason=(
+                            "owner-authorized replacement after terminal failed "
+                            "P20.4 soak job/run evidence"
+                        ),
+                        completed_at=(
+                            previous_run.get("ended_at")
+                            or previous_run.get("updated_at")
+                        ),
+                    )
+                    if closed is None:
+                        return {
+                            "status": "rejected",
+                            "reason": "previous_execution_lineage_close_failed",
+                        }
+            else:
+                previous_lineage_key = None
+
+            from dev_orchestrator.soak.bootstrap import prepare_recovery_bootstrap
+            prepared = prepare_recovery_bootstrap(
+                self.runtime_root,
+                repo_path,
+                truth.head,
+                permit_path,
+                previous_run_id=previous_permit.run_id,
+            )
+
+            now = utc_now_iso()
+            previous.update({
+                "owner_recovery_authorized": True,
+                "owner_recovery_authorized_at": now,
+                "owner_recovery_command_id": command_id,
+                "replacement_soak_run_id": replacement.run_id,
+                "replacement_permit_fingerprint": replacement.fingerprint,
+                "failed_run_sha256": old_run_sha256,
+                "previous_lineage_key": previous_lineage_key,
+            })
+            authorization = {
+                "command_id": command_id,
+                "previous_source_request_id": previous_source_id,
+                "previous_lineage_key": previous_lineage_key,
+                "previous_job_id": binding.get("job_id"),
+                "previous_run_id": previous_permit.run_id,
+                "old_run_sha256": old_run_sha256,
+                "replacement_run_id": replacement.run_id,
+                "replacement_project_id": replacement.soak_project_id,
+                "replacement_permit_path": str(Path(permit_path).resolve()),
+                "replacement_permit_fingerprint": replacement.fingerprint,
+                "prepared_head": prepared.get("prepared_head"),
+                "authorized_at": now,
+            }
+            authority.update({
+                "lifecycle_state": "READY_TO_RUN",
+                "active_owner": None,
+                "owner_gate": None,
+                "soak_recovery_authorization": authorization,
+                "updated_at": now,
+            })
+            authority["recovery_epoch_id"] = epoch_for(authority)
+            self._save_ledger(ledger)
+
+        write_execution_status(copy.deepcopy(previous), self.runtime_root)
+        return {
+            "status": "authorized",
+            "previous_run_id": previous_permit.run_id,
+            "replacement_run_id": replacement.run_id,
+            "old_run_sha256": old_run_sha256,
+            "prepared_head": truth.head,
+        }
+
+    def committed_soak_recovery(
+        self,
+        project_id: str,
+        command_id: str,
+        permit_path: str,
+        *,
+        expected_permit_fingerprint: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return an exact already-committed local soak recovery authorization."""
+        from dev_orchestrator.soak.permit import load_soak_permit
+
+        permit = load_soak_permit(permit_path or "")
+        if permit is None:
+            return None
+        if (
+            expected_permit_fingerprint is not None
+            and permit.fingerprint != str(expected_permit_fingerprint)
+        ):
+            return None
+        with self._lock:
+            ledger = self._load_ledger()
+            authority = ledger.get("lifecycle", {}).get(project_id)
+            if not isinstance(authority, dict):
+                return None
+            authorization = authority.get("soak_recovery_authorization")
+            if not (
+                authority.get("current_task_id") == "P20.4"
+                and authority.get("owner_gate") is None
+                and isinstance(authorization, dict)
+                and authorization.get("command_id") == command_id
+                and authorization.get("replacement_permit_fingerprint") == permit.fingerprint
+                and Path(str(authorization.get("replacement_permit_path") or "")).resolve()
+                   == Path(permit_path).resolve()
+            ):
+                return None
+            return {
+                "status": "authorized",
+                "previous_run_id": authorization.get("previous_run_id"),
+                "replacement_run_id": authorization.get("replacement_run_id"),
+                "old_run_sha256": authorization.get("old_run_sha256"),
+                "prepared_head": authorization.get("prepared_head"),
+            }
+
     def start_and_bind_soak(self, source_request_id: str, permit_path: str) -> dict[str, Any]:
         """Local inbox only: one existing Worker, one reserved idempotent durable job."""
         from dev_orchestrator.soak.bootstrap import prepared_bootstrap
@@ -4915,6 +5214,39 @@ class TransitionExecutor:
         if task_id is None:
             self._record_blocked(source_request_id, project_id, "current task id is unavailable", source_kind="control")
             return None
+
+        # A fresh P20.4 soak authorization is anchored to the exact committed
+        # source HEAD that was inspected before the owner gate was cleared.
+        # Enforce this fence before filtering historical Workers by current HEAD;
+        # otherwise a later commit can hide the unsafe predecessor row and fall
+        # through to an ordinary Worker launch without recovery lineage.
+        with self._lock:
+            recovery_ledger = self._load_ledger()
+            recovery_authority = (
+                recovery_ledger.get("lifecycle", {}).get(project_id)
+            )
+            pending_soak_authorization = (
+                recovery_authority.get("soak_recovery_authorization")
+                if isinstance(recovery_authority, dict) else None
+            )
+        if (
+            task_id == "P20.4"
+            and isinstance(pending_soak_authorization, dict)
+            and isinstance(recovery_authority, dict)
+            and recovery_authority.get("current_task_id") == "P20.4"
+            and recovery_authority.get("owner_gate") is None
+            and pending_soak_authorization.get("prepared_head")
+            and pending_soak_authorization.get("prepared_head") != truth.head
+        ):
+            self._record_blocked(
+                source_request_id,
+                project_id,
+                "owner-authorized P20.4 soak recovery HEAD changed",
+                task_id=task_id,
+                source_kind="control",
+            )
+            return None
+
         with self._lock:
             ledger = self._load_ledger()
             broker_rows = [
@@ -4929,9 +5261,59 @@ class TransitionExecutor:
                 broker_rows, key=lambda row: str(row.get("completed_at") or row.get("recovered_at") or row.get("started_at") or ""),
                 default=None,
             )
-            if latest_any_broker is not None and latest_any_broker.get("state") == "recovery_required" and not latest_any_broker.get("recovery_safe_retry"):
+            authority = ledger.get("lifecycle", {}).get(project_id)
+            soak_authorization = (
+                authority.get("soak_recovery_authorization")
+                if isinstance(authority, dict) else None
+            )
+            authorized_predecessor = None
+            if task_id == "P20.4" and isinstance(soak_authorization, dict):
+                previous_source_id = str(
+                    soak_authorization.get("previous_source_request_id") or ""
+                )
+                candidate = ledger.get("executions", {}).get(previous_source_id)
+                if isinstance(candidate, dict):
+                    authorized_predecessor = candidate
+            authorized_soak_supersession = (
+                task_id == "P20.4"
+                and isinstance(authorized_predecessor, dict)
+                and authorized_predecessor.get("state") == "recovery_required"
+                and authorized_predecessor.get("recovery_safe_retry") is False
+                and authorized_predecessor.get("owner_recovery_authorized") is True
+                and isinstance(soak_authorization, dict)
+                and soak_authorization.get("previous_source_request_id")
+                    == authorized_predecessor.get("source_request_id")
+                and soak_authorization.get("replacement_permit_fingerprint")
+                    == authorized_predecessor.get("replacement_permit_fingerprint")
+                and soak_authorization.get("prepared_head") == truth.head
+                and isinstance(authority, dict)
+                and authority.get("owner_gate") is None
+                and authority.get("current_task_id") == "P20.4"
+            )
+            if (
+                latest_any_broker is not None
+                and latest_any_broker.get("state") == "recovery_required"
+                and not latest_any_broker.get("recovery_safe_retry")
+                and not (
+                    authorized_soak_supersession
+                    and latest_any_broker.get("source_request_id")
+                        == authorized_predecessor.get("source_request_id")
+                )
+            ):
                 self._record_blocked(source_request_id, project_id, "latest AIBroker Worker recovery is not safe to retry", source_kind="control")
                 return None
+            if authorized_soak_supersession and lineage is None:
+                lineage = {
+                    "recovery_of": authorized_predecessor.get("source_request_id"),
+                    "recovery_reason": "owner-authorized fresh P20.4 soak measurement",
+                    "previous_soak_run_id": soak_authorization.get("previous_run_id"),
+                    "replacement_soak_run_id": soak_authorization.get("replacement_run_id"),
+                    "soak_recovery_command_id": soak_authorization.get("command_id"),
+                }
+                if soak_authorization.get("previous_lineage_key"):
+                    lineage["recovery_of_lineage_key"] = soak_authorization.get(
+                        "previous_lineage_key"
+                    )
             completed_broker = [row for row in broker_rows if row.get("state") == "completed"]
             latest_broker = max(
                 completed_broker, key=lambda row: str(row.get("completed_at") or row.get("started_at") or ""),

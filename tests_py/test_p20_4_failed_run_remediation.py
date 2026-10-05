@@ -286,7 +286,7 @@ def test_clock_correction_retains_original_start_and_monotonic_evidence(tmp_path
     with patch('psutil.boot_time', return_value=2001.705):
         result = timeline.compute_run_duration(run)
     assert result['continuity_ok']
-    assert result['monotonic_seconds'] == 21600
+    assert result['monotonic_seconds'] == pytest.approx(21600, abs=1e-9)
     assert result['wall_seconds'] == 21601.705
     assert run['started_at'] == started
     with patch.object(timeline, '_current_boot_id', return_value='actual-different-boot'):

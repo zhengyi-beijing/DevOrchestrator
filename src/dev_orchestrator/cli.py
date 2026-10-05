@@ -2262,6 +2262,67 @@ def cmd_soak_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_soak_recover(args: argparse.Namespace) -> int:
+    """Authorize a fresh P20.4 measurement after an exact failed-soak owner gate."""
+    from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
+    from dev_orchestrator.control.command_store import (
+        ControlCommandConflictError,
+        ControlCommandStore,
+    )
+    from dev_orchestrator.control.surface import project_control_view
+
+    permit = load_soak_permit(args.permit)
+    if not permit:
+        sys.stderr.write(f"Permit at {args.permit} not found or invalid.\n")
+        return 1
+    rt = resolve_runtime_root(args.runtime_root)
+    ok, reason = validate_soak_permit(permit, REPO_ROOT, rt)
+    if not ok:
+        sys.stderr.write(f"Permit validation failed: {reason}\n")
+        return 1
+    snapshot = read_json(rt / "projects/devorchestrator.json", None)
+    if not isinstance(snapshot, dict):
+        raise CliError("canonical daemon snapshot missing")
+
+    command_id = args.command_id or ("soak-recover-" + permit.run_id)
+    store = ControlCommandStore(rt)
+    permit_path = str(Path(args.permit).resolve())
+    request = {
+        "schema_version": 1,
+        "command_id": command_id,
+        "project_id": "devorchestrator",
+        "action": "soak_recover",
+        "expected": project_control_view(snapshot, rt)["control_identity"],
+        "target": {
+            "permit_path": permit_path,
+            "permit_fingerprint": permit.fingerprint,
+        },
+    }
+    existing = store.get(command_id)
+    if existing is None:
+        out = store.submit(request, source="p20_local_cli")
+    else:
+        existing_target = (
+            existing.get("target") if isinstance(existing.get("target"), dict) else {}
+        )
+        existing_path = str(existing_target.get("permit_path") or "").strip()
+        same_identity = (
+            existing.get("source") == "p20_local_cli"
+            and existing.get("project_id") == "devorchestrator"
+            and existing.get("action") == "soak_recover"
+            and bool(existing_path)
+            and Path(existing_path).resolve() == Path(permit_path).resolve()
+            and existing_target.get("permit_fingerprint") == permit.fingerprint
+        )
+        if not same_identity:
+            raise ControlCommandConflictError(
+                "command_id already belongs to different soak recovery input"
+            )
+        out = existing
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def cmd_soak_prepare(args: argparse.Namespace) -> int:
     from dev_orchestrator.soak.bootstrap import prepare_bootstrap
     from dev_orchestrator.core.repository import read_repository_truth
@@ -2845,6 +2906,14 @@ def build_parser() -> argparse.ArgumentParser:
     soak_prepare.add_argument('--permit', required=True)
     soak_prepare.add_argument('--runtime-root', default=None)
 
+    soak_recover = sub.add_parser(
+        "soak-recover",
+        help="authorize a fresh local P20.4 measurement after a failed owned soak",
+    )
+    soak_recover.add_argument("--permit", required=True)
+    soak_recover.add_argument("--command-id", default=None)
+    soak_recover.add_argument("--runtime-root", default=None)
+
     soak_status = sub.add_parser("soak-status", help="show soak run status")
     soak_status.add_argument("--permit", required=True)
 
@@ -2867,6 +2936,7 @@ _COMMANDS = {
     "soak-init": cmd_soak_init,
     "soak-start": cmd_soak_start,
     'soak-prepare': cmd_soak_prepare,
+    "soak-recover": cmd_soak_recover,
     "soak-status": cmd_soak_status,
     "soak-resume": cmd_soak_resume,
     "soak-verify": cmd_soak_verify,

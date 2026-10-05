@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "kind": "owner_recovery_software_readiness_not_live_acceptance",
+  "review": {
+    "verdict": "ACCEPT",
+    "dispatch_id": "76297f27-f4f5-4910-b4c8-feee8889f50d",
+    "execution_id": "05d325d3-94ae-44d9-af1e-7713f2ba7c31",
+    "decision_id": "5b518abd-0bca-41cb-ad1d-9ef5c66bb6b2",
+    "resource_id": "agy/agy-1/gemini-3.8-flash-high-adjudicator",
+    "provider": "agy",
+    "model": "gemini-3.8-flash-high",
+    "blocking_findings": 0,
+    "non_blocking_findings": 1
+  },
+  "reviewed_source_sha256": {
+    "docs/P20_4_OWNER_RECOVERY_CONTRACT_20261006.md": "3d4a958228c238ca0fa1993f32a7e343c39fb39cf24e79fe70df551f6726216d",
+    "src/dev_orchestrator/cli.py": "42315cdbd497b9529fa456b507c0bbece1ed94dac42d9fa82514b3c34dc21477",
+    "src/dev_orchestrator/control/command_store.py": "bc3e329de34cc6ff86eb0d0605a3322e44ec78d88a08e139d0ea3e9f2ad73eb0",
+    "src/dev_orchestrator/core/control_commands.py": "83efc4ab104df5347899fe06071781d1b5ea529b863ce6ddb2091ac0af8d2ef4",
+    "src/dev_orchestrator/core/transition_executor.py": "f20beb4ee3ab4af57feed038bcdf90fcd28957e92eb75741f53d0916e70493a8",
+    "src/dev_orchestrator/soak/bootstrap.py": "9e5f404ef504f7001be2f546efbf84308245f7bd9a2878c11c41effa488b75b8",
+    "tests_py/test_p20_4_failed_run_remediation.py": "af65e026602f951120edd19a6f8f952a60b8b9e9834eb820a010e4828e90366c",
+    "tests_py/test_p20_4_owner_recovery.py": "55e4c0f2b1af87ca455c80de9e035cfce07297f3315355b92d5992b439286f4c"
+  },
+  "test_receipts": [
+    {"artifact": "runtime/p20-owner-recovery-focused.xml", "sha256": "242f5140bf45092504377566e371f3c4eab67e9f184cd4049acc94efd267f2bb", "tests": 15, "failures": 0, "errors": 0},
+    {"artifact": "runtime/p20-owner-recovery-related.xml", "sha256": "fdd53fb7c6dcfc18156b73da9d8e61dd362671159300354afc0e9c64c119520d", "tests": 57, "failures": 0, "errors": 0},
+    {"artifact": "runtime/p20-owner-recovery-control.xml", "sha256": "843058e0817440745589fbdf63ba1d79f97dad483ab3c77c5c0f7857ffedc0d6", "tests": 94, "failures": 0, "errors": 0},
+    {"artifact": "runtime/p20-owner-recovery-policy.xml", "sha256": "986be3e4c2072531ae0b0ed6f44e80fb0df216e732db19ce1ca1b9550d9558b8", "tests": 44, "failures": 0, "errors": 0},
+    {"artifact": "runtime/p20-owner-recovery-integration.xml", "sha256": "c1630ce8bccdc56efcfbdac43d66769c0410f4cfb1780ed474cf571a9ebd97a8", "tests": 11, "failures": 0, "errors": 0}
+  ],
+  "original_run_id": "p20-live-20261004-a",
+  "original_status": "FAILED",
+  "replacement_started_at_receipt_time": false,
+  "P20_complete": false
+}

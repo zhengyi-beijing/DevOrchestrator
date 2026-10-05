@@ -18,7 +18,7 @@ CONTROL_ACTIONS = frozenset({
     "approve_owner_gate", "bind_conversation", "unbind_conversation",
     "rebind_conversation",
 })
-LOCAL_CONTROL_ACTIONS = frozenset({'soak_bind'})
+LOCAL_CONTROL_ACTIONS = frozenset({'soak_bind', 'soak_recover'})
 EXPECTED_IDENTITY_FIELDS = (
     "revision", "project_id", "repo_path", "branch", "head", "dirty",
     "status_hash", "task_id", "lifecycle_state", "gate_id", "paused",
@@ -85,10 +85,17 @@ def canonical_request(value: dict[str, Any], *, local: bool = False) -> dict[str
         "unbind_conversation": set(),
         "rebind_conversation": {"adapter", "binding_id"},
         'soak_bind': {'permit_path', 'source_request_id'},
+        'soak_recover': {'permit_path', 'permit_fingerprint'},
     }[action]
     target_unknown = sorted(set(target) - target_allowed)
     if target_unknown:
         raise ValueError("unknown target fields for action: " + ", ".join(target_unknown))
+    if action == "soak_recover":
+        for required in ("permit_path", "permit_fingerprint"):
+            if not isinstance(target.get(required), str) or not target.get(required).strip():
+                raise ValueError(
+                    "soak_recover target requires nonblank " + required
+                )
     return {
         "schema_version": CONTROL_SCHEMA_VERSION,
         "command_id": _nonblank(value.get("command_id"), "command_id"),
