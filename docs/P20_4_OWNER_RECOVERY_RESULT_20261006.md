@@ -38,4 +38,3 @@ the local CLI correctly fails closed when the canonical daemon snapshot is absen
 This is software readiness for a fresh run, not P20.4 live acceptance. The new
 run must independently satisfy the six-hour, five-task, fault-disposition,
 hard-zero, CPF, and final independent-review gates.
-
