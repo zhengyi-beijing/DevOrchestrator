@@ -1,3 +1,31 @@
+# P20.4 software remediation ACCEPT / live acceptance incomplete (2026-10-05)
+
+Diagnosis D01–D07 repaired in local commit 25eb281f. Independent Technical Review
+R1 found three blockers; the bounded delta and Windows successful-boot counter
+fix independently ACCEPTED in R2 (anthropic / claude-opus-5). Final related suite
+167 passed; authority/daemon 69 passed +18 subtests. Reviewer independently ran
+70 passing tests. Counts overlap; these are regression, not live acceptance.
+
+Normal quiescent daemon reload verified at 2026-10-05T00:17:06Z, PID39224: three
+fresh normal ticks, all six invariants true, no active roles/new role records.
+Private ledger backup retained. Broker untouched. Fifteen original case daemons
+and the primary were normally stopped with permits and process identity guards.
+
+Canonical task remains P20.4 OWNER_GATE / SOAK_EVIDENCE_UNRESOLVED. Original run
+p20-live-20261004-a remains FAILED with identical SHA-256 and original clocks;
+the gate is unchanged. No replacement soak, reset, manual lifecycle repair,
+P20.5 activation, P21 or push. P20 remains incomplete. A new live measurement
+requires an explicit owner recovery decision through normal durable controls;
+never promote, overwrite, or concatenate this failed run's timing/evidence.
+
+Details: docs/P20_4_REMEDIATION_RESULT_20261005.md. Source-correlated independent
+review/test receipts and post-reload evidence are in docs/evidence/
+P20_4_REMEDIATION_RECEIPTS_20261005.json and P20_4_REMEDIATION_APPLIED_20261005.json.
+Remaining NON_BLOCKING review notes are recorded there; account authentication
+and quota still require a usable real execution path before another live run.
+
+---
+
 # P20.4 FAILED / diagnosis checkpoint (2026-10-05)
 
 The original run p20-live-20261004-a FAILED at 2026-10-04T20:55:17Z (2026-10-05 04:55:17 Shanghai), exit code 4, system_boot_discontinuity. Canonical authority is P20.4 OWNER_GATE / SOAK_EVIDENCE_UNRESOLVED with no active Worker. P20 remains incomplete; do not treat the historical RUNNING checkpoint below as current state.

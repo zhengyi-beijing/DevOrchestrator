@@ -71,8 +71,15 @@ the native checkout test; all 70 passed. Root's final delta suite: 167 passed;
 authority/daemon regression: 69 passed and 18 subtests. Counts overlap.
 Source-correlated receipts and remaining NON_BLOCKING notes:
 [remediation receipts](evidence/P20_4_REMEDIATION_RECEIPTS_20261005.json).
-Canonical daemon reload is pending at this source-commit checkpoint. The reload
-must preserve the original gate and failed run, confirm quiescence, back up ledgers,
-and observe fresh normal ticks with all six invariants holding.
+Software repair committed locally at `25eb281f`. Normal quiescent daemon reload
+completed at 2026-10-05T00:17:06Z (08:17:06 Shanghai), after private ledger backup
+at runtime/backup-p20-reviewed-daemon-reload-20261005/. PID changed 45224 → 39224;
+three normal fresh ticks were observed, without degraded/error heartbeat. All six
+invariants hold; no active roles or new role records. Original SOAK_EVIDENCE_UNRESOLVED
+gate is identical, and the failed run SHA-256 remains
+`e782e815aa956f049ce765e67987b685d928011bad13189ecd8af081956b72c0`.
+The legacy observation file did not change after reload. Broker process generation
+is unchanged; all 16 old owned daemons remain stopped. Verified deployment receipt:
+[runtime application](evidence/P20_4_REMEDIATION_APPLIED_20261005.json).
 No final P20.4 acceptance,
 replacement soak, canonical gate clearing, P20.5 activation, P21, push or history rewrite.
