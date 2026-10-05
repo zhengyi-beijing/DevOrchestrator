@@ -1,3 +1,37 @@
+# P20.4 stalled-soak remediation ACCEPT / second run FAILED (2026-10-06)
+
+The false-running state is closed. Fresh run `p20-live-20261006-b` exceeded six
+hours but stopped making progress after P204.5 passed Technical Review and the
+generated `Successor: TBD / owner decision required` text routed that final
+Review to `owner_gate/stop`. Only P204.1–P204.4 and 3/15 live fault dispositions
+were source-verified. Process heartbeat was live, but no active role existed.
+
+Canonical was normally paused, ledgers backed up, owned job
+`job-89627c507dd6dd9f` normally cancelled, both job/soak processes proved dead,
+and all owned disposable daemons cleaned through permit-scoped APIs. The exact
+run was then settled one-way to `FAILED` with
+`owned_soak_job_terminal:cancelled`; qualification returns FAIL. Preserve its
+post-settlement SHA-256
+`8a122a385e1f83296bb60fd93e6afcd11ba427f6ca764761f6354c54923ef7c9`.
+The first failed run remains byte-identical at
+`e782e815aa956f049ce765e67987b685d928011bad13189ecd8af081956b72c0`.
+
+Software repair commit `610f97e` makes generated final tasks explicit
+end-of-roadmap terminal tasks, fails a primary terminal owner gate instead of
+heartbeating forever, gives newer NEXT reviews precedence over historical
+gates, and adds guarded/idempotent `soak-settle-stopped`. Independent Technical
+Review ACCEPTED with no blocking findings. P20.4 tests and adjacent lifecycle,
+control, daemon, job and CLI regressions pass; compile/diff/Graphify checks pass.
+Details: `docs/P20_4_STALL_REMEDIATION_RESULT_20261006.md`.
+
+Canonical remains paused at P20.4 `OWNER_GATE / SOAK_EVIDENCE_UNRESOLVED`, with
+no active Worker. P20.4 is not complete. A future attempt must be a separately
+authorized fresh run with a new run/project/permit/path/job/clock after normal
+reviewed-code daemon reload. Never resume, reset, append to, or concatenate
+either failed run. No P20.5, P21, push, reset, rebase or clean.
+
+---
+
 # P20.4 software remediation ACCEPT / live acceptance incomplete (2026-10-05)
 
 Diagnosis D01–D07 repaired in local commit 25eb281f. Independent Technical Review
