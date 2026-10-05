@@ -100,6 +100,7 @@ def open_reliability_run(
     record: dict[str, Any] = {
         "schema_version": RUN_SCHEMA_VERSION,
         "run_id": run_id,
+        "observation_store_version": 2,
         "project_id": str(project_id),
         "opened_at": now_iso,
         "closed_at": None,

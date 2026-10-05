@@ -988,7 +988,7 @@ class TransitionExecutor:
                         authority["lifecycle_state"] = "OWNER_GATE"
                     elif "worker" in roles:
                         authority["lifecycle_state"] = "EXECUTING"
-                    elif blocked_obligations and repo_task != owner_task:
+                    elif blocked_obligations:
                         prior_blocked_gate = authority.get("owner_gate")
                         same_gate = (
                             isinstance(prior_blocked_gate, dict)
@@ -999,6 +999,8 @@ class TransitionExecutor:
                         authority["owner_gate"] = {
                             "code": "NEXT_TASK_WITHOUT_HANDOFF",
                             "reason": "review actuation is durably blocked and cannot drain autonomously",
+                            "gate_id": "blocked-review:" + str(blocked_obligations[0].get('id')),
+                            "required_owner_decision": "Inspect blocked review actuation and repair its successor contract before explicit recovery.",
                             "repository_task_id": repo_task,
                             "authority_task_id": owner_task,
                             "owners": copy.deepcopy(blocked_obligations),
@@ -1011,6 +1013,22 @@ class TransitionExecutor:
                         authority["lifecycle_state"] = "OWNER_GATE"
                     elif "reviewer" in roles or "review_obligation" in roles:
                         authority["lifecycle_state"] = "REVIEWING"
+                        if 'reviewer' not in roles:
+                            reviews = (reviewer_state or {}).get('reviews', {})
+                            obligated = [reviews.get(owner.get('id'), {}) for owner in owners
+                                         if owner.get('role') == 'review_obligation']
+                            if any(row.get('state') == 'recovery_required' for row in obligated):
+                                ambiguous = next(row for row in obligated if row.get('state') == 'recovery_required')
+                                authority['owner_gate'] = {
+                                    'code': 'REVIEW_RECOVERY_REQUIRED',
+                                    'gate_id': 'review-recovery:' + str(ambiguous.get('review_id') or owners[0].get('id')),
+                                    'task_id': owner_task,
+                                    'reason': ambiguous.get('reason') or 'Reviewer outcome is ambiguous; automatic replay is unsafe',
+                                    'required_owner_decision': 'Inspect the exact Reviewer execution and reconcile its outcome before explicit recovery.',
+                                    'recorded_at': ambiguous.get('completed_at') or utc_now_iso()}
+                                authority['active_owner'] = None
+                            elif any(row.get('state') == 'failed' for row in obligated):
+                                authority['lifecycle_state'] = 'REVIEW_FAILED'
                     elif "planner" in roles:
                         authority["lifecycle_state"] = "PLANNING"
                     current_task = owner_task
@@ -1105,8 +1123,51 @@ class TransitionExecutor:
                             authority["lifecycle_state"] = "OWNER_GATE"
                     if authority.get("current_task_id") == repo_task and not authority.get("owner_gate"):
                         authority["lifecycle_state"] = lifecycle_state_from_snapshot(snapshot)
+                        # Current-task durable role terminal facts outrank markdown
+                        # readiness. Keep existing Watchdog recovery paths observable.
+                        plans = (planner_state or {}).get('plans', {})
+                        current_plans = [row for row in plans.values() if isinstance(row, dict)
+                            and row.get('project_id') == project_id and row.get('task_id') == repo_task]
+                        if current_plans:
+                            latest = max(current_plans, key=lambda row: (
+                                row.get('started_at') or row.get('completed_at') or '', row.get('plan_id') or ''))
+                            role_state = latest.get('state')
+                            if role_state in {'failed', 'recovery_required'}:
+                                authority['lifecycle_state'] = ('PLAN_FAILED' if role_state == 'failed' else 'RECOVERY_REQUIRED')
+                                if role_state == 'recovery_required':
+                                    authority['owner_gate'] = {
+                                        'code': 'PLAN_RECOVERY_REQUIRED',
+                                        'gate_id': 'plan-recovery:' + str(latest.get('plan_id')),
+                                        'task_id': repo_task,
+                                        'reason': latest.get('reason') or 'Planner outcome is ambiguous; automatic replay is unsafe',
+                                        'required_owner_decision': 'Inspect the exact Planner execution and reconcile its outcome before explicit recovery.',
+                                        'recorded_at': latest.get('completed_at') or utc_now_iso()}
+                                # Promote only a current-task bounded recovery outcome.
+                                # Historical owner-store gates lack task scope and must
+                                # never leak across the accepted successor boundary.
+                                watchdog = read_json(self.runtime_root / 'watchdog.json', {}).get('projects', {}).get(project_id, {})
+                                problems = (watchdog.get('planning_recovery_problems') or {}).values()
+                                gate = self.owner_store.latest_gate(project_id)
+                                if gate and any(problem.get('task_id') == repo_task
+                                    and problem.get('state') in {'exhausted', 'blocked'}
+                                    for problem in problems if isinstance(problem, dict)):
+                                    authority['owner_gate'] = {
+                                        'code': 'PLANNING_RECOVERY_EXHAUSTED', 'gate_id': gate['gate_id'],
+                                        'task_id': repo_task, 'reason': gate.get('reason') or 'Bounded planning recovery exhausted',
+                                        'required_owner_decision': 'Inspect current-task planning recovery and resource availability before explicit recovery.',
+                                        'recorded_at': gate.get('created_at') or utc_now_iso()}
+                            elif role_state == 'owner_gate':
+                                authority['owner_gate'] = {
+                                    'code': 'PLANNER_OWNER_GATE', 'gate_id': str(latest.get('plan_id')),
+                                    'task_id': repo_task, 'reason': latest.get('reason') or 'Planner requires owner decision',
+                                    'required_owner_decision': 'Inspect the exact Planner gate and approve or remediate it through normal owner controls.',
+                                    'recorded_at': latest.get('completed_at') or utc_now_iso()}
                 if authority.get("owner_gate"):
                     authority["lifecycle_state"] = "OWNER_GATE"
+                    if owners and all(owner.get('role') == 'review_obligation' for owner in owners):
+                        # A pending obligation remains in its durable source row;
+                        # it is not a physical role owner while explicitly gated.
+                        authority['active_owner'] = None
 
                 authority["repository_projection"] = {
                     "task_id": repo_task,
@@ -1158,11 +1219,35 @@ class TransitionExecutor:
             snapshot["lifecycle_state"] = state
             if state == "EXECUTING":
                 snapshot["state"] = "WORKER_RUNNING"
-            elif state in {"PLANNING", "REVIEWING", "OWNER_GATE"}:
+            elif state in {"PLANNING", "REVIEWING", "OWNER_GATE", "PLAN_FAILED", "REVIEW_FAILED", "RECOVERY_REQUIRED"}:
                 snapshot["state"] = state
             elif state == "PENDING_DESIGN":
                 snapshot["state"] = "IDLE"
         return projected
+
+    def record_observation_failure(self, summary: Any, error: Exception) -> None:
+        """Loss of verification is visible in the sole authority, with stable gates."""
+        with self._lock:
+            ledger = self._load_ledger()
+            changed = False
+            for project_id in _snapshot_map(summary):
+                affected = getattr(error, 'project_ids', None)
+                if affected is not None and project_id not in affected:
+                    continue
+                authority = ledger.get('lifecycle', {}).get(project_id)
+                if not isinstance(authority, dict) or authority.get('owner_gate'):
+                    continue
+                authority['owner_gate'] = {
+                    'code': 'RELIABILITY_OBSERVATION_UNAVAILABLE',
+                    'gate_id': f"observation:{project_id}:{authority.get('generation')}",
+                    'task_id': authority.get('current_task_id'),
+                    'reason': 'Normal reliability observation could not be persisted: ' + type(error).__name__,
+                    'required_owner_decision': 'Inspect observation storage and coverage; repair before explicitly resuming. Missing history cannot prove zero.',
+                    'recorded_at': utc_now_iso()}
+                authority['lifecycle_state'] = 'OWNER_GATE'
+                changed = True
+            if changed:
+                self._save_ledger(ledger)
 
     def overlay_managed_runs(self, summary: Any) -> Any:
         """Project managed-run truth onto a deep copy for WORKER_DONE dispatch."""
@@ -1698,7 +1783,7 @@ class TransitionExecutor:
     @staticmethod
     def _lifecycle_launch_guard(
         ledger: dict[str, Any], project_id: str, task_id: str,
-        source_task_id: str | None,
+        source_task_id: str | None, *, source_kind: str = '',
     ) -> tuple[str | None, str | None]:
         lifecycle = ledger.setdefault("lifecycle", {})
         authority = lifecycle.get(project_id)
@@ -1721,6 +1806,12 @@ class TransitionExecutor:
             return source_task_id, "authoritative lifecycle task is terminally settled"
         if authority_state == "PENDING_DESIGN":
             return source_task_id, "PENDING_DESIGN task cannot launch a Worker"
+        if source_kind != 'remediation' and (
+            authority_state in {'REVIEWING', 'TRANSITIONING'}
+            or any(owner.get('role') == 'review_obligation' and owner.get('task_id') == task_id
+                   for owner in active_owners(project_id, ledger))
+        ):
+            return source_task_id, 'pending review or unapplied decision fences Worker launch'
         lineage_source = _non_blank_config(source_task_id)
         if lineage_source is None:
             prior = _non_blank_config(authority.get("source_task_id"))
@@ -1990,7 +2081,7 @@ class TransitionExecutor:
                     return None
 
             source_task_id, lifecycle_error = self._lifecycle_launch_guard(
-                ledger, project_id, task_id, source_task_id,
+                ledger, project_id, task_id, source_task_id, source_kind=source_kind,
             )
             if lifecycle_error:
                 ledger["executions"][source_request_id] = {
@@ -2286,7 +2377,7 @@ class TransitionExecutor:
                     return None
 
             source_task_id, lifecycle_error = self._lifecycle_launch_guard(
-                ledger, project_id, task_id, source_task_id,
+                ledger, project_id, task_id, source_task_id, source_kind=source_kind,
             )
             if lifecycle_error:
                 ledger["executions"][source_request_id] = {
@@ -5264,7 +5355,7 @@ class TransitionExecutor:
                 already_run = any(
                     record.get("project_id") == project_id
                     and record.get("task_id") == current_task
-                    and record.get("head") == truth.head
+                    and (record.get('started_at') or record.get('state') in {'completed', 'failed', 'cancelled', 'running', 'launching'})
                     for record in ledger["executions"].values()
                     if isinstance(record, dict)
                 )

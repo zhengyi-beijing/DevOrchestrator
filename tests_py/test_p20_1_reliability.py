@@ -25,6 +25,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 from typing import Any
+from dev_orchestrator.storage.json_store import utc_now_iso
 
 from dev_orchestrator.core.control_plane_faults import fault_scenarios
 from dev_orchestrator.incidents.contract import (
@@ -699,7 +700,7 @@ class TestP201CPFObservationMatrix(unittest.TestCase):
         r_cpf03.mkdir(parents=True, exist_ok=True)
         record_daemon_boot(r_cpf03, pid=101, listen_address="127.0.0.1", port=8770, started_at="2026-10-01T00:00:00Z", boot_id="boot-0")
         run03 = open_reliability_run(r_cpf03, project_id="devorchestrator", boot_id="boot-0")
-        record_daemon_boot(r_cpf03, pid=102, listen_address="127.0.0.1", port=8770, started_at="2026-10-05T00:00:00Z", boot_id="boot-1")
+        record_daemon_boot(r_cpf03, pid=102, listen_address="127.0.0.1", port=8770, started_at=utc_now_iso(), boot_id="boot-1")
         tel03 = compute_reliability_telemetry(r_cpf03, run03["run_id"])
         self.assertEqual(tel03.metrics["daemon_restart_count"].value, 1)
         shutil.rmtree(r_cpf03.parent, ignore_errors=True)
@@ -718,6 +719,11 @@ class TestP201CPFObservationMatrix(unittest.TestCase):
             }
         }
         (r_cpf04 / "transition-executor.json").write_text(json.dumps(t_data04), encoding="utf-8")
+        from dev_orchestrator.incidents.observations import observation_directory, _append_rows
+        directory = observation_directory(r_cpf04, run04['run_id'])
+        directory.mkdir(parents=True)
+        _append_rows(directory, [{'project_id': 'devorchestrator', 'recorded_at': run04['opened_at'],
+            'invariant_code': 'SUCCESSOR_HANDOFF_LINEAGE_VALID', 'holds': False, 'escaped_to_authority': False}])
         tel04 = compute_reliability_telemetry(r_cpf04, run04["run_id"])
         self.assertEqual(tel04.metrics["lifecycle_invariant_escape_count"].value, 0)
         shutil.rmtree(r_cpf04.parent, ignore_errors=True)
@@ -882,7 +888,7 @@ class TestP201TechnicalReviewRemediation(unittest.TestCase):
             pid=2000,
             listen_address="127.0.0.1",
             port=8770,
-            started_at="2026-10-05T00:00:00Z",
+            started_at=utc_now_iso(),
             boot_id="boot-restart-1",
         )
         telemetry = compute_reliability_telemetry(self.runtime_root, run["run_id"])
@@ -993,6 +999,11 @@ class TestP201TechnicalReviewRemediation(unittest.TestCase):
             }
         }
         trans_file.write_text(json.dumps(trans_data_b), encoding="utf-8")
+        from dev_orchestrator.incidents.observations import observation_directory, _append_rows
+        directory = observation_directory(self.runtime_root, run['run_id'])
+        directory.mkdir(parents=True, exist_ok=True)
+        _append_rows(directory, [{'project_id': 'devorchestrator', 'recorded_at': run['opened_at'],
+            'invariant_code': 'INV-1', 'holds': False, 'escaped_to_authority': True, 'transition_id': 'trans-esc-1'}])
         telemetry_b = compute_reliability_telemetry(self.runtime_root, run["run_id"])
         m_b = telemetry_b.metrics["lifecycle_invariant_escape_count"]
         self.assertEqual(m_b.coverage, "full")

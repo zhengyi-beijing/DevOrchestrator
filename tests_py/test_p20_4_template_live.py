@@ -25,6 +25,12 @@ def test_generated_tasks_use_native_identity_and_real_ai_configuration():
             assert extract_task_id(title) == task
         _git(root / 'repo', '-c', 'core.autocrlf=true', 'checkout-index', '-f', '-a')
         assert all(b'\r' not in path.read_bytes() for path in (root / 'repo/agent/staged').glob('*.md'))
+        from dev_orchestrator.core.successor_consistency import resolve_successor
+        for index, task in enumerate(manifest['task_ids']):
+            resolved = resolve_successor(root / 'repo', task)
+            expected = manifest['task_ids'][index + 1] if index < 4 else None
+            assert resolved.successor_task_id == expected
+            assert resolved.kind == ('successor' if expected else 'end_of_roadmap')
         assert 'NotImplementedError' in (root / 'repo/soak_app.py').read_text(encoding='utf-8')
         assert 'class RecordStore' not in (root / 'repo/soak_app.py').read_text(encoding='utf-8')
         assert generate_soak_project(permit)['initial_commit'] == manifest['initial_commit']

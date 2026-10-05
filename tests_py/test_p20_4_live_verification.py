@@ -19,7 +19,8 @@ from dev_orchestrator.storage.json_store import write_json, utc_now_iso
 
 def test_run_scoped_escape_observations_are_read(tmp_path):
     run = open_reliability_run(tmp_path, 'fixture')
-    path = tmp_path / 'reliability/invariant-observations.jsonl'
+    path = tmp_path / 'reliability/observations' / run['run_id'] / 'invariant-observations.jsonl'
+    path.parent.mkdir(parents=True)
     row = {'project_id': 'fixture', 'recorded_at': run['opened_at'],
            'invariant_code': 'CURRENT_TASK_MATCHES_ACTIVE_EXECUTION',
            'transition_id': 't1', 'holds': False, 'escaped_to_authority': True}
@@ -31,7 +32,8 @@ def test_run_scoped_escape_observations_are_read(tmp_path):
 
 def test_corrupt_escape_observations_cannot_claim_zero(tmp_path):
     run = open_reliability_run(tmp_path, 'fixture')
-    path = tmp_path / 'reliability/invariant-observations.jsonl'
+    path = tmp_path / 'reliability/observations' / run['run_id'] / 'invariant-observations.jsonl'
+    path.parent.mkdir(parents=True)
     row = {'project_id': 'fixture', 'recorded_at': run['opened_at'],
            'holds': True, 'escaped_to_authority': False}
     path.write_text(json.dumps(row) + '\n{broken\n', encoding='utf-8')

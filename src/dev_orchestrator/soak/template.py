@@ -152,6 +152,13 @@ def generate_soak_project(permit, template_root=None):
     _git(repo, 'config', 'user.email', 'soak@devorchestrator.local')
     _git(repo, 'add', '.')
     _git(repo, 'commit', '-m', 'test: initialize five-task pure-software soak fixture')
+    from dev_orchestrator.core.successor_consistency import resolve_successor
+    for index, task in enumerate(SOAK_TASK_SPECS):
+        resolved = resolve_successor(repo, task['task_id'])
+        expected = SOAK_TASK_SPECS[index + 1]['task_id'] if index + 1 < len(SOAK_TASK_SPECS) else None
+        if (resolved.successor_task_id != expected
+                or resolved.kind != ('successor' if expected else 'end_of_roadmap')):
+            raise ValueError('generated native roadmap preflight refused: ' + resolved.reason)
     manifest = {'run_id': permit.run_id, 'project_id': permit.soak_project_id,
                 'permit_fingerprint': permit.fingerprint, 'repo_path': str(repo),
                 'runtime_root': str(runtime), 'config_path': str(config_path),

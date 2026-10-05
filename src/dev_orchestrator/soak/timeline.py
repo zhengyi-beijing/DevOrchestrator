@@ -13,13 +13,34 @@ from dev_orchestrator.storage.json_store import parse_utc, read_json, utc_now, u
 
 
 def _current_boot_id() -> str:
-    """Return a boot identifier or stable string for current system boot."""
-    try:
-        import psutil
-        return str(psutil.boot_time())
-    except Exception:
-        # Fallback to process creation time
-        return f"boot-{int(time.time() - time.monotonic())}"
+    """OS boot identity, independent of wall-clock correction. No estimate fallback."""
+    if os.name == 'nt':
+        import ctypes
+        import uuid
+        # PHNT ntexapi.h: SystemBootEnvironmentInformation (90), GUID first,
+        # ULONG FirmwareType, aligned ULONGLONG BootFlags (32 bytes).
+        query = ctypes.WinDLL('ntdll').NtQuerySystemInformation
+        query.argtypes = [ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong,
+                          ctypes.POINTER(ctypes.c_ulong)]
+        query.restype = ctypes.c_long
+        buffer = ctypes.create_string_buffer(32)
+        returned = ctypes.c_ulong()
+        status = query(90, buffer, len(buffer), ctypes.byref(returned))
+        if status < 0 or returned.value < 16 or not any(buffer.raw[:16]):
+            raise ValueError('OS boot identity unavailable')
+        # BootIdentifier identifies the BCD entry, not a particular boot.
+        # Microsoft's successful-boot counter distinguishes reboots of that entry.
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                r'SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters') as key:
+            counter, kind = winreg.QueryValueEx(key, 'BootId')
+        if kind != winreg.REG_DWORD or type(counter) is not int or counter < 0:
+            raise ValueError('successful OS boot counter unavailable')
+        return 'windows-boot:' + str(uuid.UUID(bytes_le=buffer.raw[:16])) + ':' + str(counter)
+    value = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()
+    if not value:
+        raise ValueError('OS boot identity unavailable')
+    return 'linux-boot:' + value
 
 
 def _same_boot(recorded: Any, current: str) -> bool:
@@ -57,6 +78,7 @@ def open_soak_run(permit: SoakPermit) -> dict[str, Any]:
         "started_at": now_iso,
         "updated_at": now_iso,
         "supervisor_pid": os.getpid(),
+        "supervisor_create_time": __import__('psutil').Process(os.getpid()).create_time(),
         "status": "RUNNING",
         "segments": [
             {
@@ -151,8 +173,11 @@ def checkpoint_soak_run(
             last_seg = segments[-1]
             if isinstance(last_seg, dict):
                 now_m = time.monotonic()
+                if now_m < last_seg.get('end_mono', last_seg.get('start_mono', now_m)):
+                    run_state['monotonic_rollback_observed'] = True
                 if "start_mono" in last_seg and now_m >= last_seg["start_mono"]:
-                    last_seg["end_mono"] = now_m
+                    if not run_state.get('monotonic_rollback_observed'):
+                        last_seg["end_mono"] = now_m
 
     run_state["updated_at"] = utc_now_iso()
     write_json(run_file, run_state, indent=2)
@@ -180,6 +205,19 @@ def compute_run_duration(run_state: dict[str, Any]) -> dict[str, Any]:
     monotonic_seconds = 0.0
     continuity_ok = True
     discontinuity_reason: Optional[str] = None
+    if run_state.get('monotonic_rollback_observed'):
+        return {'wall_seconds': wall_seconds, 'monotonic_seconds': 0., 'segments': run_state.get('segments', []),
+                'continuity_ok': False, 'discontinuity_reason': 'monotonic_went_backwards_between_checkpoints'}
+    # New runs prove original process generation, even from another reader.
+    if run_state.get('supervisor_create_time') is not None and run_state.get('status') == 'RUNNING':
+        try:
+            import psutil
+            process = psutil.Process(int(run_state['supervisor_pid']))
+            if process.create_time() != run_state['supervisor_create_time']:
+                raise ValueError('process generation changed')
+        except (psutil.Error, ValueError, TypeError, KeyError):
+            return {'wall_seconds': wall_seconds, 'monotonic_seconds': 0., 'segments': run_state.get('segments', []),
+                    'continuity_ok': False, 'discontinuity_reason': 'supervisor_process_discontinuity'}
 
     if not isinstance(segments, list) or not segments:
         return {
@@ -213,7 +251,11 @@ def compute_run_duration(run_state: dict[str, Any]) -> dict[str, Any]:
             continuity_ok = False
             discontinuity_reason = f"monotonic_went_backwards_in_segment_{idx}"
             break
-        if not _same_boot(seg.get('boot_id'), _current_boot_id()):
+        try:
+            current_boot = _current_boot_id()
+        except (OSError, ValueError):
+            current_boot = None
+        if current_boot is None or not _same_boot(seg.get('boot_id'), current_boot):
             continuity_ok = False
             discontinuity_reason = 'system_boot_discontinuity'
             break

@@ -80,13 +80,16 @@ def cpf_retry_proofs(permit, run_state):
 
 
 def continuous_escape_metric(permit, run_state):
-    source = Path(permit.disposable_runtime_root) / 'reliability/invariant-observations.jsonl'
+    from dev_orchestrator.incidents.observations import observation_directory
+    source = Path(permit.disposable_runtime_root) / 'reliability'
     unknown = (None, {'coverage': 'unknown', 'source': str(source)})
     try:
+        source = observation_directory(permit.disposable_runtime_root, run_state.get('reliability_run_id'))
         start, end = parse_utc(run_state.get('started_at')), parse_utc(run_state.get('updated_at'))
         if not start or not end or end < start:
             return unknown
-        rows = [json.loads(line) for line in source.read_text(encoding='utf-8').splitlines() if line.strip()]
+        from dev_orchestrator.incidents.observations import read_observations
+        rows = read_observations(permit.disposable_runtime_root, run_state.get('reliability_run_id'))
         if any(not isinstance(row, dict) for row in rows):
             return unknown
         rows = [row for row in rows if row.get('project_id') == permit.soak_project_id

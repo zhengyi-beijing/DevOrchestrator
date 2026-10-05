@@ -12,6 +12,7 @@ from dev_orchestrator.soak.template import generate_soak_project, _git
 from dev_orchestrator.soak.bootstrap import initialize_primary
 from dev_orchestrator.soak.faults import SOAK_FAULTS, reserve_fault_injection, assert_target_disposable
 from dev_orchestrator.soak.evidence import accepted_tasks, primary_active
+from dev_orchestrator.soak.cleanup import stop_owned_daemon
 
 FAILURE_CLASSES = ('malformed_ai_output', 'planner_timeout', 'worker_process_lost',
     'reviewer_rejected', 'provider_quota_exhausted', 'provider_unavailable', 'aibroker_unavailable',
@@ -27,7 +28,15 @@ class LiveFaultDriver:
         self.path = Path(permit.disposable_runtime_root) / 'fault-driver.json'
         self.state = {'run_id': permit.run_id, 'dispositions': {}, 'pending': list(permit.allowed_fault_ids)}
         self.lock = threading.Lock()
-        threading.Thread(target=self._drive, daemon=True, name='p20-disposable-fault-cases').start()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._drive, daemon=True, name='p20-disposable-fault-cases')
+        self.thread.start()
+
+    def close(self):
+        self.stop_event.set()
+        self.thread.join(timeout=45)
+        if self.thread.is_alive():
+            raise RuntimeError('fault driver shutdown deadline exceeded')
 
     def advance(self):
         with self.lock:
@@ -54,6 +63,8 @@ class LiveFaultDriver:
 
     def _drive(self):
         for index, fault in enumerate(SOAK_FAULTS):
+            if self.stop_event.is_set():
+                break
             if fault.fault_id not in self.permit.allowed_fault_ids:
                 continue
             try:
@@ -75,6 +86,18 @@ class LiveFaultDriver:
             self.permit.soak_project_id + '-' + fault.fault_id[:3], root / 'repo', root / 'runtime',
             self.permit.canonical_repo_path, self.permit.canonical_runtime_root, [fault.fault_id])
         manifest = generate_soak_project(permit)
+        try:
+            return self._run_case(index, fault, permit, manifest, root)
+        finally:
+            try:
+                stop_owned_daemon(permit)
+            finally:
+                from dev_orchestrator.incidents.reliability_runs import close_reliability_run
+                run_id = read_json(Path(permit.disposable_runtime_root) / 'soak-project-manifest.json', {}).get('reliability_run_id')
+                if run_id:
+                    close_reliability_run(permit.disposable_runtime_root, run_id, closer_source='p20_case_finally')
+
+    def _run_case(self, index, fault, permit, manifest, root):
         # Cases test one bounded task except handoff faults, which require a real successor.
         if fault.fault_id[:3] not in {'F09', 'F13'}:
             agent = Path(permit.disposable_repo_path) / 'agent'
@@ -88,17 +111,23 @@ class LiveFaultDriver:
         runtime = Path(permit.disposable_runtime_root)
         permit_path = root / 'permit.json'
         save_soak_permit(permit_path, permit)
+        write_json(runtime / 'soak-parent-owner.json', {'permit_path': str(permit_path),
+            'parent_permit_path': self.permit_path, 'pid': os.getpid(),
+            'create_time': __import__('psutil').Process(os.getpid()).create_time()})
         write_json(runtime / 'p20-local-fault.json', {'permit_path': str(permit_path),
             'parent_permit_path': self.permit_path,
             'fault_id': fault.fault_id})
         manifest['ports'] = {'daemon_port': 19800 + index * 2, 'bridge_port': 19801 + index * 2}
+        from dev_orchestrator.incidents.reliability_runs import open_reliability_run
+        manifest['reliability_run_id'] = open_reliability_run(runtime, permit.soak_project_id,
+            opener_source='p20_live_fault_case')['run_id']
         write_json(runtime / 'soak-project-manifest.json', manifest)
         initialize_primary(permit, manifest, automatic=True)
         until = time.monotonic() + 1200.
         effect = None
         stable_gate, stable_since = None, None
         gate_restarted = False
-        while time.monotonic() < until:
+        while not self.stop_event.is_set() and time.monotonic() < until:
             ledger = read_json(runtime / 'transition-executor.json', {})
             authority = ledger.get('lifecycle', {}).get(permit.soak_project_id, {})
             effect = read_json(runtime / 'fault-effect.json', effect)
@@ -128,7 +157,7 @@ class LiveFaultDriver:
                                  'generation': authority.get('generation'), 'task_id': authority.get('current_task_id')}, manifest)
                 else:
                     stable_gate, stable_since = None, None
-            time.sleep(5.)
+            self.stop_event.wait(5.)
         return None
 
     def _structural_effect(self, permit, manifest, fault, ledger, authority):
@@ -220,5 +249,4 @@ class LiveFaultDriver:
             'observed_at': utc_now_iso(), 'evidence': evidence, 'evidence_verified': True}
         write_json(Path(permit.disposable_runtime_root) / 'fault-disposition.json', proof)
         # End the dedicated case normally; no manual primary continuation or lifecycle repair.
-        self._command(permit.disposable_runtime_root, 'stop-daemon')
         return proof

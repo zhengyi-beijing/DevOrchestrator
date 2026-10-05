@@ -38,9 +38,14 @@ def accepted_tasks(permit):
                 if row.get('project_id') == permit.soak_project_id and row.get('task_id') == task
                 and row.get('state') == 'worker_launched' and row.get('worker_source_request_id') == origin), None)
             decision = decisions.get(review_id, {})
+            actuation = workers.get(review_id, {})
+            normally_settled = (actuation.get('project_id') == permit.soak_project_id
+                and actuation.get('task_id') == task
+                and ((actuation.get('state') == 'handoff' and actuation.get('handoff_consumed') is True)
+                     or (actuation.get('state') == 'settled' and actuation.get('outcome') == 'task_complete')))
             wp = (worker.get('resource_context') or {}).get('provider')
             rp = (review.get('resource_context') or {}).get('provider')
-            if (not planner or worker.get('state') != 'completed' or worker.get('task_id') != task
+            if (not normally_settled or not planner or worker.get('state') != 'completed' or worker.get('task_id') != task
                     or worker.get('engine') != 'aibroker' or not wp or not rp or wp == rp
                     or decision.get('decision') != 'next' or decision.get('head') != review.get('head')
                     or not all(worker.get(key) for key in ('dispatch_id', 'execution_id', 'decision_id'))
@@ -98,14 +103,17 @@ def observed_hard_zeros(permit, run_state):
     import json
     runtime = Path(permit.disposable_runtime_root)
     start, end = parse_utc(run_state.get('started_at')), parse_utc(run_state.get('updated_at'))
-    source = runtime / 'reliability/invariant-observations.jsonl'
+    from dev_orchestrator.incidents.observations import observation_directory
+    source = runtime / 'reliability'
     keys = ('lifecycle_repair', 'wrong_task_execution', 'fabricated_successor', 'silent_stall',
             'infinite_retry', 'restart_regression', 'lost_lifecycle_authority')
     unknown = ({key: None for key in keys}, {key: {'coverage': 'unknown', 'source': str(source)} for key in keys})
     try:
+        source = observation_directory(runtime, run_state.get('reliability_run_id'))
         if not start or not end:
             return unknown
-        rows = [json.loads(line) for line in source.read_text(encoding='utf-8').splitlines() if line.strip()]
+        from dev_orchestrator.incidents.observations import read_observations
+        rows = read_observations(runtime, run_state.get('reliability_run_id'))
         rows = [row for row in rows if row.get('project_id') == permit.soak_project_id
                 and start <= parse_utc(row['recorded_at']) <= end]
         snapshots = [row for row in rows if row.get('observation_kind') == 'authority_snapshot'
@@ -199,11 +207,17 @@ def observed_faults(permit, run_state):
             if not boots or parse_utc(boots[-1]['started_at']) <= injected:
                 continue
             import json
-            observations = [json.loads(line) for line in (case / 'reliability/invariant-observations.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
+            from dev_orchestrator.incidents.observations import read_observations, _compact_gate
+            case_run_id = read_json(case / 'soak-project-manifest.json', {}).get('reliability_run_id')
+            observations = read_observations(case, case_run_id)
+            compact_identity = _compact_gate(gate)
             after_restart = [row for row in observations if row.get('observation_kind') == 'authority_snapshot'
                 and parse_utc(row['recorded_at']) >= parse_utc(boots[-1]['started_at'])
                 and not row.get('active_owner') and isinstance(row.get('owner_gate'), dict)
-                and all(row['owner_gate'].get(key) == gate.get(key) for key in identity_fields)]
+                and (all(row['owner_gate'].get(key) == compact_identity.get(key)
+                         for key in ('gate_id', 'code', 'task_id', 'reason_sha256'))
+                     if row['owner_gate'].get('reason_sha256') else
+                     all(row['owner_gate'].get(key) == gate.get(key) for key in identity_fields))]
             if len(after_restart) < 3:
                 continue
         else:

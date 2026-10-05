@@ -49,6 +49,8 @@ def evaluate_soak_qualification(
         reasons.append('permit_invalid: ' + str(refusal))
     if run_state.get('run_id') != permit.run_id or run_state.get('project_id') != permit.soak_project_id:
         reasons.append('run_identity_mismatch')
+    if run_state.get('status') == 'FAILED':
+        reasons.append('original_run_failed')
     from dev_orchestrator.soak.evidence import accepted_tasks, observed_faults, measured_metrics
     from dev_orchestrator.soak.verification_sources import cpf_retry_proofs, continuous_escape_metric
     declared_tasks = list(run_state.get('completed_tasks') or [])
@@ -76,7 +78,8 @@ def evaluate_soak_qualification(
             reasons.append(str(duration_info["discontinuity_reason"]))
 
     mono_sec = float(duration_info.get("monotonic_seconds") or 0.0)
-    if mono_sec < REQUIRED_SOAK_DURATION_SECONDS:
+    if (mono_sec < REQUIRED_SOAK_DURATION_SECONDS
+            or float(duration_info.get('wall_seconds') or 0.) < REQUIRED_SOAK_DURATION_SECONDS):
         reasons.append("duration_gate_failed")
 
     # 2. Tasks Gate (>= 5 tasks)

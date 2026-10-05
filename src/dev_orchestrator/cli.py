@@ -1154,6 +1154,17 @@ def cmd_stop_daemon(args: argparse.Namespace) -> int:
     heartbeat_path = runtime / "daemon.json"
     pid = _read_pid_file(pid_path) or 0
     daemon_was_alive = pid > 0 and is_pid_alive(pid)
+    expected_pid = getattr(args, 'expected_pid', None)
+    expected_created = getattr(args, 'expected_create_time', None)
+    if expected_pid is not None or expected_created is not None:
+        import psutil
+        if expected_pid is None or expected_created is None or pid != expected_pid:
+            raise CliError('daemon shutdown ownership mismatch')
+        try:
+            if daemon_was_alive and psutil.Process(pid).create_time() != expected_created:
+                raise CliError('daemon shutdown process generation mismatch')
+        except psutil.NoSuchProcess:
+            daemon_was_alive = False
     tree_stopped = False
     if daemon_was_alive:
         tree_stopped = terminate_process_tree(pid)
@@ -2569,6 +2580,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     stop_daemon = sub.add_parser("stop-daemon", help="stop the recorded unified daemon process")
     stop_daemon.add_argument("--runtime-root", default=None)
+    stop_daemon.add_argument('--expected-pid', type=int, default=None)
+    stop_daemon.add_argument('--expected-create-time', type=float, default=None)
 
     jobs_list = sub.add_parser("jobs-list", help="list execution jobs")
     jobs_list.add_argument("--project-id", default=None, help="optional project id filter")

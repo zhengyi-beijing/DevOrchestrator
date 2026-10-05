@@ -322,34 +322,47 @@ def compute_reliability_telemetry(
     dup_exec_count = 0
     exec_coverage = Coverage.FULL
     exec_reason = None
-    exec_requests: dict[tuple[str, str], set[str]] = {}
-
-    for eid, edata in executions_map.items():
-        if not isinstance(edata, dict):
+    if not trans_file.is_file():
+        exec_coverage, exec_reason = Coverage.UNKNOWN, 'durable launch history unavailable'
+    reviews = read_json(runtime / 'ai-reviewer.json', {}).get('reviews', {})
+    decisions = read_json(runtime / 'review-decisions.json', {}).get('decisions', {})
+    decisions = {**read_json(runtime / 'websol-decisions.json', {}).get('decisions', {}), **decisions}
+    history: dict[str, list[dict[str, Any]]] = {}
+    launches = sorted((row for row in executions_map.values() if isinstance(row, dict)
+        and row.get('project_id') == project_id and row.get('started_at')),
+        key=lambda row: str(row['started_at']))
+    for row in launches:
+        task = row.get('task_id')
+        if not task or not row.get('source_request_id') or parse_utc(row['started_at']) is None:
+            exec_coverage, exec_reason = Coverage.UNKNOWN, 'launch history identity incomplete'
             continue
-        if str(edata.get("project_id")) != project_id:
-            continue
-        ts = edata.get("started_at") or edata.get("recorded_at")
-        if not _is_event_in_run(ts, opened_at, closed_at):
-            continue
-        req_id = edata.get("source_request_id")
-        tid = edata.get("task_id")
-        state = edata.get("state")
-        # CPF-01 stale predecessor under fenced target is not a duplicate execution
-        if state == "running" and req_id and tid:
-            pair = (str(req_id), str(tid))
-            exec_requests.setdefault(pair, set()).add(str(eid))
-
-    for (r, t), ids in exec_requests.items():
-        if len(ids) > 1:
-            dup_exec_count += len(ids) - 1
+        previous = history.setdefault(task, [])
+        legitimate = False
+        decision = decisions.get(row.get('review_decision_id'), {})
+        review = reviews.get(row.get('review_decision_id'), {})
+        ancestor = executions_map.get(row.get('recovery_of'), {})
+        if row.get('source_kind') == 'remediation':
+            parent = executions_map.get(review.get('source_request_id'), {})
+            legitimate = bool(decision.get('decision') == 'remediate'
+                and decision.get('task_id') == task and decision.get('project_id') == project_id
+                and parent in previous and parent.get('state') == 'completed')
+        if ancestor in previous and ancestor.get('state') == 'explicitly_reconciled':
+            legitimate = True
+        # An authorized retry/remediation must not overlap any previous Worker.
+        started = parse_utc(row['started_at'])
+        overlap = any(old.get('state') in {'launching', 'running'}
+            or (parse_utc(old.get('completed_at')) is not None
+                and parse_utc(old['completed_at']) > started) for old in previous)
+        if previous and (not legitimate or overlap) and _is_event_in_run(row['started_at'], opened_at, closed_at):
+            dup_exec_count += 1
+        previous.append(row)
 
     metrics["duplicate_execution_count"] = MetricResult(
         name="duplicate_execution_count",
-        value=dup_exec_count,
+        value=dup_exec_count if exec_coverage != Coverage.UNKNOWN else None,
         source="runtime/transition-executor.json",
-        identity_key="(project_id, source_request_id, task_id)",
-        dedup_rule="more than one active execution identity per logical request",
+        identity_key="(project_id, task_id, durable launch source and ancestry)",
+        dedup_rule="terminal and active history; second task launch requires authenticated lineage and no overlapping Worker",
         coverage=exec_coverage.value,
         coverage_reason=exec_reason,
     )
@@ -717,13 +730,12 @@ def compute_reliability_telemetry(
                             seen_escape_keys.add(key)
                             escape_count += 1
 
-    obs_file = Path(runtime_root) / "reliability" / "invariant-observations.jsonl"
-    if obs_file.is_file():
+    from dev_orchestrator.incidents.observations import observation_directory
+    obs_directory = observation_directory(runtime_root, run_id)
+    if obs_directory.exists() or run.get('observation_store_version') == 2:
         try:
-            for line in obs_file.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
+            from dev_orchestrator.incidents.observations import read_observations
+            for row in read_observations(runtime_root, run_id):
                 if not isinstance(row, dict):
                     continue
                 if row.get("project_id") != project_id:

@@ -1714,11 +1714,21 @@ class AIPlannerCoordinator:
                             and getattr(r, "model", None) == getattr(resource, "model", None)
                         )
                         if same_pm_failures >= 2:
-                            self._finish(
-                                plan_id, "failed",
-                                f"plan review failed: same provider/model account rotation exhausted for {resource.provider}/{resource.model}: {review_failure}",
-                            )
-                            return None
+                            snapshot_fn = getattr(self.port, 'resource_snapshot', None)
+                            candidates = snapshot_fn().get('resources', []) if callable(snapshot_fn) else []
+                            exhausted = {(r.provider, r.model) for r in failed_resources
+                                if sum((x.provider, x.model) == (r.provider, r.model) for x in failed_resources) >= 2}
+                            failed_resource_ids.update(r['resource_id'] for r in candidates
+                                if (r.get('provider'), r.get('model')) in exhausted and r.get('resource_id'))
+                            # Keep the finite failover budget and original quality /
+                            # independence. Broker decides actual eligibility. Never
+                            # blindly rotate a third account of an exhausted model.
+                            if not any(r.get('resource_id') and r['resource_id'] not in failed_resource_ids
+                                       for r in candidates):
+                                self._finish(
+                                    plan_id, 'failed',
+                                    f'plan review failed: same provider/model account rotation exhausted; no heterogeneous candidate: {review_failure}')
+                                return None
                         continue
                     if can_failover:
                         self._finish(

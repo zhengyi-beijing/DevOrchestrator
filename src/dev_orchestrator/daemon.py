@@ -574,6 +574,10 @@ def _run_orchestration_tick(
         record_post_tick_observations(runtime, projected, executor)
     except Exception as exc:
         projected['_post_tick_observation_error'] = type(exc).__name__
+        gate_observation_failure = getattr(executor, 'record_observation_failure', None)
+        if callable(gate_observation_failure):
+            gate_observation_failure(projected, exc)
+            projected = executor.overlay_lifecycle_authority(projected)
     return _persist_tick_projection(
         projected, runtime, pid=pid,
         actuation_error=actuation_error,
@@ -824,6 +828,21 @@ def run_daemon(
         pass
     try:
         while True:
+            from dev_orchestrator.soak.cleanup import parent_expired
+            try:
+                parent_lost = parent_expired(runtime)
+                parent_error = None
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                parent_lost = True
+                parent_error = type(exc).__name__
+            if parent_lost:
+                # Normal child shutdown, including exact owned Broker dispatches.
+                from dev_orchestrator.cli import _interrupt_active_broker_dispatches
+                _interrupt_active_broker_dispatches(runtime)
+                write_json(runtime / 'daemon.json', {'state': 'stopped', 'pid': pid,
+                    'stopped_at': utc_now_iso(), 'reason': 'soak_parent_guard_unavailable' if parent_error else 'permitted_soak_parent_terminal_or_lost',
+                    'parent_guard_error': parent_error})
+                break
             last_error: Optional[str] = None
             try:
                 tick_result = _run_orchestration_tick(
@@ -840,6 +859,7 @@ def run_daemon(
                         "_actuation_tick_error",
                         "_watchdog_tick_error",
                         "_supervisor_tick_error",
+                        "_post_tick_observation_error",
                     ):
                         if tick_result.get(_err_key):
                             last_error = str(tick_result[_err_key])

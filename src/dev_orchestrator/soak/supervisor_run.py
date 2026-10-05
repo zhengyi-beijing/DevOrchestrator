@@ -38,6 +38,8 @@ def run_soak_supervisor(permit_path, canonical_repo=None, canonical_runtime=None
     state['pending_faults'] = list(permit.allowed_fault_ids)
     state['supervisor_create_time'] = __import__('psutil').Process(os.getpid()).create_time()
     append_soak_event(runtime, permit.run_id, {'event_class': 'real_pipeline_observed', **active})
+    faults = None
+    exit_code = 1
     try:
         from dev_orchestrator.soak.evidence import start_cpf_verification, cpf_proofs
         state['cpf_job_id'] = start_cpf_verification(permit, state['source_revision'])
@@ -61,24 +63,47 @@ def run_soak_supervisor(permit_path, canonical_repo=None, canonical_runtime=None
             if not duration['continuity_ok']:
                 state.update(status='FAILED', ended_at=utc_now_iso(), failure_reason=duration['discontinuity_reason'])
                 checkpoint_soak_run(runtime, state)
-                return 4
+                exit_code = 4
+                break
             if duration['monotonic_seconds'] >= 21600.:
                 from dev_orchestrator.soak.qualification import evaluate_soak_qualification
                 report = evaluate_soak_qualification(permit.canonical_runtime_root, permit)
                 if report['verdict'] == 'ACCEPT':
                     state.update(status='QUALIFIED', ended_at=utc_now_iso(), qualification=report)
                     checkpoint_soak_run(runtime, state)
-                    return 0
+                    exit_code = 0
+                    break
             if duration['monotonic_seconds'] >= max_duration_seconds:
                 state.update(status='FAILED', ended_at=utc_now_iso(), failure_reason='bounded qualification deadline exhausted')
                 checkpoint_soak_run(runtime, state)
-                return 5
+                exit_code = 5
+                break
             time.sleep(poll_interval)
     except Exception as exc:
         state.update(status='FAILED', ended_at=utc_now_iso(), failure_reason=type(exc).__name__)
         append_soak_event(runtime, permit.run_id, {'event_class': 'supervisor_failed', 'error_type': type(exc).__name__})
         checkpoint_soak_run(runtime, state)
-        return 1
+        exit_code = 1
+    finally:
+        if faults is not None:
+            try:
+                faults.close()
+            except Exception as exc:
+                exit_code = 1
+                state.update(status='FAILED', failure_reason='owned_case_cleanup_failed', ended_at=utc_now_iso())
+                checkpoint_soak_run(runtime, state)
+                append_soak_event(runtime, permit.run_id, {'event_class': 'cleanup_failed', 'error_type': type(exc).__name__})
+        from dev_orchestrator.soak.cleanup import stop_owned_daemon
+        try:
+            stop_owned_daemon(permit)
+        except Exception as exc:
+            exit_code = 1
+            state.update(status='FAILED', failure_reason='owned_primary_cleanup_failed', ended_at=utc_now_iso())
+            checkpoint_soak_run(runtime, state)
+            append_soak_event(runtime, permit.run_id, {'event_class': 'cleanup_failed', 'error_type': type(exc).__name__})
+        from dev_orchestrator.incidents.reliability_runs import close_reliability_run
+        close_reliability_run(runtime, state['reliability_run_id'], closer_source='p20_supervisor_finally')
+    return exit_code
 
 
 def read_repository_head(repo):
