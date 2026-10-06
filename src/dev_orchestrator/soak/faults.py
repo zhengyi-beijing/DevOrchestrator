@@ -209,6 +209,19 @@ def get_soak_fault(fault_id: str) -> SoakFault | None:
     return None
 
 
+def disposition_allowed(fault_id: str, disposition: str) -> bool:
+    """Return whether a disposition preserves the registered fault contract.
+
+    Recovery-capable cases may safely converge either automatically or at an
+    owner gate. A fail-closed case is stricter because substituting a gate could
+    hide mutation of the condition that must remain untouched.
+    """
+    fault = get_soak_fault(fault_id)
+    if fault is None or disposition not in {'automatic_recovery', 'owner_gate', 'fail_closed'}:
+        return False
+    return fault.expected_disposition != 'fail_closed' or disposition == 'fail_closed'
+
+
 def assert_target_disposable(permit: SoakPermit, target: Any) -> None:
     """Verify that target stays strictly within the disposable boundaries."""
     if permit is None:

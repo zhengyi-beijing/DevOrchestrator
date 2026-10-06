@@ -14,6 +14,7 @@ from dev_orchestrator.soak.evidence import (
     unexpected_dirt_fail_closed,
 )
 from dev_orchestrator.soak.fault_port import FaultPort
+from dev_orchestrator.soak.faults import get_soak_fault
 from dev_orchestrator.soak.live_faults import LiveFaultDriver
 from dev_orchestrator.soak.permit import create_soak_permit
 from dev_orchestrator.soak.template import generate_soak_project
@@ -130,6 +131,29 @@ def test_duplicate_retry_proof_requires_one_durable_record(tmp_path):
     assert proof['request_hash'] == first['request_hash']
 
 
+def test_duplicate_retry_structural_effect_preserves_injection_budget(tmp_path):
+    permit = _permit(tmp_path, 'F14_DUPLICATE_RETRY')
+    runtime = Path(permit.disposable_runtime_root)
+    request = {'schema_version': 1, 'command_id': 'retry-one', 'project_id': 'project',
+               'action': 'retry', 'expected': {key: None for key in EXPECTED_IDENTITY_FIELDS},
+               'target': {'target_id': 'review'}}
+    ControlCommandStore(runtime).submit(request, source='automatic_p20_fault_duplicate_retry')
+    write_json(runtime / 'fault-effect.json', {'fault_id': 'F14_DUPLICATE_RETRY',
+        'attempt': 1, 'state': 'triggered', 'injection_id': 'initial'})
+    driver = LiveFaultDriver.__new__(LiveFaultDriver)
+    effect = driver._structural_effect(permit, {}, get_soak_fault('F14_DUPLICATE_RETRY'),
+                                       {'executions': {}}, {})
+    assert effect['state'] == 'injected'
+    assert effect['attempt'] == 1
+
+    port = _SequencePort(['succeeded'])
+    result = FaultPort(port, permit, 'F14_DUPLICATE_RETRY').execute(
+        _request(permit, 'reviewer', 'review'))
+    assert result.status == 'succeeded'
+    assert len(port.requests) == 1
+    assert read_json(runtime / 'fault-effect.json', {})['injection_id'] == effect['injection_id']
+
+
 def test_lost_handoff_proof_uses_rebuilt_transition_not_deleted_worker(tmp_path):
     permit = _permit(tmp_path, 'F13_LOST_HANDOFF')
     runtime = Path(permit.disposable_runtime_root)
@@ -143,6 +167,16 @@ def test_lost_handoff_proof_uses_rebuilt_transition_not_deleted_worker(tmp_path)
         'lifecycle': {'project': {'current_task_id': 'P204.2', 'generation': 1,
             'active_owner': {'role': 'planner', 'task_id': 'P204.2'},
             'invariants': [{'code': 'SINGLE_ACTIVE_LIFECYCLE_OWNER', 'holds': True}]}}})
+    current_path = runtime / 'transition-executor.json'
+    current = read_json(current_path, {})
+    current['lifecycle']['project']['current_task_id'] = 'P204.3'
+    current['lifecycle']['project']['active_owner']['task_id'] = 'P204.3'
+    write_json(current_path, current)
+    assert lost_handoff_recovered(permit) is None
+
+    current['lifecycle']['project']['current_task_id'] = 'P204.2'
+    current['lifecycle']['project']['active_owner']['task_id'] = 'P204.2'
+    write_json(current_path, current)
     proof = lost_handoff_recovered(permit)
     assert proof['target_task_id'] == 'P204.2'
     assert proof['single_owner_converged'] is True

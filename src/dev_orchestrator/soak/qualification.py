@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from dev_orchestrator.soak.faults import SOAK_FAULTS, CPF_COVERAGE_MAP
+from dev_orchestrator.soak.faults import SOAK_FAULTS, CPF_COVERAGE_MAP, disposition_allowed
 from dev_orchestrator.soak.permit import SoakPermit, validate_soak_permit
 from dev_orchestrator.soak.timeline import compute_run_duration, load_soak_run
 
@@ -120,6 +120,8 @@ def evaluate_soak_qualification(
             reasons.append('uncorrelated_fault: ' + str(fault_id))
         elif evidence.get('disposition') not in {'automatic_recovery', 'owner_gate', 'fail_closed'}:
             reasons.append('invalid_fault_disposition: ' + str(fault_id))
+        elif not disposition_allowed(fault_id, evidence.get('disposition')):
+            reasons.append('unexpected_fault_disposition: ' + str(fault_id))
         elif evidence.get('mode') != 'live_injection':
             reasons.append('fault_not_injected_during_run: ' + str(fault_id))
 

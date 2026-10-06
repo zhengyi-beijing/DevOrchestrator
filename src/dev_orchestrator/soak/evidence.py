@@ -84,14 +84,12 @@ def duplicate_retry_idempotent(permit, effect):
             or not effect.get('retry_command_id')):
         return None
     from dev_orchestrator.control.command_store import ControlCommandStore
-    rows = [row for row in ControlCommandStore(permit.disposable_runtime_root).recent(200)
-            if row.get('command_id') == effect['retry_command_id']
-            and row.get('project_id') == permit.soak_project_id
-            and row.get('action') == 'retry']
-    if len(rows) != 1 or not rows[0].get('request_hash'):
+    row = ControlCommandStore(permit.disposable_runtime_root).get(effect['retry_command_id'])
+    if (not isinstance(row, dict) or row.get('project_id') != permit.soak_project_id
+            or row.get('action') != 'retry' or not row.get('request_hash')):
         return None
     return {'retry_command_id': effect['retry_command_id'],
-            'request_hash': rows[0]['request_hash'], 'durable_record_count': 1}
+            'request_hash': row['request_hash'], 'durable_record_count': 1}
 
 
 def lost_handoff_recovered(permit):
@@ -120,7 +118,8 @@ def lost_handoff_recovered(permit):
     invariants = authority.get('invariants')
     owner = authority.get('active_owner')
     current_task = authority.get('current_task_id')
-    if (rebuilt is None or handoff is None or current_task == old.get('source_task_id')
+    if (rebuilt is None or rebuilt.get('transition_id') != old.get('transition_id')
+            or handoff is None or current_task != old.get('target_task_id')
             or not isinstance(invariants, list) or not invariants
             or any(row.get('holds') is not True for row in invariants)
             or (owner is not None and owner.get('task_id') != current_task)):
@@ -288,11 +287,14 @@ def observed_hard_zeros(permit, run_state):
 
 def observed_faults(permit, run_state):
     from dev_orchestrator.soak.permit import load_soak_permit, validate_soak_permit
+    from dev_orchestrator.soak.faults import disposition_allowed
     runtime = Path(permit.disposable_runtime_root)
     driver = read_json(runtime / 'fault-driver.json', {})
     found = {}
     for fault_id, declared in driver.get('dispositions', {}).items():
         if not isinstance(declared, dict):
+            continue
+        if not disposition_allowed(fault_id, declared.get('disposition')):
             continue
         case = Path(declared.get('case_runtime_root') or '').resolve()
         if not case.is_relative_to(runtime.resolve() / 'fault-cases'):

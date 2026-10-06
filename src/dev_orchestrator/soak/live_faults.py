@@ -143,12 +143,18 @@ class LiveFaultDriver:
                 'Successor: P204.2',
                 'Successor: none (end of roadmap); an accepted review returns NEXT and settles task_complete',
             )
+            if 'Successor: none (end of roadmap)' not in content:
+                raise RuntimeError(f'isolated fault case successor rewrite failed: {path.name}')
             path.write_text(content, encoding='utf-8', newline='\n')
         for number in range(2, 6):
             (agent / f'staged/P204.{number}.md').unlink(missing_ok=True)
         manifest['task_ids'] = ['P204.1']
         _git(permit.disposable_repo_path, 'add', 'agent')
         _git(permit.disposable_repo_path, 'commit', '-m', 'test: bound isolated fault case to one task')
+        from dev_orchestrator.core.successor_consistency import resolve_successor
+        resolved = resolve_successor(permit.disposable_repo_path, 'P204.1')
+        if resolved.kind != 'end_of_roadmap' or resolved.successor_task_id is not None:
+            raise RuntimeError('isolated fault case successor preflight refused: ' + resolved.reason)
 
     def _run_case(self, index, fault, permit, manifest, root):
         # Cases test one bounded task except handoff faults, which require a real successor.
@@ -217,28 +223,30 @@ class LiveFaultDriver:
                                 semantic, manifest)
                 else:
                     stable_semantic, semantic_since = None, None
-                proof = accepted_tasks(permit)
-                recovered = next((item for item in proof.values()
-                    if parse_utc(item['accepted_at']) > parse_utc(effect['injected_at'])), None)
-                if recovered is not None:
-                    return self._finish(permit, fault, effect, incident, 'automatic_recovery',
-                        {'accepted_task': recovered}, manifest)
-                gate = authority.get('owner_gate')
-                if isinstance(gate, dict) and gate.get('reason') and not authority.get('active_owner') and not primary_active(permit):
-                    identity = (gate.get('gate_id') or gate.get('code'), authority.get('current_task_id'), authority.get('generation'))
-                    if identity != stable_gate:
-                        stable_gate, stable_since = identity, time.monotonic()
-                    elif time.monotonic() - stable_since >= STABLE_DISPOSITION_SECONDS:
-                        if not gate_restarted:
-                            self._restart(permit, manifest)
-                            gate_restarted = True
-                            stable_since = time.monotonic()
-                        else:
-                            return self._finish(permit, fault, effect, incident, 'owner_gate',
-                                {'owner_gate': gate, 'stable_after_restart': True,
-                                 'generation': authority.get('generation'), 'task_id': authority.get('current_task_id')}, manifest)
-                else:
-                    stable_gate, stable_since = None, None
+                if not fault.fault_id.startswith(('F11', 'F13', 'F14')):
+                    proof = accepted_tasks(permit)
+                    recovered = next((item for item in proof.values()
+                        if parse_utc(item['accepted_at']) > parse_utc(effect['injected_at'])), None)
+                    if recovered is not None:
+                        return self._finish(permit, fault, effect, incident, 'automatic_recovery',
+                            {'accepted_task': recovered}, manifest)
+                if not fault.fault_id.startswith(('F11', 'F13', 'F14')):
+                    gate = authority.get('owner_gate')
+                    if isinstance(gate, dict) and gate.get('reason') and not authority.get('active_owner') and not primary_active(permit):
+                        identity = (gate.get('gate_id') or gate.get('code'), authority.get('current_task_id'), authority.get('generation'))
+                        if identity != stable_gate:
+                            stable_gate, stable_since = identity, time.monotonic()
+                        elif time.monotonic() - stable_since >= STABLE_DISPOSITION_SECONDS:
+                            if not gate_restarted:
+                                self._restart(permit, manifest)
+                                gate_restarted = True
+                                stable_since = time.monotonic()
+                            else:
+                                return self._finish(permit, fault, effect, incident, 'owner_gate',
+                                    {'owner_gate': gate, 'stable_after_restart': True,
+                                     'generation': authority.get('generation'), 'task_id': authority.get('current_task_id')}, manifest)
+                    else:
+                        stable_gate, stable_since = None, None
             self.stop_event.wait(5.)
         return None
 
@@ -276,8 +284,11 @@ class LiveFaultDriver:
                     'target': {'target_id': failed['review_id']}}, source='automatic_p20_fault_duplicate_retry')
         intent = reserve_fault_injection(runtime, permit.run_id, fault.fault_id, 'live_injection',
             {'path': str(runtime), 'repo_path': str(repo)}, {'active': active, 'task_id': authority.get('current_task_id')})
+        previous_effect = read_json(runtime / 'fault-effect.json', {})
         effect = {'fault_id': fault.fault_id, 'injection_id': intent['injection_id'],
                   'state': 'reserved', 'reserved_at': utc_now_iso(), 'effect_mode': 'isolated_native_boundary'}
+        if fid == 'F14':
+            effect['attempt'] = int(previous_effect.get('attempt', 1))
         write_json(runtime / 'fault-effect.json', effect)
         if fid in {'F08', 'F09'}:
             self._restart(permit, manifest)

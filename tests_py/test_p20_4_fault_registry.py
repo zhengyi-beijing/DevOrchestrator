@@ -25,6 +25,7 @@ from dev_orchestrator.soak.faults import (
     reserve_fault_injection,
     record_fault_disposition,
     load_fault_injection,
+    disposition_allowed,
 )
 from dev_orchestrator.soak.permit import create_soak_permit
 
@@ -93,6 +94,12 @@ class TestSoakFaultRegistry(unittest.TestCase):
         expected_cpfs = {f"CPF-{i:02d}" for i in range(1, 11)}
         actual_cpfs = set(CPF_COVERAGE_MAP.keys())
         self.assertEqual(actual_cpfs, expected_cpfs)
+
+    def test_fail_closed_fault_cannot_be_substituted_with_a_gate(self) -> None:
+        self.assertTrue(disposition_allowed('F11_UNEXPECTED_DIRT', 'fail_closed'))
+        self.assertFalse(disposition_allowed('F11_UNEXPECTED_DIRT', 'owner_gate'))
+        self.assertFalse(disposition_allowed('F11_UNEXPECTED_DIRT', 'automatic_recovery'))
+        self.assertTrue(disposition_allowed('F08_DAEMON_RESTART_ACTIVE', 'owner_gate'))
 
     def test_injection_reservation_and_disposition(self) -> None:
         injection = reserve_fault_injection(

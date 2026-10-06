@@ -135,10 +135,17 @@ class FaultPort:
             poller = threading.Thread(target=interrupt_owned, daemon=True)
             poller.start()
             try:
-                return self.port.execute(request)
+                result = self.port.execute(request)
             finally:
                 dispatch_done.set()
                 poller.join(timeout=5)
+                current = read_json(self.effect_path, {})
+                if (current.get('injection_id') == effect.get('injection_id')
+                        and current.get('state') == 'reserved'):
+                    current.update(state='not_injected', attempt=0,
+                        reason='owned Worker completed before a running interrupt was observed')
+                    write_json(self.effect_path, current)
+            return result
         if fid.startswith('F02'):
             # Real provider dispatch with an explicitly injected short timeout, never a mock clock.
             result = self.port.execute(replace(request, timeout_seconds=1.))
