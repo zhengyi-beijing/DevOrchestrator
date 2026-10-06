@@ -1,3 +1,31 @@
+# P20.4 run C FAILED / fault-driver terminal stall repaired (2026-10-06)
+
+Fresh run `p20-live-20261006-c` completed P204.1–P204.5 and all 10 CPF checks,
+then attempted all 15 fault cases. Only F07, F08, F09, and F12 produced verified
+dispositions. The fault-driver thread exhausted its case list with 11 pending,
+but the supervisor kept heartbeating with no execution or remaining producer.
+
+Canonical was paused normally; job `job-4f5634aea52f8ece` was cancelled and PID
+7724/PID 40304 proved dead. Canonical converged to
+`OWNER_GATE / SOAK_EVIDENCE_UNRESOLVED`, no active Worker, all invariants true.
+Run C was settled to `FAILED` without rewriting evidence. Preserve SHA-256
+`0d53c0578d07aa580e910993828265ea823299e6bbf2e2450b3f36b66cbd1308`.
+
+Commit `03323a2` makes the fault driver publish a terminal state and makes the
+supervisor fail on the next poll when a finished driver still has pending
+evidence. Independent Technical Review (`claude/default/opus`) returned ACCEPT,
+zero blocking findings. Tests: P20.4 103 passed; adjacent lifecycle/control/job/
+CLI 71 passed plus 10 subtests. Contract and result are in
+`docs/P20_4_FAULT_DRIVER_TERMINAL_CONTRACT_20261006.md` and
+`docs/P20_4_FAULT_DRIVER_TERMINAL_RESULT_20261006.md`.
+
+Canonical is paused. P20.4 is not complete. Run C must not be resumed or merged
+with another clock. Before any fresh run, reload the daemon normally onto the
+reviewed commit and use a new run/project/permit/path/job identity. No P20.5,
+P21, push, reset, rebase, or clean.
+
+---
+
 # P20.4 stalled-soak remediation ACCEPT / second run FAILED (2026-10-06)
 
 The false-running state is closed. Fresh run `p20-live-20261006-b` exceeded six
