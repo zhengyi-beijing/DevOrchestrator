@@ -11,7 +11,13 @@ from dev_orchestrator.soak.permit import create_soak_permit, save_soak_permit
 from dev_orchestrator.soak.template import generate_soak_project, _git
 from dev_orchestrator.soak.bootstrap import initialize_primary
 from dev_orchestrator.soak.faults import SOAK_FAULTS, reserve_fault_injection, assert_target_disposable
-from dev_orchestrator.soak.evidence import accepted_tasks, primary_active
+from dev_orchestrator.soak.evidence import (
+    accepted_tasks,
+    duplicate_retry_idempotent,
+    lost_handoff_recovered,
+    primary_active,
+    unexpected_dirt_fail_closed,
+)
 from dev_orchestrator.soak.cleanup import stop_owned_daemon
 
 FAILURE_CLASSES = ('malformed_ai_output', 'planner_timeout', 'worker_process_lost',
@@ -19,6 +25,10 @@ FAILURE_CLASSES = ('malformed_ai_output', 'planner_timeout', 'worker_process_los
     'daemon_restart_during_execution', 'daemon_restart_during_handoff', 'stale_head',
     'unexpected_dirty_worktree', 'missing_execution_record', 'lost_handoff', 'duplicate_request',
     'retry_without_progress')
+
+CASE_INJECTION_TIMEOUT_SECONDS = 2700.
+CASE_RECOVERY_TIMEOUT_SECONDS = 2700.
+STABLE_DISPOSITION_SECONDS = 15.
 
 
 class LiveFaultDriver:
@@ -123,20 +133,27 @@ class LiveFaultDriver:
                 if run_id:
                     close_reliability_run(permit.disposable_runtime_root, run_id, closer_source='p20_case_finally')
 
+    @staticmethod
+    def _bound_single_task(permit, manifest):
+        agent = Path(permit.disposable_repo_path) / 'agent'
+        write_json(agent / 'staged/roadmap.json', {'schema_version': 1, 'tasks': [
+            {'task_id': 'P204.1', 'successor': None, 'successor_spec_path': None}]})
+        for path in (agent / 'next.md', agent / 'staged/P204.1.md'):
+            content = path.read_text(encoding='utf-8').replace(
+                'Successor: P204.2',
+                'Successor: none (end of roadmap); an accepted review returns NEXT and settles task_complete',
+            )
+            path.write_text(content, encoding='utf-8', newline='\n')
+        for number in range(2, 6):
+            (agent / f'staged/P204.{number}.md').unlink(missing_ok=True)
+        manifest['task_ids'] = ['P204.1']
+        _git(permit.disposable_repo_path, 'add', 'agent')
+        _git(permit.disposable_repo_path, 'commit', '-m', 'test: bound isolated fault case to one task')
+
     def _run_case(self, index, fault, permit, manifest, root):
         # Cases test one bounded task except handoff faults, which require a real successor.
         if fault.fault_id[:3] not in {'F09', 'F13'}:
-            agent = Path(permit.disposable_repo_path) / 'agent'
-            write_json(agent / 'staged/roadmap.json', {'schema_version': 1, 'tasks': [
-                {'task_id': 'P204.1', 'successor': None, 'successor_spec_path': None}]})
-            for path in (agent / 'next.md', agent / 'staged/P204.1.md'):
-                content = path.read_text(encoding='utf-8').replace(
-                    'Successor: P204.2',
-                    'Successor: none (end of roadmap); an accepted review returns NEXT and settles task_complete',
-                )
-                path.write_text(content, encoding='utf-8', newline='\n')
-            _git(permit.disposable_repo_path, 'add', 'agent')
-            _git(permit.disposable_repo_path, 'commit', '-m', 'test: bound isolated fault case to one task')
+            self._bound_single_task(permit, manifest)
         runtime = Path(permit.disposable_runtime_root)
         permit_path = root / 'permit.json'
         save_soak_permit(permit_path, permit)
@@ -152,18 +169,54 @@ class LiveFaultDriver:
             opener_source='p20_live_fault_case')['run_id']
         write_json(runtime / 'soak-project-manifest.json', manifest)
         initialize_primary(permit, manifest, automatic=True)
-        until = time.monotonic() + 1200.
+        injection_until = time.monotonic() + CASE_INJECTION_TIMEOUT_SECONDS
+        recovery_until = None
+        active_injection_id = None
         effect = None
         stable_gate, stable_since = None, None
         gate_restarted = False
-        while not self.stop_event.is_set() and time.monotonic() < until:
+        stable_semantic, semantic_since = None, None
+        semantic_restarted = False
+        while not self.stop_event.is_set():
+            now = time.monotonic()
+            if now >= (recovery_until if recovery_until is not None else injection_until):
+                break
             ledger = read_json(runtime / 'transition-executor.json', {})
             authority = ledger.get('lifecycle', {}).get(permit.soak_project_id, {})
             effect = read_json(runtime / 'fault-effect.json', effect)
             if (effect is None or (fault.fault_id.startswith('F14') and effect.get('state') == 'triggered')) and index >= 7:
                 effect = self._structural_effect(permit, manifest, fault, ledger, authority)
             if effect and effect.get('state') == 'injected':
+                if effect.get('injection_id') != active_injection_id:
+                    active_injection_id = effect.get('injection_id')
+                    recovery_until = time.monotonic() + CASE_RECOVERY_TIMEOUT_SECONDS
                 incident = self._capture_effect(permit, fault, effect, index)
+                semantic = None
+                if fault.fault_id.startswith('F11'):
+                    semantic = unexpected_dirt_fail_closed(permit)
+                elif fault.fault_id.startswith('F13'):
+                    semantic = lost_handoff_recovered(permit)
+                elif fault.fault_id.startswith('F14'):
+                    semantic = duplicate_retry_idempotent(permit, effect)
+                if semantic is not None and fault.fault_id.startswith(('F13', 'F14')):
+                    return self._finish(permit, fault, effect, incident, 'automatic_recovery',
+                        semantic, manifest)
+                if semantic is not None and fault.fault_id.startswith('F11'):
+                    identity = (semantic.get('head'), semantic.get('lifecycle_state'),
+                                semantic.get('dirty_path'))
+                    if identity != stable_semantic:
+                        stable_semantic, semantic_since = identity, time.monotonic()
+                    elif time.monotonic() - semantic_since >= STABLE_DISPOSITION_SECONDS:
+                        if not semantic_restarted:
+                            self._restart(permit, manifest)
+                            semantic_restarted = True
+                            semantic_since = time.monotonic()
+                        else:
+                            semantic['stable_after_restart'] = True
+                            return self._finish(permit, fault, effect, incident, 'fail_closed',
+                                semantic, manifest)
+                else:
+                    stable_semantic, semantic_since = None, None
                 proof = accepted_tasks(permit)
                 recovered = next((item for item in proof.values()
                     if parse_utc(item['accepted_at']) > parse_utc(effect['injected_at'])), None)
@@ -175,7 +228,7 @@ class LiveFaultDriver:
                     identity = (gate.get('gate_id') or gate.get('code'), authority.get('current_task_id'), authority.get('generation'))
                     if identity != stable_gate:
                         stable_gate, stable_since = identity, time.monotonic()
-                    elif time.monotonic() - stable_since >= 15.:
+                    elif time.monotonic() - stable_since >= STABLE_DISPOSITION_SECONDS:
                         if not gate_restarted:
                             self._restart(permit, manifest)
                             gate_restarted = True

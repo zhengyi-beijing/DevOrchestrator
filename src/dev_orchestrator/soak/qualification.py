@@ -118,7 +118,7 @@ def evaluate_soak_qualification(
             'injection_id', 'incident_id', 'failure_family', 'evidence_verified',
         )):
             reasons.append('uncorrelated_fault: ' + str(fault_id))
-        elif evidence.get('disposition') not in {'automatic_recovery', 'owner_gate'}:
+        elif evidence.get('disposition') not in {'automatic_recovery', 'owner_gate', 'fail_closed'}:
             reasons.append('invalid_fault_disposition: ' + str(fault_id))
         elif evidence.get('mode') != 'live_injection':
             reasons.append('fault_not_injected_during_run: ' + str(fault_id))

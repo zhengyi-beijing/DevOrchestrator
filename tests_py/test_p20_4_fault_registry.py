@@ -84,7 +84,7 @@ class TestSoakFaultRegistry(unittest.TestCase):
         self.assertEqual(actual_fault_ids, expected_fault_ids)
 
         for fault in SOAK_FAULTS:
-            self.assertIn(fault.expected_disposition, {"automatic_recovery", "owner_gate"})
+            self.assertIn(fault.expected_disposition, {"automatic_recovery", "owner_gate", "fail_closed"})
             self.assertIsInstance(fault.unsafe, bool)
             self.assertTrue(set(fault.allowed_modes).issubset({"deterministic_test", "live_injection"}))
 

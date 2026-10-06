@@ -77,6 +77,78 @@ def primary_active(permit):
     return None
 
 
+def duplicate_retry_idempotent(permit, effect):
+    """Prove that the injected retry replay resolved to one durable command."""
+    if (effect.get('effect_mode') != 'real_idempotent_duplicate_retry_request'
+            or effect.get('duplicate_same_record') is not True
+            or not effect.get('retry_command_id')):
+        return None
+    from dev_orchestrator.control.command_store import ControlCommandStore
+    rows = [row for row in ControlCommandStore(permit.disposable_runtime_root).recent(200)
+            if row.get('command_id') == effect['retry_command_id']
+            and row.get('project_id') == permit.soak_project_id
+            and row.get('action') == 'retry']
+    if len(rows) != 1 or not rows[0].get('request_hash'):
+        return None
+    return {'retry_command_id': effect['retry_command_id'],
+            'request_hash': rows[0]['request_hash'], 'durable_record_count': 1}
+
+
+def lost_handoff_recovered(permit):
+    """Prove that the deliberately removed handoff converged from its backup."""
+    runtime = Path(permit.disposable_runtime_root)
+    backup = read_json(runtime / 'fault-lost-handoff-ledger-backup.json', {})
+    current = read_json(runtime / 'transition-executor.json', {})
+    old_handoffs = [row for row in backup.get('transitions', {}).values()
+                    if row.get('project_id') == permit.soak_project_id
+                    and row.get('source_task_id') and row.get('target_task_id')]
+    authority = current.get('lifecycle', {}).get(permit.soak_project_id, {})
+    if len(old_handoffs) != 1 or not isinstance(authority, dict):
+        return None
+    old = old_handoffs[0]
+    rebuilt = next((row for row in current.get('transitions', {}).values()
+                    if row.get('project_id') == permit.soak_project_id
+                    and row.get('source_task_id') == old.get('source_task_id')
+                    and row.get('target_task_id') == old.get('target_task_id')
+                    and row.get('state') in {'ready', 'consumed'}), None)
+    handoff = next((row for row in current.get('executions', {}).values()
+                    if row.get('project_id') == permit.soak_project_id
+                    and row.get('source_task_id') == old.get('source_task_id')
+                    and row.get('target_task_id') == old.get('target_task_id')
+                    and row.get('state') == 'handoff'
+                    and row.get('handoff_consumed') is True), None)
+    invariants = authority.get('invariants')
+    owner = authority.get('active_owner')
+    current_task = authority.get('current_task_id')
+    if (rebuilt is None or handoff is None or current_task == old.get('source_task_id')
+            or not isinstance(invariants, list) or not invariants
+            or any(row.get('holds') is not True for row in invariants)
+            or (owner is not None and owner.get('task_id') != current_task)):
+        return None
+    return {'source_task_id': old['source_task_id'], 'target_task_id': old['target_task_id'],
+            'transition_id': rebuilt.get('transition_id'), 'handoff_consumed': True,
+            'current_task_id': current_task, 'generation': authority.get('generation'),
+            'single_owner_converged': True}
+
+
+def unexpected_dirt_fail_closed(permit):
+    """Prove that unexpected dirt remains untouched with no active lifecycle owner."""
+    repo = Path(permit.disposable_repo_path)
+    marker = repo / 'injected-dirty-worktree.txt'
+    truth = read_repository_truth(repo)
+    runtime = Path(permit.disposable_runtime_root)
+    authority = read_json(runtime / 'transition-executor.json', {}).get(
+        'lifecycle', {}).get(permit.soak_project_id, {})
+    if (not marker.exists() or marker.read_text(encoding='utf-8') != 'P20 explicitly permitted unsafe dirt fault\n'
+            or not truth.valid or not truth.dirty or authority.get('active_owner') is not None
+            or primary_active(permit) is not None
+            or authority.get('lifecycle_state') not in {'PLAN_FAILED', 'OWNER_GATE', 'PENDING_DESIGN'}):
+        return None
+    return {'dirty_path': marker.name, 'head': truth.head,
+            'lifecycle_state': authority.get('lifecycle_state'), 'active_owner': None,
+            'wait_without_mutation': True}
+
+
 def primary_terminal_blocker(permit):
     """Return a durable primary-pipeline blocker that cannot make soak progress.
 
@@ -247,9 +319,16 @@ def observed_faults(permit, run_state):
                            for row in family.get('occurrences', []))):
             continue
         if declared.get('disposition') == 'automatic_recovery':
-            accepted = accepted_tasks(case_permit).get(declared.get('evidence', {}).get('accepted_task', {}).get('task_id'))
-            if not accepted or parse_utc(accepted['accepted_at']) < injected:
-                continue
+            if fault_id.startswith('F13'):
+                if lost_handoff_recovered(case_permit) is None:
+                    continue
+            elif fault_id.startswith('F14'):
+                if duplicate_retry_idempotent(case_permit, effect) is None:
+                    continue
+            else:
+                accepted = accepted_tasks(case_permit).get(declared.get('evidence', {}).get('accepted_task', {}).get('task_id'))
+                if not accepted or parse_utc(accepted['accepted_at']) < injected:
+                    continue
         elif declared.get('disposition') == 'owner_gate':
             authority = read_json(case / 'transition-executor.json', {}).get('lifecycle', {}).get(case_permit.soak_project_id, {})
             gate = authority.get('owner_gate')
@@ -276,6 +355,15 @@ def observed_faults(permit, run_state):
                      if row['owner_gate'].get('reason_sha256') else
                      all(row['owner_gate'].get(key) == gate.get(key) for key in identity_fields))]
             if len(after_restart) < 3:
+                continue
+        elif declared.get('disposition') == 'fail_closed':
+            if (not fault_id.startswith('F11')
+                    or not declared.get('evidence', {}).get('stable_after_restart')
+                    or unexpected_dirt_fail_closed(case_permit) is None):
+                continue
+            from dev_orchestrator.incidents.reliability_runs import get_daemon_boots
+            boots = get_daemon_boots(case)
+            if not boots or parse_utc(boots[-1]['started_at']) <= injected:
                 continue
         else:
             continue
