@@ -13,10 +13,13 @@ from dev_orchestrator.soak.bootstrap import initialize_primary
 from dev_orchestrator.soak.faults import SOAK_FAULTS, reserve_fault_injection, assert_target_disposable
 from dev_orchestrator.soak.evidence import (
     accepted_tasks,
+    broker_retry_recovered,
+    daemon_restart_active_recovered,
     duplicate_retry_idempotent,
     lost_handoff_recovered,
     primary_active,
     unexpected_dirt_fail_closed,
+    worker_interrupt_recovered,
 )
 from dev_orchestrator.soak.cleanup import stop_owned_daemon
 
@@ -199,13 +202,19 @@ class LiveFaultDriver:
                     recovery_until = time.monotonic() + CASE_RECOVERY_TIMEOUT_SECONDS
                 incident = self._capture_effect(permit, fault, effect, index)
                 semantic = None
-                if fault.fault_id.startswith('F11'):
+                if fault.fault_id.startswith('F03'):
+                    semantic = worker_interrupt_recovered(permit, effect)
+                elif fault.fault_id.startswith('F07'):
+                    semantic = broker_retry_recovered(permit, effect)
+                elif fault.fault_id.startswith('F08'):
+                    semantic = daemon_restart_active_recovered(permit, effect)
+                elif fault.fault_id.startswith('F11'):
                     semantic = unexpected_dirt_fail_closed(permit)
                 elif fault.fault_id.startswith('F13'):
                     semantic = lost_handoff_recovered(permit)
                 elif fault.fault_id.startswith('F14'):
                     semantic = duplicate_retry_idempotent(permit, effect)
-                if semantic is not None and fault.fault_id.startswith(('F13', 'F14')):
+                if semantic is not None and fault.fault_id.startswith(('F03', 'F07', 'F08', 'F13', 'F14')):
                     return self._finish(permit, fault, effect, incident, 'automatic_recovery',
                         semantic, manifest)
                 if semantic is not None and fault.fault_id.startswith('F11'):
@@ -224,14 +233,14 @@ class LiveFaultDriver:
                                 semantic, manifest)
                 else:
                     stable_semantic, semantic_since = None, None
-                if not fault.fault_id.startswith(('F11', 'F13', 'F14')):
+                if not fault.fault_id.startswith(('F03', 'F07', 'F08', 'F11', 'F13', 'F14')):
                     proof = accepted_tasks(permit)
                     recovered = next((item for item in proof.values()
                         if parse_utc(item['accepted_at']) > parse_utc(effect['injected_at'])), None)
                     if recovered is not None:
                         return self._finish(permit, fault, effect, incident, 'automatic_recovery',
                             {'accepted_task': recovered}, manifest)
-                if not fault.fault_id.startswith(('F11', 'F13', 'F14')):
+                if not fault.fault_id.startswith(('F03', 'F07', 'F08', 'F11', 'F13', 'F14')):
                     gate = authority.get('owner_gate')
                     if isinstance(gate, dict) and gate.get('reason') and not authority.get('active_owner') and not primary_active(permit):
                         identity = (gate.get('gate_id') or gate.get('code'), authority.get('current_task_id'), authority.get('generation'))
@@ -288,11 +297,20 @@ class LiveFaultDriver:
         previous_effect = read_json(runtime / 'fault-effect.json', {})
         effect = {'fault_id': fault.fault_id, 'injection_id': intent['injection_id'],
                   'state': 'reserved', 'reserved_at': utc_now_iso(), 'effect_mode': 'isolated_native_boundary'}
+        if fid == 'F08':
+            effect['pre_restart_active'] = dict(active)
+            effect['pre_restart_authority'] = {
+                'current_task_id': authority.get('current_task_id'),
+                'generation': authority.get('generation'),
+            }
+            effect['daemon_before'] = self._daemon_identity(runtime)
         if fid == 'F14':
             effect['attempt'] = int(previous_effect.get('attempt', 1))
         write_json(runtime / 'fault-effect.json', effect)
         if fid in {'F08', 'F09'}:
             self._restart(permit, manifest)
+            if fid == 'F08':
+                effect['daemon_after'] = self._daemon_identity(runtime)
         elif fid == 'F10':
             _git(repo, 'commit', '--allow-empty', '-m', 'test: inject stale plan HEAD boundary')
         elif fid == 'F11':
@@ -326,6 +344,19 @@ class LiveFaultDriver:
         effect.update(state='injected', injected_at=utc_now_iso())
         write_json(runtime / 'fault-effect.json', effect)
         return effect
+
+    @staticmethod
+    def _daemon_identity(runtime):
+        row = read_json(Path(runtime) / 'daemon.json', {})
+        pid = row.get('pid')
+        create_time = None
+        if pid:
+            try:
+                create_time = __import__('psutil').Process(int(pid)).create_time()
+            except (__import__('psutil').Error, OSError, ValueError, TypeError):
+                pass
+        return {'state': row.get('state'), 'pid': pid, 'create_time': create_time,
+                'started_at': row.get('started_at')}
 
     def _capture_effect(self, permit, fault, effect, index):
         from dev_orchestrator.incidents.capture import capture_incident

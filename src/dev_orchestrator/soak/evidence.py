@@ -77,6 +77,163 @@ def primary_active(permit):
     return None
 
 
+def _after_effect(value, effect):
+    observed = parse_utc(value)
+    injected = parse_utc(effect.get('injected_at'))
+    return observed is not None and injected is not None and observed > injected
+
+
+def worker_interrupt_recovered(permit, effect):
+    """Prove a killed Worker was replaced by an independently reviewed retry.
+
+    Recovery Workers can be launched by a durable control command, so they do
+    not necessarily retain the original Planner's ``worker_source_request_id``.
+    The proof therefore follows the completed Worker into its own Technical
+    Review and terminal lifecycle actuation instead of requiring false Planner
+    ancestry.
+    """
+    if (effect.get('fault_id') != 'F03_WORKER_KILLED'
+            or effect.get('state') != 'injected'
+            or effect.get('effect_mode') != 'owned_broker_worker_interrupt'):
+        return None
+    runtime = Path(permit.disposable_runtime_root)
+    truth = read_repository_truth(permit.disposable_repo_path)
+    if not truth.valid:
+        return None
+    workers = read_json(runtime / 'transition-executor.json', {}).get('executions', {})
+    reviews = read_json(runtime / 'ai-reviewer.json', {}).get('reviews', {})
+    decisions = read_json(runtime / 'review-decisions.json', {}).get('decisions', {})
+    interrupted = next(((key, row) for key, row in workers.items()
+        if row.get('project_id') == permit.soak_project_id
+        and row.get('broker_request_id') == effect.get('request_id')
+        and row.get('state') in {'failed', 'cancelled'}
+        and _after_effect(row.get('completed_at'), effect)), None)
+    if interrupted is None:
+        return None
+    for review_id, review in reviews.items():
+        source = review.get('source_request_id')
+        worker = workers.get(source, {})
+        actuation = workers.get(review_id, {})
+        decision = decisions.get(review_id, {})
+        wp = (worker.get('resource_context') or {}).get('provider')
+        rp = (review.get('resource_context') or {}).get('provider')
+        settled = ((actuation.get('state') == 'handoff'
+                    and actuation.get('handoff_consumed') is True)
+                   or (actuation.get('state') == 'settled'
+                       and actuation.get('outcome') == 'task_complete'))
+        if (review.get('project_id') != permit.soak_project_id
+                or worker.get('project_id') != permit.soak_project_id
+                or source == interrupted[0]
+                or worker.get('task_id') != review.get('task_id')
+                or worker.get('state') != 'completed'
+                or not _after_effect(worker.get('completed_at'), effect)
+                or worker.get('engine') != 'aibroker'
+                or not all(worker.get(key) for key in ('dispatch_id', 'execution_id', 'decision_id'))
+                or review.get('state') != 'completed' or review.get('decision') != 'next'
+                or not _after_effect(review.get('completed_at'), effect)
+                or not all(review.get(key) for key in ('dispatch_id', 'execution_id', 'decision_id'))
+                or decision.get('decision') != 'next'
+                or decision.get('head') != review.get('head')
+                or not is_git_ancestor(permit.disposable_repo_path,
+                                       worker.get('head') or '', review.get('head') or '')
+                or not is_git_ancestor(permit.disposable_repo_path,
+                                       review.get('head') or '', truth.head)
+                or not settled or not wp or not rp or wp == rp):
+            continue
+        return {'worker_source_request_id': source, 'task_id': review.get('task_id'),
+                'review_id': review_id, 'commit': review.get('head'),
+                'worker_provider': wp, 'reviewer_provider': rp,
+                'accepted_at': review.get('completed_at'), 'ledger_verified': True,
+                'recovery_lineage': 'durable_control_retry'}
+    return None
+
+
+def broker_retry_recovered(permit, effect):
+    """Prove the real Broker boundary succeeded on a later Planner attempt."""
+    if (effect.get('fault_id') != 'F07_BROKER_UNAVAILABLE'
+            or effect.get('state') != 'injected'
+            or effect.get('effect_mode') != 'injected_transport_boundary'):
+        return None
+    runtime = Path(permit.disposable_runtime_root)
+    plans = read_json(runtime / 'ai-planner.json', {}).get('plans', {})
+    workers = read_json(runtime / 'transition-executor.json', {}).get('executions', {})
+    for plan_id, plan in plans.items():
+        if (plan.get('project_id') != permit.soak_project_id
+                or plan.get('state') != 'worker_launched'):
+            continue
+        source = plan.get('worker_source_request_id')
+        worker = workers.get(source, {})
+        attempts = plan.get('planner_attempts') or ()
+        injected_attempt = next((attempt for attempt in attempts
+            if attempt.get('request_id') == effect.get('request_id')
+            and _after_effect(attempt.get('completed_at'), effect)), None)
+        if (worker.get('project_id') != permit.soak_project_id
+                or worker.get('task_id') != plan.get('task_id')
+                or injected_attempt is None):
+            continue
+        for number, attempt in enumerate(attempts, 1):
+            resource = attempt.get('resource') or {}
+            if (attempt.get('status') == 'succeeded'
+                    and _after_effect(attempt.get('completed_at'), effect)
+                    and attempt.get('dispatch_id') and attempt.get('execution_id')
+                    and resource.get('provider')):
+                return {'planner_id': plan_id, 'task_id': plan.get('task_id'),
+                        'worker_source_request_id': source,
+                        'recovered_attempt': number,
+                        'planner_provider': resource['provider'],
+                        'recovered_at': attempt.get('completed_at'),
+                        'ledger_verified': True}
+    return None
+
+
+def daemon_restart_active_recovered(permit, effect):
+    """Prove a daemon PID changed while active authority stayed coherent."""
+    if (effect.get('fault_id') != 'F08_DAEMON_RESTART_ACTIVE'
+            or effect.get('state') != 'injected'
+            or effect.get('effect_mode') != 'isolated_native_boundary'):
+        return None
+    before = effect.get('daemon_before') or {}
+    after = effect.get('daemon_after') or {}
+    pre_active = effect.get('pre_restart_active') or {}
+    pre_authority = effect.get('pre_restart_authority') or {}
+    if (not pre_active.get('role_record_id') or not pre_active.get('task_id')
+            or pre_active.get('state') not in {'planning', 'reviewing', 'applying',
+                                               'remediating', 'launching', 'running'}
+            or not before.get('pid') or not after.get('pid')
+            or before.get('create_time') is None or after.get('create_time') is None
+            or before.get('state') not in {'running', 'degraded'}
+            or after.get('state') not in {'running', 'degraded'}
+            or (before.get('pid'), before.get('create_time'))
+               == (after.get('pid'), after.get('create_time'))):
+        return None
+    runtime = Path(permit.disposable_runtime_root)
+    daemon = read_json(runtime / 'daemon.json', {})
+    daemon_create_time = daemon.get('create_time')
+    if daemon.get('pid') and daemon_create_time is None:
+        try:
+            daemon_create_time = __import__('psutil').Process(int(daemon['pid'])).create_time()
+        except (__import__('psutil').Error, OSError, ValueError, TypeError):
+            pass
+    authority = read_json(runtime / 'transition-executor.json', {}).get(
+        'lifecycle', {}).get(permit.soak_project_id, {})
+    invariants = authority.get('invariants')
+    owner = authority.get('active_owner')
+    task = pre_active['task_id']
+    if (daemon.get('state') != 'running'
+            or (daemon.get('pid'), daemon_create_time)
+               != (after.get('pid'), after.get('create_time'))
+            or authority.get('current_task_id') != task
+            or authority.get('generation') != pre_authority.get('generation')
+            or not isinstance(invariants, list) or not invariants
+            or any(row.get('holds') is not True for row in invariants)
+            or (owner is not None and owner.get('task_id') != task)):
+        return None
+    return {'role_record_id': pre_active['role_record_id'], 'task_id': task,
+            'old_pid': before['pid'], 'new_pid': after['pid'],
+            'current_task_id': task, 'generation': authority.get('generation'),
+            'single_owner_converged': True, 'clock_reset': False}
+
+
 def duplicate_retry_idempotent(permit, effect):
     """Prove that the injected retry replay resolved to one durable command."""
     if (effect.get('effect_mode') != 'real_idempotent_duplicate_retry_request'

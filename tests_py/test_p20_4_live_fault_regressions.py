@@ -10,8 +10,11 @@ from dev_orchestrator.ai.contracts import AIRoleRequest, AIRoleResult
 from dev_orchestrator.control.command_store import ControlCommandStore, EXPECTED_IDENTITY_FIELDS
 from dev_orchestrator.core.transition_executor import TransitionExecutor
 from dev_orchestrator.soak.evidence import (
+    broker_retry_recovered,
+    daemon_restart_active_recovered,
     duplicate_retry_idempotent,
     lost_handoff_recovered,
+    worker_interrupt_recovered,
     unexpected_dirt_fail_closed,
 )
 from dev_orchestrator.soak.fault_port import FaultPort
@@ -115,6 +118,141 @@ def test_worker_interrupt_polls_for_entire_dispatch(tmp_path):
     assert port.polls >= 3
     assert effect['state'] == 'injected'
     assert effect['effect_mode'] == 'owned_broker_worker_interrupt'
+
+
+def test_worker_interrupt_recovery_accepts_reviewed_control_retry(tmp_path):
+    permit = _permit(tmp_path, 'F03_WORKER_KILLED')
+    runtime = Path(permit.disposable_runtime_root)
+    repo = Path(permit.disposable_repo_path)
+    subprocess.run(['git', 'init', '-q'], cwd=repo, check=True)
+    subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=repo, check=True)
+    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=repo, check=True)
+    (repo / 'tracked.txt').write_text('reviewed\n', encoding='utf-8')
+    subprocess.run(['git', 'add', 'tracked.txt'], cwd=repo, check=True)
+    subprocess.run(['git', 'commit', '-qm', 'reviewed'], cwd=repo, check=True)
+    reviewed_head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=repo, check=True,
+                                   capture_output=True, text=True).stdout.strip()
+    effect = {'fault_id': 'F03_WORKER_KILLED', 'state': 'injected',
+              'injected_at': '2026-10-07T01:00:00+00:00',
+              'request_id': 'ai-worker:initial:execute',
+              'effect_mode': 'owned_broker_worker_interrupt'}
+    write_json(runtime / 'transition-executor.json', {'executions': {
+        'initial:execute': {'project_id': 'project', 'task_id': 'P204.1',
+            'state': 'failed', 'completed_at': '2026-10-07T01:00:01+00:00',
+            'broker_request_id': 'ai-worker:initial:execute'},
+        'retry-worker': {'project_id': 'project', 'task_id': 'P204.1',
+            'state': 'completed', 'completed_at': '2026-10-07T01:02:00+00:00',
+            'engine': 'aibroker', 'dispatch_id': 'wd', 'execution_id': 'we',
+            'decision_id': 'wdec', 'head': reviewed_head,
+            'resource_context': {'provider': 'agy'}},
+        'ai_review:retry-worker': {'project_id': 'project', 'task_id': 'P204.1',
+            'state': 'settled', 'outcome': 'task_complete'},
+    }})
+    write_json(runtime / 'ai-reviewer.json', {'reviews': {
+        'ai_review:retry-worker': {'project_id': 'project', 'task_id': 'P204.1',
+            'source_request_id': 'retry-worker', 'state': 'completed', 'decision': 'next',
+            'completed_at': '2026-10-07T01:03:00+00:00', 'head': reviewed_head,
+            'dispatch_id': 'rd', 'execution_id': 're', 'decision_id': 'rdec',
+            'resource_context': {'provider': 'anthropic'}},
+    }})
+    write_json(runtime / 'review-decisions.json', {'decisions': {
+        'ai_review:retry-worker': {'decision': 'next', 'head': reviewed_head},
+    }})
+
+    proof = worker_interrupt_recovered(permit, effect)
+    assert proof['worker_source_request_id'] == 'retry-worker'
+    assert proof['review_id'] == 'ai_review:retry-worker'
+    assert proof['worker_provider'] == 'agy'
+    assert proof['reviewer_provider'] == 'anthropic'
+    ledger = read_json(runtime / 'transition-executor.json', {})
+    ledger['executions']['initial:execute']['broker_request_id'] = 'different-request'
+    write_json(runtime / 'transition-executor.json', ledger)
+    assert worker_interrupt_recovered(permit, effect) is None
+    ledger['executions']['initial:execute']['broker_request_id'] = effect['request_id']
+    write_json(runtime / 'transition-executor.json', ledger)
+    reviews = read_json(runtime / 'ai-reviewer.json', {})
+    reviews['reviews']['ai_review:retry-worker']['resource_context']['provider'] = 'agy'
+    write_json(runtime / 'ai-reviewer.json', reviews)
+    assert worker_interrupt_recovered(permit, effect) is None
+    reviews['reviews']['ai_review:retry-worker']['resource_context']['provider'] = 'anthropic'
+    reviews['reviews']['ai_review:retry-worker']['head'] = 'missing-head'
+    write_json(runtime / 'ai-reviewer.json', reviews)
+    decisions = read_json(runtime / 'review-decisions.json', {})
+    decisions['decisions']['ai_review:retry-worker']['head'] = 'missing-head'
+    write_json(runtime / 'review-decisions.json', decisions)
+    assert worker_interrupt_recovered(permit, effect) is None
+
+
+def test_broker_retry_recovery_stops_at_recovered_boundary(tmp_path):
+    permit = _permit(tmp_path, 'F07_BROKER_UNAVAILABLE')
+    runtime = Path(permit.disposable_runtime_root)
+    effect = {'fault_id': 'F07_BROKER_UNAVAILABLE', 'state': 'injected',
+              'injected_at': '2026-10-07T01:00:00+00:00',
+              'request_id': 'plan:planner',
+              'effect_mode': 'injected_transport_boundary'}
+    write_json(runtime / 'ai-planner.json', {'plans': {'plan': {
+        'project_id': 'project', 'task_id': 'P204.1', 'state': 'worker_launched',
+        'worker_source_request_id': 'plan:execute',
+            'planner_attempts': [
+                {'request_id': 'plan:planner', 'status': None,
+                 'completed_at': '2026-10-07T01:00:01+00:00'},
+            {'status': 'succeeded', 'completed_at': '2026-10-07T01:00:05+00:00',
+             'dispatch_id': 'pd', 'execution_id': 'pe',
+             'resource': {'provider': 'anthropic'}},
+        ],
+    }}})
+    write_json(runtime / 'transition-executor.json', {'executions': {
+        'plan:execute': {'project_id': 'project', 'task_id': 'P204.1',
+            'state': 'running'},
+    }})
+
+    proof = broker_retry_recovered(permit, effect)
+    assert proof['planner_id'] == 'plan'
+    assert proof['worker_source_request_id'] == 'plan:execute'
+    assert proof['recovered_attempt'] == 2
+    effect['request_id'] = 'unrelated:planner'
+    assert broker_retry_recovered(permit, effect) is None
+    effect['request_id'] = 'plan:planner'
+    effect['effect_mode'] = 'wrong-boundary'
+    assert broker_retry_recovered(permit, effect) is None
+    effect['effect_mode'] = 'injected_transport_boundary'
+    effect['injected_at'] = '2026-10-07T01:00:06+00:00'
+    assert broker_retry_recovered(permit, effect) is None
+
+
+def test_daemon_restart_active_recovery_requires_identity_and_invariants(tmp_path):
+    permit = _permit(tmp_path, 'F08_DAEMON_RESTART_ACTIVE')
+    runtime = Path(permit.disposable_runtime_root)
+    effect = {'fault_id': 'F08_DAEMON_RESTART_ACTIVE', 'state': 'injected',
+              'injected_at': '2026-10-07T01:00:02+00:00',
+              'effect_mode': 'isolated_native_boundary',
+              'pre_restart_active': {'role_record_id': 'plan', 'task_id': 'P204.1',
+                                     'state': 'planning'},
+              'pre_restart_authority': {'current_task_id': 'P204.1', 'generation': 3},
+              'daemon_before': {'state': 'running', 'pid': 100, 'create_time': 1.0},
+              'daemon_after': {'state': 'running', 'pid': 200, 'create_time': 2.0}}
+    write_json(runtime / 'ai-planner.json', {'plans': {'plan': {
+        'project_id': 'project', 'task_id': 'P204.1', 'state': 'planning'}}})
+    write_json(runtime / 'transition-executor.json', {'executions': {}, 'lifecycle': {
+        'project': {'current_task_id': 'P204.1', 'generation': 3,
+            'active_owner': {'role': 'planner', 'id': 'plan', 'task_id': 'P204.1'},
+            'invariants': [{'code': 'SINGLE_ACTIVE_LIFECYCLE_OWNER', 'holds': True}]},
+    }})
+    write_json(runtime / 'daemon.json', {'state': 'running', 'pid': 200,
+                                         'create_time': 2.0})
+
+    proof = daemon_restart_active_recovered(permit, effect)
+    assert proof['old_pid'] == 100 and proof['new_pid'] == 200
+    assert proof['current_task_id'] == 'P204.1'
+    assert proof['generation'] == 3
+    assert proof['single_owner_converged'] is True
+    effect['pre_restart_active']['state'] = 'completed'
+    assert daemon_restart_active_recovered(permit, effect) is None
+    effect['pre_restart_active']['state'] = 'planning'
+    ledger = read_json(runtime / 'transition-executor.json', {})
+    ledger['lifecycle']['project']['generation'] = 4
+    write_json(runtime / 'transition-executor.json', ledger)
+    assert daemon_restart_active_recovered(permit, effect) is None
 
 
 def test_duplicate_retry_proof_requires_one_durable_record(tmp_path):
