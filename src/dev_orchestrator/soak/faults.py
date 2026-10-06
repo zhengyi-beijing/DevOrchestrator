@@ -219,7 +219,9 @@ def disposition_allowed(fault_id: str, disposition: str) -> bool:
     fault = get_soak_fault(fault_id)
     if fault is None or disposition not in {'automatic_recovery', 'owner_gate', 'fail_closed'}:
         return False
-    return fault.expected_disposition != 'fail_closed' or disposition == 'fail_closed'
+    if disposition == 'fail_closed' or fault.expected_disposition == 'fail_closed':
+        return disposition == fault.expected_disposition
+    return disposition in {'automatic_recovery', 'owner_gate'}
 
 
 def assert_target_disposable(permit: SoakPermit, target: Any) -> None:

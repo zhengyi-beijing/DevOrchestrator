@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dev_orchestrator.ai.contracts import AIRoleRequest, AIRoleResult
 from dev_orchestrator.control.command_store import ControlCommandStore, EXPECTED_IDENTITY_FIELDS
+from dev_orchestrator.core.transition_executor import TransitionExecutor
 from dev_orchestrator.soak.evidence import (
     duplicate_retry_idempotent,
     lost_handoff_recovered,
@@ -163,10 +164,16 @@ def test_lost_handoff_proof_uses_rebuilt_transition_not_deleted_worker(tmp_path)
                {'transitions': {'handoff-1': transition}})
     write_json(runtime / 'transition-executor.json', {'transitions': {'handoff-1': transition},
         'executions': {'review': {'project_id': 'project', 'source_task_id': 'P204.1',
-            'target_task_id': 'P204.2', 'state': 'handoff', 'handoff_consumed': True}},
-        'lifecycle': {'project': {'current_task_id': 'P204.2', 'generation': 1,
-            'active_owner': {'role': 'planner', 'task_id': 'P204.2'},
+            'target_task_id': 'P204.2', 'state': 'handoff',
+            'lifecycle_transition_id': 'handoff-1', 'transition_generation': 1}},
+        'lifecycle': {'project': {'current_task_id': 'P204.1', 'generation': 0,
+            'active_owner': None,
             'invariants': [{'code': 'SINGLE_ACTIVE_LIFECYCLE_OWNER', 'holds': True}]}}})
+    TransitionExecutor(runtime).mark_handoff_consumed('review', 'continue-1', 'plan-1')
+    current = read_json(runtime / 'transition-executor.json', {})
+    current['lifecycle']['project']['active_owner'] = {'role': 'planner', 'task_id': 'P204.2'}
+    write_json(runtime / 'transition-executor.json', current)
+    assert current['transitions']['handoff-1']['state'] == 'published'
     current_path = runtime / 'transition-executor.json'
     current = read_json(current_path, {})
     current['lifecycle']['project']['current_task_id'] = 'P204.3'

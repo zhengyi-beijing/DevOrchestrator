@@ -108,7 +108,7 @@ def lost_handoff_recovered(permit):
                     if row.get('project_id') == permit.soak_project_id
                     and row.get('source_task_id') == old.get('source_task_id')
                     and row.get('target_task_id') == old.get('target_task_id')
-                    and row.get('state') in {'ready', 'consumed'}), None)
+                    and row.get('state') in {'ready', 'published', 'completed'}), None)
     handoff = next((row for row in current.get('executions', {}).values()
                     if row.get('project_id') == permit.soak_project_id
                     and row.get('source_task_id') == old.get('source_task_id')

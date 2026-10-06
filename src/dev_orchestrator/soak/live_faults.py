@@ -154,7 +154,8 @@ class LiveFaultDriver:
         from dev_orchestrator.core.successor_consistency import resolve_successor
         resolved = resolve_successor(permit.disposable_repo_path, 'P204.1')
         if resolved.kind != 'end_of_roadmap' or resolved.successor_task_id is not None:
-            raise RuntimeError('isolated fault case successor preflight refused: ' + resolved.reason)
+            raise RuntimeError('isolated fault case successor preflight refused: '
+                               + str(resolved.reason or resolved.kind))
 
     def _run_case(self, index, fault, permit, manifest, root):
         # Cases test one bounded task except handoff faults, which require a real successor.

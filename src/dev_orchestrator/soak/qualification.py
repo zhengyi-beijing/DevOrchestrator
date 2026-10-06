@@ -60,7 +60,7 @@ def evaluate_soak_qualification(
         values, coverage, _ = measured_metrics(permit, run_state)
         values['lifecycle_invariant_escape'], coverage['lifecycle_invariant_escape'] = continuous_escape_metric(permit, run_state)
         actual_cpfs = cpf_retry_proofs(permit, run_state)
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         actual_tasks, actual_faults, values, coverage, actual_cpfs = {}, {}, {}, {}, {}
         reasons.append('source_evidence_unavailable_or_corrupt')
     for task in declared_tasks:

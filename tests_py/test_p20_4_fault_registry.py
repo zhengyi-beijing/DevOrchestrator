@@ -100,6 +100,7 @@ class TestSoakFaultRegistry(unittest.TestCase):
         self.assertFalse(disposition_allowed('F11_UNEXPECTED_DIRT', 'owner_gate'))
         self.assertFalse(disposition_allowed('F11_UNEXPECTED_DIRT', 'automatic_recovery'))
         self.assertTrue(disposition_allowed('F08_DAEMON_RESTART_ACTIVE', 'owner_gate'))
+        self.assertFalse(disposition_allowed('F08_DAEMON_RESTART_ACTIVE', 'fail_closed'))
 
     def test_injection_reservation_and_disposition(self) -> None:
         injection = reserve_fault_injection(
