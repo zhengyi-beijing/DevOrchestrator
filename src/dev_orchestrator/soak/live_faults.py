@@ -26,7 +26,15 @@ class LiveFaultDriver:
         self.permit = permit
         self.permit_path = str(Path(permit_path).resolve())
         self.path = Path(permit.disposable_runtime_root) / 'fault-driver.json'
-        self.state = {'run_id': permit.run_id, 'dispositions': {}, 'pending': list(permit.allowed_fault_ids)}
+        self.state = {
+            'run_id': permit.run_id,
+            'driver_state': 'running',
+            'started_at': utc_now_iso(),
+            'finished_at': None,
+            'dispositions': {},
+            'pending': list(permit.allowed_fault_ids),
+            'errors': {},
+        }
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._drive, daemon=True, name='p20-disposable-fault-cases')
@@ -41,6 +49,18 @@ class LiveFaultDriver:
     def advance(self):
         with self.lock:
             return dict(self.state['dispositions']), list(self.state['pending'])
+
+    def terminal_failure(self):
+        """Return a typed blocker once no producer can create pending evidence."""
+        with self.lock:
+            if self.state.get('driver_state') != 'finished' or not self.state['pending']:
+                return None
+            return {
+                'code': 'FAULT_DRIVER_EXHAUSTED_WITH_PENDING_EVIDENCE',
+                'pending_faults': list(self.state['pending']),
+                'errors': dict(self.state.get('errors', {})),
+                'finished_at': self.state.get('finished_at'),
+            }
 
     def _save(self):
         with self.lock:
@@ -62,23 +82,29 @@ class LiveFaultDriver:
             '--port', manifest['ports']['daemon_port'], '--bridge-port', manifest['ports']['bridge_port'], '--interval', 5)
 
     def _drive(self):
-        for index, fault in enumerate(SOAK_FAULTS):
-            if self.stop_event.is_set():
-                break
-            if fault.fault_id not in self.permit.allowed_fault_ids:
-                continue
-            try:
-                proof = self._case(index, fault)
-                if proof is not None:
+        try:
+            for index, fault in enumerate(SOAK_FAULTS):
+                if self.stop_event.is_set():
+                    break
+                if fault.fault_id not in self.permit.allowed_fault_ids:
+                    continue
+                try:
+                    proof = self._case(index, fault)
+                    if proof is not None:
+                        with self.lock:
+                            self.state['dispositions'][fault.fault_id] = proof
+                            self.state['pending'].remove(fault.fault_id)
+                    self._save()
+                except Exception as exc:
+                    # A harness error is pending/failed evidence, never an expected owner gate.
                     with self.lock:
-                        self.state['dispositions'][fault.fault_id] = proof
-                        self.state['pending'].remove(fault.fault_id)
-                self._save()
-            except Exception as exc:
-                # A harness error is pending/failed evidence, never an expected owner gate.
-                with self.lock:
-                    self.state.setdefault('errors', {})[fault.fault_id] = type(exc).__name__
-                self._save()
+                        self.state['errors'][fault.fault_id] = type(exc).__name__
+                    self._save()
+        finally:
+            with self.lock:
+                self.state['driver_state'] = 'stopped' if self.stop_event.is_set() else 'finished'
+                self.state['finished_at'] = utc_now_iso()
+            self._save()
 
     def _case(self, index, fault):
         root = Path(self.permit.disposable_runtime_root) / 'fault-cases' / fault.fault_id

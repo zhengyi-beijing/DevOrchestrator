@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import threading
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import psutil
 import pytest
@@ -170,3 +172,132 @@ def test_stopped_settlement_refuses_live_original_process(tmp_path):
     }
     with pytest.raises(RuntimeError, match="original supervisor is still alive"):
         settle_stopped_soak_run(permit, job)
+
+
+def test_finished_fault_driver_with_pending_evidence_is_a_typed_blocker(tmp_path):
+    from dev_orchestrator.soak.live_faults import LiveFaultDriver
+
+    driver = LiveFaultDriver.__new__(LiveFaultDriver)
+    driver.lock = threading.Lock()
+    driver.state = {
+        "driver_state": "finished",
+        "finished_at": "2026-10-06T09:00:00+00:00",
+        "dispositions": {"F07": {"evidence_verified": True}},
+        "pending": ["F01", "F02"],
+        "errors": {"F02": "RuntimeError"},
+    }
+
+    blocker = driver.terminal_failure()
+    assert blocker == {
+        "code": "FAULT_DRIVER_EXHAUSTED_WITH_PENDING_EVIDENCE",
+        "pending_faults": ["F01", "F02"],
+        "errors": {"F02": "RuntimeError"},
+        "finished_at": "2026-10-06T09:00:00+00:00",
+    }
+    driver.state["pending"] = []
+    assert driver.terminal_failure() is None
+
+
+def test_fault_driver_records_terminal_state_when_case_list_is_exhausted(tmp_path):
+    from dev_orchestrator.soak.live_faults import LiveFaultDriver
+    from dev_orchestrator.storage.json_store import read_json
+
+    driver = LiveFaultDriver.__new__(LiveFaultDriver)
+    driver.permit = SimpleNamespace(run_id="run", allowed_fault_ids=("UNKNOWN",))
+    driver.path = tmp_path / "fault-driver.json"
+    driver.lock = threading.Lock()
+    driver.stop_event = threading.Event()
+    driver.state = {
+        "run_id": "run",
+        "driver_state": "running",
+        "started_at": "2026-10-06T08:00:00+00:00",
+        "finished_at": None,
+        "dispositions": {},
+        "pending": ["UNKNOWN"],
+        "errors": {},
+    }
+
+    driver._drive()
+
+    persisted = read_json(driver.path, {})
+    assert persisted["driver_state"] == "finished"
+    assert persisted["finished_at"]
+    assert persisted["pending"] == ["UNKNOWN"]
+    assert driver.terminal_failure()["code"] == "FAULT_DRIVER_EXHAUSTED_WITH_PENDING_EVIDENCE"
+
+
+def test_supervisor_fails_immediately_when_fault_driver_is_terminal(tmp_path):
+    from dev_orchestrator.soak import supervisor_run
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    permit = SimpleNamespace(
+        run_id="terminal-driver-run",
+        soak_project_id="terminal-driver-project",
+        disposable_runtime_root=str(runtime),
+        canonical_repo_path=str(tmp_path / "canonical"),
+        canonical_runtime_root=str(tmp_path / "canonical-runtime"),
+        allowed_fault_ids=("F01",),
+    )
+    state = {
+        "run_id": permit.run_id,
+        "task_evidence": {},
+        "completed_tasks": [],
+        "fault_dispositions": {},
+        "pending_faults": ["F01"],
+        "cpf_convergences": {},
+        "hard_zeros": {},
+        "metric_coverage": {},
+    }
+    blocker = {
+        "code": "FAULT_DRIVER_EXHAUSTED_WITH_PENDING_EVIDENCE",
+        "pending_faults": ["F01"],
+        "errors": {},
+        "finished_at": "2026-10-06T09:00:00+00:00",
+    }
+
+    class TerminalDriver:
+        def __init__(self, *_args):
+            pass
+
+        def advance(self):
+            return {}, ["F01"]
+
+        def terminal_failure(self):
+            return blocker
+
+        def close(self):
+            pass
+
+    events = []
+    with (
+        patch.object(supervisor_run, "load_soak_permit", return_value=permit),
+        patch.object(supervisor_run, "validate_soak_permit", return_value=(True, None)),
+        patch.object(supervisor_run, "load_soak_run", return_value=None),
+        patch.object(supervisor_run, "read_json", return_value={"initial_control_id": "initial"}),
+        patch("dev_orchestrator.control.command_store.ControlCommandStore.get",
+              return_value={"state": "accepted"}),
+        patch.object(supervisor_run, "primary_active", return_value={"task_id": "P204.1"}),
+        patch.object(supervisor_run, "open_soak_run", return_value=state),
+        patch.object(supervisor_run, "read_repository_head", return_value="abc123"),
+        patch("dev_orchestrator.incidents.reliability_runs.open_reliability_run",
+              return_value={"run_id": "reliability"}),
+        patch("dev_orchestrator.incidents.reliability_runs.close_reliability_run"),
+        patch("dev_orchestrator.soak.evidence.start_cpf_verification", return_value="cpf-job"),
+        patch("dev_orchestrator.soak.evidence.cpf_proofs", return_value={}),
+        patch("dev_orchestrator.soak.live_faults.LiveFaultDriver", TerminalDriver),
+        patch.object(supervisor_run, "accepted_tasks", return_value={}),
+        patch.object(supervisor_run, "measured_metrics", return_value=({}, {}, {})),
+        patch.object(supervisor_run, "checkpoint_soak_run"),
+        patch.object(supervisor_run, "append_soak_event", side_effect=lambda _r, _i, row: events.append(row)),
+        patch("dev_orchestrator.soak.cleanup.stop_owned_daemon"),
+    ):
+        exit_code = supervisor_run.run_soak_supervisor("permit.json")
+
+    assert exit_code == 7
+    assert state["status"] == "FAILED"
+    assert state["failure_reason"] == (
+        "fault_driver_terminal:FAULT_DRIVER_EXHAUSTED_WITH_PENDING_EVIDENCE"
+    )
+    assert state["fault_driver_blocker"] == blocker
+    assert any(row["event_class"] == "fault_driver_terminal_blocker" for row in events)

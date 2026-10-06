@@ -64,6 +64,21 @@ def run_soak_supervisor(permit_path, canonical_repo=None, canonical_runtime=None
             state['metric_coverage'].update(coverage)
             state['reliability_telemetry'] = telemetry
             checkpoint_soak_run(runtime, state)
+            fault_blocker = faults.terminal_failure()
+            if fault_blocker is not None:
+                state.update(
+                    status='FAILED',
+                    ended_at=utc_now_iso(),
+                    failure_reason='fault_driver_terminal:' + fault_blocker['code'],
+                    fault_driver_blocker=fault_blocker,
+                )
+                append_soak_event(runtime, permit.run_id, {
+                    'event_class': 'fault_driver_terminal_blocker',
+                    **fault_blocker,
+                })
+                checkpoint_soak_run(runtime, state)
+                exit_code = 7
+                break
             blocker = primary_terminal_blocker(permit)
             if blocker is not None:
                 state.update(
