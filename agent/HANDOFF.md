@@ -1,3 +1,28 @@
+# P20.4 run D FAILED / live fault-disposition remediation ACCEPT (2026-10-07)
+
+Fresh run `p20-live-20261006-d` correctly terminated after about 4h12m with
+exit code 7 and `FAULT_DRIVER_EXHAUSTED_WITH_PENDING_EVIDENCE`. Five faults
+verified (F01/F07/F08/F09/F12); ten remained pending. The new terminal guard
+worked and no false-running stall recurred. Canonical is
+`OWNER_GATE / SOAK_EVIDENCE_UNRESOLVED`, no active owner, all invariants true.
+
+Commits `d7bae80`, `354ba69`, and `c4b2a59` repair the shared causes: separate
+bounded injection/recovery phases, durable F03 polling, Technical-Review-only
+F04 injection, non-consuming upstream failures, true one-task fixtures, and
+semantic F11/F13/F14 evidence. All P20.4 tests pass (112); adjacent regression
+passes (185 plus 23 subtests). Final independent Technical Review by
+`claude/default/opus` returned ACCEPT with zero BLOCKING findings and reproduced
+285 related tests plus 18 subtests.
+
+Details:
+`docs/P20_4_LIVE_FAULT_DISPOSITION_REMEDIATION_RESULT_20261007.md`.
+Run D is immutable failed evidence and must not be resumed or merged with a new
+clock. P20.4 remains incomplete. A fresh measurement requires new run/project/
+permit/path/job/source-request identities. No P20.5, P21, push, reset, rebase,
+or clean.
+
+---
+
 # P20.4 run C FAILED / fault-driver terminal stall repaired (2026-10-06)
 
 Fresh run `p20-live-20261006-c` completed P204.1–P204.5 and all 10 CPF checks,
