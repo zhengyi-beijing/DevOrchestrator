@@ -1,3 +1,32 @@
+# P20.4 Run H preflight failed / resource failover remediation ACCEPT (2026-10-08)
+
+Run H (`p20-live-20261008-h`) never created a run file or measurement clock.
+Its isolated initial Planner hit the real `claude/default/opus` weekly limit
+three times, but `failure_classification` remained null, so the same exhausted
+resource was retried. Canonical job `job-b88542ae1a5828b4` exited 3 before the
+primary pipeline became active, and authority converged normally to
+`SOAK_EVIDENCE_UNRESOLVED` with no active role.
+
+Commit `1422042` classifies `weekly limit` as `quota_exhausted` in direct and
+reconciled result paths, enabling the existing exact-resource exclusion and
+bounded failover contract. AIBroker/Planner tests pass (66); all P20.4 tests
+pass (124); compile, diff, and Graphify checks pass. Independent review
+`p20-run-h-weekly-limit-review-20261008-r1` returned ACCEPT with zero findings.
+The ignored AIBroker config now permits the verified Copilot Sonnet resource as
+a Planner; its prior config is preserved with SHA-256
+`8eb2ad0716d6c9b5238f937d26640d30d0d1228b0cb4fe01c8060e1cef7382e0`.
+Details: `docs/P20_4_RUN_H_PREFLIGHT_RESOURCE_REMEDIATION_20261008.md`.
+
+Start only a fresh Run I through normal `soak-recover`, with new
+run/project/permit/path/job/source-request identities and a normally reloaded
+daemon. Do not reuse Run H's failed job or isolated primary project. The user
+browser edits remain preserved in stash commit
+`d2d3e61516d286dc34c669f360411a735595f92a` and in the external backup patch
+whose SHA-256 is
+`53e2a8f93109b2999ccf3bc1bcaa453e356e6cbd48c6d3b4d56bc2efb9e994c1`.
+
+---
+
 # P20.4 Run G F03 remediation ACCEPT / Run H pending start (2026-10-08)
 
 Run G (`p20-live-20261007-g`) remains immutable failed evidence. Its sole
