@@ -169,6 +169,53 @@ def _old_terminal_job(executor: TransitionExecutor):
     )
 
 
+def _premeasurement_fixture(tmp_path: Path):
+    values = _fixture(tmp_path)
+    _, runtime, _, old, old_path, _, _, old_run_path, _ = values
+    old_run_path.unlink()
+    state_path = runtime / "transition-executor.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    row = state["executions"]["worker-old"]
+    row.pop("external_execution_binding")
+    row["reason"] = (
+        "bounded_soak_preparation_deadline_expired; inspect the reserved job; "
+        "no automatic duplicate launch"
+    )
+    row["external_execution_preparation"] = {
+        "run_id": old.run_id,
+        "permit_path": str(old_path),
+        "permit_fingerprint": old.fingerprint,
+        "prepared_head": row["head"],
+        "prepared_at": "2026-10-01T00:00:00+00:00",
+        "source": "p20_local_owner_recovery",
+        "replacement_of_run_id": "earlier-run",
+        "deadline_at": "2026-10-01T00:04:00+00:00",
+    }
+    row["external_execution_start_intent"] = {
+        "job_id": "job-old",
+        "run_id": old.run_id,
+        "permit_fingerprint": old.fingerprint,
+        "reserved_at": "2026-10-01T00:01:00+00:00",
+    }
+    state["lifecycle"]["devorchestrator"]["owner_gate"]["reason"] = row["reason"]
+    write_json(state_path, state)
+    return values
+
+
+def _old_premeasurement_job(old, *, state="failed"):
+    return SimpleNamespace(
+        state=state,
+        project_id="devorchestrator",
+        task_id="P20.4",
+        source_request_id="worker-old",
+        kind="soak",
+        command_ref="p20_soak_supervisor",
+        transport="local",
+        parameters_digest=old.fingerprint,
+        idempotency_key=f"soak:{old.run_id}:worker-old",
+    )
+
+
 def _authorize(executor: TransitionExecutor, project: dict, permit_path: Path, command_id: str):
     executor.owner_store.set_paused(
         "devorchestrator", True, command_id="fixture-pause", action="pause", reason="test"
@@ -261,6 +308,130 @@ def test_owner_recovery_preserves_failed_run_and_prepares_new_measurement(tmp_pa
         isinstance(row, dict) and row.get("state") in {"launching", "running"}
         for row in state["executions"].values()
     )
+
+
+def test_owner_recovery_accepts_exact_terminal_premeasurement_job(tmp_path):
+    repo, runtime, project, old, _, new, new_path, old_run_path, _ = (
+        _premeasurement_fixture(tmp_path)
+    )
+    executor = TransitionExecutor(runtime)
+    executor.owner_store.set_paused(
+        "devorchestrator", True, command_id="fixture-pause", action="pause", reason="test"
+    )
+    with patch(
+        "dev_orchestrator.jobs.service.JobService.status",
+        return_value=_old_premeasurement_job(old),
+    ) as status:
+        result = executor.authorize_soak_recovery(
+            project, str(new_path), command_id="owner-recover-premeasurement"
+        )
+
+    assert result["status"] == "authorized"
+    assert result["previous_run_id"] == old.run_id
+    assert result["replacement_run_id"] == new.run_id
+    assert result["old_run_sha256"] is None
+    assert result["premeasurement_failure"] is True
+    assert len(result["old_job_identity_sha256"]) == 64
+    assert not old_run_path.exists()
+    status.assert_called_once_with("job-old")
+
+    state = executor.state()
+    auth = state["lifecycle"]["devorchestrator"]
+    assert auth["owner_gate"] is None
+    recovery = auth["soak_recovery_authorization"]
+    assert recovery["premeasurement_failure"] is True
+    assert recovery["old_run_sha256"] is None
+    assert recovery["old_job_identity_sha256"] == result["old_job_identity_sha256"]
+    assert state["executions"]["worker-old"]["failed_job_identity_sha256"] == result[
+        "old_job_identity_sha256"
+    ]
+    assert json.loads((runtime / "p20-soak-bootstrap.json").read_text(encoding="utf-8"))[
+        "run_id"
+    ] == new.run_id
+    assert _git(repo, "status", "--porcelain") == ""
+
+
+def test_owner_recovery_rejects_premeasurement_job_when_run_file_exists(tmp_path):
+    _, runtime, project, old, _, _, new_path, old_run_path, _ = _premeasurement_fixture(tmp_path)
+    write_json(old_run_path, {"run_id": old.run_id, "status": "FAILED"})
+    executor = TransitionExecutor(runtime)
+    executor.owner_store.set_paused(
+        "devorchestrator", True, command_id="fixture-pause", action="pause", reason="test"
+    )
+    with patch(
+        "dev_orchestrator.jobs.service.JobService.status",
+        return_value=_old_premeasurement_job(old),
+    ):
+        result = executor.authorize_soak_recovery(
+            project, str(new_path), command_id="owner-recover-premeasurement-with-run"
+        )
+    assert result == {"status": "rejected", "reason": "unexpected_premeasurement_soak_run"}
+
+
+def test_owner_recovery_rejects_completed_premeasurement_job(tmp_path):
+    _, runtime, project, old, _, _, new_path, _, _ = _premeasurement_fixture(tmp_path)
+    executor = TransitionExecutor(runtime)
+    executor.owner_store.set_paused(
+        "devorchestrator", True, command_id="fixture-pause", action="pause", reason="test"
+    )
+    with patch(
+        "dev_orchestrator.jobs.service.JobService.status",
+        return_value=_old_premeasurement_job(old, state="completed"),
+    ):
+        result = executor.authorize_soak_recovery(
+            project, str(new_path), command_id="owner-recover-completed-premeasurement"
+        )
+    assert result == {"status": "rejected", "reason": "previous_soak_job_not_terminal"}
+
+
+def test_owner_recovery_rejects_unexpired_premeasurement_preparation(tmp_path):
+    _, runtime, project, old, _, _, new_path, _, _ = _premeasurement_fixture(tmp_path)
+    state_path = runtime / "transition-executor.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["executions"]["worker-old"]["external_execution_preparation"]["deadline_at"] = (
+        "2999-10-01T00:04:00+00:00"
+    )
+    write_json(state_path, state)
+    executor = TransitionExecutor(runtime)
+    executor.owner_store.set_paused(
+        "devorchestrator", True, command_id="fixture-pause", action="pause", reason="test"
+    )
+    with patch(
+        "dev_orchestrator.jobs.service.JobService.status",
+        return_value=_old_premeasurement_job(old),
+    ):
+        result = executor.authorize_soak_recovery(
+            project, str(new_path), command_id="owner-recover-unexpired-premeasurement"
+        )
+    assert result == {
+        "status": "rejected",
+        "reason": "previous_soak_preparation_not_terminal",
+    }
+
+
+def test_owner_recovery_rejects_premeasurement_prepared_for_different_head(tmp_path):
+    _, runtime, project, old, _, _, new_path, _, _ = _premeasurement_fixture(tmp_path)
+    state_path = runtime / "transition-executor.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["executions"]["worker-old"]["external_execution_preparation"]["prepared_head"] = (
+        "0" * 40
+    )
+    write_json(state_path, state)
+    executor = TransitionExecutor(runtime)
+    executor.owner_store.set_paused(
+        "devorchestrator", True, command_id="fixture-pause", action="pause", reason="test"
+    )
+    with patch(
+        "dev_orchestrator.jobs.service.JobService.status",
+        return_value=_old_premeasurement_job(old),
+    ):
+        result = executor.authorize_soak_recovery(
+            project, str(new_path), command_id="owner-recover-wrong-head"
+        )
+    assert result == {
+        "status": "rejected",
+        "reason": "previous_soak_preparation_identity_mismatch",
+    }
 
 
 def test_owner_recovery_replays_after_bootstrap_publish_before_ledger_save(tmp_path):

@@ -3024,6 +3024,12 @@ class TransitionExecutor:
                     "previous_run_id": existing_auth.get("previous_run_id"),
                     "replacement_run_id": replacement.run_id,
                     "old_run_sha256": existing_auth.get("old_run_sha256"),
+                    "old_job_identity_sha256": existing_auth.get(
+                        "old_job_identity_sha256"
+                    ),
+                    "premeasurement_failure": existing_auth.get(
+                        "premeasurement_failure", False
+                    ),
                 }
 
             gate = authority.get("owner_gate")
@@ -3063,9 +3069,20 @@ class TransitionExecutor:
                 return {"status": "rejected", "reason": "failed_soak_execution_not_found"}
 
             binding = previous.get("external_execution_binding")
-            if not isinstance(binding, dict) or binding.get("binding_kind") != "p20_soak_run":
+            preparation = previous.get("external_execution_preparation")
+            start_intent = previous.get("external_execution_start_intent")
+            premeasurement_failure = False
+            if isinstance(binding, dict) and binding.get("binding_kind") == "p20_soak_run":
+                previous_permit_path = binding.get("permit_path") or ""
+                previous_job_id = binding.get("job_id")
+            elif binding is None and isinstance(preparation, dict) and isinstance(start_intent, dict):
+                previous_permit_path = preparation.get("permit_path") or ""
+                previous_job_id = start_intent.get("job_id")
+                premeasurement_failure = True
+            else:
                 return {"status": "rejected", "reason": "failed_soak_binding_missing"}
-            previous_permit = load_soak_permit(binding.get("permit_path") or "")
+
+            previous_permit = load_soak_permit(previous_permit_path)
             if previous_permit is None:
                 return {"status": "rejected", "reason": "previous_soak_permit_unreadable"}
             previous_ok, previous_reason = validate_soak_permit(
@@ -3076,7 +3093,33 @@ class TransitionExecutor:
                     "status": "rejected",
                     "reason": "previous_soak_permit_invalid: " + str(previous_reason),
                 }
-            if (
+            if premeasurement_failure:
+                preparation_deadline = parse_utc(preparation.get("deadline_at"))
+                if (
+                    preparation.get("permit_fingerprint") != previous_permit.fingerprint
+                    or preparation.get("run_id") != previous_permit.run_id
+                    or preparation.get("prepared_head") != previous.get("head")
+                    or start_intent.get("permit_fingerprint") != previous_permit.fingerprint
+                    or start_intent.get("run_id") != previous_permit.run_id
+                    or not isinstance(previous_job_id, str)
+                    or not previous_job_id.strip()
+                ):
+                    return {
+                        "status": "rejected",
+                        "reason": "previous_soak_preparation_identity_mismatch",
+                    }
+                if (
+                    not str(previous.get("reason") or "").startswith(
+                        "bounded_soak_preparation_deadline_expired"
+                    )
+                    or preparation_deadline is None
+                    or utc_now() < preparation_deadline
+                ):
+                    return {
+                        "status": "rejected",
+                        "reason": "previous_soak_preparation_not_terminal",
+                    }
+            elif (
                 binding.get("permit_fingerprint") != previous_permit.fingerprint
                 or binding.get("soak_run_id") != previous_permit.run_id
                 or binding.get("soak_project_id") != previous_permit.soak_project_id
@@ -3087,16 +3130,23 @@ class TransitionExecutor:
             previous_run = load_soak_run(
                 previous_permit.disposable_runtime_root, previous_permit.run_id
             )
-            if not isinstance(previous_run, dict) or previous_run.get("status") != "FAILED":
-                return {"status": "rejected", "reason": "previous_soak_run_not_terminal_failed"}
-
             old_run_path = (
                 Path(previous_permit.disposable_runtime_root)
                 / ("run-" + previous_permit.run_id + ".json")
             )
-            if not old_run_path.is_file():
-                return {"status": "rejected", "reason": "previous_soak_run_evidence_missing"}
-            old_run_sha256 = hashlib.sha256(old_run_path.read_bytes()).hexdigest()
+            if premeasurement_failure:
+                if previous_run is not None or old_run_path.exists():
+                    return {
+                        "status": "rejected",
+                        "reason": "unexpected_premeasurement_soak_run",
+                    }
+                old_run_sha256 = None
+            else:
+                if not isinstance(previous_run, dict) or previous_run.get("status") != "FAILED":
+                    return {"status": "rejected", "reason": "previous_soak_run_not_terminal_failed"}
+                if not old_run_path.is_file():
+                    return {"status": "rejected", "reason": "previous_soak_run_evidence_missing"}
+                old_run_sha256 = hashlib.sha256(old_run_path.read_bytes()).hexdigest()
 
             if (
                 replacement.run_id == previous_permit.run_id
@@ -3113,8 +3163,13 @@ class TransitionExecutor:
                 return {"status": "rejected", "reason": "replacement_soak_run_already_exists"}
 
             from dev_orchestrator.jobs.service import JobService
-            old_job = JobService(self.runtime_root).status(str(binding.get("job_id") or ""))
-            if old_job is None or old_job.state not in {"completed", "failed", "cancelled"}:
+            old_job = JobService(self.runtime_root).status(str(previous_job_id or ""))
+            accepted_job_states = (
+                {"failed", "cancelled"}
+                if premeasurement_failure
+                else {"completed", "failed", "cancelled"}
+            )
+            if old_job is None or old_job.state not in accepted_job_states:
                 return {"status": "rejected", "reason": "previous_soak_job_not_terminal"}
             if (
                 getattr(old_job, "project_id", None) != project_id
@@ -3129,7 +3184,24 @@ class TransitionExecutor:
             ):
                 return {"status": "rejected", "reason": "previous_soak_job_identity_mismatch"}
 
-            # The owned soak job/run are now independently proven terminal failed.
+            old_job_evidence = {
+                "job_id": previous_job_id,
+                "state": getattr(old_job, "state", None),
+                "project_id": getattr(old_job, "project_id", None),
+                "task_id": getattr(old_job, "task_id", None),
+                "source_request_id": getattr(old_job, "source_request_id", None),
+                "kind": getattr(old_job, "kind", None),
+                "command_ref": getattr(old_job, "command_ref", None),
+                "transport": getattr(old_job, "transport", None),
+                "parameters_digest": getattr(old_job, "parameters_digest", None),
+                "idempotency_key": getattr(old_job, "idempotency_key", None),
+            }
+            old_job_identity_sha256 = hashlib.sha256(json.dumps(
+                old_job_evidence, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+
+            # The owned soak job and, when measurement started, its run are now
+            # independently proven terminal failed.
             # Settle any real execution obligation before clearing the owner gate;
             # otherwise execution-loss detection will later misclassify this
             # intentionally failed execution as a vanished Worker.
@@ -3157,8 +3229,9 @@ class TransitionExecutor:
                             "P20.4 soak job/run evidence"
                         ),
                         completed_at=(
-                            previous_run.get("ended_at")
-                            or previous_run.get("updated_at")
+                            (previous_run.get("ended_at") or previous_run.get("updated_at"))
+                            if isinstance(previous_run, dict)
+                            else None
                         ),
                     )
                     if closed is None:
@@ -3186,15 +3259,19 @@ class TransitionExecutor:
                 "replacement_soak_run_id": replacement.run_id,
                 "replacement_permit_fingerprint": replacement.fingerprint,
                 "failed_run_sha256": old_run_sha256,
+                "failed_job_identity_sha256": old_job_identity_sha256,
+                "premeasurement_failure": premeasurement_failure,
                 "previous_lineage_key": previous_lineage_key,
             })
             authorization = {
                 "command_id": command_id,
                 "previous_source_request_id": previous_source_id,
                 "previous_lineage_key": previous_lineage_key,
-                "previous_job_id": binding.get("job_id"),
+                "previous_job_id": previous_job_id,
                 "previous_run_id": previous_permit.run_id,
                 "old_run_sha256": old_run_sha256,
+                "old_job_identity_sha256": old_job_identity_sha256,
+                "premeasurement_failure": premeasurement_failure,
                 "replacement_run_id": replacement.run_id,
                 "replacement_project_id": replacement.soak_project_id,
                 "replacement_permit_path": str(Path(permit_path).resolve()),
@@ -3218,6 +3295,8 @@ class TransitionExecutor:
             "previous_run_id": previous_permit.run_id,
             "replacement_run_id": replacement.run_id,
             "old_run_sha256": old_run_sha256,
+            "old_job_identity_sha256": old_job_identity_sha256,
+            "premeasurement_failure": premeasurement_failure,
             "prepared_head": truth.head,
         }
 
@@ -3261,6 +3340,8 @@ class TransitionExecutor:
                 "previous_run_id": authorization.get("previous_run_id"),
                 "replacement_run_id": authorization.get("replacement_run_id"),
                 "old_run_sha256": authorization.get("old_run_sha256"),
+                "old_job_identity_sha256": authorization.get("old_job_identity_sha256"),
+                "premeasurement_failure": authorization.get("premeasurement_failure", False),
                 "prepared_head": authorization.get("prepared_head"),
             }
 
