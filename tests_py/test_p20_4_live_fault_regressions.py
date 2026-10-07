@@ -242,7 +242,8 @@ def test_daemon_restart_active_recovery_requires_identity_and_invariants(tmp_pat
     permit = _permit(tmp_path, 'F08_DAEMON_RESTART_ACTIVE')
     runtime = Path(permit.disposable_runtime_root)
     effect = {'fault_id': 'F08_DAEMON_RESTART_ACTIVE', 'state': 'injected',
-              'injected_at': '2026-10-07T01:00:02+00:00',
+              'reserved_at': '2026-10-07T01:00:02+00:00',
+              'injected_at': '2026-10-07T01:00:04+00:00',
               'effect_mode': 'isolated_native_boundary',
               'pre_restart_active': {'role_record_id': 'plan', 'task_id': 'P204.1',
                                      'state': 'planning'},
@@ -257,8 +258,7 @@ def test_daemon_restart_active_recovery_requires_identity_and_invariants(tmp_pat
             'active_owner': {'role': 'planner', 'id': 'plan', 'task_id': 'P204.1'},
             'invariants': [{'code': 'SINGLE_ACTIVE_LIFECYCLE_OWNER', 'holds': True}]},
     }})
-    write_json(runtime / 'daemon.json', {'state': 'running', 'pid': 200,
-                                         'create_time': 2.0})
+    write_json(runtime / 'daemon.json', {'state': 'running', 'pid': 200})
     run = open_reliability_run(runtime, 'project')
     write_json(runtime / 'soak-project-manifest.json', {'reliability_run_id': run['run_id']})
     record_daemon_boot(runtime, 200, '127.0.0.1', 1,
@@ -278,6 +278,15 @@ def test_daemon_restart_active_recovery_requires_identity_and_invariants(tmp_pat
     assert proof['generation'] == 3
     assert proof['single_owner_converged'] is True
     assert proof['restart_boot_id'] == 'boot-after'
+    write_json(runtime / 'daemon.json', {'state': 'stopped', 'pid': 200,
+                                         'stopped_at': '2026-10-07T01:00:20+00:00'})
+    assert daemon_restart_active_recovered(permit, effect) == proof
+    effect['reserved_at'] = '2026-10-07T01:00:03.500000+00:00'
+    assert daemon_restart_active_recovered(permit, effect) is None
+    effect['reserved_at'] = '2026-10-07T01:00:02+00:00'
+    effect['daemon_after']['pid'] = 201
+    assert daemon_restart_active_recovered(permit, effect) is None
+    effect['daemon_after']['pid'] = 200
     effect['pre_restart_active']['state'] = 'completed'
     assert daemon_restart_active_recovered(permit, effect) is None
     effect['pre_restart_active']['state'] = 'planning'
@@ -290,6 +299,83 @@ def test_daemon_restart_active_recovery_requires_identity_and_invariants(tmp_pat
     ledger['lifecycle']['project']['active_owner'] = None
     write_json(runtime / 'transition-executor.json', ledger)
     assert daemon_restart_active_recovered(permit, effect) is None
+
+
+def test_observed_faults_revalidates_f08_after_case_daemon_cleanup(tmp_path):
+    from dev_orchestrator.incidents import observations
+    from dev_orchestrator.incidents.reliability_runs import open_reliability_run, record_daemon_boot
+    from dev_orchestrator.soak import evidence as evidence_module
+    from dev_orchestrator.soak.permit import save_soak_permit
+
+    canonical = tmp_path / 'canonical'
+    (canonical / 'runtime').mkdir(parents=True)
+    parent = create_soak_permit('parent', 'primary', tmp_path / 'primary/repo',
+        tmp_path / 'primary/runtime', canonical, canonical / 'runtime',
+        ['F08_DAEMON_RESTART_ACTIVE'])
+    case_runtime = (Path(parent.disposable_runtime_root) / 'fault-cases'
+                    / 'F08_DAEMON_RESTART_ACTIVE' / 'runtime')
+    case = create_soak_permit('case', 'case-project', case_runtime.parent / 'repo',
+        case_runtime, canonical, canonical / 'runtime', ['F08_DAEMON_RESTART_ACTIVE'])
+    Path(case.disposable_repo_path).mkdir(parents=True)
+    case_runtime.mkdir(parents=True)
+    case_permit_path = case_runtime.parent / 'permit.json'
+    save_soak_permit(case_permit_path, case)
+    write_json(Path(case.disposable_repo_path) / case.disposable_marker_name,
+               {'run_id': case.run_id, 'project_id': case.soak_project_id})
+
+    effect = {'fault_id': 'F08_DAEMON_RESTART_ACTIVE', 'state': 'injected',
+        'injection_id': 'injection', 'reserved_at': '2026-10-07T01:00:02+00:00',
+        'injected_at': '2026-10-07T01:00:04+00:00',
+        'effect_mode': 'isolated_native_boundary',
+        'pre_restart_active': {'role_record_id': 'plan', 'task_id': 'P204.1',
+                               'state': 'planning'},
+        'pre_restart_authority': {'current_task_id': 'P204.1', 'generation': 3},
+        'daemon_before': {'state': 'running', 'pid': 100, 'create_time': 1.0},
+        'daemon_after': {'state': 'starting', 'pid': 200, 'create_time': 2.0}}
+    write_json(case_runtime / 'fault-effect.json', effect)
+    write_json(case_runtime / 'soak-faults/injection.json', {
+        'mode': 'live_injection', 'fault_id': effect['fault_id'], 'run_id': case.run_id})
+    write_json(case_runtime / 'ai-planner.json', {'plans': {'plan': {
+        'project_id': case.soak_project_id, 'task_id': 'P204.1', 'state': 'planning'}}})
+    write_json(case_runtime / 'transition-executor.json', {'executions': {}, 'lifecycle': {
+        case.soak_project_id: {'current_task_id': 'P204.1', 'generation': 3,
+            'lifecycle_state': 'PLANNING',
+            'active_owner': {'role': 'planner', 'id': 'plan', 'task_id': 'P204.1'},
+            'invariants': [{'code': 'SINGLE_ACTIVE_LIFECYCLE_OWNER', 'holds': True}]},
+    }})
+    write_json(case_runtime / 'daemon.json', {'state': 'stopped', 'pid': 200,
+        'stopped_at': '2026-10-07T01:00:20+00:00', 'tree_stopped': True})
+    run = open_reliability_run(case_runtime, case.soak_project_id)
+    write_json(case_runtime / 'soak-project-manifest.json', {'reliability_run_id': run['run_id']})
+    record_daemon_boot(case_runtime, 200, '127.0.0.1', 1,
+        started_at='2026-10-07T01:00:03+00:00', boot_id='boot-after')
+    directory = observations.observation_directory(case_runtime, run['run_id'])
+    directory.mkdir(parents=True)
+    observations._append_rows(directory, [{
+        'project_id': case.soak_project_id, 'observation_kind': 'authority_snapshot',
+        'recorded_at': f'2026-10-07T01:00:{second:02d}+00:00',
+        'task_id': 'P204.1', 'generation': 3, 'lifecycle_state': 'PLANNING',
+        'owner_gate': None, 'active_owner': True,
+    } for second in (5, 10, 15)])
+    write_json(case_runtime / 'incident-packets/index.json', {'families': {'family': {
+        'family_id': 'family', 'project_id': case.soak_project_id,
+        'packet_ids': ['packet'], 'occurrences': [{'occurrence_key': 'injection'}],
+    }}})
+    proof = daemon_restart_active_recovered(case, effect)
+    assert proof is not None
+    declared = {'case_runtime_root': str(case_runtime),
+        'case_permit_path': str(case_permit_path), 'failure_family': 'family',
+        'incident_id': 'packet', 'disposition': 'automatic_recovery', 'evidence': proof}
+    write_json(Path(parent.disposable_runtime_root) / 'fault-driver.json', {
+        'dispositions': {effect['fault_id']: declared}})
+    state = {'started_at': '2026-10-07T01:00:00+00:00',
+             'updated_at': '2026-10-07T01:01:00+00:00'}
+
+    assert effect['fault_id'] in evidence_module.observed_faults(parent, state)
+    declared['evidence']['restart_boot_id'] = 'tampered'
+    write_json(Path(parent.disposable_runtime_root) / 'fault-driver.json', {
+        'dispositions': {effect['fault_id']: declared}})
+    assert effect['fault_id'] not in evidence_module.observed_faults(parent, state)
 
 
 @pytest.mark.parametrize(('fault_id', 'proof_name'), (

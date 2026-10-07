@@ -212,29 +212,22 @@ def daemon_restart_active_recovered(permit, effect):
                == (after.get('pid'), after.get('create_time'))):
         return None
     runtime = Path(permit.disposable_runtime_root)
-    daemon = read_json(runtime / 'daemon.json', {})
-    daemon_create_time = daemon.get('create_time')
-    if daemon.get('pid') and daemon_create_time is None:
-        try:
-            daemon_create_time = __import__('psutil').Process(int(daemon['pid'])).create_time()
-        except (__import__('psutil').Error, OSError, ValueError, TypeError):
-            pass
     authority = read_json(runtime / 'transition-executor.json', {}).get(
         'lifecycle', {}).get(permit.soak_project_id, {})
     invariants = authority.get('invariants')
     owner = authority.get('active_owner')
     task = pre_active['task_id']
     from dev_orchestrator.incidents.reliability_runs import get_daemon_boots
+    reserved = parse_utc(effect.get('reserved_at'))
     injected = parse_utc(effect.get('injected_at'))
-    if injected is None:
+    if reserved is None or injected is None or reserved >= injected:
         return None
     boots = [row for row in get_daemon_boots(runtime)
-             if parse_utc(row.get('started_at')) and parse_utc(row['started_at']) > injected]
+             if row.get('pid') == after.get('pid')
+             and parse_utc(row.get('started_at'))
+             and reserved < parse_utc(row['started_at']) <= injected]
     boot = boots[-1] if boots else None
-    if (daemon.get('state') not in {'running', 'degraded'}
-            or (daemon.get('pid'), daemon_create_time)
-               != (after.get('pid'), after.get('create_time'))
-            or boot is None or boot.get('pid') != after.get('pid')
+    if (boot is None
             or authority.get('current_task_id') != task
             or authority.get('generation') != pre_authority.get('generation')
             or not isinstance(invariants, list) or not invariants
