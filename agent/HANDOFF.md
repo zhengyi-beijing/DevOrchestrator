@@ -1,3 +1,33 @@
+# P20.4 Run F RUNNING / fresh post-remediation soak (2026-10-07)
+
+Fresh run `p20-live-20261007-f` is the only active P20.4 qualification
+measurement. It began at `2026-10-07T08:46:51+08:00` with project
+`p20-soak-20261007-f`, job `job-f7a51b2103ce1049`, permit
+`runtime/p20-live-permit-20261007-f.json`, and source revision
+`b4271baf4912e37a106cdd3357a39c4364c0de64`.
+
+At handoff (`2026-10-07T09:25+08:00`), the parent supervisor (PID 5584), soak
+child (PID 11236), and canonical daemon (PID 15804) were alive. The run is
+`RUNNING`, clock continuity holds, P204.1-P204.4 are complete, and F01
+(`MALFORMED_PLANNER`) has verified automatic recovery. F02 has started its
+isolated fault-case work; it must not be counted as verified until a durable
+disposition is published. Fourteen faults remain pending. There are no recorded
+run incidents. CPF-01 through CPF-10 are PASS and all hard-zero counters remain
+zero.
+
+The run must continue under its existing supervisor and permit. Do not resume,
+settle, restart, or merge its clock with another run unless its durable state
+requires the prescribed recovery path. Earliest six-hour observation point is
+`2026-10-07T14:46:51+08:00`; qualification also requires all five tasks,
+all fifteen fault dispositions, hard-zero compliance, and final review.
+
+Run E is immutable failed evidence; its boundary remediation remains accepted
+on commits `1c713fc`, `bed7d5d`, and `62dc8ec`. See
+`docs/P20_4_RUN_E_BOUNDARY_REMEDIATION_RESULT_20261007.md` and
+`runtime/p20-4-running-checkpoint.json` for the current binding and checkpoint.
+
+---
+
 # P20.4 Run E FAILED / boundary remediation ACCEPT (2026-10-07)
 
 Fresh run `p20-live-20261007-e` ran for 6h00m41s, completed P204.1-P204.5,
