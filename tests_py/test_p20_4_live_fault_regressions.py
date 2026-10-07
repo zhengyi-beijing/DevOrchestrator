@@ -211,6 +211,7 @@ def test_planner_timeout_recovery_stops_at_watchdog_worker_launch(tmp_path):
                 'dispatch_id': 'timeout-dispatch', 'execution_id': 'timeout-execution'}]},
         recovered_plan: {'project_id': 'project', 'task_id': 'P204.1',
             'state': 'worker_launched', 'worker_source_request_id': 'wd-recovery:execute',
+            'started_at': '2026-10-07T01:01:01+00:00',
             'planner_attempts': [{'request_id': 'wd-recovery:planner',
                 'status': 'succeeded', 'completed_at': '2026-10-07T01:02:00+00:00',
                 'dispatch_id': 'recovery-dispatch', 'execution_id': 'recovery-execution',
@@ -222,6 +223,7 @@ def test_planner_timeout_recovery_stops_at_watchdog_worker_launch(tmp_path):
             'started_at': '2026-10-07T01:02:01+00:00'},
     }})
     write_json(runtime / 'progress-channel.json', {'history': [{
+        'project_id': 'project',
         'milestone': 'RECOVERY_STARTED', 'timestamp': '2026-10-07T01:01:00+00:00',
         'details': {'source': 'watchdog', 'command_id': 'wd-recovery',
                     'action': 'continue'},
@@ -250,6 +252,45 @@ def test_planner_timeout_recovery_stops_at_watchdog_worker_launch(tmp_path):
     progress = read_json(runtime / 'progress-channel.json', {})
     progress['history'][0]['details']['source'] = 'manual'
     write_json(runtime / 'progress-channel.json', progress)
+    assert planner_timeout_recovered(permit, effect) is None
+
+
+def test_planner_timeout_recovery_accepts_in_plan_provider_retry(tmp_path):
+    permit = _permit(tmp_path, 'F02_PLANNER_TIMEOUT')
+    runtime = Path(permit.disposable_runtime_root)
+    effect = {'fault_id': 'F02_PLANNER_TIMEOUT', 'state': 'injected',
+              'injected_at': '2026-10-07T01:00:00+00:00',
+              'request_id': 'plan:planner', 'dispatch_id': 'timeout-dispatch',
+              'execution_id': 'timeout-execution',
+              'effect_mode': 'real_dispatch_timeout'}
+    write_json(runtime / 'ai-planner.json', {'plans': {'plan': {
+        'project_id': 'project', 'task_id': 'P204.1', 'state': 'worker_launched',
+        'worker_source_request_id': 'plan:execute', 'planner_attempts': [
+            {'request_id': 'plan:planner', 'status': 'failed',
+             'reason': 'execution timed out after 1.0 seconds',
+             'completed_at': '2026-10-07T01:00:01+00:00',
+             'dispatch_id': 'timeout-dispatch', 'execution_id': 'timeout-execution'},
+            {'request_id': 'plan:planner:retry-1', 'status': 'succeeded',
+             'completed_at': '2026-10-07T01:00:05+00:00',
+             'dispatch_id': 'recovery-dispatch', 'execution_id': 'recovery-execution',
+             'resource': {'provider': 'openai'}},
+        ],
+    }}})
+    write_json(runtime / 'transition-executor.json', {'executions': {
+        'plan:execute': {'project_id': 'project', 'task_id': 'P204.1',
+            'state': 'running', 'source_kind': 'control', 'engine': 'aibroker',
+            'started_at': '2026-10-07T01:00:06+00:00'},
+    }})
+
+    proof = planner_timeout_recovered(permit, effect)
+    assert proof['recovered_plan_id'] == 'plan'
+    assert proof['recovered_attempt'] == 2
+    assert proof['recovery_lineage'] == 'planner_attempt_retry'
+
+    plans = read_json(runtime / 'ai-planner.json', {})
+    plans['plans']['plan']['planner_attempts'][1]['completed_at'] = (
+        '2026-10-07T01:00:07+00:00')
+    write_json(runtime / 'ai-planner.json', plans)
     assert planner_timeout_recovered(permit, effect) is None
 
 

@@ -172,10 +172,12 @@ def planner_timeout_recovered(permit, effect):
     workers = read_json(runtime / 'transition-executor.json', {}).get('executions', {})
     injected_plan = None
     injected_task = None
+    injected_attempt_number = None
+    injected_completed_at = None
     for plan_id, plan in plans.items():
         if plan.get('project_id') != permit.soak_project_id:
             continue
-        for attempt in plan.get('planner_attempts') or ():
+        for number, attempt in enumerate(plan.get('planner_attempts') or (), 1):
             reason = str(attempt.get('reason') or '').lower()
             if (attempt.get('request_id') == request_id
                     and attempt.get('status') == 'failed'
@@ -184,11 +186,57 @@ def planner_timeout_recovered(permit, effect):
                     and attempt.get('execution_id') == effect.get('execution_id')
                     and _after_effect(attempt.get('completed_at'), effect)):
                 injected_plan, injected_task = plan_id, plan.get('task_id')
+                injected_attempt_number = number
+                injected_completed_at = parse_utc(attempt.get('completed_at'))
                 break
         if injected_plan:
             break
     if not injected_plan or not injected_task:
         return None
+
+    def recovered_attempt(plan, *, after_attempt=0):
+        source = plan.get('worker_source_request_id')
+        worker = workers.get(source, {})
+        worker_started = parse_utc(worker.get('started_at'))
+        if (not isinstance(source, str) or not source
+                or worker.get('project_id') != permit.soak_project_id
+                or worker.get('task_id') != injected_task
+                or worker.get('source_kind') != 'control'
+                or worker.get('engine') != 'aibroker'
+                or not worker_started or not _after_effect(worker.get('started_at'), effect)):
+            return None
+        for number, attempt in enumerate(plan.get('planner_attempts') or (), 1):
+            resource = attempt.get('resource') or {}
+            recovered_at = parse_utc(attempt.get('completed_at'))
+            if (number > after_attempt
+                    and attempt.get('status') == 'succeeded'
+                    and attempt.get('request_id') != request_id
+                    and recovered_at and injected_completed_at <= recovered_at <= worker_started
+                    and attempt.get('dispatch_id') and attempt.get('execution_id')
+                    and resource.get('provider')):
+                return number, attempt, source
+        return None
+
+    # A healthy heterogeneous pool can recover inside the same bounded Planner
+    # cycle.  That is already automatic recovery and does not need a watchdog
+    # command in between the failed and successful attempts.
+    original = plans[injected_plan]
+    if original.get('state') == 'worker_launched':
+        recovered = recovered_attempt(original, after_attempt=injected_attempt_number)
+        if recovered is not None:
+            number, attempt, source = recovered
+            return {'injected_plan_id': injected_plan,
+                    'injected_request_id': request_id,
+                    'timeout_dispatch_id': effect['dispatch_id'],
+                    'timeout_execution_id': effect['execution_id'],
+                    'recovered_plan_id': injected_plan,
+                    'worker_source_request_id': source,
+                    'task_id': injected_task,
+                    'recovered_attempt': number,
+                    'planner_provider': attempt['resource']['provider'],
+                    'recovered_at': attempt.get('completed_at'),
+                    'recovery_lineage': 'planner_attempt_retry',
+                    'ledger_verified': True}
 
     progress = read_json(runtime / 'progress-channel.json', {}).get('history', [])
     recoveries = {}
@@ -198,6 +246,7 @@ def planner_timeout_recovered(permit, effect):
         details = row['details']
         command_id = details.get('command_id')
         if (row.get('milestone') == 'RECOVERY_STARTED'
+                and row.get('project_id') == permit.soak_project_id
                 and details.get('source') == 'watchdog'
                 and details.get('action') == 'continue'
                 and isinstance(command_id, str) and command_id.startswith('wd-')
@@ -209,46 +258,45 @@ def planner_timeout_recovered(permit, effect):
                 or plan.get('task_id') != injected_task or plan.get('state') != 'worker_launched'):
             continue
         command_id = plan_id.removeprefix('ai_plan:')
-        if plan_id != 'ai_plan:' + command_id or command_id not in recoveries:
+        from dev_orchestrator.control.command_store import safe_command_id
+        if (plan_id != 'ai_plan:' + command_id or safe_command_id(command_id) != command_id
+                or command_id not in recoveries):
             continue
-        source = plan.get('worker_source_request_id')
-        worker = workers.get(source, {})
+        recovered = recovered_attempt(plan)
+        if recovered is None:
+            continue
+        number, attempt, source = recovered
         command = read_json(runtime / 'control/history' / (command_id + '.json'), {})
-        if (not isinstance(source, str) or not source
-                or worker.get('project_id') != permit.soak_project_id
-                or worker.get('task_id') != injected_task
-                or worker.get('source_kind') != 'control'
-                or worker.get('engine') != 'aibroker'
-                or not _after_effect(worker.get('started_at'), effect)
-                or command.get('command_id') != command_id
+        command_requested = parse_utc(command.get('requested_at'))
+        milestone_at = parse_utc(recoveries[command_id].get('timestamp'))
+        plan_started = parse_utc(plan.get('started_at'))
+        recovered_at = parse_utc(attempt.get('completed_at'))
+        worker_started = parse_utc(workers[source].get('started_at'))
+        if (command.get('command_id') != command_id
                 or command.get('project_id') != permit.soak_project_id
                 or command.get('action') != 'continue'
                 or command.get('state') != 'accepted'
                 or command.get('plan_id') != plan_id
                 or command.get('lifecycle_action') != 'execute'
                 or command.get('task_id') != injected_task
-                or not _after_effect(command.get('requested_at'), effect)):
+                or not all((command_requested, milestone_at, plan_started,
+                            recovered_at, worker_started))
+                or not (parse_utc(effect['injected_at']) < command_requested
+                        <= milestone_at <= plan_started <= recovered_at <= worker_started)):
             continue
-        for number, attempt in enumerate(plan.get('planner_attempts') or (), 1):
-            resource = attempt.get('resource') or {}
-            if (attempt.get('status') == 'succeeded'
-                    and attempt.get('request_id') != request_id
-                    and _after_effect(attempt.get('completed_at'), effect)
-                    and attempt.get('dispatch_id') and attempt.get('execution_id')
-                    and resource.get('provider')):
-                return {'injected_plan_id': injected_plan,
-                        'injected_request_id': request_id,
-                        'timeout_dispatch_id': effect['dispatch_id'],
-                        'timeout_execution_id': effect['execution_id'],
-                        'recovery_command_id': command_id,
-                        'recovered_plan_id': plan_id,
-                        'worker_source_request_id': source,
-                        'task_id': injected_task,
-                        'recovered_attempt': number,
-                        'planner_provider': resource['provider'],
-                        'recovered_at': attempt.get('completed_at'),
-                        'recovery_lineage': 'watchdog_continue',
-                        'ledger_verified': True}
+        return {'injected_plan_id': injected_plan,
+                'injected_request_id': request_id,
+                'timeout_dispatch_id': effect['dispatch_id'],
+                'timeout_execution_id': effect['execution_id'],
+                'recovery_command_id': command_id,
+                'recovered_plan_id': plan_id,
+                'worker_source_request_id': source,
+                'task_id': injected_task,
+                'recovered_attempt': number,
+                'planner_provider': attempt['resource']['provider'],
+                'recovered_at': attempt.get('completed_at'),
+                'recovery_lineage': 'watchdog_continue',
+                'ledger_verified': True}
     return None
 
 
