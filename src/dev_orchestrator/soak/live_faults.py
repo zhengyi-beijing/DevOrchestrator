@@ -17,6 +17,7 @@ from dev_orchestrator.soak.evidence import (
     daemon_restart_active_recovered,
     duplicate_retry_idempotent,
     lost_handoff_recovered,
+    planner_timeout_recovered,
     primary_active,
     unexpected_dirt_fail_closed,
     worker_interrupt_recovered,
@@ -202,7 +203,9 @@ class LiveFaultDriver:
                     recovery_until = time.monotonic() + CASE_RECOVERY_TIMEOUT_SECONDS
                 incident = self._capture_effect(permit, fault, effect, index)
                 semantic = None
-                if fault.fault_id.startswith('F03'):
+                if fault.fault_id.startswith('F02'):
+                    semantic = planner_timeout_recovered(permit, effect)
+                elif fault.fault_id.startswith('F03'):
                     semantic = worker_interrupt_recovered(permit, effect)
                 elif fault.fault_id.startswith('F07'):
                     semantic = broker_retry_recovered(permit, effect)
@@ -214,7 +217,7 @@ class LiveFaultDriver:
                     semantic = lost_handoff_recovered(permit)
                 elif fault.fault_id.startswith('F14'):
                     semantic = duplicate_retry_idempotent(permit, effect)
-                if semantic is not None and fault.fault_id.startswith(('F03', 'F07', 'F08', 'F13', 'F14')):
+                if semantic is not None and fault.fault_id.startswith(('F02', 'F03', 'F07', 'F08', 'F13', 'F14')):
                     return self._finish(permit, fault, effect, incident, 'automatic_recovery',
                         semantic, manifest)
                 if semantic is not None and fault.fault_id.startswith('F11'):
@@ -233,7 +236,7 @@ class LiveFaultDriver:
                                 semantic, manifest)
                 else:
                     stable_semantic, semantic_since = None, None
-                if not fault.fault_id.startswith(('F03', 'F07', 'F08', 'F11', 'F13', 'F14')):
+                if not fault.fault_id.startswith(('F02', 'F03', 'F07', 'F08', 'F11', 'F13', 'F14')):
                     proof = accepted_tasks(permit)
                     recovered = next((item for item in proof.values()
                         if parse_utc(item['accepted_at']) > parse_utc(effect['injected_at'])), None)

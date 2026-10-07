@@ -151,6 +151,107 @@ def worker_interrupt_recovered(permit, effect):
     return None
 
 
+def planner_timeout_recovered(permit, effect):
+    """Prove an injected Planner timeout reached a later watchdog-owned launch.
+
+    The Planner boundary is recovered once a later watchdog ``continue`` has a
+    successful real Planner dispatch and the resulting Worker launch is durably
+    present.  Downstream Worker/Review completion is deliberately outside this
+    proof: waiting for it conflates an independent execution failure with the
+    Planner timeout disposition.
+    """
+    request_id = effect.get('request_id')
+    if (effect.get('fault_id') != 'F02_PLANNER_TIMEOUT'
+            or effect.get('state') != 'injected'
+            or effect.get('effect_mode') != 'real_dispatch_timeout'
+            or not isinstance(request_id, str) or not request_id.strip()
+            or not effect.get('dispatch_id') or not effect.get('execution_id')):
+        return None
+    runtime = Path(permit.disposable_runtime_root)
+    plans = read_json(runtime / 'ai-planner.json', {}).get('plans', {})
+    workers = read_json(runtime / 'transition-executor.json', {}).get('executions', {})
+    injected_plan = None
+    injected_task = None
+    for plan_id, plan in plans.items():
+        if plan.get('project_id') != permit.soak_project_id:
+            continue
+        for attempt in plan.get('planner_attempts') or ():
+            reason = str(attempt.get('reason') or '').lower()
+            if (attempt.get('request_id') == request_id
+                    and attempt.get('status') == 'failed'
+                    and ('timeout' in reason or 'timed out' in reason)
+                    and attempt.get('dispatch_id') == effect.get('dispatch_id')
+                    and attempt.get('execution_id') == effect.get('execution_id')
+                    and _after_effect(attempt.get('completed_at'), effect)):
+                injected_plan, injected_task = plan_id, plan.get('task_id')
+                break
+        if injected_plan:
+            break
+    if not injected_plan or not injected_task:
+        return None
+
+    progress = read_json(runtime / 'progress-channel.json', {}).get('history', [])
+    recoveries = {}
+    for row in progress if isinstance(progress, list) else ():
+        if not isinstance(row, dict) or not isinstance(row.get('details'), dict):
+            continue
+        details = row['details']
+        command_id = details.get('command_id')
+        if (row.get('milestone') == 'RECOVERY_STARTED'
+                and details.get('source') == 'watchdog'
+                and details.get('action') == 'continue'
+                and isinstance(command_id, str) and command_id.startswith('wd-')
+                and _after_effect(row.get('timestamp'), effect)):
+            recoveries[command_id] = row
+
+    for plan_id, plan in plans.items():
+        if (plan_id == injected_plan or plan.get('project_id') != permit.soak_project_id
+                or plan.get('task_id') != injected_task or plan.get('state') != 'worker_launched'):
+            continue
+        command_id = plan_id.removeprefix('ai_plan:')
+        if plan_id != 'ai_plan:' + command_id or command_id not in recoveries:
+            continue
+        source = plan.get('worker_source_request_id')
+        worker = workers.get(source, {})
+        command = read_json(runtime / 'control/history' / (command_id + '.json'), {})
+        if (not isinstance(source, str) or not source
+                or worker.get('project_id') != permit.soak_project_id
+                or worker.get('task_id') != injected_task
+                or worker.get('source_kind') != 'control'
+                or worker.get('engine') != 'aibroker'
+                or not _after_effect(worker.get('started_at'), effect)
+                or command.get('command_id') != command_id
+                or command.get('project_id') != permit.soak_project_id
+                or command.get('action') != 'continue'
+                or command.get('state') != 'accepted'
+                or command.get('plan_id') != plan_id
+                or command.get('lifecycle_action') != 'execute'
+                or command.get('task_id') != injected_task
+                or not _after_effect(command.get('requested_at'), effect)):
+            continue
+        for number, attempt in enumerate(plan.get('planner_attempts') or (), 1):
+            resource = attempt.get('resource') or {}
+            if (attempt.get('status') == 'succeeded'
+                    and attempt.get('request_id') != request_id
+                    and _after_effect(attempt.get('completed_at'), effect)
+                    and attempt.get('dispatch_id') and attempt.get('execution_id')
+                    and resource.get('provider')):
+                return {'injected_plan_id': injected_plan,
+                        'injected_request_id': request_id,
+                        'timeout_dispatch_id': effect['dispatch_id'],
+                        'timeout_execution_id': effect['execution_id'],
+                        'recovery_command_id': command_id,
+                        'recovered_plan_id': plan_id,
+                        'worker_source_request_id': source,
+                        'task_id': injected_task,
+                        'recovered_attempt': number,
+                        'planner_provider': resource['provider'],
+                        'recovered_at': attempt.get('completed_at'),
+                        'recovery_lineage': 'watchdog_continue',
+                        'ledger_verified': True}
+    return None
+
+
 def broker_retry_recovered(permit, effect):
     """Prove the real Broker boundary succeeded on a later Planner attempt."""
     request_id = effect.get('request_id')
@@ -516,13 +617,15 @@ def observed_faults(permit, run_state):
             continue
         if declared.get('disposition') == 'automatic_recovery':
             boundary_proof = None
-            if fault_id.startswith('F03'):
+            if fault_id.startswith('F02'):
+                boundary_proof = planner_timeout_recovered(case_permit, effect)
+            elif fault_id.startswith('F03'):
                 boundary_proof = worker_interrupt_recovered(case_permit, effect)
             elif fault_id.startswith('F07'):
                 boundary_proof = broker_retry_recovered(case_permit, effect)
             elif fault_id.startswith('F08'):
                 boundary_proof = daemon_restart_active_recovered(case_permit, effect)
-            if fault_id.startswith(('F03', 'F07', 'F08')):
+            if fault_id.startswith(('F02', 'F03', 'F07', 'F08')):
                 if boundary_proof is None or declared.get('evidence') != boundary_proof:
                     continue
             elif fault_id.startswith('F13'):

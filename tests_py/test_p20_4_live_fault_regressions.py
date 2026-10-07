@@ -17,6 +17,7 @@ from dev_orchestrator.soak.evidence import (
     daemon_restart_active_recovered,
     duplicate_retry_idempotent,
     lost_handoff_recovered,
+    planner_timeout_recovered,
     worker_interrupt_recovered,
     unexpected_dirt_fail_closed,
 )
@@ -190,6 +191,66 @@ def test_worker_interrupt_recovery_accepts_reviewed_control_retry(tmp_path):
     decisions['decisions']['ai_review:retry-worker']['head'] = 'missing-head'
     write_json(runtime / 'review-decisions.json', decisions)
     assert worker_interrupt_recovered(permit, effect) is None
+
+
+def test_planner_timeout_recovery_stops_at_watchdog_worker_launch(tmp_path):
+    permit = _permit(tmp_path, 'F02_PLANNER_TIMEOUT')
+    runtime = Path(permit.disposable_runtime_root)
+    effect = {'fault_id': 'F02_PLANNER_TIMEOUT', 'state': 'injected',
+              'injected_at': '2026-10-07T01:00:00+00:00',
+              'request_id': 'initial:planner', 'dispatch_id': 'timeout-dispatch',
+              'execution_id': 'timeout-execution',
+              'effect_mode': 'real_dispatch_timeout'}
+    recovered_plan = 'ai_plan:wd-recovery'
+    write_json(runtime / 'ai-planner.json', {'plans': {
+        'ai_plan:initial': {'project_id': 'project', 'task_id': 'P204.1',
+            'state': 'failed', 'planner_attempts': [{
+                'request_id': 'initial:planner', 'status': 'failed',
+                'reason': 'execution timed out after 1.0 seconds',
+                'completed_at': '2026-10-07T01:00:01+00:00',
+                'dispatch_id': 'timeout-dispatch', 'execution_id': 'timeout-execution'}]},
+        recovered_plan: {'project_id': 'project', 'task_id': 'P204.1',
+            'state': 'worker_launched', 'worker_source_request_id': 'wd-recovery:execute',
+            'planner_attempts': [{'request_id': 'wd-recovery:planner',
+                'status': 'succeeded', 'completed_at': '2026-10-07T01:02:00+00:00',
+                'dispatch_id': 'recovery-dispatch', 'execution_id': 'recovery-execution',
+                'resource': {'provider': 'anthropic'}}]},
+    }})
+    write_json(runtime / 'transition-executor.json', {'executions': {
+        'wd-recovery:execute': {'project_id': 'project', 'task_id': 'P204.1',
+            'state': 'running', 'source_kind': 'control', 'engine': 'aibroker',
+            'started_at': '2026-10-07T01:02:01+00:00'},
+    }})
+    write_json(runtime / 'progress-channel.json', {'history': [{
+        'milestone': 'RECOVERY_STARTED', 'timestamp': '2026-10-07T01:01:00+00:00',
+        'details': {'source': 'watchdog', 'command_id': 'wd-recovery',
+                    'action': 'continue'},
+    }]})
+    write_json(runtime / 'control/history/wd-recovery.json', {
+        'command_id': 'wd-recovery', 'project_id': 'project', 'action': 'continue',
+        'state': 'accepted', 'plan_id': recovered_plan, 'lifecycle_action': 'execute',
+        'task_id': 'P204.1', 'requested_at': '2026-10-07T01:01:00+00:00',
+    })
+
+    proof = planner_timeout_recovered(permit, effect)
+    assert proof['injected_plan_id'] == 'ai_plan:initial'
+    assert proof['recovered_plan_id'] == recovered_plan
+    assert proof['recovery_command_id'] == 'wd-recovery'
+    assert proof['worker_source_request_id'] == 'wd-recovery:execute'
+    assert proof['recovery_lineage'] == 'watchdog_continue'
+
+    ledger = read_json(runtime / 'transition-executor.json', {})
+    ledger['executions']['wd-recovery:execute']['state'] = 'cancelled'
+    write_json(runtime / 'transition-executor.json', ledger)
+    assert planner_timeout_recovered(permit, effect) == proof
+
+    effect['dispatch_id'] = 'unrelated-dispatch'
+    assert planner_timeout_recovered(permit, effect) is None
+    effect['dispatch_id'] = 'timeout-dispatch'
+    progress = read_json(runtime / 'progress-channel.json', {})
+    progress['history'][0]['details']['source'] = 'manual'
+    write_json(runtime / 'progress-channel.json', progress)
+    assert planner_timeout_recovered(permit, effect) is None
 
 
 def test_broker_retry_recovery_stops_at_recovered_boundary(tmp_path):
@@ -379,6 +440,7 @@ def test_observed_faults_revalidates_f08_after_case_daemon_cleanup(tmp_path):
 
 
 @pytest.mark.parametrize(('fault_id', 'proof_name'), (
+    ('F02_PLANNER_TIMEOUT', 'planner_timeout_recovered'),
     ('F03_WORKER_KILLED', 'worker_interrupt_recovered'),
     ('F07_BROKER_UNAVAILABLE', 'broker_retry_recovered'),
     ('F08_DAEMON_RESTART_ACTIVE', 'daemon_restart_active_recovered'),
