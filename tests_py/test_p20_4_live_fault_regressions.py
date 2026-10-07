@@ -110,7 +110,8 @@ class _DelayedRunningPort:
 
     def interrupt(self, request_id, reason):
         self.interrupted.set()
-        return {'request_id': request_id, 'status': 'cancelled', 'reason': reason}
+        return {'request_id': request_id, 'status': 'cancelled', 'reason': reason,
+                'interrupt_supported': True}
 
 
 def test_worker_interrupt_polls_for_entire_dispatch(tmp_path):
@@ -123,6 +124,76 @@ def test_worker_interrupt_polls_for_entire_dispatch(tmp_path):
     assert port.polls >= 3
     assert effect['state'] == 'injected'
     assert effect['effect_mode'] == 'owned_broker_worker_interrupt'
+
+
+class _RacingInterruptPort:
+    def __init__(self):
+        self.interrupts = 0
+        self.interrupted = threading.Event()
+
+    def execute(self, request):
+        assert self.interrupted.wait(3)
+        return _result(request, 'cancelled')
+
+    def status(self, request_id):
+        return {'request_id': request_id, 'status': 'running'}
+
+    def interrupt(self, request_id, reason):
+        self.interrupts += 1
+        if self.interrupts == 1:
+            return {'request_id': request_id, 'status': 'failed'}
+        if self.interrupts == 2:
+            return {'request_id': request_id, 'status': 'running',
+                    'interrupt_supported': False}
+        self.interrupted.set()
+        return {'request_id': request_id, 'status': 'failed',
+                'interrupt_supported': True, 'dispatch_id': 'dispatch',
+                'execution_id': 'execution'}
+
+
+def test_worker_interrupt_retries_until_terminal_acknowledgement(tmp_path):
+    permit = _permit(tmp_path, 'F03_WORKER_KILLED')
+    port = _RacingInterruptPort()
+    result = FaultPort(port, permit, 'F03_WORKER_KILLED').execute(
+        _request(permit, 'worker', 'control'))
+    effect = read_json(Path(permit.disposable_runtime_root) / 'fault-effect.json', {})
+
+    assert result.status == 'cancelled'
+    assert port.interrupts == 3
+    assert effect['state'] == 'injected'
+    assert effect['interrupt_status'] == 'failed'
+    assert effect['interrupt_supported'] is True
+    assert effect['interrupt_dispatch_id'] == 'dispatch'
+    assert effect['interrupt_execution_id'] == 'execution'
+
+
+class _UnsupportedInterruptPort:
+    def __init__(self):
+        self.interrupt_attempted = threading.Event()
+
+    def execute(self, request):
+        assert self.interrupt_attempted.wait(3)
+        return _result(request)
+
+    def status(self, request_id):
+        return {'request_id': request_id, 'status': 'running'}
+
+    def interrupt(self, request_id, reason):
+        self.interrupt_attempted.set()
+        return {'request_id': request_id, 'status': 'running',
+                'interrupt_supported': False}
+
+
+def test_worker_interrupt_does_not_claim_unconfirmed_injection(tmp_path):
+    permit = _permit(tmp_path, 'F03_WORKER_KILLED')
+    result = FaultPort(_UnsupportedInterruptPort(), permit, 'F03_WORKER_KILLED').execute(
+        _request(permit, 'worker', 'control'))
+    effect = read_json(Path(permit.disposable_runtime_root) / 'fault-effect.json', {})
+
+    assert result.status == 'succeeded'
+    assert effect['state'] == 'not_injected'
+    assert effect['attempt'] == 0
+    assert effect['reason'] == 'owned Worker completed before a terminal interrupt was confirmed'
 
 
 def test_worker_interrupt_recovery_accepts_reviewed_control_retry(tmp_path):

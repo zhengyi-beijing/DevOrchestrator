@@ -126,10 +126,23 @@ class FaultPort:
                     if dispatch_done.is_set():
                         return
                     if isinstance(fact, dict) and fact.get('request_id') == request.request_id and fact.get('status') == 'running':
-                        result = self.port.interrupt(request.request_id, 'P20 isolated owned Worker killed once')
+                        try:
+                            result = self.port.interrupt(
+                                request.request_id, 'P20 isolated owned Worker killed once')
+                        except Exception:
+                            continue
+                        if (not isinstance(result, dict)
+                                or result.get('request_id') != request.request_id
+                                or result.get('status') not in {'failed', 'cancelled'}
+                                or result.get('interrupt_supported') is not True):
+                            continue
                         # Broker's normal managed process-tree interruption API owns target verification.
                         effect.update(state='injected', injected_at=utc_now_iso(),
-                            effect_mode='owned_broker_worker_interrupt', interrupt_status=(result or {}).get('status'))
+                            effect_mode='owned_broker_worker_interrupt',
+                            interrupt_status=result.get('status'),
+                            interrupt_supported=result.get('interrupt_supported'),
+                            interrupt_dispatch_id=result.get('dispatch_id'),
+                            interrupt_execution_id=result.get('execution_id'))
                         write_json(self.effect_path, effect)
                         return
             poller = threading.Thread(target=interrupt_owned, daemon=True)
@@ -143,7 +156,7 @@ class FaultPort:
                 if (current.get('injection_id') == effect.get('injection_id')
                         and current.get('state') == 'reserved'):
                     current.update(state='not_injected', attempt=0,
-                        reason='owned Worker completed before a running interrupt was observed')
+                        reason='owned Worker completed before a terminal interrupt was confirmed')
                     write_json(self.effect_path, current)
             return result
         if fid.startswith('F02'):
