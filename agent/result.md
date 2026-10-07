@@ -1,3 +1,18 @@
+# P20.4 Run E FAILED / boundary remediation ACCEPT (2026-10-07)
+
+Run `p20-live-20261007-e` completed all five tasks and 12/15 fault cases, then
+failed honestly after 6h00m41s with F03/F07/F08 pending. Commits `1c713fc`,
+`bed7d5d`, and `62dc8ec` repair the boundary evidence and cleanup-safe final
+qualification. Local regression passed 413 tests plus 23 subtests; independent
+`claude/default/opus` review ACCEPTED with zero BLOCKING findings and reproduced
+255 P20 tests. Canonical remains P20.4
+`OWNER_GATE / SOAK_EVIDENCE_UNRESOLVED`, with no active owner and all invariants
+true. Run E is immutable; the next measurement must be a fresh `soak-recover`
+run with all new identities. Details:
+`docs/P20_4_RUN_E_BOUNDARY_REMEDIATION_RESULT_20261007.md`.
+
+---
+
 # P20.4 software remediation ACCEPT / live acceptance incomplete (2026-10-05)
 
 Diagnosis D01–D07 repaired in local commit 25eb281f. Independent Technical Review

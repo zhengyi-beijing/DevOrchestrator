@@ -1,3 +1,24 @@
+# P20.4 Run E FAILED / boundary remediation ACCEPT (2026-10-07)
+
+Fresh run `p20-live-20261007-e` ran for 6h00m41s, completed P204.1-P204.5,
+and verified 12/15 fault dispositions, then terminated honestly with exit code
+7 because F03/F07/F08 evidence remained pending. Canonical is
+`OWNER_GATE / SOAK_EVIDENCE_UNRESOLVED`, no active owner, all invariants true.
+
+Commits `1c713fc`, `bed7d5d`, and `62dc8ec` repair exact Worker/Broker boundary
+proof, qualification revalidation, and cleanup-safe durable daemon-restart
+evidence. Local regression: 413 passed plus 23 subtests. Final independent
+Technical Review by `claude/default/opus` returned ACCEPT with zero BLOCKING
+findings and reproduced 255 P20 tests. Details:
+`docs/P20_4_RUN_E_BOUNDARY_REMEDIATION_RESULT_20261007.md`.
+
+Run E is immutable failed evidence and must not be resumed or merged with a new
+clock. P20.4 remains incomplete. Start only a fresh measurement with new
+run/project/permit/path/job/source-request identities through normal
+`soak-recover`. No P20.5, P21, push, reset, rebase, or clean.
+
+---
+
 # P20.4 run D FAILED / live fault-disposition remediation ACCEPT (2026-10-07)
 
 Fresh run `p20-live-20261006-d` correctly terminated after about 4h12m with
