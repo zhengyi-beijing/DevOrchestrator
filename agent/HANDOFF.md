@@ -1,3 +1,30 @@
+# P20.4 Run G F03 remediation ACCEPT / Run H pending start (2026-10-08)
+
+Run G (`p20-live-20261007-g`) remains immutable failed evidence. Its sole
+pending fault case, F03 (`WORKER_KILLED`), was falsely marked injected after
+the Broker returned `status=running` and `interrupt_supported=false`; the
+original Worker then succeeded, so the recovery verifier correctly found no
+failed Worker and reviewed retry.
+
+Commit `d1917f4` requires an exact terminal interrupt acknowledgement with
+`interrupt_supported=true`, retries unconfirmed responses, and records
+`not_injected` if the Worker completes first. All P20.4 tests pass (124);
+adjacent regression passes (285 plus 23 subtests); compile, diff, and Graphify
+checks pass. Independent Technical Review request
+`p20-run-g-f03-remediation-review-20261008-r5` returned ACCEPT with zero
+BLOCKING and one NON_BLOCKING finding. Details:
+`docs/P20_4_RUN_G_F03_REMEDIATION_RESULT_20261008.md`.
+
+P20.4 remains incomplete. Start only a fresh Run H through normal
+`soak-recover`, with new run/project/permit/path/job/source-request identities
+and a normally reloaded daemon. Run G's terminal run-file SHA-256 remains
+`dc73f6a223e5ced9d5349985d18668e529f87fbf724c126fa23360ff7f3c7fee`.
+The unrelated dirty changes in `browser/chatgpt-web-adapter.user.js` and
+`tests_py/test_chatgpt_web_adapter.py` must be preserved and excluded from the
+P20.4 commits.
+
+---
+
 # P20.4 Run F F02 remediation ACCEPT / Run G pending start (2026-10-07)
 
 Run F (`p20-live-20261007-f`) remains immutable failed evidence. Its sole
