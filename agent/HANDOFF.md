@@ -1,30 +1,38 @@
-# P20.4 Run F RUNNING / fresh post-remediation soak (2026-10-07)
+# P20.4 Run F FAILED / F02 evidence gap pending diagnosis (2026-10-07)
 
-Fresh run `p20-live-20261007-f` is the only active P20.4 qualification
-measurement. It began at `2026-10-07T08:46:51+08:00` with project
-`p20-soak-20261007-f`, job `job-f7a51b2103ce1049`, permit
-`runtime/p20-live-permit-20261007-f.json`, and source revision
-`b4271baf4912e37a106cdd3357a39c4364c0de64`.
+Fresh run `p20-live-20261007-f` started at
+`2026-10-07T08:46:51+08:00` and ended at
+`2026-10-07T12:59:45+08:00` after 15,172.203 monotonic seconds. Job
+`job-f7a51b2103ce1049` exited with code 7. The run failed honestly with
+`fault_driver_terminal:FAULT_DRIVER_EXHAUSTED_WITH_PENDING_EVIDENCE`; clock
+continuity remained true and no run incidents were recorded.
 
-At handoff (`2026-10-07T09:25+08:00`), the parent supervisor (PID 5584), soak
-child (PID 11236), and canonical daemon (PID 15804) were alive. The run is
-`RUNNING`, clock continuity holds, P204.1-P204.4 are complete, and F01
-(`MALFORMED_PLANNER`) has verified automatic recovery. F02 has started its
-isolated fault-case work; it must not be counted as verified until a durable
-disposition is published. Fourteen faults remain pending. There are no recorded
-run incidents. CPF-01 through CPF-10 are PASS and all hard-zero counters remain
-zero.
+P204.1-P204.4 completed with ledger-verified evidence; P204.5 did not complete.
+Fourteen of fifteen live fault cases produced verified dispositions. The sole
+pending case is F02 (`PLANNER_TIMEOUT`). CPF-01 through CPF-10 passed. Because
+the run ended early, several hard-zero coverage fields are unknown (`null`), so
+qualification correctly returns FAIL in addition to the duration, task, and F02
+gates. Preserve the terminal run file SHA-256
+`b24ae34e1ab0e51fa8e448100d0ef7e8cc44318055a99a2749ee5dce771d37f6`.
 
-The run must continue under its existing supervisor and permit. Do not resume,
-settle, restart, or merge its clock with another run unless its durable state
-requires the prescribed recovery path. Earliest six-hour observation point is
-`2026-10-07T14:46:51+08:00`; qualification also requires all five tasks,
-all fifteen fault dispositions, hard-zero compliance, and final review.
+The Run F supervisor PID 5584 and soak child PID 11236 are gone. At this handoff
+the canonical daemon PID 15804 is healthy, but a host restart will stop it and
+its status must be rechecked before further work. Run F is immutable failed
+evidence: do not resume, retry, settle, or merge its clock. After restart, first
+diagnose the F02 isolated case and its missing disposition. Implement and review
+any required repair before starting a fresh Run G through the normal
+`soak-recover` path with new run/project/permit/path/job/source-request
+identities.
 
-Run E is immutable failed evidence; its boundary remediation remains accepted
-on commits `1c713fc`, `bed7d5d`, and `62dc8ec`. See
-`docs/P20_4_RUN_E_BOUNDARY_REMEDIATION_RESULT_20261007.md` and
-`runtime/p20-4-running-checkpoint.json` for the current binding and checkpoint.
+Run F artifacts are under `C:\work\p20-soak\20261007-live-f`; its permit is
+`runtime/p20-live-permit-20261007-f.json`. The canonical repository currently
+also has unrelated uncommitted changes in `browser/chatgpt-web-adapter.user.js`
+and `tests_py/test_chatgpt_web_adapter.py`; preserve them and do not fold them
+into P20.4 remediation without inspecting ownership.
+
+Run E is also immutable failed evidence; its boundary remediation remains
+accepted on commits `1c713fc`, `bed7d5d`, and `62dc8ec`. See
+`docs/P20_4_RUN_E_BOUNDARY_REMEDIATION_RESULT_20261007.md` for that repair.
 
 ---
 
