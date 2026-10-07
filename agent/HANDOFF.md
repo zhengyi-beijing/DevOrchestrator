@@ -1,3 +1,29 @@
+# P20.4 Run H premeasurement recovery remediation ACCEPT / Run J pending (2026-10-08)
+
+Commit `2e55084` fixes the lifecycle gap that prevented Run H's exact failed
+premeasurement job from being replaced. The new branch requires matching
+preparation/start-intent/permit/job identity, expired deadline and matching
+prepared HEAD, no run state or run file, and an exact failed/cancelled job. It
+records a stable job-identity digest, settles lineage, and leaves the existing
+bound `FAILED`-run path strict.
+
+Verification passed: owner recovery 20; all P20.4 129; adjacent lifecycle,
+control, and watchdog 144 plus 23 subtests; compile, diff, and Graphify checks.
+Independent review `p20-run-h-premeasurement-recovery-review-20261008-r1`
+returned ACCEPT with zero BLOCKING findings. Details:
+`docs/P20_4_RUN_H_PREMEASUREMENT_RECOVERY_REMEDIATION_20261008.md`.
+
+Run J (`p20-live-20261008-j`) remains premeasurement with no canonical job or
+run file. Its isolated real-AI chain completed P204.1 and independent review,
+then correctly failed closed because its Worker wrote invalid readiness value
+`done`. Correct that disposable artifact to `completed`, advance the isolated
+pipeline until a role is active, reload the canonical daemon at current HEAD,
+authorize Run H -> Run J with a new recovery command ID, resume through the
+watchdog-owned source request, and start/bind the supervisor. Do not change
+canonical HEAD after binding.
+
+---
+
 # P20.4 Run I preflight reviewer no-candidate / Run J pending (2026-10-08)
 
 Run I (`p20-live-20261008-i`) never created a run file, canonical soak job, or
