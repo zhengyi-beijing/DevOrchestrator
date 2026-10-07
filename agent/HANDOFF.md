@@ -1,3 +1,29 @@
+# P20.4 Run F F02 remediation ACCEPT / Run G pending start (2026-10-07)
+
+Run F (`p20-live-20261007-f`) remains immutable failed evidence. Its sole
+pending fault case, F02 (`PLANNER_TIMEOUT`), had actually recovered at the
+Planner boundary; the old verifier incorrectly waited for a complete
+Worker/Reviewer acceptance after the recovered Worker became ambiguous.
+
+Commits `6d826ec` and `2d90b24` add exact same-plan retry and watchdog recovery
+proofs, enforce causal/project/path identity, and recompute the proof during
+qualification. The untouched Run F artifacts now yield a non-null F02 proof.
+All P20.4 tests pass (122); adjacent regression passes (281 plus 23 subtests).
+Final independent Technical Review request
+`p20-run-f-f02-remediation-review-20261007-r2` returned ACCEPT with zero
+BLOCKING findings and reproduced those checks. Details:
+`docs/P20_4_RUN_F_F02_REMEDIATION_RESULT_20261007.md`.
+
+P20.4 remains incomplete. Start only a fresh Run G through normal
+`soak-recover`, with new run/project/permit/path/job/source-request identities
+and a normally reloaded daemon. Run F's run-file SHA-256 remains
+`b24ae34e1ab0e51fa8e448100d0ef7e8cc44318055a99a2749ee5dce771d37f6`.
+The unrelated dirty changes in `browser/chatgpt-web-adapter.user.js` and
+`tests_py/test_chatgpt_web_adapter.py` must be preserved and excluded from the
+P20.4 commits.
+
+---
+
 # P20.4 Run F FAILED / F02 evidence gap pending diagnosis (2026-10-07)
 
 Fresh run `p20-live-20261007-f` started at
