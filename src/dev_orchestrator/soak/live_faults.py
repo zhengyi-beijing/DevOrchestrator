@@ -240,7 +240,7 @@ class LiveFaultDriver:
                     if recovered is not None:
                         return self._finish(permit, fault, effect, incident, 'automatic_recovery',
                             {'accepted_task': recovered}, manifest)
-                if not fault.fault_id.startswith(('F03', 'F07', 'F08', 'F11', 'F13', 'F14')):
+                if not fault.fault_id.startswith(('F11', 'F13', 'F14')):
                     gate = authority.get('owner_gate')
                     if isinstance(gate, dict) and gate.get('reason') and not authority.get('active_owner') and not primary_active(permit):
                         identity = (gate.get('gate_id') or gate.get('code'), authority.get('current_task_id'), authority.get('generation'))

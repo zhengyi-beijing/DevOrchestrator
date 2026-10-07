@@ -4,7 +4,10 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+from datetime import timedelta
 from pathlib import Path
+
+import pytest
 
 from dev_orchestrator.ai.contracts import AIRoleRequest, AIRoleResult
 from dev_orchestrator.control.command_store import ControlCommandStore, EXPECTED_IDENTITY_FIELDS
@@ -23,6 +26,7 @@ from dev_orchestrator.soak.live_faults import LiveFaultDriver
 from dev_orchestrator.soak.permit import create_soak_permit
 from dev_orchestrator.soak.template import generate_soak_project
 from dev_orchestrator.storage.json_store import read_json, write_json
+from dev_orchestrator.storage.json_store import parse_utc, utc_now_iso
 
 
 def _permit(tmp_path: Path, fault_id: str):
@@ -170,6 +174,11 @@ def test_worker_interrupt_recovery_accepts_reviewed_control_retry(tmp_path):
     assert worker_interrupt_recovered(permit, effect) is None
     ledger['executions']['initial:execute']['broker_request_id'] = effect['request_id']
     write_json(runtime / 'transition-executor.json', ledger)
+    ledger['executions']['initial:execute']['task_id'] = 'P204.other'
+    write_json(runtime / 'transition-executor.json', ledger)
+    assert worker_interrupt_recovered(permit, effect) is None
+    ledger['executions']['initial:execute']['task_id'] = 'P204.1'
+    write_json(runtime / 'transition-executor.json', ledger)
     reviews = read_json(runtime / 'ai-reviewer.json', {})
     reviews['reviews']['ai_review:retry-worker']['resource_context']['provider'] = 'agy'
     write_json(runtime / 'ai-reviewer.json', reviews)
@@ -196,7 +205,8 @@ def test_broker_retry_recovery_stops_at_recovered_boundary(tmp_path):
             'planner_attempts': [
                 {'request_id': 'plan:planner', 'status': None,
                  'completed_at': '2026-10-07T01:00:01+00:00'},
-            {'status': 'succeeded', 'completed_at': '2026-10-07T01:00:05+00:00',
+                {'request_id': 'plan:planner:retry-1', 'status': 'succeeded',
+                 'completed_at': '2026-10-07T01:00:05+00:00',
              'dispatch_id': 'pd', 'execution_id': 'pe',
              'resource': {'provider': 'anthropic'}},
         ],
@@ -216,11 +226,19 @@ def test_broker_retry_recovery_stops_at_recovered_boundary(tmp_path):
     effect['effect_mode'] = 'wrong-boundary'
     assert broker_retry_recovered(permit, effect) is None
     effect['effect_mode'] = 'injected_transport_boundary'
+    plans = read_json(runtime / 'ai-planner.json', {})
+    plans['plans']['plan']['planner_attempts'][1]['request_id'] = effect['request_id']
+    write_json(runtime / 'ai-planner.json', plans)
+    assert broker_retry_recovered(permit, effect) is None
+    plans['plans']['plan']['planner_attempts'][1]['request_id'] = 'plan:planner:retry-1'
+    write_json(runtime / 'ai-planner.json', plans)
     effect['injected_at'] = '2026-10-07T01:00:06+00:00'
     assert broker_retry_recovered(permit, effect) is None
 
 
 def test_daemon_restart_active_recovery_requires_identity_and_invariants(tmp_path):
+    from dev_orchestrator.incidents import observations
+    from dev_orchestrator.incidents.reliability_runs import open_reliability_run, record_daemon_boot
     permit = _permit(tmp_path, 'F08_DAEMON_RESTART_ACTIVE')
     runtime = Path(permit.disposable_runtime_root)
     effect = {'fault_id': 'F08_DAEMON_RESTART_ACTIVE', 'state': 'injected',
@@ -230,22 +248,36 @@ def test_daemon_restart_active_recovery_requires_identity_and_invariants(tmp_pat
                                      'state': 'planning'},
               'pre_restart_authority': {'current_task_id': 'P204.1', 'generation': 3},
               'daemon_before': {'state': 'running', 'pid': 100, 'create_time': 1.0},
-              'daemon_after': {'state': 'running', 'pid': 200, 'create_time': 2.0}}
+              'daemon_after': {'state': 'starting', 'pid': 200, 'create_time': 2.0}}
     write_json(runtime / 'ai-planner.json', {'plans': {'plan': {
         'project_id': 'project', 'task_id': 'P204.1', 'state': 'planning'}}})
     write_json(runtime / 'transition-executor.json', {'executions': {}, 'lifecycle': {
         'project': {'current_task_id': 'P204.1', 'generation': 3,
+            'lifecycle_state': 'PLANNING',
             'active_owner': {'role': 'planner', 'id': 'plan', 'task_id': 'P204.1'},
             'invariants': [{'code': 'SINGLE_ACTIVE_LIFECYCLE_OWNER', 'holds': True}]},
     }})
     write_json(runtime / 'daemon.json', {'state': 'running', 'pid': 200,
                                          'create_time': 2.0})
+    run = open_reliability_run(runtime, 'project')
+    write_json(runtime / 'soak-project-manifest.json', {'reliability_run_id': run['run_id']})
+    record_daemon_boot(runtime, 200, '127.0.0.1', 1,
+                       started_at='2026-10-07T01:00:03+00:00', boot_id='boot-after')
+    directory = observations.observation_directory(runtime, run['run_id'])
+    directory.mkdir(parents=True)
+    observations._append_rows(directory, [{
+        'project_id': 'project', 'observation_kind': 'authority_snapshot',
+        'recorded_at': f'2026-10-07T01:00:{second:02d}+00:00',
+        'task_id': 'P204.1', 'generation': 3, 'lifecycle_state': 'PLANNING',
+        'owner_gate': None, 'active_owner': True,
+    } for second in (4, 9, 14)])
 
     proof = daemon_restart_active_recovered(permit, effect)
     assert proof['old_pid'] == 100 and proof['new_pid'] == 200
     assert proof['current_task_id'] == 'P204.1'
     assert proof['generation'] == 3
     assert proof['single_owner_converged'] is True
+    assert proof['restart_boot_id'] == 'boot-after'
     effect['pre_restart_active']['state'] = 'completed'
     assert daemon_restart_active_recovered(permit, effect) is None
     effect['pre_restart_active']['state'] = 'planning'
@@ -253,6 +285,61 @@ def test_daemon_restart_active_recovery_requires_identity_and_invariants(tmp_pat
     ledger['lifecycle']['project']['generation'] = 4
     write_json(runtime / 'transition-executor.json', ledger)
     assert daemon_restart_active_recovered(permit, effect) is None
+    ledger['lifecycle']['project']['generation'] = 3
+    ledger['lifecycle']['project']['lifecycle_state'] = 'PLAN_FAILED'
+    ledger['lifecycle']['project']['active_owner'] = None
+    write_json(runtime / 'transition-executor.json', ledger)
+    assert daemon_restart_active_recovered(permit, effect) is None
+
+
+@pytest.mark.parametrize(('fault_id', 'proof_name'), (
+    ('F03_WORKER_KILLED', 'worker_interrupt_recovered'),
+    ('F07_BROKER_UNAVAILABLE', 'broker_retry_recovered'),
+    ('F08_DAEMON_RESTART_ACTIVE', 'daemon_restart_active_recovered'),
+))
+def test_observed_faults_revalidates_boundary_specific_evidence(
+        tmp_path, monkeypatch, fault_id, proof_name):
+    from dev_orchestrator.soak import evidence as evidence_module
+    from dev_orchestrator.soak.permit import save_soak_permit
+    canonical = tmp_path / 'canonical'
+    (canonical / 'runtime').mkdir(parents=True)
+    parent = create_soak_permit('parent', 'primary', tmp_path / 'primary/repo',
+        tmp_path / 'primary/runtime', canonical, canonical / 'runtime', [fault_id])
+    case = Path(parent.disposable_runtime_root) / 'fault-cases' / fault_id / 'runtime'
+    permit = create_soak_permit('case', 'case-project', case.parent / 'repo', case,
+        canonical, canonical / 'runtime', [fault_id])
+    Path(permit.disposable_repo_path).mkdir(parents=True)
+    case.mkdir(parents=True)
+    permit_path = case.parent / 'permit.json'
+    save_soak_permit(permit_path, permit)
+    write_json(Path(permit.disposable_repo_path) / permit.disposable_marker_name,
+               {'run_id': permit.run_id, 'project_id': permit.soak_project_id})
+    now = parse_utc(utc_now_iso())
+    start, injected = now - timedelta(seconds=30), now - timedelta(seconds=20)
+    effect = {'state': 'injected', 'fault_id': fault_id,
+              'injection_id': 'injection', 'injected_at': injected.isoformat()}
+    write_json(case / 'fault-effect.json', effect)
+    write_json(case / 'soak-faults/injection.json', {
+        'mode': 'live_injection', 'fault_id': fault_id, 'run_id': permit.run_id})
+    write_json(case / 'incident-packets/index.json', {'families': {'family': {
+        'family_id': 'family', 'project_id': permit.soak_project_id,
+        'packet_ids': ['packet'], 'occurrences': [{'occurrence_key': 'injection'}],
+    }}})
+    proof = {'fault_id': fault_id, 'boundary_verified': True}
+    declared = {'case_runtime_root': str(case), 'case_permit_path': str(permit_path),
+        'failure_family': 'family', 'incident_id': 'packet',
+        'disposition': 'automatic_recovery', 'evidence': dict(proof)}
+    write_json(Path(parent.disposable_runtime_root) / 'fault-driver.json', {
+        'dispositions': {fault_id: declared}})
+    monkeypatch.setattr(evidence_module, proof_name,
+                        lambda case_permit, current_effect: dict(proof))
+    state = {'started_at': start.isoformat(), 'updated_at': now.isoformat()}
+
+    assert fault_id in evidence_module.observed_faults(parent, state)
+    declared['evidence']['boundary_verified'] = False
+    write_json(Path(parent.disposable_runtime_root) / 'fault-driver.json', {
+        'dispositions': {fault_id: declared}})
+    assert fault_id not in evidence_module.observed_faults(parent, state)
 
 
 def test_duplicate_retry_proof_requires_one_durable_record(tmp_path):

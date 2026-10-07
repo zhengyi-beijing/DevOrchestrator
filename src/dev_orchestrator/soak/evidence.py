@@ -92,9 +92,11 @@ def worker_interrupt_recovered(permit, effect):
     Review and terminal lifecycle actuation instead of requiring false Planner
     ancestry.
     """
+    request_id = effect.get('request_id')
     if (effect.get('fault_id') != 'F03_WORKER_KILLED'
             or effect.get('state') != 'injected'
-            or effect.get('effect_mode') != 'owned_broker_worker_interrupt'):
+            or effect.get('effect_mode') != 'owned_broker_worker_interrupt'
+            or not isinstance(request_id, str) or not request_id.strip()):
         return None
     runtime = Path(permit.disposable_runtime_root)
     truth = read_repository_truth(permit.disposable_repo_path)
@@ -105,7 +107,7 @@ def worker_interrupt_recovered(permit, effect):
     decisions = read_json(runtime / 'review-decisions.json', {}).get('decisions', {})
     interrupted = next(((key, row) for key, row in workers.items()
         if row.get('project_id') == permit.soak_project_id
-        and row.get('broker_request_id') == effect.get('request_id')
+        and row.get('broker_request_id') == request_id
         and row.get('state') in {'failed', 'cancelled'}
         and _after_effect(row.get('completed_at'), effect)), None)
     if interrupted is None:
@@ -124,6 +126,7 @@ def worker_interrupt_recovered(permit, effect):
         if (review.get('project_id') != permit.soak_project_id
                 or worker.get('project_id') != permit.soak_project_id
                 or source == interrupted[0]
+                or worker.get('task_id') != interrupted[1].get('task_id')
                 or worker.get('task_id') != review.get('task_id')
                 or worker.get('state') != 'completed'
                 or not _after_effect(worker.get('completed_at'), effect)
@@ -150,9 +153,11 @@ def worker_interrupt_recovered(permit, effect):
 
 def broker_retry_recovered(permit, effect):
     """Prove the real Broker boundary succeeded on a later Planner attempt."""
+    request_id = effect.get('request_id')
     if (effect.get('fault_id') != 'F07_BROKER_UNAVAILABLE'
             or effect.get('state') != 'injected'
-            or effect.get('effect_mode') != 'injected_transport_boundary'):
+            or effect.get('effect_mode') != 'injected_transport_boundary'
+            or not isinstance(request_id, str) or not request_id.strip()):
         return None
     runtime = Path(permit.disposable_runtime_root)
     plans = read_json(runtime / 'ai-planner.json', {}).get('plans', {})
@@ -165,7 +170,7 @@ def broker_retry_recovered(permit, effect):
         worker = workers.get(source, {})
         attempts = plan.get('planner_attempts') or ()
         injected_attempt = next((attempt for attempt in attempts
-            if attempt.get('request_id') == effect.get('request_id')
+            if attempt.get('request_id') == request_id
             and _after_effect(attempt.get('completed_at'), effect)), None)
         if (worker.get('project_id') != permit.soak_project_id
                 or worker.get('task_id') != plan.get('task_id')
@@ -174,6 +179,7 @@ def broker_retry_recovered(permit, effect):
         for number, attempt in enumerate(attempts, 1):
             resource = attempt.get('resource') or {}
             if (attempt.get('status') == 'succeeded'
+                    and attempt.get('request_id') != request_id
                     and _after_effect(attempt.get('completed_at'), effect)
                     and attempt.get('dispatch_id') and attempt.get('execution_id')
                     and resource.get('provider')):
@@ -187,7 +193,7 @@ def broker_retry_recovered(permit, effect):
 
 
 def daemon_restart_active_recovered(permit, effect):
-    """Prove a daemon PID changed while active authority stayed coherent."""
+    """Prove a post-injection boot observed coherent active or accepted work."""
     if (effect.get('fault_id') != 'F08_DAEMON_RESTART_ACTIVE'
             or effect.get('state') != 'injected'
             or effect.get('effect_mode') != 'isolated_native_boundary'):
@@ -202,7 +208,6 @@ def daemon_restart_active_recovered(permit, effect):
             or not before.get('pid') or not after.get('pid')
             or before.get('create_time') is None or after.get('create_time') is None
             or before.get('state') not in {'running', 'degraded'}
-            or after.get('state') not in {'running', 'degraded'}
             or (before.get('pid'), before.get('create_time'))
                == (after.get('pid'), after.get('create_time'))):
         return None
@@ -219,19 +224,58 @@ def daemon_restart_active_recovered(permit, effect):
     invariants = authority.get('invariants')
     owner = authority.get('active_owner')
     task = pre_active['task_id']
-    if (daemon.get('state') != 'running'
+    from dev_orchestrator.incidents.reliability_runs import get_daemon_boots
+    injected = parse_utc(effect.get('injected_at'))
+    if injected is None:
+        return None
+    boots = [row for row in get_daemon_boots(runtime)
+             if parse_utc(row.get('started_at')) and parse_utc(row['started_at']) > injected]
+    boot = boots[-1] if boots else None
+    if (daemon.get('state') not in {'running', 'degraded'}
             or (daemon.get('pid'), daemon_create_time)
                != (after.get('pid'), after.get('create_time'))
+            or boot is None or boot.get('pid') != after.get('pid')
             or authority.get('current_task_id') != task
             or authority.get('generation') != pre_authority.get('generation')
             or not isinstance(invariants, list) or not invariants
-            or any(row.get('holds') is not True for row in invariants)
-            or (owner is not None and owner.get('task_id') != task)):
+            or any(row.get('holds') is not True for row in invariants)):
         return None
-    return {'role_record_id': pre_active['role_record_id'], 'task_id': task,
+    state = authority.get('lifecycle_state')
+    base = {'role_record_id': pre_active['role_record_id'], 'task_id': task,
             'old_pid': before['pid'], 'new_pid': after['pid'],
-            'current_task_id': task, 'generation': authority.get('generation'),
+            'restart_boot_id': boot.get('boot_id'), 'current_task_id': task,
+            'generation': authority.get('generation'),
             'single_owner_converged': True, 'clock_reset': False}
+    if state == 'COMPLETE':
+        accepted = accepted_tasks(permit).get(task)
+        if accepted and _after_effect(accepted.get('accepted_at'), effect):
+            return {**base, 'accepted_task': accepted}
+        return None
+    active_states = {'PLANNING', 'EXECUTING', 'REVIEWING'}
+    active = primary_active(permit)
+    if (state not in active_states or not isinstance(owner, dict)
+            or owner.get('task_id') != task or active is None or active.get('task_id') != task):
+        return None
+    manifest = read_json(runtime / 'soak-project-manifest.json', {})
+    run_id = manifest.get('reliability_run_id')
+    try:
+        from dev_orchestrator.incidents.observations import read_observations
+        rows = read_observations(runtime, run_id)
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    booted_at = parse_utc(boot['started_at'])
+    stable = [row for row in rows
+        if row.get('project_id') == permit.soak_project_id
+        and row.get('observation_kind') == 'authority_snapshot'
+        and parse_utc(row.get('recorded_at')) >= booted_at
+        and row.get('task_id') == task
+        and row.get('generation') == authority.get('generation')
+        and row.get('lifecycle_state') in active_states
+        and row.get('active_owner') is True
+        and not row.get('owner_gate')]
+    if len(stable) < 3:
+        return None
+    return base
 
 
 def duplicate_retry_idempotent(permit, effect):
@@ -478,7 +522,17 @@ def observed_faults(permit, run_state):
                            for row in family.get('occurrences', []))):
             continue
         if declared.get('disposition') == 'automatic_recovery':
-            if fault_id.startswith('F13'):
+            boundary_proof = None
+            if fault_id.startswith('F03'):
+                boundary_proof = worker_interrupt_recovered(case_permit, effect)
+            elif fault_id.startswith('F07'):
+                boundary_proof = broker_retry_recovered(case_permit, effect)
+            elif fault_id.startswith('F08'):
+                boundary_proof = daemon_restart_active_recovered(case_permit, effect)
+            if fault_id.startswith(('F03', 'F07', 'F08')):
+                if boundary_proof is None or declared.get('evidence') != boundary_proof:
+                    continue
+            elif fault_id.startswith('F13'):
                 if lost_handoff_recovered(case_permit) is None:
                     continue
             elif fault_id.startswith('F14'):
