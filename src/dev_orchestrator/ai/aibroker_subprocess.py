@@ -119,6 +119,7 @@ _RESOURCE_FAILURE_CODES = {
 _RESOURCE_FAILURE_TEXT = (
     ("usage limit", "quota_exhausted"),
     ("session limit", "quota_exhausted"),
+    ("weekly limit", "quota_exhausted"),
     ("quota exhausted", "quota_exhausted"),
     ("no quota", "quota_exhausted"),
     ("quota reached", "quota_exhausted"),

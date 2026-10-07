@@ -62,7 +62,9 @@ def _nonblank(value: Any) -> str | None:
 
 def _classify_reconciled_dispatch_failure(error: str | None) -> str | None:
     text = str(error or "").lower()
-    if any(token in text for token in ("session limit", "no quota", "quota exhausted")):
+    if any(token in text for token in (
+        "session limit", "weekly limit", "no quota", "quota exhausted"
+    )):
         return "quota_exhausted"
     if "rate limit" in text or "too many requests" in text:
         return "rate_limited"

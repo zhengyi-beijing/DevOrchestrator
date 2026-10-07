@@ -227,6 +227,14 @@ class AIBrokerExecutionPortTests(unittest.TestCase):
         result = self.port._result_from_payload(self.request(role="planner"), payload)
         self.assertEqual(result.failure_classification, "quota_exhausted")
 
+    def test_weekly_limit_is_normalized_as_quota_exhausted(self):
+        payload = self.payload(
+            status="failed", output=None,
+            error="You've hit your weekly limit · resets 9am (Asia/Shanghai)",
+        )
+        result = self.port._result_from_payload(self.request(role="planner"), payload)
+        self.assertEqual(result.failure_classification, "quota_exhausted")
+
     def test_no_quota_is_normalized_as_quota_exhausted(self):
         payload = self.payload(
             status="failed", output=None,

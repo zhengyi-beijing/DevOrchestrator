@@ -6,7 +6,23 @@ import unittest
 from pathlib import Path
 
 from dev_orchestrator.ai.contracts import AIRoleResult, ResourceContext
-from dev_orchestrator.core.ai_planner import AIPlannerCoordinator, PlannerProtocolError, _parse_plan, _parse_plan_review
+from dev_orchestrator.core.ai_planner import (
+    AIPlannerCoordinator,
+    PlannerProtocolError,
+    _classify_reconciled_dispatch_failure,
+    _parse_plan,
+    _parse_plan_review,
+)
+
+
+class PlannerFailureClassificationTests(unittest.TestCase):
+    def test_reconciled_weekly_limit_is_quota_exhaustion(self):
+        self.assertEqual(
+            _classify_reconciled_dispatch_failure(
+                "You've hit your weekly limit · resets 9am (Asia/Shanghai)"
+            ),
+            "quota_exhausted",
+        )
 
 
 class PlannerPromptContractTests(unittest.TestCase):
