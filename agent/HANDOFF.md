@@ -1,3 +1,23 @@
+# P20.4 Run I preflight reviewer no-candidate / Run J pending (2026-10-08)
+
+Run I (`p20-live-20261008-i`) never created a run file, canonical soak job, or
+measurement clock. The new Copilot Planner route succeeded on its first attempt
+and produced a valid P204.1 plan, proving the weekly-limit remediation and
+Planner candidate are effective. Independent Plan Review then correctly
+returned `no_candidate`: provider independence excluded Copilot, while the
+freshly restarted Broker had no non-Copilot reviewer health snapshot.
+
+AGY 2/3 Claude-thinking and Gemini-adjudicator reviewer resources have now been
+probed available. Run I's isolated daemon was normally stopped after preserving
+evidence. Details:
+`docs/P20_4_RUN_I_PREFLIGHT_REVIEWER_AVAILABILITY_20261008.md`.
+
+Start only a fresh Run J through normal `soak-recover`; do not reuse Run I's
+blocked initial control. Use new run/project/permit/path/job/source-request
+identities and a new six-hour clock.
+
+---
+
 # P20.4 Run H preflight failed / resource failover remediation ACCEPT (2026-10-08)
 
 Run H (`p20-live-20261008-h`) never created a run file or measurement clock.
