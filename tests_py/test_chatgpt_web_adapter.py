@@ -116,7 +116,8 @@ class ChatGptWebAdapterTests(unittest.TestCase):
 
     def test_userscript_has_compact_transport_status_badge(self):
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('STATUS_ELEMENT_ID = "devorch-web-status"', source)
+        self.assertIn('STATUS_ELEMENT_ID = "devorch-release-web-status"', source)
+        self.assertIn('overlay.id = "devorch-release-confirm-modal"', source)
         for state in ("LIVE", "IDLE", "CLAIMED", "WAITING", "OFFLINE"):
             self.assertIn('setAdapterStatus("' + state, source)
         self.assertIn('badge.style.cssText = "position:fixed;right:12px;bottom:12px;', source)
@@ -146,7 +147,9 @@ class ChatGptWebAdapterTests(unittest.TestCase):
 
     def test_userscript_raises_transport_alert_from_server_attention_metadata(self):
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('// @version      0.1.26', source)
+        self.assertIn('// @name         DevOrchestrator Release ChatGPT Web binding adapter', source)
+        self.assertIn('// @namespace    devorchestrator.release', source)
+        self.assertIn('// @version      1.30', source)
         self.assertIn('// @grant        GM_notification', source)
         self.assertIn('notification.attention !== "urgent"', source)
         self.assertIn('GM_notification({', source)
@@ -166,12 +169,13 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "true|1|DevOrchestrator requires attention")
 
-    def test_userscript_pairs_and_sends_capability_scoped_8770_heartbeat(self):
+    def test_userscript_pairs_and_sends_capability_scoped_8750_heartbeat(self):
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('CONTROL_BASE = "http://127.0.0.1:8770"', source)
+        self.assertIn('BRIDGE_BASE = "http://127.0.0.1:8751"', source)
+        self.assertIn('CONTROL_BASE = "http://127.0.0.1:8750"', source)
         self.assertIn('/api/v1/control/adapter-pairings/redeem', source)
         self.assertIn('/api/v1/control/session-heartbeats', source)
-        self.assertIn('GM_registerMenuCommand("Pair DevOrchestrator 8770 heartbeat"', source)
+        self.assertIn('GM_registerMenuCommand("Pair DevOrchestrator Release 8750 heartbeat"', source)
         self.assertIn('headers.Authorization = "Bearer " + capability', source)
         self.assertNotIn('/v1/owner-action', source)
         script = SCRIPT.as_posix()
@@ -235,7 +239,7 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         request = payload["requests"][0]
         self.assertEqual(
             request["url"],
-            "http://127.0.0.1:8770/api/v1/control/web-bridge/bootstrap/redeem",
+            "http://127.0.0.1:8750/api/v1/control/web-bridge/bootstrap/redeem",
         )
         self.assertEqual(request["headers"]["Authorization"], "Bearer heartbeat-secret")
         self.assertEqual(request["data"], {"project_id": "p1", "adapter": "chatgpt_web", "binding_id": "conv-1"})
@@ -388,6 +392,96 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         state, detail = result.stdout.strip().split("|")
         self.assertEqual(state, "DEGRADED")
         self.assertIn("heartbeat", detail.lower())
+
+    def test_userscript_roleless_dom_confirms_submitted_request_only_outside_composer(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "let bodyText='[DEVORCH_WEB_SOL_REQUEST req-roleless] review';"
+            "let composerText='';"
+            "const composer={innerText:'',textContent:'',focus:()=>{},getAttribute:()=>null};"
+            "globalThis.document={body:{get innerText(){return bodyText;}},"
+            "querySelectorAll:(q)=>[],querySelector:(q)=>q==='#prompt-textarea'?composer:null};"
+            "Object.defineProperty(composer,'innerText',{get:()=>composerText,set:(v)=>{composerText=v}});"
+            "Object.defineProperty(composer,'textContent',{get:()=>composerText,set:(v)=>{composerText=v}});"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const submitted=a.userMessageHasRequest('req-roleless');"
+            "composerText='[DEVORCH_WEB_SOL_REQUEST req-roleless] review';"
+            "const draftOnly=a.userMessageHasRequest('req-roleless');"
+            "console.log(String(submitted)+'|'+String(draftOnly));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "true|false")
+
+    def test_userscript_roleless_dom_extracts_only_complete_json_response(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "let bodyText='header\\n[DEVORCH_WEB_SOL_REQUEST req-r] review\\n'"
+            "+'[DEVORCH_WEB_SOL_RESPONSE req-r] example\\n{}\\n'"
+            "+'[DEVORCH_WEB_SOL_RESPONSE req-r]\\n{\\\"decision\\\":\\\"NEXT\\\"}\\nfooter';"
+            "globalThis.document={body:{get innerText(){return bodyText;}},"
+            "querySelectorAll:(q)=>[],querySelector:()=>null};"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const exact=a.findResponseText('req-r');"
+            "const other=a.findResponseText('req-other');"
+            "console.log(exact.replace(/\\n/g,'<NL>')+'|'+other);"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            '[DEVORCH_WEB_SOL_RESPONSE req-r]<NL>{"decision":"NEXT"}|',
+        )
+
+    def test_userscript_roleless_probe_requires_second_marker_and_exact_probe_line(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "let bodyText='[DEVORCH_WEB_SOL_REQUEST probe:websol:conv:1:abc] health\\n'"
+            "+'[DEVORCH_WEB_SOL_RESPONSE probe:websol:conv:1:abc] prb-abcdef ok';"
+            "globalThis.document={body:{get innerText(){return bodyText;}},"
+            "querySelectorAll:(q)=>[],querySelector:()=>null};"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const one=a.findResponseText('probe:websol:conv:1:abc');"
+            "bodyText+='\\n[DEVORCH_WEB_SOL_RESPONSE probe:websol:conv:1:abc] prb-abcdef ok';"
+            "const two=a.findResponseText('probe:websol:conv:1:abc');"
+            "bodyText+='\\n[DEVORCH_WEB_SOL_RESPONSE probe:websol:conv:1:abc] arbitrary text';"
+            "const bad=a.findResponseText('probe:websol:conv:1:abc');"
+            "console.log(String(one)+'|'+two+'|'+String(bad));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            '|[DEVORCH_WEB_SOL_RESPONSE probe:websol:conv:1:abc] prb-abcdef ok|',
+        )
+
+    def test_userscript_finds_unique_global_semantic_send_outside_composer_ancestors(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "const composer={focus:()=>{},disabled:false,hidden:false,isConnected:true,getAttribute:()=>null,parentElement:null};"
+            "const send={disabled:false,innerText:'',getAttribute:(n)=>n==='aria-label'?'Send':null};"
+            "const send2={disabled:false,innerText:'',getAttribute:(n)=>n==='aria-label'?'Send message':null};"
+            "let globals=[send];"
+            "globalThis.document={"
+            "querySelector:(q)=>q==='#prompt-textarea'?composer:null,"
+            "querySelectorAll:(q)=>q==='button'?globals:[]};"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const one=a.findSendButton()===send;"
+            "globals=[send,send2];"
+            "const many=a.findSendButton()===null;"
+            "console.log(String(one)+'|'+String(many));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "true|true")
 
 
 if __name__ == "__main__":

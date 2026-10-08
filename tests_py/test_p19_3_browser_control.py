@@ -887,7 +887,7 @@ class UserscriptAdapterTests(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(len(data["requests"]), 2)
         claim = data["requests"][1]
-        self.assertEqual(claim["url"], "http://127.0.0.1:8770/api/v1/control/web-bridge/bootstrap/redeem")
+        self.assertEqual(claim["url"], "http://127.0.0.1:8750/api/v1/control/web-bridge/bootstrap/redeem")
         self.assertNotIn("?", claim["url"])
         self.assertEqual(json.loads(claim["data"]), {
             "project_id": "devorchestrator", "adapter": "chatgpt_web", "binding_id": "conv-live",

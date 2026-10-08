@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         DevOrchestrator ChatGPT Web binding adapter
-// @namespace    devorchestrator
-// @version      0.1.26
-// @description  Dumb ChatGPT Web adapter for bound read-only DevOrchestrator status plus paired 8770 conversation-presence heartbeat.
+// @name         DevOrchestrator Release ChatGPT Web binding adapter
+// @namespace    devorchestrator.release
+// @version      1.30
+// @description  Dumb ChatGPT Web adapter for the local release daemon on ports 8750/8751.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
 // @grant        GM_xmlhttpRequest
@@ -26,8 +26,8 @@
 (function (root) {
   "use strict";
 
-  var BRIDGE_BASE = "http://127.0.0.1:8765";
-  var CONTROL_BASE = "http://127.0.0.1:8770";
+  var BRIDGE_BASE = "http://127.0.0.1:8751";
+  var CONTROL_BASE = "http://127.0.0.1:8750";
   var ADAPTER_ID = "chatgpt_web";
   var CONVERSATION_PATH_RE = /\/c\/([A-Za-z0-9_-]+)/;
   var REQUEST_HEAD = "[DEVORCH_WEB_SOL_REQUEST ";
@@ -100,7 +100,7 @@
   var responseStability = { text: null, since: 0, ready: false };
 
 
-  var STATUS_ELEMENT_ID = "devorch-web-status";
+  var STATUS_ELEMENT_ID = "devorch-release-web-status";
   var lastHealthSnapshot = null;
   var lastHeartbeatTime = 0;
 
@@ -942,18 +942,84 @@
     try { localStorage.setItem(remoteSyncReloadStorageKey(bindingId, requestId), String(now)); } catch (err) {}
   }
 
+  function rolelessBodyText() {
+    if (typeof document === "undefined" || !document.body
+        || typeof document.body.innerText !== "string") {
+      return "";
+    }
+    var roleNodes = typeof document.querySelectorAll === "function"
+      ? document.querySelectorAll("[data-message-author-role]")
+      : [];
+    if (roleNodes && roleNodes.length !== 0) {
+      return "";
+    }
+    return document.body.innerText;
+  }
+
+  function composerText() {
+    try {
+      var composer = findComposer();
+      if (!composer) { return ""; }
+      if (typeof composer.innerText === "string") { return composer.innerText; }
+      if (typeof composer.textContent === "string") { return composer.textContent; }
+    } catch (err) {}
+    return "";
+  }
+
+  function extractCompleteJsonObject(text, startIndex) {
+    if (typeof text !== "string") { return ""; }
+    var open = text.indexOf("{", Math.max(0, startIndex || 0));
+    if (open === -1) { return ""; }
+    var depth = 0;
+    var inString = false;
+    var escaped = false;
+    for (var i = open; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+      } else if (ch === "{") {
+        depth += 1;
+      } else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          return text.slice(open, i + 1);
+        }
+        if (depth < 0) {
+          return "";
+        }
+      }
+    }
+    return "";
+  }
+
   function userMessageHasRequest(requestId) {
     if (typeof document === "undefined") {
       return false;
     }
     var marker = REQUEST_HEAD + requestId + "]";
-    var messages = document.querySelectorAll("[data-message-author-role='user']");
+    var messages = typeof document.querySelectorAll === "function"
+      ? document.querySelectorAll("[data-message-author-role='user']")
+      : [];
     for (var i = messages.length - 1; i >= 0; i--) {
       if ((messages[i].innerText || "").indexOf(marker) !== -1) {
         return true;
       }
     }
-    return false;
+    var bodyText = rolelessBodyText();
+    if (!bodyText || bodyText.indexOf(marker) === -1) {
+      return false;
+    }
+    return composerText().indexOf(marker) === -1;
   }
 
   function requestAlreadySubmitted(bindingId, requestId) {
@@ -1229,8 +1295,8 @@
 
   function registerControlPairingMenu() {
     if (typeof GM_registerMenuCommand !== "function") { return; }
-    GM_registerMenuCommand("Pair DevOrchestrator 8770 heartbeat", function () {
-      var raw = typeof root.prompt === "function" ? root.prompt("Paste pairing-id:code from the 8770 dashboard") : "";
+    GM_registerMenuCommand("Pair DevOrchestrator Release 8750 heartbeat", function () {
+      var raw = typeof root.prompt === "function" ? root.prompt("Paste pairing-id:code from the 8750 dashboard") : "";
       redeemControlPairing(raw || "").then(function (ok) {
         if (typeof root.alert === "function") { root.alert(ok ? "DevOrchestrator heartbeat paired" : "Pairing failed"); }
       });
@@ -1457,6 +1523,23 @@
       if (primary.length === 1) { return primary[0]; }
       if (primary.length > 1) { return null; }
     }
+
+    // Current ChatGPT layouts can place the composer control button outside
+    // the composer's nearby ancestor subtree. Fall back only when the whole
+    // document contains exactly one enabled semantic Send/Submit button.
+    // Zero or multiple candidates fail closed.
+    if (typeof document.querySelectorAll === "function") {
+      var globalButtons = document.querySelectorAll("button");
+      var globalSemantic = [];
+      for (var g = 0; g < globalButtons.length; g++) {
+        if (isSemanticSendButton(globalButtons[g])) {
+          globalSemantic.push(globalButtons[g]);
+        }
+      }
+      if (globalSemantic.length === 1) {
+        return globalSemantic[0];
+      }
+    }
     return null;
   }
 
@@ -1497,13 +1580,17 @@
 
   function findResponseText(requestId) {
     if (typeof document === "undefined") { return ""; }
-    var assistants = document.querySelectorAll("[data-message-author-role='assistant']");
+    var assistants = typeof document.querySelectorAll === "function"
+      ? document.querySelectorAll("[data-message-author-role='assistant']")
+      : [];
     for (var i = assistants.length - 1; i >= 0; i--) {
       var messageText = assistants[i].innerText || "";
       if (responseMatches(messageText, requestId)) { return messageText; }
     }
     var marker = REQUEST_HEAD + requestId + "]";
-    var turns = document.querySelectorAll("[data-message-author-role]");
+    var turns = typeof document.querySelectorAll === "function"
+      ? document.querySelectorAll("[data-message-author-role]")
+      : [];
     var seenExactRequest = false;
     for (var j = 0; j < turns.length; j++) {
       var turn = turns[j];
@@ -1517,7 +1604,30 @@
         return RESPONSE_HEAD + requestId + "]\n" + text;
       }
     }
-    return "";
+    if (turns && turns.length !== 0) { return ""; }
+    var bodyText = rolelessBodyText();
+    var responseMarker = RESPONSE_HEAD + requestId + "]";
+    if (!bodyText) { return ""; }
+    var firstResponseMarker = bodyText.indexOf(responseMarker);
+    var lastResponseMarker = bodyText.lastIndexOf(responseMarker);
+    if (firstResponseMarker === -1 || lastResponseMarker === firstResponseMarker) {
+      return "";
+    }
+
+    var responseTailStart = lastResponseMarker + responseMarker.length;
+    var responseTail = bodyText.slice(responseTailStart, responseTailStart + 512);
+
+    if (requestId.indexOf("probe:websol:") === 0) {
+      var firstLine = responseTail.split(/\r?\n/, 1)[0].trim();
+      if (/^prb-[A-Za-z0-9_-]{6,128}\s+ok$/.test(firstLine)) {
+        return responseMarker + " " + firstLine;
+      }
+      return "";
+    }
+
+    var jsonText = extractCompleteJsonObject(bodyText, responseTailStart);
+    if (!jsonText) { return ""; }
+    return responseMarker + "\n" + jsonText;
   }
 
   function schedule(fn, delayMs) {
@@ -1776,13 +1886,13 @@
       return null;
     }
 
-    var existing = document.getElementById("devorch-confirm-modal");
+    var existing = document.getElementById("devorch-release-confirm-modal");
     if (existing && existing.parentNode) {
       existing.parentNode.removeChild(existing);
     }
 
     var overlay = document.createElement("div");
-    overlay.id = "devorch-confirm-modal";
+    overlay.id = "devorch-release-confirm-modal";
     overlay.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:2147483646;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,sans-serif;";
 
     var modal = document.createElement("div");
