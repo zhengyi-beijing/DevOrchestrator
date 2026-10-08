@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DevOrchestrator Release ChatGPT Web binding adapter
 // @namespace    devorchestrator.release
-// @version      1.30
+// @version      1.33
 // @description  Dumb ChatGPT Web adapter for the local release daemon on ports 8750/8751.
 // @author       DevOrchestrator
 // @match        https://chatgpt.com/*
@@ -71,6 +71,14 @@
   var resultConfirmSuccessCount = 0;
   var lastResultSubmitRequestId = null;
   var lastResultSubmitStage = "idle";
+  var lastResolvedSendPath = "none";
+  var lastResolvedSendSurface = "none";
+  var lastWebSolSubmitPath = "none";
+  var lastWebSolSubmitRequestId = null;
+  var lastWebSolUserTurnEvidence = "none";
+  var lastWebSolUserTurnRequestId = null;
+  var webSolSubmitAttemptCount = 0;
+  var webSolUserTurnConfirmCount = 0;
   var POLL_MS = 1500;
   var RENEW_INTERVAL_MS = 20000;
   var WAIT_DEADLINE_MS = 15 * 60 * 1000;
@@ -942,18 +950,115 @@
     try { localStorage.setItem(remoteSyncReloadStorageKey(bindingId, requestId), String(now)); } catch (err) {}
   }
 
+  function collectComposedQueryRoots() {
+    if (typeof document === "undefined") { return []; }
+    var roots = [document];
+    var pending = [document];
+    var seen = [];
+    var maxRoots = 32;
+    var maxElementsPerRoot = 10000;
+
+    function enqueue(rootNode) {
+      if (!rootNode || roots.indexOf(rootNode) !== -1 || pending.indexOf(rootNode) !== -1) { return; }
+      if (roots.length + pending.length >= maxRoots) { return; }
+      pending.push(rootNode);
+    }
+
+    while (pending.length > 0 && roots.length <= maxRoots) {
+      var rootNode = pending.shift();
+      if (!rootNode || seen.indexOf(rootNode) !== -1) { continue; }
+      seen.push(rootNode);
+      if (roots.indexOf(rootNode) === -1) { roots.push(rootNode); }
+
+      var elements = [];
+      try {
+        elements = typeof rootNode.querySelectorAll === "function" ? rootNode.querySelectorAll("*") : [];
+      } catch (err) {
+        elements = [];
+      }
+      var count = Math.min(elements ? elements.length : 0, maxElementsPerRoot);
+      for (var i = 0; i < count; i++) {
+        var element = elements[i];
+        if (!element) { continue; }
+        if (element.shadowRoot) {
+          enqueue(element.shadowRoot);
+        }
+        var tagName = typeof element.tagName === "string" ? element.tagName.toUpperCase() : "";
+        if (tagName === "IFRAME") {
+          try {
+            if (element.contentDocument) { enqueue(element.contentDocument); }
+          } catch (err2) {}
+        }
+      }
+    }
+    return roots.slice(0, maxRoots);
+  }
+
+  function querySelectorAllComposed(selector) {
+    var roots = collectComposedQueryRoots();
+    var result = [];
+    for (var r = 0; r < roots.length; r++) {
+      var nodes = [];
+      try {
+        nodes = typeof roots[r].querySelectorAll === "function" ? roots[r].querySelectorAll(selector) : [];
+      } catch (err) {
+        nodes = [];
+      }
+      for (var i = 0; nodes && i < nodes.length; i++) {
+        if (result.indexOf(nodes[i]) === -1) { result.push(nodes[i]); }
+      }
+    }
+    return result;
+  }
+
+  function querySelectorComposed(selector) {
+    var roots = collectComposedQueryRoots();
+    for (var r = 0; r < roots.length; r++) {
+      try {
+        if (typeof roots[r].querySelector === "function") {
+          var found = roots[r].querySelector(selector);
+          if (found) { return found; }
+        }
+      } catch (err) {}
+      try {
+        if (typeof roots[r].querySelectorAll === "function") {
+          var nodes = roots[r].querySelectorAll(selector);
+          if (nodes && nodes.length) { return nodes[0]; }
+        }
+      } catch (err2) {}
+    }
+    return null;
+  }
+
+  function rolelessTextSurfaces() {
+    if (typeof document === "undefined") { return []; }
+    var roleNodes = querySelectorAllComposed("[data-message-author-role]");
+    if (roleNodes && roleNodes.length !== 0) { return []; }
+
+    var roots = collectComposedQueryRoots();
+    var surfaces = [];
+    for (var r = 0; r < roots.length; r++) {
+      var text = "";
+      var rootNode = roots[r];
+      try {
+        if (rootNode.body && typeof rootNode.body.innerText === "string") {
+          text = rootNode.body.innerText;
+        } else if (rootNode.host && typeof rootNode.host.innerText === "string") {
+          text = rootNode.host.innerText;
+        }
+      } catch (err) {
+        text = "";
+      }
+      if (text && surfaces.indexOf(text) === -1) {
+        surfaces.push(text);
+      }
+    }
+    return surfaces;
+  }
+
   function rolelessBodyText() {
-    if (typeof document === "undefined" || !document.body
-        || typeof document.body.innerText !== "string") {
-      return "";
-    }
-    var roleNodes = typeof document.querySelectorAll === "function"
-      ? document.querySelectorAll("[data-message-author-role]")
-      : [];
-    if (roleNodes && roleNodes.length !== 0) {
-      return "";
-    }
-    return document.body.innerText;
+    var surfaces = rolelessTextSurfaces();
+    return surfaces.length ? surfaces.join("\n") : "";
   }
 
   function composerText() {
@@ -1002,33 +1107,46 @@
     return "";
   }
 
-  function userMessageHasRequest(requestId) {
+  function userMessageRequestEvidence(requestId) {
     if (typeof document === "undefined") {
-      return false;
+      return "none";
     }
     var marker = REQUEST_HEAD + requestId + "]";
-    var messages = typeof document.querySelectorAll === "function"
-      ? document.querySelectorAll("[data-message-author-role='user']")
-      : [];
+    var messages = querySelectorAllComposed("[data-message-author-role='user']");
     for (var i = messages.length - 1; i >= 0; i--) {
       if ((messages[i].innerText || "").indexOf(marker) !== -1) {
-        return true;
+        return "role_user";
       }
     }
-    var bodyText = rolelessBodyText();
-    if (!bodyText || bodyText.indexOf(marker) === -1) {
-      return false;
+    var surfaces = rolelessTextSurfaces();
+    if (!surfaces.length || composerText().indexOf(marker) !== -1) {
+      return "none";
     }
-    return composerText().indexOf(marker) === -1;
+    for (var s = 0; s < surfaces.length; s++) {
+      if (surfaces[s].indexOf(marker) !== -1) {
+        return "roleless_surface";
+      }
+    }
+    return "none";
+  }
+
+  function userMessageHasRequest(requestId) {
+    return userMessageRequestEvidence(requestId) !== "none";
   }
 
   function requestAlreadySubmitted(bindingId, requestId) {
     // A localStorage mark is only telemetry. It is not submission authority:
     // a click can leave text in ChatGPT's conversationDrafts without creating
     // a real user turn. Only live user-message DOM evidence proves submission.
-    if (!userMessageHasRequest(requestId)) {
+    var evidence = userMessageRequestEvidence(requestId);
+    if (evidence === "none") {
       return false;
     }
+    if (lastWebSolUserTurnRequestId !== requestId) {
+      webSolUserTurnConfirmCount = Math.min(webSolUserTurnConfirmCount + 1, 10000);
+    }
+    lastWebSolUserTurnEvidence = evidence;
+    lastWebSolUserTurnRequestId = requestId.slice(0, 128);
     markRequestSubmitted(bindingId, requestId);
     return true;
   }
@@ -1041,6 +1159,7 @@
     advanceResponseStability: advanceResponseStability,
     classifyRenewResult: classifyRenewResult,
     requestAlreadySubmitted: requestAlreadySubmitted,
+    userMessageRequestEvidence: userMessageRequestEvidence,
     userMessageHasRequest: userMessageHasRequest,
     markRequestSubmitted: markRequestSubmitted,
     shouldRemoteSyncReload: shouldRemoteSyncReload,
@@ -1064,6 +1183,7 @@
     updateAdapterStatusDemoting: updateAdapterStatusDemoting,
     sendControlHeartbeat: sendControlHeartbeat,
     redeemControlPairing: redeemControlPairing,
+    importHeartbeatCapability: importHeartbeatCapability,
     redeemBrowserControlBootstrap: redeemBrowserControlBootstrap,
     parseActionEnvelope: parseActionEnvelope,
     validateActionEnvelope: validateActionEnvelope,
@@ -1177,6 +1297,13 @@
       scheduleControlHeartbeat(0);
       return true;
     });
+  }
+
+  function importHeartbeatCapability(raw) {
+    var fields = pairingFields(raw);
+    if (!fields) { return false; }
+    saveCapability(fields.code, fields.pairing_id);
+    return true;
   }
 
   function redeemBrowserControlBootstrap(projectId, bindingId, heartbeatCapability) {
@@ -1301,6 +1428,16 @@
         if (typeof root.alert === "function") { root.alert(ok ? "DevOrchestrator heartbeat paired" : "Pairing failed"); }
       });
     });
+    GM_registerMenuCommand("Import DevOrchestrator Release heartbeat capability", function () {
+      var raw = typeof root.prompt === "function"
+        ? root.prompt("Paste pairing-id:capability from the local Release operator")
+        : "";
+      var ok = importHeartbeatCapability(raw || "");
+      if (ok) { scheduleControlHeartbeat(0); }
+      if (typeof root.alert === "function") {
+        root.alert(ok ? "DevOrchestrator heartbeat capability imported" : "Capability import failed");
+      }
+    });
     GM_registerMenuCommand("Forget DevOrchestrator heartbeat capability", clearCapability);
     GM_registerMenuCommand("Pair DevOrchestrator read-only control", function () {
       var raw = typeof root.prompt === "function" ? root.prompt("Paste the project-and-conversation-bound WebBridge capability token from DevOrchestrator:") : "";
@@ -1410,10 +1547,10 @@
 
   function findComposer() {
     if (typeof document === "undefined") { return null; }
-    var legacy = document.querySelector("#prompt-textarea");
+    var legacy = querySelectorComposed("#prompt-textarea");
     if (legacy) { return legacy; }
 
-    var editables = document.querySelectorAll("[contenteditable='true']");
+    var editables = querySelectorAllComposed("[contenteditable='true']");
     if (!editables || editables.length !== 1) { return null; }
     var fallback = editables[0];
     if (!fallback || typeof fallback.focus !== "function" || fallback.disabled
@@ -1426,18 +1563,20 @@
 
   function setComposerText(composer, text) {
     composer.focus();
-    // Replace the entire composer, never append to a stale ChatGPT draft.
-    // The old adapter could leave Pn+1 concatenated after Pn, then mistake the
-    // click for a successful submission.
+    // Composer may live inside an open shadow root or same-origin iframe.
+    // Always use its owning document/view for selection, execCommand and input.
+    var ownerDocument = composer.ownerDocument || document;
+    var ownerView = ownerDocument.defaultView || (typeof window !== "undefined" ? window : null);
     try {
-      if (typeof window !== "undefined" && window.getSelection && document.createRange) {
-        var selection = window.getSelection();
-        var range = document.createRange();
+      if (ownerView && ownerView.getSelection && ownerDocument.createRange) {
+        var selection = ownerView.getSelection();
+        var range = ownerDocument.createRange();
         range.selectNodeContents(composer);
         selection.removeAllRanges();
         selection.addRange(range);
       }
-      if (document.execCommand("insertText", false, text)) {
+      if (typeof ownerDocument.execCommand === "function"
+          && ownerDocument.execCommand("insertText", false, text)) {
         return true;
       }
     } catch (err) {
@@ -1445,8 +1584,11 @@
     }
     composer.textContent = "";
     composer.textContent = text;
-    if (typeof InputEvent === "function") {
-      composer.dispatchEvent(new InputEvent("input", {
+    var InputEventCtor = ownerView && ownerView.InputEvent
+      ? ownerView.InputEvent
+      : (typeof InputEvent === "function" ? InputEvent : null);
+    if (InputEventCtor) {
+      composer.dispatchEvent(new InputEventCtor("input", {
         bubbles: true,
         inputType: "insertText",
         data: text
@@ -1498,29 +1640,108 @@
     return classText.indexOf("bg-composer-primary") !== -1;
   }
 
-  function findSendButton() {
-    var legacy = document.querySelector("button[data-testid='send-button']");
-    if (legacy && !legacy.disabled && !isStopComposerButton(legacy)) { return legacy; }
+  function usableSendControl(control) {
+    return control && !control.disabled
+      && (!control.getAttribute || control.getAttribute("aria-disabled") !== "true")
+      && !isStopComposerButton(control);
+  }
 
-    var composerSubmit = document.querySelector("button#composer-submit-button");
-    if (composerSubmit && !composerSubmit.disabled && !isStopComposerButton(composerSubmit)) {
-      return composerSubmit;
+  function elementSurface(element) {
+    if (!element || typeof document === "undefined") { return "none"; }
+    var ownerDocument = element.ownerDocument || document;
+    if (ownerDocument !== document) { return "same_origin_iframe"; }
+    try {
+      var rootNode = typeof element.getRootNode === "function" ? element.getRootNode() : ownerDocument;
+      if (rootNode && rootNode.host) { return "open_shadow_root"; }
+    } catch (err) {}
+    return "document";
+  }
+
+  function rememberSendControl(control, path) {
+    lastResolvedSendPath = path;
+    lastResolvedSendSurface = elementSurface(control);
+    return control;
+  }
+
+  function semanticControlsWithin(root) {
+    if (!root || typeof root.querySelectorAll !== "function") { return []; }
+    var selectors = ["button", "[role='button']", "input[type='submit']"];
+    var controls = [];
+    for (var s = 0; s < selectors.length; s++) {
+      var found = root.querySelectorAll(selectors[s]);
+      for (var i = 0; found && i < found.length; i++) {
+        if (controls.indexOf(found[i]) === -1 && isSemanticSendButton(found[i])) {
+          controls.push(found[i]);
+        }
+      }
+    }
+    return controls;
+  }
+
+  function semanticControlsComposed() {
+    var roots = collectComposedQueryRoots();
+    var controls = [];
+    for (var r = 0; r < roots.length; r++) {
+      var found = semanticControlsWithin(roots[r]);
+      for (var i = 0; i < found.length; i++) {
+        if (controls.indexOf(found[i]) === -1) { controls.push(found[i]); }
+      }
+    }
+    return controls;
+  }
+
+  function findComposerFormSubmitControl(composer) {
+    var form = composer && typeof composer.closest === "function" ? composer.closest("form") : null;
+    if (!form || typeof form.querySelectorAll !== "function") { return null; }
+    var candidates = [];
+    var controls = form.querySelectorAll("button,input[type='submit']");
+    for (var i = 0; controls && i < controls.length; i++) {
+      var control = controls[i];
+      var tagName = typeof control.tagName === "string" ? control.tagName.toLowerCase() : "";
+      var type = typeof control.type === "string" ? control.type.toLowerCase() : "";
+      if (!type && control.getAttribute) { type = (control.getAttribute("type") || "").toLowerCase(); }
+      var isNativeSubmit = tagName === "input" || (tagName === "button" && (!type || type === "submit"));
+      if (isNativeSubmit && usableSendControl(control) && candidates.indexOf(control) === -1) {
+        candidates.push(control);
+      }
+    }
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  function findSendButton() {
+    lastResolvedSendPath = "none";
+    lastResolvedSendSurface = "none";
+    // Recent ChatGPT builds have changed this control between a native button
+    // and a role=button wrapper. Match the stable identity without assuming
+    // the element tag.
+    var legacy = querySelectorComposed("[data-testid='send-button']")
+      || querySelectorComposed("button[data-testid='send-button']");
+    if (usableSendControl(legacy)) { return rememberSendControl(legacy, "send_testid"); }
+
+    var composerSubmit = querySelectorComposed("#composer-submit-button")
+      || querySelectorComposed("button#composer-submit-button")
+      || querySelectorComposed("[data-testid='composer-submit-button']");
+    if (usableSendControl(composerSubmit)) {
+      return rememberSendControl(composerSubmit, "composer_submit_identity");
     }
 
     var composer = findComposer();
+    var formSubmit = findComposerFormSubmitControl(composer);
+    if (formSubmit) {
+      return rememberSendControl(formSubmit, "composer_form_submit_control");
+    }
     var container = composer && composer.parentElement;
     for (var depth = 0; container && depth < 4; depth += 1, container = container.parentElement) {
       if (typeof container.querySelectorAll !== "function") { continue; }
       var buttons = container.querySelectorAll("button");
-      var semantic = [];
+      var semantic = semanticControlsWithin(container);
       var primary = [];
       for (var i = 0; i < buttons.length; i++) {
-        if (isSemanticSendButton(buttons[i])) { semantic.push(buttons[i]); }
         if (isComposerPrimaryButton(buttons[i])) { primary.push(buttons[i]); }
       }
-      if (semantic.length === 1) { return semantic[0]; }
+      if (semantic.length === 1) { return rememberSendControl(semantic[0], "composer_ancestor_semantic"); }
       if (semantic.length > 1) { return null; }
-      if (primary.length === 1) { return primary[0]; }
+      if (primary.length === 1) { return rememberSendControl(primary[0], "composer_ancestor_primary"); }
       if (primary.length > 1) { return null; }
     }
 
@@ -1529,15 +1750,9 @@
     // document contains exactly one enabled semantic Send/Submit button.
     // Zero or multiple candidates fail closed.
     if (typeof document.querySelectorAll === "function") {
-      var globalButtons = document.querySelectorAll("button");
-      var globalSemantic = [];
-      for (var g = 0; g < globalButtons.length; g++) {
-        if (isSemanticSendButton(globalButtons[g])) {
-          globalSemantic.push(globalButtons[g]);
-        }
-      }
+      var globalSemantic = semanticControlsComposed();
       if (globalSemantic.length === 1) {
-        return globalSemantic[0];
+        return rememberSendControl(globalSemantic[0], "global_semantic");
       }
     }
     return null;
@@ -1547,6 +1762,40 @@
     var send = findSendButton();
     if (send && !send.disabled) {
       send.click();
+      lastWebSolSubmitPath = lastResolvedSendPath;
+      return true;
+    }
+    var composer = findComposer();
+    var form = composer && typeof composer.closest === "function" ? composer.closest("form") : null;
+    if (form && typeof form.requestSubmit === "function") {
+      // requestSubmit follows the browser's normal form-submission path and
+      // reaches React's onSubmit handler even when the visible control is an
+      // icon-only/custom element that cannot be identified safely.
+      try {
+        form.requestSubmit();
+        lastWebSolSubmitPath = "form_request_submit";
+        return true;
+      } catch (err) {}
+    }
+    if (composer && typeof composer.dispatchEvent === "function") {
+      // Last-resort compatibility path for composer implementations that own
+      // Enter handling directly. Use the composer's own browsing context so
+      // same-origin iframe composers receive events from the correct realm.
+      var ownerDocument = composer.ownerDocument || document;
+      var ownerView = ownerDocument.defaultView || (typeof window !== "undefined" ? window : null);
+      var KeyboardEventCtor = ownerView && ownerView.KeyboardEvent
+        ? ownerView.KeyboardEvent
+        : (typeof KeyboardEvent === "function" ? KeyboardEvent : null);
+      if (!KeyboardEventCtor) { return false; }
+      composer.dispatchEvent(new KeyboardEventCtor("keydown", {
+        key: "Enter", code: "Enter", keyCode: 13, which: 13,
+        bubbles: true, cancelable: true
+      }));
+      composer.dispatchEvent(new KeyboardEventCtor("keyup", {
+        key: "Enter", code: "Enter", keyCode: 13, which: 13,
+        bubbles: true, cancelable: true
+      }));
+      lastWebSolSubmitPath = "keyboard_enter";
       return true;
     }
     return false;
@@ -1566,6 +1815,8 @@
 
   function submitWhenReady(bindingId, claim, submitDeadline) {
     if (clickSendButton()) {
+      webSolSubmitAttemptCount = Math.min(webSolSubmitAttemptCount + 1, 10000);
+      lastWebSolSubmitRequestId = claim.request_id.slice(0, 128);
       setAdapterStatus("CLAIMED", "Send clicked; confirming user turn");
       confirmSubmission(bindingId, claim, Date.now() + SUBMISSION_CONFIRM_MS);
       return;
@@ -1580,17 +1831,13 @@
 
   function findResponseText(requestId) {
     if (typeof document === "undefined") { return ""; }
-    var assistants = typeof document.querySelectorAll === "function"
-      ? document.querySelectorAll("[data-message-author-role='assistant']")
-      : [];
+    var assistants = querySelectorAllComposed("[data-message-author-role='assistant']");
     for (var i = assistants.length - 1; i >= 0; i--) {
       var messageText = assistants[i].innerText || "";
       if (responseMatches(messageText, requestId)) { return messageText; }
     }
     var marker = REQUEST_HEAD + requestId + "]";
-    var turns = typeof document.querySelectorAll === "function"
-      ? document.querySelectorAll("[data-message-author-role]")
-      : [];
+    var turns = querySelectorAllComposed("[data-message-author-role]");
     var seenExactRequest = false;
     for (var j = 0; j < turns.length; j++) {
       var turn = turns[j];
@@ -1605,29 +1852,35 @@
       }
     }
     if (turns && turns.length !== 0) { return ""; }
-    var bodyText = rolelessBodyText();
+
     var responseMarker = RESPONSE_HEAD + requestId + "]";
-    if (!bodyText) { return ""; }
-    var firstResponseMarker = bodyText.indexOf(responseMarker);
-    var lastResponseMarker = bodyText.lastIndexOf(responseMarker);
-    if (firstResponseMarker === -1 || lastResponseMarker === firstResponseMarker) {
-      return "";
-    }
-
-    var responseTailStart = lastResponseMarker + responseMarker.length;
-    var responseTail = bodyText.slice(responseTailStart, responseTailStart + 512);
-
-    if (requestId.indexOf("probe:websol:") === 0) {
-      var firstLine = responseTail.split(/\r?\n/, 1)[0].trim();
-      if (/^prb-[A-Za-z0-9_-]{6,128}\s+ok$/.test(firstLine)) {
-        return responseMarker + " " + firstLine;
+    var surfaces = rolelessTextSurfaces();
+    for (var s = 0; s < surfaces.length; s++) {
+      var bodyText = surfaces[s];
+      if (!bodyText) { continue; }
+      var firstResponseMarker = bodyText.indexOf(responseMarker);
+      var lastResponseMarker = bodyText.lastIndexOf(responseMarker);
+      if (firstResponseMarker === -1 || lastResponseMarker === firstResponseMarker) {
+        continue;
       }
-      return "";
-    }
 
-    var jsonText = extractCompleteJsonObject(bodyText, responseTailStart);
-    if (!jsonText) { return ""; }
-    return responseMarker + "\n" + jsonText;
+      var responseTailStart = lastResponseMarker + responseMarker.length;
+      var responseTail = bodyText.slice(responseTailStart, responseTailStart + 512);
+
+      if (requestId.indexOf("probe:websol:") === 0) {
+        var firstLine = responseTail.split(/\r?\n/, 1)[0].trim();
+        if (/^prb-[A-Za-z0-9_-]{6,128}\s+ok$/.test(firstLine)) {
+          return responseMarker + " " + firstLine;
+        }
+        continue;
+      }
+
+      var jsonText = extractCompleteJsonObject(bodyText, responseTailStart);
+      if (jsonText) {
+        return responseMarker + "\n" + jsonText;
+      }
+    }
+    return "";
   }
 
   function schedule(fn, delayMs) {
@@ -2147,6 +2400,35 @@
       ? document.body.innerText
       : "";
     var shadowTelemetry = collectOpenShadowTelemetry(allElements);
+    var composer = findComposer();
+    var composerKind = "none";
+    var composerSurface = elementSurface(composer);
+    if (composer) {
+      var composerId = composer.id || (composer.getAttribute && composer.getAttribute("id")) || "";
+      var composerTag = typeof composer.tagName === "string" ? composer.tagName.toLowerCase() : "";
+      if (composerId === "prompt-textarea") {
+        composerKind = "prompt_textarea";
+      } else if (composerTag === "textarea") {
+        composerKind = "textarea";
+      } else if (!composer.getAttribute || composer.getAttribute("contenteditable") === "true") {
+        composerKind = "contenteditable";
+      } else {
+        composerKind = "other";
+      }
+    }
+    var discoveredSendControl = findSendButton();
+    var submitCandidatePath = lastResolvedSendPath;
+    var submitCandidateSurface = lastResolvedSendSurface;
+    if (!discoveredSendControl && composer && typeof composer.closest === "function") {
+      var composerForm = composer.closest("form");
+      if (composerForm && typeof composerForm.requestSubmit === "function") {
+        submitCandidatePath = "form_request_submit";
+        submitCandidateSurface = elementSurface(composerForm);
+      } else if (typeof composer.dispatchEvent === "function") {
+        submitCandidatePath = "keyboard_enter";
+        submitCandidateSurface = composerSurface;
+      }
+    }
 
     var firstAssistant = Math.max(0, assistants.length - assistantCount);
     for (var i = firstAssistant; i < assistants.length; i++) {
@@ -2202,6 +2484,16 @@
       textarea_count: selectorCount("textarea"),
       legacy_send_button_count: selectorCount("button[data-testid='send-button']"),
       composer_submit_button_count: selectorCount("button#composer-submit-button"),
+      composer_kind: composerKind,
+      composer_surface: composerSurface,
+      submit_candidate_path: submitCandidatePath,
+      submit_candidate_surface: submitCandidateSurface,
+      websol_submit_attempt_count: webSolSubmitAttemptCount,
+      websol_user_turn_confirm_count: webSolUserTurnConfirmCount,
+      last_websol_submit_path: lastWebSolSubmitPath,
+      last_websol_submit_request_id: lastWebSolSubmitRequestId,
+      last_websol_user_turn_evidence: lastWebSolUserTurnEvidence,
+      last_websol_user_turn_request_id: lastWebSolUserTurnRequestId,
       result_submit_attempt_count: resultSubmitAttemptCount,
       result_composer_found_count: resultComposerFoundCount,
       result_composer_prepared_count: resultComposerPreparedCount,

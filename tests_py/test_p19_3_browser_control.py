@@ -538,6 +538,16 @@ class UserscriptAdapterTests(unittest.TestCase):
         self.assertEqual(telemetry["textarea_count"], 1)
         self.assertEqual(telemetry["legacy_send_button_count"], 0)
         self.assertEqual(telemetry["composer_submit_button_count"], 1)
+        self.assertEqual(telemetry["composer_kind"], "contenteditable")
+        self.assertEqual(telemetry["composer_surface"], "document")
+        self.assertEqual(telemetry["submit_candidate_path"], "send_testid")
+        self.assertEqual(telemetry["submit_candidate_surface"], "document")
+        self.assertEqual(telemetry["websol_submit_attempt_count"], 0)
+        self.assertEqual(telemetry["websol_user_turn_confirm_count"], 0)
+        self.assertEqual(telemetry["last_websol_submit_path"], "none")
+        self.assertIsNone(telemetry["last_websol_submit_request_id"])
+        self.assertEqual(telemetry["last_websol_user_turn_evidence"], "none")
+        self.assertIsNone(telemetry["last_websol_user_turn_request_id"])
         self.assertEqual(telemetry["result_submit_attempt_count"], 0)
         self.assertEqual(telemetry["result_composer_found_count"], 0)
         self.assertEqual(telemetry["result_composer_prepared_count"], 0)
@@ -1590,6 +1600,16 @@ class BridgeHTTPServerIntegrationTests(unittest.TestCase):
                 "textarea_count": 1,
                 "legacy_send_button_count": 0,
                 "composer_submit_button_count": 1,
+                "composer_kind": "contenteditable",
+                "composer_surface": "open_shadow_root",
+                "submit_candidate_path": "send_testid",
+                "submit_candidate_surface": "open_shadow_root",
+                "websol_submit_attempt_count": 2,
+                "websol_user_turn_confirm_count": 1,
+                "last_websol_submit_path": "send_testid",
+                "last_websol_submit_request_id": "probe:websol:conv-1:1:abc",
+                "last_websol_user_turn_evidence": "roleless_surface",
+                "last_websol_user_turn_request_id": "probe:websol:conv-1:1:abc",
                 "result_submit_attempt_count": 4,
                 "result_composer_found_count": 3,
                 "result_composer_prepared_count": 2,
@@ -1639,6 +1659,16 @@ class BridgeHTTPServerIntegrationTests(unittest.TestCase):
             ("roleless_fallback_dispatch_count", 10_001),
             ("prompt_textarea_count", 10_001),
             ("contenteditable_count", True),
+            ("composer_kind", "message_text"),
+            ("composer_surface", "closed_shadow_root"),
+            ("submit_candidate_path", "javascript_eval"),
+            ("submit_candidate_surface", "cross_origin_iframe"),
+            ("websol_submit_attempt_count", 10_001),
+            ("websol_user_turn_confirm_count", True),
+            ("last_websol_submit_path", "direct_dom_mutation"),
+            ("last_websol_submit_request_id", "x" * 129),
+            ("last_websol_user_turn_evidence", "claim_only"),
+            ("last_websol_user_turn_request_id", "x" * 129),
             ("result_submit_attempt_count", 10_001),
             ("result_composer_found_count", 5),
             ("result_confirm_success_count", 2),

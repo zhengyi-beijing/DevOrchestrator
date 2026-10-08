@@ -149,7 +149,7 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('// @name         DevOrchestrator Release ChatGPT Web binding adapter', source)
         self.assertIn('// @namespace    devorchestrator.release', source)
-        self.assertIn('// @version      1.30', source)
+        self.assertIn('// @version      1.33', source)
         self.assertIn('// @grant        GM_notification', source)
         self.assertIn('notification.attention !== "urgent"', source)
         self.assertIn('GM_notification({', source)
@@ -215,6 +215,29 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         self.assertNotIn("Authorization", payload["requests"][0]["headers"])
         self.assertEqual(payload["requests"][1]["headers"]["Authorization"], "Bearer scoped-cap")
         self.assertEqual(payload["requests"][1]["data"]["binding_id"], "conv")
+
+    def test_userscript_imports_owner_supplied_heartbeat_capability_without_origin_exchange(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('Import DevOrchestrator Release heartbeat capability', source)
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "const values={};"
+            "globalThis.GM_getValue=(k,d)=>Object.prototype.hasOwnProperty.call(values,k)?values[k]:d;"
+            "globalThis.GM_setValue=(k,v)=>{values[k]=v};"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const ok=a.importHeartbeatCapability('pair-release:heartbeat-secret');"
+            "const bad=a.importHeartbeatCapability('invalid');"
+            "console.log(JSON.stringify({ok,bad,record:JSON.parse(values['devorch:control:heartbeat-capability'])}));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["bad"])
+        self.assertEqual(payload["record"]["pairing_id"], "pair-release")
+        self.assertEqual(payload["record"]["token"], "heartbeat-secret")
 
     def test_userscript_redeems_bootstrap_into_gm_storage_only(self):
         script = SCRIPT.as_posix()
@@ -482,6 +505,137 @@ class ChatGptWebAdapterTests(unittest.TestCase):
         result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "true|true")
+
+    def test_userscript_accepts_non_button_send_identity_and_role_button(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "const tagged={disabled:false,innerText:'',getAttribute:(n)=>n==='data-testid'?'send-button':null};"
+            "const roleSend={disabled:false,innerText:'',getAttribute:(n)=>n==='aria-label'?'Send prompt':(n==='role'?'button':null)};"
+            "let direct=tagged; let roles=[];"
+            "globalThis.document={"
+            "querySelector:(q)=>q===\"[data-testid='send-button']\"?direct:null,"
+            "querySelectorAll:(q)=>q===\"[role='button']\"?roles:[]};"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const identity=a.findSendButton()===tagged;"
+            "direct=null; roles=[roleSend];"
+            "const semantic=a.findSendButton()===roleSend;"
+            "console.log(String(identity)+'|'+String(semantic));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "true|true")
+
+    def test_userscript_uses_form_submission_when_send_control_is_not_discoverable(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "let submitted=0;"
+            "const form={requestSubmit:()=>{submitted+=1}};"
+            "const composer={focus:()=>{},disabled:false,hidden:false,isConnected:true,getAttribute:()=>null,"
+            "parentElement:null,closest:(q)=>q==='form'?form:null};"
+            "globalThis.document={querySelector:(q)=>q==='#prompt-textarea'?composer:null,querySelectorAll:()=>[]};"
+            "require(" + json.dumps(script) + ");"
+            "const ok=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__.clickSendButton();"
+            "console.log(String(ok)+'|'+String(submitted));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "true|1")
+
+    def test_userscript_clicks_unique_icon_only_native_submit_in_composer_form(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "let clicks=0;"
+            "const submit={tagName:'BUTTON',type:'submit',disabled:false,innerText:'',"
+            "getAttribute:()=>null,click:()=>{clicks+=1}};"
+            "const form={querySelectorAll:(q)=>q===\"button,input[type='submit']\"?[submit]:[],parentElement:null};"
+            "const composer={focus:()=>{},disabled:false,hidden:false,isConnected:true,getAttribute:(n)=>n==='contenteditable'?'true':null,"
+            "parentElement:form,closest:(q)=>q==='form'?form:null};"
+            "globalThis.document={querySelector:(q)=>q==='#prompt-textarea'?composer:null,querySelectorAll:()=>[]};"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const found=a.findSendButton()===submit; const clicked=a.clickSendButton();"
+            "console.log(String(found)+'|'+String(clicked)+'|'+String(clicks));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "true|true|1")
+
+    def test_userscript_requires_user_turn_dom_evidence_not_claim_or_composer_draft(self):
+        script = SCRIPT.as_posix()
+        request_id = "probe:websol:conv:1:userturn"
+        marker = f"[DEVORCH_WEB_SOL_REQUEST {request_id}]"
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "let composerText=" + json.dumps(marker) + ";"
+            "const composer={focus:()=>{},disabled:false,hidden:false,isConnected:true,getAttribute:(n)=>n==='contenteditable'?'true':null,"
+            "get innerText(){return composerText},parentElement:null};"
+            "globalThis.document={body:{innerText:" + json.dumps(marker) + "},"
+            "querySelector:(q)=>q==='#prompt-textarea'?composer:null,"
+            "querySelectorAll:()=>[]};"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const draft=a.userMessageRequestEvidence(" + json.dumps(request_id) + ");"
+            "composerText='';"
+            "const turn=a.userMessageRequestEvidence(" + json.dumps(request_id) + ");"
+            "const confirmed=a.requestAlreadySubmitted('conv'," + json.dumps(request_id) + ");"
+            "console.log(draft+'|'+turn+'|'+String(confirmed));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "none|roleless_surface|true")
+
+    def test_userscript_discovers_composer_and_send_control_in_open_shadow_root(self):
+        script = SCRIPT.as_posix()
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "const composer={focus:()=>{},disabled:false,hidden:false,isConnected:true,getAttribute:()=>null,parentElement:null};"
+            "const send={disabled:false,click:()=>{},innerText:'',getAttribute:(n)=>n==='aria-label'?'Send prompt':null};"
+            "const shadow={querySelector:(q)=>q==='#prompt-textarea'?composer:(q===\"[data-testid='send-button']\"?send:null),"
+            "querySelectorAll:(q)=>q==='*'?[composer,send]:[]};"
+            "const host={tagName:'DIV',shadowRoot:shadow};"
+            "globalThis.document={querySelector:()=>null,querySelectorAll:(q)=>q==='*'?[host]:[]};"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "console.log(String(a.findComposer()===composer)+'|'+String(a.findSendButton()===send));"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "true|true")
+
+    def test_userscript_discovers_composer_and_probe_response_in_same_origin_iframe(self):
+        script = SCRIPT.as_posix()
+        request_id = "probe:websol:conv:1:abcdef"
+        nonce = "prb-abcdef"
+        body_text = (
+            f"[DEVORCH_WEB_SOL_REQUEST {request_id}] probe\\n"
+            f"Reply with [DEVORCH_WEB_SOL_RESPONSE {request_id}] {nonce} ok\\n"
+            f"[DEVORCH_WEB_SOL_RESPONSE {request_id}] {nonce} ok"
+        )
+        code = (
+            "globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST_DISABLED__=true;"
+            "const composer={focus:()=>{},disabled:false,hidden:false,isConnected:true,getAttribute:()=>null,parentElement:null};"
+            "const send={disabled:false,click:()=>{},innerText:'',getAttribute:(n)=>n==='aria-label'?'Send prompt':null};"
+            "const frameDoc={body:{innerText:" + json.dumps(body_text) + "},"
+            "querySelector:(q)=>q==='#prompt-textarea'?composer:(q===\"[data-testid='send-button']\"?send:null),"
+            "querySelectorAll:(q)=>[]};"
+            "const frame={tagName:'IFRAME',contentDocument:frameDoc};"
+            "globalThis.document={body:{innerText:''},querySelector:()=>null,"
+            "querySelectorAll:(q)=>q==='*'?[frame]:[]};"
+            "require(" + json.dumps(script) + ");"
+            "const a=globalThis.__DEVORCH_CHATGPT_ADAPTER_TEST__;"
+            "const response=a.findResponseText(" + json.dumps(request_id) + ");"
+            "console.log(String(a.findComposer()===composer)+'|'+String(a.findSendButton()===send)+'|'+response);"
+        )
+        result = subprocess.run(["node", "-e", code], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            "true|true|" + f"[DEVORCH_WEB_SOL_RESPONSE {request_id}] {nonce} ok",
+        )
 
 
 if __name__ == "__main__":

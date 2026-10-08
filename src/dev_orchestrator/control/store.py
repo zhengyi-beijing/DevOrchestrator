@@ -67,6 +67,16 @@ _ACTION_SCAN_FIELDS = {
     "textarea_count",
     "legacy_send_button_count",
     "composer_submit_button_count",
+    "composer_kind",
+    "composer_surface",
+    "submit_candidate_path",
+    "submit_candidate_surface",
+    "websol_submit_attempt_count",
+    "websol_user_turn_confirm_count",
+    "last_websol_submit_path",
+    "last_websol_submit_request_id",
+    "last_websol_user_turn_evidence",
+    "last_websol_user_turn_request_id",
     "result_submit_attempt_count",
     "result_composer_found_count",
     "result_composer_prepared_count",
@@ -123,6 +133,8 @@ def _sanitize_action_scan(value: Any) -> dict[str, Any] | None:
         "textarea_count",
         "legacy_send_button_count",
         "composer_submit_button_count",
+        "websol_submit_attempt_count",
+        "websol_user_turn_confirm_count",
         "result_submit_attempt_count",
         "result_composer_found_count",
         "result_composer_prepared_count",
@@ -218,6 +230,53 @@ def _sanitize_action_scan(value: Any) -> dict[str, Any] | None:
             return None
         result_request_id = result_request_id.strip()
 
+    websol_submit_request_id = value.get("last_websol_submit_request_id")
+    if websol_submit_request_id is not None:
+        if (
+            not isinstance(websol_submit_request_id, str)
+            or not websol_submit_request_id.strip()
+            or len(websol_submit_request_id) > _ACTION_SCAN_MAX_REQUEST_ID
+        ):
+            return None
+        websol_submit_request_id = websol_submit_request_id.strip()
+
+    websol_user_turn_request_id = value.get("last_websol_user_turn_request_id")
+    if websol_user_turn_request_id is not None:
+        if (
+            not isinstance(websol_user_turn_request_id, str)
+            or not websol_user_turn_request_id.strip()
+            or len(websol_user_turn_request_id) > _ACTION_SCAN_MAX_REQUEST_ID
+        ):
+            return None
+        websol_user_turn_request_id = websol_user_turn_request_id.strip()
+
+    composer_kind = value.get("composer_kind")
+    if composer_kind not in {"none", "prompt_textarea", "textarea", "contenteditable", "other"}:
+        return None
+    surface_values = {"none", "document", "open_shadow_root", "same_origin_iframe"}
+    composer_surface = value.get("composer_surface")
+    submit_candidate_surface = value.get("submit_candidate_surface")
+    if composer_surface not in surface_values or submit_candidate_surface not in surface_values:
+        return None
+    submit_path_values = {
+        "none",
+        "send_testid",
+        "composer_submit_identity",
+        "composer_form_submit_control",
+        "composer_ancestor_semantic",
+        "composer_ancestor_primary",
+        "global_semantic",
+        "form_request_submit",
+        "keyboard_enter",
+    }
+    submit_candidate_path = value.get("submit_candidate_path")
+    last_websol_submit_path = value.get("last_websol_submit_path")
+    if submit_candidate_path not in submit_path_values or last_websol_submit_path not in submit_path_values:
+        return None
+    last_websol_user_turn_evidence = value.get("last_websol_user_turn_evidence")
+    if last_websol_user_turn_evidence not in {"none", "role_user", "roleless_surface"}:
+        return None
+
     result_stage = value.get("last_result_submit_stage")
     if result_stage not in {"idle", "no_composer", "prepared", "no_send", "clicked", "confirmed", "timeout"}:
         return None
@@ -232,6 +291,14 @@ def _sanitize_action_scan(value: Any) -> dict[str, Any] | None:
         "body_has_action_marker": body_has_action_marker,
         "most_recent_request_id": request_id,
         "last_roleless_fallback_request_id": fallback_request_id,
+        "composer_kind": composer_kind,
+        "composer_surface": composer_surface,
+        "submit_candidate_path": submit_candidate_path,
+        "submit_candidate_surface": submit_candidate_surface,
+        "last_websol_submit_path": last_websol_submit_path,
+        "last_websol_submit_request_id": websol_submit_request_id,
+        "last_websol_user_turn_evidence": last_websol_user_turn_evidence,
+        "last_websol_user_turn_request_id": websol_user_turn_request_id,
         "last_result_submit_request_id": result_request_id,
         "last_result_submit_stage": result_stage,
         "action_scan_active": active,
