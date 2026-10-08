@@ -31,6 +31,34 @@ Adapter 0.1.2 real-browser deployment on TS-ZY_PC with XLabServer remains a
 valuable integration gate, but it is not a prerequisite for normal Core
 feature development or third-party project onboarding.
 
+## Web Sol self-service conversation binding and rotation
+
+Status: **FUTURE**
+
+Goal: let an owner bind or rotate a project's Web Sol conversation from a new
+ChatGPT tab without copying the conversation id into a separate CLI command.
+
+- Support a reserved local command such as `/devorch bind <project_id>` in the
+  ChatGPT composer. The Userscript must intercept it before submission so the
+  command and its authorization material are never sent to ChatGPT.
+- Resolve the exact live `/c/<conversation-id>` from the current tab and show an
+  explicit owner confirmation containing the project, prior binding and target
+  conversation before any mutation.
+- Authorize the operation with a short-lived, one-time capability scoped only
+  to `bind_conversation` or `rebind_conversation`; the heartbeat capability and
+  assistant prose must never become general control authority.
+- Reuse the existing live-session, uniqueness, active-claim, expected-revision
+  and audit guards. A failed or cancelled operation must leave the prior binding
+  unchanged.
+- After a successful bind/rebind, run a real Web Sol probe automatically and
+  report success or a bounded diagnostic in the tab. Do not close or retire the
+  prior conversation until the new binding and probe are both verified.
+- Keep manual dashboard/CLI bind and rebind paths available as recovery paths.
+- Acceptance: from a fresh live ChatGPT conversation, `/devorch bind scankits`
+  can confirm, atomically bind/rebind and pass the probe without exposing a
+  broad control token, accepting model-generated authority, cross-routing
+  another project, or losing an in-flight request.
+
 ## Transition Executor / Worker actuation
 
 Still owner-gated. Before implementation, freeze a new contract covering
