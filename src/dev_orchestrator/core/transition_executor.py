@@ -33,6 +33,7 @@ from dev_orchestrator.agents.router import AgentRouter
 from dev_orchestrator.config import load_projects_config
 from dev_orchestrator.control.owner_store import OwnerControlStore
 from dev_orchestrator.core.repository import read_repository_truth
+from dev_orchestrator.core.readiness import snapshot_task_marked_complete
 from dev_orchestrator.core.staged_roadmap import read_successor
 from dev_orchestrator.core.successor_consistency import (
     SuccessorResolution,
@@ -219,19 +220,12 @@ def _next_task_ready(
     return parse_task_status(snapshot.get("next_status")).is_ready_to_run()
 
 
-def _task_marked_complete(snapshot: dict[str, Any]) -> bool:
-    readiness = snapshot.get("readiness")
-    if isinstance(readiness, dict):
-        if (
-            readiness.get("valid", True)
-            and not readiness.get("stale", False)
-            and readiness.get("state") == "completed"
-        ):
-            readiness_task = _non_blank_config(readiness.get("task_id"))
-            advertised_task = _advertised_task_id(snapshot)
-            if readiness_task is None or advertised_task is None or readiness_task == advertised_task:
-                return True
-    return parse_task_status(snapshot.get("next_status")).is_completed()
+def _task_marked_complete(
+    snapshot: dict[str, Any], *, expected_task_id: str | None = None,
+) -> bool:
+    return snapshot_task_marked_complete(
+        snapshot, expected_task_id=expected_task_id,
+    )
 
 
 
@@ -1325,7 +1319,9 @@ class TransitionExecutor:
                 )
                 if (
                     is_ready
-                    or _task_marked_complete(snapshot)
+                    or _task_marked_complete(
+                        snapshot, expected_task_id=advertised_task_id,
+                    )
                     or (
                         next_updated is not None
                         and record_completed is not None
@@ -5000,7 +4996,9 @@ class TransitionExecutor:
                 current_task == task_id and _next_task_ready(snapshot, predecessor_task_id=task_id)
             )
             if current_task == task_id and (
-                _task_marked_complete(snapshot) or reviewed_current_ready
+                _task_marked_complete(
+                    snapshot, expected_task_id=task_id,
+                ) or reviewed_current_ready
             ):
                 repo_dir = project.get("repo_path") or ""
                 successor = resolve_successor(repo_dir, task_id)
@@ -5687,7 +5685,9 @@ class TransitionExecutor:
         current_task = _advertised_task_id(snapshot)
         if not current_task:
             return
-        if not _task_marked_complete(snapshot):
+        if not _task_marked_complete(
+            snapshot, expected_task_id=current_task,
+        ):
             return
         repo_dir = project.get("repo_path") or ""
         truth = read_repository_truth(repo_dir)

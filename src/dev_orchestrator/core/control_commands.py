@@ -32,6 +32,7 @@ from dev_orchestrator.core.ai_reviewer import AIReviewerCoordinator
 from dev_orchestrator.core.lifecycle_authority import TERMINAL_LIFECYCLE_STATES, task_has_terminal_settlement
 from dev_orchestrator.core.lifecycle_projection import overlay_orchestration_lifecycle
 from dev_orchestrator.core.project_status import project_runtime_status
+from dev_orchestrator.core.readiness import snapshot_task_marked_complete
 from dev_orchestrator.core.repository import read_repository_truth
 from dev_orchestrator.core.task_status import parse_task_status
 from dev_orchestrator.storage.json_store import read_json, utc_now_iso, write_json
@@ -345,7 +346,9 @@ class ControlCommandCoordinator:
             if row.get("reviewed_ready") is True:
                 status_ok = status_obj.is_ready_to_run()
             else:
-                status_ok = status_obj.is_completed() or _terminal_settled_predecessor(
+                status_ok = snapshot_task_marked_complete(
+                    snapshot, expected_task_id=_nonblank(row.get("task_id")),
+                ) or _terminal_settled_predecessor(
                     executor, project_id, _nonblank(row.get("task_id")) or "",
                 )
             if staged_successor != next_task_id or (

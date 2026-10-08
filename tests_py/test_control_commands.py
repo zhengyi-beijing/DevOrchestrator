@@ -256,6 +256,60 @@ class ControlCommandTests(unittest.TestCase):
             third = coordinator2.advance(config, snapshot, executor)
             self.assertEqual(len(planner.calls), 1)
 
+    def test_staged_handoff_consumes_structured_completed_with_stale_ready_markdown(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; repo.mkdir(); runtime = base / "runtime"
+            config = base / "projects.json"; write_config(config, repo)
+            planner = FakePlanner(); executor = FakeExecutor(launch=True)
+            executor.records["review-r1"] = {
+                "project_id": "p1", "state": "handoff", "outcome": "planning_required",
+                "task_id": "P1", "next_task_id": "P2", "staged_successor": "P2",
+                "staged_spec_path": "agent/staged/P2.md", "staged_spec_sha256": "abc",
+                "reviewed_branch": "main", "reviewed_head": "head1",
+            }
+            coordinator = ControlCommandCoordinator(runtime, planner)
+            snapshot = {"projects": [{
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**READY_TO_RUN**", "telemetry": {"task_id": "P1"},
+                "readiness": {
+                    "source": "structured", "state": "completed", "task_id": "P1",
+                    "valid": True, "stale": False,
+                },
+            }]}
+
+            first = coordinator.advance(config, snapshot, executor)
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0]["lifecycle_action"], "plan")
+            self.assertTrue(executor.records["review-r1"]["handoff_consumed"])
+            self.assertEqual(planner.calls[0][0], "deferred")
+            self.assertEqual(planner.calls[0][3], "P2")
+
+            self.assertEqual(coordinator.advance(config, snapshot, executor), [])
+            self.assertEqual(len(planner.calls), 1)
+
+    def test_staged_handoff_rejects_mismatched_structured_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; repo.mkdir(); runtime = base / "runtime"
+            config = base / "projects.json"; write_config(config, repo)
+            planner = FakePlanner(); executor = FakeExecutor(launch=True)
+            executor.records["review-r1"] = {
+                "project_id": "p1", "state": "handoff", "outcome": "planning_required",
+                "task_id": "P1", "next_task_id": "P2", "staged_successor": "P2",
+            }
+            coordinator = ControlCommandCoordinator(runtime, planner)
+            snapshot = {"projects": [{
+                "project_id": "p1", "state": "IDLE",
+                "next_status": "**COMPLETE**", "telemetry": {"task_id": "P1"},
+                "readiness": {
+                    "source": "structured", "state": "completed", "task_id": "OTHER",
+                    "valid": True, "stale": False,
+                },
+            }]}
+
+            self.assertEqual(coordinator.advance(config, snapshot, executor), [])
+            self.assertNotIn("handoff_consumed", executor.records["review-r1"])
+            self.assertEqual(planner.calls, [])
+
     def test_staged_ready_decision_handoff_consumes_on_ready_status(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td); repo = base / "repo"; repo.mkdir(); runtime = base / "runtime"

@@ -96,6 +96,30 @@ class TaskStateResolution:
         }
 
 
+def snapshot_task_marked_complete(
+    snapshot: dict[str, Any],
+    *,
+    expected_task_id: Optional[str] = None,
+) -> bool:
+    """Return whether one snapshot authoritatively marks a task completed.
+
+    Valid structured readiness outranks the legacy Markdown projection.  When
+    an expected task identity is supplied, structured completion must be bound
+    to that exact task.  Invalid, stale, or mismatched structured readiness
+    fails closed instead of falling back to a possibly stale ``next.md``.
+    """
+    readiness = snapshot.get("readiness")
+    if isinstance(readiness, dict):
+        if not readiness.get("valid", True) or readiness.get("stale", False):
+            return False
+        readiness_task = str(readiness.get("task_id") or "").strip() or None
+        expected = str(expected_task_id or "").strip() or None
+        if expected is not None and readiness_task != expected:
+            return False
+        return readiness.get("state") == "completed"
+    return parse_task_status(snapshot.get("next_status")).is_completed()
+
+
 def resolve_task_state(
     project: Optional[dict[str, Any]] = None,
     snapshot: Optional[dict[str, Any]] = None,
