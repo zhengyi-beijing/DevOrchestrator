@@ -220,6 +220,17 @@ def _next_task_ready(
 
 
 def _task_marked_complete(snapshot: dict[str, Any]) -> bool:
+    readiness = snapshot.get("readiness")
+    if isinstance(readiness, dict):
+        if (
+            readiness.get("valid", True)
+            and not readiness.get("stale", False)
+            and readiness.get("state") == "completed"
+        ):
+            readiness_task = _non_blank_config(readiness.get("task_id"))
+            advertised_task = _advertised_task_id(snapshot)
+            if readiness_task is None or advertised_task is None or readiness_task == advertised_task:
+                return True
     return parse_task_status(snapshot.get("next_status")).is_completed()
 
 

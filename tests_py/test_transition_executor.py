@@ -1004,5 +1004,61 @@ class TransitionExecutorActuationTests(unittest.TestCase):
             self.assertNotIn("[PROJECT_CONTEXT_BEGIN]", backend.started[0].prompt)
 
 
+    def test_structured_completed_current_task_with_stale_ready_markdown_hands_off(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td); repo = base / "repo"; runtime = base / "runtime"
+            make_repo(repo, "P1")
+            (repo / "agent" / "next.md").write_text(
+                "# P1 bounded task\nStatus: **READY_TO_RUN**\n", encoding="utf-8",
+            )
+            staged = repo / "agent" / "staged"; staged.mkdir(parents=True)
+            (staged / "roadmap.json").write_text(json.dumps({
+                "schema_version": 1,
+                "tasks": [{
+                    "task_id": "P1", "successor": "P2",
+                    "successor_spec_path": "agent/staged/P2.md",
+                }],
+            }), encoding="utf-8")
+            (staged / "P2.md").write_bytes(
+                b"# P2 bounded task\n\nStatus: **PENDING DESIGN**\n"
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "agent/"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-m", "reviewed P1 structured complete"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+            head = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True,
+            ).strip()
+            config = base / "projects.json"; write_config(config, repo, bootstrap=False)
+            write_decision(runtime, head=head, task_id="P1")
+            summary = ready_summary(repo, "P1")
+            summary["projects"][0].update({
+                "state": "IDLE",
+                "next_status": "**READY_TO_RUN**",
+                "readiness": {
+                    "schema_version": 1,
+                    "state": "completed",
+                    "source": "structured",
+                    "task_id": "P1",
+                    "valid": True,
+                    "stale": False,
+                    "code": "OK",
+                    "reason": "structured execution state valid",
+                },
+            })
+            backend = FakeBackend("agy")
+            executor = TransitionExecutor(runtime, backend_overrides={"agy": backend})
+
+            self.assertEqual(executor.advance(summary, config), [])
+            row = executor.state()["executions"]["worker_done:p1:r1"]
+            self.assertEqual(
+                (row["state"], row["outcome"], row["next_task_id"]),
+                ("handoff", "planning_required", "P2"),
+            )
+            self.assertEqual(row["predecessor_terminal_state"], "settled")
+            self.assertEqual(len(backend.started), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
